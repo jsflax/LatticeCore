@@ -1,7 +1,9 @@
 #include <stdio.h>
+#include <cmath>
 #include <list.hpp>
 #include <lattice.hpp>
 #include <managed_object.hpp>
+#include <geo_bounds.hpp>
 
 // MARK: - Link List Ref retain/release for SWIFT_SHARED_REFERENCE
 void retainLinkListRef(lattice::link_list_ref* p) {
@@ -211,4 +213,225 @@ std::vector<size_t> link_list::find_where(const std::string& sql_predicate) cons
     return indices;
 }
 
+// MARK: - GeoBounds List implementations
+
+geo_bounds_list::geo_bounds_list(const managed<std::vector<geo_bounds*>>& o) : lattice(nullptr) {
+    new (&managed_) managed<std::vector<geo_bounds*>>(o);
+    lattice = static_cast<swift_lattice*>(managed_.lattice);
+}
+
+geo_bounds_list::element_proxy geo_bounds_list::operator[](size_t idx) const {
+    element_proxy proxy;
+    proxy.idx = idx;
+    proxy.list = const_cast<geo_bounds_list*>(this);
+    if (lattice) {
+        // managed_[idx] returns element_proxy -> managed<geo_bounds*>& -> detach() -> geo_bounds
+        auto& self = const_cast<geo_bounds_list&>(*this);
+        managed<geo_bounds*>& m = self.managed_[idx];
+        proxy.value = m.detach();
+    } else {
+        proxy.value = unmanaged_[idx];
+    }
+    return proxy;
+}
+
+geo_bounds_list::element_proxy& geo_bounds_list::element_proxy::operator=(const geo_bounds& bounds) {
+    value = bounds;
+    list->set(idx, bounds);
+    return *this;
+}
+
+void geo_bounds_list::element_proxy::assign(geo_bounds_ref* ref) {
+    if (ref) {
+        *this = *ref->get();
+    }
+}
+
+geo_bounds_ref* geo_bounds_list::element_proxy::getObjectRef() const {
+    return new geo_bounds_ref(value);
+}
+
+size_t geo_bounds_list::size() const {
+    if (lattice) {
+        return managed_.size();
+    } else {
+        return unmanaged_.size();
+    }
+}
+
+bool geo_bounds_list::empty() const {
+    return size() == 0;
+}
+
+void geo_bounds_list::push_back(const geo_bounds& bounds) {
+    if (lattice) {
+        managed_.push_back(bounds);
+    } else {
+        unmanaged_.push_back(bounds);
+    }
+}
+
+void geo_bounds_list::push_back(geo_bounds_ref* ref) {
+    if (ref) {
+        push_back(*ref->get());
+    }
+}
+
+void geo_bounds_list::erase(size_t idx) {
+    if (lattice) {
+        managed_.erase(idx);
+    } else {
+        if (idx < unmanaged_.size()) {
+            unmanaged_.erase(unmanaged_.begin() + static_cast<std::ptrdiff_t>(idx));
+        }
+    }
+}
+
+void geo_bounds_list::clear() {
+    if (lattice) {
+        managed_.clear();
+    } else {
+        unmanaged_.clear();
+    }
+}
+
+void geo_bounds_list::set(size_t idx, const geo_bounds& bounds) {
+    if (lattice) {
+        managed_[idx] = bounds;
+    } else {
+        if (idx < unmanaged_.size()) {
+            unmanaged_[idx] = bounds;
+        }
+    }
+}
+
+std::optional<size_t> geo_bounds_list::find_index(const geo_bounds& target) const {
+    if (lattice) {
+        const auto& list_table = managed_.list_table_;
+        const auto& parent_id = managed_.parent_global_id_;
+        auto* db = managed_.db;
+
+        if (list_table.empty() || !db || !db->table_exists(list_table)) {
+            return std::nullopt;
+        }
+
+        // Query to find the index of a matching geo_bounds by coordinates
+        std::string sql = R"(
+            WITH ordered_bounds AS (
+                SELECT id, minLat, maxLat, minLon, maxLon,
+                       (ROW_NUMBER() OVER (ORDER BY id)) - 1 as idx
+                FROM )" + list_table + R"(
+                WHERE parentId = ?
+            )
+            SELECT idx FROM ordered_bounds
+            WHERE minLat = ? AND maxLat = ? AND minLon = ? AND maxLon = ?
+            LIMIT 1
+        )";
+
+        auto rows = db->query(sql, {parent_id, target.min_lat, target.max_lat, target.min_lon, target.max_lon});
+
+        if (!rows.empty()) {
+            auto it = rows[0].find("idx");
+            if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                return static_cast<size_t>(std::get<int64_t>(it->second));
+            }
+        }
+        return std::nullopt;
+    } else {
+        // Unmanaged: compare by coordinates with epsilon
+        const double eps = 1e-9;
+        auto close_enough = [eps](double a, double b) {
+            return std::abs(a - b) < eps;
+        };
+
+        for (size_t i = 0; i < unmanaged_.size(); i++) {
+            const geo_bounds& element = unmanaged_[i];
+            if (close_enough(element.min_lat, target.min_lat) &&
+                close_enough(element.max_lat, target.max_lat) &&
+                close_enough(element.min_lon, target.min_lon) &&
+                close_enough(element.max_lon, target.max_lon)) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+}
+
+std::vector<size_t> geo_bounds_list::find_where(const std::string& sql_predicate) const {
+    // Only supported for managed lists
+    if (!lattice) {
+        return {};
+    }
+
+    const auto& list_table = managed_.list_table_;
+    const auto& parent_id = managed_.parent_global_id_;
+    auto* db = managed_.db;
+
+    if (list_table.empty() || !db || !db->table_exists(list_table)) {
+        return {};
+    }
+
+    // Query to find all indices of matching elements
+    std::string sql = R"(
+        WITH ordered_bounds AS (
+            SELECT id, (ROW_NUMBER() OVER (ORDER BY id)) - 1 as idx
+            FROM )" + list_table + R"(
+            WHERE parentId = ?
+        )
+        SELECT ob.idx
+        FROM ordered_bounds ob
+        INNER JOIN )" + list_table + R"( t ON t.id = ob.id
+        WHERE )" + sql_predicate + R"(
+        ORDER BY ob.idx
+    )";
+
+    auto rows = db->query(sql, {parent_id});
+
+    std::vector<size_t> indices;
+    indices.reserve(rows.size());
+
+    for (const auto& row : rows) {
+        auto it = row.find("idx");
+        if (it != row.end() && std::holds_alternative<int64_t>(it->second)) {
+            indices.push_back(static_cast<size_t>(std::get<int64_t>(it->second)));
+        }
+    }
+
+    return indices;
+}
+
+swift_lattice_ref* geo_bounds_list_ref::getLattice() const SWIFT_COMPUTED_PROPERTY {
+    return swift_lattice_ref::get_ref_for_lattice(impl_->lattice);
+}
+
+}
+
+// MARK: - GeoBounds Ref retain/release for SWIFT_SHARED_REFERENCE
+void retainGeoBoundsRef(lattice::geo_bounds_ref* p) {
+    if (p) {
+        p->retain();
+    }
+}
+
+void releaseGeoBoundsRef(lattice::geo_bounds_ref* p) {
+    if (p) {
+        if (p->release()) {
+            delete p;
+        }
+    }
+}
+
+// MARK: - GeoBounds List Ref retain/release for SWIFT_SHARED_REFERENCE
+void retainGeoBoundsListRef(lattice::geo_bounds_list_ref* p) {
+    if (p) {
+        p->retain();
+    }
+}
+
+void releaseGeoBoundsListRef(lattice::geo_bounds_list_ref* p) {
+    if (p) {
+        if (p->release()) {
+            delete p;
+        }
+    }
 }

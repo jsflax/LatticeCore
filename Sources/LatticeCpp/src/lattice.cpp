@@ -11,7 +11,7 @@ instance_registry& instance_registry::instance() {
     return reg;
 }
 void lattice_db::setup_change_hook() {
-    printf("[setup_change_hook] Setting up hooks for path: %s\n", config_.path.c_str());
+    LOG_DEBUG("setup_change_hook", "Setting up hooks for path: %s", config_.path.c_str());
 
     // Update hook - buffers changes (called for each row change)
     sqlite3_update_hook(db_->handle(),
@@ -26,12 +26,12 @@ void lattice_db::setup_change_hook() {
                 default: return;
             }
 
-            printf("[update_hook] table=%s op=%s rowid=%lld\n", table_name, op.c_str(), (long long)rowid);
+            LOG_DEBUG("update_hook", "table=%s op=%s rowid=%lld", table_name, op.c_str(), (long long)rowid);
 
             // Handle internal tables specially
             std::string table(table_name);
             if (table == "_SyncControl") {
-                printf("[update_hook] Skipping _SyncControl table\n");
+                LOG_DEBUG("update_hook", "Skipping _SyncControl table");
                 return;
             }
 
@@ -40,7 +40,7 @@ void lattice_db::setup_change_hook() {
             // - File DBs: skip (let flush_changes handle it via WAL hook to avoid double notification)
             if (table == "AuditLog") {
                 if (self->config_.path == ":memory:" || self->config_.path.empty()) {
-                    printf("[update_hook] AuditLog change (in-memory), notifying directly: op=%s rowid=%lld\n", op.c_str(), (long long)rowid);
+                    LOG_DEBUG("update_hook", "AuditLog change (in-memory), notifying directly: op=%s rowid=%lld", op.c_str(), (long long)rowid);
                     // Get globalId for the AuditLog entry
                     std::string global_id;
                     if (operation != SQLITE_DELETE) {
@@ -55,14 +55,14 @@ void lattice_db::setup_change_hook() {
                     }
                     self->notify_change("AuditLog", op, static_cast<int64_t>(rowid), global_id);
                 } else {
-                    printf("[update_hook] AuditLog change (file DB), skipping - WAL hook will handle\n");
+                    LOG_DEBUG("update_hook", "AuditLog change (file DB), skipping - WAL hook will handle");
                 }
                 return;
             }
 
             // Skip link tables (they start with underscore and have no 'id' column)
             if (!table.empty() && table[0] == '_') {
-                printf("[update_hook] Skipping link table: %s\n", table_name);
+                LOG_DEBUG("update_hook", "Skipping link table: %s", table_name);
                 return;
             }
 
@@ -80,16 +80,16 @@ void lattice_db::setup_change_hook() {
             }
 
             // Buffer the change instead of notifying immediately
-            printf("[update_hook] Buffering change: table=%s op=%s rowid=%lld globalId=%s\n",
+            LOG_DEBUG("update_hook", "Buffering change: table=%s op=%s rowid=%lld globalId=%s",
                    table.c_str(), op.c_str(), (long long)rowid, global_id.c_str());
             self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id);
 
             // For in-memory databases, flush immediately since WAL hook won't fire
             if (self->config_.path == ":memory:" || self->config_.path.empty()) {
-                printf("[update_hook] In-memory DB, calling flush_changes()\n");
+                LOG_DEBUG("update_hook", "In-memory DB, calling flush_changes()");
                 self->flush_changes();
             } else {
-                printf("[update_hook] File DB (path=%s), waiting for WAL hook\n", self->config_.path.c_str());
+                LOG_DEBUG("update_hook", "File DB (path=%s), waiting for WAL hook", self->config_.path.c_str());
             }
         },
         this
@@ -162,6 +162,159 @@ void lattice_db::attach(lattice_db &lattice) {
                     " AS SELECT * FROM \"" + alias.string() + "\"." + table_name);
         }
     }
+}
+
+// ============================================================================
+// managed<std::vector<geo_bounds*>> method implementations
+// ============================================================================
+
+size_t managed<std::vector<geo_bounds*>>::size() const {
+    if (!is_bound()) return unmanaged_value.size();
+    load_if_needed();
+    return cached_objects_.size();
+}
+
+void managed<std::vector<geo_bounds*>>::load_if_needed() const {
+    if (loaded_ || !is_bound()) return;
+
+    cached_objects_.clear();
+    std::string sql = "SELECT id, minLat, maxLat, minLon, maxLon FROM " + list_table_ +
+                      " WHERE parent_id = ? ORDER BY id";
+    auto rows = db->query(sql, {parent_global_id_});
+
+    for (const auto& row : rows) {
+        auto get_double = [&](const std::string& col) -> double {
+            auto it = row.find(col);
+            if (it != row.end() && std::holds_alternative<double>(it->second)) {
+                return std::get<double>(it->second);
+            }
+            return 0.0;
+        };
+        auto get_int64 = [&](const std::string& col) -> int64_t {
+            auto it = row.find(col);
+            if (it != row.end() && std::holds_alternative<int64_t>(it->second)) {
+                return std::get<int64_t>(it->second);
+            }
+            return 0;
+        };
+
+        geo_bounds bounds(
+            get_double("minLat"),
+            get_double("maxLat"),
+            get_double("minLon"),
+            get_double("maxLon")
+        );
+        int64_t row_id = get_int64("id");
+
+        auto wrapper = std::make_shared<managed<geo_bounds*>>(bounds);
+        wrapper->bind_to_list_row(db, lattice, list_table_, rtree_table_, row_id, parent_global_id_);
+        cached_objects_.push_back(wrapper);
+    }
+    loaded_ = true;
+}
+
+void managed<std::vector<geo_bounds*>>::push_back(const geo_bounds& bounds) {
+    if (!is_bound()) {
+        unmanaged_value.push_back(bounds);
+        return;
+    }
+
+    // Ensure the list table exists
+    if (lattice) {
+        lattice->ensure_geo_bounds_list_table(table_name, column_name);
+    }
+
+    // Insert into list table using insert() which returns the row id
+    primary_key_t new_row_id = db->insert(list_table_, {
+        {"parent_id", parent_global_id_},
+        {"minLat", bounds.min_lat},
+        {"maxLat", bounds.max_lat},
+        {"minLon", bounds.min_lon},
+        {"maxLon", bounds.max_lon}
+    });
+
+    // Create cached wrapper
+    auto wrapper = std::make_shared<managed<geo_bounds*>>(bounds);
+    wrapper->bind_to_list_row(db, lattice, list_table_, rtree_table_, new_row_id, parent_global_id_);
+    cached_objects_.push_back(wrapper);
+}
+
+void managed<std::vector<geo_bounds*>>::erase(size_t index) {
+    if (!is_bound()) {
+        if (index < unmanaged_value.size()) {
+            unmanaged_value.erase(unmanaged_value.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+        return;
+    }
+
+    load_if_needed();
+    if (index >= cached_objects_.size()) return;
+
+    // Get the row id from the cached wrapper
+    int64_t row_id_to_delete = cached_objects_[index]->list_row_id_;
+
+    // Delete from database
+    db->execute("DELETE FROM " + list_table_ + " WHERE id = ?", {row_id_to_delete});
+
+    // Update cache
+    cached_objects_.erase(cached_objects_.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+void managed<std::vector<geo_bounds*>>::clear() {
+    if (!is_bound()) {
+        unmanaged_value.clear();
+        return;
+    }
+
+    // Delete all entries for this parent
+    std::string sql = "DELETE FROM " + list_table_ + " WHERE parent_id = ?";
+    db->execute(sql, {parent_global_id_});
+
+    // Clear cache
+    cached_objects_.clear();
+    loaded_ = true;  // Mark as loaded (empty)
+}
+
+managed<std::vector<geo_bounds*>>::iterator managed<std::vector<geo_bounds*>>::begin() {
+    load_if_needed();
+    return iterator(cached_objects_.begin());
+}
+
+managed<std::vector<geo_bounds*>>::iterator managed<std::vector<geo_bounds*>>::end() {
+    load_if_needed();
+    return iterator(cached_objects_.end());
+}
+
+managed<std::vector<geo_bounds*>>::element_proxy
+managed<std::vector<geo_bounds*>>::operator[](size_t index) {
+    return element_proxy(this, index);
+}
+
+geo_bounds managed<std::vector<geo_bounds*>>::operator[](size_t index) const {
+    if (!is_bound()) {
+        return unmanaged_value[index];
+    }
+    load_if_needed();
+    return cached_objects_[index]->detach();
+}
+
+// Element proxy implementations
+managed<std::vector<geo_bounds*>>::element_proxy::operator managed<geo_bounds*>&() const {
+    list_->load_if_needed();
+    return *list_->cached_objects_[index_];
+}
+
+managed<geo_bounds*>*
+managed<std::vector<geo_bounds*>>::element_proxy::operator->() const {
+    list_->load_if_needed();
+    return list_->cached_objects_[index_].get();
+}
+
+managed<std::vector<geo_bounds*>>::element_proxy&
+managed<std::vector<geo_bounds*>>::element_proxy::operator=(const geo_bounds& bounds) {
+    list_->load_if_needed();
+    *list_->cached_objects_[index_] = bounds;
+    return *this;
 }
 
 } // namespace lattice

@@ -960,6 +960,261 @@ struct CONFORMS_TO_MANAGED managed<std::vector<geo_bounds>> : managed_base {
     }
 };
 
+// ============================================================================
+// MARK: managed<geo_bounds*> - A single geo_bounds stored as a row in a list table
+// This is different from managed<geo_bounds> which stores in 4 columns of the parent table.
+// This version wraps a geo_bounds that lives in a separate list table row.
+// ============================================================================
+
+template<>
+struct CONFORMS_TO_MANAGED managed<geo_bounds*> : managed_base {
+    using SwiftType = geo_bounds*;
+    using OptionalType = managed<geo_bounds*>;
+
+    mutable geo_bounds cached_value_;
+    mutable bool is_loaded_ = false;
+    std::string list_table_;      // e.g., "_Place_regions"
+    std::string rtree_table_;     // e.g., "_Place_regions_rtree"
+    int64_t list_row_id_ = 0;     // Row ID within the list table
+    std::string parent_global_id_;
+
+    managed() = default;
+    managed(const geo_bounds& v) : cached_value_(v), is_loaded_(true) {}
+
+    // Bind to a specific row in a list table
+    void bind_to_list_row(database* db_ptr, lattice_db* lattice_ptr,
+                          const std::string& list_table, const std::string& rtree_table,
+                          int64_t list_row_id, const std::string& parent_gid) {
+        db = db_ptr;
+        lattice = lattice_ptr;
+        list_table_ = list_table;
+        rtree_table_ = rtree_table;
+        list_row_id_ = list_row_id;
+        parent_global_id_ = parent_gid;
+    }
+
+    bool is_bound() const { return db != nullptr && list_row_id_ != 0; }
+
+    void load_if_needed() const {
+        if (is_loaded_ || !is_bound()) return;
+
+        std::string sql = "SELECT minLat, maxLat, minLon, maxLon FROM " + list_table_ +
+                          " WHERE id = ?";
+        auto rows = db->query(sql, {list_row_id_});
+
+        if (!rows.empty()) {
+            const auto& row = rows[0];
+            auto get_double = [&](const std::string& col) -> double {
+                auto it = row.find(col);
+                if (it != row.end() && std::holds_alternative<double>(it->second)) {
+                    return std::get<double>(it->second);
+                }
+                return 0.0;
+            };
+            cached_value_ = geo_bounds(
+                get_double("minLat"),
+                get_double("maxLat"),
+                get_double("minLon"),
+                get_double("maxLon")
+            );
+        }
+        is_loaded_ = true;
+    }
+
+    [[nodiscard]] geo_bounds detach() const {
+        load_if_needed();
+        return cached_value_;
+    }
+
+    operator geo_bounds() const SWIFT_NAME(get()) { return detach(); }
+
+    // Assignment updates the database row
+    managed& operator=(const geo_bounds& v) SWIFT_NAME(set(_:)) {
+        if (is_bound()) {
+            db->update(list_table_, list_row_id_, {
+                {"minLat", v.min_lat},
+                {"maxLat", v.max_lat},
+                {"minLon", v.min_lon},
+                {"maxLon", v.max_lon}
+            });
+            // Update R*Tree if it exists
+            if (db->table_exists(rtree_table_)) {
+                db->execute("UPDATE " + rtree_table_ + " SET minLat = ?, maxLat = ?, minLon = ?, maxLon = ? WHERE id = ?",
+                    {v.min_lat, v.max_lat, v.min_lon, v.max_lon, list_row_id_});
+            }
+        }
+        cached_value_ = v;
+        is_loaded_ = true;
+        return *this;
+    }
+
+    // Accessors for geo_bounds fields
+    double min_lat() const { return detach().min_lat; }
+    double max_lat() const { return detach().max_lat; }
+    double min_lon() const { return detach().min_lon; }
+    double max_lon() const { return detach().max_lon; }
+
+    // Convenience methods from geo_bounds
+    double center_lat() const { return detach().center_lat(); }
+    double center_lon() const { return detach().center_lon(); }
+    double lat_span() const { return detach().lat_span(); }
+    double lon_span() const { return detach().lon_span(); }
+    bool is_point() const { return detach().is_point(); }
+    bool contains(double lat, double lon) const { return detach().contains(lat, lon); }
+    bool intersects(const geo_bounds& other) const { return detach().intersects(other); }
+};
+
+// ============================================================================
+// MARK: managed<std::vector<geo_bounds*>> - Geo bounds list with pointer semantics
+// Similar to managed<std::vector<T*>> for models, but for geo_bounds.
+// Each geo_bounds in the list is stored as a row in a separate table with R*Tree index.
+// ============================================================================
+
+template<>
+struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<geo_bounds*>> : managed_base {
+    using OptionalType = managed<std::vector<geo_bounds*>>;
+    using SwiftType = std::vector<geo_bounds*>;
+    using Wrapped = std::vector<geo_bounds*>;
+
+    mutable std::vector<std::shared_ptr<managed<geo_bounds*>>> cached_objects_;
+    mutable bool loaded_ = false;
+    std::string parent_global_id_;
+    std::string list_table_;    // e.g., "_Place_regions"
+    std::string rtree_table_;   // e.g., "_Place_regions_rtree"
+
+    // Unmanaged storage for objects not yet bound
+    std::vector<geo_bounds> unmanaged_value;
+
+    managed() = default;
+    managed(const managed&) = default;
+    managed(managed&&) = default;
+    managed(const std::vector<geo_bounds>& val) : unmanaged_value(val) {}
+
+    // OptionalProtocol requirements - lists always "have value" (even if empty)
+    bool hasValue() const SWIFT_NAME(hasValue()) { return true; }
+    std::vector<geo_bounds*> value() const SWIFT_NAME(value()) { return std::vector<geo_bounds*>{}; }
+
+    operator std::vector<geo_bounds*>() const SWIFT_NAME(get()) {
+        return std::vector<geo_bounds*>{};
+    }
+
+    managed& operator=(std::vector<geo_bounds*> v) SWIFT_NAME(set(_:)) {
+        return *this;
+    }
+
+    Wrapped getPointee() const SWIFT_COMPUTED_PROPERTY {
+        return value();
+    }
+    void setPointee(Wrapped wrapped) SWIFT_COMPUTED_PROPERTY {
+        this->operator=(wrapped);
+    }
+
+    // Bind to parent - sets up list table name
+    void bind_to_parent(model_base* parent, const char* prop_name) {
+        managed_base::bind_to_parent(parent, prop_name);
+        list_table_ = "_" + parent->table_name_ + "_" + std::string(prop_name);
+        rtree_table_ = list_table_ + "_rtree";
+        parent_global_id_ = parent->global_id_;
+    }
+
+    void bind_to_parent(model_base* parent, const property_descriptor& p) {
+        db = parent->db_;
+        lattice = parent->lattice_;
+        table_name = parent->table_name_;
+        column_name = p.name;
+        row_id = parent->id_;
+        list_table_ = "_" + parent->table_name_ + "_" + p.name;
+        rtree_table_ = list_table_ + "_rtree";
+        parent_global_id_ = parent->global_id_;
+    }
+
+    const std::string& list_table() const { return list_table_; }
+    const std::string& rtree_table() const { return rtree_table_; }
+
+    // Size
+    size_t size() const;
+    bool empty() const { return size() == 0; }
+
+    // Modifiers - declarations, implementations in lattice.hpp
+    void push_back(const geo_bounds& bounds);
+    void erase(size_t index);
+    void clear();
+
+    // Get a copy of all geo_bounds
+    [[nodiscard]] std::vector<geo_bounds> detach() const {
+        if (!is_bound()) return unmanaged_value;
+        load_if_needed();
+        std::vector<geo_bounds> result;
+        result.reserve(cached_objects_.size());
+        for (const auto& obj : cached_objects_) {
+            result.push_back(obj->detach());
+        }
+        return result;
+    }
+
+    // Proxy class for subscript assignment
+    class element_proxy {
+    public:
+        element_proxy(managed<std::vector<geo_bounds*>>* list, size_t index)
+            : list_(list), index_(index) {}
+
+        // Read access - convert to managed<geo_bounds*>&
+        operator managed<geo_bounds*>&() const;
+
+        // Pointer access to underlying geo_bounds
+        managed<geo_bounds*>* operator->() const;
+
+        // Assignment from geo_bounds value
+        element_proxy& operator=(const geo_bounds& bounds);
+
+    private:
+        managed<std::vector<geo_bounds*>>* list_;
+        size_t index_;
+    };
+
+    // Iterator support
+    struct iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = managed<geo_bounds*>;
+        using difference_type = std::ptrdiff_t;
+        using pointer = managed<geo_bounds*>*;
+        using reference = managed<geo_bounds*>&;
+
+        iterator(typename std::vector<std::shared_ptr<managed<geo_bounds*>>>::iterator it) : it_(it) {}
+        iterator(const iterator&) = default;
+        iterator& operator=(const iterator&) = default;
+
+        reference operator*() const { return **it_; }
+        pointer operator->() const { return it_->get(); }
+        iterator& operator++() { ++it_; return *this; }
+        iterator operator++(int) { iterator tmp = *this; ++it_; return tmp; }
+
+        friend bool operator==(const iterator& a, const iterator& b) {
+            return a.it_ == b.it_;
+        }
+        friend bool operator!=(const iterator& a, const iterator& b) {
+            return !(a == b);
+        }
+
+    private:
+        typename std::vector<std::shared_ptr<managed<geo_bounds*>>>::iterator it_;
+    };
+
+    iterator begin();
+    iterator end();
+
+    // Subscript access with assignment support
+    element_proxy operator[](size_t index);
+
+    // Const subscript access (read-only, returns copy)
+    geo_bounds operator[](size_t index) const;
+
+private:
+    friend class element_proxy;
+    void load_if_needed() const;
+};
+
 template <typename T>
 struct is_vector {
     static bool const value = false;

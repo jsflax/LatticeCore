@@ -8,7 +8,11 @@ struct _defer {
     ~_defer() { fn(); }
 };
 
-#define defer(fn, ...) _defer _scope_exit_##__LINE__(fn, __VA_ARGS__);
+#define CONCAT(a, b) CONCAT_INNER(a, b)
+#define CONCAT_INNER(a, b) a ## b
+
+
+#define defer(...) _defer CONCAT(scope_exit_, __LINE__)(__VA_ARGS__)
 
 
 #endif

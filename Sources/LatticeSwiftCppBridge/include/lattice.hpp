@@ -25,6 +25,10 @@ void releaseSwiftLatticeRef(lattice::swift_lattice_ref*);
 void retainSwiftMigrationContextRef(lattice::swift_migration_context_ref*);
 void releaseSwiftMigrationContextRef(lattice::swift_migration_context_ref*);
 
+// Log level control
+void lattice_set_log_level(lattice::log_level level);
+lattice::log_level lattice_get_log_level();
+
 namespace lattice {
 
 // ============================================================================
@@ -422,9 +426,10 @@ public:
         OptionalString where_clause = std::nullopt,
         OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt,
-        OptionalInt64 offset = std::nullopt) {
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt) {
 
-        auto rows = query_rows(table_name, where_clause, order_by, limit, offset);
+        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by);
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
 
@@ -474,8 +479,10 @@ public:
         return results;
     }
     
-    size_t count(const std::string& table_name, OptionalString where_clause = std::nullopt) {
-        return lattice_db::count(table_name, where_clause);
+    size_t count(const std::string& table_name,
+                 OptionalString where_clause = std::nullopt,
+                 OptionalString group_by = std::nullopt) {
+        return lattice_db::count(table_name, where_clause, group_by);
     }
 
     bool delete_where(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt) {
@@ -645,8 +652,9 @@ public:
         OptionalString where_clause = std::nullopt,
         OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt,
-        OptionalInt64 offset = std::nullopt)
-        SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:)) {
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt)
+        SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
 
         // Build spatial query SQL using R*Tree
         std::string list_table = "_" + table_name + "_" + geo_column;
@@ -679,6 +687,11 @@ public:
         // Add additional where clause if provided
         if (where_clause.has_value() && !where_clause.value().empty()) {
             sql += " AND (" + where_clause.value() + ")";
+        }
+
+        // Add group by if provided
+        if (group_by.has_value() && !group_by.value().empty()) {
+            sql += " GROUP BY " + group_by.value();
         }
 
         // Add order by if provided
@@ -977,8 +990,9 @@ public:
         const GeoConstraintVector& geos,
         OptionalString where_clause,
         const sort_descriptor& sort,
-        int64_t limit)
-        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:where:sort:limit:)) {
+        int64_t limit,
+        OptionalString group_by = std::nullopt)
+        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:where:sort:limit:groupBy:)) {
 
         // Constants for geo calculations
         constexpr double METERS_PER_DEGREE = 111000.0;
@@ -1205,6 +1219,11 @@ public:
         // WHERE clause
         if (where_clause.has_value() && !where_clause.value().empty()) {
             sql << " WHERE " << where_clause.value();
+        }
+
+        // GROUP BY clause
+        if (group_by.has_value() && !group_by.value().empty()) {
+            sql << " GROUP BY " << group_by.value();
         }
 
         // ORDER BY clause (based on sort descriptor)

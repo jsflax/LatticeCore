@@ -1,5 +1,6 @@
 #pragma once
 
+#include "log.hpp"
 #include "types.hpp"
 #include "db.hpp"
 #include "schema.hpp"
@@ -443,31 +444,7 @@ public:
     /// ```
     void enumerate_objects(
         const std::string& table_name,
-        std::function<void(const migration_row& old_row, migration_row& new_row)> block
-    ) {
-        // Get all rows from the table
-        auto rows = db_.query("SELECT * FROM " + table_name);
-
-        for (const auto& old_row : rows) {
-            // Create new_row as a copy of old_row
-            migration_row new_row = old_row;
-
-            // Let user transform the data
-            block(old_row, new_row);
-
-            // Store transformed row for later application
-            // (will be applied after auto-migration adds new columns)
-            int64_t row_id = 0;
-            auto id_it = old_row.find("id");
-            if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
-                row_id = std::get<int64_t>(id_it->second);
-            }
-
-            if (row_id > 0) {
-                pending_updates_[table_name][row_id] = std::move(new_row);
-            }
-        }
-    }
+        std::function<void(const migration_row& old_row, migration_row& new_row)> block);
 
     /// Rename a property (copies old column value to new column name).
     /// Useful when renaming without type change.
@@ -539,8 +516,8 @@ public:
                         db_.execute(sql.str(), params);
                     } catch (const std::exception& e) {
                         // Log error but continue
-                        std::cerr << "Migration update failed for " << table_name
-                                  << " row " << row_id << ": " << e.what() << std::endl;
+                        LOG_ERROR("migration", "Update failed for %s row %lld: %s",
+                                  table_name.c_str(), (long long)row_id, e.what());
                     }
                 }
             }
@@ -1037,26 +1014,26 @@ public:
     /// Flush buffered changes and notify observers (called from WAL hook)
     /// Broadcasts to all instances sharing this database path
     void flush_changes() {
-        printf("[flush_changes] Called\n");
+        LOG_DEBUG("flush_changes", "Called");
         std::vector<std::tuple<std::string, std::string, int64_t, std::string>> changes;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
-            printf("[flush_changes] buffer_empty=%d is_flushing=%d\n", change_buffer_.empty(), is_flushing_);
+            LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
             if (change_buffer_.empty() || is_flushing_) return;
             is_flushing_ = true;
             changes = std::move(change_buffer_);
             change_buffer_.clear();
         }
 
-        printf("[flush_changes] Processing %zu changes\n", changes.size());
+        LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
         // Get all instances sharing this database path
         auto instances = instance_registry::instance().get_instances(config_.path);
-        printf("[flush_changes] Found %zu instances for path: %s\n", instances.size(), config_.path.c_str());
+        LOG_DEBUG("flush_changes", "Found %zu instances for path: %s", instances.size(), config_.path.c_str());
 
         // Notify observers on all instances for each buffered change
         for (const auto& [table, op, row_id, global_id] : changes) {
-            printf("[flush_changes] Notifying model change: table=%s op=%s\n", table.c_str(), op.c_str());
+            LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s", table.c_str(), op.c_str());
             for (auto* instance : instances) {
                 instance->notify_change(table, op, row_id, global_id);
             }
@@ -1068,7 +1045,7 @@ public:
             // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
             if (table == "AuditLog") continue;
 
-            printf("[flush_changes] Querying AuditLog for table=%s rowId=%lld op=%s\n", table.c_str(), (long long)row_id, op.c_str());
+            LOG_DEBUG("flush_changes", "Querying AuditLog for table=%s rowId=%lld op=%s", table.c_str(), (long long)row_id, op.c_str());
 
             // Query for AuditLog entry created by trigger for this model change
             auto audit_rows = read_db().query(
@@ -1076,7 +1053,7 @@ public:
                 {table, row_id, op}
             );
 
-            printf("[flush_changes] AuditLog query returned %zu rows\n", audit_rows.size());
+            LOG_DEBUG("flush_changes", "AuditLog query returned %zu rows", audit_rows.size());
 
             if (!audit_rows.empty()) {
                 const auto& row = audit_rows[0];
@@ -1088,7 +1065,7 @@ public:
                     int64_t audit_row_id = std::get<int64_t>(id_it->second);
                     std::string audit_global_id = std::get<std::string>(gid_it->second);
 
-                    printf("[flush_changes] Notifying AuditLog observers: rowId=%lld\n", (long long)audit_row_id);
+                    LOG_DEBUG("flush_changes", "Notifying AuditLog observers: rowId=%lld", (long long)audit_row_id);
 
                     // Notify AuditLog observers on all instances
                     for (auto* instance : instances) {
@@ -1096,7 +1073,7 @@ public:
                     }
                 }
             } else {
-                printf("[flush_changes] No AuditLog entry found!\n");
+                LOG_DEBUG("flush_changes", "No AuditLog entry found!");
             }
         }
 
@@ -1104,7 +1081,7 @@ public:
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             is_flushing_ = false;
         }
-        printf("[flush_changes] Done\n");
+        LOG_DEBUG("flush_changes", "Done");
     }
 
     // ========================================================================
@@ -1306,8 +1283,15 @@ public:
     }
 
     // Count rows in a table (with optional WHERE clause)
-    size_t count(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt) {
-        std::string sql = "SELECT COUNT(*) as cnt FROM " + table_name;
+    size_t count(const std::string& table_name,
+                 std::optional<std::string> where_clause = std::nullopt,
+                 std::optional<std::string> group_by = std::nullopt) {
+        std::string sql;
+        if (group_by.has_value()) {
+            sql = "SELECT COUNT(DISTINCT " + *group_by + ") as cnt FROM " + table_name;
+        } else {
+            sql = "SELECT COUNT(*) as cnt FROM " + table_name;
+        }
         if (where_clause.has_value()) {
             sql += " WHERE " + *where_clause;
         }
@@ -1470,12 +1454,16 @@ public:
         std::optional<std::string> where_clause = std::nullopt,
         std::optional<std::string> order_by = std::nullopt,
         std::optional<int64_t> limit = std::nullopt,
-        std::optional<int64_t> offset = std::nullopt) {
+        std::optional<int64_t> offset = std::nullopt,
+        std::optional<std::string> group_by = std::nullopt) {
 
         std::ostringstream sql;
         sql << "SELECT * FROM " << table_name;
         if (where_clause && !where_clause->empty()) {
             sql << " WHERE " << *where_clause;
+        }
+        if (group_by && !group_by->empty()) {
+            sql << " GROUP BY " << *group_by;
         }
         if (order_by && !order_by->empty()) {
             sql << " ORDER BY " << *order_by;
@@ -1745,18 +1733,21 @@ public:
         std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
         auto results = db_->query(check_sql, {rtree_table});
         if (!results.empty()) {
-            return;  // Already exists
+            // Table already exists - triggers keep it in sync, no repopulation needed
+            return;
         }
 
-        // Create R*Tree virtual table
+        // Create R*Tree virtual table (if it doesn't exist)
         // Uses row id for joining back to main table
-        std::ostringstream sql;
-        sql << "CREATE VIRTUAL TABLE " << rtree_table << " USING rtree("
-            << "id, "           // Matches main table id
-            << "minLat, maxLat, "
-            << "minLon, maxLon"
-            << ")";
-        db_->execute(sql.str());
+        if (!db_->table_exists(rtree_table)) {
+            std::ostringstream sql;
+            sql << "CREATE VIRTUAL TABLE " << rtree_table << " USING rtree("
+                << "id, "           // Matches main table id
+                << "minLat, maxLat, "
+                << "minLon, maxLon"
+                << ")";
+            db_->execute(sql.str());
+        }
 
         // Column names in main table
         std::string minLat = column_name + "_minLat";
@@ -1799,6 +1790,43 @@ public:
                        << "DELETE FROM " << rtree_table << " WHERE id = OLD.id; "
                        << "END";
         db_->execute(delete_trigger.str());
+
+        // Populate rtree from existing data (for migration scenarios)
+        repopulate_geo_bounds_rtree(model_table, column_name);
+    }
+
+    /// Repopulate an rtree table from the main table data.
+    /// Clears and repopulates to ensure correct values after migration.
+    void repopulate_geo_bounds_rtree(const std::string& model_table,
+                                     const std::string& column_name) {
+        std::string rtree_table = "_" + model_table + "_" + column_name + "_rtree";
+        std::string minLat = column_name + "_minLat";
+        std::string maxLat = column_name + "_maxLat";
+        std::string minLon = column_name + "_minLon";
+        std::string maxLon = column_name + "_maxLon";
+
+        // Clear existing rtree data
+        db_->execute("DELETE FROM " + rtree_table);
+
+        // Repopulate from main table
+        std::ostringstream populate_sql;
+        populate_sql << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
+                     << "SELECT id, " << minLat << ", " << maxLat << ", " << minLon << ", " << maxLon << " "
+                     << "FROM " << model_table << " "
+                     << "WHERE " << minLat << " IS NOT NULL";
+        db_->execute(populate_sql.str());
+    }
+
+    /// Ensure all geo_bounds rtree tables exist for a set of model schemas.
+    /// Call this AFTER migration data has been applied to ensure rtrees contain correct data.
+    void ensure_geo_bounds_rtrees(const std::vector<model_schema>& schemas) {
+        for (const auto& schema : schemas) {
+            for (const auto& prop : schema.properties) {
+                if (prop.is_geo_bounds && prop.kind != property_kind::list) {
+                    ensure_rtree_table(schema.table_name, prop.name);
+                }
+            }
+        }
     }
 
     /// Ensure a geo_bounds list table exists with its R*Tree.
@@ -1840,14 +1868,16 @@ public:
             list_table + "_parent ON " + list_table + "(parent_id)";
         db_->execute(idx_sql);
 
-        // Create R*Tree virtual table for spatial indexing
-        std::ostringstream rtree_sql;
-        rtree_sql << "CREATE VIRTUAL TABLE " << rtree_table << " USING rtree("
-                  << "id, "  // Matches list table id
-                  << "minLat, maxLat, "
-                  << "minLon, maxLon"
-                  << ")";
-        db_->execute(rtree_sql.str());
+        // Create R*Tree virtual table for spatial indexing (if it doesn't exist)
+        if (!db_->table_exists(rtree_table)) {
+            std::ostringstream rtree_sql;
+            rtree_sql << "CREATE VIRTUAL TABLE " << rtree_table << " USING rtree("
+                      << "id, "  // Matches list table id
+                      << "minLat, maxLat, "
+                      << "minLon, maxLon"
+                      << ")";
+            db_->execute(rtree_sql.str());
+        }
 
         // Create triggers to keep R*Tree in sync with list table
         // INSERT trigger
@@ -2182,6 +2212,10 @@ private:
         std::vector<std::pair<std::string, column_type>> columns;
 
         for (const auto& prop : schema.properties) {
+            // Skip list properties - they use separate tables (link_list, geo_bounds_list)
+            if (prop.kind == property_kind::list) {
+                continue;
+            }
             if (prop.is_geo_bounds) {
                 // geo_bounds expands to 4 REAL columns
                 sql << ", " << prop.name << "_minLat REAL";
@@ -2242,11 +2276,15 @@ private:
         auto existing = db_->get_table_info(schema.table_name);
 
         // Build model schema map: column_name -> SQL_TYPE
-        // geo_bounds properties expand to 4 columns
+        // geo_bounds properties expand to 4 columns (but not geo_bounds lists)
         std::unordered_map<std::string, std::string> model_cols;
         model_cols["id"] = "INTEGER";
         model_cols["globalId"] = "TEXT";
         for (const auto& prop : schema.properties) {
+            // Skip list properties - they use separate tables (link_list, geo_bounds_list)
+            if (prop.kind == property_kind::list) {
+                continue;
+            }
             if (prop.is_geo_bounds) {
                 model_cols[prop.name + "_minLat"] = "REAL";
                 model_cols[prop.name + "_maxLat"] = "REAL";
@@ -2278,14 +2316,11 @@ private:
 
         // No changes needed
         if (added.empty() && removed.empty() && changed.empty()) {
-            // Still ensure R*Tree/list tables exist for geo_bounds
+            // Still ensure geo_bounds LIST tables exist (they're separate join tables)
+            // Single geo_bounds rtrees are created in Phase 6 after all migrations
             for (const auto& prop : schema.properties) {
-                if (prop.is_geo_bounds) {
-                    if (prop.kind == property_kind::list) {
-                        ensure_geo_bounds_list_table(schema.table_name, prop.name);
-                    } else {
-                        ensure_rtree_table(schema.table_name, prop.name);
-                    }
+                if (prop.is_geo_bounds && prop.kind == property_kind::list) {
+                    ensure_geo_bounds_list_table(schema.table_name, prop.name);
                 }
             }
             return;
@@ -2341,17 +2376,16 @@ private:
             }
         }
 
-        // Ensure R*Tree/list tables exist for geo_bounds properties
-        // (always run - covers both newly added and existing geo_bounds)
+        // Ensure geo_bounds LIST tables exist (these are separate join tables, not affected by migration timing)
         for (const auto& prop : schema.properties) {
-            if (prop.is_geo_bounds) {
-                if (prop.kind == property_kind::list) {
-                    ensure_geo_bounds_list_table(schema.table_name, prop.name);
-                } else if (geo_bounds_added) {
-                    ensure_rtree_table(schema.table_name, prop.name);
-                }
+            if (prop.is_geo_bounds && prop.kind == property_kind::list) {
+                ensure_geo_bounds_list_table(schema.table_name, prop.name);
             }
         }
+
+        // NOTE: rtree creation for single geo_bounds properties is deferred.
+        // During migration, columns are added first, then data is updated via apply_pending_updates(),
+        // and finally ensure_geo_bounds_rtrees() is called to create rtree tables with correct data.
 
         // If columns were removed or changed type, need to rebuild the table
         // (DROP COLUMN has limitations in SQLite, so always use rebuild for safety)
@@ -2411,6 +2445,10 @@ private:
         src_exprs.push_back("globalId");
 
         for (const auto& prop : schema.properties) {
+            // Skip list properties - they use separate tables (link_list, geo_bounds_list)
+            if (prop.kind == property_kind::list) {
+                continue;
+            }
             if (prop.is_geo_bounds) {
                 // geo_bounds expands to 4 columns
                 std::array<std::string, 4> suffixes = {"_minLat", "_maxLat", "_minLon", "_maxLon"};
@@ -2453,6 +2491,24 @@ private:
 
         // 5. Drop old table
         db_->execute("DROP TABLE " + tmp);
+
+        // 6. Populate rtree tables for geo_bounds properties (data now exists)
+        for (const auto& prop : schema.properties) {
+            if (prop.is_geo_bounds && prop.kind != property_kind::list) {
+                std::string rtree_table = "_" + table + "_" + prop.name + "_rtree";
+                std::string minLat = prop.name + "_minLat";
+                std::string maxLat = prop.name + "_maxLat";
+                std::string minLon = prop.name + "_minLon";
+                std::string maxLon = prop.name + "_maxLon";
+
+                std::ostringstream populate_sql;
+                populate_sql << "INSERT OR IGNORE INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
+                             << "SELECT id, " << minLat << ", " << maxLat << ", " << minLon << ", " << maxLon << " "
+                             << "FROM " << table << " "
+                             << "WHERE " << minLat << " IS NOT NULL";
+                db_->execute(populate_sql.str());
+            }
+        }
     }
 
     void ensure_link_tables() {

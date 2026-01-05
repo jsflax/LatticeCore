@@ -1,7 +1,7 @@
 #include "lattice/db.hpp"
+#include "lattice/log.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
-#include <iostream>
 
 namespace lattice {
 
@@ -64,6 +64,7 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
 
 database::~database() {
     if (db_) {
+        sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
         sqlite3_close(db_);
     }
 }
@@ -307,7 +308,7 @@ primary_key_t database::insert(const std::string& table,
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.str().c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        std::cout<<"Failed to prepare insert: " + std::string(sqlite3_errmsg(db_))<<std::endl;
+        LOG_ERROR("db", "Failed to prepare insert: %s", sqlite3_errmsg(db_));
         throw db_error("Failed to prepare insert: " + std::string(sqlite3_errmsg(db_)));
     }
 
@@ -321,7 +322,7 @@ primary_key_t database::insert(const std::string& table,
 
     if (rc != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));
-        std::cout<<"Insert failed: " + err<<std::endl;
+        LOG_ERROR("db", "Insert failed: %s", err.c_str());
         throw db_error("Insert failed: " + err);
     }
 
@@ -389,7 +390,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        std::cerr<<std::string(sqlite3_errmsg(db_))<<" in "<<sql<<std::endl;
+        LOG_ERROR("db", "%s in %s", sqlite3_errmsg(db_), sql.c_str());
         throw db_error("Failed to prepare query: " + std::string(sqlite3_errmsg(db_)));
     }
 

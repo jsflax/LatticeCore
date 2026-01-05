@@ -12,6 +12,7 @@
 
 namespace lattice {
     class dynamic_object_ref;
+    class geo_bounds_list_ref;
 }
 // Forward declarations for Swift shared reference
 void retainDynamicObjectRef(lattice::dynamic_object_ref* p);
@@ -130,7 +131,8 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     dynamic_object get_object(const std::string& name) const SWIFT_NAME(getObject(named:)) SWIFT_RETURNS_INDEPENDENT_VALUE;
     
     link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:));
-    
+    geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:));
+
     template <typename T>
     void set_field(const std::string& name, const T& value) {
         if (lattice) {
@@ -199,22 +201,6 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
         }
     }
 
-    // geo_bounds list accessors
-    std::vector<geo_bounds> get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) {
-        if (lattice) {
-            return managed_.get_geo_bounds_list(name);
-        } else {
-            return unmanaged_.get_geo_bounds_list(name);
-        }
-    }
-
-    size_t geo_bounds_list_size(const std::string& name) const SWIFT_NAME(geoBoundsListSize(named:)) {
-        if (lattice) {
-            return managed_.geo_bounds_list_size(name);
-        } else {
-            return unmanaged_.geo_bounds_list_size(name);
-        }
-    }
 
     geo_bounds get_geo_bounds_at(const std::string& name, size_t index) const SWIFT_NAME(getGeoBounds(named:at:)) {
         if (lattice) {
@@ -385,6 +371,10 @@ public:
         return impl_->get_link_list(name);
     }
 
+    geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) {
+        return impl_->get_geo_bounds_list(name);
+    }
+
     // geo_bounds accessors
     geo_bounds get_geo_bounds(const std::string& name) const SWIFT_NAME(getGeoBounds(named:)) {
         return impl_->get_geo_bounds(name);
@@ -402,26 +392,6 @@ public:
         return impl_->has_geo_bounds(name);
     }
 
-    // geo_bounds list accessors
-    std::vector<geo_bounds> get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) {
-        return impl_->get_geo_bounds_list(name);
-    }
-
-    size_t geo_bounds_list_size(const std::string& name) const SWIFT_NAME(geoBoundsListSize(named:)) {
-        return impl_->geo_bounds_list_size(name);
-    }
-
-    geo_bounds get_geo_bounds_at(const std::string& name, size_t index) const SWIFT_NAME(getGeoBounds(named:at:)) {
-        return impl_->get_geo_bounds_at(name, index);
-    }
-
-    void add_geo_bounds(const std::string& name, const geo_bounds& value) SWIFT_NAME(addGeoBounds(named:_:)) {
-        impl_->add_geo_bounds(name, value);
-    }
-
-    void clear_geo_bounds_list(const std::string& name) SWIFT_NAME(clearGeoBoundsList(named:)) {
-        impl_->clear_geo_bounds_list(name);
-    }
 
     void remove_geo_bounds_at(const std::string& name, size_t index) SWIFT_NAME(removeGeoBounds(named:at:)) {
         impl_->remove_geo_bounds_at(name, index);

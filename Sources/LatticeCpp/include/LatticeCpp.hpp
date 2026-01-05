@@ -25,6 +25,7 @@
 //       }
 //   }
 
+#include "lattice/log.hpp"
 #include "lattice/types.hpp"
 #include "lattice/db.hpp"
 #include "lattice/managed.hpp"

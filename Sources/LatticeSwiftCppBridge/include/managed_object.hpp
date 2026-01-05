@@ -74,7 +74,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         //        return source;
     }
     void setPointee(Wrapped src) SWIFT_COMPUTED_PROPERTY {
-        printf("SETTING POINTEE\n");
+        LOG_DEBUG("managed_object", "SETTING POINTEE");
         source = src.source;
         source.setPointee(src.source);
         table_name_ = src.table_name_;

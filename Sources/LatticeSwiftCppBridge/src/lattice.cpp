@@ -2,7 +2,17 @@
 #include <list.hpp>
 #include <unmanaged_object.hpp>
 #include <dynamic_object.hpp>
+#include <geo_bounds.hpp>
 #include <util.hpp>
+
+// Log level control
+void lattice_set_log_level(lattice::log_level level) {
+    lattice::set_log_level(level);
+}
+
+lattice::log_level lattice_get_log_level() {
+    return lattice::get_log_level();
+}
 
 // swift_lattice_ref retain/release for SWIFT_SHARED_REFERENCE
 // The ref counting is managed by swift_lattice_ref's atomic counter
@@ -83,6 +93,22 @@ link_list_ref* dynamic_object::get_link_list(const std::string &name) const {
         // Unmanaged: list_values in swift_dynamic_object is the source of truth
         // TODO: Consider if link_list_ref should extend lifetime of swift_dynamic_object
         return link_list_ref::wrap(unmanaged_.get_link_list(name));
+    }
+}
+
+geo_bounds_list_ref* dynamic_object::get_geo_bounds_list(const std::string &name) const {
+    if (lattice) {
+        // Create a fresh managed vector bound to this object's property
+        managed<std::vector<geo_bounds*>> m;
+        const property_descriptor& property = managed_.properties_.at(name);
+        model_base* base = const_cast<model_base*>(static_cast<const model_base*>(&managed_));
+        m.bind_to_parent(base, property);
+        // Return an owning geo_bounds_list_ref
+        return geo_bounds_list_ref::create(m);
+    } else {
+        // Unmanaged: return empty list for now
+        // TODO: Add geo_bounds list support to unmanaged objects
+        return geo_bounds_list_ref::create();
     }
 }
 
@@ -203,6 +229,10 @@ std::optional<managed<swift_dynamic_object>> swift_lattice::object(int64_t prima
 }
 
 void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
+    auto transaction = lattice::transaction(this->db());
+    defer([&transaction] {
+        transaction.commit();
+    });
     // Build model_schema list and identify new vs existing tables
     // Note: Don't update schemas_ yet - we need old schemas for migration
     std::vector<model_schema> all_schemas;
@@ -264,9 +294,18 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
             // Query all rows and migrate them
             auto rows = db().query("SELECT id FROM " + table_name);
+            LOG_INFO("swift_lattice", "migrating %zu rows for table %s", rows.size(), table_name.c_str());
+            size_t migration_count = 0;
+            size_t total = rows.size();
             for (const auto& row : rows) {
+                defer([&migration_count, total, &table_name]() {
+                    migration_count += 1;
+                    if (migration_count % 100 == 0 || migration_count == total) {
+                        LOG_INFO("swift_lattice", "migrated %zu/%zu for %s", migration_count, total, table_name.c_str());
+                    }
+                });
                 int64_t row_id = std::get<int64_t>(row.at("id"));
-
+                
                 // Hydrate with OLD schema
                 auto obj_opt = this->object(row_id, table_name);
                 if (!obj_opt) continue;
@@ -384,7 +423,12 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         }
     }
 
-    // Phase 6: Create UNIQUE indexes for constraints
+    // Phase 6: Ensure geo_bounds rtree tables exist with correct data
+    // This is called AFTER all migration updates are applied, so rtrees are created
+    // with the correct (migrated) data rather than default values.
+    ensure_geo_bounds_rtrees(all_schemas);
+
+    // Phase 7: Create UNIQUE indexes for constraints
     for (const auto& entry : schemas) {
         for (size_t i = 0; i < entry.constraints.size(); ++i) {
             const auto& constraint = entry.constraints[i];
@@ -455,4 +499,29 @@ bool lattice::swift_lattice::remove(dynamic_object_ref* obj) {
 
 void lattice::swift_lattice::attach(swift_lattice &lattice) {
     lattice_db::attach(lattice);
+}
+
+void lattice::migration_context::enumerate_objects(const std::string &table_name, std::function<void (const migration_row &, migration_row &)> block) {
+    // Get all rows from the table
+    auto rows = db_.query("SELECT * FROM " + table_name);
+    LOG_INFO("migration_context", "migrating %zu rows for table %s", rows.size(), table_name.c_str());
+    for (const auto& old_row : rows) {
+        // Create new_row as a copy of old_row
+        migration_row new_row = old_row;
+
+        // Let user transform the data
+        block(old_row, new_row);
+
+        // Store transformed row for later application
+        // (will be applied after auto-migration adds new columns)
+        int64_t row_id = 0;
+        auto id_it = old_row.find("id");
+        if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
+            row_id = std::get<int64_t>(id_it->second);
+        }
+
+        if (row_id > 0) {
+            pending_updates_[table_name][row_id] = std::move(new_row);
+        }
+    }
 }

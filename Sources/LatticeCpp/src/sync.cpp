@@ -499,7 +499,7 @@ synchronizer::synchronizer(lattice_db& db, const sync_config& config,
     // Observe AuditLog for new local changes to trigger upload
     audit_log_observer_id_ = db_.add_table_observer("AuditLog",
         [this](const std::string& operation, int64_t row_id, const std::string& global_id) {
-            printf("[synchronizer] AuditLog observer: op=%s row_id=%lld is_connected=%d\n",
+            LOG_DEBUG("synchronizer", "AuditLog observer: op=%s row_id=%lld is_connected=%d",
                    operation.c_str(), (long long)row_id, is_connected_ ? 1 : 0);
             // Only upload on INSERT of local (non-remote) entries
             if (operation == "INSERT" && is_connected_) {
@@ -508,7 +508,7 @@ synchronizer::synchronizer(lattice_db& db, const sync_config& config,
                     "SELECT isFromRemote, isSynchronized FROM AuditLog WHERE id = ?",
                     {row_id}
                 );
-                printf("[synchronizer] AuditLog query returned %zu rows\n", rows.size());
+                LOG_DEBUG("synchronizer", "AuditLog query returned %zu rows", rows.size());
                 if (!rows.empty()) {
                     auto from_remote_it = rows[0].find("isFromRemote");
                     auto synced_it = rows[0].find("isSynchronized");
@@ -519,12 +519,12 @@ synchronizer::synchronizer(lattice_db& db, const sync_config& config,
                         std::holds_alternative<int64_t>(synced_it->second) &&
                         std::get<int64_t>(synced_it->second) != 0;
 
-                    printf("[synchronizer] AuditLog entry: isFromRemote=%d isSynchronized=%d\n",
+                    LOG_DEBUG("synchronizer", "AuditLog entry: isFromRemote=%d isSynchronized=%d",
                            is_from_remote ? 1 : 0, is_synced ? 1 : 0);
 
                     // Only upload if this is a new local entry
                     if (!is_from_remote && !is_synced) {
-                        printf("[synchronizer] Triggering upload for local entry\n");
+                        LOG_DEBUG("synchronizer", "Triggering upload for local entry");
                         upload_pending_changes();
                     }
                 }
@@ -576,7 +576,7 @@ void synchronizer::sync_now() {
 }
 
 void synchronizer::on_websocket_open() {
-    printf("[synchronizer] on_websocket_open called\n");
+    LOG_DEBUG("synchronizer", "on_websocket_open called");
     is_connected_ = true;
     reconnect_attempts_ = 0;
 
@@ -585,7 +585,7 @@ void synchronizer::on_websocket_open() {
     }
 
     // Upload any pending changes
-    printf("[synchronizer] Calling upload_pending_changes...\n");
+    LOG_DEBUG("synchronizer", "Calling upload_pending_changes...");
     upload_pending_changes();
 }
 
@@ -645,11 +645,11 @@ void synchronizer::on_websocket_close(int code, const std::string& reason) {
 }
 
 void synchronizer::upload_pending_changes() {
-    printf("[synchronizer] upload_pending_changes called\n");
+    LOG_DEBUG("synchronizer", "upload_pending_changes called");
     // Query unsynced audit log entries
     auto entries = query_audit_log(db_.db(), true);
 
-    printf("[synchronizer] Found %zu unsynced entries\n", entries.size());
+    LOG_DEBUG("synchronizer", "Found %zu unsynced entries", entries.size());
     if (entries.empty()) return;
 
     // Chunk into batches
@@ -659,7 +659,7 @@ void synchronizer::upload_pending_changes() {
 
         auto event = server_sent_event::make_audit_log(chunk);
         auto json = event.to_json();
-        printf("[synchronizer] Sending %zu entries to server: %s\n", chunk.size(), json.substr(0, 200).c_str());
+        LOG_DEBUG("synchronizer", "Sending %zu entries to server: %s", chunk.size(), json.substr(0, 200).c_str());
         ws_client_->send(websocket_message::from_binary({json.begin(), json.end()}));
     }
 }

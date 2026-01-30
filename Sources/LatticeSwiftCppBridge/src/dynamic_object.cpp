@@ -174,16 +174,13 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
 // Implement retain/release for Swift shared reference
 void retainDynamicObjectRef(lattice::dynamic_object_ref* p) {
     if (p) {
-//        std::cout << "RETAIN " << p << " count: " << p->ref_count_ << " -> " << (p->ref_count_ + 1) << std::endl;
         p->retain();
     }
 }
 
 void releaseDynamicObjectRef(lattice::dynamic_object_ref* p) {
-    if (p ) {
-//        std::cout << "RELEASE " << p << " count: " << p->ref_count_ << " -> " << (p->ref_count_ - 1) << std::endl;
+    if (p) {
         if (p->release()) {
-//            std::cout << "DELETE " << p << std::endl;
             delete p;
         }
     }

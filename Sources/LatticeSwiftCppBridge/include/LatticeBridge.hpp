@@ -27,13 +27,6 @@ type get_##name(const std::string& name) const SWIFT_NAME(get_##name(named:)) { 
     return get_field<type>(name); \
 }
 
-
-//void assign_managed(managed<swift_dynamic_object> object,
-//                    std::string name,
-//                    managed_base* managed) {
-//    object.assign_managed(name, managed);
-//}
-
 // Type aliases for Swift C++ interop
 
 using ManagedString = managed<std::string>;

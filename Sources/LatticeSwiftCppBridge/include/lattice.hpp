@@ -294,16 +294,6 @@ private:
 // Internal implementation - inherits from lattice_db
 class swift_lattice : public lattice_db {
 public:
-    // Construct with path (uses default scheduler, no sync)
-//    explicit swift_lattice(const std::string& path)
-//        : lattice_db(path) {
-//    }
-//
-//    // Construct in-memory (uses default scheduler, no sync)
-//    swift_lattice()
-//        : lattice_db() {
-//    }
-
     // Construct with full configuration (including optional sync)
     explicit swift_lattice(swift_configuration&& config)
         : lattice_db(config),
@@ -353,6 +343,10 @@ public:
         return {};
     }
 
+    std::string path_copy() const {
+        return swift_config_.path;
+    }
+    
 private:
     // Stored schemas for hydration
     std::unordered_map<std::string, SwiftSchema> schemas_;
@@ -366,24 +360,6 @@ private:
 public:
     // Add with schema from the object instance
     void add(dynamic_object& obj);
-    
-    // Add with schema from the object instance
-    managed<swift_dynamic_object> add(swift_dynamic_object&& obj) {
-//        auto unmanaged_links = obj.unmanaged_objects;
-//        auto managed_links = obj.managed_objects;
-//        
-//        const managed<swift_dynamic_object> object = lattice_db::add(std::move(obj), obj.instance_schema());
-//        for (auto& [name, unmanaged_object] : unmanaged_links) {
-//            auto new_link = add(std::move(unmanaged_object));
-//            managed<swift_dynamic_object*> link = object.get_managed_field<swift_dynamic_object*>(name);
-//            link = &new_link;
-//        }
-//        for (auto& [name, managed_object] : managed_links) {
-//            managed<swift_dynamic_object*> link = object.get_managed_field<swift_dynamic_object*>(name);
-//            link = managed_object;
-//        }
-//        return object;
-    }
 
     void add_bulk(std::vector<dynamic_object>& objects);
     void add_bulk(std::vector<dynamic_object*>& objects);
@@ -1670,6 +1646,10 @@ public:
 
     int64_t hash_value() {
         return reinterpret_cast<intptr_t>(impl_.get());
+    }
+    
+    std::string path() const {
+        return impl_.get()->path();
     }
 private:
     swift_lattice_ref() = default;

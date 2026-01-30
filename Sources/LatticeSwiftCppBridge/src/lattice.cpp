@@ -475,7 +475,6 @@ bool lattice::swift_lattice::remove(dynamic_object &&obj) {
     if (!obj.lattice) return false;
     lattice_db::remove(obj.managed_, obj.managed_.table_name());
     obj.lattice = nullptr;
-    std::move(obj);
     return true;
 }
 

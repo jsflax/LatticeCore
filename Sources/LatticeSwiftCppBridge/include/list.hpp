@@ -1,6 +1,8 @@
 #ifndef list_hpp
 #define list_hpp
 
+#ifdef __cplusplus
+
 #include <bridging.hpp>
 #include <vector>
 #include <optional>
@@ -280,4 +282,7 @@ using optional_size_t = std::optional<size_t>;
 using vec_size_t = std::vector<size_t>;
 
 }
+
+#endif // __cplusplus
+
 #endif /* list_hpp */

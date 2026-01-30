@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <functional>
 #include <memory>
 #include <thread>
@@ -296,3 +298,5 @@ namespace default_scheduler {
 } // namespace default_scheduler
 
 } // namespace lattice
+
+#endif // __cplusplus

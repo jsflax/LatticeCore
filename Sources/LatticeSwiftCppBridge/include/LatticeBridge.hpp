@@ -1,6 +1,8 @@
 #ifndef LatticeBridge_hpp
 #define LatticeBridge_hpp
 
+#ifdef __cplusplus
+
 #include <lattice.hpp>
 
 namespace lattice {
@@ -102,5 +104,7 @@ class swift_lattice;
 class swift_lattice_ref;
 
 } // namespace lattice
+
+#endif // __cplusplus
 
 #endif /* LatticeBridge_hpp */

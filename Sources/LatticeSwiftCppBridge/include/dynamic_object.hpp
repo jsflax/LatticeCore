@@ -1,6 +1,8 @@
 #ifndef dynamic_object_hpp
 #define dynamic_object_hpp
 
+#ifdef __cplusplus
+
 #include <bridging.hpp>
 #include <string>
 #include <atomic>
@@ -424,5 +426,7 @@ private:
 } SWIFT_SHARED_REFERENCE(retainDynamicObjectRef, releaseDynamicObjectRef);
 
 }
+
+#endif // __cplusplus
 
 #endif /* dynamic_object.hpp */

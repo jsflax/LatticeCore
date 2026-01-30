@@ -1,6 +1,8 @@
 #ifndef unmanaged_object_hpp
 #define unmanaged_object_hpp
 
+#ifdef __cplusplus
+
 #include <bridging.hpp>
 #include <string>
 #include <unordered_map>
@@ -201,4 +203,7 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(LatticeSwiftModule.OptionalProtocol) swift_dyn
 };
 
 }
+
+#endif // __cplusplus
+
 #endif /* unmanaged_object_hpp */

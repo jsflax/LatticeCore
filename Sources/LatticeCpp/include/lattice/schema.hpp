@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include "types.hpp"
 #include <string>
 #include <vector>
@@ -371,3 +373,5 @@ namespace lattice { namespace detail {
     static ::lattice::schema_registrar<cls> _lattice_registrar_##cls { \
         ::lattice::managed<cls>::schema() \
     }
+
+#endif // __cplusplus

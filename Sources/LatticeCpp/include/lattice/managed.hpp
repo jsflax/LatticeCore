@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include "types.hpp"
 #include "db.hpp"
 #include "observation.hpp"
@@ -1761,3 +1763,5 @@ private:
 };
 
 } // namespace lattice
+
+#endif // __cplusplus

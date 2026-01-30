@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <vector>
 #include <string>
 #include <functional>
@@ -318,3 +320,5 @@ private:
 #endif // LATTICE_HAS_COROUTINES
 
 } // namespace lattice
+
+#endif // __cplusplus

@@ -1,6 +1,8 @@
 #ifndef util_hpp
 #define util_hpp
 
+#ifdef __cplusplus
+
 template <typename Fn>
 struct _defer {
     Fn fn;
@@ -14,5 +16,6 @@ struct _defer {
 
 #define defer(...) _defer CONCAT(scope_exit_, __LINE__)(__VA_ARGS__)
 
+#endif // __cplusplus
 
 #endif

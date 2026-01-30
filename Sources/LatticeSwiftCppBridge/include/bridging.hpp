@@ -7,6 +7,8 @@
 #ifndef SWIFT_BRIDGING_COMPAT_H
 #define SWIFT_BRIDGING_COMPAT_H
 
+#ifdef __cplusplus
+
 #if __has_include(<swift/bridging.hpp>)
     // Real Swift bridging available (Swift Package Manager build)
     #include <swift/bridging.hpp>
@@ -31,5 +33,7 @@
         #define SWIFT_RETURNS_INDEPENDENT_VALUE
     #endif
 #endif
+
+#endif // __cplusplus
 
 #endif // SWIFT_BRIDGING_COMPAT_H

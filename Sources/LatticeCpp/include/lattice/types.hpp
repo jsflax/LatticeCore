@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <cstdint>
 #include <string>
 #include <optional>
@@ -274,3 +276,5 @@ namespace detail {
 } // namespace detail
 
 } // namespace lattice
+
+#endif // __cplusplus

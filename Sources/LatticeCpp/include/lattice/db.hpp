@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include "types.hpp"
 #include <sqlite3.h>
 #include <stdexcept>
@@ -95,3 +97,5 @@ private:
 };
 
 } // namespace lattice
+
+#endif // __cplusplus

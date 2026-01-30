@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <LatticeCpp.hpp>
 #include <bridging.hpp>
 #include <concepts>
@@ -1701,3 +1703,5 @@ private:
 } // namespace lattice
 
 namespace swift_lattice = lattice;
+
+#endif // __cplusplus

@@ -1,6 +1,8 @@
 #ifndef geo_bounds_hpp
 #define geo_bounds_hpp
 
+#ifdef __cplusplus
+
 #include <LatticeCpp.hpp>
 #include <bridging.hpp>
 #include <vector>
@@ -315,5 +317,7 @@ private:
 } SWIFT_SHARED_REFERENCE(retainGeoBoundsListRef, releaseGeoBoundsListRef) SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxLinkListRef);
 
 }
+
+#endif // __cplusplus
 
 #endif

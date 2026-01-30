@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 // LatticeCpp - Cross-platform ORM with Sync
 //
 // Usage:
@@ -34,3 +36,5 @@
 #include "lattice/network.hpp"
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
+
+#endif // __cplusplus

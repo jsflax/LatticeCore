@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <string>
 #include <vector>
 #include <functional>
@@ -466,3 +468,5 @@ private:
 };
 
 } // namespace lattice
+
+#endif // __cplusplus

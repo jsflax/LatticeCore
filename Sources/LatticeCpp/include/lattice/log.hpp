@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include <cstdio>
 #include <atomic>
 
@@ -39,3 +41,5 @@ inline log_level get_log_level() {
 #define LOG_WARN(tag, fmt, ...)  LATTICE_LOG(lattice::log_level::warn, tag, fmt, ##__VA_ARGS__)
 #define LOG_INFO(tag, fmt, ...)  LATTICE_LOG(lattice::log_level::info, tag, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(tag, fmt, ...) LATTICE_LOG(lattice::log_level::debug, tag, fmt, ##__VA_ARGS__)
+
+#endif // __cplusplus

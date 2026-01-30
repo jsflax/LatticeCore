@@ -1,6 +1,8 @@
 #ifndef managed_object_hpp
 #define managed_object_hpp
 
+#ifdef __cplusplus
+
 #include <array>
 #include <bridging.hpp>
 #include <string>
@@ -390,5 +392,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     friend struct link_list;
 };
 }
+
+#endif // __cplusplus
 
 #endif /* Header_h */

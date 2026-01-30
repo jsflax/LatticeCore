@@ -1,5 +1,7 @@
 #pragma once
 
+#ifdef __cplusplus
+
 #include "types.hpp"
 #include "db.hpp"
 #include "network.hpp"
@@ -249,3 +251,5 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
 std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
 
 } // namespace lattice
+
+#endif // __cplusplus

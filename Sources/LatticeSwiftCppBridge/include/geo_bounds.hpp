@@ -70,16 +70,7 @@ public:
     // For SWIFT_SHARED_REFERENCE
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
-    
-    // Check if this is a managed (persisted) object
-//    bool is_managed() const {
-//        return impl_->lattice != nullptr;
-//    }
-//    
-//    swift_lattice_ref* lattice_ref() const {
-//        return impl_->lattice;
-//    }
-    
+
 private:
     geo_bounds_ref() = default;
 

@@ -22,7 +22,7 @@
 
 namespace lattice {
 
-// uuid_t serialization - stores as string
+// uuid_t serialization - stores as string (ADL works since uuid_t is in lattice namespace)
 inline void to_json(nlohmann::json& j, const uuid_t& u) {
     j = u.to_string();
 }
@@ -33,22 +33,28 @@ inline void from_json(const nlohmann::json& j, uuid_t& u) {
     }
 }
 
-// timestamp_t serialization - stores as double (seconds since epoch)
-inline void to_json(nlohmann::json& j, const timestamp_t& t) {
-    auto duration = t.time_since_epoch();
-    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-    j = static_cast<double>(millis) / 1000.0;
-}
-
-inline void from_json(const nlohmann::json& j, timestamp_t& t) {
-    if (j.is_number()) {
-        double seconds = j.get<double>();
-        auto millis = static_cast<int64_t>(seconds * 1000.0);
-        t = timestamp_t(std::chrono::milliseconds(millis));
-    }
-}
-
 } // namespace lattice
+
+// timestamp_t is std::chrono::time_point, so ADL won't find functions in lattice namespace.
+// Use nlohmann's adl_serializer specialization instead.
+namespace nlohmann {
+template <>
+struct adl_serializer<lattice::timestamp_t> {
+    static void to_json(json& j, const lattice::timestamp_t& t) {
+        auto duration = t.time_since_epoch();
+        auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+        j = static_cast<double>(millis) / 1000.0;
+    }
+
+    static void from_json(const json& j, lattice::timestamp_t& t) {
+        if (j.is_number()) {
+            double seconds = j.get<double>();
+            auto millis = static_cast<int64_t>(seconds * 1000.0);
+            t = lattice::timestamp_t(std::chrono::milliseconds(millis));
+        }
+    }
+};
+} // namespace nlohmann
 
 #if __has_include(<swift/bridging>)
 #include <swift/bridging>

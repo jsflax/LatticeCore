@@ -458,13 +458,26 @@ public:
     }
     
     size_t count(const std::string& table_name,
-                 OptionalString where_clause = std::nullopt,
-                 OptionalString group_by = std::nullopt) {
+                 OptionalString where_clause,
+                 OptionalString group_by) {
         return lattice_db::count(table_name, where_clause, group_by);
     }
 
-    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt) {
+    size_t count(const std::string& table_name,
+                 OptionalString where_clause) {
+        return lattice_db::count(table_name, where_clause, std::nullopt);
+    }
+
+    size_t count(const std::string& table_name) {
+        return lattice_db::count(table_name, std::nullopt, std::nullopt);
+    }
+
+    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause) {
         return lattice_db::delete_where(table_name, where_clause);
+    }
+
+    bool delete_where(const std::string& table_name) {
+        return lattice_db::delete_where(table_name, std::nullopt);
     }
 
     int64_t compact_audit_log() {
@@ -1631,8 +1644,11 @@ public:
     /// - new_row: should be filled with transformed data
     static swift_lattice_ref* create(const swift_configuration& config, const SchemaVector& schemas)
         SWIFT_NAME(create(swiftConfig:schemas:)) {
+        // std::cerr << "[DEBUG] swift_lattice_ref::create() start" << std::endl;
         auto ref = new swift_lattice_ref();
+        // std::cerr << "[DEBUG] swift_lattice_ref::create() calling get_or_create_shared" << std::endl;
         ref->impl_ = get_or_create_shared(config, schemas);
+        // std::cerr << "[DEBUG] swift_lattice_ref::create() done, returning ref" << std::endl;
         return ref;
     }
 

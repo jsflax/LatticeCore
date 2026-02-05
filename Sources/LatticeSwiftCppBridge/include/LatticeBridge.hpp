@@ -52,7 +52,7 @@ using ManagedListFloat = managed<std::vector<float>>;
 
 using ManagedTimestamp = managed<timestamp_t>;
 using ManagedOptionalTimestamp = managed<std::optional<timestamp_t>>;
-using ManagedListTimestamp = managed<std::optional<timestamp_t>>;
+using ManagedListTimestamp = managed<std::vector<timestamp_t>>;
 
 using ManagedData = managed<ByteVector>;
 using ManagedOptionalData = managed<std::optional<ByteVector>>;

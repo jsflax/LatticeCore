@@ -2,19 +2,32 @@
 #include "lattice/log.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
+#include <iostream>
+#include <thread>
+#include <chrono>
 
 namespace lattice {
 
 database::database(const std::string& path, open_mode mode) : path_(path), mode_(mode) {
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
-    if (mode == open_mode::read_only) {
+    int rc;
+
+    if (mode == open_mode::read_only_immutable) {
+        // Use URI mode with immutable=1 for truly immutable databases.
+        // This tells SQLite to skip WAL/journal file checks, which is required
+        // for bundled databases in app resources where -wal/-shm files don't exist.
+        flags |= SQLITE_OPEN_READONLY | SQLITE_OPEN_URI;
+        std::string uri = "file:" + path + "?immutable=1";
+        rc = sqlite3_open_v2(uri.c_str(), &db_, flags, nullptr);
+    } else if (mode == open_mode::read_only) {
+        // Regular read-only for WAL concurrent readers (no immutable flag)
         flags |= SQLITE_OPEN_READONLY;
+        rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     } else {
         flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+        rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
-
-    int rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     if (rc != SQLITE_OK) {
         std::string error = sqlite3_errmsg(db_);
         sqlite3_close(db_);
@@ -64,7 +77,9 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
 
 database::~database() {
     if (db_) {
-        sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        if (mode_ == open_mode::read_write) {
+            sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        }
         sqlite3_close(db_);
     }
 }
@@ -391,6 +406,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         LOG_ERROR("db", "%s in %s", sqlite3_errmsg(db_), sql.c_str());
+        std::cerr<<"db: "<<sqlite3_errmsg(db_)<<" "<<sql.c_str()<<std::endl;
         throw db_error("Failed to prepare query: " + std::string(sqlite3_errmsg(db_)));
     }
 
@@ -426,14 +442,24 @@ void database::begin_transaction() {
     // This prevents deadlocks when multiple connections try to upgrade from read to write
     int rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
 
-    // Retry on SQLITE_BUSY or SQLITE_LOCKED
-    while (rc != SQLITE_OK) {
-        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-            // Database is busy, retry
-            rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
-        } else {
-            throw db_error("Failed to begin transaction: " + std::string(sqlite3_errmsg(db_)));
-        }
+    // Retry with exponential backoff for SQLITE_BUSY and SQLITE_LOCKED
+    // Note: sqlite3_busy_timeout handles some SQLITE_BUSY cases, but SQLITE_LOCKED
+    // (table-level locks) requires manual retry. We handle both for robustness.
+    int backoff_ms = 1;
+    const int max_backoff_ms = 1000;
+    const int max_total_wait_ms = 30000;  // 30 seconds total
+    int total_waited_ms = 0;
+
+    while ((rc == SQLITE_BUSY || rc == SQLITE_LOCKED) && total_waited_ms < max_total_wait_ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        total_waited_ms += backoff_ms;
+        backoff_ms = std::min(backoff_ms * 2, max_backoff_ms);  // Exponential backoff, capped
+        rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+    }
+
+    if (rc != SQLITE_OK) {
+        auto error = std::string(sqlite3_errmsg(db_));
+        throw db_error("Failed to begin transaction: " + error);
     }
 }
 

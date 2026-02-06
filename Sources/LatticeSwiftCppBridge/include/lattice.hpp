@@ -1494,10 +1494,12 @@ namespace detail {
         std::string path;
         std::shared_ptr<scheduler> sched;
         std::string websocket_url;  // Include sync config in cache key
+        std::string schema_hash;    // Hash of table names to detect schema changes
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if (path != other.path) return path < other.path;
             if (websocket_url != other.websocket_url) return websocket_url < other.websocket_url;
+            if (schema_hash != other.schema_hash) return schema_hash < other.schema_hash;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -1509,6 +1511,7 @@ namespace detail {
         bool operator==(const LatticeRefCacheKey& other) const {
             if (path != other.path) return false;
             if (websocket_url != other.websocket_url) return false;
+            if (schema_hash != other.schema_hash) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -1526,17 +1529,62 @@ namespace detail {
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
             std::lock_guard<std::mutex> lock(mutex_);
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url};
-
-            // Find existing entry
-            for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
-                if (it->first == key) {
-                    if (auto existing = it->second.lock()) {
-                        return existing;
+            // Build schema hash from table names and properties (sorted for consistency)
+            std::string schema_hash;
+            {
+                std::vector<std::string> schema_strings;
+                schema_strings.reserve(schemas.size());
+                for (const auto& s : schemas) {
+                    std::string entry = s.table_name + "{";
+                    // Collect property names
+                    std::vector<std::string> prop_names;
+                    for (const auto& [name, _] : s.properties) {
+                        prop_names.push_back(name);
                     }
-                    // Expired, remove from both caches
-                    key_cache_.erase(it);
-                    break;
+                    std::sort(prop_names.begin(), prop_names.end());
+                    for (size_t i = 0; i < prop_names.size(); ++i) {
+                        if (i > 0) entry += ",";
+                        entry += prop_names[i];
+                    }
+                    entry += "}";
+                    schema_strings.push_back(entry);
+                }
+                std::sort(schema_strings.begin(), schema_strings.end());
+                for (const auto& s : schema_strings) {
+                    if (!schema_hash.empty()) schema_hash += ";";
+                    schema_hash += s;
+                }
+            }
+
+            // Skip cache when migration is needed (target_schema_version > 1 indicates migration)
+            // Migration requires a fresh connection to detect and apply schema changes
+            bool skip_cache = config.target_schema_version > 1;
+
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash};
+
+            // Find existing entry (unless migration requires fresh connection)
+            if (!skip_cache) {
+                for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
+                    if (it->first == key) {
+                        if (auto existing = it->second.lock()) {
+                            return existing;
+                        }
+                        // Expired, remove from both caches
+                        key_cache_.erase(it);
+                        break;
+                    }
+                }
+            } else {
+                // For migration: remove any existing entry for this key
+                // This ensures the old connection is invalidated
+                for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
+                    if (it->first == key) {
+                        if (auto existing = it->second.lock()) {
+                            ptr_cache_.erase(existing.get());
+                        }
+                        key_cache_.erase(it);
+                        break;
+                    }
                 }
             }
 

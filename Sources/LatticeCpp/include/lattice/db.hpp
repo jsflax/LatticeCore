@@ -18,8 +18,9 @@ class database {
 public:
     /// Open mode for database connections
     enum class open_mode {
-        read_write,  ///< Full read/write access (default)
-        read_only    ///< Read-only access (for concurrent readers)
+        read_write,         ///< Full read/write access (default)
+        read_only,          ///< Read-only access (for WAL concurrent readers)
+        read_only_immutable ///< Read-only for truly immutable/bundled databases (skips WAL checks)
     };
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write);

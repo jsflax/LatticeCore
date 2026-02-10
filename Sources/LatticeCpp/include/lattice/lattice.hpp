@@ -336,6 +336,14 @@ struct configuration {
     /// Example: copying lat/lon to new geo_bounds columns before lat/lon are dropped.
     migration_block_t migration_block;
 
+    /// Read-only mode. When true:
+    /// - Database is opened with SQLITE_OPEN_READONLY
+    /// - No WAL mode (uses existing journal mode)
+    /// - No table creation or schema changes
+    /// - No sync, no change hooks
+    /// Use this for bundled template databases in app resources.
+    bool read_only = false;
+
     // Default constructor - in-memory, no sync
     configuration() = default;
 
@@ -571,12 +579,16 @@ public:
     // Construct with full configuration (including optional sync)
     explicit lattice_db(const configuration& config)
         : config_(config)
-        , db_(std::make_unique<database>(config.path, database::open_mode::read_write))
-        , read_db_(config.path != ":memory:" ? std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr)
+        , db_(std::make_unique<database>(config.path,
+              config.read_only ? database::open_mode::read_only_immutable : database::open_mode::read_write))
+        , read_db_(config.read_only ? nullptr :
+                   (config.path != ":memory:" ? std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr))
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
-        ensure_tables();
-        setup_change_hook();
-        setup_sync_if_configured();
+        if (!config.read_only) {
+            ensure_tables();
+            setup_change_hook();
+            setup_sync_if_configured();
+        }
         instance_registry::instance().register_instance(config_.path, this);
     }
 

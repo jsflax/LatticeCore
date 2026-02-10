@@ -77,6 +77,13 @@ using DynamicObjectVector = std::vector<dynamic_object>;
 using DynamicObjectPtrVector = std::vector<dynamic_object*>;
 using DynamicObjectRefPtrVector = std::vector<dynamic_object_ref*>;
 
+// Helper function for Swift to push to vector
+// (Works around Swift-C++ interop bug where SWIFT_SHARED_REFERENCE types
+// are incorrectly converted when passed to std::vector::push_back)
+inline void push_dynamic_object_ref(DynamicObjectRefPtrVector& vec, dynamic_object_ref* ptr) {
+    vec.push_back(ptr);
+}
+
 using OptionalManagedModel = std::optional<managed<swift_dynamic_object>>;
 
 static OptionalManagedModel from_nonoptional(managed<swift_dynamic_object> o) {

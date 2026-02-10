@@ -18,13 +18,16 @@ lattice::log_level lattice_get_log_level() {
 // The ref counting is managed by swift_lattice_ref's atomic counter
 
 void retainSwiftLatticeRef(lattice::swift_lattice_ref* ptr) {
+    // std::cerr << "[DEBUG] retainSwiftLatticeRef ptr=" << ptr << std::endl;
     if (!ptr) return;
     ptr->retain();
 }
 
 void releaseSwiftLatticeRef(lattice::swift_lattice_ref* ptr) {
+    // std::cerr << "[DEBUG] releaseSwiftLatticeRef ptr=" << ptr << std::endl;
     if (!ptr) return;
     if (ptr->release()) {
+        // std::cerr << "[DEBUG] releaseSwiftLatticeRef deleting" << std::endl;
         delete ptr;
     }
 }
@@ -122,12 +125,28 @@ void dynamic_object::manage(managed<swift_dynamic_object> o) {
 // Construct with swift_configuration (includes row migration callback)
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
     : lattice_db(config), swift_config_(config) {
-    ensure_swift_tables(schemas);
+    if (!config.read_only) {
+        ensure_swift_tables(schemas);
+    } else {
+        // In read-only mode, just store schemas without creating tables
+        for (const auto& entry : schemas) {
+            schemas_[entry.table_name] = entry.properties;
+            constraints_[entry.table_name] = entry.constraints;
+        }
+    }
 }
 
 swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& schemas)
     : lattice_db(config), swift_config_(std::move(config)) {
-    ensure_swift_tables(schemas);
+    if (!swift_config_.read_only) {
+        ensure_swift_tables(schemas);
+    } else {
+        // In read-only mode, just store schemas without creating tables
+        for (const auto& entry : schemas) {
+            schemas_[entry.table_name] = entry.properties;
+            constraints_[entry.table_name] = entry.constraints;
+        }
+    }
 }
 
 void swift_lattice::add(dynamic_object &obj) {
@@ -196,11 +215,20 @@ void swift_lattice::add_bulk(std::vector<dynamic_object*>& objects) {
     if (objects.empty()) {
         return;
     }
+    // Check that first object is not already managed
+    if (objects[0]->lattice) {
+        throw std::runtime_error("Cannot add already managed object");
+    }
     // Use schema from first object (all objects in the batch should have the same schema)
     auto schema = objects[0]->unmanaged_.instance_schema();
     auto upsert_cols = get_upsert_columns(schema.table_name);
     std::vector<swift_dynamic_object> v;
-    for (auto& o : objects) { v.push_back(o->unmanaged_); }
+    for (auto& o : objects) {
+        if (o->lattice) {
+            throw std::runtime_error("Cannot add already managed object");
+        }
+        v.push_back(o->unmanaged_);
+    }
     auto managed_vector = lattice_db::add_bulk_with_schema(std::move(v), schema, upsert_cols);
     for (size_t i = 0; i < managed_vector.size(); i++) {
         auto unmanaged_obj = v[i];
@@ -456,11 +484,18 @@ void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
     if (objects.empty()) {
         return;
     }
+    // Check that first object is not already managed
+    if (objects[0].lattice) {
+        throw std::runtime_error("Cannot add already managed object");
+    }
     // Use schema from first object (all objects in the batch should have the same schema)
     auto schema = objects[0].unmanaged_.instance_schema();
     auto upsert_cols = get_upsert_columns(schema.table_name);
     std::vector<swift_dynamic_object> v;
     for (auto& o : objects) {
+        if (o.lattice) {
+            throw std::runtime_error("Cannot add already managed object");
+        }
         v.push_back(o.unmanaged_);
     }
     auto managed_vector = lattice_db::add_bulk_with_schema(std::move(v), schema, upsert_cols);

@@ -281,6 +281,13 @@ public:
         return ref;
     }
 
+    // Factory that copies the dynamic_object (avoids passing shared_ptr through Swift)
+    static dynamic_object_ref* wrap(const dynamic_object& obj) {
+        auto ref = new dynamic_object_ref();
+        ref->impl_ = std::make_shared<dynamic_object>(obj);
+        return ref;
+    }
+
     dynamic_object_ref(managed<swift_dynamic_object>& o) {
         impl_ = std::make_shared<dynamic_object>(o);
     }

@@ -305,7 +305,7 @@ private:
 
     friend void ::retainGeoBoundsListRef(lattice::geo_bounds_list_ref* p);
     friend void ::releaseGeoBoundsListRef(lattice::geo_bounds_list_ref* p);
-} SWIFT_SHARED_REFERENCE(retainGeoBoundsListRef, releaseGeoBoundsListRef) SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxLinkListRef);
+} SWIFT_SHARED_REFERENCE(retainGeoBoundsListRef, releaseGeoBoundsListRef);
 
 }
 

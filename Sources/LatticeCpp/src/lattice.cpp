@@ -2,6 +2,7 @@
 // This file kept for potential non-template implementations
 
 #include "lattice/lattice.hpp"
+#include <unordered_set>
 
 namespace lattice {
 
@@ -131,26 +132,50 @@ void lattice_db::setup_sync_if_configured() {
     synchronizer_->connect();
 }
 
+static std::vector<std::string> get_column_names(database* db, const std::string& schema, const std::string& table_name) {
+    auto rows = db->query("PRAGMA " + schema + ".table_info(" + table_name + ")");
+    std::vector<std::string> cols;
+    for (const auto& row : rows) {
+        auto it = row.find("name");
+        if (it != row.end() && std::holds_alternative<std::string>(it->second))
+            cols.push_back(std::get<std::string>(it->second));
+    }
+    std::sort(cols.begin(), cols.end());
+    return cols;
+}
+
 void lattice_db::attach(lattice_db &lattice) {
     std::reference_wrapper<std::unique_ptr<database>> dbs[2] = {this->db_, this->read_db_};
     for (auto& db : dbs) {
-        std::stringstream ss;
-        ss << "ATTACH DATABASE ";
-        ss << "'" << lattice.config_.path << "'";
-        ss << " AS ";
         std::filesystem::path p = lattice.config_.path;
         auto alias = p.filename().replace_extension();
-        ss << alias;
-        
-        db.get()->execute(ss.str());
-        
+
+        {
+            std::stringstream ss;
+            ss << "ATTACH DATABASE ";
+            ss << "'" << lattice.config_.path << "'";
+            ss << " AS \"" << alias.string() << "\"";
+            db.get()->execute(ss.str());
+        }
+
+        // Collect main DB's table names for overlap detection
+        auto main_tables = db.get()->query(
+            "SELECT name FROM main.sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' "
+            "AND name NOT IN ('AuditLog', '_SyncControl') "
+            "AND name NOT LIKE '%_vec0'");
+        std::unordered_set<std::string> main_table_set;
+        for (const auto& row : main_tables) {
+            auto it = row.find("name");
+            if (it != row.end() && std::holds_alternative<std::string>(it->second))
+                main_table_set.insert(std::get<std::string>(it->second));
+        }
+
         auto tables = lattice.db_->query(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name NOT LIKE 'sqlite_%' "
             "AND name NOT IN ('AuditLog', '_SyncControl') "
             "AND name NOT LIKE '%_vec0'");
-
-        int64_t total_entries = 0;
 
         for (const auto& table_row : tables) {
             auto it = table_row.find("name");
@@ -158,8 +183,29 @@ void lattice_db::attach(lattice_db &lattice) {
                 continue;
 
             std::string table_name = std::get<std::string>(it->second);
-            db.get()->execute("CREATE TEMP VIEW IF NOT EXISTS " + table_name +
+
+            if (main_table_set.count(table_name)) {
+                // Verify schemas match before creating UNION view
+                auto main_cols = get_column_names(db.get().get(), "main", table_name);
+                auto attached_cols = get_column_names(db.get().get(), "\"" + alias.string() + "\"", table_name);
+
+                if (main_cols != attached_cols) {
+                    throw std::runtime_error(
+                        "Schema mismatch for table '" + table_name +
+                        "' between main database and attached database '" + alias.string() + "'");
+                }
+
+                // Same table exists in both with matching schema: create UNION ALL view
+                // Include _source column so hydrate can qualify table_name for lazy reads
+                std::string quoted_alias = "\"" + alias.string() + "\"";
+                db.get()->execute("CREATE TEMP VIEW IF NOT EXISTS " + table_name +
+                    " AS SELECT *, 'main' AS _source FROM main." + table_name +
+                    " UNION ALL SELECT *, '" + quoted_alias + "' AS _source FROM " + quoted_alias + "." + table_name);
+            } else {
+                // Table only in attached DB: simple passthrough view
+                db.get()->execute("CREATE TEMP VIEW IF NOT EXISTS " + table_name +
                     " AS SELECT * FROM \"" + alias.string() + "\"." + table_name);
+            }
         }
     }
 }

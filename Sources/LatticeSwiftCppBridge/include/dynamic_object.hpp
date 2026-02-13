@@ -30,6 +30,7 @@ class dynamic_object_ref;
 // MARK: Dynamic Object
 struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     swift_lattice_ref* lattice = nullptr;
+    bool deleted_ = false;
 
     dynamic_object() : lattice(nullptr) {
         new (&unmanaged_) swift_dynamic_object();

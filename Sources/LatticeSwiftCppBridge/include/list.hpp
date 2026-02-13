@@ -32,9 +32,9 @@ struct link_list {
     swift_lattice* lattice = nullptr;
     
     link_list() : lattice(nullptr) {
-        new (&unmanaged_) std::vector<swift_dynamic_object *>();
+        new (&unmanaged_) std::vector<std::shared_ptr<dynamic_object>>();
     }
-    
+
     ~link_list() {
         if (lattice) {
             managed_.~managed();
@@ -42,7 +42,7 @@ struct link_list {
             unmanaged_.~vector();
         }
     }
-    
+
     link_list(const link_list& o) : lattice(o.lattice) {
         if (lattice) {
             new (&managed_) managed(o.managed_);
@@ -50,7 +50,7 @@ struct link_list {
             new (&unmanaged_) std::vector(o.unmanaged_);
         }
     }
-    
+
     link_list(link_list&& o) : lattice(o.lattice) {
         if (lattice) {
             new (&managed_) managed(std::move(o.managed_));
@@ -58,7 +58,7 @@ struct link_list {
             new (&unmanaged_) std::vector(std::move(o.unmanaged_));
         }
     }
-    
+
     link_list& operator=(const link_list& o) {
         if (this != &o) {
             // Destroy current
@@ -77,7 +77,7 @@ struct link_list {
         }
         return *this;
     }
-    
+
     link_list& operator=(link_list&& o) {
         if (this != &o) {
             // Destroy current
@@ -95,10 +95,6 @@ struct link_list {
             }
         }
         return *this;
-    }
-    
-    link_list(const std::vector<swift_dynamic_object *>& o) : lattice(nullptr) {
-        new (&unmanaged_) std::vector<swift_dynamic_object *>(o);
     }
     
     link_list(const managed<std::vector<swift_dynamic_object*>>& o);
@@ -177,7 +173,7 @@ struct link_list {
 
 private:
     union {
-        std::vector<dynamic_object_ref *> unmanaged_;
+        std::vector<std::shared_ptr<dynamic_object>> unmanaged_;
         managed<std::vector<swift_dynamic_object *>> managed_;
     };
     
@@ -276,7 +272,7 @@ private:
 
     friend void ::retainLinkListRef(lattice::link_list_ref* p);
     friend void ::releaseLinkListRef(lattice::link_list_ref* p);
-} SWIFT_SHARED_REFERENCE(retainLinkListRef, releaseLinkListRef)  SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxLinkListRef);
+} SWIFT_SHARED_REFERENCE(retainLinkListRef, releaseLinkListRef);
 
 using optional_size_t = std::optional<size_t>;
 using vec_size_t = std::vector<size_t>;

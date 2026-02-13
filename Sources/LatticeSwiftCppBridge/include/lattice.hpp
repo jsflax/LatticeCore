@@ -1097,10 +1097,16 @@ public:
         // ====================================================================
         std::vector<std::string> vec_cte_names;
         for (const auto& vc : vectors) {
+            std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
+
+            // vec0 table is created lazily on first vector insert (needs dimensions).
+            // If no data has been inserted yet, the table won't exist — return empty.
+            if (!db().table_exists(vec_table)) {
+                return CombinedQueryResultVector{};
+            }
+
             std::string cte_name = "vec_" + std::to_string(cte_index++);
             vec_cte_names.push_back(cte_name);
-
-            std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
 
             // Determine distance function
             std::string distance_func;

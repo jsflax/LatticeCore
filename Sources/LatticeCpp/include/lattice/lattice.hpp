@@ -2019,6 +2019,12 @@ public:
                                        const std::optional<std::string>& where_clause = std::nullopt) {
         std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
 
+        // vec0 table is created lazily on first vector insert (needs dimensions).
+        // If no data has been inserted yet, return empty results.
+        if (!db_->table_exists(vec_table)) {
+            return {};
+        }
+
         // Build the KNN query
         // If there's a where clause, we need to JOIN with the main table
         std::ostringstream sql;
@@ -2893,12 +2899,21 @@ protected:
 
         obj.db_ = db_.get();
         obj.lattice_ = this;
-        obj.table_name_ = table_name;
+
+        // If _source column present (from same-model UNION attach view),
+        // qualify table_name so lazy reads/writes target the correct schema.
+        auto source_it = row.find("_source");
+        if (source_it != row.end() && std::holds_alternative<std::string>(source_it->second)) {
+            auto source_schema = std::get<std::string>(source_it->second);
+            obj.table_name_ = source_schema + "." + table_name;
+        } else {
+            obj.table_name_ = table_name;
+        }
 
         // Populate the source object's values from the row (only for types with 'source' member)
         if constexpr (has_source_member<T>::value) {
             for (const auto& [key, value] : row) {
-                if (key != "id" && key != "globalId") {
+                if (key != "id" && key != "globalId" && key != "_source") {
                     obj.source.values[key] = value;
                 }
             }

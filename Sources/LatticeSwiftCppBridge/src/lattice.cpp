@@ -153,6 +153,9 @@ void swift_lattice::add(dynamic_object &obj) {
     if (obj.lattice) {
         throw std::runtime_error("Cannot add already managed object");
     }
+    if (obj.deleted_) {
+        throw std::runtime_error("Cannot add a deleted object");
+    }
     auto& unmanaged_obj = obj.unmanaged_;
     const std::string& table_name = unmanaged_obj.table_name;
     auto upsert_cols = get_upsert_columns(table_name);
@@ -170,11 +173,11 @@ void swift_lattice::add(dynamic_object &obj) {
     }
     for (auto& [name, list] : unmanaged_obj.list_values) {
         auto link_list_field = object.get_managed_field<std::vector<swift_dynamic_object*>>(name);
-        for (auto link : list->unmanaged_) {
-            if (!link->getLattice()) {
-                add(*link->shared());
+        for (auto& obj_ptr : list->unmanaged_) {
+            if (!obj_ptr->lattice) {
+                add(*obj_ptr);
             }
-            link_list_field.push_back(&link->shared()->managed_);
+            link_list_field.push_back(&obj_ptr->managed_);
         }
     }
     // Handle geo_bounds lists
@@ -190,6 +193,11 @@ void swift_lattice::add(dynamic_object &obj) {
 void swift_lattice::add_bulk(std::vector<dynamic_object_ref*>& objects) {
     if (objects.empty()) {
         return;
+    }
+    for (auto& o : objects) {
+        if (o->impl_->deleted_) {
+            throw std::runtime_error("Cannot add a deleted object");
+        }
     }
     // Use schema from first object (all objects in the batch should have the same schema)
     auto schema = objects[0]->impl_->unmanaged_.instance_schema();
@@ -226,6 +234,9 @@ void swift_lattice::add_bulk(std::vector<dynamic_object*>& objects) {
     for (auto& o : objects) {
         if (o->lattice) {
             throw std::runtime_error("Cannot add already managed object");
+        }
+        if (o->deleted_) {
+            throw std::runtime_error("Cannot add a deleted object");
         }
         v.push_back(o->unmanaged_);
     }
@@ -496,6 +507,9 @@ void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
         if (o.lattice) {
             throw std::runtime_error("Cannot add already managed object");
         }
+        if (o.deleted_) {
+            throw std::runtime_error("Cannot add a deleted object");
+        }
         v.push_back(o.unmanaged_);
     }
     auto managed_vector = lattice_db::add_bulk_with_schema(std::move(v), schema, upsert_cols);
@@ -527,7 +541,9 @@ bool lattice::swift_lattice::remove(dynamic_object_ref* obj) {
     new (&obj->impl_->unmanaged_) swift_dynamic_object(table_name, properties);
     // 3. NOW clear lattice to indicate unmanaged state
     obj->impl_->lattice = nullptr;
-    
+    // 4. Mark as deleted so link list append can detect stale objects
+    obj->impl_->deleted_ = true;
+
     return true;
 }
 

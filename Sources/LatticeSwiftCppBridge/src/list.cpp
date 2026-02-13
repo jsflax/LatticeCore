@@ -40,7 +40,7 @@ link_list::element_proxy& link_list::element_proxy::operator=(dynamic_object_ref
             list->managed_[idx] = &o->impl_->managed_;
         }
     } else {
-        list->unmanaged_[idx] = o;
+        list->unmanaged_[idx] = o->shared();
     }
     return *this;
 }
@@ -57,10 +57,10 @@ link_list::element_proxy link_list::operator[](size_t idx) const {
             managed_obj.property_types_[name] = column_type.type;
             managed_obj.property_names_.push_back(name);
         }
-        
+
         proxy.object = std::make_shared<dynamic_object>(managed_obj);
     } else {
-        proxy.object = unmanaged_[idx]->impl_;
+        proxy.object = unmanaged_[idx];
     }
     return proxy;
 }
@@ -90,7 +90,8 @@ void link_list::push_back(dynamic_object_ref* obj) {
             managed_.push_back(&obj->impl_->managed_);
         }
     } else {
-        unmanaged_.push_back(obj);
+        // Store shared_ptr to keep the dynamic_object alive
+        unmanaged_.push_back(obj->shared());
     }
 }
 
@@ -155,10 +156,10 @@ std::optional<size_t> link_list::find_index(const dynamic_object_ref& obj) const
             }
         }
     } else {
-        // Unmanaged list - compare by pointer address
-        const dynamic_object_ref* target_ptr = &obj;
+        // Unmanaged list - compare by dynamic_object pointer
+        const dynamic_object* target_ptr = obj.impl_.get();
         for (size_t i = 0; i < count; i++) {
-            if (unmanaged_[i] == target_ptr) {
+            if (unmanaged_[i].get() == target_ptr) {
                 return i;
             }
         }

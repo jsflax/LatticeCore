@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+build/
+cmake-build/
+cmake-build-android-*/
+.DS_Store
+*.o
+*.a
+*.so
+*.dylib
+.claude/

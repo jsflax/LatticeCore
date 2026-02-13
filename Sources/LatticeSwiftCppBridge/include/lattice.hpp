@@ -2,7 +2,7 @@
 
 #ifdef __cplusplus
 
-#include <LatticeCpp.hpp>
+#include <LatticeCore.hpp>
 #include <bridging.hpp>
 #include <concepts>
 

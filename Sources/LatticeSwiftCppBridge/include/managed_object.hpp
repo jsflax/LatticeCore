@@ -7,7 +7,7 @@
 #include <bridging.hpp>
 #include <string>
 #include <unmanaged_object.hpp>
-#include <LatticeCpp.hpp>
+#include <LatticeCore.hpp>
 
 
 // ============================================================================

@@ -2,10 +2,10 @@
 
 #ifdef __cplusplus
 
-// LatticeCpp - Cross-platform ORM with Sync
+// LatticeCore - Cross-platform ORM with Sync
 //
 // Usage:
-//   #include <LatticeCpp.hpp>
+//   #include <LatticeCore.hpp>
 //
 //   struct Trip {
 //       std::string name;

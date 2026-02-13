@@ -3,7 +3,7 @@
 // Integration tests for sync - mirrors Swift's SyncTests.swift
 // Uses Crow (server) + websocketpp (client) for real WebSocket communication
 
-#include <LatticeCpp.hpp>
+#include <LatticeCore.hpp>
 #include <iostream>
 #include <thread>
 #include <atomic>

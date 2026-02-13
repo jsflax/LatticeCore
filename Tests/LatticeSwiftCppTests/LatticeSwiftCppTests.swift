@@ -1,4 +1,4 @@
-import LatticeCpp
+import LatticeCore
 import LatticeSwiftCppBridge
 import Testing
 import Foundation

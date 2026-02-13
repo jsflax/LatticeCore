@@ -9,7 +9,7 @@
 #include <memory>
 #include <unmanaged_object.hpp>
 #include <managed_object.hpp>
-#include <LatticeCpp.hpp>
+#include <LatticeCore.hpp>
 
 
 namespace lattice {

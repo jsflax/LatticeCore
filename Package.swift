@@ -3,15 +3,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "LatticeCpp",
+    name: "LatticeCore",
     platforms: [
         .macOS(.v14),
         .iOS(.v17)
     ],
     products: [
         .library(
-            name: "LatticeCpp",
-            targets: ["LatticeCpp"]
+            name: "LatticeCore",
+            targets: ["LatticeCore"]
         ),
         .library(
             name: "LatticeSwiftCppBridge",
@@ -26,8 +26,8 @@ let package = Package(
             targets: ["LatticeCAPI"]
         ),
         .executable(
-            name: "LatticeCppTests",
-            targets: ["LatticeCppTests"]
+            name: "LatticeCoreTests",
+            targets: ["LatticeCoreTests"]
         ),
     ],
     targets: [
@@ -47,9 +47,9 @@ let package = Package(
             ]
         ),
         .target(
-            name: "LatticeCpp",
+            name: "LatticeCore",
             dependencies: ["SqliteVec"],
-            path: "Sources/LatticeCpp",
+            path: "Sources/LatticeCore",
             sources: ["src"],
             publicHeadersPath: "include",
             cxxSettings: [
@@ -63,7 +63,7 @@ let package = Package(
         .target(name: "LatticeSwiftModule"),
         .target(
             name: "LatticeSwiftCppBridge",
-            dependencies: ["LatticeCpp", "LatticeSwiftModule"],
+            dependencies: ["LatticeCore", "LatticeSwiftModule"],
             path: "Sources/LatticeSwiftCppBridge",
             sources: ["src"],
             publicHeadersPath: "include",
@@ -84,7 +84,7 @@ let package = Package(
             cxxSettings: [
                 .headerSearchPath("include"),
                 .headerSearchPath("../LatticeSwiftCppBridge/include"),
-                .headerSearchPath("../LatticeCpp/include"),
+                .headerSearchPath("../LatticeCore/include"),
                 .unsafeFlags(["-std=c++20"])
             ],
             linkerSettings: [
@@ -92,9 +92,9 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "LatticeCppTests",
-            dependencies: ["LatticeCpp"],
-            path: "Tests/LatticeCppTests",
+            name: "LatticeCoreTests",
+            dependencies: ["LatticeCore"],
+            path: "Tests/LatticeCoreTests",
             exclude: ["vendor"],
             cxxSettings: [
                 .headerSearchPath("vendor"),

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(LatticeCpp VERSION 0.1.0 LANGUAGES C CXX)
+project(LatticeCore VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,19 +53,19 @@ endif()
 target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
 
 # =============================================================================
-# LatticeCpp - Core C++ ORM implementation
+# LatticeCore - Core C++ ORM implementation
 # =============================================================================
-add_library(LatticeCpp STATIC
-    Sources/LatticeCpp/src/db.cpp
-    Sources/LatticeCpp/src/schema.cpp
-    Sources/LatticeCpp/src/sync.cpp
-    Sources/LatticeCpp/src/network.cpp
-    Sources/LatticeCpp/src/lattice.cpp
+add_library(LatticeCore STATIC
+    Sources/LatticeCore/src/db.cpp
+    Sources/LatticeCore/src/schema.cpp
+    Sources/LatticeCore/src/sync.cpp
+    Sources/LatticeCore/src/network.cpp
+    Sources/LatticeCore/src/lattice.cpp
 )
-target_include_directories(LatticeCpp PUBLIC
-    Sources/LatticeCpp/include
+target_include_directories(LatticeCore PUBLIC
+    Sources/LatticeCore/include
 )
-target_link_libraries(LatticeCpp PUBLIC
+target_link_libraries(LatticeCore PUBLIC
     SqliteVec
     SQLite::SQLite3
 )
@@ -83,7 +83,7 @@ add_library(LatticeSwiftCppBridge STATIC
 target_include_directories(LatticeSwiftCppBridge PUBLIC
     Sources/LatticeSwiftCppBridge/include
 )
-target_link_libraries(LatticeSwiftCppBridge PUBLIC LatticeCpp)
+target_link_libraries(LatticeSwiftCppBridge PUBLIC LatticeCore)
 
 # For non-Apple platforms, we need to stub out Swift bridging macros
 if(NOT APPLE)

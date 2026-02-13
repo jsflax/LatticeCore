@@ -1,4 +1,4 @@
-#include <LatticeCpp.hpp>
+#include <LatticeCore.hpp>
 #include <cassert>
 #include <iostream>
 #include <filesystem>
@@ -2451,7 +2451,7 @@ void test_geo_bounds_list_spatial_query() {
 // ============================================================================
 
 int main() {
-    std::cout << "=== LatticeCpp Tests ===" << std::endl;
+    std::cout << "=== LatticeCore Tests ===" << std::endl;
     std::cout << "Replicating Swift LatticeTests in C++" << std::endl;
     std::cout << "Direct property writes (no save() or dirty tracking!)" << std::endl;
     std::cout << std::endl;

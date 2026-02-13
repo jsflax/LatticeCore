@@ -8,7 +8,7 @@ LatticeCore provides the core database engine — query execution, schema manage
 
 ```
 Sources/
-├── LatticeCpp/              # Core C++ database engine
+├── LatticeCore/             # Core C++ database engine
 ├── LatticeSwiftCppBridge/   # Swift-C++ interop layer
 ├── LatticeSwiftModule/      # Swift module overlay
 ├── LatticeCAPI/             # C API wrapper
@@ -17,7 +17,7 @@ Sources/
 
 ## Requirements
 
-- Swift 5.9+ / C++20
+- Swift 6.2+ / C++20
 - macOS 14+ / iOS 17+
 - SQLite3
 

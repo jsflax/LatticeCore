@@ -6,7 +6,7 @@
 #include <bridging.hpp>
 #include <string>
 #include <unordered_map>
-#include <LatticeCpp.hpp>
+#include <LatticeCore.hpp>
 
 namespace lattice {
 

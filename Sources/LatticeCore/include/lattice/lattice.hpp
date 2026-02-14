@@ -1841,6 +1841,78 @@ public:
         }
     }
 
+    /// Ensure an FTS5 virtual table exists for a text column.
+    /// Creates external content FTS5 table + INSERT/UPDATE/DELETE triggers.
+    void ensure_fts5_table(const std::string& model_table,
+                           const std::string& column_name) {
+        std::string fts_table = "_" + model_table + "_" + column_name + "_fts";
+
+        // Check if table already exists
+        if (db_->table_exists(fts_table)) {
+            return;
+        }
+
+        // Create external content FTS5 virtual table
+        std::ostringstream sql;
+        sql << "CREATE VIRTUAL TABLE " << fts_table << " USING fts5("
+            << column_name << ", "
+            << "content='" << model_table << "', "
+            << "content_rowid='id', "
+            << "tokenize='porter'"
+            << ")";
+        db_->execute(sql.str());
+
+        // INSERT trigger - copy text to FTS on insert
+        std::ostringstream insert_trigger;
+        insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_insert "
+                       << "AFTER INSERT ON " << model_table << " "
+                       << "BEGIN "
+                       << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
+                       << "VALUES (NEW.id, NEW." << column_name << "); "
+                       << "END";
+        db_->execute(insert_trigger.str());
+
+        // UPDATE trigger - FTS5 delete-then-insert
+        std::ostringstream update_trigger;
+        update_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_update "
+                       << "AFTER UPDATE OF " << column_name << " ON " << model_table << " "
+                       << "BEGIN "
+                       << "INSERT INTO " << fts_table << "(" << fts_table << ", rowid, " << column_name << ") "
+                       << "VALUES ('delete', OLD.id, OLD." << column_name << "); "
+                       << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
+                       << "VALUES (NEW.id, NEW." << column_name << "); "
+                       << "END";
+        db_->execute(update_trigger.str());
+
+        // DELETE trigger - BEFORE DELETE to use OLD values
+        std::ostringstream delete_trigger;
+        delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_delete "
+                       << "BEFORE DELETE ON " << model_table << " "
+                       << "BEGIN "
+                       << "INSERT INTO " << fts_table << "(" << fts_table << ", rowid, " << column_name << ") "
+                       << "VALUES ('delete', OLD.id, OLD." << column_name << "); "
+                       << "END";
+        db_->execute(delete_trigger.str());
+
+        // Populate FTS from existing data
+        std::ostringstream populate_sql;
+        populate_sql << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
+                     << "SELECT id, " << column_name << " FROM " << model_table
+                     << " WHERE " << column_name << " IS NOT NULL";
+        db_->execute(populate_sql.str());
+    }
+
+    /// Ensure all FTS5 tables exist for a set of model schemas.
+    void ensure_fts5_tables(const std::vector<model_schema>& schemas) {
+        for (const auto& schema : schemas) {
+            for (const auto& prop : schema.properties) {
+                if (prop.is_full_text && prop.type == column_type::text) {
+                    ensure_fts5_table(schema.table_name, prop.name);
+                }
+            }
+        }
+    }
+
     /// Ensure a geo_bounds list table exists with its R*Tree.
     /// Creates table: _<ModelTable>_<column> with parent_id and geo bounds columns
     /// Creates R*Tree: _<ModelTable>_<column>_rtree for spatial indexing

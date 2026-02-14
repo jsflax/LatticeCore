@@ -467,6 +467,9 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // with the correct (migrated) data rather than default values.
     ensure_geo_bounds_rtrees(all_schemas);
 
+    // Phase 6b: Ensure FTS5 tables exist for full-text indexed columns
+    ensure_fts5_tables(all_schemas);
+
     // Phase 7: Create UNIQUE indexes for constraints
     for (const auto& entry : schemas) {
         for (size_t i = 0; i < entry.constraints.size(); ++i) {

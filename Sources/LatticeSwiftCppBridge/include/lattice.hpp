@@ -108,13 +108,25 @@ struct geo_constraint {
         : column(col), center_lat(lat), center_lon(lon), radius_meters(radius) {}
 };
 
+/// Full-text search constraint for FTS5
+struct text_constraint {
+    std::string column;
+    std::string search_text;
+    int limit;
+
+    text_constraint() = default;
+    text_constraint(const std::string& col, const std::string& text, int lim)
+        : column(col), search_text(text), limit(lim) {}
+};
+
 /// Sort descriptor for nearest results
 struct sort_descriptor {
     enum class Type : int32_t {
         none = 0,
         geo_distance = 1,    // Sort by geo distance column
         vector_distance = 2, // Sort by vector distance column
-        property = 3         // Sort by a property column
+        property = 3,        // Sort by a property column
+        text_rank = 4        // Sort by FTS5 rank column
     };
 
     Type type = Type::none;
@@ -129,6 +141,7 @@ struct sort_descriptor {
 using BoundsConstraintVector = std::vector<bounds_constraint>;
 using VectorConstraintVector = std::vector<vector_constraint>;
 using GeoConstraintVector = std::vector<geo_constraint>;
+using TextConstraintVector = std::vector<text_constraint>;
 
 /// Distance entry for combined query result
 struct distance_entry {
@@ -979,18 +992,19 @@ public:
         const BoundsConstraintVector& bounds,
         const VectorConstraintVector& vectors,
         const GeoConstraintVector& geos,
+        const TextConstraintVector& texts,
         OptionalString where_clause,
         const sort_descriptor& sort,
         int64_t limit,
         OptionalString group_by = std::nullopt)
-        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:where:sort:limit:groupBy:)) {
+        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:)) {
 
         // Constants for geo calculations
         constexpr double METERS_PER_DEGREE = 111000.0;
         constexpr double DEG_TO_RAD = 3.14159265358979323846 / 180.0;
 
         // If no constraints, just return objects with limit
-        if (bounds.empty() && vectors.empty() && geos.empty()) {
+        if (bounds.empty() && vectors.empty() && geos.empty() && texts.empty()) {
             auto rows = db().query("SELECT * FROM " + table_name +
                 (where_clause.has_value() && !where_clause.value().empty()
                     ? " WHERE " + where_clause.value() : "") +
@@ -1157,23 +1171,66 @@ public:
         }
 
         // ====================================================================
-        // Step 5: Final intersection of all candidates (including vectors)
+        // Step 4b: FTS5 full-text search constraints
+        // ====================================================================
+        std::vector<std::string> fts_cte_names;
+        for (const auto& tc : texts) {
+            std::string fts_table = "_" + table_name + "_" + tc.column + "_fts";
+
+            std::string cte_name = "fts_" + std::to_string(cte_index++);
+            fts_cte_names.push_back(cte_name);
+
+            // Escape single quotes in search text
+            std::string escaped_text = tc.search_text;
+            size_t pos = 0;
+            while ((pos = escaped_text.find('\'', pos)) != std::string::npos) {
+                escaped_text.replace(pos, 1, "''");
+                pos += 2;
+            }
+
+            sql << cte_name << " AS ("
+                << "SELECT fts.rowid AS id, fts.rank AS distance"
+                << " FROM " << fts_table << " fts"
+                << " WHERE " << fts_table << " MATCH '" << escaped_text << "'";
+
+            // Pre-filter by spatial candidates if we have them
+            if (!cte_names.empty()) {
+                sql << " AND fts.rowid IN (SELECT id FROM " << candidates_cte << ")";
+            }
+
+            // Apply user's WHERE clause to FTS CTE
+            if (where_clause.has_value() && !where_clause.value().empty()) {
+                sql << " AND fts.rowid IN (SELECT id FROM " << table_name
+                    << " WHERE " << where_clause.value() << ")";
+            }
+
+            sql << " ORDER BY fts.rank LIMIT " << tc.limit
+                << "), ";
+        }
+
+        // ====================================================================
+        // Step 5: Final intersection of all candidates (including vectors and FTS)
         // ====================================================================
         std::string final_candidates_cte = "final_candidates";
         sql << final_candidates_cte << " AS (";
 
-        if (!vec_cte_names.empty()) {
-            // If we have vector constraints, intersect their results
-            for (size_t i = 0; i < vec_cte_names.size(); ++i) {
+        // Collect all candidate sources
+        std::vector<std::string> all_candidate_ctes;
+        for (const auto& v : vec_cte_names) all_candidate_ctes.push_back(v);
+        for (const auto& f : fts_cte_names) all_candidate_ctes.push_back(f);
+
+        if (!all_candidate_ctes.empty()) {
+            // Intersect all vector and FTS candidates
+            for (size_t i = 0; i < all_candidate_ctes.size(); ++i) {
                 if (i > 0) sql << " INTERSECT ";
-                sql << "SELECT id FROM " << vec_cte_names[i];
+                sql << "SELECT id FROM " << all_candidate_ctes[i];
             }
             // Also intersect with spatial candidates if present
             if (!cte_names.empty()) {
                 sql << " INTERSECT SELECT id FROM " << candidates_cte;
             }
         } else if (!cte_names.empty()) {
-            // No vector constraints, just use spatial candidates
+            // No vector/FTS constraints, just use spatial candidates
             sql << "SELECT id FROM " << candidates_cte;
         } else {
             // No constraints at all - select all IDs
@@ -1196,6 +1253,11 @@ public:
             sql << ", v" << i << ".distance AS _dist_" << vectors[i].column;
         }
 
+        // Add FTS rank columns
+        for (size_t i = 0; i < texts.size(); ++i) {
+            sql << ", f" << i << ".distance AS _dist_" << texts[i].column;
+        }
+
         sql << " FROM " << table_name;
 
         // Join final candidates
@@ -1211,6 +1273,12 @@ public:
         for (size_t i = 0; i < vec_cte_names.size(); ++i) {
             sql << " LEFT JOIN " << vec_cte_names[i] << " v" << i
                 << " ON " << table_name << ".id = v" << i << ".id";
+        }
+
+        // Join FTS CTEs for rank values
+        for (size_t i = 0; i < fts_cte_names.size(); ++i) {
+            sql << " LEFT JOIN " << fts_cte_names[i] << " f" << i
+                << " ON " << table_name << ".id = f" << i << ".id";
         }
 
         // WHERE clause
@@ -1229,7 +1297,8 @@ public:
             switch (sort.type) {
                 case sort_descriptor::Type::geo_distance:
                 case sort_descriptor::Type::vector_distance:
-                    // Sort by distance column (alias is _dist_{column})
+                case sort_descriptor::Type::text_rank:
+                    // Sort by distance/rank column (alias is _dist_{column})
                     order_col = "_dist_" + sort.column;
                     break;
                 case sort_descriptor::Type::property:
@@ -1272,6 +1341,15 @@ public:
                 auto it = row.find(dist_col);
                 if (it != row.end() && std::holds_alternative<double>(it->second)) {
                     distances.emplace_back(vc.column, std::get<double>(it->second));
+                }
+            }
+
+            // Extract FTS rank scores
+            for (const auto& tc : texts) {
+                std::string dist_col = "_dist_" + tc.column;
+                auto it = row.find(dist_col);
+                if (it != row.end() && std::holds_alternative<double>(it->second)) {
+                    distances.emplace_back(tc.column, std::get<double>(it->second));
                 }
             }
 

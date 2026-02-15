@@ -1404,7 +1404,8 @@ public:
                 "AND name NOT LIKE 'sqlite_%' "
                 "AND name NOT IN ('AuditLog', '_SyncControl') "
                 "AND name NOT LIKE '%_vec0' "
-                "AND name NOT LIKE '%_rtree%'");
+                "AND name NOT LIKE '%_rtree%' "
+                "AND name NOT LIKE '\\_%' ESCAPE '\\'");
 
             int64_t total_entries = 0;
 
@@ -1643,6 +1644,18 @@ public:
 
     /// Get the read-only database connection (falls back to write connection for in-memory DBs)
     database& read_db() { return read_db_ ? *read_db_ : *db_; }
+
+    /// Close the read-only connection (for operations requiring exclusive access)
+    void close_read_db() {
+        read_db_.reset();
+    }
+
+    /// Reopen the read-only connection after exclusive operations
+    void reopen_read_db() {
+        if (config_.path != ":memory:" && !config_.read_only) {
+            read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only);
+        }
+    }
 
     // Create a link table on demand (public for managed<T*> access)
     void ensure_link_table(const std::string& link_table_name) {

@@ -67,6 +67,11 @@ void lattice_db::setup_change_hook() {
                 return;
             }
 
+            // Skip SQLite internal tables (triggered during VACUUM, etc.)
+            if (table.rfind("sqlite_", 0) == 0) {
+                return;
+            }
+
             // Get the globalId for this row (only for model tables with 'id' column)
             std::string global_id;
             if (operation != SQLITE_DELETE) {

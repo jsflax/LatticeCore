@@ -501,6 +501,24 @@ public:
         return lattice_db::generate_history();
     }
 
+    /// Checkpoint the WAL file, flushing all changes to the main database file.
+    void checkpoint() {
+        sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+    }
+
+    /// Rebuild the database file, reclaiming unused space.
+    /// Closes the read connection before vacuuming and reopens it after.
+    void vacuum() {
+        close_read_db();
+        try {
+            db().execute("VACUUM");
+        } catch (...) {
+            reopen_read_db();
+            throw;
+        }
+        reopen_read_db();
+    }
+
     const std::string& path() const { return config().path; }
 
     void begin_transaction() { lattice_db::begin_transaction(); }
@@ -1827,6 +1845,27 @@ private:
         return detail::LatticeCache::instance().get_or_create(config, schemas);
     }
 } SWIFT_SHARED_REFERENCE(retainSwiftLatticeRef, releaseSwiftLatticeRef);
+
+// ============================================================================
+// Migration Lookup Functions
+// Only valid during a migration callback. Used to look up existing objects
+// by primary key or globalId for FK-to-Link migration.
+// ============================================================================
+
+/// Look up an object by primary key during migration. Returns true if found.
+/// Call migration_take_lookup_result() to get the result.
+bool migration_lookup(const std::string& table_name, int64_t primary_key)
+    SWIFT_NAME(migrationLookup(table:primaryKey:));
+
+/// Look up an object by globalId during migration. Returns true if found.
+/// Call migration_take_lookup_result() to get the result.
+bool migration_lookup_by_global_id(const std::string& table_name, const std::string& global_id)
+    SWIFT_NAME(migrationLookupByGlobalId(table:globalId:));
+
+/// Take the result of the last successful migration_lookup call.
+/// Returns an empty ref if no lookup result is available.
+dynamic_object_ref* migration_take_lookup_result()
+    SWIFT_NAME(migrationTakeLookupResult());
 
 } // namespace lattice
 

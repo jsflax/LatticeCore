@@ -5,6 +5,10 @@
 #include <geo_bounds.hpp>
 #include <util.hpp>
 
+// Thread-local state for migration lookup functions
+static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;
+static thread_local std::shared_ptr<lattice::dynamic_object> g_migration_lookup_result;
+
 // Log level control
 void lattice_set_log_level(lattice::log_level level) {
     lattice::set_log_level(level);
@@ -314,6 +318,9 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     for (int version = current_version + 1; version <= target_version; version++) {
         migration_context migration_ctx(db());
 
+        // Set migration lattice for Migration.lookup() calls from Swift
+        g_migration_lattice = this;
+
         // For each existing table, check if it needs migration at this version
         for (const auto& table_name : existing_tables) {
             // Ask Swift for old/new schema pair for this table at this version
@@ -426,6 +433,46 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                 }
 
                 migration_ctx.queue_row_update(table_name, row_id, std::move(new_row));
+
+                // Process link_values set by the migration callback (FK-to-Link)
+                std::string parent_gid = new_ref->get_string("globalId");
+                for (auto& [link_name, link_obj_ptr] : new_ref->impl_->unmanaged_.link_values) {
+                    if (!link_obj_ptr) continue;
+
+                    auto prop_it = new_schema.find(link_name);
+                    if (prop_it == new_schema.end()) continue;
+                    const auto& prop = prop_it->second;
+                    if (prop.kind != property_kind::link) continue;
+
+                    std::string child_gid = link_obj_ptr->get_string("globalId");
+                    if (parent_gid.empty() || child_gid.empty()) continue;
+
+                    std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + link_name;
+                    ensure_link_table(link_table);
+                    db().execute("INSERT OR REPLACE INTO " + link_table +
+                        " (lhs, rhs) VALUES ('" + parent_gid + "', '" + child_gid + "')");
+                }
+
+                // Process list_values set by the migration callback (FK-to-List)
+                for (auto& [list_name, list_ptr] : new_ref->impl_->unmanaged_.list_values) {
+                    if (!list_ptr) continue;
+
+                    auto prop_it = new_schema.find(list_name);
+                    if (prop_it == new_schema.end()) continue;
+                    const auto& prop = prop_it->second;
+                    if (prop.kind != property_kind::list || prop.is_geo_bounds) continue;
+
+                    std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + list_name;
+                    ensure_link_table(link_table);
+
+                    for (auto& elem_ptr : list_ptr->unmanaged_) {
+                        if (!elem_ptr) continue;
+                        std::string child_gid = elem_ptr->get_string("globalId");
+                        if (parent_gid.empty() || child_gid.empty()) continue;
+                        db().execute("INSERT OR REPLACE INTO " + link_table +
+                            " (lhs, rhs) VALUES ('" + parent_gid + "', '" + child_gid + "')");
+                    }
+                }
             }
 
             // Now update schemas_ to NEW schema and apply table migration
@@ -445,6 +492,10 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
         // Update version in _lattice_meta
         set_schema_version(version);
+
+        // Clear migration lattice pointer
+        g_migration_lattice = nullptr;
+        g_migration_lookup_result.reset();
     }
 
     // Finally, store all final schemas and handle any tables that didn't need migration
@@ -555,3 +606,44 @@ void lattice::swift_lattice::attach(swift_lattice &lattice) {
 }
 
 // enumerate_objects is now defined inline in lattice.hpp
+
+// MARK: - Migration Lookup Functions
+
+bool lattice::migration_lookup(const std::string& table_name, int64_t primary_key) {
+    if (!g_migration_lattice) {
+        g_migration_lookup_result = nullptr;
+        return false;
+    }
+    auto obj = g_migration_lattice->object(primary_key, table_name);
+    if (!obj) {
+        g_migration_lookup_result = nullptr;
+        return false;
+    }
+    swift_dynamic_object detached = obj->detach();
+    g_migration_lookup_result = std::make_shared<dynamic_object>(detached);
+    return true;
+}
+
+bool lattice::migration_lookup_by_global_id(const std::string& table_name, const std::string& global_id) {
+    if (!g_migration_lattice) {
+        g_migration_lookup_result = nullptr;
+        return false;
+    }
+    auto obj = g_migration_lattice->object_by_global_id(global_id, table_name);
+    if (!obj) {
+        g_migration_lookup_result = nullptr;
+        return false;
+    }
+    swift_dynamic_object detached = obj->detach();
+    g_migration_lookup_result = std::make_shared<dynamic_object>(detached);
+    return true;
+}
+
+lattice::dynamic_object_ref* lattice::migration_take_lookup_result() {
+    if (!g_migration_lookup_result) {
+        return dynamic_object_ref::create();
+    }
+    auto result = g_migration_lookup_result;
+    g_migration_lookup_result = nullptr;
+    return dynamic_object_ref::wrap(result);
+}

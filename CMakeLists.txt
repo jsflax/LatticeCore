@@ -61,6 +61,9 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/lattice.cpp
+    Sources/LatticeCore/src/cross_process_notifier_darwin.cpp
+    Sources/LatticeCore/src/cross_process_notifier_linux.cpp
+    Sources/LatticeCore/src/cross_process_notifier_noop.cpp
 )
 target_include_directories(LatticeCore PUBLIC
     Sources/LatticeCore/include

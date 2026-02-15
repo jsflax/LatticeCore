@@ -7,6 +7,7 @@
 #include "managed.hpp"
 #include "scheduler.hpp"
 #include "observation.hpp"
+#include "cross_process_notifier.hpp"
 #include <vector>
 #include <memory>
 #include <functional>
@@ -452,7 +453,22 @@ public:
     /// ```
     void enumerate_objects(
         const std::string& table_name,
-        std::function<void(const migration_row& old_row, migration_row& new_row)> block);
+        std::function<void(const migration_row& old_row, migration_row& new_row)> block) {
+        auto rows = db_.query("SELECT * FROM " + table_name);
+        LOG_INFO("migration_context", "migrating %zu rows for table %s", rows.size(), table_name.c_str());
+        for (const auto& old_row : rows) {
+            migration_row new_row = old_row;
+            block(old_row, new_row);
+            int64_t row_id = 0;
+            auto id_it = old_row.find("id");
+            if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
+                row_id = std::get<int64_t>(id_it->second);
+            }
+            if (row_id > 0) {
+                pending_updates_[table_name][row_id] = std::move(new_row);
+            }
+        }
+    }
 
     /// Rename a property (copies old column value to new column name).
     /// Useful when renaming without type change.
@@ -563,6 +579,7 @@ public:
         ensure_tables();
         setup_change_hook();
         instance_registry::instance().register_instance(config_.path, this);
+        setup_cross_process_notifier();
     }
 
     // Construct in-memory (uses default scheduler, no sync)
@@ -574,6 +591,7 @@ public:
         ensure_tables();
         setup_change_hook();
         instance_registry::instance().register_instance(config_.path, this);
+        setup_cross_process_notifier();
     }
 
     // Construct with full configuration (including optional sync)
@@ -590,6 +608,7 @@ public:
             setup_sync_if_configured();
         }
         instance_registry::instance().register_instance(config_.path, this);
+        setup_cross_process_notifier();
     }
 
     ~lattice_db();
@@ -1086,6 +1105,22 @@ public:
                 }
             } else {
                 LOG_DEBUG("flush_changes", "No AuditLog entry found!");
+            }
+        }
+
+        // Update cross-process cursor and post notification
+        if (xproc_notifier_) {
+            // Advance cursor to current max so our own notification bounces back as a no-op
+            auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
+            if (!max_rows.empty()) {
+                auto it = max_rows[0].find("max_id");
+                if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                    last_seen_audit_id_ = std::get<int64_t>(it->second);
+                }
+            }
+
+            if (!config_.read_only) {
+                xproc_notifier_->post_notification();
             }
         }
 
@@ -2188,6 +2223,12 @@ private:
     // Setup hooks for change notifications
     // Update hook buffers changes, WAL hook flushes on commit (matches Swift's pattern)
     void setup_change_hook();
+
+    // Cross-process observation
+    std::unique_ptr<cross_process_notifier> xproc_notifier_;
+    int64_t last_seen_audit_id_ = 0;
+    void setup_cross_process_notifier();
+    void handle_cross_process_notification();
 
     void ensure_tables() {
         // First create sync control table and register sync_disabled() function
@@ -3725,6 +3766,12 @@ namespace lattice {
 // ============================================================================
 
 inline lattice_db::~lattice_db() {
+    // Stop cross-process listener before teardown
+    if (xproc_notifier_) {
+        xproc_notifier_->stop_listening();
+        xproc_notifier_.reset();
+    }
+
     // Unregister from instance registry
     instance_registry::instance().unregister_instance(config_.path, this);
 

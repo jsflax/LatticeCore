@@ -554,27 +554,4 @@ void lattice::swift_lattice::attach(swift_lattice &lattice) {
     lattice_db::attach(lattice);
 }
 
-void lattice::migration_context::enumerate_objects(const std::string &table_name, std::function<void (const migration_row &, migration_row &)> block) {
-    // Get all rows from the table
-    auto rows = db_.query("SELECT * FROM " + table_name);
-    LOG_INFO("migration_context", "migrating %zu rows for table %s", rows.size(), table_name.c_str());
-    for (const auto& old_row : rows) {
-        // Create new_row as a copy of old_row
-        migration_row new_row = old_row;
-
-        // Let user transform the data
-        block(old_row, new_row);
-
-        // Store transformed row for later application
-        // (will be applied after auto-migration adds new columns)
-        int64_t row_id = 0;
-        auto id_it = old_row.find("id");
-        if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
-            row_id = std::get<int64_t>(id_it->second);
-        }
-
-        if (row_id > 0) {
-            pending_updates_[table_name][row_id] = std::move(new_row);
-        }
-    }
-}
+// enumerate_objects is now defined inline in lattice.hpp

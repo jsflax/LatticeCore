@@ -106,7 +106,95 @@ void lattice_db::setup_change_hook() {
         this
     );
 }
-// Future: non-template implementations can go here
+void lattice_db::setup_cross_process_notifier() {
+    xproc_notifier_ = make_cross_process_notifier(config_.path);
+    if (!xproc_notifier_) return;
+
+    // Initialize cursor to current max AuditLog id
+    auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
+    if (!max_rows.empty()) {
+        auto it = max_rows[0].find("max_id");
+        if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+            last_seen_audit_id_ = std::get<int64_t>(it->second);
+        }
+    }
+
+    LOG_DEBUG("xproc", "Initialized cursor at audit id=%lld for path: %s",
+              (long long)last_seen_audit_id_, config_.path.c_str());
+
+    xproc_notifier_->start_listening([this] {
+        handle_cross_process_notification();
+    });
+}
+
+void lattice_db::handle_cross_process_notification() {
+    LOG_DEBUG("xproc", "Cross-process notification received, last_seen=%lld", (long long)last_seen_audit_id_);
+
+    // Query AuditLog for entries newer than our cursor
+    auto rows = read_db().query(
+        "SELECT id, tableName, operation, rowId, globalRowId FROM AuditLog WHERE id > ? ORDER BY id ASC",
+        {last_seen_audit_id_}
+    );
+
+    if (rows.empty()) {
+        LOG_DEBUG("xproc", "No new AuditLog entries (self-notification)");
+        return;
+    }
+
+    LOG_DEBUG("xproc", "Found %zu new AuditLog entries from other process", rows.size());
+
+    // Get all local instances for this database path
+    auto instances = instance_registry::instance().get_instances(config_.path);
+
+    for (const auto& row : rows) {
+        auto id_it = row.find("id");
+        auto table_it = row.find("tableName");
+        auto op_it = row.find("operation");
+        auto rowid_it = row.find("rowId");
+        auto growid_it = row.find("globalRowId");
+
+        if (id_it == row.end() || !std::holds_alternative<int64_t>(id_it->second)) continue;
+
+        int64_t audit_id = std::get<int64_t>(id_it->second);
+        std::string table = (table_it != row.end() && std::holds_alternative<std::string>(table_it->second))
+            ? std::get<std::string>(table_it->second) : "";
+        std::string op = (op_it != row.end() && std::holds_alternative<std::string>(op_it->second))
+            ? std::get<std::string>(op_it->second) : "";
+        int64_t row_id = (rowid_it != row.end() && std::holds_alternative<int64_t>(rowid_it->second))
+            ? std::get<int64_t>(rowid_it->second) : 0;
+        std::string global_row_id = (growid_it != row.end() && std::holds_alternative<std::string>(growid_it->second))
+            ? std::get<std::string>(growid_it->second) : "";
+
+        // Notify model table observers
+        for (auto* instance : instances) {
+            instance->notify_change(table, op, row_id, global_row_id);
+        }
+
+        // Notify AuditLog observers
+        // Retrieve the globalId of the audit entry itself
+        auto gid_it = row.find("globalRowId");  // reuse globalRowId for audit entry's own identifier
+        // Actually we need the AuditLog row's own globalId - query it
+        auto audit_gid_rows = read_db().query(
+            "SELECT globalId FROM AuditLog WHERE id = ?", {audit_id}
+        );
+        std::string audit_global_id;
+        if (!audit_gid_rows.empty()) {
+            auto git = audit_gid_rows[0].find("globalId");
+            if (git != audit_gid_rows[0].end() && std::holds_alternative<std::string>(git->second)) {
+                audit_global_id = std::get<std::string>(git->second);
+            }
+        }
+
+        for (auto* instance : instances) {
+            instance->notify_change("AuditLog", "INSERT", audit_id, audit_global_id);
+        }
+
+        last_seen_audit_id_ = audit_id;
+    }
+
+    LOG_DEBUG("xproc", "Cross-process notification handled, cursor now at %lld", (long long)last_seen_audit_id_);
+}
+
 void lattice_db::setup_sync_if_configured() {
     if (!config_.is_sync_enabled()) {
         return;

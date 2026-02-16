@@ -1743,16 +1743,23 @@ public:
         std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
         auto results = db_->query(check_sql, {vec_table});
         if (!results.empty()) {
-            return;  // Already exists
+            // Table exists — verify sync triggers are intact (rebuild_table can drop them)
+            auto trig = db_->query(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='"
+                + vec_table + "_insert' LIMIT 1");
+            if (!trig.empty()) return;
+            // Fall through to recreate triggers only
         }
 
-        // Create vec0 virtual table with globalId as primary key
-        std::ostringstream sql;
-        sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
-            << "global_id TEXT PRIMARY KEY, "
-            << "embedding float[" << dimensions << "]"
-            << ")";
-        db_->execute(sql.str());
+        // Create vec0 virtual table with globalId as primary key (if it doesn't exist)
+        if (results.empty()) {
+            std::ostringstream sql;
+            sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
+                << "global_id TEXT PRIMARY KEY, "
+                << "embedding float[" << dimensions << "]"
+                << ")";
+            db_->execute(sql.str());
+        }
 
         // Create triggers to keep vec0 in sync with main table
         // INSERT trigger
@@ -1799,14 +1806,19 @@ public:
         // Check if table already exists
         std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
         auto results = db_->query(check_sql, {rtree_table});
-        if (!results.empty()) {
-            // Table already exists - triggers keep it in sync, no repopulation needed
-            return;
+        bool table_exists = !results.empty();
+        if (table_exists) {
+            // Table exists — verify sync triggers are intact (rebuild_table can drop them)
+            auto trig = db_->query(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='"
+                + rtree_table + "_insert' LIMIT 1");
+            if (!trig.empty()) return;
+            // Fall through to recreate triggers only
         }
 
         // Create R*Tree virtual table (if it doesn't exist)
         // Uses row id for joining back to main table
-        if (!db_->table_exists(rtree_table)) {
+        if (!table_exists) {
             std::ostringstream sql;
             sql << "CREATE VIRTUAL TABLE " << rtree_table << " USING rtree("
                 << "id, "           // Matches main table id
@@ -1858,8 +1870,10 @@ public:
                        << "END";
         db_->execute(delete_trigger.str());
 
-        // Populate rtree from existing data (for migration scenarios)
-        repopulate_geo_bounds_rtree(model_table, column_name);
+        // Populate rtree from existing data (only on first creation)
+        if (!table_exists) {
+            repopulate_geo_bounds_rtree(model_table, column_name);
+        }
     }
 
     /// Repopulate an rtree table from the main table data.
@@ -1903,19 +1917,27 @@ public:
         std::string fts_table = "_" + model_table + "_" + column_name + "_fts";
 
         // Check if table already exists
-        if (db_->table_exists(fts_table)) {
-            return;
+        bool table_exists = db_->table_exists(fts_table);
+        if (table_exists) {
+            // Table exists — verify sync triggers are intact (rebuild_table can drop them)
+            auto trig = db_->query(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='"
+                + fts_table + "_insert' LIMIT 1");
+            if (!trig.empty()) return;
+            // Fall through to recreate triggers only
         }
 
-        // Create external content FTS5 virtual table
-        std::ostringstream sql;
-        sql << "CREATE VIRTUAL TABLE " << fts_table << " USING fts5("
-            << column_name << ", "
-            << "content='" << model_table << "', "
-            << "content_rowid='id', "
-            << "tokenize='porter'"
-            << ")";
-        db_->execute(sql.str());
+        // Create external content FTS5 virtual table (if it doesn't exist)
+        if (!table_exists) {
+            std::ostringstream sql;
+            sql << "CREATE VIRTUAL TABLE " << fts_table << " USING fts5("
+                << column_name << ", "
+                << "content='" << model_table << "', "
+                << "content_rowid='id', "
+                << "tokenize='porter'"
+                << ")";
+            db_->execute(sql.str());
+        }
 
         // INSERT trigger - copy text to FTS on insert
         std::ostringstream insert_trigger;
@@ -1949,12 +1971,14 @@ public:
                        << "END";
         db_->execute(delete_trigger.str());
 
-        // Populate FTS from existing data
-        std::ostringstream populate_sql;
-        populate_sql << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
-                     << "SELECT id, " << column_name << " FROM " << model_table
-                     << " WHERE " << column_name << " IS NOT NULL";
-        db_->execute(populate_sql.str());
+        // Populate FTS from existing data (only on first creation)
+        if (!table_exists) {
+            std::ostringstream populate_sql;
+            populate_sql << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
+                         << "SELECT id, " << column_name << " FROM " << model_table
+                         << " WHERE " << column_name << " IS NOT NULL";
+            db_->execute(populate_sql.str());
+        }
     }
 
     /// Ensure all FTS5 tables exist for a set of model schemas.
@@ -2476,6 +2500,9 @@ private:
                     ensure_geo_bounds_list_table(schema.table_name, prop.name);
                 }
             }
+            // Retroactive safety: ensure audit triggers exist — a previous bug in
+            // rebuild_table could silently drop them during schema migration.
+            ensure_audit_triggers(schema);
             return;
         }
 
@@ -2550,6 +2577,16 @@ private:
         }
     }
 
+    void ensure_audit_triggers(const model_schema& schema) {
+        // Quick check: if the insert trigger exists, all three do.
+        auto rows = db_->query(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='Audit"
+            + schema.table_name + "Insert' LIMIT 1");
+        if (rows.empty()) {
+            recreate_model_table_triggers(schema);
+        }
+    }
+
     void recreate_model_table_triggers(const model_schema& schema) {
         // Drop existing triggers
         drop_model_table_triggers(schema.table_name);
@@ -2580,13 +2617,28 @@ private:
         const std::string& table = schema.table_name;
         std::string tmp = table + "_old";
 
-        // 1. Rename existing table
+        // 1. Drop ALL triggers on this table before rename — SQLite preserves
+        //    trigger names after ALTER TABLE RENAME, so CREATE TRIGGER IF NOT
+        //    EXISTS would skip creation, leaving the new table without triggers
+        //    once the old table (and its triggers) are dropped. This affects
+        //    AuditLog, FTS5, vec0, and R*Tree sync triggers.
+        {
+            auto trigger_rows = db_->query(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='"
+                + table + "'");
+            for (const auto& row : trigger_rows) {
+                db_->execute("DROP TRIGGER IF EXISTS "
+                             + std::get<std::string>(row.at("name")));
+            }
+        }
+
+        // 2. Rename existing table
         db_->execute("ALTER TABLE " + table + " RENAME TO " + tmp);
 
-        // 2. Create new table with correct schema
+        // 3. Create new table with correct schema (including fresh triggers)
         create_model_table(schema);
 
-        // 3. Build column lists for INSERT
+        // 4. Build column lists for INSERT
         // - dest_cols: column names for the INSERT INTO clause
         // - src_exprs: expressions for the SELECT clause (column name or default value)
         std::vector<std::string> dest_cols;
@@ -2633,7 +2685,7 @@ private:
             }
         }
 
-        // 4. Copy data with defaults for new columns
+        // 5. Copy data with defaults for new columns
         std::string dest_str = dest_cols[0];
         std::string src_str = src_exprs[0];
         for (size_t i = 1; i < dest_cols.size(); ++i) {
@@ -2642,10 +2694,10 @@ private:
         }
         db_->execute("INSERT INTO " + table + " (" + dest_str + ") SELECT " + src_str + " FROM " + tmp);
 
-        // 5. Drop old table
+        // 6. Drop old table
         db_->execute("DROP TABLE " + tmp);
 
-        // 6. Populate rtree tables for geo_bounds properties (data now exists)
+        // 7. Populate rtree tables for geo_bounds properties (data now exists)
         for (const auto& prop : schema.properties) {
             if (prop.is_geo_bounds && prop.kind != property_kind::list) {
                 std::string rtree_table = "_" + table + "_" + prop.name + "_rtree";

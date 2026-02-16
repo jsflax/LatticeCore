@@ -551,15 +551,14 @@ public:
             });
     }
 
-    using swift_object_observer_callback = void (*)(void* context);
+    using swift_object_observer_callback = void (^)(const std::string& changed_fields_names);
 
     uint64_t add_object_observer(const std::string& table_name,
                                   int64_t row_id,
-                                  void* context,
                                   swift_object_observer_callback callback) {
         return lattice_db::add_object_observer(table_name, row_id,
-            [context, callback]() {
-                callback(context);
+            [callback](const std::string& changed_fields_names) {
+                callback(changed_fields_names);
             });
     }
 #else
@@ -578,15 +577,14 @@ public:
             });
     }
 
-    using object_observer_callback = std::function<void(void* context)>;
+    using object_observer_callback = std::function<void(const std::string& changed_fields_names)>;
 
     uint64_t add_object_observer(const std::string& table_name,
                                   int64_t row_id,
-                                  void* context,
                                   object_observer_callback callback) {
         return lattice_db::add_object_observer(table_name, row_id,
-            [context, callback]() {
-                callback(context);
+            [callback](const std::string& changed_fields_names) {
+                callback(changed_fields_names);
             });
     }
 #endif

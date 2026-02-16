@@ -8,6 +8,9 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <climits>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+#include <functional>
 
 namespace lattice {
 
@@ -32,6 +35,20 @@ static std::string derive_notification_key(const std::string& db_path) {
     return "com.lattice.db." + std::string(hex, CC_SHA256_DIGEST_LENGTH * 2);
 }
 
+/// Static registry for Darwin notification callbacks, keyed by token.
+/// The GCD block receives the token as a parameter and looks up the callback here,
+/// so it captures no C++ objects and is safe after the notifier is destroyed.
+// Intentionally leaked: prevents use-after-destroy when GCD callbacks
+// fire during process teardown (after atexit handlers run).
+static std::mutex& callback_registry_mutex() {
+    static auto* m = new std::mutex();
+    return *m;
+}
+static std::unordered_map<int, std::function<void()>>& callback_registry() {
+    static auto* r = new std::unordered_map<int, std::function<void()>>();
+    return *r;
+}
+
 class darwin_cross_process_notifier final : public cross_process_notifier {
 public:
     explicit darwin_cross_process_notifier(const std::string& db_path)
@@ -51,20 +68,28 @@ public:
     void start_listening(std::function<void()> callback) override {
         if (listening_) return;
 
-        callback_ = std::move(callback);
-
         uint32_t status = notify_register_dispatch(
             key_.c_str(),
             &token_,
             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
-            ^(int) {
-                if (callback_) {
-                    callback_();
+            ^(int token) {
+                // Look up callback from static registry — no C++ captures in this block.
+                std::function<void()> cb;
+                {
+                    std::lock_guard<std::mutex> lock(callback_registry_mutex());
+                    auto it = callback_registry().find(token);
+                    if (it == callback_registry().end()) return;
+                    cb = it->second;
                 }
+                cb();
             }
         );
 
         if (status == NOTIFY_STATUS_OK) {
+            {
+                std::lock_guard<std::mutex> lock(callback_registry_mutex());
+                callback_registry()[token_] = std::move(callback);
+            }
             listening_ = true;
             LOG_DEBUG("xproc", "Darwin listener registered for: %s", key_.c_str());
         } else {
@@ -74,9 +99,14 @@ public:
 
     void stop_listening() override {
         if (!listening_) return;
+        // Remove from registry BEFORE cancelling, so any in-flight block
+        // that hasn't read the registry yet will find nothing.
+        {
+            std::lock_guard<std::mutex> lock(callback_registry_mutex());
+            callback_registry().erase(token_);
+        }
         notify_cancel(token_);
         listening_ = false;
-        callback_ = nullptr;
         LOG_DEBUG("xproc", "Darwin listener cancelled for: %s", key_.c_str());
     }
 
@@ -88,7 +118,6 @@ private:
     std::string key_;
     int token_ = 0;
     bool listening_ = false;
-    std::function<void()> callback_;
 };
 
 std::unique_ptr<cross_process_notifier> make_cross_process_notifier(const std::string& db_path) {

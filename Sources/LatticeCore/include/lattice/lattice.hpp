@@ -1062,6 +1062,21 @@ public:
         auto instances = instance_registry::instance().get_instances(config_.path);
         LOG_DEBUG("flush_changes", "Found %zu instances for path: %s", instances.size(), config_.path.c_str());
 
+        // Advance cross-process cursor BEFORE notifying observers.
+        // A stale GCD callback from a previous post_notification() may fire on
+        // a background thread during our synchronous observer dispatch below.
+        // If the cursor isn't bumped yet, that callback would find the new audit
+        // entries and duplicate the notifications.
+        if (xproc_notifier_) {
+            auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
+            if (!max_rows.empty()) {
+                auto it = max_rows[0].find("max_id");
+                if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                    last_seen_audit_id_ = std::get<int64_t>(it->second);
+                }
+            }
+        }
+
         // Notify observers on all instances for each buffered change
         for (const auto& [table, op, row_id, global_id] : changes) {
             LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s", table.c_str(), op.c_str());
@@ -1108,20 +1123,9 @@ public:
             }
         }
 
-        // Update cross-process cursor and post notification
-        if (xproc_notifier_) {
-            // Advance cursor to current max so our own notification bounces back as a no-op
-            auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
-            if (!max_rows.empty()) {
-                auto it = max_rows[0].find("max_id");
-                if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    last_seen_audit_id_ = std::get<int64_t>(it->second);
-                }
-            }
-
-            if (!config_.read_only) {
-                xproc_notifier_->post_notification();
-            }
+        // Post cross-process notification (cursor already advanced above)
+        if (xproc_notifier_ && !config_.read_only) {
+            xproc_notifier_->post_notification();
         }
 
         {
@@ -1191,7 +1195,7 @@ public:
     /// Register an observer for a specific object (by table and row ID)
     /// Returns an ID that can be used to unregister
     observer_id add_object_observer(const std::string& table_name, int64_t row_id,
-                                     std::function<void()> callback) {
+                                     std::function<void(const std::string&)> callback) {
         std::lock_guard<std::mutex> lock(object_observers_mutex_);
         auto id = next_observer_id_++;
         object_observers_[table_name][row_id].emplace_back(id, std::move(callback));
@@ -1238,7 +1242,8 @@ public:
     void notify_change(const std::string& table_name,
                        const std::string& operation,
                        int64_t row_id,
-                       const std::string& global_row_id) {
+                       const std::string& global_row_id,
+                       const std::string& changed_fields_names = "") {
         std::vector<std::function<void()>> callbacks;
 
         // Collect table-level observers
@@ -1262,7 +1267,9 @@ public:
                 auto row_it = table_it->second.find(row_id);
                 if (row_it != table_it->second.end()) {
                     for (const auto& [id, callback] : row_it->second) {
-                        callbacks.push_back(callback);
+                        callbacks.push_back([callback, changed_fields_names] {
+                            callback(changed_fields_names);
+                        });
                     }
                 }
             }
@@ -2231,7 +2238,7 @@ private:
     // Per-object observer storage (for individual model observation)
     // Maps: tableName -> rowId -> [observer callbacks]
     std::mutex object_observers_mutex_;
-    std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void()>>>>> object_observers_;
+    std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void(const std::string&)>>>>> object_observers_;
 
     // Setup hooks for change notifications
     // Update hook buffers changes, WAL hook flushes on commit (matches Swift's pattern)
@@ -2241,7 +2248,9 @@ private:
     std::unique_ptr<cross_process_notifier> xproc_notifier_;
     int64_t last_seen_audit_id_ = 0;
     void setup_cross_process_notifier();
+public:
     void handle_cross_process_notification();
+private:
 
     void ensure_tables() {
         // First create sync control table and register sync_disabled() function
@@ -3779,14 +3788,15 @@ namespace lattice {
 // ============================================================================
 
 inline lattice_db::~lattice_db() {
-    // Stop cross-process listener before teardown
+    // Unregister from instance registry FIRST so that any stale GCD callbacks
+    // from the cross-process notifier can't find us via get_instances().
+    instance_registry::instance().unregister_instance(config_.path, this);
+
+    // Stop cross-process listener after unregistering
     if (xproc_notifier_) {
         xproc_notifier_->stop_listening();
         xproc_notifier_.reset();
     }
-
-    // Unregister from instance registry
-    instance_registry::instance().unregister_instance(config_.path, this);
 
     // Disconnect synchronizer before destroying
     if (synchronizer_) {

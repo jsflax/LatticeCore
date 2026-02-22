@@ -1409,7 +1409,7 @@ public:
             auto tables = db_->query(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name NOT LIKE 'sqlite_%' "
-                "AND name NOT IN ('AuditLog', '_SyncControl') "
+                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta') "
                 "AND name NOT LIKE '%_vec0' "
                 "AND name NOT LIKE '%_rtree%' "
                 "AND name NOT LIKE '\\_%' ESCAPE '\\'");

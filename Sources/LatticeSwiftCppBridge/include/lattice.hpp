@@ -9,7 +9,7 @@
 #include <dynamic_object.hpp>
 #include <list.hpp>
 
-#ifdef __BLOCKS__
+#if defined(__BLOCKS__) && defined(__APPLE__)
 #include <Block.h>
 #endif
 

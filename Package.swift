@@ -43,7 +43,8 @@ let package = Package(
                 .define("SQLITE_VEC_ENABLE_NEON", .when(platforms: [.macOS, .iOS])),
             ],
             linkerSettings: [
-                .linkedLibrary("sqlite3")
+                .linkedLibrary("sqlite3"),
+                .linkedLibrary("m", .when(platforms: [.linux])),
             ]
         ),
         .target(
@@ -54,10 +55,13 @@ let package = Package(
             publicHeadersPath: "include",
             cxxSettings: [
                 .headerSearchPath("include"),
-                .unsafeFlags(["-std=c++20"])
+                .define("SQLITE_CORE"),
+                .unsafeFlags(["-std=c++20"]),
+                .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
             ],
             linkerSettings: [
-                .linkedLibrary("sqlite3")
+                .linkedLibrary("sqlite3"),
+                .linkedLibrary("m", .when(platforms: [.linux])),
             ]
         ),
         .target(name: "LatticeSwiftModule"),
@@ -69,7 +73,9 @@ let package = Package(
             publicHeadersPath: "include",
             cxxSettings: [
                 .headerSearchPath("include"),
-                .unsafeFlags(["-std=c++20"])
+                .headerSearchPath("../LatticeCore/include"),
+                .unsafeFlags(["-std=c++20"]),
+                .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
@@ -85,7 +91,8 @@ let package = Package(
                 .headerSearchPath("include"),
                 .headerSearchPath("../LatticeSwiftCppBridge/include"),
                 .headerSearchPath("../LatticeCore/include"),
-                .unsafeFlags(["-std=c++20"])
+                .unsafeFlags(["-std=c++20"]),
+                .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS]))
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
@@ -100,7 +107,8 @@ let package = Package(
                 .headerSearchPath("vendor"),
                 .define("ASIO_STANDALONE"),
                 .define("_WEBSOCKETPP_CPP11_THREAD_"),
-                .unsafeFlags(["-std=c++20"])
+                .unsafeFlags(["-std=c++20"]),
+                .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")

@@ -1,0 +1,14 @@
+module LatticeCore {
+    textual header "LatticeCpp.hpp"
+    textual header "lattice/db.hpp"
+    textual header "lattice/lattice.hpp"
+    textual header "lattice/log.hpp"
+    textual header "lattice/managed.hpp"
+    textual header "lattice/network.hpp"
+    textual header "lattice/observation.hpp"
+    textual header "lattice/scheduler.hpp"
+    textual header "lattice/schema.hpp"
+    textual header "lattice/sync.hpp"
+    textual header "lattice/types.hpp"
+    export *
+}

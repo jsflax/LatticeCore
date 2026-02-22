@@ -1,0 +1,23 @@
+name: Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: swiftlang/swift:nightly-main-noble
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y libsqlite3-dev
+
+      - name: Build
+        run: swift build --target LatticeCppTests
+
+      - name: Run C++ tests
+        run: swift run LatticeCppTests

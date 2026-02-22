@@ -10,8 +10,11 @@
 #ifdef __cplusplus
 
 #if __has_include(<swift/bridging.hpp>)
-    // Real Swift bridging available (Swift Package Manager build)
+    // Real Swift bridging available (macOS Swift Package Manager build)
     #include <swift/bridging.hpp>
+#elif __has_include(<swift/bridging>)
+    // Real Swift bridging available (Linux Swift toolchain)
+    #include <swift/bridging>
 #else
     // Stub definitions for non-Swift builds (CMake, etc.)
     #ifndef SWIFT_SHARED_REFERENCE

@@ -1,0 +1,4 @@
+module SqliteVec {
+    textual header "sqlite-vec.h"
+    export *
+}

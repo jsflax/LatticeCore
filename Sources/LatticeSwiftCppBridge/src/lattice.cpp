@@ -9,6 +9,11 @@
 static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;
 static thread_local std::shared_ptr<lattice::dynamic_object> g_migration_lookup_result;
 
+// Thread-local state for row migration callback refs
+// Set before calling the row migration callback, read by Swift via accessor functions.
+static thread_local lattice::dynamic_object_ref* g_migration_old_row = nullptr;
+static thread_local lattice::dynamic_object_ref* g_migration_new_row = nullptr;
+
 // Log level control
 void lattice_set_log_level(lattice::log_level level) {
     lattice::set_log_level(level);
@@ -129,8 +134,11 @@ void dynamic_object::manage(managed<swift_dynamic_object> o) {
 // Construct with swift_configuration (includes row migration callback)
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
     : lattice_db(config), swift_config_(config) {
+    LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
     if (!config.read_only) {
+        LOG_DEBUG("swift_lattice", "ensure_swift_tables");
         ensure_swift_tables(schemas);
+        LOG_DEBUG("swift_lattice", "ensure_swift_tables done");
     } else {
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
@@ -138,6 +146,7 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
             constraints_[entry.table_name] = entry.constraints;
         }
     }
+    LOG_DEBUG("swift_lattice", "ctor done");
 }
 
 swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& schemas)
@@ -155,9 +164,11 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
 
 void swift_lattice::add(dynamic_object &obj) {
     if (obj.lattice) {
+        LOG_ERROR("swift_lattice", "Cannot add already managed object (table: %s)", obj.unmanaged_.table_name.c_str());
         throw std::runtime_error("Cannot add already managed object");
     }
     if (obj.deleted_) {
+        LOG_ERROR("swift_lattice", "Cannot add a deleted object (table: %s)", obj.unmanaged_.table_name.c_str());
         throw std::runtime_error("Cannot add a deleted object");
     }
     auto& unmanaged_obj = obj.unmanaged_;
@@ -200,6 +211,7 @@ void swift_lattice::add_bulk(std::vector<dynamic_object_ref*>& objects) {
     }
     for (auto& o : objects) {
         if (o->impl_->deleted_) {
+            LOG_ERROR("swift_lattice", "Cannot add a deleted object in add_bulk (ref)");
             throw std::runtime_error("Cannot add a deleted object");
         }
     }
@@ -229,6 +241,7 @@ void swift_lattice::add_bulk(std::vector<dynamic_object*>& objects) {
     }
     // Check that first object is not already managed
     if (objects[0]->lattice) {
+        LOG_ERROR("swift_lattice", "Cannot add already managed object in add_bulk(ptr)");
         throw std::runtime_error("Cannot add already managed object");
     }
     // Use schema from first object (all objects in the batch should have the same schema)
@@ -237,9 +250,11 @@ void swift_lattice::add_bulk(std::vector<dynamic_object*>& objects) {
     std::vector<swift_dynamic_object> v;
     for (auto& o : objects) {
         if (o->lattice) {
+            LOG_ERROR("swift_lattice", "Cannot add already managed object in add_bulk(ptr) loop");
             throw std::runtime_error("Cannot add already managed object");
         }
         if (o->deleted_) {
+            LOG_ERROR("swift_lattice", "Cannot add a deleted object in add_bulk(ptr) loop");
             throw std::runtime_error("Cannot add a deleted object");
         }
         v.push_back(o->unmanaged_);
@@ -323,10 +338,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
         // For each existing table, check if it needs migration at this version
         for (const auto& table_name : existing_tables) {
-            // Ask Swift for old/new schema pair for this table at this version
-            auto schema_pair_opt = swift_config_.get_schema_pair_block
-                ? swift_config_.get_schema_pair_block(table_name, version)
-                : std::nullopt;
+            // Look up old/new schema pair for this table at this version
+            auto schema_pair_opt = swift_config_.lookupMigrationSchema(table_name, version);
 
             if (!schema_pair_opt) {
                 // No migration defined for this table at this version
@@ -390,8 +403,12 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                 });
                 
                 // Call Swift migration callback
-                if (swift_config_.row_migration_block) {
-                    swift_config_.row_migration_block(table_name, old_ref, new_ref);
+                if (swift_config_.row_migration_fn_) {
+                    g_migration_old_row = old_ref;
+                    g_migration_new_row = new_ref;
+                    swift_config_.row_migration_fn_(table_name, old_ref, new_ref);
+                    g_migration_old_row = nullptr;
+                    g_migration_new_row = nullptr;
                 }
 
                 // Collect new values for update
@@ -448,7 +465,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     if (parent_gid.empty() || child_gid.empty()) continue;
 
                     std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + link_name;
-                    ensure_link_table(link_table);
+                    ensure_link_table(link_table, table_name);
                     db().execute("INSERT OR REPLACE INTO " + link_table +
                         " (lhs, rhs) VALUES ('" + parent_gid + "', '" + child_gid + "')");
                 }
@@ -463,7 +480,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     if (prop.kind != property_kind::list || prop.is_geo_bounds) continue;
 
                     std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + list_name;
-                    ensure_link_table(link_table);
+                    ensure_link_table(link_table, table_name);
 
                     for (auto& elem_ptr : list_ptr->unmanaged_) {
                         if (!elem_ptr) continue;
@@ -551,6 +568,7 @@ void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
     }
     // Check that first object is not already managed
     if (objects[0].lattice) {
+        LOG_ERROR("swift_lattice", "Cannot add already managed object in add_bulk(val)");
         throw std::runtime_error("Cannot add already managed object");
     }
     // Use schema from first object (all objects in the batch should have the same schema)
@@ -559,9 +577,11 @@ void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
     std::vector<swift_dynamic_object> v;
     for (auto& o : objects) {
         if (o.lattice) {
+            LOG_ERROR("swift_lattice", "Cannot add already managed object in add_bulk(val) loop");
             throw std::runtime_error("Cannot add already managed object");
         }
         if (o.deleted_) {
+            LOG_ERROR("swift_lattice", "Cannot add a deleted object in add_bulk(val) loop");
             throw std::runtime_error("Cannot add a deleted object");
         }
         v.push_back(o.unmanaged_);
@@ -646,4 +666,12 @@ lattice::dynamic_object_ref* lattice::migration_take_lookup_result() {
     auto result = g_migration_lookup_result;
     g_migration_lookup_result = nullptr;
     return dynamic_object_ref::wrap(result);
+}
+
+lattice::dynamic_object_ref* lattice::migration_get_old_row() {
+    return g_migration_old_row;
+}
+
+lattice::dynamic_object_ref* lattice::migration_get_new_row() {
+    return g_migration_new_row;
 }

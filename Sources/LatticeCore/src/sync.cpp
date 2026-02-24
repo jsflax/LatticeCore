@@ -590,37 +590,50 @@ void synchronizer::on_websocket_open() {
 }
 
 void synchronizer::on_websocket_message(const websocket_message& msg) {
-    std::string json_str = msg.as_string();
+    // Wrap in try-catch: this is called from Swift via the WebSocket callback.
+    // C++ exceptions must NOT propagate across the Swift/C++ boundary — that
+    // causes std::terminate() → SIGTRAP.
+    try {
+        std::string json_str = msg.as_string();
 
-    auto event = server_sent_event::from_json(json_str);
-    if (!event) {
+        auto event = server_sent_event::from_json(json_str);
+        if (!event) {
+            if (on_error_) {
+                scheduler_->invoke([this] { on_error_("Failed to parse server message"); });
+            }
+            return;
+        }
+
+        if (event->event_type == server_sent_event::type::audit_log) {
+            // Apply remote changes
+            apply_remote_changes(event->audit_logs);
+
+            // Send acknowledgment
+            std::vector<std::string> ids;
+            for (const auto& entry : event->audit_logs) {
+                ids.push_back(entry.global_id);
+            }
+            auto ack = server_sent_event::make_ack(ids);
+            auto json = ack.to_json();
+            ws_client_->send(websocket_message::from_binary({json.begin(), json.end()}));
+
+        } else if (event->event_type == server_sent_event::type::ack) {
+            // Mark local entries as synchronized
+            mark_as_synced(event->acked_ids);
+
+            if (on_sync_complete_) {
+                std::vector<std::string> ids = event->acked_ids;
+                scheduler_->invoke([this, ids] { on_sync_complete_(ids); });
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("synchronizer", "on_websocket_message failed: %s", e.what());
         if (on_error_) {
-            scheduler_->invoke([this] { on_error_("Failed to parse server message"); });
+            std::string error_msg = e.what();
+            scheduler_->invoke([this, error_msg] { on_error_("WebSocket message handling failed: " + error_msg); });
         }
-        return;
-    }
-
-    if (event->event_type == server_sent_event::type::audit_log) {
-        // Apply remote changes
-        apply_remote_changes(event->audit_logs);
-
-        // Send acknowledgment
-        std::vector<std::string> ids;
-        for (const auto& entry : event->audit_logs) {
-            ids.push_back(entry.global_id);
-        }
-        auto ack = server_sent_event::make_ack(ids);
-        auto json = ack.to_json();
-        ws_client_->send(websocket_message::from_binary({json.begin(), json.end()}));
-
-    } else if (event->event_type == server_sent_event::type::ack) {
-        // Mark local entries as synchronized
-        mark_as_synced(event->acked_ids);
-
-        if (on_sync_complete_) {
-            std::vector<std::string> ids = event->acked_ids;
-            scheduler_->invoke([this, ids] { on_sync_complete_(ids); });
-        }
+    } catch (...) {
+        LOG_ERROR("synchronizer", "on_websocket_message failed with unknown error");
     }
 }
 
@@ -650,6 +663,10 @@ void synchronizer::upload_pending_changes() {
     auto entries = query_audit_log(db_.db(), true);
 
     LOG_DEBUG("synchronizer", "Found %zu unsynced entries", entries.size());
+    for (const auto& e : entries) {
+        LOG_DEBUG("synchronizer", "  unsynced: id=%lld table=%s op=%s globalId=%s",
+                  (long long)e.id, e.table_name.c_str(), e.operation.c_str(), e.global_id.c_str());
+    }
     if (entries.empty()) return;
 
     // Chunk into batches
@@ -665,14 +682,15 @@ void synchronizer::upload_pending_changes() {
 }
 
 void synchronizer::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
-    // Disable sync triggers while applying remote changes
-    db_.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-
     // Track which global IDs we actually inserted (for observer notification)
     std::vector<std::string> inserted_global_ids;
 
     try {
         db_.db().begin_transaction();
+
+        // Disable sync triggers while applying remote changes (inside transaction
+        // so the write lock is already held and rollback reverts if anything fails)
+        db_.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
 
         for (const auto& entry : entries) {
             // Check if we already have this audit entry (prevent duplicates)
@@ -690,10 +708,14 @@ void synchronizer::apply_remote_changes(const std::vector<audit_log_entry>& entr
             // Generate and execute the SQL instruction
             auto schema = db_.get_table_schema(entry.table_name);
             auto [sql, params] = entry.generate_instruction(schema);
+            LOG_DEBUG("apply_remote", "table=%s op=%s globalRowId=%s sql=%s",
+                      entry.table_name.c_str(), entry.operation.c_str(),
+                      entry.global_row_id.c_str(), sql.c_str());
             if (!sql.empty()) {
                 try {
                     db_.db().execute(sql, params);
                 } catch (const std::exception& e) {
+                    LOG_ERROR("apply_remote", "Failed: %s (SQL: %s)", e.what(), sql.c_str());
                     // Log error but continue with other entries
                     if (on_error_) {
                         scheduler_->invoke([this, msg = std::string(e.what())] {
@@ -724,14 +746,14 @@ void synchronizer::apply_remote_changes(const std::vector<audit_log_entry>& entr
             inserted_global_ids.push_back(entry.global_id);
         }
 
+        // Re-enable sync triggers (inside transaction so no separate lock needed)
+        db_.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+
         db_.db().commit();
     } catch (...) {
         db_.db().rollback();
         throw;
     }
-
-    // Re-enable sync triggers
-    db_.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
 
     // Note: AuditLog observer notifications are now handled by flush_changes()
     // which queries for AuditLog entries corresponding to each model table change
@@ -841,23 +863,58 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 }
 
 void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& global_ids) {
-    for (const auto& gid : global_ids) {
-        // Get the row ID before updating
-        auto rows = db.db().query(
-            "SELECT id FROM AuditLog WHERE globalId = ?",
-            {gid}
-        );
+    // Collect row IDs for observer notification after commit
+    std::vector<std::pair<int64_t, std::string>> notify_list;
 
-        db.db().execute("UPDATE AuditLog SET isSynchronized = 1 WHERE globalId = ?", {gid});
+    // begin_transaction() has 30-second retry logic for SQLITE_BUSY/SQLITE_LOCKED
+    // and for TOCTOU races (another thread holds a transaction on this connection).
+    // If we're already inside a transaction (e.g. called from receive_sync_data),
+    // don't start a nested one — just do the work in the existing transaction.
+    bool own_transaction = false;
+    if (!db.db().is_in_transaction()) {
+        db.db().begin_transaction();
+        own_transaction = true;
+    }
 
-        // Notify observers of the update (update hook skips AuditLog table)
-        if (!rows.empty()) {
+    try {
+        for (const auto& gid : global_ids) {
+            // Check current state — skip if already synced (avoids spurious
+            // observer notifications when ACKs are forwarded by the server)
+            auto rows = db.db().query(
+                "SELECT id, isSynchronized FROM AuditLog WHERE globalId = ?",
+                {gid}
+            );
+
+            if (rows.empty()) continue;
+
+            auto synced_it = rows[0].find("isSynchronized");
+            bool already_synced = synced_it != rows[0].end() &&
+                std::holds_alternative<int64_t>(synced_it->second) &&
+                std::get<int64_t>(synced_it->second) != 0;
+
+            if (already_synced) continue;
+
+            db.db().execute("UPDATE AuditLog SET isSynchronized = 1 WHERE globalId = ?", {gid});
+
             auto it = rows[0].find("id");
             if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                int64_t row_id = std::get<int64_t>(it->second);
-                db.notify_change("AuditLog", "UPDATE", row_id, gid);
+                notify_list.emplace_back(std::get<int64_t>(it->second), gid);
             }
         }
+
+        if (own_transaction) {
+            db.db().commit();
+        }
+    } catch (...) {
+        if (own_transaction && db.db().is_in_transaction()) {
+            try { db.db().rollback(); } catch (...) {}
+        }
+        throw;
+    }
+
+    // Notify observers after commit (update hook skips AuditLog table)
+    for (const auto& [row_id, gid] : notify_list) {
+        db.notify_change("AuditLog", "UPDATE", row_id, gid);
     }
 }
 

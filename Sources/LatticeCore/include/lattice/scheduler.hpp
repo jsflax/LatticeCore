@@ -49,8 +49,21 @@ struct scheduler {
 
 class generic_scheduler : public scheduler {
 public:
-#ifdef __BLOCKS__
-    // Block-based constructor for Apple platforms (Swift interop)
+    // C function pointer constructor (portable, Swift-safe on all platforms).
+    // invoke_fn receives a void* work item and scheduler context.
+    // Call execute_work(work) to run and free the work item.
+    generic_scheduler(void* context,
+                      void (*invoke_fn)(void* work, void* ctx),
+                      bool (*is_on_thread_fn)(void*),
+                      bool (*is_same_as_fn)(const scheduler*, void*),
+                      bool (*can_invoke_fn)(void*),
+                      void (*destroy_fn)(void*) = nullptr);
+
+    // Run and free a work item received by invoke_fn.
+    static void execute_work(void* work);
+
+#if defined(__BLOCKS__) && !defined(__swift__)
+    // Block-based constructor (C++ callers on platforms with blocks)
     generic_scheduler(void* context,
                       void (^invoke_fn)(std::function<void()>&&, void*),
                       bool (*is_on_thread_fn)(void*),
@@ -68,7 +81,8 @@ public:
     {}
 #endif
 
-    // std::function-based constructor (portable)
+#ifndef __swift__
+    // std::function-based constructor (for C++ callers and internal make_shared)
     generic_scheduler(void* context,
                       std::function<void(std::function<void()>&&, void*)> invoke_fn,
                       bool (*is_on_thread_fn)(void*),
@@ -82,7 +96,8 @@ public:
         , can_invoke_fn_(can_invoke_fn)
         , destroy_fn_(destroy_fn)
     {}
-    
+#endif
+
     ~generic_scheduler() override {
         if (destroy_fn_ && context_) {
             destroy_fn_(context_);
@@ -105,15 +120,11 @@ public:
         return can_invoke_fn_(context_);
     }
 
-    std::shared_ptr<scheduler> make_shared() const {
-        return std::make_shared<generic_scheduler>(context_, invoke_fn_, is_on_thread_fn_, is_same_as_fn_,
-                                                   can_invoke_fn_, destroy_fn_);
-    }
-    
+    std::shared_ptr<scheduler> make_shared() const;
+
     void* context_;
 private:
     std::function<void(std::function<void()>&&, void*)> invoke_fn_;
-//    void (*invoke_fn_)(std::function<void()>&&, void*);
     bool (*is_on_thread_fn_)(void*);
     bool (*is_same_as_fn_)(const scheduler*, void*);
     bool (*can_invoke_fn_)(void*);

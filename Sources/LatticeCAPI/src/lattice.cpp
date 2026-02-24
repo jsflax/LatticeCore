@@ -801,7 +801,8 @@ extern "C" uint64_t lattice_db_observe_object(
     if (!db || !table_name || !callback) return 0;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        return db_ref->get()->add_object_observer(std::string(table_name), row_id,
+        // Cast to base class to avoid name hiding from swift_lattice's block-based overload
+        return static_cast<lattice::lattice_db*>(db_ref->get())->add_object_observer(std::string(table_name), row_id,
             [context, callback](const std::string&) { callback(context); });
     } catch (...) {
         return 0;

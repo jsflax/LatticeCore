@@ -9,7 +9,7 @@
 #include <dynamic_object.hpp>
 #include <list.hpp>
 
-#if defined(__BLOCKS__) && defined(__APPLE__)
+#if defined(__BLOCKS__) && defined(__APPLE__) && !defined(__swift__)
 #include <Block.h>
 #endif
 
@@ -239,35 +239,75 @@ inline std::optional<std::vector<uint8_t>> column_value_as_blob(const column_val
 // (Defined early so swift_configuration can use it)
 // ============================================================================
 
-#ifdef __BLOCKS__
-/// Row migration callback for Swift interop.
-using swift_row_migration_callback = void (^)(const std::string& table_name,
-                                               dynamic_object_ref* old_row,
-                                               dynamic_object_ref* new_row);
-#else
-using swift_row_migration_callback = std::function<void(const std::string& table_name,
-                                                         dynamic_object_ref* old_row,
-                                                         dynamic_object_ref* new_row)>;
-#endif
-
 /// Swift-specific configuration that extends the core configuration.
-/// Note: Copy is deleted - the block is owned by Swift.
 struct swift_configuration : public configuration {
     struct SchemaPair { SwiftSchema from, to; };
-    
-    void setGetOldAndNewSchemaForVersionBlock(std::optional<SchemaPair> (^block) (const std::string& table_name, size_t version_number)) {
-        get_schema_pair_block = [block = std::move(block)](const std::string& table_name, size_t version_number) {
+
+    // Pre-populate migration schema pairs (eliminates block callback).
+    // Called from Swift for each table+version that has a schema change.
+    void addMigrationSchema(size_t version, const std::string& table_name,
+                           const SwiftSchema& from, const SwiftSchema& to) {
+        migration_schemas_[version][table_name] = SchemaPair{from, to};
+    }
+
+    // C function pointer callback for row migration (Swift-visible).
+    // Follows the same pattern as generic_scheduler: void* context + C fn pointers.
+    // During the callback, call migration_get_old_row() / migration_get_new_row()
+    // to access the current row refs.
+    void setRowMigrationCallback(
+        void* context,
+        void (*callback)(const char* table_name, void* ctx),
+        void (*destroy)(void*) = nullptr
+    ) {
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        row_migration_fn_ = [shared_ctx, cb](const std::string& table_name,
+                                              dynamic_object_ref*,
+                                              dynamic_object_ref*) {
+            cb(table_name.c_str(), shared_ctx.get());
+        };
+    }
+
+#if defined(__BLOCKS__) && !defined(__swift__)
+    // Block-based setters (C++ callers on Apple only — hidden from Swift)
+    void setGetOldAndNewSchemaForVersionBlock(
+        std::optional<SchemaPair> (^block)(const std::string& table_name, size_t version_number)
+    ) {
+        get_schema_pair_fn_ = [block](const std::string& table_name, size_t version_number) {
             return block(table_name, version_number);
         };
     }
-    
-    void setRowMigrationBlock(swift_row_migration_callback row_migration_block) SWIFT_COMPUTED_PROPERTY {
-        this->row_migration_block = [row_migration_block = std::move(row_migration_block)]
-        (const std::string& table_name, dynamic_object_ref* old_row, dynamic_object_ref* new_row) {
-            row_migration_block(table_name, old_row, new_row);
+
+    void setRowMigrationBlock(
+        void (^block)(const std::string& table_name,
+                      dynamic_object_ref* old_row,
+                      dynamic_object_ref* new_row)
+    ) SWIFT_COMPUTED_PROPERTY {
+        row_migration_fn_ = [block](const std::string& table_name,
+                                     dynamic_object_ref* old_row,
+                                     dynamic_object_ref* new_row) {
+            block(table_name, old_row, new_row);
         };
     }
-    
+#endif
+
+    // Internal schema lookup (used by C++ migration code)
+    std::optional<SchemaPair> lookupMigrationSchema(const std::string& table_name, size_t version) const {
+        // Check pre-populated data first
+        auto vit = migration_schemas_.find(version);
+        if (vit != migration_schemas_.end()) {
+            auto tit = vit->second.find(table_name);
+            if (tit != vit->second.end()) {
+                return tit->second;
+            }
+        }
+        // Fall back to callback (C++ callers)
+        if (get_schema_pair_fn_) {
+            return get_schema_pair_fn_(table_name, version);
+        }
+        return std::nullopt;
+    }
+
     // Default - in-memory
     swift_configuration() = default;
 
@@ -288,19 +328,14 @@ struct swift_configuration : public configuration {
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
 
-    // Move only - copy is deleted
-    swift_configuration(const swift_configuration&) = default;
-    swift_configuration(swift_configuration&&) = default;
-    swift_configuration& operator=(const swift_configuration&) = default;
-    swift_configuration& operator=(swift_configuration&&) = default;
-    ~swift_configuration() = default;
-
 private:
     std::function<void(const std::string& table_name,
                        dynamic_object_ref* old_row,
-                       dynamic_object_ref* new_row)> row_migration_block;
-    std::function<std::optional<SchemaPair>(const std::string& table_name, size_t version_number)> get_schema_pair_block;
-    
+                       dynamic_object_ref* new_row)> row_migration_fn_;
+    std::function<std::optional<SchemaPair>(const std::string& table_name,
+                                            size_t version_number)> get_schema_pair_fn_;
+    std::unordered_map<size_t, std::unordered_map<std::string, SchemaPair>> migration_schemas_;
+
     friend class swift_lattice;
 };
 
@@ -373,6 +408,9 @@ private:
 public:
     // Add with schema from the object instance
     void add(dynamic_object& obj);
+    void add(dynamic_object_ref* ref) {
+        add(*ref->impl_);
+    }
 
     void add_bulk(std::vector<dynamic_object>& objects);
     void add_bulk(std::vector<dynamic_object*>& objects);
@@ -455,6 +493,7 @@ public:
         for (const auto& row : rows) {
             auto type_it = row.find("_type");
             if (type_it == row.end()) {
+                LOG_ERROR("swift_lattice", "Bad query: row missing '_type' column");
                 throw std::runtime_error("Bad query");
             }
             auto table_name = std::get<std::string>(type_it->second);
@@ -506,6 +545,10 @@ public:
         sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
     }
 
+    /// Explicitly close all database connections and stop background services.
+    /// Call before deleting database files to avoid "vnode unlinked while in use".
+    void close() { lattice_db::close(); }
+
     /// Rebuild the database file, reclaiming unused space.
     /// Closes the read connection before vacuuming and reopens it after.
     void vacuum() {
@@ -535,8 +578,38 @@ public:
     // MARK: Observation API
     // ========================================================================
 
-#ifdef __BLOCKS__
-    // Block-based observers for Apple platforms (Swift interop)
+    // C function pointer observers (Swift-visible).
+    // Same pattern as generic_scheduler: void* context + C fn pointers.
+    uint64_t add_table_observer(const std::string& table_name,
+                                 void* context,
+                                 void (*callback)(void* ctx,
+                                                  const char* operation,
+                                                  int64_t row_id,
+                                                  const char* global_row_id),
+                                 void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        return lattice_db::add_table_observer(table_name,
+            [shared_ctx, cb](const std::string& op, int64_t row_id, const std::string& global_id) {
+                cb(shared_ctx.get(), op.c_str(), row_id, global_id.c_str());
+            });
+    }
+
+    uint64_t add_object_observer(const std::string& table_name,
+                                  int64_t row_id,
+                                  void* context,
+                                  void (*callback)(const char* changed_field_names, void* ctx),
+                                  void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        return lattice_db::add_object_observer(table_name, row_id,
+            [shared_ctx, cb](const std::string& changed_fields_names) {
+                cb(changed_fields_names.c_str(), shared_ctx.get());
+            });
+    }
+
+#if defined(__BLOCKS__) && !defined(__swift__)
+    // Block-based observers (C++ callers on Apple only — hidden from Swift)
     using swift_table_observer_callback = void (^)(void* context,
                                                    const std::string& operation,
                                                    int64_t row_id,
@@ -556,32 +629,6 @@ public:
     uint64_t add_object_observer(const std::string& table_name,
                                   int64_t row_id,
                                   swift_object_observer_callback callback) {
-        return lattice_db::add_object_observer(table_name, row_id,
-            [callback](const std::string& changed_fields_names) {
-                callback(changed_fields_names);
-            });
-    }
-#else
-    // Context-based observers for portable platforms (C API compatible)
-    using table_observer_callback = std::function<void(void* context,
-                                                        const std::string& operation,
-                                                        int64_t row_id,
-                                                        const std::string& global_row_id)>;
-
-    uint64_t add_table_observer(const std::string& table_name,
-                                 void* context,
-                                 table_observer_callback callback) {
-        return lattice_db::add_table_observer(table_name,
-            [context, callback](const std::string& op, int64_t row_id, const std::string& global_id) {
-                callback(context, op, row_id, global_id);
-            });
-    }
-
-    using object_observer_callback = std::function<void(const std::string& changed_fields_names)>;
-
-    uint64_t add_object_observer(const std::string& table_name,
-                                  int64_t row_id,
-                                  object_observer_callback callback) {
         return lattice_db::add_object_observer(table_name, row_id,
             [callback](const std::string& changed_fields_names) {
                 callback(changed_fields_names);
@@ -1627,6 +1674,7 @@ namespace detail {
         // Template to preserve swift_configuration type for constructor overload resolution
         template<typename ConfigT>
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
+            LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
             std::lock_guard<std::mutex> lock(mutex_);
 
             // Build schema hash from table names and properties (sorted for consistency)
@@ -1689,7 +1737,9 @@ namespace detail {
             }
 
             // Create new instance - ConfigT selects the right constructor
+            LOG_DEBUG("LatticeCache", "Creating new swift_lattice for path=%s", config.path.c_str());
             auto inst = std::make_shared<swift_lattice>(config, schemas);
+            LOG_DEBUG("LatticeCache", "swift_lattice created, ptr=%p", inst.get());
             key_cache_.emplace_back(key, inst);
             ptr_cache_[inst.get()] = inst;
             return inst;
@@ -1792,11 +1842,11 @@ public:
     /// - new_row: should be filled with transformed data
     static swift_lattice_ref* create(const swift_configuration& config, const SchemaVector& schemas)
         SWIFT_NAME(create(swiftConfig:schemas:)) {
-        // std::cerr << "[DEBUG] swift_lattice_ref::create() start" << std::endl;
+        LOG_DEBUG("swift_lattice_ref", "create() start path=%s schemas=%zu", config.path.c_str(), schemas.size());
         auto ref = new swift_lattice_ref();
-        // std::cerr << "[DEBUG] swift_lattice_ref::create() calling get_or_create_shared" << std::endl;
+        LOG_DEBUG("swift_lattice_ref", "create() calling get_or_create_shared");
         ref->impl_ = get_or_create_shared(config, schemas);
-        // std::cerr << "[DEBUG] swift_lattice_ref::create() done, returning ref" << std::endl;
+        LOG_DEBUG("swift_lattice_ref", "create() done, impl=%p", ref->impl_.get());
         return ref;
     }
 
@@ -1864,6 +1914,16 @@ bool migration_lookup_by_global_id(const std::string& table_name, const std::str
 /// Returns an empty ref if no lookup result is available.
 dynamic_object_ref* migration_take_lookup_result()
     SWIFT_NAME(migrationTakeLookupResult());
+
+/// Get the old row ref during a row migration callback.
+/// Only valid inside a setRowMigrationCallback callback.
+dynamic_object_ref* migration_get_old_row()
+    SWIFT_NAME(migrationGetOldRow());
+
+/// Get the new row ref during a row migration callback.
+/// Only valid inside a setRowMigrationCallback callback.
+dynamic_object_ref* migration_get_new_row()
+    SWIFT_NAME(migrationGetNewRow());
 
 } // namespace lattice
 

@@ -196,7 +196,10 @@ public:
     void set_on_close(on_close_handler handler) override { on_close_ = handler; }
 
     void trigger_on_open() { if (on_open_) on_open_(); }
-    void trigger_on_message(const websocket_message& msg) { if (on_message_) on_message_(msg); }
+    void trigger_on_message(const websocket_message& msg) {
+        if (on_message_)
+            on_message_(msg);
+    }
     void trigger_on_error(const std::string& error) { if (on_error_) on_error_(error); }
     void trigger_on_close(int code, const std::string& reason) { if (on_close_) on_close_(code, reason); }
 };

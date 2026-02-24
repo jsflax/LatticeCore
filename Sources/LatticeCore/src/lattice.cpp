@@ -6,6 +6,9 @@
 
 namespace lattice {
 
+// Single definition of the global log level (declared extern in log.hpp).
+std::atomic<log_level> g_log_level{log_level::off};
+
 // Singleton instance - defined here to ensure single copy across all translation units
 instance_registry& instance_registry::instance() {
     // Intentionally leaked: prevents use-after-destroy when GCD callbacks
@@ -43,10 +46,13 @@ void lattice_db::setup_change_hook() {
             // - File DBs: skip (let flush_changes handle it via WAL hook to avoid double notification)
             if (table == "AuditLog") {
                 if (self->config_.path == ":memory:" || self->config_.path.empty()) {
-                    LOG_DEBUG("update_hook", "AuditLog change (in-memory), notifying directly: op=%s rowid=%lld", op.c_str(), (long long)rowid);
-                    // Get globalId for the AuditLog entry
-                    std::string global_id;
-                    if (operation != SQLITE_DELETE) {
+                    // In-memory DBs: notify directly from update_hook.
+                    // flush_changes() can't handle this because it runs during the
+                    // model table's update_hook, BEFORE the AuditLog trigger fires.
+                    if (operation == SQLITE_INSERT) {
+                        LOG_DEBUG("update_hook", "AuditLog change (in-memory), notifying directly");
+                        // Get globalId for the AuditLog entry
+                        std::string global_id;
                         std::string sql = "SELECT globalId FROM AuditLog WHERE id = ?";
                         auto rows = self->db_->query(sql, {static_cast<int64_t>(rowid)});
                         if (!rows.empty()) {
@@ -55,17 +61,28 @@ void lattice_db::setup_change_hook() {
                                 global_id = std::get<std::string>(it->second);
                             }
                         }
+                        // In-memory databases each have their own isolated storage
+                        // despite sharing the ":memory:" path string, so only
+                        // notify this instance (matching flush_changes() behavior).
+                        self->notify_change("AuditLog", "INSERT", static_cast<int64_t>(rowid), global_id);
                     }
-                    self->notify_change("AuditLog", op, static_cast<int64_t>(rowid), global_id);
                 } else {
                     LOG_DEBUG("update_hook", "AuditLog change (file DB), skipping - WAL hook will handle");
+                    // Advance the cross-process cursor on ALL instances sharing
+                    // this path INSIDE the transaction, before the WAL commit
+                    // makes this entry visible to readers. This prevents
+                    // handle_cross_process_notification (on the inotify/GCD
+                    // thread) from seeing local entries and firing duplicate
+                    // observer callbacks — both on this instance and on other
+                    // same-process instances sharing the same database file.
+                    if (operation == SQLITE_INSERT) {
+                        auto all = instance_registry::instance().get_instances(self->config_.path);
+                        for (auto* inst : all) {
+                            inst->last_seen_audit_id_.store(
+                                static_cast<int64_t>(rowid), std::memory_order_release);
+                        }
+                    }
                 }
-                return;
-            }
-
-            // Skip link tables (they start with underscore and have no 'id' column)
-            if (!table.empty() && table[0] == '_') {
-                LOG_DEBUG("update_hook", "Skipping link table: %s", table_name);
                 return;
             }
 
@@ -74,9 +91,14 @@ void lattice_db::setup_change_hook() {
                 return;
             }
 
-            // Get the globalId for this row (only for model tables with 'id' column)
+            // Link tables start with underscore — they don't have a globalId column
+            // but we still buffer them so flush_changes() can find their AuditLog
+            // entries and notify the synchronizer.
+            bool is_link_table = !table.empty() && table[0] == '_';
+
+            // Get the globalId for this row (only for model tables)
             std::string global_id;
-            if (operation != SQLITE_DELETE) {
+            if (!is_link_table && operation != SQLITE_DELETE) {
                 std::string sql = "SELECT globalId FROM " + table + " WHERE id = ?";
                 auto rows = self->db_->query(sql, {static_cast<int64_t>(rowid)});
                 if (!rows.empty()) {
@@ -129,10 +151,9 @@ void lattice_db::setup_cross_process_notifier() {
     LOG_DEBUG("xproc", "Initialized cursor at audit id=%lld for path: %s",
               (long long)last_seen_audit_id_, config_.path.c_str());
 
-    xproc_notifier_->start_listening([path = config_.path] {
-        // Look up live instances from the registry instead of capturing `this`.
-        // The destructor unregisters from the registry BEFORE stopping the listener,
-        // so a stale GCD callback won't find a destroyed instance here.
+    xproc_notifier_->start_listening([path = config_.path,
+                                      mtx = xproc_callback_mutex_] {
+        std::lock_guard<std::mutex> lock(*mtx);
         auto instances = instance_registry::instance().get_instances(path);
         if (!instances.empty()) {
             instances[0]->handle_cross_process_notification();
@@ -141,16 +162,17 @@ void lattice_db::setup_cross_process_notifier() {
 }
 
 void lattice_db::handle_cross_process_notification() {
-    LOG_DEBUG("xproc", "Cross-process notification received, last_seen=%lld", (long long)last_seen_audit_id_);
+    auto cursor = last_seen_audit_id_.load(std::memory_order_acquire);
+    LOG_DEBUG("xproc", "Cross-process notification received, last_seen=%lld", (long long)cursor);
 
     // During process teardown the database files may already be deleted while
     // this callback is still queued on the dispatch queue. Catch db_error to
     // prevent an uncaught exception from aborting the process.
     try {
-        // Query AuditLog for entries newer than our cursor
+        // Query AuditLog for entries newer than our cursor.
         auto rows = read_db().query(
             "SELECT id, tableName, operation, rowId, globalRowId, changedFieldsNames FROM AuditLog WHERE id > ? ORDER BY id ASC",
-            {last_seen_audit_id_}
+            {cursor}
         );
 
         if (rows.empty()) {
@@ -158,11 +180,34 @@ void lattice_db::handle_cross_process_notification() {
             return;
         }
 
+        // Re-check cursor: the update_hook may have advanced it while we were
+        // querying (local write committed between our cursor read and the
+        // SELECT). Filter out entries that are now below the updated cursor
+        // to avoid duplicate notifications for local changes.
+        auto updated_cursor = last_seen_audit_id_.load(std::memory_order_acquire);
+        if (updated_cursor > cursor) {
+            rows.erase(
+                std::remove_if(rows.begin(), rows.end(), [updated_cursor](const auto& row) {
+                    auto id_it = row.find("id");
+                    return id_it != row.end() &&
+                           std::holds_alternative<int64_t>(id_it->second) &&
+                           std::get<int64_t>(id_it->second) <= updated_cursor;
+                }),
+                rows.end()
+            );
+            if (rows.empty()) {
+                LOG_DEBUG("xproc", "All entries filtered by advanced cursor (local write race)");
+                return;
+            }
+        }
+
         LOG_DEBUG("xproc", "Found %zu new AuditLog entries from other process", rows.size());
 
-        // Get all local instances for this database path
-        auto instances = instance_registry::instance().get_instances(config_.path);
-
+        // Only notify THIS instance's observers. Each instance sharing the
+        // same database path has its own cross-process notifier, so each
+        // independently receives the event and processes it. Notifying all
+        // instances here would cause N^2 observer callbacks when N instances
+        // share a path (e.g., migration tests that open the same DB twice).
         for (const auto& row : rows) {
             auto id_it = row.find("id");
             auto table_it = row.find("tableName");
@@ -185,13 +230,10 @@ void lattice_db::handle_cross_process_notification() {
             std::string changed_fields_names = (cfn_it != row.end() && std::holds_alternative<std::string>(cfn_it->second))
                 ? std::get<std::string>(cfn_it->second) : "";
 
-            // Notify model table and object observers
-            for (auto* instance : instances) {
-                instance->notify_change(table, op, row_id, global_row_id, changed_fields_names);
-            }
+            // Notify this instance's model table and object observers
+            notify_change(table, op, row_id, global_row_id, changed_fields_names);
 
-            // Notify AuditLog observers
-            // Retrieve the globalId of the audit entry itself
+            // Notify this instance's AuditLog observers
             auto audit_gid_rows = read_db().query(
                 "SELECT globalId FROM AuditLog WHERE id = ?", {audit_id}
             );
@@ -203,11 +245,9 @@ void lattice_db::handle_cross_process_notification() {
                 }
             }
 
-            for (auto* instance : instances) {
-                instance->notify_change("AuditLog", "INSERT", audit_id, audit_global_id);
-            }
+            notify_change("AuditLog", "INSERT", audit_id, audit_global_id);
 
-            last_seen_audit_id_ = audit_id;
+            last_seen_audit_id_.store(audit_id, std::memory_order_release);
         }
 
         LOG_DEBUG("xproc", "Cross-process notification handled, cursor now at %lld", (long long)last_seen_audit_id_);
@@ -299,6 +339,8 @@ void lattice_db::attach(lattice_db &lattice) {
                 auto attached_cols = get_column_names(db.get().get(), "\"" + alias.string() + "\"", table_name);
 
                 if (main_cols != attached_cols) {
+                    LOG_ERROR("db", "Schema mismatch for table '%s' between main and attached DB '%s'",
+                              table_name.c_str(), alias.string().c_str());
                     throw std::runtime_error(
                         "Schema mismatch for table '" + table_name +
                         "' between main database and attached database '" + alias.string() + "'");

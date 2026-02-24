@@ -13,6 +13,7 @@
 #include <functional>
 #include <random>
 #include <sstream>
+#include <atomic>
 #include <iomanip>
 #include <mutex>
 #include <map>
@@ -227,13 +228,13 @@ public:
 
     /// Access first element (throws if empty)
     managed<T>& first() {
-        if (items_.empty()) throw std::out_of_range("Results is empty");
+        if (items_.empty()) { LOG_ERROR("results", "first() called on empty Results"); throw std::out_of_range("Results is empty"); }
         return items_.front();
     }
 
     /// Access last element (throws if empty)
     managed<T>& last() {
-        if (items_.empty()) throw std::out_of_range("Results is empty");
+        if (items_.empty()) { LOG_ERROR("results", "last() called on empty Results"); throw std::out_of_range("Results is empty"); }
         return items_.back();
     }
 
@@ -602,13 +603,20 @@ public:
         , read_db_(config.read_only ? nullptr :
                    (config.path != ":memory:" ? std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr))
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
+        LOG_DEBUG("lattice_db", "ctor start path=%s read_only=%d", config.path.c_str(), config.read_only);
         if (!config.read_only) {
+            LOG_DEBUG("lattice_db", "ensure_tables");
             ensure_tables();
+            LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
+            LOG_DEBUG("lattice_db", "setup_sync_if_configured");
             setup_sync_if_configured();
         }
+        LOG_DEBUG("lattice_db", "register_instance");
         instance_registry::instance().register_instance(config_.path, this);
+        LOG_DEBUG("lattice_db", "setup_cross_process_notifier");
         setup_cross_process_notifier();
+        LOG_DEBUG("lattice_db", "ctor done");
     }
 
     ~lattice_db();
@@ -756,6 +764,7 @@ public:
         // Prepare once
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_->handle(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            LOG_ERROR("db", "Failed to prepare bulk insert: %s", sqlite3_errmsg(db_->handle()));
             throw std::runtime_error("Failed to prepare bulk insert: " + std::string(sqlite3_errmsg(db_->handle())));
         }
 
@@ -821,6 +830,7 @@ public:
 
                 // Execute
                 if (sqlite3_step(stmt) != SQLITE_DONE) {
+                    LOG_ERROR("db", "Failed to insert (bulk): %s", sqlite3_errmsg(db_->handle()));
                     throw std::runtime_error("Failed to insert: " + std::string(sqlite3_errmsg(db_->handle())));
                 }
 
@@ -1058,38 +1068,84 @@ public:
 
         LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
-        // Get all instances sharing this database path
-        auto instances = instance_registry::instance().get_instances(config_.path);
+        // Get all instances sharing this database path.
+        // In-memory databases each have their own isolated storage despite
+        // sharing the ":memory:" path string, so only notify this instance.
+        auto instances = (config_.path == ":memory:" || config_.path.empty())
+            ? std::vector<lattice_db*>{this}
+            : instance_registry::instance().get_instances(config_.path);
         LOG_DEBUG("flush_changes", "Found %zu instances for path: %s", instances.size(), config_.path.c_str());
 
-        // Advance cross-process cursor BEFORE notifying observers.
-        // A stale GCD callback from a previous post_notification() may fire on
-        // a background thread during our synchronous observer dispatch below.
-        // If the cursor isn't bumped yet, that callback would find the new audit
-        // entries and duplicate the notifications.
+        // Advance cross-process cursor on ALL instances sharing this path
+        // BEFORE notifying observers. This prevents any instance's
+        // cross-process handler from re-dispatching entries that
+        // flush_changes is about to (or just did) deliver.
         if (xproc_notifier_) {
             auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
             if (!max_rows.empty()) {
                 auto it = max_rows[0].find("max_id");
                 if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    last_seen_audit_id_ = std::get<int64_t>(it->second);
+                    auto max_id = std::get<int64_t>(it->second);
+                    for (auto* inst : instances) {
+                        inst->last_seen_audit_id_.store(max_id, std::memory_order_release);
+                    }
                 }
             }
         }
 
-        // Notify observers on all instances for each buffered change
+        // Resolve internal tables (link tables, geo_bounds list tables) to their
+        // parent tables. Internal table changes are translated to parent UPDATE
+        // notifications — e.g. a link table INSERT becomes a parent table UPDATE.
+        // The _lattice_meta value stores the parent table name.
+        std::unordered_map<std::string, std::string> internal_table_parents;
+        bool had_internal_changes = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
-            LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s", table.c_str(), op.c_str());
-            for (auto* instance : instances) {
-                instance->notify_change(table, op, row_id, global_id);
+            if (table == "AuditLog" || internal_table_parents.count(table)) continue;
+            auto meta = read_db().query(
+                "SELECT value FROM _lattice_meta WHERE key = ?",
+                {"internal_table:" + table}
+            );
+            if (!meta.empty()) {
+                auto val_it = meta[0].find("value");
+                if (val_it != meta[0].end() && std::holds_alternative<std::string>(val_it->second)) {
+                    internal_table_parents[table] = std::get<std::string>(val_it->second);
+                }
             }
         }
 
-        // Also notify AuditLog observers for entries created by SQL triggers
-        // (The update hook skips AuditLog to avoid infinite loops, but observers still need notification)
+        // Notify observers on all instances for each buffered change.
+        // Internal table changes are translated to parent table UPDATEs.
+        for (const auto& [table, op, row_id, global_id] : changes) {
+            auto it = internal_table_parents.find(table);
+            if (it != internal_table_parents.end() && !it->second.empty()) {
+                // Internal table — notify as parent table UPDATE
+                LOG_DEBUG("flush_changes", "Internal table %s -> parent UPDATE %s", table.c_str(), it->second.c_str());
+                for (auto* instance : instances) {
+                    instance->notify_change(it->second, "UPDATE", 0, "");
+                }
+                had_internal_changes = true;
+            } else {
+                LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s", table.c_str(), op.c_str());
+                for (auto* instance : instances) {
+                    instance->notify_change(table, op, row_id, global_id);
+                }
+            }
+        }
+
+        // Also notify AuditLog observers for entries created by SQL triggers.
+        // For in-memory DBs, skip this — the update_hook notifies AuditLog observers
+        // directly because flush_changes() runs before the trigger fires.
+        // For file-based DBs, flush_changes() runs at WAL commit (after triggers), so the entry exists.
+        // Internal table AuditLog entries are skipped — their sync is triggered separately.
+        bool is_in_memory = config_.path == ":memory:" || config_.path.empty();
+        bool triggered_regular_audit = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
             // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
             if (table == "AuditLog") continue;
+            // In-memory DBs: AuditLog notification handled by update_hook directly
+            if (is_in_memory) continue;
+            // Internal tables — AuditLog entries handled by async sync trigger below
+            if (internal_table_parents.count(table)) continue;
 
             LOG_DEBUG("flush_changes", "Querying AuditLog for table=%s rowId=%lld op=%s", table.c_str(), (long long)row_id, op.c_str());
 
@@ -1117,10 +1173,21 @@ public:
                     for (auto* instance : instances) {
                         instance->notify_change("AuditLog", "INSERT", audit_row_id, audit_global_id);
                     }
+                    triggered_regular_audit = true;
                 }
             } else {
                 LOG_DEBUG("flush_changes", "No AuditLog entry found!");
             }
+        }
+
+        // Internal table changes need to reach the synchronizer but not external
+        // AuditLog observers. Only trigger when no regular AuditLog notification
+        // was fired (regular notifications already cause the synchronizer to pick
+        // up ALL unsynced entries including internal ones). Dispatch via scheduler
+        // to avoid calling sync_now() from within the WAL hook — synchronous calls
+        // race with WebSocket ACK handlers that begin_transaction on the same connection.
+        if (had_internal_changes && !triggered_regular_audit) {
+            trigger_sync_upload();
         }
 
         // Post cross-process notification (cursor already advanced above)
@@ -1657,6 +1724,11 @@ public:
         read_db_.reset();
     }
 
+    /// Explicitly close all database connections and stop background services.
+    /// Safe to call before deleting the database files. After calling close(),
+    /// any further operations on this instance are undefined behavior.
+    void close();
+
     /// Reopen the read-only connection after exclusive operations
     void reopen_read_db() {
         if (config_.path != ":memory:" && !config_.read_only) {
@@ -1665,7 +1737,11 @@ public:
     }
 
     // Create a link table on demand (public for managed<T*> access)
-    void ensure_link_table(const std::string& link_table_name) {
+    void ensure_link_table(const std::string& link_table_name, const std::string& parent_table = "") {
+        // Register as internal table — AuditLog entries won't be surfaced to observers.
+        // Changes are translated into UPDATE notifications on the parent table.
+        register_internal_table(link_table_name, parent_table);
+
         if (db_->table_exists(link_table_name)) return;
 
         // Create link table with globalId for sync and PRIMARY KEY to prevent duplicates
@@ -1684,11 +1760,6 @@ public:
             "PRIMARY KEY(lhs, rhs)"
         ")";
         db_->execute(sql);
-
-        // Create index for efficient lookups
-        std::string idx_sql = "CREATE INDEX IF NOT EXISTS idx_" +
-            link_table_name + "_lhs ON " + link_table_name + "(lhs)";
-        db_->execute(idx_sql);
 
         // Create audit triggers for sync/observation
         create_link_table_triggers(link_table_name);
@@ -2000,6 +2071,10 @@ public:
         std::string list_table = "_" + model_table + "_" + column_name;
         std::string rtree_table = list_table + "_rtree";
 
+        // Register as internal table — AuditLog entries won't be surfaced to observers.
+        // Always register (idempotent) so existing databases get the metadata.
+        register_internal_table(list_table, model_table);
+
         // Check if table already exists
         if (db_->table_exists(list_table)) {
             return;
@@ -2254,6 +2329,9 @@ private:
     // Initialize synchronizer if configured
     void setup_sync_if_configured();
 
+    // Trigger synchronizer upload for internal table changes (defined after sync.hpp)
+    void trigger_sync_upload();
+
     // Table-level observer storage (for Results observation)
     std::mutex observers_mutex_;
     observer_id next_observer_id_ = 1;
@@ -2270,7 +2348,11 @@ private:
 
     // Cross-process observation
     std::unique_ptr<cross_process_notifier> xproc_notifier_;
-    int64_t last_seen_audit_id_ = 0;
+    std::atomic<int64_t> last_seen_audit_id_{0};
+    // Shared mutex captured by the xproc callback lambda so it outlives this
+    // object.  The destructor locks it while unregistering, preventing the
+    // callback from accessing a partially-destroyed lattice_db.
+    std::shared_ptr<std::mutex> xproc_callback_mutex_ = std::make_shared<std::mutex>();
     void setup_cross_process_notifier();
 public:
     void handle_cross_process_notification();
@@ -2798,6 +2880,17 @@ protected:
         )");
         // Initialize schema version to 1 if not set
         db_->execute("INSERT OR IGNORE INTO _lattice_meta(key, value) VALUES('schema_version', '1')");
+    }
+
+    /// Register a table as internal. Its AuditLog entries will be used for sync
+    /// but not surfaced to external observers (e.g. changeStream).
+    /// The parent_table is stored as the value — changes to the internal table
+    /// are translated into UPDATE notifications on the parent table.
+    void register_internal_table(const std::string& table_name, const std::string& parent_table = "") {
+        db_->execute(
+            "INSERT OR IGNORE INTO _lattice_meta(key, value) VALUES(?, ?)",
+            {"internal_table:" + table_name, parent_table}
+        );
     }
 
     /// Store a schema snapshot as JSON for a specific version.
@@ -3571,12 +3664,14 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::replace_lin
 
     load_if_needed();
     if (index >= cached_objects_.size()) {
+        LOG_ERROR("link_list", "replace_link_at: index %zu >= cached size %zu", index, cached_objects_.size());
         throw std::out_of_range("Link list index out of range");
     }
 
     // Get the old global ID at this position
     auto linked_ids = get_linked_ids();
     if (index >= linked_ids.size()) {
+        LOG_ERROR("link_list", "replace_link_at: index %zu >= linked_ids size %zu", index, linked_ids.size());
         throw std::out_of_range("Link list index out of range");
     }
     const auto& old_child_global_id = linked_ids[index];
@@ -3839,18 +3934,39 @@ namespace lattice {
 // lattice_db sync method implementations
 // ============================================================================
 
-inline lattice_db::~lattice_db() {
-    // Unregister from instance registry FIRST so that any stale GCD callbacks
-    // from the cross-process notifier can't find us via get_instances().
-    instance_registry::instance().unregister_instance(config_.path, this);
+inline void lattice_db::close() {
+    {
+        // Lock the callback mutex so any in-flight xproc callback finishes
+        // before we tear down the database handles it accesses.
+        std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
+        instance_registry::instance().unregister_instance(config_.path, this);
+    }
+    if (xproc_notifier_) {
+        xproc_notifier_->stop_listening();
+        xproc_notifier_.reset();
+    }
+    if (synchronizer_) {
+        synchronizer_->disconnect();
+        synchronizer_.reset();
+    }
+    read_db_.reset();
+    db_.reset();
+}
 
-    // Stop cross-process listener after unregistering
+inline lattice_db::~lattice_db() {
+    // close() may have already been called; each step is idempotent.
+    {
+        // Lock the callback mutex so any in-flight xproc callback finishes
+        // before we tear down the database handles it accesses.
+        std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
+        instance_registry::instance().unregister_instance(config_.path, this);
+    }
+
     if (xproc_notifier_) {
         xproc_notifier_->stop_listening();
         xproc_notifier_.reset();
     }
 
-    // Disconnect synchronizer before destroying
     if (synchronizer_) {
         synchronizer_->disconnect();
     }
@@ -3863,6 +3979,22 @@ inline bool lattice_db::is_sync_connected() const {
 inline void lattice_db::sync_now() {
     if (synchronizer_) {
         synchronizer_->sync_now();
+    }
+}
+
+inline void lattice_db::trigger_sync_upload() {
+    if (synchronizer_ && synchronizer_->is_connected()) {
+        // Dispatch via scheduler instead of calling sync_now() synchronously.
+        // This method is called from the WAL hook; a synchronous sync_now()
+        // would call upload_pending_changes() which sends data over WebSocket.
+        // The server's ACK can arrive on the WebSocket receive thread and call
+        // mark_as_synced() → begin_transaction() while we're still inside the
+        // WAL hook, causing "cannot start a transaction within a transaction".
+        scheduler_->invoke([this]() {
+            if (synchronizer_ && synchronizer_->is_connected()) {
+                synchronizer_->sync_now();
+            }
+        });
     }
 }
 

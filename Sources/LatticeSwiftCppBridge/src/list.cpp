@@ -85,9 +85,23 @@ void link_list::push_back(dynamic_object_ref* obj) {
             // Already managed - just add the link
             managed_.push_back(&obj->impl_->managed_);
         } else {
-            // Not managed - add to database first
-            lattice->add(*obj->impl_.get());
-            managed_.push_back(&obj->impl_->managed_);
+            // Not managed - add to database first, then link.
+            // Wrap in a transaction so both AuditLog entries (child INSERT +
+            // link INSERT) are committed atomically. Without this, the sync
+            // system can upload the child before the link entry exists.
+            auto& db = lattice->db();
+            bool own_txn = !db.is_in_transaction();
+            if (own_txn) db.begin_transaction();
+            try {
+                lattice->add(*obj->impl_.get());
+                managed_.push_back(&obj->impl_->managed_);
+                if (own_txn) db.commit();
+            } catch (...) {
+                if (own_txn && db.is_in_transaction()) {
+                    try { db.rollback(); } catch (...) {}
+                }
+                throw;
+            }
         }
     } else {
         // Store shared_ptr to keep the dynamic_object alive

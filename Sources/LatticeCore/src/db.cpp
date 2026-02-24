@@ -32,6 +32,7 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
         std::string error = sqlite3_errmsg(db_);
         sqlite3_close(db_);
         db_ = nullptr;
+        LOG_ERROR("db", "Failed to open database: %s", error.c_str());
         throw db_error("Failed to open database: " + error);
     }
 
@@ -58,19 +59,25 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
     execute("PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #endif
 
-    // Only run ANALYZE on read-write connections
-    if (mode == open_mode::read_write) {
-        execute("ANALYZE");                     // Update query planner statistics
-    }
-
     // Set busy timeout to handle lock contention (5 seconds)
+    // Must be set before ANALYZE or any query that might contend with other connections.
     sqlite3_busy_timeout(db_, 5000);
+
+    // Only run ANALYZE on read-write connections (best-effort — don't fail init if locked)
+    if (mode == open_mode::read_write) {
+        try {
+            execute("ANALYZE");
+        } catch (const db_error&) {
+            LOG_WARN("db", "ANALYZE skipped (database busy)");
+        }
+    }
 
     // Initialize sqlite-vec extension for vector search
     int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
     if (vec_rc != SQLITE_OK) {
         sqlite3_close(db_);
         db_ = nullptr;
+        LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
         throw db_error("Failed to initialize sqlite-vec extension");
     }
 }
@@ -109,6 +116,7 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
         if (rc != SQLITE_OK) {
             std::string error = errmsg ? errmsg : "Unknown error";
             sqlite3_free(errmsg);
+            LOG_ERROR("db", "SQL execution failed: %s (SQL: %s)", error.c_str(), sql.c_str());
             throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
         }
     } else {
@@ -116,6 +124,7 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
         sqlite3_stmt* stmt = nullptr;
         int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
         if (rc != SQLITE_OK) {
+            LOG_ERROR("db", "Failed to prepare statement: %s (SQL: %s)", sqlite3_errmsg(db_), sql.c_str());
             throw db_error("Failed to prepare statement: " + std::string(sqlite3_errmsg(db_)));
         }
 
@@ -128,6 +137,7 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
         sqlite3_finalize(stmt);
 
         if (rc != SQLITE_DONE) {
+            LOG_ERROR("db", "Execution failed: %s (SQL: %s)", sqlite3_errmsg(db_), sql.c_str());
             throw db_error("Execution failed: " + std::string(sqlite3_errmsg(db_)));
         }
     }
@@ -139,6 +149,7 @@ bool database::table_exists(const std::string& name) const {
 
     int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
+        LOG_ERROR("db", "Failed to prepare table_exists statement: %s", sqlite3_errmsg(db_));
         throw db_error("Failed to prepare statement");
     }
 
@@ -157,6 +168,7 @@ std::unordered_map<std::string, std::string> database::get_table_info(const std:
 
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
+        LOG_ERROR("db", "Failed to prepare table_info statement: %s", sqlite3_errmsg(db_));
         throw db_error("Failed to prepare table_info statement");
     }
 
@@ -365,6 +377,7 @@ void database::update(const std::string& table,
     int rc = sqlite3_prepare_v2(db_, sql.str().c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         auto error = std::string(sqlite3_errmsg(db_));
+        LOG_ERROR("db", "Failed to prepare update: %s", error.c_str());
         throw db_error("Failed to prepare update: " + error);
     }
 
@@ -378,6 +391,7 @@ void database::update(const std::string& table,
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
+        LOG_ERROR("db", "Update failed: %s", sqlite3_errmsg(db_));
         throw db_error("Update failed: " + std::string(sqlite3_errmsg(db_)));
     }
 }
@@ -388,6 +402,7 @@ void database::remove(const std::string& table, primary_key_t id) {
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
+        LOG_ERROR("db", "Failed to prepare delete: %s", sqlite3_errmsg(db_));
         throw db_error("Failed to prepare delete: " + std::string(sqlite3_errmsg(db_)));
     }
 
@@ -396,6 +411,7 @@ void database::remove(const std::string& table, primary_key_t id) {
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
+        LOG_ERROR("db", "Delete failed: %s", sqlite3_errmsg(db_));
         throw db_error("Delete failed: " + std::string(sqlite3_errmsg(db_)));
     }
 }
@@ -431,6 +447,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
 
     if (rc != SQLITE_DONE) {
         auto error = std::string(sqlite3_errmsg(db_));
+        LOG_ERROR("db", "Query failed: %s", error.c_str());
         throw db_error("Query failed: " + error);
     }
 
@@ -442,15 +459,28 @@ void database::begin_transaction() {
     // This prevents deadlocks when multiple connections try to upgrade from read to write
     int rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
 
-    // Retry with exponential backoff for SQLITE_BUSY and SQLITE_LOCKED
-    // Note: sqlite3_busy_timeout handles some SQLITE_BUSY cases, but SQLITE_LOCKED
-    // (table-level locks) requires manual retry. We handle both for robustness.
+    // Retry with exponential backoff for transient errors:
+    // - SQLITE_BUSY/SQLITE_LOCKED: another connection holds the WAL write lock
+    // - SQLITE_ERROR + already in transaction: another thread on this same serialized
+    //   connection (SQLITE_OPEN_FULLMUTEX) started a transaction between our caller's
+    //   is_in_transaction() check and this call. The other thread's transaction will
+    //   finish shortly, so we retry.
     int backoff_ms = 1;
     const int max_backoff_ms = 1000;
     const int max_total_wait_ms = 30000;  // 30 seconds total
     int total_waited_ms = 0;
 
-    while ((rc == SQLITE_BUSY || rc == SQLITE_LOCKED) && total_waited_ms < max_total_wait_ms) {
+    while (rc != SQLITE_OK && total_waited_ms < max_total_wait_ms) {
+        bool should_retry = false;
+        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+            should_retry = true;
+        } else if (rc == SQLITE_ERROR && is_in_transaction()) {
+            // "cannot start a transaction within a transaction" — another thread
+            // on this connection has an active transaction. Wait for it to finish.
+            should_retry = true;
+        }
+        if (!should_retry) break;
+
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
         total_waited_ms += backoff_ms;
         backoff_ms = std::min(backoff_ms * 2, max_backoff_ms);  // Exponential backoff, capped
@@ -459,6 +489,7 @@ void database::begin_transaction() {
 
     if (rc != SQLITE_OK) {
         auto error = std::string(sqlite3_errmsg(db_));
+        LOG_ERROR("db", "Failed to begin transaction: %s", error.c_str());
         throw db_error("Failed to begin transaction: " + error);
     }
 }

@@ -18,4 +18,4 @@ jobs:
           swift-version: "6.2"
 
       - name: Build and run C++ tests
-        run: swift build --target LatticeCoreTests && .build/debug/LatticeCoreTests
+        run: swift run LatticeCoreTests

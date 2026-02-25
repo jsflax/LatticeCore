@@ -17,4 +17,4 @@ jobs:
         run: apt-get update && apt-get install -y libsqlite3-dev
 
       - name: Build and run C++ tests
-        run: swift build --target LatticeCoreTests && .build/debug/LatticeCoreTests
+        run: swift run LatticeCoreTests

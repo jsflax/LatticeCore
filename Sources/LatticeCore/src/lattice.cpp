@@ -2,6 +2,7 @@
 // This file kept for potential non-template implementations
 
 #include "lattice/lattice.hpp"
+#include <set>
 #include <unordered_set>
 
 namespace lattice {
@@ -256,8 +257,34 @@ void lattice_db::handle_cross_process_notification() {
     }
 }
 
+// Synchronizer registry — at most one synchronizer per {path, websocket_url}
+static std::mutex& sync_registry_mutex() {
+    static std::mutex m;
+    return m;
+}
+static std::set<std::pair<std::string, std::string>>& active_sync_keys() {
+    static std::set<std::pair<std::string, std::string>> s;
+    return s;
+}
+
+bool lattice_db::try_register_sync_key(const std::string& path, const std::string& ws_url) {
+    std::lock_guard<std::mutex> lock(sync_registry_mutex());
+    return active_sync_keys().emplace(path, ws_url).second;
+}
+
+void lattice_db::unregister_sync_key(const std::string& path, const std::string& ws_url) {
+    std::lock_guard<std::mutex> lock(sync_registry_mutex());
+    active_sync_keys().erase({path, ws_url});
+}
+
 void lattice_db::setup_sync_if_configured() {
     if (!config_.is_sync_enabled()) {
+        return;
+    }
+
+    // Only one synchronizer per {path, websocket_url} across all instances
+    if (!try_register_sync_key(config_.path, config_.websocket_url)) {
+        LOG_DEBUG("lattice_db", "Synchronizer already active for this path, skipping");
         return;
     }
 

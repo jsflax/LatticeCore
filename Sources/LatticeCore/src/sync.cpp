@@ -605,11 +605,11 @@ void synchronizer::on_websocket_message(const websocket_message& msg) {
         }
 
         if (event->event_type == server_sent_event::type::audit_log) {
-            // Apply remote changes
             apply_remote_changes(event->audit_logs);
 
             // Send acknowledgment
             std::vector<std::string> ids;
+            ids.reserve(event->audit_logs.size());
             for (const auto& entry : event->audit_logs) {
                 ids.push_back(entry.global_id);
             }
@@ -618,12 +618,13 @@ void synchronizer::on_websocket_message(const websocket_message& msg) {
             ws_client_->send(websocket_message::from_binary({json.begin(), json.end()}));
 
         } else if (event->event_type == server_sent_event::type::ack) {
-            // Mark local entries as synchronized
             mark_as_synced(event->acked_ids);
 
             if (on_sync_complete_) {
-                std::vector<std::string> ids = event->acked_ids;
-                scheduler_->invoke([this, ids] { on_sync_complete_(ids); });
+                auto ids = std::move(event->acked_ids);
+                scheduler_->invoke([this, ids = std::move(ids)] {
+                    on_sync_complete_(ids);
+                });
             }
         }
     } catch (const std::exception& e) {
@@ -912,9 +913,16 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
         throw;
     }
 
-    // Notify observers after commit (update hook skips AuditLog table)
+    // Notify AuditLog observers on ALL instances sharing this database path.
+    // The synchronizer lives on one instance, but changeStream listeners may
+    // be on other instances (different isolation contexts).
+    auto instances = (db.config().path == ":memory:" || db.config().path.empty())
+        ? std::vector<lattice_db*>{&db}
+        : instance_registry::instance().get_instances(db.config().path);
     for (const auto& [row_id, gid] : notify_list) {
-        db.notify_change("AuditLog", "UPDATE", row_id, gid);
+        for (auto* instance : instances) {
+            instance->notify_change("AuditLog", "UPDATE", row_id, gid);
+        }
     }
 }
 
@@ -923,6 +931,83 @@ std::vector<audit_log_entry> events_after(database& db, const std::optional<std:
         return query_audit_log(db, false, checkpoint_global_id);
     } else {
         return query_audit_log(db, false, std::nullopt);
+    }
+}
+
+void apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries) {
+    if (entries.empty()) return;
+
+    // Fast path: skip transaction entirely if all entries are duplicates.
+    // This avoids blocking the caller with unnecessary _SyncControl toggles
+    // when the same data arrives from multiple WebSocket connections.
+    bool any_new = false;
+    for (const auto& entry : entries) {
+        auto existing = db.db().query(
+            "SELECT id FROM AuditLog WHERE globalId = ?",
+            {entry.global_id}
+        );
+        if (existing.empty()) {
+            any_new = true;
+            break;
+        }
+    }
+    if (!any_new) return;
+
+    try {
+        db.db().begin_transaction();
+
+        // Disable sync triggers while applying remote changes
+        db.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+
+        for (const auto& entry : entries) {
+            // Re-check inside transaction (entry may have been inserted concurrently)
+            auto existing = db.db().query(
+                "SELECT id FROM AuditLog WHERE globalId = ?",
+                {entry.global_id}
+            );
+            if (!existing.empty()) continue;
+
+            // If it's a link table (starts with _), ensure it exists
+            if (!entry.table_name.empty() && entry.table_name[0] == '_') {
+                db.ensure_link_table(entry.table_name);
+            }
+
+            // Generate and execute the SQL instruction
+            auto schema = db.get_table_schema(entry.table_name);
+            auto [sql, params] = entry.generate_instruction(schema);
+            if (!sql.empty()) {
+                try {
+                    db.db().execute(sql, params);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("apply_remote", "Failed: %s (SQL: %s)", e.what(), sql.c_str());
+                }
+            }
+
+            // Record the audit entry as from remote
+            std::string insert_sql = R"(
+                INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
+                    changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1)
+            )";
+            db.db().execute(insert_sql, {
+                entry.global_id,
+                entry.table_name,
+                entry.operation,
+                entry.row_id,
+                entry.global_row_id,
+                entry.changed_fields_to_json(),
+                entry.changed_fields_names_to_json(),
+                entry.timestamp
+            });
+        }
+
+        // Re-enable sync triggers
+        db.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+
+        db.db().commit();
+    } catch (...) {
+        db.db().rollback();
+        throw;
     }
 }
 

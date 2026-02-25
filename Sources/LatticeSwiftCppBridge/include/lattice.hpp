@@ -548,6 +548,7 @@ public:
     /// Explicitly close all database connections and stop background services.
     /// Call before deleting database files to avoid "vnode unlinked while in use".
     void close() { lattice_db::close(); }
+    bool is_sync_connected() const { return lattice_db::is_sync_connected(); }
 
     /// Rebuild the database file, reclaiming unused space.
     /// Closes the read connection before vacuuming and reopens it after.
@@ -1446,8 +1447,8 @@ public:
         std::vector<std::string> result;
         
         if (event->event_type == server_sent_event::type::audit_log) {
-            // Apply remote changes and collect global IDs
-//            synchronizer_->apply_remote_changes(event->audit_logs);
+            // Apply remote changes to this database (model SQL + AuditLog records)
+            ::lattice::apply_remote_changes(*this, event->audit_logs);
             result.reserve(event->audit_logs.size());
             for (const auto& entry : event->audit_logs) {
                 result.push_back(entry.global_id);

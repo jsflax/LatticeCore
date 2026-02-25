@@ -250,6 +250,10 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
 // Get events after a checkpoint (for server-side sync)
 std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
 
+// Apply remote audit log entries to a database (server-side receive path)
+// Disables sync triggers, executes model SQL, inserts AuditLog records, re-enables triggers.
+void apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries);
+
 } // namespace lattice
 
 #endif // __cplusplus

@@ -287,7 +287,9 @@ std::optional<managed<swift_dynamic_object>> swift_lattice::object(int64_t prima
 }
 
 void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
+    LOG_INFO("swift_lattice", "ensure_swift_tables: acquiring transaction");
     auto transaction = lattice::transaction(this->db());
+    LOG_INFO("swift_lattice", "ensure_swift_tables: transaction acquired");
     defer([&transaction] {
         transaction.commit();
     });
@@ -319,9 +321,12 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         }
     }
 
+    LOG_INFO("swift_lattice", "ensure_swift_tables: creating %zu new tables, %zu existing", new_tables.size(), existing_tables.size());
+
     // Create new tables first (no migration needed)
     for (const auto& schema : all_schemas) {
         if (std::find(new_tables.begin(), new_tables.end(), schema.table_name) != new_tables.end()) {
+            LOG_INFO("swift_lattice", "ensure_swift_tables: creating table %s", schema.table_name.c_str());
             create_model_table_public(schema);
         }
     }
@@ -530,14 +535,17 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         }
     }
 
+    LOG_INFO("swift_lattice", "ensure_swift_tables: tables created/migrated, doing rtrees");
     // Phase 6: Ensure geo_bounds rtree tables exist with correct data
     // This is called AFTER all migration updates are applied, so rtrees are created
     // with the correct (migrated) data rather than default values.
     ensure_geo_bounds_rtrees(all_schemas);
 
+    LOG_INFO("swift_lattice", "ensure_swift_tables: doing fts5");
     // Phase 6b: Ensure FTS5 tables exist for full-text indexed columns
     ensure_fts5_tables(all_schemas);
 
+    LOG_INFO("swift_lattice", "ensure_swift_tables: creating indexes");
     // Phase 7: Create UNIQUE indexes for constraints
     for (const auto& entry : schemas) {
         for (size_t i = 0; i < entry.constraints.size(); ++i) {

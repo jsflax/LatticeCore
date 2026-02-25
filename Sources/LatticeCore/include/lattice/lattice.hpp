@@ -2329,6 +2329,13 @@ private:
     // Initialize synchronizer if configured
     void setup_sync_if_configured();
 
+    // Tear down synchronizer and hand off to a sibling instance if one exists
+    void teardown_sync();
+
+    // Synchronizer registry — ensures at most one synchronizer per {path, websocket_url}
+    static bool try_register_sync_key(const std::string& path, const std::string& ws_url);
+    static void unregister_sync_key(const std::string& path, const std::string& ws_url);
+
     // Trigger synchronizer upload for internal table changes (defined after sync.hpp)
     void trigger_sync_upload();
 
@@ -3934,10 +3941,23 @@ namespace lattice {
 // lattice_db sync method implementations
 // ============================================================================
 
+inline void lattice_db::teardown_sync() {
+    if (!synchronizer_) return;
+    unregister_sync_key(config_.path, config_.websocket_url);
+    synchronizer_->disconnect();
+    synchronizer_.reset();
+    // Hand off sync responsibility to a surviving sibling instance
+    for (auto* sibling : instance_registry::instance().get_instances(config_.path)) {
+        if (sibling->config_.is_sync_enabled() &&
+            sibling->config_.websocket_url == config_.websocket_url) {
+            sibling->setup_sync_if_configured();
+            break;
+        }
+    }
+}
+
 inline void lattice_db::close() {
     {
-        // Lock the callback mutex so any in-flight xproc callback finishes
-        // before we tear down the database handles it accesses.
         std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
         instance_registry::instance().unregister_instance(config_.path, this);
     }
@@ -3945,10 +3965,7 @@ inline void lattice_db::close() {
         xproc_notifier_->stop_listening();
         xproc_notifier_.reset();
     }
-    if (synchronizer_) {
-        synchronizer_->disconnect();
-        synchronizer_.reset();
-    }
+    teardown_sync();
     read_db_.reset();
     db_.reset();
 }
@@ -3956,20 +3973,14 @@ inline void lattice_db::close() {
 inline lattice_db::~lattice_db() {
     // close() may have already been called; each step is idempotent.
     {
-        // Lock the callback mutex so any in-flight xproc callback finishes
-        // before we tear down the database handles it accesses.
         std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
         instance_registry::instance().unregister_instance(config_.path, this);
     }
-
     if (xproc_notifier_) {
         xproc_notifier_->stop_listening();
         xproc_notifier_.reset();
     }
-
-    if (synchronizer_) {
-        synchronizer_->disconnect();
-    }
+    teardown_sync();
 }
 
 inline bool lattice_db::is_sync_connected() const {

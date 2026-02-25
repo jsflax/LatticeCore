@@ -1,4 +1,4 @@
-name: Linux
+name: macOS
 
 on:
   push:
@@ -8,13 +8,9 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
-    container: swift:6.2-noble
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: apt-get update && apt-get install -y libsqlite3-dev
 
       - name: Build
         run: swift build

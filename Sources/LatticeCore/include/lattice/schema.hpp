@@ -89,6 +89,7 @@ struct property_descriptor {
     bool is_vector = false;                     // true if this is a vector for similarity search
     bool is_geo_bounds = false;                 // true if this is a geo_bounds for R*Tree spatial indexing
     bool is_full_text = false;                  // true if this is a full-text search column (FTS5)
+    bool is_indexed = false;                    // true if this property should have a non-unique index
 };
 
 // Type trait to detect geo_bounds types (single value)

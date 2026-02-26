@@ -566,6 +566,17 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             db().execute(sql.str());
         }
     }
+
+    // Phase 7b: Create non-unique indexes for @Indexed properties
+    for (const auto& schema : all_schemas) {
+        for (const auto& prop : schema.properties) {
+            if (!prop.is_indexed) continue;
+            std::ostringstream sql;
+            sql << "CREATE INDEX IF NOT EXISTS idx_" << schema.table_name << "_" << prop.name
+                << " ON " << schema.table_name << "(" << prop.name << ")";
+            db().execute(sql.str());
+        }
+    }
 }
 
 }

@@ -712,6 +712,43 @@ void synchronizer::apply_remote_changes(const std::vector<audit_log_entry>& entr
             LOG_DEBUG("apply_remote", "table=%s op=%s globalRowId=%s sql=%s",
                       entry.table_name.c_str(), entry.operation.c_str(),
                       entry.global_row_id.c_str(), sql.c_str());
+
+            // Resolve the local rowId and operation for this object.
+            // flush_changes correlates model changes with AuditLog entries by
+            // (tableName, rowId, operation). After compaction, the sender's
+            // rowId and operation may differ from the receiver's:
+            //   - rowId diverges when INSERT...ON CONFLICT DO UPDATE bumps
+            //     the autoincrement counter
+            //   - operation diverges when sender says INSERT but receiver
+            //     already has the row (ON CONFLICT takes the UPDATE path)
+            int64_t local_row_id = entry.row_id;
+            std::string local_operation = entry.operation;
+
+            // Only resolve for model tables (which have an `id` column).
+            // Link tables (prefixed with _) use composite PK (lhs, rhs)
+            // and don't have an `id` column.
+            bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
+
+            // Check if the row already exists locally (before execution)
+            bool row_existed = false;
+            if (is_model_table && !entry.global_row_id.empty()) {
+                auto pre_rows = db_.db().query(
+                    "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                    {entry.global_row_id}
+                );
+                if (!pre_rows.empty()) {
+                    row_existed = true;
+                    auto it = pre_rows[0].find("id");
+                    if (it != pre_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                        local_row_id = std::get<int64_t>(it->second);
+                    }
+                    // Sender says INSERT but row exists locally → local op is UPDATE
+                    if (entry.operation == "INSERT") {
+                        local_operation = "UPDATE";
+                    }
+                }
+            }
+
             if (!sql.empty()) {
                 try {
                     db_.db().execute(sql, params);
@@ -726,8 +763,22 @@ void synchronizer::apply_remote_changes(const std::vector<audit_log_entry>& entr
                 }
             }
 
-            // Record the audit entry as from remote
-            // Serialize changed_fields and changed_fields_names to JSON strings for DB storage
+            // For genuine INSERTs (row didn't exist), get the new local rowId
+            if (is_model_table && !row_existed && entry.operation != "DELETE" && !entry.global_row_id.empty()) {
+                auto post_rows = db_.db().query(
+                    "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                    {entry.global_row_id}
+                );
+                if (!post_rows.empty()) {
+                    auto it = post_rows[0].find("id");
+                    if (it != post_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                        local_row_id = std::get<int64_t>(it->second);
+                    }
+                }
+            }
+
+            // Record the audit entry as from remote (using local operation and rowId
+            // so flush_changes can correlate with the update_hook notification)
             std::string insert_sql = R"(
                 INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
                     changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized)
@@ -736,8 +787,8 @@ void synchronizer::apply_remote_changes(const std::vector<audit_log_entry>& entr
             db_.db().execute(insert_sql, {
                 entry.global_id,
                 entry.table_name,
-                entry.operation,
-                entry.row_id,
+                local_operation,
+                local_row_id,
                 entry.global_row_id,
                 entry.changed_fields_to_json(),
                 entry.changed_fields_names_to_json(),
@@ -975,11 +1026,61 @@ void apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& en
             // Generate and execute the SQL instruction
             auto schema = db.get_table_schema(entry.table_name);
             auto [sql, params] = entry.generate_instruction(schema);
+
+            // Resolve the local rowId and operation for this object.
+            // flush_changes correlates model changes with AuditLog entries by
+            // (tableName, rowId, operation). After compaction, the sender's
+            // rowId and operation may differ from the receiver's:
+            //   - rowId diverges when INSERT...ON CONFLICT DO UPDATE bumps
+            //     the autoincrement counter
+            //   - operation diverges when sender says INSERT but receiver
+            //     already has the row (ON CONFLICT takes the UPDATE path)
+            int64_t local_row_id = entry.row_id;
+            std::string local_operation = entry.operation;
+
+            // Only resolve for model tables (which have an `id` column).
+            // Link tables (prefixed with _) use composite PK (lhs, rhs).
+            bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
+
+            // Check if the row already exists locally (before execution)
+            bool row_existed = false;
+            if (is_model_table && !entry.global_row_id.empty()) {
+                auto pre_rows = db.db().query(
+                    "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                    {entry.global_row_id}
+                );
+                if (!pre_rows.empty()) {
+                    row_existed = true;
+                    auto it = pre_rows[0].find("id");
+                    if (it != pre_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                        local_row_id = std::get<int64_t>(it->second);
+                    }
+                    // Sender says INSERT but row exists → local op is UPDATE
+                    if (entry.operation == "INSERT") {
+                        local_operation = "UPDATE";
+                    }
+                }
+            }
+
             if (!sql.empty()) {
                 try {
                     db.db().execute(sql, params);
                 } catch (const std::exception& e) {
                     LOG_ERROR("apply_remote", "Failed: %s (SQL: %s)", e.what(), sql.c_str());
+                }
+            }
+
+            // For genuine INSERTs (row didn't exist), get the new local rowId
+            if (is_model_table && !row_existed && entry.operation != "DELETE" && !entry.global_row_id.empty()) {
+                auto post_rows = db.db().query(
+                    "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                    {entry.global_row_id}
+                );
+                if (!post_rows.empty()) {
+                    auto it = post_rows[0].find("id");
+                    if (it != post_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                        local_row_id = std::get<int64_t>(it->second);
+                    }
                 }
             }
 
@@ -992,8 +1093,8 @@ void apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& en
             db.db().execute(insert_sql, {
                 entry.global_id,
                 entry.table_name,
-                entry.operation,
-                entry.row_id,
+                local_operation,
+                local_row_id,
                 entry.global_row_id,
                 entry.changed_fields_to_json(),
                 entry.changed_fields_names_to_json(),

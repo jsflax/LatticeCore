@@ -408,8 +408,12 @@ private:
 public:
     // Add with schema from the object instance
     void add(dynamic_object& obj);
+    void add_preserving_global_id(dynamic_object& obj, const std::string& preserved_global_id);
     void add(dynamic_object_ref* ref) {
         add(*ref->impl_);
+    }
+    void add_preserving_global_id(dynamic_object_ref* ref, const std::string& preserved_global_id) {
+        add_preserving_global_id(*ref->impl_, preserved_global_id);
     }
 
     void add_bulk(std::vector<dynamic_object>& objects);

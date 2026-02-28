@@ -659,10 +659,11 @@ public:
     /// Add an unmanaged object with explicit schema (for dynamic objects)
     template<typename T>
     managed<std::decay_t<T>> add(T&& obj, const model_schema& schema,
-                                  const std::vector<std::string>& conflict_columns = {}) {
+                                  const std::vector<std::string>& conflict_columns = {},
+                                  const std::string& preserved_global_id = "") {
         using U = std::decay_t<T>;
         managed<U> m(std::forward<T>(obj));
-        bind_managed(m, schema, conflict_columns);
+        bind_managed(m, schema, conflict_columns, preserved_global_id);
         return m;
     }
     
@@ -914,7 +915,8 @@ public:
     /// conflict_columns: if non-empty, uses ON CONFLICT DO UPDATE for upsert
     template<typename T>
     void bind_managed(managed<T>& obj, const model_schema& schema,
-                      const std::vector<std::string>& conflict_columns = {}) {
+                      const std::vector<std::string>& conflict_columns = {},
+                      const std::string& preserved_global_id = "") {
         // Convert property_descriptors to column_defs for table creation
         std::vector<column_def> columns;
         columns.reserve(schema.properties.size());
@@ -927,7 +929,7 @@ public:
 
         // Collect values and add globalId
         auto values = obj.collect_values();
-        auto gid = generate_global_id();
+        auto gid = preserved_global_id.empty() ? generate_global_id() : preserved_global_id;
         values.insert(values.begin(), {"globalId", gid});
 
         // Ensure vec0 tables exist for any vector columns (with triggers)

@@ -205,6 +205,49 @@ void swift_lattice::add(dynamic_object &obj) {
     obj.manage(object);
 }
 
+void swift_lattice::add_preserving_global_id(dynamic_object &obj, const std::string& preserved_global_id) {
+    if (obj.lattice) {
+        LOG_ERROR("swift_lattice", "Cannot add already managed object (table: %s)", obj.unmanaged_.table_name.c_str());
+        throw std::runtime_error("Cannot add already managed object");
+    }
+    if (obj.deleted_) {
+        LOG_ERROR("swift_lattice", "Cannot add a deleted object (table: %s)", obj.unmanaged_.table_name.c_str());
+        throw std::runtime_error("Cannot add a deleted object");
+    }
+    auto& unmanaged_obj = obj.unmanaged_;
+    const std::string& table_name = unmanaged_obj.table_name;
+    auto upsert_cols = get_upsert_columns(table_name);
+
+    // Add with optional conflict columns for upsert, preserving globalId
+    const managed<swift_dynamic_object> object = lattice_db::add(
+        std::move(unmanaged_obj), unmanaged_obj.instance_schema(), upsert_cols, preserved_global_id);
+
+    for (auto& [name, link] : unmanaged_obj.link_values) {
+        if (!link->lattice) {
+            add(*link);
+        }
+        managed<swift_dynamic_object*> link_field = object.get_managed_field<swift_dynamic_object*>(name);
+        link_field = link->managed_.as_link();
+    }
+    for (auto& [name, list] : unmanaged_obj.list_values) {
+        auto link_list_field = object.get_managed_field<std::vector<swift_dynamic_object*>>(name);
+        for (auto& obj_ptr : list->unmanaged_) {
+            if (!obj_ptr->lattice) {
+                add(*obj_ptr);
+            }
+            link_list_field.push_back(&obj_ptr->managed_);
+        }
+    }
+    // Handle geo_bounds lists
+    for (auto& [name, bounds_list] : unmanaged_obj.geo_bounds_lists) {
+        auto geo_list_field = object.get_managed_field<std::vector<geo_bounds>>(name);
+        for (const auto& bounds : bounds_list) {
+            const_cast<managed<std::vector<geo_bounds>>&>(geo_list_field).push_back(bounds);
+        }
+    }
+    obj.manage(object);
+}
+
 void swift_lattice::add_bulk(std::vector<dynamic_object_ref*>& objects) {
     if (objects.empty()) {
         return;

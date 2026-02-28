@@ -509,10 +509,15 @@ public:
 
     /// Apply pending updates after auto-migration has added new columns
     void apply_pending_updates() {
+        LOG_INFO("migration", "apply_pending_updates: %zu tables queued", pending_updates_.size());
         for (const auto& [table_name, rows] : pending_updates_) {
+            LOG_INFO("migration", "  applying %zu row updates for %s", rows.size(), table_name.c_str());
             // Get current table columns to filter out columns that no longer exist
             auto existing_cols = db_.get_table_info(table_name);
+            LOG_DEBUG("migration", "  current table has %zu columns", existing_cols.size());
 
+            size_t update_count = 0;
+            size_t skip_count = 0;
             for (const auto& [row_id, new_row] : rows) {
                 // Build UPDATE statement - only include columns that exist in the table
                 std::ostringstream sql;
@@ -525,7 +530,10 @@ public:
                     if (col == "id" || col == "globalId") continue;
 
                     // Only include columns that exist in the current schema
-                    if (existing_cols.find(col) == existing_cols.end()) continue;
+                    if (existing_cols.find(col) == existing_cols.end()) {
+                        LOG_INFO("migration", "  skipping column %s (not in table %s)", col.c_str(), table_name.c_str());
+                        continue;
+                    }
 
                     if (!first) sql << ", ";
                     first = false;
@@ -539,13 +547,17 @@ public:
 
                     try {
                         db_.execute(sql.str(), params);
+                        update_count++;
                     } catch (const std::exception& e) {
-                        // Log error but continue
                         LOG_ERROR("migration", "Update failed for %s row %lld: %s",
                                   table_name.c_str(), (long long)row_id, e.what());
                     }
+                } else {
+                    skip_count++;
+                    LOG_INFO("migration", "  row %lld: no updatable columns (all skipped)", (long long)row_id);
                 }
             }
+            LOG_INFO("migration", "  %s: %zu updated, %zu skipped", table_name.c_str(), update_count, skip_count);
         }
         pending_updates_.clear();
     }
@@ -1832,11 +1844,15 @@ public:
             db_->execute(sql.str());
         }
 
-        // Create triggers to keep vec0 in sync with main table
+        // Create triggers to keep vec0 in sync with main table.
+        // Use main.-qualified model_table in the ON clause so triggers work
+        // even when a TEMP UNION ALL view shadows the model table (from attach()).
+        // Note: SQLite forbids qualified names inside trigger bodies, but the
+        // vec table references resolve correctly because ATTACH excludes virtual tables.
         // INSERT trigger
         std::ostringstream insert_trigger;
         insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_insert "
-                       << "AFTER INSERT ON " << model_table << " "
+                       << "AFTER INSERT ON main." << model_table << " "
                        << "WHEN NEW." << column_name << " IS NOT NULL "
                        << "BEGIN "
                        << "DELETE FROM " << vec_table << " WHERE global_id = NEW.globalId; "
@@ -1848,7 +1864,7 @@ public:
         // UPDATE trigger
         std::ostringstream update_trigger;
         update_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_update "
-                       << "AFTER UPDATE OF " << column_name << " ON " << model_table << " "
+                       << "AFTER UPDATE OF " << column_name << " ON main." << model_table << " "
                        << "WHEN NEW." << column_name << " IS NOT NULL "
                        << "BEGIN "
                        << "DELETE FROM " << vec_table << " WHERE global_id = NEW.globalId; "
@@ -1860,7 +1876,7 @@ public:
         // DELETE trigger
         std::ostringstream delete_trigger;
         delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_delete "
-                       << "AFTER DELETE ON " << model_table << " "
+                       << "AFTER DELETE ON main." << model_table << " "
                        << "BEGIN "
                        << "DELETE FROM " << vec_table << " WHERE global_id = OLD.globalId; "
                        << "END";
@@ -1905,11 +1921,14 @@ public:
         std::string minLon = column_name + "_minLon";
         std::string maxLon = column_name + "_maxLon";
 
-        // Create triggers to keep R*Tree in sync with main table
+        // Create triggers to keep R*Tree in sync with main table.
+        // Use main.-qualified model_table in ON clause so triggers work
+        // even when a TEMP UNION ALL view shadows the model table (from attach()).
+        // Note: SQLite forbids qualified names inside trigger bodies.
         // INSERT trigger - add to R*Tree when row is inserted with non-null geo data
         std::ostringstream insert_trigger;
         insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_insert "
-                       << "AFTER INSERT ON " << model_table << " "
+                       << "AFTER INSERT ON main." << model_table << " "
                        << "WHEN NEW." << minLat << " IS NOT NULL "
                        << "BEGIN "
                        << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
@@ -1922,7 +1941,7 @@ public:
         std::ostringstream update_trigger;
         update_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_update "
                        << "AFTER UPDATE OF " << minLat << ", " << maxLat << ", "
-                       << minLon << ", " << maxLon << " ON " << model_table << " "
+                       << minLon << ", " << maxLon << " ON main." << model_table << " "
                        << "BEGIN "
                        << "DELETE FROM " << rtree_table << " WHERE id = OLD.id; "
                        << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
@@ -1935,7 +1954,7 @@ public:
         // DELETE trigger - remove from R*Tree when row is deleted
         std::ostringstream delete_trigger;
         delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_delete "
-                       << "AFTER DELETE ON " << model_table << " "
+                       << "AFTER DELETE ON main." << model_table << " "
                        << "BEGIN "
                        << "DELETE FROM " << rtree_table << " WHERE id = OLD.id; "
                        << "END";
@@ -2010,10 +2029,13 @@ public:
             db_->execute(sql.str());
         }
 
-        // INSERT trigger - copy text to FTS on insert
+        // INSERT trigger - copy text to FTS on insert.
+        // Use main.-qualified model_table in ON clause so triggers work even when
+        // a TEMP UNION ALL view shadows the model table (from attach()).
+        // Note: SQLite forbids qualified names inside trigger bodies.
         std::ostringstream insert_trigger;
         insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_insert "
-                       << "AFTER INSERT ON " << model_table << " "
+                       << "AFTER INSERT ON main." << model_table << " "
                        << "BEGIN "
                        << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
                        << "VALUES (NEW.id, NEW." << column_name << "); "
@@ -2023,7 +2045,7 @@ public:
         // UPDATE trigger - FTS5 delete-then-insert
         std::ostringstream update_trigger;
         update_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_update "
-                       << "AFTER UPDATE OF " << column_name << " ON " << model_table << " "
+                       << "AFTER UPDATE OF " << column_name << " ON main." << model_table << " "
                        << "BEGIN "
                        << "INSERT INTO " << fts_table << "(" << fts_table << ", rowid, " << column_name << ") "
                        << "VALUES ('delete', OLD.id, OLD." << column_name << "); "
@@ -2035,7 +2057,7 @@ public:
         // DELETE trigger - BEFORE DELETE to use OLD values
         std::ostringstream delete_trigger;
         delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_delete "
-                       << "BEFORE DELETE ON " << model_table << " "
+                       << "BEFORE DELETE ON main." << model_table << " "
                        << "BEGIN "
                        << "INSERT INTO " << fts_table << "(" << fts_table << ", rowid, " << column_name << ") "
                        << "VALUES ('delete', OLD.id, OLD." << column_name << "); "
@@ -2046,7 +2068,7 @@ public:
         if (!table_exists) {
             std::ostringstream populate_sql;
             populate_sql << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
-                         << "SELECT id, " << column_name << " FROM " << model_table
+                         << "SELECT id, " << column_name << " FROM main." << model_table
                          << " WHERE " << column_name << " IS NOT NULL";
             db_->execute(populate_sql.str());
         }
@@ -2245,15 +2267,6 @@ public:
                                        const std::optional<std::string>& where_clause = std::nullopt) {
         std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
 
-        // vec0 table is created lazily on first vector insert (needs dimensions).
-        // If no data has been inserted yet, return empty results.
-        if (!db_->table_exists(vec_table)) {
-            return {};
-        }
-
-        // Build the KNN query
-        // If there's a where clause, we need to JOIN with the main table
-        std::ostringstream sql;
         std::string dist_func;
         switch (metric) {
             case distance_metric::cosine: dist_func = "vec_distance_cosine"; break;
@@ -2261,23 +2274,65 @@ public:
             default: dist_func = "vec_distance_L2"; break;
         }
 
+        std::vector<knn_result> results;
+
+        // Query main DB's vec table
+        if (db_->table_exists(vec_table)) {
+            auto main_results = knn_query_single(
+                "main", vec_table, model_table, dist_func, query_vector, k, where_clause);
+            results.insert(results.end(), main_results.begin(), main_results.end());
+        }
+
+        // Query each attached DB's vec table
+        for (const auto& alias : attached_aliases_) {
+            std::string qualified_vec = "\"" + alias + "\"." + vec_table;
+            // Check if the attached DB has this vec table
+            std::string check_sql = "SELECT name FROM \"" + alias + "\".sqlite_master "
+                                    "WHERE type='table' AND name=?";
+            auto check = db_->query(check_sql, {vec_table});
+            if (check.empty()) continue;
+
+            auto attached_results = knn_query_single(
+                "\"" + alias + "\"", vec_table, model_table, dist_func, query_vector, k, where_clause);
+            results.insert(results.end(), attached_results.begin(), attached_results.end());
+        }
+
+        // Sort by distance and take top k
+        std::sort(results.begin(), results.end(),
+                  [](const knn_result& a, const knn_result& b) { return a.distance < b.distance; });
+        if (results.size() > static_cast<size_t>(k)) {
+            results.resize(k);
+        }
+        return results;
+    }
+
+    /// Run a knn query against a single schema's vec table.
+    std::vector<knn_result> knn_query_single(
+            const std::string& schema,
+            const std::string& vec_table,
+            const std::string& model_table,
+            const std::string& dist_func,
+            const std::vector<uint8_t>& query_vector,
+            int k,
+            const std::optional<std::string>& where_clause) {
+        std::string qualified_vec = schema + "." + vec_table;
+
+        std::ostringstream sql;
         if (where_clause && !where_clause->empty()) {
-            // With filter: JOIN main table and apply WHERE clause
-            // Use explicit distance function for consistent behavior
-            // Don't alias model table so column names in predicate resolve naturally
+            // With filter: JOIN model table (TEMP VIEW for UNION ALL) and apply WHERE clause
             sql << "SELECT v.global_id, " << dist_func << "(v.embedding, ?) as distance "
-                << "FROM " << vec_table << " v "
+                << "FROM " << qualified_vec << " v "
                 << "JOIN " << model_table << " ON " << model_table << ".globalId = v.global_id "
                 << "WHERE " << *where_clause << " "
                 << "ORDER BY distance LIMIT " << k;
-        } else if (metric == distance_metric::l2) {
+        } else if (dist_func == "vec_distance_L2") {
             // No filter, L2: use vec0's native MATCH for fastest performance
-            sql << "SELECT global_id, distance FROM " << vec_table
+            sql << "SELECT global_id, distance FROM " << qualified_vec
                 << " WHERE embedding MATCH ? AND k = " << k;
         } else {
             // No filter, non-L2: use explicit distance function
             sql << "SELECT global_id, " << dist_func << "(embedding, ?) as distance "
-                << "FROM " << vec_table
+                << "FROM " << qualified_vec
                 << " ORDER BY distance LIMIT " << k;
         }
 
@@ -2303,6 +2358,10 @@ public:
         }
         return results;
     }
+
+protected:
+    // Attached database aliases (set by attach()) for cross-DB knn/fts queries
+    std::vector<std::string> attached_aliases_;
 
 private:
     template<typename U> friend class query;
@@ -2538,8 +2597,13 @@ private:
     }
 
     void migrate_model_table(const model_schema& schema) {
+        LOG_INFO("migrate", "migrate_model_table: %s", schema.table_name.c_str());
         // Get existing columns from database
         auto existing = db_->get_table_info(schema.table_name);
+        LOG_INFO("migrate", "  existing columns: %zu", existing.size());
+        for (const auto& [col, type] : existing) {
+            LOG_DEBUG("migrate", "    existing: %s (%s)", col.c_str(), type.c_str());
+        }
 
         // Build model schema map: column_name -> SQL_TYPE
         // geo_bounds properties expand to 4 columns (but not geo_bounds lists)
@@ -2578,6 +2642,18 @@ private:
             if (model_cols.find(col) == model_cols.end()) {
                 removed.push_back(col);
             }
+        }
+
+        LOG_INFO("migrate", "  model columns: %zu, added: %zu, removed: %zu, changed: %zu",
+                 model_cols.size(), added.size(), removed.size(), changed.size());
+        for (const auto& col : added) {
+            LOG_INFO("migrate", "    + added: %s", col.c_str());
+        }
+        for (const auto& col : removed) {
+            LOG_INFO("migrate", "    - removed: %s", col.c_str());
+        }
+        for (const auto& col : changed) {
+            LOG_INFO("migrate", "    ~ changed: %s", col.c_str());
         }
 
         // No changes needed
@@ -2705,6 +2781,7 @@ private:
                        const std::unordered_map<std::string, std::string>& model_cols) {
         const std::string& table = schema.table_name;
         std::string tmp = table + "_old";
+        LOG_INFO("migrate", "rebuild_table: %s -> %s", table.c_str(), tmp.c_str());
 
         // 1. Drop ALL triggers on this table before rename — SQLite preserves
         //    trigger names after ALTER TABLE RENAME, so CREATE TRIGGER IF NOT
@@ -2781,9 +2858,19 @@ private:
             dest_str += ", " + dest_cols[i];
             src_str += ", " + src_exprs[i];
         }
-        db_->execute("INSERT INTO " + table + " (" + dest_str + ") SELECT " + src_str + " FROM " + tmp);
+        std::string copy_sql = "INSERT INTO " + table + " (" + dest_str + ") SELECT " + src_str + " FROM " + tmp;
+        LOG_INFO("migrate", "rebuild_table: copying data: %s", copy_sql.c_str());
+        db_->execute(copy_sql);
+
+        // Verify row count after copy
+        auto count_rows = db_->query("SELECT COUNT(*) as cnt FROM " + table);
+        if (!count_rows.empty()) {
+            auto cnt = std::get<int64_t>(count_rows[0].at("cnt"));
+            LOG_INFO("migrate", "rebuild_table: %lld rows copied to %s", (long long)cnt, table.c_str());
+        }
 
         // 6. Drop old table
+        LOG_INFO("migrate", "rebuild_table: dropping %s", tmp.c_str());
         db_->execute("DROP TABLE " + tmp);
 
         // 7. Populate rtree tables for geo_bounds properties (data now exists)

@@ -103,6 +103,14 @@ std::optional<swift_configuration::SchemaPair> to_optional<swift_configuration::
 class swift_lattice;
 class swift_lattice_ref;
 
+void try_catch(void (^invoke_fn)()) {
+    try {
+        invoke_fn();
+    } catch (...) {
+        
+    }
+}
+
 } // namespace lattice
 
 #endif // __cplusplus

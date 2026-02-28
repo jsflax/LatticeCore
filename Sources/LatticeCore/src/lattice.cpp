@@ -334,12 +334,22 @@ void lattice_db::attach(lattice_db &lattice) {
             db.get()->execute(ss.str());
         }
 
-        // Collect main DB's table names for overlap detection
-        auto main_tables = db.get()->query(
-            "SELECT name FROM main.sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' "
-            "AND name NOT IN ('AuditLog', '_SyncControl') "
-            "AND name NOT LIKE '%_vec0'");
+        // Collect main DB's model table names for overlap detection.
+        // Exclude all internal/auxiliary tables:
+        //   - _-prefixed: virtual tables (_Model_col_vec, _Model_col_fts, _Model_col_rtree)
+        //     and their shadow tables (_*_info, _*_chunks, _*_rowids, _*_content, etc.)
+        //   - AuditLog, _SyncControl: Lattice internal bookkeeping
+        //   - sqlite_*: SQLite internal
+        // knn_query/combinedNearestQuery handle cross-DB vec/fts search via attached_aliases_.
+        std::string table_filter =
+            "SELECT name FROM %s WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%%' "
+            "AND name NOT LIKE '\\_%%' ESCAPE '\\' "
+            "AND name NOT IN ('AuditLog')";
+
+        char main_sql[512];
+        snprintf(main_sql, sizeof(main_sql), table_filter.c_str(), "main.sqlite_master");
+        auto main_tables = db.get()->query(main_sql);
         std::unordered_set<std::string> main_table_set;
         for (const auto& row : main_tables) {
             auto it = row.find("name");
@@ -347,11 +357,9 @@ void lattice_db::attach(lattice_db &lattice) {
                 main_table_set.insert(std::get<std::string>(it->second));
         }
 
-        auto tables = lattice.db_->query(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' "
-            "AND name NOT IN ('AuditLog', '_SyncControl') "
-            "AND name NOT LIKE '%_vec0'");
+        char attached_sql[512];
+        snprintf(attached_sql, sizeof(attached_sql), table_filter.c_str(), "sqlite_master");
+        auto tables = lattice.db_->query(attached_sql);
 
         for (const auto& table_row : tables) {
             auto it = table_row.find("name");
@@ -386,6 +394,10 @@ void lattice_db::attach(lattice_db &lattice) {
             }
         }
     }
+
+    // Store alias for cross-DB knn_query
+    std::filesystem::path p = lattice.config_.path;
+    attached_aliases_.push_back(p.filename().replace_extension().string());
 }
 
 // ============================================================================

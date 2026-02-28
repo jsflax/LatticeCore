@@ -83,7 +83,7 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
         new (&managed_) managed<swift_dynamic_object>(o);
         lattice = managed_.lattice_ref();
     }
-    
+
     dynamic_object(const managed<swift_dynamic_object*>& o) : lattice(nullptr) {
         new (&managed_) managed<swift_dynamic_object>(*o.get_value());
         lattice = managed_.lattice_ref();

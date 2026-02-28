@@ -1177,9 +1177,23 @@ public:
         for (const auto& vc : vectors) {
             std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
 
+            // Collect schemas that have this vec table (main + attached)
+            std::vector<std::string> vec_schemas;
+            if (db().table_exists(vec_table)) {
+                vec_schemas.push_back("main");
+            }
+            for (const auto& alias : attached_aliases_) {
+                std::string check_sql = "SELECT name FROM \"" + alias + "\".sqlite_master "
+                                        "WHERE type='table' AND name=?";
+                auto check = db().query(check_sql, {vec_table});
+                if (!check.empty()) {
+                    vec_schemas.push_back("\"" + alias + "\"");
+                }
+            }
+
             // vec0 table is created lazily on first vector insert (needs dimensions).
-            // If no data has been inserted yet, the table won't exist — return empty.
-            if (!db().table_exists(vec_table)) {
+            // If no schema has the table, return empty results.
+            if (vec_schemas.empty()) {
                 return CombinedQueryResultVector{};
             }
 
@@ -1203,34 +1217,33 @@ public:
             blob_ss << "'";
             std::string query_blob = blob_ss.str();
 
-            // Always join with main table to get id (vec0 uses global_id, not rowid)
-            sql << cte_name << " AS ("
-                << "SELECT m.id AS id, " << distance_func << "(v.embedding, " << query_blob << ") AS distance"
-                << " FROM " << vec_table << " v"
-                << " JOIN " << table_name << " m ON m.globalId = v.global_id";
-
             // Build WHERE conditions
             std::vector<std::string> where_conditions;
-
-            // Pre-filter by spatial candidates if we have them
             if (!cte_names.empty()) {
                 where_conditions.push_back("m.id IN (SELECT id FROM " + candidates_cte + ")");
             }
-
-            // Apply user's WHERE clause to vector CTE
             if (where_clause.has_value() && !where_clause.value().empty()) {
                 where_conditions.push_back("(" + where_clause.value() + ")");
             }
-
+            std::string where_suffix;
             if (!where_conditions.empty()) {
-                sql << " WHERE ";
+                where_suffix = " WHERE ";
                 for (size_t i = 0; i < where_conditions.size(); ++i) {
-                    if (i > 0) sql << " AND ";
-                    sql << where_conditions[i];
+                    if (i > 0) where_suffix += " AND ";
+                    where_suffix += where_conditions[i];
                 }
             }
 
-            sql << " ORDER BY distance ASC LIMIT " << vc.k
+            // Build CTE: UNION ALL across all schemas' vec tables, then ORDER + LIMIT
+            sql << cte_name << " AS (SELECT * FROM (";
+            for (size_t si = 0; si < vec_schemas.size(); ++si) {
+                if (si > 0) sql << " UNION ALL ";
+                sql << "SELECT m.id AS id, " << distance_func << "(v.embedding, " << query_blob << ") AS distance"
+                    << " FROM " << vec_schemas[si] << "." << vec_table << " v"
+                    << " JOIN " << table_name << " m ON m.globalId = v.global_id"
+                    << where_suffix;
+            }
+            sql << ") ORDER BY distance ASC LIMIT " << vc.k
                 << "), ";
         }
 
@@ -1240,6 +1253,22 @@ public:
         std::vector<std::string> fts_cte_names;
         for (const auto& tc : texts) {
             std::string fts_table = "_" + table_name + "_" + tc.column + "_fts";
+
+            // Collect schemas that have this FTS table
+            std::vector<std::string> fts_schemas;
+            if (db().table_exists(fts_table)) {
+                fts_schemas.push_back("main");
+            }
+            for (const auto& alias : attached_aliases_) {
+                std::string check_sql = "SELECT name FROM \"" + alias + "\".sqlite_master "
+                                        "WHERE type='table' AND name=?";
+                auto check = db().query(check_sql, {fts_table});
+                if (!check.empty()) {
+                    fts_schemas.push_back("\"" + alias + "\"");
+                }
+            }
+            // If no schema has the FTS table, skip this constraint
+            if (fts_schemas.empty()) continue;
 
             std::string cte_name = "fts_" + std::to_string(cte_index++);
             fts_cte_names.push_back(cte_name);
@@ -1252,23 +1281,27 @@ public:
                 pos += 2;
             }
 
-            sql << cte_name << " AS ("
-                << "SELECT fts.rowid AS id, fts.rank AS distance"
-                << " FROM " << fts_table << " fts"
-                << " WHERE " << fts_table << " MATCH '" << escaped_text << "'";
-
-            // Pre-filter by spatial candidates if we have them
+            // Build WHERE suffix for pre-filtering
+            std::string fts_where_suffix;
             if (!cte_names.empty()) {
-                sql << " AND fts.rowid IN (SELECT id FROM " << candidates_cte << ")";
+                fts_where_suffix += " AND fts.rowid IN (SELECT id FROM " + candidates_cte + ")";
             }
-
-            // Apply user's WHERE clause to FTS CTE
             if (where_clause.has_value() && !where_clause.value().empty()) {
-                sql << " AND fts.rowid IN (SELECT id FROM " << table_name
-                    << " WHERE " << where_clause.value() << ")";
+                fts_where_suffix += " AND fts.rowid IN (SELECT id FROM " + table_name
+                    + " WHERE " + where_clause.value() + ")";
             }
 
-            sql << " ORDER BY fts.rank LIMIT " << tc.limit
+            // Build CTE: UNION ALL across all schemas' FTS tables, then ORDER + LIMIT
+            sql << cte_name << " AS (SELECT * FROM (";
+            for (size_t si = 0; si < fts_schemas.size(); ++si) {
+                if (si > 0) sql << " UNION ALL ";
+                std::string qualified_fts = fts_schemas[si] + "." + fts_table;
+                sql << "SELECT fts.rowid AS id, fts.rank AS distance"
+                    << " FROM " << qualified_fts << " fts"
+                    << " WHERE " << fts_table << " MATCH '" << escaped_text << "'"
+                    << fts_where_suffix;
+            }
+            sql << ") ORDER BY distance LIMIT " << tc.limit
                 << "), ";
         }
 
@@ -1706,8 +1739,12 @@ namespace detail {
             }
 
             // Skip cache when migration is needed (target_schema_version > 1 indicates migration)
-            // Migration requires a fresh connection to detect and apply schema changes
-            bool skip_cache = config.target_schema_version > 1;
+            // Migration requires a fresh connection to detect and apply schema changes.
+            // Also skip cache for in-memory databases — each ":memory:" open creates a
+            // distinct SQLite database, so reusing a cached instance would incorrectly
+            // share state between callers that expect isolated storage.
+            bool skip_cache = config.target_schema_version > 1 ||
+                              config.path == ":memory:" || config.path.empty();
 
             LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash};
 
@@ -1724,13 +1761,12 @@ namespace detail {
                     }
                 }
             } else {
-                // For migration: remove any existing entry for this key
-                // This ensures the old connection is invalidated
+                // For migration: remove key_cache_ entry so a fresh instance is created,
+                // but preserve ptr_cache_ — the old instance may still be alive and its
+                // managed objects need get_by_pointer() to resolve the lattice ref.
+                // The ptr_cache_ weak_ptr will expire naturally when the instance is released.
                 for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
                     if (it->first == key) {
-                        if (auto existing = it->second.lock()) {
-                            ptr_cache_.erase(existing.get());
-                        }
                         key_cache_.erase(it);
                         break;
                     }

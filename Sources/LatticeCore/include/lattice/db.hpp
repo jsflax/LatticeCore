@@ -61,7 +61,7 @@ public:
                              const std::vector<column_value_t>& params = {});
 
     // Transaction support
-    void begin_transaction();
+    void begin_transaction(bool exclusive = false);
     void commit();
     void rollback();
     bool is_in_transaction() const;
@@ -86,7 +86,7 @@ private:
 // RAII transaction guard
 class transaction {
 public:
-    explicit transaction(database& db);
+    explicit transaction(database& db, bool exclusive = false);
     ~transaction();
 
     void commit();

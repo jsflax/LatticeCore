@@ -289,7 +289,7 @@ primary_key_t database::insert(const std::string& table,
                                const std::vector<std::pair<std::string, column_value_t>>& values,
                                const std::vector<std::string>& conflict_columns) {
     std::ostringstream sql;
-    sql << "INSERT INTO " << table << " (";
+    sql << "INSERT INTO main." << table << " (";
 
     bool first = true;
     for (const auto& [col, _] : values) {
@@ -454,10 +454,12 @@ std::vector<database::row_t> database::query(const std::string& sql,
     return results;
 }
 
-void database::begin_transaction() {
-    // Use BEGIN IMMEDIATE to acquire write lock immediately
-    // This prevents deadlocks when multiple connections try to upgrade from read to write
-    int rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+void database::begin_transaction(bool exclusive) {
+    // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).
+    // EXCLUSIVE: acquires write lock AND blocks all readers.
+    // Use exclusive for migrations so stale connections can't read mid-migration.
+    const char* sql = exclusive ? "BEGIN EXCLUSIVE" : "BEGIN IMMEDIATE";
+    int rc = sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
 
     // Retry with exponential backoff for transient errors:
     // - SQLITE_BUSY/SQLITE_LOCKED: another connection holds the WAL write lock
@@ -484,7 +486,7 @@ void database::begin_transaction() {
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
         total_waited_ms += backoff_ms;
         backoff_ms = std::min(backoff_ms * 2, max_backoff_ms);  // Exponential backoff, capped
-        rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+        rc = sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
     }
 
     if (rc != SQLITE_OK) {
@@ -508,8 +510,8 @@ bool database::is_in_transaction() const {
 }
 
 // Transaction RAII guard
-transaction::transaction(database& db) : db_(db) {
-    db_.begin_transaction();
+transaction::transaction(database& db, bool exclusive) : db_(db) {
+    db_.begin_transaction(exclusive);
 }
 
 transaction::~transaction() {

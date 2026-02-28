@@ -287,14 +287,13 @@ std::optional<managed<swift_dynamic_object>> swift_lattice::object(int64_t prima
 }
 
 void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
-    LOG_INFO("swift_lattice", "ensure_swift_tables: acquiring transaction");
-    auto transaction = lattice::transaction(this->db());
-    LOG_INFO("swift_lattice", "ensure_swift_tables: transaction acquired");
-    defer([&transaction] {
-        transaction.commit();
-    });
+    LOG_INFO("swift_lattice", "ensure_swift_tables: acquiring exclusive transaction");
+    auto transaction = lattice::transaction(this->db(), /*exclusive=*/true);
+    LOG_INFO("swift_lattice", "ensure_swift_tables: exclusive transaction acquired");
+    // NOTE: No unconditional defer{commit} — if an exception occurs during
+    // migration, the transaction destructor will rollback, preventing
+    // partial migration state (table rebuilt but version not bumped).
     // Build model_schema list and identify new vs existing tables
-    // Note: Don't update schemas_ yet - we need old schemas for migration
     std::vector<model_schema> all_schemas;
     std::vector<std::string> new_tables;
     std::vector<std::string> existing_tables;
@@ -331,11 +330,31 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         }
     }
 
+    // Pre-populate schemas_ for ALL tables so Migration.lookup() can hydrate
+    // objects from non-migrating tables (e.g. looking up Memory by id during
+    // an Edge migration). The migration loop will override schemas_ with
+    // old_schema for tables that ARE being migrated.
+    for (const auto& entry : schemas) {
+        schemas_[entry.table_name] = entry.properties;
+    }
+
     // Incremental migration loop
     int current_version = get_schema_version();
     int target_version = swift_config_.target_schema_version;
+    LOG_INFO("swift_lattice", "migration: current_version=%d, target_version=%d", current_version, target_version);
+
+    if (current_version > target_version) {
+        LOG_ERROR("swift_lattice", "Database schema version (%d) is newer than this binary supports (%d). "
+                  "Update the application to a version that supports schema v%d.",
+                  current_version, target_version, current_version);
+        throw std::runtime_error(
+            "Database schema version (" + std::to_string(current_version) +
+            ") is newer than this binary supports (" + std::to_string(target_version) +
+            "). Update the application.");
+    }
 
     for (int version = current_version + 1; version <= target_version; version++) {
+        LOG_INFO("swift_lattice", "migration: running version %d", version);
         migration_context migration_ctx(db());
 
         // Set migration lattice for Migration.lookup() calls from Swift
@@ -347,11 +366,44 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             auto schema_pair_opt = swift_config_.lookupMigrationSchema(table_name, version);
 
             if (!schema_pair_opt) {
+                LOG_DEBUG("swift_lattice", "  no migration for %s at version %d", table_name.c_str(), version);
                 // No migration defined for this table at this version
                 continue;
             }
+            LOG_INFO("swift_lattice", "  found migration for %s at version %d", table_name.c_str(), version);
 
             const auto& [old_schema, new_schema] = *schema_pair_opt;
+
+            // Guard against partial migration: if the table was already rebuilt
+            // (e.g. previous migration crashed after DDL but before version bump),
+            // the old schema columns won't exist. Detect this and skip row migration.
+            auto actual_cols = db().get_table_info(table_name);
+            bool old_schema_matches = true;
+            for (const auto& [col_name, col_prop] : old_schema) {
+                if (col_name == "id" || col_name == "globalId") continue;
+                // Links and lists are stored in separate tables, not as columns
+                if (col_prop.kind != property_kind::primitive) continue;
+                if (actual_cols.find(col_name) == actual_cols.end()) {
+                    old_schema_matches = false;
+                    LOG_INFO("swift_lattice", "  table %s missing old column '%s' — already rebuilt",
+                             table_name.c_str(), col_name.c_str());
+                    break;
+                }
+            }
+
+            if (!old_schema_matches) {
+                // Table already has new schema from a previous partial migration.
+                // Just update internal schema and rebuild triggers/indexes, skip row migration.
+                LOG_INFO("swift_lattice", "  skipping row migration for %s (table already rebuilt)", table_name.c_str());
+                schemas_[table_name] = new_schema;
+                for (const auto& s : all_schemas) {
+                    if (s.table_name == table_name) {
+                        migrate_model_table_public(s);
+                        break;
+                    }
+                }
+                continue;
+            }
 
             // Temporarily set schemas_ to OLD schema for hydration
             schemas_[table_name] = old_schema;
@@ -498,6 +550,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             }
 
             // Now update schemas_ to NEW schema and apply table migration
+            LOG_INFO("swift_lattice", "  setting new schema for %s, calling migrate_model_table", table_name.c_str());
             schemas_[table_name] = new_schema;
 
             // Find the model_schema for this table and migrate
@@ -507,12 +560,15 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     break;
                 }
             }
+            LOG_INFO("swift_lattice", "  migrate_model_table done for %s", table_name.c_str());
         }
 
         // Apply queued row updates for this version
+        LOG_INFO("swift_lattice", "  applying pending updates for version %d", version);
         migration_ctx.apply_pending_updates();
 
         // Update version in _lattice_meta
+        LOG_INFO("swift_lattice", "  setting schema version to %d", version);
         set_schema_version(version);
 
         // Clear migration lattice pointer
@@ -577,6 +633,10 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             db().execute(sql.str());
         }
     }
+
+    // All migrations and schema setup succeeded — commit the transaction.
+    // If anything above threw, the transaction destructor rolls back instead.
+    transaction.commit();
 }
 
 }

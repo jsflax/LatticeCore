@@ -50,40 +50,40 @@ namespace lattice_integration_tests {
 // Real WebSocket Client using websocketpp
 // ============================================================================
 
-class real_websocket_client : public lattice::websocket_client {
+class real_sync_transport : public lattice::sync_transport {
 public:
     using client_t = websocketpp::client<websocketpp::config::asio_client>;
     using message_ptr = websocketpp::config::asio_client::message_type::ptr;
 
-    real_websocket_client() {
+    real_sync_transport() {
         client_.clear_access_channels(websocketpp::log::alevel::all);
         client_.clear_error_channels(websocketpp::log::elevel::all);
         client_.init_asio();
 
         client_.set_open_handler([this](websocketpp::connection_hdl hdl) {
             hdl_ = hdl;
-            state_ = lattice::websocket_state::open;
+            state_ = lattice::transport_state::open;
             if (on_open_) on_open_();
         });
 
         client_.set_message_handler([this](websocketpp::connection_hdl, message_ptr msg) {
             if (on_message_) {
-                on_message_(lattice::websocket_message::from_string(msg->get_payload()));
+                on_message_(lattice::transport_message::from_string(msg->get_payload()));
             }
         });
 
         client_.set_fail_handler([this](websocketpp::connection_hdl) {
-            state_ = lattice::websocket_state::closed;
+            state_ = lattice::transport_state::closed;
             if (on_error_) on_error_("Connection failed");
         });
 
         client_.set_close_handler([this](websocketpp::connection_hdl) {
-            state_ = lattice::websocket_state::closed;
+            state_ = lattice::transport_state::closed;
             if (on_close_) on_close_(1000, "Connection closed");
         });
     }
 
-    ~real_websocket_client() {
+    ~real_sync_transport() {
         disconnect();
         if (io_thread_.joinable()) {
             io_thread_.join();
@@ -113,20 +113,20 @@ public:
     }
 
     void disconnect() override {
-        if (state_ == lattice::websocket_state::open) {
+        if (state_ == lattice::transport_state::open) {
             websocketpp::lib::error_code ec;
             client_.close(hdl_, websocketpp::close::status::normal, "Client disconnect", ec);
         }
         client_.stop();
     }
 
-    lattice::websocket_state state() const override { return state_; }
+    lattice::transport_state state() const override { return state_; }
 
-    void send(const lattice::websocket_message& message) override {
-        if (state_ != lattice::websocket_state::open) return;
+    void send(const lattice::transport_message& message) override {
+        if (state_ != lattice::transport_state::open) return;
 
         websocketpp::lib::error_code ec;
-        if (message.msg_type == lattice::websocket_message::type::binary) {
+        if (message.msg_type == lattice::transport_message::type::binary) {
             client_.send(hdl_, message.data.data(), message.data.size(),
                         websocketpp::frame::opcode::binary, ec);
         } else {
@@ -143,7 +143,7 @@ private:
     client_t client_;
     websocketpp::connection_hdl hdl_;
     std::thread io_thread_;
-    std::atomic<lattice::websocket_state> state_{lattice::websocket_state::closed};
+    std::atomic<lattice::transport_state> state_{lattice::transport_state::closed};
 
     on_open_handler on_open_;
     on_message_handler on_message_;
@@ -158,8 +158,8 @@ public:
         return nullptr;  // Not implemented yet
     }
 
-    std::unique_ptr<lattice::websocket_client> create_websocket_client() override {
-        return std::make_unique<real_websocket_client>();
+    std::unique_ptr<lattice::sync_transport> create_sync_transport() override {
+        return std::make_unique<real_sync_transport>();
     }
 };
 

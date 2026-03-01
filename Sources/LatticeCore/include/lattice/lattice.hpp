@@ -8,6 +8,8 @@
 #include "scheduler.hpp"
 #include "observation.hpp"
 #include "cross_process_notifier.hpp"
+#include "sync.hpp"  // for sync_filter_entry (used by configuration)
+#include "ipc.hpp"   // for ipc_endpoint (used by setup_ipc)
 #include <vector>
 #include <memory>
 #include <functional>
@@ -363,9 +365,24 @@ struct configuration {
                   std::shared_ptr<lattice::scheduler> s = nullptr)
         : path(p), sched(std::move(s)), websocket_url(ws_url), authorization_token(auth_token) {}
 
-    /// Returns true if sync is configured (websocket_url is not empty)
+    /// Upload filter. nullopt = sync everything (default).
+    std::optional<std::vector<sync_filter_entry>> sync_filter;
+
+    /// IPC sync targets. Each entry specifies a channel name and optional filter.
+    struct ipc_target {
+        std::string channel;
+        std::optional<std::vector<sync_filter_entry>> sync_filter;
+    };
+    std::vector<ipc_target> ipc_targets;
+
+    /// Returns true if WSS sync is configured (websocket_url is not empty)
     bool is_sync_enabled() const {
         return !websocket_url.empty() && !authorization_token.empty();
+    }
+
+    /// Returns true if any IPC targets are configured
+    bool is_ipc_enabled() const {
+        return !ipc_targets.empty();
     }
 };
 
@@ -623,6 +640,8 @@ public:
             setup_change_hook();
             LOG_DEBUG("lattice_db", "setup_sync_if_configured");
             setup_sync_if_configured();
+            LOG_DEBUG("lattice_db", "setup_ipc_if_configured");
+            setup_ipc_if_configured();
         }
         LOG_DEBUG("lattice_db", "register_instance");
         instance_registry::instance().register_instance(config_.path, this);
@@ -1088,7 +1107,10 @@ public:
         auto instances = (config_.path == ":memory:" || config_.path.empty())
             ? std::vector<lattice_db*>{this}
             : instance_registry::instance().get_instances(config_.path);
-        LOG_DEBUG("flush_changes", "Found %zu instances for path: %s", instances.size(), config_.path.c_str());
+        LOG_DEBUG("flush_changes", "Found %zu instances for path: %s (this=%p)", instances.size(), config_.path.c_str(), (void*)this);
+        for (auto* inst : instances) {
+            LOG_DEBUG("flush_changes", "  instance %p", (void*)inst);
+        }
 
         // Advance cross-process cursor on ALL instances sharing this path
         // BEFORE notifying observers. This prevents any instance's
@@ -1229,6 +1251,12 @@ public:
     /// Manually trigger sync (uploads pending changes)
     void sync_now();
 
+    /// Update the sync filter at runtime, triggering reconciliation
+    void update_sync_filter(std::vector<sync_filter_entry> filter);
+
+    /// Clear the sync filter, reverting to syncing everything
+    void clear_sync_filter();
+
     /// Connect to sync server (called automatically if configured)
     void connect_sync();
 
@@ -1332,11 +1360,16 @@ public:
             std::lock_guard<std::mutex> lock(observers_mutex_);
             auto it = table_observers_.find(table_name);
             if (it != table_observers_.end()) {
+                LOG_DEBUG("notify_change", "table=%s found %zu observers on instance %p",
+                          table_name.c_str(), it->second.size(), (void*)this);
                 for (const auto& [id, cb] : it->second) {
                     callbacks.push_back([cb, operation, row_id, global_row_id] {
                         cb(operation, row_id, global_row_id);
                     });
                 }
+            } else {
+                LOG_DEBUG("notify_change", "table=%s NO observers on instance %p",
+                          table_name.c_str(), (void*)this);
             }
         }
 
@@ -1463,6 +1496,7 @@ public:
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
         try {
             db_->execute("DELETE FROM AuditLog");
+            db_->execute("DELETE FROM _lattice_sync_state");
             db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
         } catch (...) {
             db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
@@ -1490,7 +1524,7 @@ public:
             auto tables = db_->query(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name NOT LIKE 'sqlite_%' "
-                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta') "
+                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', '_lattice_sync_set') "
                 "AND name NOT LIKE '%_vec0' "
                 "AND name NOT LIKE '%_rtree%' "
                 "AND name NOT LIKE '\\_%' ESCAPE '\\'");
@@ -2368,12 +2402,20 @@ protected:
 private:
     template<typename U> friend class query;
     template<typename U> friend class results;
+    friend class synchronizer;
 
     configuration config_;
     std::unique_ptr<database> db_;       // Write connection
     std::unique_ptr<database> read_db_;  // Read-only connection for concurrent reads
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<synchronizer> synchronizer_;
+
+    // IPC sync
+    struct ipc_sync_state {
+        std::unique_ptr<ipc_endpoint> endpoint;
+        std::unique_ptr<synchronizer> sync;
+    };
+    std::vector<ipc_sync_state> ipc_synchronizers_;
 
     // Sync callbacks
     std::function<void(bool)> on_sync_state_change_;
@@ -2389,6 +2431,9 @@ private:
 
     // Initialize synchronizer if configured
     void setup_sync_if_configured();
+
+    // Initialize IPC synchronizers if configured
+    void setup_ipc_if_configured();
 
     // Tear down synchronizer and hand off to a sibling instance if one exists
     void teardown_sync();
@@ -2935,6 +2980,33 @@ private:
             )
         )");
         db_->execute("INSERT OR IGNORE INTO _SyncControl(id, disabled) VALUES(1, 0)");
+
+        // Create _lattice_sync_set table for tracking filtered sync membership
+        db_->execute(R"(
+            CREATE TABLE IF NOT EXISTS _lattice_sync_set (
+                table_name TEXT NOT NULL,
+                global_row_id TEXT NOT NULL,
+                PRIMARY KEY (table_name, global_row_id)
+            )
+        )");
+
+        // Create _lattice_sync_state table for per-synchronizer sync tracking.
+        // Each row tracks whether a specific synchronizer has synced a given AuditLog entry.
+        // Absence of a row = pending for that sync_id.
+        db_->execute(R"(
+            CREATE TABLE IF NOT EXISTS _lattice_sync_state (
+                audit_entry_id INTEGER NOT NULL,
+                sync_id TEXT NOT NULL,
+                is_synchronized INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (audit_entry_id, sync_id)
+            )
+        )");
+        // Partial index for efficient pending-entry queries per sync_id
+        db_->execute(R"(
+            CREATE INDEX IF NOT EXISTS idx_sync_state_pending
+                ON _lattice_sync_state(sync_id, is_synchronized)
+                WHERE is_synchronized = 0
+        )");
 
         // Create sync_disabled() SQL function
         // This allows triggers to check if sync is disabled
@@ -4020,17 +4092,30 @@ change_stream<collection_change> results<T>::changes() {
 
 // ============================================================================
 // Include sync.hpp here so synchronizer is fully defined
-// This must be after lattice_db is fully defined since synchronizer uses it
 // ============================================================================
-#include "sync.hpp"
 
 namespace lattice {
 
 // ============================================================================
 // lattice_db sync method implementations
+// (synchronizer is fully defined via sync.hpp included above)
 // ============================================================================
 
 inline void lattice_db::teardown_sync() {
+    // Tear down IPC synchronizers
+    for (auto& ipc : ipc_synchronizers_) {
+        if (ipc.sync) {
+            ipc.sync->disconnect();
+            ipc.sync.reset();
+        }
+        if (ipc.endpoint) {
+            ipc.endpoint->stop();
+            ipc.endpoint.reset();
+        }
+    }
+    ipc_synchronizers_.clear();
+
+    // Tear down WSS synchronizer
     if (!synchronizer_) return;
     unregister_sync_key(config_.path, config_.websocket_url);
     synchronizer_->disconnect();
@@ -4082,19 +4167,40 @@ inline void lattice_db::sync_now() {
     }
 }
 
+inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
+    if (synchronizer_) {
+        synchronizer_->update_sync_filter(std::move(filter));
+    }
+}
+
+inline void lattice_db::clear_sync_filter() {
+    if (synchronizer_) {
+        synchronizer_->clear_sync_filter();
+    }
+}
+
 inline void lattice_db::trigger_sync_upload() {
+    // Dispatch via scheduler instead of calling sync_now() synchronously.
+    // This method is called from the WAL hook; a synchronous sync_now()
+    // would call upload_pending_changes() which sends data over the transport.
+    // The remote ACK can arrive on the receive thread and call
+    // mark_as_synced() → begin_transaction() while we're still inside the
+    // WAL hook, causing "cannot start a transaction within a transaction".
     if (synchronizer_ && synchronizer_->is_connected()) {
-        // Dispatch via scheduler instead of calling sync_now() synchronously.
-        // This method is called from the WAL hook; a synchronous sync_now()
-        // would call upload_pending_changes() which sends data over WebSocket.
-        // The server's ACK can arrive on the WebSocket receive thread and call
-        // mark_as_synced() → begin_transaction() while we're still inside the
-        // WAL hook, causing "cannot start a transaction within a transaction".
         scheduler_->invoke([this]() {
             if (synchronizer_ && synchronizer_->is_connected()) {
                 synchronizer_->sync_now();
             }
         });
+    }
+    for (auto& ipc : ipc_synchronizers_) {
+        if (ipc.sync && ipc.sync->is_connected()) {
+            scheduler_->invoke([&ipc]() {
+                if (ipc.sync && ipc.sync->is_connected()) {
+                    ipc.sync->sync_now();
+                }
+            });
+        }
     }
 }
 

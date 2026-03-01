@@ -165,6 +165,8 @@ struct combined_query_result {
 };
 
 using CombinedQueryResultVector = std::vector<combined_query_result>;
+using SyncFilterVector = std::vector<sync_filter_entry>;
+using IPCTargetVector = std::vector<configuration::ipc_target>;
 
 // ============================================================================
 // column_value_t helper functions for Swift interop
@@ -327,6 +329,14 @@ struct swift_configuration : public configuration {
 
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
+
+    void set_sync_filter(const SyncFilterVector& filter) {
+        sync_filter = std::vector<sync_filter_entry>(filter.begin(), filter.end());
+    }
+
+    void set_ipc_targets(const IPCTargetVector& targets) {
+        ipc_targets = std::vector<ipc_target>(targets.begin(), targets.end());
+    }
 
 private:
     std::function<void(const std::string& table_name,
@@ -553,6 +563,9 @@ public:
     /// Call before deleting database files to avoid "vnode unlinked while in use".
     void close() { lattice_db::close(); }
     bool is_sync_connected() const { return lattice_db::is_sync_connected(); }
+
+    void update_sync_filter(const SyncFilterVector& filter);
+    void clear_sync_filter();
 
     /// Rebuild the database file, reclaiming unused space.
     /// Closes the read connection before vacuuming and reopens it after.

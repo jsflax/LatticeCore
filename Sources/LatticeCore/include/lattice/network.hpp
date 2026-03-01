@@ -64,23 +64,21 @@ public:
 };
 
 // ============================================================================
-// WebSocket Client Interface
+// Sync Transport Interface
 // ============================================================================
 //
-// Abstract interface for WebSocket connections. Used for real-time sync.
-// Platform-specific implementations:
-// - Apple: URLSessionWebSocketTask
-// - Android: OkHttp WebSocket
-// - Generic: libwebsockets, Beast, etc.
+// Abstract interface for bidirectional sync connections.
+// Implementations: WebSocket (Apple URLSession, NIO), Unix domain socket (IPC),
+// or any transport providing connect/disconnect/send/receive semantics.
 
-enum class websocket_state {
+enum class transport_state {
     connecting,
     open,
     closing,
     closed
 };
 
-struct websocket_message {
+struct transport_message {
     enum class type { text, binary };
     type msg_type = type::binary;
     std::vector<uint8_t> data;
@@ -89,37 +87,37 @@ struct websocket_message {
         return std::string(data.begin(), data.end());
     }
 
-    static websocket_message from_string(const std::string& s) {
-        websocket_message msg;
+    static transport_message from_string(const std::string& s) {
+        transport_message msg;
         msg.msg_type = type::text;
         msg.data = std::vector<uint8_t>(s.begin(), s.end());
         return msg;
     }
 
-    static websocket_message from_binary(const std::vector<uint8_t>& d) {
-        websocket_message msg;
+    static transport_message from_binary(const std::vector<uint8_t>& d) {
+        transport_message msg;
         msg.msg_type = type::binary;
         msg.data = d;
         return msg;
     }
 };
 
-class websocket_client {
+class sync_transport {
 public:
-    virtual ~websocket_client() = default;
+    virtual ~sync_transport() = default;
 
     // Connection lifecycle
     virtual void connect(const std::string& url,
                         const std::map<std::string, std::string>& headers = {}) = 0;
     virtual void disconnect() = 0;
-    virtual websocket_state state() const = 0;
+    virtual transport_state state() const = 0;
 
     // Send message
-    virtual void send(const websocket_message& message) = 0;
+    virtual void send(const transport_message& message) = 0;
 
     // Event callbacks
     using on_open_handler = std::function<void()>;
-    using on_message_handler = std::function<void(const websocket_message&)>;
+    using on_message_handler = std::function<void(const transport_message&)>;
     using on_error_handler = std::function<void(const std::string& error)>;
     using on_close_handler = std::function<void(int code, const std::string& reason)>;
 
@@ -130,23 +128,23 @@ public:
 };
 
 // ============================================================================
-// Generic WebSocket Client - for external injection of implementations
+// Generic Sync Transport - for external injection of implementations
 // ============================================================================
 
-class generic_websocket_client: public websocket_client {
+class generic_sync_transport: public sync_transport {
 public:
     // C function pointer types using void* for C++ types (portable, Swift-safe).
     // url_ptr/headers_ptr/message_ptr are opaque pointers to C++ objects;
     // implementations cast back via helper methods.
     using connect_fn_ptr = void (*)(void* user_data, const void* url_ptr, const void* headers_ptr);
     using disconnect_fn_ptr = void (*)(void* user_data);
-    using state_fn_ptr = websocket_state (*)(void* user_data);
+    using state_fn_ptr = transport_state (*)(void* user_data);
     using send_fn_ptr = void (*)(void* user_data, const void* message_ptr);
 
     // Helpers: cast opaque pointers back to C++ types
     static const std::string& cast_url(const void* p) { return *static_cast<const std::string*>(p); }
     static const HeadersMap& cast_headers(const void* p) { return *static_cast<const HeadersMap*>(p); }
-    static const websocket_message& cast_message(const void* p) { return *static_cast<const websocket_message*>(p); }
+    static const transport_message& cast_message(const void* p) { return *static_cast<const transport_message*>(p); }
 
 private:
     void* user_data_;
@@ -162,7 +160,7 @@ private:
 
 public:
     // C function pointer constructor (primary, works from Swift on all platforms)
-    generic_websocket_client(void* user_data,
+    generic_sync_transport(void* user_data,
                              connect_fn_ptr connect,
                              disconnect_fn_ptr disconnect,
                              state_fn_ptr state,
@@ -175,7 +173,7 @@ public:
     {
     }
 
-    ~generic_websocket_client() = default;
+    ~generic_sync_transport() = default;
 
     void connect(const std::string& url,
                  const std::map<std::string, std::string>& headers = {}) override {
@@ -186,12 +184,12 @@ public:
         if (disconnect_) disconnect_(user_data_);
     }
 
-    websocket_state state() const override {
+    transport_state state() const override {
         if (state_) return state_(user_data_);
-        return websocket_state::closed;
+        return transport_state::closed;
     }
 
-    void send(const websocket_message& message) override {
+    void send(const transport_message& message) override {
         if (send_) send_(user_data_, &message);
     }
 
@@ -201,7 +199,7 @@ public:
     void set_on_close(on_close_handler handler) override { on_close_ = handler; }
 
     void trigger_on_open() { if (on_open_) on_open_(); }
-    void trigger_on_message(const websocket_message& msg) {
+    void trigger_on_message(const transport_message& msg) {
         if (on_message_)
             on_message_(msg);
     }
@@ -209,7 +207,7 @@ public:
     void trigger_on_close(int code, const std::string& reason) { if (on_close_) on_close_(code, reason); }
 };
 
-using UniqueWebsocketClient = std::unique_ptr<websocket_client>;
+using UniqueSyncTransport = std::unique_ptr<sync_transport>;
 
 // ============================================================================
 // Factory for creating platform-specific clients
@@ -220,7 +218,7 @@ public:
     virtual ~network_factory() = default;
 
     virtual std::unique_ptr<http_client> create_http_client() = 0;
-    virtual std::unique_ptr<websocket_client> create_websocket_client() = 0;
+    virtual std::unique_ptr<sync_transport> create_sync_transport() = 0;
 };
 
 // Global factory registration (set by platform layer)
@@ -235,19 +233,19 @@ class generic_network_factory : public network_factory {
 public:
     // C function pointer types (portable, Swift-safe on all platforms)
     using create_http_fn_ptr = http_client* (*)(void* user_data);
-    using create_websocket_fn_ptr = websocket_client* (*)(void* user_data);
+    using create_transport_fn_ptr = sync_transport* (*)(void* user_data);
 
 private:
     void* user_data_;
     create_http_fn_ptr http_fn_;
-    create_websocket_fn_ptr ws_fn_;
+    create_transport_fn_ptr ws_fn_;
     void (*destroy_fn_)(void*);
 
 public:
     // C function pointer constructor (primary, works from Swift on all platforms)
     generic_network_factory(void* user_data,
                             create_http_fn_ptr http_fn,
-                            create_websocket_fn_ptr ws_fn,
+                            create_transport_fn_ptr ws_fn,
                             void (*destroy_fn)(void*) = nullptr)
         : user_data_(user_data)
         , http_fn_(http_fn)
@@ -268,9 +266,9 @@ public:
         return nullptr;
     }
 
-    std::unique_ptr<websocket_client> create_websocket_client() override {
+    std::unique_ptr<sync_transport> create_sync_transport() override {
         if (ws_fn_) {
-            return std::unique_ptr<websocket_client>(ws_fn_(user_data_));
+            return std::unique_ptr<sync_transport>(ws_fn_(user_data_));
         }
         return nullptr;
     }
@@ -278,7 +276,7 @@ public:
 
 inline void register_generic_network_factory(void* user_data,
                                              generic_network_factory::create_http_fn_ptr http_fn,
-                                             generic_network_factory::create_websocket_fn_ptr ws_fn,
+                                             generic_network_factory::create_transport_fn_ptr ws_fn,
                                              void (*destroy_fn)(void*) = nullptr) {
     auto factory = std::make_shared<generic_network_factory>(user_data, http_fn, ws_fn, destroy_fn);
     set_network_factory(factory);
@@ -299,23 +297,23 @@ public:
     }
 };
 
-class mock_websocket_client : public websocket_client {
+class mock_sync_transport : public sync_transport {
 public:
     void connect(const std::string& url,
                 const std::map<std::string, std::string>& headers = {}) override {
         url_ = url;
-        state_ = websocket_state::open;
+        state_ = transport_state::open;
         if (on_open_) on_open_();
     }
 
     void disconnect() override {
-        state_ = websocket_state::closed;
+        state_ = transport_state::closed;
         if (on_close_) on_close_(1000, "Normal closure");
     }
 
-    websocket_state state() const override { return state_; }
+    transport_state state() const override { return state_; }
 
-    void send(const websocket_message& message) override {
+    void send(const transport_message& message) override {
         sent_messages_.push_back(message);
     }
 
@@ -325,7 +323,7 @@ public:
     void set_on_close(on_close_handler handler) override { on_close_ = handler; }
 
     // Test helpers
-    void simulate_message(const websocket_message& msg) {
+    void simulate_message(const transport_message& msg) {
         if (on_message_) on_message_(msg);
     }
 
@@ -333,7 +331,7 @@ public:
         if (on_error_) on_error_(error);
     }
 
-    const std::vector<websocket_message>& get_sent_messages() const {
+    const std::vector<transport_message>& get_sent_messages() const {
         return sent_messages_;
     }
 
@@ -341,12 +339,12 @@ public:
 
 private:
     std::string url_;
-    websocket_state state_ = websocket_state::closed;
+    transport_state state_ = transport_state::closed;
     on_open_handler on_open_;
     on_message_handler on_message_;
     on_error_handler on_error_;
     on_close_handler on_close_;
-    std::vector<websocket_message> sent_messages_;
+    std::vector<transport_message> sent_messages_;
 };
 
 class mock_network_factory : public network_factory {
@@ -355,17 +353,17 @@ public:
         return std::make_unique<null_http_client>();
     }
 
-    std::unique_ptr<websocket_client> create_websocket_client() override {
-        auto client = std::make_unique<mock_websocket_client>();
+    std::unique_ptr<sync_transport> create_sync_transport() override {
+        auto client = std::make_unique<mock_sync_transport>();
         last_websocket_ = client.get();
         return client;
     }
 
     // Access last created websocket for testing
-    mock_websocket_client* last_websocket() { return last_websocket_; }
+    mock_sync_transport* last_websocket() { return last_websocket_; }
 
 private:
-    mock_websocket_client* last_websocket_ = nullptr;
+    mock_sync_transport* last_websocket_ = nullptr;
 };
 
 } // namespace lattice

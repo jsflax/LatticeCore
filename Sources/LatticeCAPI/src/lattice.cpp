@@ -1174,7 +1174,7 @@ extern "C" void lattice_string_free(char* str) {
 // =============================================================================
 
 // Internal wrapper for C callback-based WebSocket client
-struct lattice_websocket_client_internal : public lattice::websocket_client {
+struct lattice_websocket_client_internal : public lattice::sync_transport {
     void* user_data_;
     lattice_ws_connect_fn connect_fn_;
     lattice_ws_disconnect_fn disconnect_fn_;
@@ -1229,17 +1229,17 @@ struct lattice_websocket_client_internal : public lattice::websocket_client {
         }
     }
 
-    lattice::websocket_state state() const override {
+    lattice::transport_state state() const override {
         if (state_fn_) {
             auto s = state_fn_(const_cast<void*>(user_data_));
-            return static_cast<lattice::websocket_state>(s);
+            return static_cast<lattice::transport_state>(s);
         }
-        return lattice::websocket_state::closed;
+        return lattice::transport_state::closed;
     }
 
-    void send(const lattice::websocket_message& message) override {
+    void send(const lattice::transport_message& message) override {
         if (send_fn_) {
-            auto type = (message.msg_type == lattice::websocket_message::type::text)
+            auto type = (message.msg_type == lattice::transport_message::type::text)
                 ? LATTICE_WS_MSG_TEXT : LATTICE_WS_MSG_BINARY;
             send_fn_(user_data_, type, message.data.data(), message.data.size());
         }
@@ -1276,10 +1276,10 @@ struct lattice_websocket_client_internal : public lattice::websocket_client {
     void trigger_on_message(lattice_websocket_msg_type_t type, const uint8_t* data, size_t size) {
         // Call C++ handler (sync layer) - this is the important one!
         if (cpp_on_message_handler_) {
-            lattice::websocket_message msg;
+            lattice::transport_message msg;
             msg.msg_type = (type == LATTICE_WS_MSG_TEXT)
-                ? lattice::websocket_message::type::text
-                : lattice::websocket_message::type::binary;
+                ? lattice::transport_message::type::text
+                : lattice::transport_message::type::binary;
             msg.data.assign(data, data + size);
             cpp_on_message_handler_(msg);
         }
@@ -1450,13 +1450,13 @@ struct lattice_network_factory_internal : public lattice::network_factory {
         return nullptr;
     }
 
-    std::unique_ptr<lattice::websocket_client> create_websocket_client() override {
+    std::unique_ptr<lattice::sync_transport> create_sync_transport() override {
         if (create_ws_fn_) {
             auto* c_client = create_ws_fn_(user_data_);
             if (c_client) {
                 // The C API returns a raw pointer, wrap it in unique_ptr
                 auto* internal = reinterpret_cast<lattice_websocket_client_internal*>(c_client);
-                return std::unique_ptr<lattice::websocket_client>(internal);
+                return std::unique_ptr<lattice::sync_transport>(internal);
             }
         }
         return nullptr;

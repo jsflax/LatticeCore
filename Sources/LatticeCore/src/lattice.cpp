@@ -37,8 +37,8 @@ void lattice_db::setup_change_hook() {
 
             // Handle internal tables specially
             std::string table(table_name);
-            if (table == "_SyncControl") {
-                LOG_DEBUG("update_hook", "Skipping _SyncControl table");
+            if (table == "_SyncControl" || table == "_lattice_sync_set") {
+                LOG_DEBUG("update_hook", "Skipping internal table %s", table_name);
                 return;
             }
 
@@ -277,6 +277,19 @@ void lattice_db::unregister_sync_key(const std::string& path, const std::string&
     active_sync_keys().erase({path, ws_url});
 }
 
+// Collect all sync_ids for this database (WSS + all IPC channels).
+// Used to populate all_active_sync_ids for per-synchronizer sync state.
+static std::vector<std::string> collect_all_sync_ids(const configuration& config) {
+    std::vector<std::string> ids;
+    if (config.is_sync_enabled()) {
+        ids.push_back("wss:" + config.websocket_url);
+    }
+    for (const auto& target : config.ipc_targets) {
+        ids.push_back("ipc:" + target.channel);
+    }
+    return ids;
+}
+
 void lattice_db::setup_sync_if_configured() {
     if (!config_.is_sync_enabled()) {
         return;
@@ -292,6 +305,14 @@ void lattice_db::setup_sync_if_configured() {
     sync_config sync_cfg;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
+    sync_cfg.sync_filter = config_.sync_filter;
+
+    // Use per-synchronizer sync state when multiple transports are configured
+    auto all_ids = collect_all_sync_ids(config_);
+    if (all_ids.size() > 1) {
+        sync_cfg.sync_id = "wss:" + config_.websocket_url;
+        sync_cfg.all_active_sync_ids = all_ids;
+    }
 
     // Create synchronizer
     synchronizer_ = std::make_unique<synchronizer>(*this, sync_cfg, scheduler_);
@@ -306,6 +327,47 @@ void lattice_db::setup_sync_if_configured() {
 
     // Auto-connect (like Swift's Lattice.init)
     synchronizer_->connect();
+}
+
+void lattice_db::setup_ipc_if_configured() {
+    if (!config_.is_ipc_enabled()) {
+        return;
+    }
+
+    auto all_ids = collect_all_sync_ids(config_);
+
+    // Phase 1: Create all endpoints and store them in the vector.
+    // We must do this BEFORE starting any endpoint, because:
+    // - The server callback fires asynchronously on the accept thread
+    // - Capturing &state.sync from a local that is later moved = dangling pointer
+    // - reserve() ensures push_back won't invalidate references
+    ipc_synchronizers_.reserve(config_.ipc_targets.size());
+
+    for (const auto& target : config_.ipc_targets) {
+        ipc_sync_state state;
+        state.endpoint = std::make_unique<ipc_endpoint>(target.channel);
+        ipc_synchronizers_.push_back(std::move(state));
+    }
+
+    // Phase 2: Start endpoints using stable references into the vector.
+    for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
+        const auto& target = config_.ipc_targets[i];
+        std::string sync_id = "ipc:" + target.channel;
+        auto& sync_slot = ipc_synchronizers_[i].sync;
+
+        ipc_synchronizers_[i].endpoint->start(
+            [this, sync_id, all_ids, &target, &sync_slot](std::unique_ptr<ipc_socket_client> transport) {
+                sync_config ipc_cfg;
+                ipc_cfg.sync_id = sync_id;
+                ipc_cfg.all_active_sync_ids = all_ids;
+                ipc_cfg.sync_filter = target.sync_filter;
+
+                auto sync = std::make_unique<synchronizer>(*this, ipc_cfg,
+                    std::move(transport), scheduler_);
+                sync->connect();
+                sync_slot = std::move(sync);
+            });
+    }
 }
 
 static std::vector<std::string> get_column_names(database* db, const std::string& schema, const std::string& table_name) {

@@ -5,6 +5,9 @@
 #include <cmath>
 #include <algorithm>
 
+// IPC transport tests
+#include "IPCTests.hpp"
+
 // Integration tests (real networking with Crow + websocketpp)
 // TODO: Fix mutex crash in integration tests
 // #define RUN_INTEGRATION_TESTS
@@ -1777,7 +1780,7 @@ void test_synchronizer() {
         to_ack.push_back(entry.global_id);
     }
     auto ack = lattice::server_sent_event::make_ack(to_ack);
-    mock_ws->simulate_message(lattice::websocket_message::from_string(ack.to_json()));
+    mock_ws->simulate_message(lattice::transport_message::from_string(ack.to_json()));
 
     assert(!synced_ids.empty());
 
@@ -1813,7 +1816,7 @@ void test_synchronizer() {
 
     auto remote_event = lattice::server_sent_event::make_audit_log({remote_entry});
     std::cout << "    Sending remote event JSON: " << remote_event.to_json() << std::endl;
-    mock_ws->simulate_message(lattice::websocket_message::from_string(remote_event.to_json()));
+    mock_ws->simulate_message(lattice::transport_message::from_string(remote_event.to_json()));
 
     // Check that an ack was sent back
     auto& ack_sent = mock_ws->get_sent_messages();
@@ -2524,6 +2527,16 @@ int main() {
         // geo_bounds list tests
         test_geo_bounds_list();
         test_geo_bounds_list_spatial_query();
+
+        // IPC transport tests
+        ipc_tests::run_all();
+
+        // IPC end-to-end sync tests
+        std::cout << std::endl;
+        std::cout << "--- IPC End-to-End Sync Tests ---" << std::endl;
+        ipc_tests::test_ipc_source_to_target<Person>();
+        ipc_tests::test_ipc_bidirectional<Person>();
+        std::cout << "--- IPC End-to-End Sync Tests: All passed ---" << std::endl;
 
 #ifdef RUN_INTEGRATION_TESTS
         // Integration tests (real networking)

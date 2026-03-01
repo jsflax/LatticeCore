@@ -1,7 +1,7 @@
-# LatticeCpp - Core C++ ORM Implementation
+# LatticeCore - Core C++ ORM Implementation
 
 ## Overview
-LatticeCpp is the C++ core of the Lattice ORM system. It provides the database layer that Swift (and eventually Kotlin) frontends delegate to. Built on SQLite with support for sync, change tracking, and observation.
+LatticeCore is the C++ core of the Lattice ORM system. It provides the database layer that Swift (and eventually Kotlin) frontends delegate to. Built on SQLite with support for sync, change tracking, IPC transport, and observation.
 
 ---
 
@@ -21,22 +21,24 @@ Example: `combinedNearestQuery()` does vector search + geo filtering + bounds in
 ## Project Structure
 
 ```
-LatticeCpp/
+LatticeCore/
 ├── Sources/
-│   ├── LatticeCpp/                    # Core C++ implementation
+│   ├── LatticeCore/                   # Core C++ implementation
 │   │   ├── include/
-│   │   │   ├── LatticeCpp.hpp         # Main header (includes all)
+│   │   │   ├── LatticeCore.hpp        # Main header (includes all)
 │   │   │   └── lattice/
 │   │   │       ├── db.hpp             # Database wrapper
 │   │   │       ├── lattice.hpp        # lattice_db, managed<T>, query<T>
 │   │   │       ├── schema.hpp         # Schema types, registry
-│   │   │       ├── sync.hpp           # Synchronizer
-│   │   │       └── network.hpp        # HTTP/WebSocket client
+│   │   │       ├── sync.hpp           # Synchronizer, sync_transport, sync filters
+│   │   │       ├── network.hpp        # HTTP/WebSocket client (generic_websocket_client)
+│   │   │       └── ipc.hpp            # IPC transport (Unix domain sockets)
 │   │   └── src/
 │   │       ├── db.cpp                 # SQLite operations
 │   │       ├── schema.cpp             # Schema registry
-│   │       ├── sync.cpp               # Sync implementation
-│   │       └── network.cpp            # Network implementation
+│   │       ├── sync.cpp               # Sync implementation, per-synchronizer state
+│   │       ├── network.cpp            # Network implementation
+│   │       └── ipc.cpp               # IPC server/client, length-prefix framing
 │   └── LatticeSwiftCppBridge/         # Swift interop layer
 │       ├── include/
 │       │   └── lattice.hpp            # Swift-specific types
@@ -206,9 +208,11 @@ swift test                     # Run tests (in Lattice project)
 - ✅ Table observers with C function callbacks
 - ✅ Database attachment (`attach()`)
 - ✅ Transaction support (`begin_transaction()`, `commit()`)
-- ✅ WebSocket client integration via `generic_websocket_client`
+- ✅ WebSocket sync via `sync_transport` interface
 - ✅ Scheduler injection for observer dispatch
-
-### TODO
-- ⏳ AuditLog compaction
-- ⏳ Full sync protocol implementation
+- ✅ AuditLog compaction (`generate_history()`)
+- ✅ Full sync protocol (upload/download/reconcile)
+- ✅ Filtered sync with per-table upload predicates (`sync_filter_entry`)
+- ✅ Per-synchronizer sync state (`_lattice_sync_state` table)
+- ✅ IPC transport via Unix domain sockets (`ipc_server`/`ipc_socket_client`)
+- ✅ Cloud relay mode (`sync_apply_mode::relay`)

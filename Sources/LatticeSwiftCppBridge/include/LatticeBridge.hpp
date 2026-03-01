@@ -15,6 +15,10 @@ inline OptionalInt64 int64_to_optional(int64_t v) {
     return v;
 }
 
+inline std::optional<std::vector<sync_filter_entry>> sync_filter_to_optional(const SyncFilterVector& v) {
+    return std::vector<sync_filter_entry>(v.begin(), v.end());
+}
+
 using int64_t = int64_t;
 
 

@@ -640,9 +640,10 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // with the correct (migrated) data rather than default values.
     ensure_geo_bounds_rtrees(all_schemas);
 
-    LOG_INFO("swift_lattice", "ensure_swift_tables: doing fts5");
+    LOG_INFO("swift_lattice", "ensure_swift_tables: doing fts5 (%zu schemas)", all_schemas.size());
     // Phase 6b: Ensure FTS5 tables exist for full-text indexed columns
     ensure_fts5_tables(all_schemas);
+    LOG_INFO("swift_lattice", "ensure_swift_tables: fts5 done");
 
     LOG_INFO("swift_lattice", "ensure_swift_tables: creating indexes");
     // Phase 7: Create UNIQUE indexes for constraints
@@ -679,10 +680,12 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
     // All migrations and schema setup succeeded — commit the transaction.
     // If anything above threw, the transaction destructor rolls back instead.
+    LOG_INFO("swift_lattice", "ensure_swift_tables: committing transaction");
     transaction.commit();
+    LOG_INFO("swift_lattice", "ensure_swift_tables done");
 }
 
-}
+} // namespace lattice
 
 void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
     if (objects.empty()) {
@@ -796,4 +799,12 @@ lattice::dynamic_object_ref* lattice::migration_get_old_row() {
 
 lattice::dynamic_object_ref* lattice::migration_get_new_row() {
     return g_migration_new_row;
+}
+
+void lattice::swift_lattice::update_sync_filter(const SyncFilterVector& filter) {
+    lattice_db::update_sync_filter(std::vector<sync_filter_entry>(filter.begin(), filter.end()));
+}
+
+void lattice::swift_lattice::clear_sync_filter() {
+    lattice_db::clear_sync_filter();
 }

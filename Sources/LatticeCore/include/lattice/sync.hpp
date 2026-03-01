@@ -160,12 +160,36 @@ struct server_sent_event {
 // Sync Configuration
 // ============================================================================
 
+// ============================================================================
+// Sync Filter
+// ============================================================================
+
+struct sync_filter_entry {
+    std::string table_name;
+    std::optional<std::string> where_clause;  // nullopt = all rows
+};
+
 struct sync_config {
     std::string websocket_url;
     std::string authorization_token;
     int max_reconnect_attempts = 6;
     double base_delay_seconds = 1.0;
     size_t chunk_size = 1000;  // Max events per message
+
+    /// Upload filter. nullopt = sync everything (default).
+    /// Empty vector = sync nothing. Non-empty = whitelist.
+    std::optional<std::vector<sync_filter_entry>> sync_filter;
+
+    /// Unique identifier for this synchronizer instance (e.g. "wss:<url>" or "ipc:<channel>").
+    /// When set, per-synchronizer sync state is tracked in _lattice_sync_state
+    /// instead of using the single isSynchronized column on AuditLog.
+    /// This enables multiple synchronizers per database without interference.
+    std::string sync_id;
+
+    /// All active sync_ids on this database (including this one).
+    /// Used for eager cleanup: when all sync_ids have synced an entry,
+    /// _lattice_sync_state rows are deleted and isSynchronized=1 is set.
+    std::vector<std::string> all_active_sync_ids;
 };
 
 // ============================================================================
@@ -180,6 +204,13 @@ public:
 
     synchronizer(lattice_db& db, const sync_config& config,
                  std::shared_ptr<scheduler> scheduler = nullptr);
+
+    /// Construct with an externally-provided transport (for IPC).
+    /// The transport is already connected or will be connected via connect().
+    synchronizer(lattice_db& db, const sync_config& config,
+                 std::unique_ptr<sync_transport> transport,
+                 std::shared_ptr<scheduler> scheduler = nullptr);
+
     ~synchronizer();
 
     // Non-copyable, non-moveable
@@ -196,6 +227,10 @@ public:
     // Manual sync trigger (uploads pending changes)
     void sync_now();
 
+    // Sync filter management
+    void update_sync_filter(std::vector<sync_filter_entry> filter);
+    void clear_sync_filter();
+
     // Event handlers
     void set_on_sync_complete(on_sync_complete_handler handler) { on_sync_complete_ = std::move(handler); }
     void set_on_error(on_error_handler handler) { on_error_ = std::move(handler); }
@@ -205,7 +240,7 @@ private:
     lattice_db& db_;
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
-    std::unique_ptr<websocket_client> ws_client_;
+    std::unique_ptr<sync_transport> ws_client_;
 
     std::atomic<bool> is_connected_{false};
     std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
@@ -220,7 +255,7 @@ private:
 
     // Internal handlers
     void on_websocket_open();
-    void on_websocket_message(const websocket_message& msg);
+    void on_transport_message(const transport_message& msg);
     void on_websocket_error(const std::string& error);
     void on_websocket_close(int code, const std::string& reason);
 
@@ -228,6 +263,21 @@ private:
     void upload_pending_changes();
     void apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
+
+    // Sync filter helpers
+    // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")
+    std::optional<std::optional<std::string>> get_filter_for_table(const std::string& table_name) const;
+    bool is_table_in_filter(const std::string& table_name) const;
+    bool row_matches_filter(const std::string& table_name, const std::string& global_row_id);
+    audit_log_entry build_insert_entry_from_current_row(const std::string& table_name, const std::string& global_row_id);
+
+    // Sync set management
+    void sync_set_add(const std::string& table_name, const std::string& global_row_id);
+    void sync_set_remove(const std::string& table_name, const std::string& global_row_id);
+    bool sync_set_contains(const std::string& table_name, const std::string& global_row_id);
+
+    // Reconciliation (called on filter change)
+    void reconcile_sync_filter();
 
     // Reconnection
     void schedule_reconnect();
@@ -244,8 +294,22 @@ std::vector<audit_log_entry> query_audit_log(database& db,
     bool only_unsynced = false,
     std::optional<std::string> after_global_id = std::nullopt);
 
+/// Query unsynced audit log entries for a specific synchronizer using _lattice_sync_state.
+/// Returns entries that have no sync_state row (or is_synchronized=0) for the given sync_id.
+/// Unlike the single-sync query, this does NOT filter on isFromRemote — any entry not yet
+/// synced by this sync_id is returned, enabling cross-transport relay.
+std::vector<audit_log_entry> query_audit_log_for_sync(database& db, const std::string& sync_id);
+
 // Mark audit entries as synchronized (with observer notification)
 void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& global_ids);
+
+/// Mark audit entries as synchronized for a specific sync_id in _lattice_sync_state.
+/// Also performs eager cleanup: when all active sync_ids have synced an entry,
+/// deletes _lattice_sync_state rows and sets isSynchronized=1 on AuditLog.
+void mark_audit_entries_synced_for(lattice_db& db,
+                                   const std::vector<std::string>& global_ids,
+                                   const std::string& sync_id,
+                                   const std::vector<std::string>& all_active_sync_ids);
 
 // Get events after a checkpoint (for server-side sync)
 std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
@@ -253,6 +317,14 @@ std::vector<audit_log_entry> events_after(database& db, const std::optional<std:
 // Apply remote audit log entries to a database (server-side receive path)
 // Disables sync triggers, executes model SQL, inserts AuditLog records, re-enables triggers.
 void apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries);
+
+/// Apply remote audit log entries and mark them as synced for the receiving sync_id.
+/// Unlike apply_remote_changes, this uses per-synchronizer sync state so that OTHER
+/// synchronizers (WSS, BLE, etc.) see the entries as pending and relay them.
+/// The receiving sync_id's _lattice_sync_state is set to 1 (preventing re-upload = loop prevention).
+void apply_remote_changes_for(lattice_db& db,
+                              const std::vector<audit_log_entry>& entries,
+                              const std::string& sync_id);
 
 } // namespace lattice
 

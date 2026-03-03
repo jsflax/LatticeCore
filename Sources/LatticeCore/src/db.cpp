@@ -66,7 +66,8 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
     // Only run ANALYZE on read-write connections (best-effort — don't fail init if locked)
     if (mode == open_mode::read_write) {
         try {
-            execute("ANALYZE");
+            sqlite3_exec(db_, "ANALYZE", nullptr, nullptr, nullptr);
+//            execute("ANALYZE");
         } catch (const db_error&) {
             LOG_WARN("db", "ANALYZE skipped (database busy)");
         }
@@ -85,7 +86,7 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
 database::~database() {
     if (db_) {
         if (mode_ == open_mode::read_write) {
-            sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+            sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
         }
         sqlite3_close(db_);
     }
@@ -137,8 +138,9 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
         sqlite3_finalize(stmt);
 
         if (rc != SQLITE_DONE) {
-            LOG_ERROR("db", "Execution failed: %s (SQL: %s)", sqlite3_errmsg(db_), sql.c_str());
-            throw db_error("Execution failed: " + std::string(sqlite3_errmsg(db_)));
+            auto errmsg = sqlite3_errmsg(db_);
+            LOG_ERROR("db", "Execution failed: %s (SQL: %s)", errmsg, sql.c_str());
+            throw db_error("Execution failed: " + std::string(errmsg));
         }
     }
 }

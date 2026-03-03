@@ -17,6 +17,8 @@
 #include <thread>
 #include <variant>
 #include <unordered_map>
+#include <unordered_set>
+#include <mutex>
 
 namespace lattice {
 
@@ -202,14 +204,27 @@ public:
     using on_error_handler = std::function<void(const std::string& error)>;
     using on_state_change_handler = std::function<void(bool connected)>;
 
-    synchronizer(lattice_db& db, const sync_config& config,
-                 std::shared_ptr<scheduler> scheduler = nullptr);
+    // ============================================================================
+    // Sync Progress
+    // ============================================================================
+
+    struct sync_progress {
+        int64_t pending_upload = 0;
+        int64_t total_upload = 0;    // snapshot at start of batch
+        int64_t acked = 0;
+        int64_t received = 0;        // cumulative downloads
+    };
+
+    using on_progress_handler = std::function<void(const sync_progress&)>;
+
+    /// Construct with an owned lattice_db (dedicated connection for sync).
+    /// Scheduler comes from db->scheduler().
+    synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);
 
     /// Construct with an externally-provided transport (for IPC).
     /// The transport is already connected or will be connected via connect().
-    synchronizer(lattice_db& db, const sync_config& config,
-                 std::unique_ptr<sync_transport> transport,
-                 std::shared_ptr<scheduler> scheduler = nullptr);
+    synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
+                 std::unique_ptr<sync_transport> transport);
 
     ~synchronizer();
 
@@ -236,22 +251,50 @@ public:
     void set_on_error(on_error_handler handler) { on_error_ = std::move(handler); }
     void set_on_state_change(on_state_change_handler handler) { on_state_change_ = std::move(handler); }
 
+    // Progress
+    void set_on_progress(on_progress_handler handler);
+
+    sync_progress get_progress() const;
+
 private:
-    lattice_db& db_;
+    std::unique_ptr<lattice_db> db_;
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<sync_transport> ws_client_;
 
     std::atomic<bool> is_connected_{false};
+    std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
     std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
     std::atomic<int> reconnect_attempts_{0};
+    std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
+    std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
+
+    // In-flight tracking: entries sent but not yet ACK'd.
+    // Prevents upload_pending_changes from re-sending entries on each cycle.
+    // Accessed from scheduler thread (upload) and WebSocket/IPC thread (ACK) — needs mutex.
+    std::mutex in_flight_mutex_;
+    std::unordered_set<std::string> in_flight_ids_;
 
     on_sync_complete_handler on_sync_complete_;
     on_error_handler on_error_;
     on_state_change_handler on_state_change_;
+    mutable std::mutex progress_handler_mutex_;
+    on_progress_handler on_progress_;
+
+    // Progress tracking
+    std::atomic<int64_t> progress_pending_upload_{0};
+    std::atomic<int64_t> progress_total_upload_{0};
+    std::atomic<int64_t> progress_acked_{0};
+    std::atomic<int64_t> progress_received_{0};
+
+    void fire_progress();
 
     // Observer for AuditLog changes (triggers upload when new local entries appear)
     uint64_t audit_log_observer_id_{0};
+
+    // Constructor helpers
+    void setup_transport_handlers();
+    void setup_observer();
 
     // Internal handlers
     void on_websocket_open();
@@ -261,15 +304,27 @@ private:
 
     // Sync operations
     void upload_pending_changes();
-    void apply_remote_changes(const std::vector<audit_log_entry>& entries);
+    std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
+
+    // upload_pending_changes decomposed phases
+    struct classified_entries {
+        std::vector<audit_log_entry> to_send;
+        std::vector<int64_t> to_mark_synced;
+    };
+    std::vector<audit_log_entry> query_pending_entries();
+    classified_entries classify_entries(std::vector<audit_log_entry>& entries);
+    void classify_delete(audit_log_entry& entry, classified_entries& result);
+    void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
+    void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
+    void send_entries(std::vector<audit_log_entry>& entries);
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")
     std::optional<std::optional<std::string>> get_filter_for_table(const std::string& table_name) const;
     bool is_table_in_filter(const std::string& table_name) const;
     bool row_matches_filter(const std::string& table_name, const std::string& global_row_id);
-    audit_log_entry build_insert_entry_from_current_row(const std::string& table_name, const std::string& global_row_id);
+    std::optional<audit_log_entry> build_insert_entry_from_current_row(const std::string& table_name, const std::string& global_row_id);
 
     // Sync set management
     void sync_set_add(const std::string& table_name, const std::string& global_row_id);
@@ -298,7 +353,10 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 /// Returns entries that have no sync_state row (or is_synchronized=0) for the given sync_id.
 /// Unlike the single-sync query, this does NOT filter on isFromRemote — any entry not yet
 /// synced by this sync_id is returned, enabling cross-transport relay.
-std::vector<audit_log_entry> query_audit_log_for_sync(database& db, const std::string& sync_id);
+std::vector<audit_log_entry> query_audit_log_for_sync(
+    database& db,
+    const std::string& sync_id,
+    const std::optional<std::vector<sync_filter_entry>>& sync_filter = std::nullopt);
 
 // Mark audit entries as synchronized (with observer notification)
 void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& global_ids);
@@ -316,13 +374,15 @@ std::vector<audit_log_entry> events_after(database& db, const std::optional<std:
 
 // Apply remote audit log entries to a database (server-side receive path)
 // Disables sync triggers, executes model SQL, inserts AuditLog records, re-enables triggers.
-void apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries);
+// Returns global IDs of successfully applied entries (entries that failed SQL execution are excluded).
+std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries);
 
 /// Apply remote audit log entries and mark them as synced for the receiving sync_id.
 /// Unlike apply_remote_changes, this uses per-synchronizer sync state so that OTHER
 /// synchronizers (WSS, BLE, etc.) see the entries as pending and relay them.
 /// The receiving sync_id's _lattice_sync_state is set to 1 (preventing re-upload = loop prevention).
-void apply_remote_changes_for(lattice_db& db,
+/// Returns global IDs of successfully applied entries.
+std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
                               const std::string& sync_id);
 

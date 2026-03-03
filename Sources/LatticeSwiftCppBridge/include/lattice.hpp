@@ -567,6 +567,47 @@ public:
     void update_sync_filter(const SyncFilterVector& filter);
     void clear_sync_filter();
 
+    // Sync progress — polling
+    int64_t sync_progress_pending_upload() const {
+        auto p = lattice_db::get_sync_progress();
+        return p.pending_upload;
+    }
+    int64_t sync_progress_total_upload() const {
+        auto p = lattice_db::get_sync_progress();
+        return p.total_upload;
+    }
+    int64_t sync_progress_acked() const {
+        auto p = lattice_db::get_sync_progress();
+        return p.acked;
+    }
+    int64_t sync_progress_received() const {
+        auto p = lattice_db::get_sync_progress();
+        return p.received;
+    }
+
+    // Sync progress — callback (fires on synchronizer's std_thread_scheduler thread)
+    void set_on_sync_progress(void* context,
+                               void (*callback)(void* ctx,
+                                                int64_t pending_upload,
+                                                int64_t total_upload,
+                                                int64_t acked,
+                                                int64_t received),
+                               void (*destroy)(void*) = nullptr) {
+        LOG_INFO("swift_lattice", "set_on_sync_progress: callback=%s (db=%s)",
+                 callback ? "SET" : "CLEAR", config().path.c_str());
+        if (!callback) {
+            lattice_db::set_on_sync_progress(nullptr);
+            if (context && destroy) { destroy(context); }
+            return;
+        }
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        lattice_db::set_on_sync_progress(
+            [shared_ctx, cb](const synchronizer::sync_progress& p) {
+                cb(shared_ctx.get(), p.pending_upload, p.total_upload, p.acked, p.received);
+            });
+    }
+
     /// Rebuild the database file, reclaiming unused space.
     /// Closes the read connection before vacuuming and reopens it after.
     void vacuum() {
@@ -1487,7 +1528,7 @@ public:
     
     /// Receive sync data from a client (server-side)
     /// data: JSON bytes containing ServerSentEvent
-    /// Returns list of acknowledged global IDs
+    /// Returns list of acknowledged global IDs (only successfully applied entries)
     std::vector<std::string> receive_sync_data(const ByteVector& data) {
         std::string json_str(data.begin(), data.end());
         auto event = server_sent_event::from_json(json_str);
@@ -1495,20 +1536,16 @@ public:
             return {};  // Parse failed
         }
         std::vector<std::string> result;
-        
+
         if (event->event_type == server_sent_event::type::audit_log) {
-            // Apply remote changes to this database (model SQL + AuditLog records)
-            ::lattice::apply_remote_changes(*this, event->audit_logs);
-            result.reserve(event->audit_logs.size());
-            for (const auto& entry : event->audit_logs) {
-                result.push_back(entry.global_id);
-            }
+            // Apply remote changes — returns only successfully applied IDs
+            result = ::lattice::apply_remote_changes(*this, event->audit_logs);
         } else if (event->event_type == server_sent_event::type::ack) {
             // Mark entries as synchronized (includes observer notification)
             ::lattice::mark_audit_entries_synced(*this, event->acked_ids);
             result = event->acked_ids;
         }
-        
+
         return result;
     }
 } SWIFT_UNSAFE_REFERENCE;
@@ -1692,12 +1729,14 @@ namespace detail {
         std::string path;
         std::shared_ptr<scheduler> sched;
         std::string websocket_url;  // Include sync config in cache key
-        std::string schema_hash;    // Hash of table names to detect schema changes
+        std::string schema_hash;    // Hash of table names + property types
+        int32_t schema_version;     // Target schema version (differentiates pre/post migration)
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if (path != other.path) return path < other.path;
             if (websocket_url != other.websocket_url) return websocket_url < other.websocket_url;
             if (schema_hash != other.schema_hash) return schema_hash < other.schema_hash;
+            if (schema_version != other.schema_version) return schema_version < other.schema_version;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -1710,6 +1749,7 @@ namespace detail {
             if (path != other.path) return false;
             if (websocket_url != other.websocket_url) return false;
             if (schema_hash != other.schema_hash) return false;
+            if (schema_version != other.schema_version) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -1755,15 +1795,14 @@ namespace detail {
                 }
             }
 
-            // Skip cache when migration is needed (target_schema_version > 1 indicates migration)
-            // Migration requires a fresh connection to detect and apply schema changes.
-            // Also skip cache for in-memory databases — each ":memory:" open creates a
+            // Skip cache for in-memory databases — each ":memory:" open creates a
             // distinct SQLite database, so reusing a cached instance would incorrectly
             // share state between callers that expect isolated storage.
-            bool skip_cache = config.target_schema_version > 1 ||
-                              config.path == ":memory:" || config.path.empty();
+            // Migration is NOT a reason to skip cache: it's idempotent (checks
+            // current_version vs target_version and skips if already applied).
+            bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version};
 
             // Find existing entry (unless migration requires fresh connection)
             if (!skip_cache) {

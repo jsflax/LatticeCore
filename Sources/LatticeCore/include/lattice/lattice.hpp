@@ -59,14 +59,30 @@ struct has_geo_bounds_lists<T, std::void_t<decltype(std::declval<T>().collect_ge
 // Similar to Swift's latticeIsolationRegistrar
 // ============================================================================
 
+/// Guard token allocated on the heap so it outlives the lattice_db instance.
+/// flush_changes() copies these from the registry and can safely check the
+/// alive flag even after the lattice_db is destroyed.
+struct instance_guard {
+    std::atomic<bool> alive{true};
+    /// Number of in-flight notify_change() calls on this instance.
+    /// The destructor spins until this reaches 0 before proceeding.
+    std::atomic<int> notify_refcount{0};
+};
+
 class instance_registry {
 public:
+    struct entry {
+        lattice_db* ptr;
+        std::shared_ptr<instance_guard> guard;
+    };
+
     // Singleton accessor - defined in lattice.cpp to avoid ODR violations
     static instance_registry& instance();
 
-    void register_instance(const std::string& path, lattice_db* db) {
+    void register_instance(const std::string& path, lattice_db* db,
+                           std::shared_ptr<instance_guard> guard) {
         std::lock_guard<std::mutex> lock(mutex_);
-        instances_[path].push_back(db);
+        instances_[path].push_back({db, std::move(guard)});
     }
 
     void unregister_instance(const std::string& path, lattice_db* db) {
@@ -74,14 +90,36 @@ public:
         auto it = instances_.find(path);
         if (it != instances_.end()) {
             auto& vec = it->second;
-            vec.erase(std::remove(vec.begin(), vec.end(), db), vec.end());
+            vec.erase(std::remove_if(vec.begin(), vec.end(),
+                [db](const entry& e) { return e.ptr == db; }), vec.end());
             if (vec.empty()) {
                 instances_.erase(it);
             }
         }
     }
 
-    std::vector<lattice_db*> get_instances(const std::string& path) {
+    /// Iterate alive instances for a path with guard protection.
+    /// The callback receives a raw pointer guaranteed to remain valid for
+    /// the duration of the call (the instance's destructor spins on
+    /// notify_refcount before proceeding).
+    template<typename Fn>
+    void for_each_alive(const std::string& path, Fn&& fn) {
+        auto entries = get_entries(path);
+        for (auto& e : entries) {
+            e.guard->notify_refcount.fetch_add(1, std::memory_order_seq_cst);
+            if (!e.guard->alive.load(std::memory_order_seq_cst)) {
+                e.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
+                continue;
+            }
+            fn(e.ptr);
+            e.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
+        }
+    }
+
+private:
+    instance_registry() = default;
+
+    std::vector<entry> get_entries(const std::string& path) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = instances_.find(path);
         if (it != instances_.end()) {
@@ -90,10 +128,8 @@ public:
         return {};
     }
 
-private:
-    instance_registry() = default;
     std::mutex mutex_;
-    std::map<std::string, std::vector<lattice_db*>> instances_;
+    std::map<std::string, std::vector<entry>> instances_;
 };
 
 // ============================================================================
@@ -608,7 +644,7 @@ public:
         , scheduler_(std::make_shared<immediate_scheduler>()) {
         ensure_tables();
         setup_change_hook();
-        instance_registry::instance().register_instance(config_.path, this);
+        instance_registry::instance().register_instance(config_.path, this, guard_);
         setup_cross_process_notifier();
     }
 
@@ -620,31 +656,45 @@ public:
         , scheduler_(std::make_shared<immediate_scheduler>()) {
         ensure_tables();
         setup_change_hook();
-        instance_registry::instance().register_instance(config_.path, this);
+        instance_registry::instance().register_instance(config_.path, this, guard_);
         setup_cross_process_notifier();
     }
 
     // Construct with full configuration (including optional sync)
-    explicit lattice_db(const configuration& config)
+    // defer_sync: when true, skips sync/ipc setup — caller must call
+    // setup_sync_if_configured() + setup_ipc_if_configured() after
+    // all tables are created (used by swift_lattice).
+    static std::atomic<int64_t>& alive_count() {
+        static std::atomic<int64_t> count{0};
+        return count;
+    }
+
+    explicit lattice_db(const configuration& config, bool defer_sync = false)
         : config_(config)
         , db_(std::make_unique<database>(config.path,
               config.read_only ? database::open_mode::read_only_immutable : database::open_mode::read_write))
         , read_db_(config.read_only ? nullptr :
                    (config.path != ":memory:" ? std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr))
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
+        auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
+        LOG_INFO("lattice_db", "CREATED (this=%p, path=%s, ipc=%d, sync=%d, alive=%lld)",
+                 (void*)this, config.path.c_str(), config.is_ipc_enabled() ? 1 : 0,
+                 config.is_sync_enabled() ? 1 : 0, (long long)n);
         LOG_DEBUG("lattice_db", "ctor start path=%s read_only=%d", config.path.c_str(), config.read_only);
         if (!config.read_only) {
             LOG_DEBUG("lattice_db", "ensure_tables");
             ensure_tables();
             LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
-            LOG_DEBUG("lattice_db", "setup_sync_if_configured");
-            setup_sync_if_configured();
-            LOG_DEBUG("lattice_db", "setup_ipc_if_configured");
-            setup_ipc_if_configured();
+            if (!defer_sync) {
+                LOG_DEBUG("lattice_db", "setup_sync_if_configured");
+                setup_sync_if_configured();
+                LOG_DEBUG("lattice_db", "setup_ipc_if_configured");
+                setup_ipc_if_configured();
+            }
         }
         LOG_DEBUG("lattice_db", "register_instance");
-        instance_registry::instance().register_instance(config_.path, this);
+        instance_registry::instance().register_instance(config_.path, this, guard_);
         LOG_DEBUG("lattice_db", "setup_cross_process_notifier");
         setup_cross_process_notifier();
         LOG_DEBUG("lattice_db", "ctor done");
@@ -1101,16 +1151,17 @@ public:
 
         LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
-        // Get all instances sharing this database path.
-        // In-memory databases each have their own isolated storage despite
-        // sharing the ":memory:" path string, so only notify this instance.
-        auto instances = (config_.path == ":memory:" || config_.path.empty())
-            ? std::vector<lattice_db*>{this}
-            : instance_registry::instance().get_instances(config_.path);
-        LOG_DEBUG("flush_changes", "Found %zu instances for path: %s (this=%p)", instances.size(), config_.path.c_str(), (void*)this);
-        for (auto* inst : instances) {
-            LOG_DEBUG("flush_changes", "  instance %p", (void*)inst);
-        }
+        // Helper: iterate alive instances sharing this path, guarded by
+        // refcount so the destructor waits for in-flight calls to complete.
+        // In-memory DBs each have isolated storage, so only notify this instance.
+        bool is_file_db = config_.path != ":memory:" && !config_.path.empty();
+        auto for_each_alive = [&](auto&& fn) {
+            if (is_file_db) {
+                instance_registry::instance().for_each_alive(config_.path, fn);
+            } else {
+                fn(this);
+            }
+        };
 
         // Advance cross-process cursor on ALL instances sharing this path
         // BEFORE notifying observers. This prevents any instance's
@@ -1122,9 +1173,9 @@ public:
                 auto it = max_rows[0].find("max_id");
                 if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
                     auto max_id = std::get<int64_t>(it->second);
-                    for (auto* inst : instances) {
+                    for_each_alive([max_id](lattice_db* inst) {
                         inst->last_seen_audit_id_.store(max_id, std::memory_order_release);
-                    }
+                    });
                 }
             }
         }
@@ -1156,15 +1207,16 @@ public:
             if (it != internal_table_parents.end() && !it->second.empty()) {
                 // Internal table — notify as parent table UPDATE
                 LOG_DEBUG("flush_changes", "Internal table %s -> parent UPDATE %s", table.c_str(), it->second.c_str());
-                for (auto* instance : instances) {
-                    instance->notify_change(it->second, "UPDATE", 0, "");
-                }
+                auto parent_table = it->second;
+                for_each_alive([&parent_table](lattice_db* instance) {
+                    instance->notify_change(parent_table, "UPDATE", 0, "");
+                });
                 had_internal_changes = true;
             } else {
                 LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s", table.c_str(), op.c_str());
-                for (auto* instance : instances) {
+                for_each_alive([&table, &op, row_id, &global_id](lattice_db* instance) {
                     instance->notify_change(table, op, row_id, global_id);
-                }
+                });
             }
         }
 
@@ -1206,9 +1258,9 @@ public:
                     LOG_DEBUG("flush_changes", "Notifying AuditLog observers: rowId=%lld", (long long)audit_row_id);
 
                     // Notify AuditLog observers on all instances
-                    for (auto* instance : instances) {
+                    for_each_alive([audit_row_id, &audit_global_id](lattice_db* instance) {
                         instance->notify_change("AuditLog", "INSERT", audit_row_id, audit_global_id);
-                    }
+                    });
                     triggered_regular_audit = true;
                 }
             } else {
@@ -1268,6 +1320,12 @@ public:
 
     /// Set callback for sync errors
     void set_on_sync_error(std::function<void(const std::string& error)> handler);
+
+    /// Get aggregated sync progress across all synchronizers (WSS + IPC)
+    synchronizer::sync_progress get_sync_progress() const;
+
+    /// Set callback for sync progress updates (fires on synchronizer thread)
+    void set_on_sync_progress(synchronizer::on_progress_handler handler);
 
     // ========================================================================
     // Observation API
@@ -2429,12 +2487,14 @@ private:
     std::vector<std::tuple<std::string, std::string, int64_t, std::string>> change_buffer_;  // (table, op, rowId, globalId)
     bool is_flushing_ = false;
 
+protected:
     // Initialize synchronizer if configured
     void setup_sync_if_configured();
 
     // Initialize IPC synchronizers if configured
     void setup_ipc_if_configured();
 
+private:
     // Tear down synchronizer and hand off to a sibling instance if one exists
     void teardown_sync();
 
@@ -2466,6 +2526,9 @@ private:
     // object.  The destructor locks it while unregistering, preventing the
     // callback from accessing a partially-destroyed lattice_db.
     std::shared_ptr<std::mutex> xproc_callback_mutex_ = std::make_shared<std::mutex>();
+    /// Heap-allocated guard for safe cross-instance notification.
+    /// Set alive=false before teardown; spin on refcount before destroying members.
+    std::shared_ptr<instance_guard> guard_ = std::make_shared<instance_guard>();
     void setup_cross_process_notifier();
 public:
     void handle_cross_process_notification();
@@ -4102,12 +4165,27 @@ namespace lattice {
 // ============================================================================
 
 inline void lattice_db::teardown_sync() {
-    // Tear down IPC synchronizers
+    // Phase 1: Disconnect ALL synchronizers (joins transport read threads,
+    // removes AuditLog observers). This must complete for every synchronizer
+    // BEFORE destroying any of them, because flush_changes() on one sync's
+    // db iterates ALL registered instances — destroying one sync's db while
+    // another sync's thread is in flush_changes causes a use-after-free on
+    // observers_mutex_.
     for (auto& ipc : ipc_synchronizers_) {
-        if (ipc.sync) {
-            ipc.sync->disconnect();
-            ipc.sync.reset();
-        }
+        if (ipc.sync) ipc.sync->disconnect();
+    }
+    if (synchronizer_) synchronizer_->disconnect();
+
+    // Phase 2: All transport threads stopped. Destroy IPC synchronizers
+    // and unregister their keys from the sync registry.
+    // Each synchronizer destructor drains its scheduler before destroying
+    // its owned lattice_db, so in-flight work completes safely while all
+    // remaining instances are still alive and registered.
+    for (const auto& target : config_.ipc_targets) {
+        unregister_sync_key(config_.path, "ipc:" + target.channel);
+    }
+    for (auto& ipc : ipc_synchronizers_) {
+        if (ipc.sync) ipc.sync.reset();
         if (ipc.endpoint) {
             ipc.endpoint->stop();
             ipc.endpoint.reset();
@@ -4115,22 +4193,33 @@ inline void lattice_db::teardown_sync() {
     }
     ipc_synchronizers_.clear();
 
-    // Tear down WSS synchronizer
+    // Phase 3: Destroy WSS synchronizer
     if (!synchronizer_) return;
     unregister_sync_key(config_.path, config_.websocket_url);
-    synchronizer_->disconnect();
     synchronizer_.reset();
     // Hand off sync responsibility to a surviving sibling instance
-    for (auto* sibling : instance_registry::instance().get_instances(config_.path)) {
-        if (sibling->config_.is_sync_enabled() &&
-            sibling->config_.websocket_url == config_.websocket_url) {
-            sibling->setup_sync_if_configured();
-            break;
-        }
-    }
+    bool handed_off = false;
+    instance_registry::instance().for_each_alive(config_.path,
+        [&](lattice_db* sibling) {
+            if (!handed_off && sibling != this &&
+                sibling->config_.is_sync_enabled() &&
+                sibling->config_.websocket_url == config_.websocket_url) {
+                sibling->setup_sync_if_configured();
+                handed_off = true;
+            }
+        });
 }
 
 inline void lattice_db::close() {
+    // 1. Mark as dying — prevents new notify_change() calls from starting.
+    guard_->alive.store(false, std::memory_order_seq_cst);
+    // 2. Wait for any in-flight notify_change() calls to complete.
+    while (guard_->notify_refcount.load(std::memory_order_seq_cst) > 0) {
+        std::this_thread::yield();
+    }
+    // 3. Stop all sync threads while all members are still alive.
+    teardown_sync();
+    // 4. Now safe to unregister — no sync threads, no in-flight notifications.
     {
         std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
         instance_registry::instance().unregister_instance(config_.path, this);
@@ -4139,13 +4228,24 @@ inline void lattice_db::close() {
         xproc_notifier_->stop_listening();
         xproc_notifier_.reset();
     }
-    teardown_sync();
     read_db_.reset();
     db_.reset();
 }
 
 inline lattice_db::~lattice_db() {
+    auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
+    LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",
+             (void*)this, config_.path.c_str(), (long long)n);
     // close() may have already been called; each step is idempotent.
+    // 1. Mark as dying (idempotent if close() already ran).
+    guard_->alive.store(false, std::memory_order_seq_cst);
+    // 2. Wait for any in-flight notify_change() calls to complete.
+    while (guard_->notify_refcount.load(std::memory_order_seq_cst) > 0) {
+        std::this_thread::yield();
+    }
+    // 3. Stop all sync threads.
+    teardown_sync();
+    // 4. Unregister after all sync threads are stopped.
     {
         std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
         instance_registry::instance().unregister_instance(config_.path, this);
@@ -4154,7 +4254,6 @@ inline lattice_db::~lattice_db() {
         xproc_notifier_->stop_listening();
         xproc_notifier_.reset();
     }
-    teardown_sync();
 }
 
 inline bool lattice_db::is_sync_connected() const {
@@ -4169,13 +4268,28 @@ inline void lattice_db::sync_now() {
 
 inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
     if (synchronizer_) {
-        synchronizer_->update_sync_filter(std::move(filter));
+        synchronizer_->update_sync_filter(filter);
+    }
+    for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
+        // Update the config so lazily-created synchronizers (accept callback
+        // hasn't fired yet) pick up the latest filter.
+        if (i < config_.ipc_targets.size()) {
+            config_.ipc_targets[i].sync_filter = filter;
+        }
+        if (ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->update_sync_filter(filter);
+        }
     }
 }
 
 inline void lattice_db::clear_sync_filter() {
     if (synchronizer_) {
         synchronizer_->clear_sync_filter();
+    }
+    for (auto& ipc : ipc_synchronizers_) {
+        if (ipc.sync) {
+            ipc.sync->clear_sync_filter();
+        }
     }
 }
 
@@ -4231,6 +4345,46 @@ inline void lattice_db::set_on_sync_error(std::function<void(const std::string& 
     if (synchronizer_) {
         synchronizer_->set_on_error(on_sync_error_);
     }
+}
+
+inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
+    // Walk all instances on the same path — the synchronizer may live on a sibling.
+    synchronizer::sync_progress agg;
+    instance_registry::instance().for_each_alive(config_.path,
+        [&agg](lattice_db* sibling) {
+            if (sibling->synchronizer_) {
+                auto p = sibling->synchronizer_->get_progress();
+                agg.pending_upload += p.pending_upload;
+                agg.total_upload += p.total_upload;
+                agg.acked += p.acked;
+                agg.received += p.received;
+            }
+            for (const auto& ipc : sibling->ipc_synchronizers_) {
+                if (ipc.sync) {
+                    auto p = ipc.sync->get_progress();
+                    agg.pending_upload += p.pending_upload;
+                    agg.total_upload += p.total_upload;
+                    agg.acked += p.acked;
+                    agg.received += p.received;
+                }
+            }
+        });
+    return agg;
+}
+
+inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler handler) {
+    // Walk all instances on the same path — the synchronizer may live on a sibling.
+    instance_registry::instance().for_each_alive(config_.path,
+        [&handler](lattice_db* sibling) {
+            if (sibling->synchronizer_) {
+                sibling->synchronizer_->set_on_progress(handler);
+            }
+            for (auto& ipc : sibling->ipc_synchronizers_) {
+                if (ipc.sync) {
+                    ipc.sync->set_on_progress(handler);
+                }
+            }
+        });
 }
 
 // Implementation of managed<std::vector<uint8_t>> methods that need lattice_db

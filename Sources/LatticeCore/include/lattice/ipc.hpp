@@ -8,6 +8,7 @@
 #include <memory>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <vector>
 
 namespace lattice {
@@ -62,7 +63,7 @@ public:
 
 private:
     std::string socket_path_;
-    int fd_ = -1;
+    std::atomic<int> fd_{-1};
     std::atomic<transport_state> state_{transport_state::closed};
 
     on_open_handler on_open_;
@@ -72,6 +73,7 @@ private:
 
     std::thread read_thread_;
     std::atomic<bool> should_stop_{false};
+    std::mutex send_mutex_;
 
     void start_read_loop();
     void close_fd();

@@ -1711,15 +1711,26 @@ void test_synchronizer() {
     auto mock_factory = std::make_shared<lattice::mock_network_factory>();
     lattice::set_network_factory(mock_factory);
 
-    lattice::lattice_db db;
+    // Synchronizer now owns its own lattice_db (unique_ptr).
+    // We keep a second connection to the same file for verification.
+    auto tmp = std::filesystem::temp_directory_path() / "test_synchronizer.sqlite";
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.string()));
+
+    // Second connection for reading back state
+    lattice::lattice_db reader_db(lattice::configuration(tmp.string()));
 
     // Create sync config
     lattice::sync_config config;
     config.websocket_url = "ws://localhost:8080/sync";
     config.authorization_token = "test-token";
+    config.sync_id = "test-sync";
+    config.all_active_sync_ids = {"test-sync"};
 
-    // Create synchronizer
-    lattice::synchronizer sync(db, config);
+    // Seed data before moving db into synchronizer
+    db->add(Person{"SyncTest", 40, std::nullopt});
+
+    // Create synchronizer (takes ownership of db)
+    lattice::synchronizer sync(std::move(db), config);
 
     // Get the mock websocket for testing
     auto* mock_ws = mock_factory->last_websocket();
@@ -1744,9 +1755,6 @@ void test_synchronizer() {
     // -------------------------------------------------------------------------
     std::cout << "  Testing upload..." << std::endl;
 
-    // Create some data that will generate AuditLog entries
-    auto person = db.add(Person{"SyncTest", 40, std::nullopt});
-
     // Trigger sync
     sync.sync_now();
 
@@ -1770,8 +1778,8 @@ void test_synchronizer() {
         synced_ids = ids;
     });
 
-    // Query unsynced entries
-    auto unsynced = lattice::query_audit_log(db.db(), true);
+    // Query unsynced entries via reader connection
+    auto unsynced = lattice::query_audit_log(reader_db.db(), true);
     assert(!unsynced.empty());
 
     // Simulate server ack
@@ -1785,7 +1793,7 @@ void test_synchronizer() {
     assert(!synced_ids.empty());
 
     // Verify entries are now marked as synchronized
-    auto still_unsynced = lattice::query_audit_log(db.db(), true);
+    auto still_unsynced = lattice::query_audit_log(reader_db.db(), true);
     assert(still_unsynced.empty());
 
     std::cout << "    Receive ack OK" << std::endl;
@@ -1823,8 +1831,8 @@ void test_synchronizer() {
     assert(!ack_sent.empty());
     assert(ack_sent[0].as_string().find("\"ack\"") != std::string::npos);
 
-    // Verify the remote person was created
-    auto remote_person = db.find_by_global_id<Person>("remote-person-uuid");
+    // Verify the remote person was created (via reader connection)
+    auto remote_person = reader_db.find_by_global_id<Person>("remote-person-uuid");
     assert(remote_person.has_value());
     assert(remote_person->name.detach() == "RemotePerson");
     assert(remote_person->age.detach() == 50);
@@ -1841,7 +1849,158 @@ void test_synchronizer() {
 
     std::cout << "    Disconnection OK" << std::endl;
 
+    // Cleanup
+    std::filesystem::remove(tmp);
+    std::filesystem::remove(std::string(tmp) + "-wal");
+    std::filesystem::remove(std::string(tmp) + "-shm");
+
     std::cout << "  Synchronizer test passed!" << std::endl;
+}
+
+// ============================================================================
+// Test: Synchronizer destroy-during-scheduled-work race
+// ============================================================================
+//
+// Reproduces a crash where on_websocket_open() dispatches a lambda to the
+// std_thread_scheduler. The lambda checks is_destroyed_ (false) and starts
+// upload_pending_changes().  Meanwhile the destructor runs on another thread,
+// sets is_destroyed_ = true and destroys members.  The lambda then accesses
+// db_ → use-after-free.
+//
+// A blocking mock transport keeps the lambda alive inside send() while the
+// main thread destroys the synchronizer, reliably hitting the race.
+
+/// Transport whose send() blocks until signalled, giving us precise control
+/// over the timing between the scheduler thread and the destructor thread.
+class blocking_mock_transport : public lattice::sync_transport {
+public:
+    std::atomic<bool> in_send{false};
+    std::atomic<bool> release_send{false};
+
+    void connect(const std::string&,
+                 const std::map<std::string, std::string>&) override {
+        state_ = lattice::transport_state::open;
+        if (on_open_) on_open_();
+    }
+    void disconnect() override {
+        release_send = true;  // unblock send if still blocked
+        state_ = lattice::transport_state::closed;
+    }
+    lattice::transport_state state() const override { return state_; }
+
+    void send(const lattice::transport_message&) override {
+        in_send = true;
+        // Block until the test signals us to continue, keeping the lambda alive
+        while (!release_send.load()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        in_send = false;
+    }
+
+    void set_on_open(on_open_handler h)    override { on_open_ = h; }
+    void set_on_message(on_message_handler)override {}
+    void set_on_error(on_error_handler)    override {}
+    void set_on_close(on_close_handler)    override {}
+
+private:
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_open_handler on_open_;
+};
+
+/// Transport that fires on_open synchronously, records sent messages, and
+/// optionally sleeps in send() to widen the race window.
+class slow_mock_transport : public lattice::sync_transport {
+public:
+    std::atomic<bool> started_work{false};
+    std::chrono::milliseconds send_delay{0};
+
+    void connect(const std::string&,
+                 const std::map<std::string, std::string>&) override {
+        state_ = lattice::transport_state::open;
+        if (on_open_) on_open_();
+    }
+    void disconnect() override {
+        state_ = lattice::transport_state::closed;
+    }
+    lattice::transport_state state() const override { return state_; }
+
+    void send(const lattice::transport_message&) override {
+        if (send_delay.count() > 0)
+            std::this_thread::sleep_for(send_delay);
+    }
+
+    void set_on_open(on_open_handler h)    override { on_open_ = h; }
+    void set_on_message(on_message_handler)override {}
+    void set_on_error(on_error_handler)    override {}
+    void set_on_close(on_close_handler)    override {}
+
+private:
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_open_handler on_open_;
+};
+
+void test_synchronizer_destroy_race() {
+    std::cout << "Testing synchronizer destroy-during-scheduled-work..." << std::endl;
+
+    // -------------------------------------------------------------------------
+    // The crash scenario (from Engram):
+    //   1. IPC accept callback creates a synchronizer with a std_thread_scheduler
+    //   2. connect() → on_open → lambda queued to scheduler
+    //   3. Scheduler thread picks up lambda → upload_pending_changes()
+    //      starts iterating to_mark_synced (entries not matching sync_filter),
+    //      each iteration calls db_->db().execute()
+    //   4. Another thread destroys the synchronizer
+    //   5. Lambda continues → db_->db() → use-after-free
+    //
+    // The is_destroyed_ flag at the top of the lambda is insufficient:
+    // it was checked (false) before the destructor started.
+    // -------------------------------------------------------------------------
+
+    auto tmp = std::filesystem::temp_directory_path() / "destroy_race.sqlite";
+
+    // File-based DB with a real std_thread_scheduler (async dispatch)
+    lattice::configuration db_cfg(tmp.string(),
+                                  std::make_shared<lattice::std_thread_scheduler>());
+    auto db = std::make_unique<lattice::lattice_db>(db_cfg);
+
+    // Seed many AuditLog entries.  With a sync_filter that excludes Person,
+    // all entries go to to_mark_synced → the lambda iterates calling
+    // db_->db().execute() for each, giving us a wide race window.
+    for (int i = 0; i < 500; i++) {
+        db->add(Person{"race-test-" + std::to_string(i), i, std::nullopt});
+    }
+
+    lattice::sync_config sync_cfg;
+    sync_cfg.sync_id = "destroy-race";
+    sync_cfg.all_active_sync_ids = {"destroy-race"};
+    // Filter allows only Person with name="IMPOSSIBLE", so all entries fail
+    // the filter → all go to to_mark_synced → loop calls db_->db().execute() 500x
+    sync_cfg.sync_filter = std::vector<lattice::sync_filter_entry>{
+        {"Person", std::string("name = 'IMPOSSIBLE'")}
+    };
+
+    auto transport = std::make_unique<slow_mock_transport>();
+
+    auto sync = std::make_unique<lattice::synchronizer>(
+        std::move(db), sync_cfg, std::move(transport));
+    sync->connect();
+
+    // Give the scheduler thread time to start the lambda and enter the
+    // to_mark_synced loop (500 iterations, each doing a DB execute).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    // Destroy the synchronizer from this thread while the lambda is
+    // iterating to_mark_synced on the scheduler thread.
+    // Without a fix, the lambda accesses db_ after it's destroyed → crash.
+    sync.reset();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::filesystem::remove(tmp);
+    std::filesystem::remove(std::string(tmp) + "-wal");
+    std::filesystem::remove(std::string(tmp) + "-shm");
+
+    std::cout << "    Destroy race OK (no crash)" << std::endl;
 }
 
 // ============================================================================
@@ -2513,6 +2672,7 @@ int main() {
         // Sync tests
         test_sync_protocol();
         test_synchronizer();
+        test_synchronizer_destroy_race();
 
         // Migration callback tests
         test_migration_block_callback();

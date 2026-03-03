@@ -37,7 +37,7 @@ void lattice_db::setup_change_hook() {
 
             // Handle internal tables specially
             std::string table(table_name);
-            if (table == "_SyncControl" || table == "_lattice_sync_set") {
+            if (table == "_SyncControl" || table == "_lattice_sync_set" || table == "_lattice_sync_state") {
                 LOG_DEBUG("update_hook", "Skipping internal table %s", table_name);
                 return;
             }
@@ -77,11 +77,11 @@ void lattice_db::setup_change_hook() {
                     // observer callbacks — both on this instance and on other
                     // same-process instances sharing the same database file.
                     if (operation == SQLITE_INSERT) {
-                        auto all = instance_registry::instance().get_instances(self->config_.path);
-                        for (auto* inst : all) {
-                            inst->last_seen_audit_id_.store(
-                                static_cast<int64_t>(rowid), std::memory_order_release);
-                        }
+                        instance_registry::instance().for_each_alive(self->config_.path,
+                            [rowid](lattice_db* inst) {
+                                inst->last_seen_audit_id_.store(
+                                    static_cast<int64_t>(rowid), std::memory_order_release);
+                            });
                     }
                 }
                 return;
@@ -155,10 +155,15 @@ void lattice_db::setup_cross_process_notifier() {
     xproc_notifier_->start_listening([path = config_.path,
                                       mtx = xproc_callback_mutex_] {
         std::lock_guard<std::mutex> lock(*mtx);
-        auto instances = instance_registry::instance().get_instances(path);
-        if (!instances.empty()) {
-            instances[0]->handle_cross_process_notification();
-        }
+        // Pick first alive instance to handle the xproc notification.
+        bool handled = false;
+        instance_registry::instance().for_each_alive(path,
+            [&handled](lattice_db* inst) {
+                if (!handled) {
+                    inst->handle_cross_process_notification();
+                    handled = true;
+                }
+            });
     });
 }
 
@@ -257,7 +262,8 @@ void lattice_db::handle_cross_process_notification() {
     }
 }
 
-// Synchronizer registry — at most one synchronizer per {path, websocket_url}
+// Synchronizer registry — at most one synchronizer per {path, key}
+// Used for both WSS (key = websocket_url) and IPC (key = channel name).
 static std::mutex& sync_registry_mutex() {
     static std::mutex m;
     return m;
@@ -267,14 +273,14 @@ static std::set<std::pair<std::string, std::string>>& active_sync_keys() {
     return s;
 }
 
-bool lattice_db::try_register_sync_key(const std::string& path, const std::string& ws_url) {
+bool lattice_db::try_register_sync_key(const std::string& path, const std::string& key) {
     std::lock_guard<std::mutex> lock(sync_registry_mutex());
-    return active_sync_keys().emplace(path, ws_url).second;
+    return active_sync_keys().emplace(path, key).second;
 }
 
-void lattice_db::unregister_sync_key(const std::string& path, const std::string& ws_url) {
+void lattice_db::unregister_sync_key(const std::string& path, const std::string& key) {
     std::lock_guard<std::mutex> lock(sync_registry_mutex());
-    active_sync_keys().erase({path, ws_url});
+    active_sync_keys().erase({path, key});
 }
 
 // Collect all sync_ids for this database (WSS + all IPC channels).
@@ -307,15 +313,22 @@ void lattice_db::setup_sync_if_configured() {
     sync_cfg.authorization_token = config_.authorization_token;
     sync_cfg.sync_filter = config_.sync_filter;
 
-    // Use per-synchronizer sync state when multiple transports are configured
+    // Always use per-synchronizer sync state
     auto all_ids = collect_all_sync_ids(config_);
-    if (all_ids.size() > 1) {
-        sync_cfg.sync_id = "wss:" + config_.websocket_url;
-        sync_cfg.all_active_sync_ids = all_ids;
-    }
+    sync_cfg.sync_id = "wss:" + config_.websocket_url;
+    sync_cfg.all_active_sync_ids = all_ids;
+
+    // Create dedicated lattice_db for the synchronizer (owns its own connection,
+    // runs on std_thread_scheduler so sync work happens off the Swift actor thread).
+    // xproc notifications bridge writes between parent and sync connections.
+    configuration sync_db_config(config_.path,
+                                 std::make_shared<std_thread_scheduler>());
+    sync_db_config.target_schema_version = config_.target_schema_version;
+    sync_db_config.migration_block = config_.migration_block;
+    auto sync_db = std::make_unique<lattice_db>(sync_db_config);
 
     // Create synchronizer
-    synchronizer_ = std::make_unique<synchronizer>(*this, sync_cfg, scheduler_);
+    synchronizer_ = std::make_unique<synchronizer>(std::move(sync_db), sync_cfg);
 
     // Wire up callbacks if set
     if (on_sync_state_change_) {
@@ -334,6 +347,21 @@ void lattice_db::setup_ipc_if_configured() {
         return;
     }
 
+    // Only one IPC endpoint per {path, channel} across all instances
+    // (mirrors the WSS dedup via try_register_sync_key).
+    // Filter out channels that are already registered by another instance.
+    std::vector<size_t> active_indices;
+    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
+        const auto& channel = config_.ipc_targets[i].channel;
+        if (try_register_sync_key(config_.path, "ipc:" + channel)) {
+            active_indices.push_back(i);
+        } else {
+            LOG_DEBUG("lattice_db", "IPC synchronizer already active for %s on channel %s, skipping",
+                      config_.path.c_str(), channel.c_str());
+        }
+    }
+    if (active_indices.empty()) return;
+
     auto all_ids = collect_all_sync_ids(config_);
 
     // Phase 1: Create all endpoints and store them in the vector.
@@ -341,31 +369,48 @@ void lattice_db::setup_ipc_if_configured() {
     // - The server callback fires asynchronously on the accept thread
     // - Capturing &state.sync from a local that is later moved = dangling pointer
     // - reserve() ensures push_back won't invalidate references
-    ipc_synchronizers_.reserve(config_.ipc_targets.size());
+    ipc_synchronizers_.reserve(active_indices.size());
 
-    for (const auto& target : config_.ipc_targets) {
+    for (size_t idx : active_indices) {
         ipc_sync_state state;
-        state.endpoint = std::make_unique<ipc_endpoint>(target.channel);
+        state.endpoint = std::make_unique<ipc_endpoint>(config_.ipc_targets[idx].channel);
         ipc_synchronizers_.push_back(std::move(state));
     }
 
     // Phase 2: Start endpoints using stable references into the vector.
     for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
-        const auto& target = config_.ipc_targets[i];
+        const auto& target = config_.ipc_targets[active_indices[i]];
         std::string sync_id = "ipc:" + target.channel;
         auto& sync_slot = ipc_synchronizers_[i].sync;
 
         ipc_synchronizers_[i].endpoint->start(
             [this, sync_id, all_ids, &target, &sync_slot](std::unique_ptr<ipc_socket_client> transport) {
+                LOG_INFO("ipc_sync", "[%s] Accept callback fired (sync_slot=%s, db=%s)",
+                         sync_id.c_str(), sync_slot ? "OCCUPIED" : "empty",
+                         config_.path.c_str());
+
                 sync_config ipc_cfg;
                 ipc_cfg.sync_id = sync_id;
                 ipc_cfg.all_active_sync_ids = all_ids;
                 ipc_cfg.sync_filter = target.sync_filter;
 
-                auto sync = std::make_unique<synchronizer>(*this, ipc_cfg,
-                    std::move(transport), scheduler_);
+                // Create dedicated lattice_db for this IPC synchronizer
+                configuration ipc_db_config(config_.path,
+                                            std::make_shared<std_thread_scheduler>());
+                ipc_db_config.target_schema_version = config_.target_schema_version;
+                ipc_db_config.migration_block = config_.migration_block;
+                auto ipc_db = std::make_unique<lattice_db>(ipc_db_config);
+
+                LOG_INFO("ipc_sync", "[%s] Creating synchronizer (replacing old=%p)",
+                         sync_id.c_str(), sync_slot ? (void*)sync_slot.get() : nullptr);
+
+                auto sync = std::make_unique<synchronizer>(
+                    std::move(ipc_db), ipc_cfg, std::move(transport));
                 sync->connect();
                 sync_slot = std::move(sync);
+
+                LOG_INFO("ipc_sync", "[%s] New synchronizer installed (this=%p)",
+                         sync_id.c_str(), (void*)sync_slot.get());
             });
     }
 }

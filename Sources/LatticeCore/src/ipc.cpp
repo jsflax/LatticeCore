@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <arpa/inet.h>  // htonl / ntohl
+#include <poll.h>
 
 #ifdef __APPLE__
 #include <pwd.h>
@@ -43,6 +44,22 @@ std::string resolve_ipc_socket_path(const std::string& channel) {
 #endif
     std::filesystem::create_directories(dir);
     return dir + "/" + channel + ".sock";
+}
+
+// ============================================================================
+// Socket helpers
+// ============================================================================
+
+/// Suppress SIGPIPE on a socket.  Without this, writing to a closed peer
+/// kills the process instead of returning an error from write()/send().
+static void suppress_sigpipe(int fd) {
+#ifdef __APPLE__
+    int on = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    // Linux: handled via MSG_NOSIGPIPE on each send, or signal(SIGPIPE, SIG_IGN)
+    (void)fd;
+#endif
 }
 
 // ============================================================================
@@ -123,7 +140,7 @@ void ipc_socket_client::connect(const std::string& /*url*/,
     if (state_ == transport_state::open || state_ == transport_state::connecting) return;
 
     // If fd_ is already valid (server-accepted connection), just start the read loop.
-    if (fd_ >= 0) {
+    if (fd_.load() >= 0) {
         state_ = transport_state::open;
         start_read_loop();
         if (on_open_) on_open_();
@@ -141,6 +158,7 @@ void ipc_socket_client::connect(const std::string& /*url*/,
         if (on_error_) on_error_(err);
         return;
     }
+    suppress_sigpipe(sock);
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -155,7 +173,7 @@ void ipc_socket_client::connect(const std::string& /*url*/,
         return;
     }
 
-    fd_ = sock;
+    fd_.store(sock);
     state_ = transport_state::open;
 
     start_read_loop();
@@ -190,7 +208,13 @@ transport_state ipc_socket_client::state() const {
 }
 
 void ipc_socket_client::send(const transport_message& message) {
-    int fd = fd_;
+    int fd = fd_.load();
+    if (fd < 0 || state_ != transport_state::open) return;
+
+    std::lock_guard<std::mutex> lock(send_mutex_);
+
+    // Re-check after acquiring lock — fd may have been closed while waiting
+    fd = fd_.load();
     if (fd < 0 || state_ != transport_state::open) return;
 
     bool ok;
@@ -226,7 +250,7 @@ void ipc_socket_client::start_read_loop() {
     should_stop_ = false;
     read_thread_ = std::thread([this]() {
         while (!should_stop_) {
-            auto payload = read_length_prefixed(fd_);
+            auto payload = read_length_prefixed(fd_.load());
             if (payload.empty()) {
                 if (should_stop_) break;
                 // Connection lost
@@ -245,8 +269,7 @@ void ipc_socket_client::start_read_loop() {
 }
 
 void ipc_socket_client::close_fd() {
-    int fd = fd_;
-    fd_ = -1;
+    int fd = fd_.exchange(-1);
     if (fd >= 0) {
         ::shutdown(fd, SHUT_RDWR);
         ::close(fd);
@@ -274,6 +297,7 @@ void ipc_server::start(accept_callback callback) {
     if (listen_fd_ < 0) {
         throw std::runtime_error("ipc_server: socket() failed: " + std::string(strerror(errno)));
     }
+    suppress_sigpipe(listen_fd_);
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -307,6 +331,7 @@ void ipc_server::start(accept_callback callback) {
                 continue;
             }
             LOG_DEBUG("ipc_server", "Accepted client fd=%d", client_fd);
+            suppress_sigpipe(client_fd);
             auto client = std::make_unique<ipc_socket_client>(client_fd);
             cb(std::move(client));
         }
@@ -357,8 +382,80 @@ void ipc_endpoint::start(transport_ready_callback callback) {
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
 
-    // Don't unlink first — if bind fails with EADDRINUSE, we connect as client
+    // Don't unlink first — if bind fails with EADDRINUSE, we probe the socket
+    // to distinguish a live server from a stale file left by a crashed process.
     int bind_result = ::bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+
+    if (bind_result != 0 && errno == EADDRINUSE) {
+        // Probe: try to connect. If ECONNREFUSED, the socket is stale.
+        int probe = ::connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+        if (probe < 0 && (errno == ECONNREFUSED || errno == ENOENT)) {
+            // Stale socket — remove it and retry bind as server
+            LOG_DEBUG("ipc_endpoint", "Channel '%s': stale socket detected, removing %s",
+                      channel_.c_str(), socket_path_.c_str());
+            ::close(sock);
+            ::unlink(socket_path_.c_str());
+
+            sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            if (sock < 0) {
+                throw std::runtime_error("ipc_endpoint: socket() failed on retry: " + std::string(strerror(errno)));
+            }
+            bind_result = ::bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+            // If bind still fails, fall through to the error handling below
+        } else if (probe == 0) {
+            // Probe connected — but the peer might be a zombie socket from a
+            // recently-killed process.  Poll briefly: if the fd becomes readable
+            // immediately it means the kernel queued an EOF (peer is gone).
+            // NOTE: POLLIN alone is ambiguous — it fires for both EOF and real
+            // data (e.g. the server's accept callback may send sync data within
+            // the poll window).  We must recv(MSG_PEEK) to distinguish.
+            struct pollfd pfd{sock, POLLIN, 0};
+            int pr = ::poll(&pfd, 1, 50 /* ms */);
+            bool is_dead = false;
+            if (pr > 0 && (pfd.revents & POLLHUP)) {
+                // Definite hangup — dead peer.
+                is_dead = true;
+            } else if (pr > 0 && (pfd.revents & POLLIN)) {
+                // POLLIN could be EOF (dead) or real data (alive).  Peek to check.
+                char buf;
+                ssize_t n = ::recv(sock, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
+                is_dead = (n <= 0);  // 0 = EOF, <0 = error → treat as dead
+            }
+            if (is_dead) {
+                // Dead peer.  Treat as stale.
+                LOG_DEBUG("ipc_endpoint",
+                          "Channel '%s': probe connected but peer is dead (poll revents=0x%x), removing %s",
+                          channel_.c_str(), pfd.revents, socket_path_.c_str());
+                ::close(sock);
+                ::unlink(socket_path_.c_str());
+
+                sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+                if (sock < 0) {
+                    throw std::runtime_error("ipc_endpoint: socket() failed on zombie retry: " +
+                                             std::string(strerror(errno)));
+                }
+                bind_result = ::bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+                // Fall through to bind_result check below
+            } else {
+                // Live server — reuse the already-connected socket as the client.
+                suppress_sigpipe(sock);
+                client_ = std::make_unique<ipc_socket_client>(sock);
+                callback(std::move(client_));
+                LOG_DEBUG("ipc_endpoint", "Channel '%s': acting as client to %s (reused probe fd=%d)",
+                          channel_.c_str(), socket_path_.c_str(), sock);
+                return;
+            }
+        } else {
+            // Some other connect error — fall through as client anyway
+            ::close(sock);
+
+            client_ = std::make_unique<ipc_socket_client>(socket_path_);
+            callback(std::move(client_));
+            LOG_DEBUG("ipc_endpoint", "Channel '%s': acting as client to %s (connect errno=%d)",
+                      channel_.c_str(), socket_path_.c_str(), errno);
+            return;
+        }
+    }
 
     if (bind_result == 0) {
         // We got the bind — become the server
@@ -368,20 +465,9 @@ void ipc_endpoint::start(transport_ready_callback callback) {
 
         server_ = std::make_unique<ipc_server>(socket_path_);
         server_->start([cb = callback](std::unique_ptr<ipc_socket_client> client) {
-            // Hand the transport to the synchronizer. It will set callbacks
-            // then call connect(), which starts the read loop for accepted-fd clients.
             cb(std::move(client));
         });
         LOG_DEBUG("ipc_endpoint", "Channel '%s': acting as server on %s",
-                  channel_.c_str(), socket_path_.c_str());
-    } else if (errno == EADDRINUSE) {
-        // Socket already exists — connect as client
-        ::close(sock);
-
-        client_ = std::make_unique<ipc_socket_client>(socket_path_);
-        // connect() is called by the synchronizer — we just hand it off
-        callback(std::move(client_));
-        LOG_DEBUG("ipc_endpoint", "Channel '%s': acting as client to %s",
                   channel_.c_str(), socket_path_.c_str());
     } else {
         int err = errno;

@@ -133,12 +133,15 @@ void dynamic_object::manage(managed<swift_dynamic_object> o) {
 // MARK: Swift Lattice
 // Construct with swift_configuration (includes row migration callback)
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
-    : lattice_db(config), swift_config_(config) {
+    : lattice_db(config, /*defer_sync=*/true), swift_config_(config) {
     LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
     if (!config.read_only) {
         LOG_DEBUG("swift_lattice", "ensure_swift_tables");
         ensure_swift_tables(schemas);
         LOG_DEBUG("swift_lattice", "ensure_swift_tables done");
+        // Sync setup after all tables exist (Swift tables created by ensure_swift_tables)
+        setup_sync_if_configured();
+        setup_ipc_if_configured();
     } else {
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
@@ -150,9 +153,11 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
 }
 
 swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& schemas)
-    : lattice_db(config), swift_config_(std::move(config)) {
+    : lattice_db(config, /*defer_sync=*/true), swift_config_(std::move(config)) {
     if (!swift_config_.read_only) {
         ensure_swift_tables(schemas);
+        setup_sync_if_configured();
+        setup_ipc_if_configured();
     } else {
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {

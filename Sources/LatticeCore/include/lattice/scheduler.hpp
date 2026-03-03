@@ -2,6 +2,7 @@
 
 #ifdef __cplusplus
 
+#include "log.hpp"
 #include <functional>
 #include <memory>
 #include <thread>
@@ -45,6 +46,12 @@ struct scheduler {
     // Check if invoke() is currently possible.
     // May return false if the event loop isn't running.
     [[nodiscard]] virtual bool can_invoke() const noexcept = 0;
+
+    // Stop the scheduler and wait for in-flight work to complete.
+    // After shutdown(), invoke() becomes a no-op and can_invoke() returns false.
+    // Idempotent — safe to call multiple times or from the destructor.
+    // Default implementation is a no-op (for schedulers without a dedicated thread).
+    virtual void shutdown() {}
 };
 
 class generic_scheduler : public scheduler {
@@ -142,14 +149,28 @@ using SharedScheduler = std::shared_ptr<scheduler>;
 
 class std_thread_scheduler : public scheduler {
 public:
+    static std::atomic<int64_t>& alive_count() {
+        static std::atomic<int64_t> count{0};
+        return count;
+    }
+
     std_thread_scheduler() : running_(true) {
+        auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
         worker_ = std::thread([this] { run_loop(); });
         thread_id_ = worker_.get_id();
+        LOG_INFO("scheduler", "std_thread_scheduler CREATED (this=%p, alive=%lld)", (void*)this, (long long)n);
     }
 
     ~std_thread_scheduler() override {
+        shutdown();
+        auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
+        LOG_INFO("scheduler", "std_thread_scheduler DESTROYED (this=%p, alive=%lld)", (void*)this, (long long)n);
+    }
+
+    void shutdown() override {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_) return;  // already shut down
             running_ = false;
         }
         cv_.notify_one();
@@ -197,7 +218,13 @@ private:
             }
 
             if (fn) {
-                fn();
+                try {
+                    fn();
+                } catch (const std::exception& e) {
+                    LOG_ERROR("scheduler", "Work item threw exception: %s", e.what());
+                } catch (...) {
+                    LOG_ERROR("scheduler", "Work item threw unknown exception");
+                }
             }
         }
     }

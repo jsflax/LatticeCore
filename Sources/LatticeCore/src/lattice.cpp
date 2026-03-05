@@ -176,6 +176,11 @@ void lattice_db::setup_cross_process_notifier() {
 }
 
 void lattice_db::handle_cross_process_notification() {
+    // KILL-SWITCH: set LATTICE_DISABLE_XPROC=1 to suppress cross-process observer dispatch.
+    // Used to diagnose whether xproc notifications cause main-thread stalls.
+    static bool disabled = (std::getenv("LATTICE_DISABLE_XPROC") != nullptr);
+    if (disabled) return;
+
     auto cursor = last_seen_audit_id_.load(std::memory_order_acquire);
     LOG_DEBUG("xproc", "Cross-process notification received, last_seen=%lld", (long long)cursor);
 

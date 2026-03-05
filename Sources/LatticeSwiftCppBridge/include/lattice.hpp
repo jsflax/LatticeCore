@@ -566,6 +566,10 @@ public:
         return lattice_db::safe_compact_audit_log(stale_threshold_seconds);
     }
 
+    void backdate_replication_slots(int64_t seconds) {
+        lattice_db::backdate_replication_slots(seconds);
+    }
+
     int64_t generate_history() {
         return lattice_db::generate_history();
     }

@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <mutex>
 #include <map>
+#include <set>
 #include <array>
 #include <stdio.h>
 #include <iostream>
@@ -1434,14 +1435,53 @@ public:
         }
     }
 
-    // Batch notify — collects callbacks for multiple changes, dispatches once.
-    // Reduces N scheduler invocations (each creating a Task) to 1.
+    // Batch notify — single scheduler dispatch for all observer callbacks.
+    // Model table callbacks fire individually (observers need per-row info).
+    // AuditLog callbacks are coalesced per observer (consumers only need
+    // "something changed", not per-row details — saves 50% of total callbacks).
     void notify_changes_batched(
         const std::vector<std::tuple<std::string, std::string, int64_t, std::string, std::string>>& changes) {
         std::vector<std::function<void()>> all_callbacks;
+
+        // Track which AuditLog observers have already been collected
+        std::set<uint64_t> seen_audit_observers;
+
         for (const auto& [table, op, row_id, global_row_id, changed_fields] : changes) {
-            collect_observer_callbacks(table, op, row_id, global_row_id, changed_fields, all_callbacks);
+            // Collect table-level observers
+            {
+                std::lock_guard<std::mutex> lock(observers_mutex_);
+                auto it = table_observers_.find(table);
+                if (it != table_observers_.end()) {
+                    bool is_audit = (table == "AuditLog");
+                    for (const auto& [id, cb] : it->second) {
+                        if (is_audit) {
+                            // AuditLog: fire each observer at most once per batch
+                            if (!seen_audit_observers.insert(id).second) continue;
+                        }
+                        all_callbacks.push_back([cb, op, row_id, global_row_id] {
+                            cb(op, row_id, global_row_id);
+                        });
+                    }
+                }
+            }
+
+            // Per-object observers — always fire (specific to individual rows)
+            {
+                std::lock_guard<std::mutex> lock(object_observers_mutex_);
+                auto table_it = object_observers_.find(table);
+                if (table_it != object_observers_.end()) {
+                    auto row_it = table_it->second.find(row_id);
+                    if (row_it != table_it->second.end()) {
+                        for (const auto& [id, callback] : row_it->second) {
+                            all_callbacks.push_back([callback, changed_fields] {
+                                callback(changed_fields);
+                            });
+                        }
+                    }
+                }
+            }
         }
+
         if (all_callbacks.empty()) return;
         // Single scheduler dispatch for all callbacks
         scheduler_->invoke([callbacks = std::move(all_callbacks)]() mutable {
@@ -1698,6 +1738,15 @@ public:
         }
 
         return deleted;
+    }
+
+    /// Backdate all replication slots' last_active_at by the given number of seconds.
+    /// Test-only: allows deterministic stale-slot eviction without wall-clock sleeps.
+    void backdate_replication_slots(int64_t seconds) {
+        db_->execute(
+            "UPDATE _lattice_replication_slots "
+            "SET last_active_at = datetime(last_active_at, '-' || ? || ' seconds')",
+            {seconds});
     }
 
     /// Generate audit log INSERT entries for objects not already in the audit log.

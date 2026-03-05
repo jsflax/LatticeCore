@@ -174,8 +174,9 @@ struct sync_filter_entry {
 struct sync_config {
     std::string websocket_url;
     std::string authorization_token;
-    int max_reconnect_attempts = 6;
+    int max_reconnect_attempts = 0;  // 0 = unlimited
     double base_delay_seconds = 1.0;
+    double max_delay_seconds = 60.0;
     size_t chunk_size = 1000;  // Max events per message
 
     /// Upload filter. nullopt = sync everything (default).

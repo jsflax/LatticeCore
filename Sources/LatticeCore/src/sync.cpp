@@ -1526,11 +1526,15 @@ void synchronizer::mark_as_synced(const std::vector<std::string>& global_ids) {
 }
 
 void synchronizer::schedule_reconnect() {
-    if (should_reconnect_ && !is_connected_ && reconnect_attempts_ < config_.max_reconnect_attempts) {
-        double delay = std::pow(2.0, reconnect_attempts_) * config_.base_delay_seconds;
+    bool within_limit = config_.max_reconnect_attempts == 0
+        || reconnect_attempts_ < config_.max_reconnect_attempts;
+    if (should_reconnect_ && !is_connected_ && within_limit) {
+        double delay = std::min(
+            std::pow(2.0, reconnect_attempts_) * config_.base_delay_seconds,
+            config_.max_delay_seconds);
         ++reconnect_attempts_;
-        LOG_INFO("synchronizer", "[%s] Scheduling reconnect attempt %d/%d in %.1fs",
-                 config_.sync_id.c_str(), reconnect_attempts_.load(), config_.max_reconnect_attempts, delay);
+        LOG_INFO("synchronizer", "[%s] Scheduling reconnect attempt %d in %.1fs",
+                 config_.sync_id.c_str(), reconnect_attempts_.load(), delay);
 
         // Schedule reconnection with an interruptible sleep.
         // Short-sleep loop checks is_destroyed_ so that scheduler_->shutdown()

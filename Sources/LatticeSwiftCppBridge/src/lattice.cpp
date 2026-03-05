@@ -759,6 +759,24 @@ void lattice::swift_lattice::attach(swift_lattice &lattice) {
 
 // MARK: - Migration Lookup Functions
 
+/// Filter a managed object's properties to only include columns that actually
+/// exist in the database table. During migration, the registered schema may
+/// include columns not yet added (e.g. additive schema changes applied after
+/// row migrations).
+static void filter_properties_to_existing_columns(
+    lattice::managed<lattice::swift_dynamic_object>& obj,
+    const std::string& table_name) {
+    auto actual_cols = g_migration_lattice->db().get_table_info(table_name);
+    lattice::SwiftSchema filtered;
+    for (const auto& [name, desc] : obj.properties_) {
+        if (name == "id" || name == "globalId" || actual_cols.count(name)) {
+            filtered[name] = desc;
+        }
+    }
+    obj.properties_ = filtered;
+    obj.source.properties = filtered;
+}
+
 bool lattice::migration_lookup(const std::string& table_name, int64_t primary_key) {
     if (!g_migration_lattice) {
         g_migration_lookup_result = nullptr;
@@ -769,6 +787,7 @@ bool lattice::migration_lookup(const std::string& table_name, int64_t primary_ke
         g_migration_lookup_result = nullptr;
         return false;
     }
+    filter_properties_to_existing_columns(*obj, table_name);
     swift_dynamic_object detached = obj->detach();
     g_migration_lookup_result = std::make_shared<dynamic_object>(detached);
     return true;
@@ -784,6 +803,7 @@ bool lattice::migration_lookup_by_global_id(const std::string& table_name, const
         g_migration_lookup_result = nullptr;
         return false;
     }
+    filter_properties_to_existing_columns(*obj, table_name);
     swift_dynamic_object detached = obj->detach();
     g_migration_lookup_result = std::make_shared<dynamic_object>(detached);
     return true;

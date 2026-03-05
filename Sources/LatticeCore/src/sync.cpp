@@ -661,6 +661,8 @@ void synchronizer::on_websocket_open() {
     scheduler_->invoke([this] {
         if (is_destroyed_) return;
 
+        register_replication_slot(db_->db(), config_.sync_id);
+
         if (config_.sync_filter) {
             LOG_DEBUG("synchronizer", "Reconciling sync filter on connect...");
             reconcile_sync_filter();
@@ -702,14 +704,28 @@ void synchronizer::on_transport_message(const transport_message& msg) {
             // Running apply_remote_changes on the IPC read thread causes
             // SQLite write contention (busy/locked) with the scheduler thread.
             auto entries = std::move(event->audit_logs);
-            scheduler_->invoke([this, entries = std::move(entries)] {
-                if (is_destroyed_) return;
+            auto entry_count = entries.size();
+            scheduler_->invoke([this, entries = std::move(entries), entry_count] {
+                if (is_destroyed_) {
+                    LOG_INFO("synchronizer", "[%s] scheduler lambda: is_destroyed_, skipping apply of %zu entries",
+                             config_.sync_id.c_str(), entry_count);
+                    return;
+                }
+                LOG_INFO("synchronizer", "[%s] scheduler lambda: applying %zu entries (db=%s)",
+                         config_.sync_id.c_str(), entries.size(), db_->config().path.c_str());
                 auto applied_ids = apply_remote_changes(entries);
+                LOG_INFO("synchronizer", "[%s] apply_remote_changes returned %zu/%zu (db=%s)",
+                         config_.sync_id.c_str(), applied_ids.size(), entries.size(),
+                         db_->config().path.c_str());
 
                 // Send acknowledgment only for successfully applied entries
                 if (!applied_ids.empty()) {
                     auto ack = server_sent_event::make_ack(applied_ids);
                     auto json_ack = ack.to_json();
+                    LOG_INFO("synchronizer", "[%s] sending ACK for %zu entries (transport_state=%d, db=%s)",
+                             config_.sync_id.c_str(), applied_ids.size(),
+                             static_cast<int>(ws_client_->state()),
+                             db_->config().path.c_str());
                     ws_client_->send(transport_message::from_binary({json_ack.begin(), json_ack.end()}));
                 }
 
@@ -745,6 +761,8 @@ void synchronizer::on_transport_message(const transport_message& msg) {
 }
 
 void synchronizer::on_websocket_error(const std::string& error) {
+    LOG_ERROR("synchronizer", "[%s] WebSocket error: %s (this=%p, db=%s)",
+              config_.sync_id.c_str(), error.c_str(), (void*)this, db_->config().path.c_str());
     if (on_error_) {
         scheduler_->invoke([this, error] { on_error_(error); });
     }
@@ -754,6 +772,8 @@ void synchronizer::on_websocket_error(const std::string& error) {
 }
 
 void synchronizer::on_websocket_close(int code, const std::string& reason) {
+    LOG_INFO("synchronizer", "[%s] WebSocket closed (code=%d, reason=%s, this=%p, db=%s)",
+             config_.sync_id.c_str(), code, reason.c_str(), (void*)this, db_->config().path.c_str());
     is_connected_ = false;
 
     if (on_state_change_) {
@@ -960,10 +980,28 @@ void synchronizer::reconcile_sync_filter() {
     bool has_changes = false;
 
     // Phase 1: Removals — check every row in sync set against new filter.
-    // Insert synthetic DELETE entries into AuditLog so the normal upload pipeline
-    // handles delivery with in-flight tracking and ACK confirmation.
-    // Don't remove from sync set here — classify_delete() does that on upload.
+    // Build a set of all currently-matching globalIds per table (one query per filter entry),
+    // then iterate the sync set and DELETE anything not in the match set.
+    std::unordered_set<std::string> current_matches;  // "table\0globalId"
+    if (config_.sync_filter) {
+        for (const auto& fe : *config_.sync_filter) {
+            std::string sql = "SELECT globalId FROM " + fe.table_name;
+            if (fe.where_clause) {
+                sql += " WHERE (" + *fe.where_clause + ")";
+            }
+            auto rows = db_->db().query(sql);
+            for (const auto& r : rows) {
+                auto gid_it = r.find("globalId");
+                if (gid_it != r.end()) {
+                    current_matches.insert(fe.table_name + '\0'
+                                         + std::get<std::string>(gid_it->second));
+                }
+            }
+        }
+    }
     auto sync_set_rows = db_->db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
+    LOG_INFO("synchronizer", "reconcile Phase 1: %zu sync_set rows, %zu current matches",
+             sync_set_rows.size(), current_matches.size());
     for (const auto& row : sync_set_rows) {
         auto tn_it = row.find("table_name");
         auto gid_it = row.find("global_row_id");
@@ -972,7 +1010,7 @@ void synchronizer::reconcile_sync_filter() {
         std::string tn = std::get<std::string>(tn_it->second);
         std::string gid = std::get<std::string>(gid_it->second);
 
-        if (!row_matches_filter(tn, gid)) {
+        if (current_matches.count(tn + '\0' + gid) == 0) {
             db_->db().execute(
                 "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
                 "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
@@ -985,32 +1023,107 @@ void synchronizer::reconcile_sync_filter() {
     // Phase 2: Additions — for each table in filter, find matching rows not in sync set.
     // Insert synthetic INSERT entries into AuditLog so the normal upload pipeline
     // handles delivery, sync set management, and ACK confirmation.
+    // Optimized: batch-fetch all matching rows per table instead of per-row queries.
     if (config_.sync_filter) {
         for (const auto& fe : *config_.sync_filter) {
-            std::string sql = "SELECT globalId FROM " + fe.table_name +
+            // Get column metadata once per table (not per row)
+            auto cols = db_->db().query("PRAGMA table_info(" + fe.table_name + ")");
+            auto schema = db_->get_table_schema(fe.table_name);
+
+            std::ostringstream select_cols;
+            std::vector<std::string> col_names;
+            bool first = true;
+            for (const auto& col : cols) {
+                auto name_it = col.find("name");
+                auto type_it = col.find("type");
+                if (name_it == col.end() || !std::holds_alternative<std::string>(name_it->second))
+                    continue;
+                std::string col_name = std::get<std::string>(name_it->second);
+                if (col_name == "id" || col_name == "globalId") continue;
+
+                std::string col_type;
+                if (type_it != col.end() && std::holds_alternative<std::string>(type_it->second))
+                    col_type = std::get<std::string>(type_it->second);
+
+                if (!first) select_cols << ", ";
+                first = false;
+                if (col_type == "BLOB") {
+                    select_cols << "hex(" << col_name << ") AS " << col_name;
+                } else {
+                    select_cols << col_name;
+                }
+                col_names.push_back(col_name);
+            }
+
+            // Batch-fetch all matching rows not in sync set
+            std::string sql = "SELECT id, globalId, " + select_cols.str() +
+                              " FROM " + fe.table_name +
                               " WHERE globalId NOT IN (SELECT global_row_id FROM _lattice_sync_set WHERE table_name = ?)";
             std::vector<column_value_t> params = {fe.table_name};
             if (fe.where_clause) {
                 sql += " AND (" + *fe.where_clause + ")";
             }
-            auto rows = db_->db().query(sql, params);
-            for (const auto& row : rows) {
-                auto gid_it = row.find("globalId");
-                if (gid_it == row.end()) continue;
-                std::string gid = std::get<std::string>(gid_it->second);
+            auto all_rows = db_->db().query(sql, params);
+            LOG_INFO("synchronizer", "reconcile Phase 2: %s — %zu new rows to synthesize",
+                     fe.table_name.c_str(), all_rows.size());
 
-                auto insert_entry = build_insert_entry_from_current_row(fe.table_name, gid);
-                if (insert_entry) {
+            // Synthesize INSERT audit entries from the batch-fetched rows
+            db_->db().begin_transaction();
+            try {
+                for (const auto& fetched_row : all_rows) {
+                    auto gid_it = fetched_row.find("globalId");
+                    if (gid_it == fetched_row.end()) continue;
+                    std::string gid = std::get<std::string>(gid_it->second);
+
+                    audit_log_entry entry;
+                    entry.global_id = db_->generate_global_id();
+                    entry.table_name = fe.table_name;
+                    entry.operation = "INSERT";
+                    entry.global_row_id = gid;
+
+                    auto id_it = fetched_row.find("id");
+                    if (id_it != fetched_row.end() && std::holds_alternative<int64_t>(id_it->second))
+                        entry.row_id = std::get<int64_t>(id_it->second);
+
+                    entry.timestamp = std::to_string(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0);
+
+                    for (const auto& col_name : col_names) {
+                        auto val_it = fetched_row.find(col_name);
+                        if (val_it == fetched_row.end()) continue;
+                        const auto& cv = val_it->second;
+
+                        if (std::holds_alternative<std::nullptr_t>(cv)) {
+                            entry.changed_fields[col_name] = any_property(nullptr);
+                        } else if (std::holds_alternative<int64_t>(cv)) {
+                            entry.changed_fields[col_name] = any_property(std::get<int64_t>(cv));
+                        } else if (std::holds_alternative<double>(cv)) {
+                            entry.changed_fields[col_name] = any_property(std::get<double>(cv));
+                        } else if (std::holds_alternative<std::string>(cv)) {
+                            entry.changed_fields[col_name] = any_property(std::get<std::string>(cv));
+                        } else if (std::holds_alternative<std::vector<uint8_t>>(cv)) {
+                            entry.changed_fields[col_name] = any_property(std::get<std::vector<uint8_t>>(cv));
+                        }
+                        entry.changed_fields_names.push_back(col_name);
+                    }
+
                     db_->db().execute(
                         "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
                         "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
                         "VALUES (?, ?, 'INSERT', ?, ?, ?, ?, 0, 0)",
-                        {insert_entry->global_id, insert_entry->table_name,
-                         insert_entry->row_id, insert_entry->global_row_id,
-                         insert_entry->changed_fields_to_json(),
-                         insert_entry->changed_fields_names_to_json()});
+                        {entry.global_id, entry.table_name,
+                         entry.row_id, entry.global_row_id,
+                         entry.changed_fields_to_json(),
+                         entry.changed_fields_names_to_json()});
                     has_changes = true;
                 }
+                db_->db().commit();
+            } catch (...) {
+                if (db_->db().is_in_transaction()) {
+                    try { db_->db().rollback(); } catch (...) {}
+                }
+                throw;
             }
         }
     }
@@ -1048,14 +1161,6 @@ std::vector<audit_log_entry> synchronizer::query_pending_entries() {
     }
 
     LOG_DEBUG("synchronizer", "Found %zu unsynced entries to upload", entries.size());
-
-    if (!entries.empty()) {
-        auto count = static_cast<int64_t>(entries.size());
-        progress_pending_upload_.fetch_add(count, std::memory_order_relaxed);
-        progress_total_upload_.fetch_add(count, std::memory_order_relaxed);
-        fire_progress();
-    }
-
     return entries;
 }
 
@@ -1131,13 +1236,72 @@ synchronizer::classified_entries synchronizer::classify_entries(std::vector<audi
         return {std::move(entries), {}};
     }
 
-    LOG_DEBUG("synchronizer", "FILTERED upload path — filter has %zu entries",
-              config_.sync_filter->size());
+    LOG_DEBUG("synchronizer", "FILTERED upload path — filter has %zu entries, %zu audit entries to classify",
+              config_.sync_filter->size(), entries.size());
+
+    // Pre-load sync set into memory — O(1) hash lookups instead of O(N) SQL queries.
+    // Key is "table_name\0global_row_id" for compact hashing.
+    std::unordered_set<std::string> sync_set_cache;
+    {
+        auto rows = db_->db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
+        sync_set_cache.reserve(rows.size());
+        for (const auto& row : rows) {
+            auto tn_it = row.find("table_name");
+            auto gid_it = row.find("global_row_id");
+            if (tn_it != row.end() && gid_it != row.end()) {
+                std::string key = std::get<std::string>(tn_it->second) + '\0'
+                                + std::get<std::string>(gid_it->second);
+                sync_set_cache.insert(std::move(key));
+            }
+        }
+        LOG_DEBUG("synchronizer", "Loaded sync set cache: %zu entries", sync_set_cache.size());
+    }
+
+    // Pre-compute filter matches per table — one SQL query per filter entry
+    // instead of one per audit entry. Key is "table_name\0global_row_id".
+    std::unordered_set<std::string> filter_matches;
     for (const auto& fe : *config_.sync_filter) {
         LOG_DEBUG("synchronizer", "  filter entry: table=%s where=%s",
                   fe.table_name.c_str(),
                   fe.where_clause ? fe.where_clause->c_str() : "(all rows)");
+
+        std::string sql = "SELECT globalId FROM " + fe.table_name;
+        if (fe.where_clause) {
+            sql += " WHERE (" + *fe.where_clause + ")";
+        }
+        auto rows = db_->db().query(sql);
+        for (const auto& row : rows) {
+            auto gid_it = row.find("globalId");
+            if (gid_it != row.end()) {
+                std::string key = fe.table_name + '\0'
+                                + std::get<std::string>(gid_it->second);
+                filter_matches.insert(std::move(key));
+            }
+        }
     }
+    LOG_DEBUG("synchronizer", "Pre-computed filter matches: %zu rows", filter_matches.size());
+
+    // Lambda replacements for sync_set_contains and row_matches_filter
+    // that use the in-memory caches instead of SQL queries.
+    auto cached_sync_set_contains = [&](const std::string& table_name,
+                                         const std::string& global_row_id) -> bool {
+        return sync_set_cache.count(table_name + '\0' + global_row_id) > 0;
+    };
+    auto cached_row_matches_filter = [&](const std::string& table_name,
+                                          const std::string& global_row_id) -> bool {
+        return filter_matches.count(table_name + '\0' + global_row_id) > 0;
+    };
+    // Keep sync_set_add/remove updating both the cache and the DB.
+    auto cached_sync_set_add = [&](const std::string& table_name,
+                                    const std::string& global_row_id) {
+        sync_set_cache.insert(table_name + '\0' + global_row_id);
+        sync_set_add(table_name, global_row_id);
+    };
+    auto cached_sync_set_remove = [&](const std::string& table_name,
+                                       const std::string& global_row_id) {
+        sync_set_cache.erase(table_name + '\0' + global_row_id);
+        sync_set_remove(table_name, global_row_id);
+    };
 
     classified_entries result;
     for (auto& entry : entries) {
@@ -1152,24 +1316,57 @@ synchronizer::classified_entries synchronizer::classify_entries(std::vector<audi
             }
         }
 
-        LOG_DEBUG("synchronizer", "Processing entry: table=%s filter_table=%s op=%s globalRowId=%s is_link=%d",
-                  entry.table_name.c_str(), filter_table.c_str(), entry.operation.c_str(),
-                  entry.global_row_id.c_str(), is_link_table ? 1 : 0);
-
         if (!is_table_in_filter(filter_table)) {
-            LOG_DEBUG("synchronizer", "  -> table NOT in filter, marking synced (skip)");
             result.to_mark_synced.push_back(entry.id);
             continue;
         }
 
         if (entry.operation == "DELETE") {
-            classify_delete(entry, result);
+            // Inline classify_delete with cached lookups
+            if (cached_sync_set_contains(entry.table_name, entry.global_row_id)) {
+                result.to_send.push_back(entry);
+                cached_sync_set_remove(entry.table_name, entry.global_row_id);
+            } else {
+                result.to_mark_synced.push_back(entry.id);
+            }
         } else {
-            classify_insert_or_update(entry, filter_table, is_link_table, result);
+            // Inline classify_insert_or_update with cached lookups
+            bool matches = is_link_table || cached_row_matches_filter(entry.table_name, entry.global_row_id);
+            bool in_set = cached_sync_set_contains(entry.table_name, entry.global_row_id);
+
+            if (matches && !in_set) {
+                if (entry.operation == "INSERT") {
+                    result.to_send.push_back(entry);
+                    cached_sync_set_add(entry.table_name, entry.global_row_id);
+                } else {
+                    auto insert_entry = build_insert_entry_from_current_row(entry.table_name, entry.global_row_id);
+                    if (insert_entry) {
+                        result.to_send.push_back(std::move(*insert_entry));
+                        cached_sync_set_add(entry.table_name, entry.global_row_id);
+                        result.to_mark_synced.push_back(entry.id);
+                    } else {
+                        result.to_mark_synced.push_back(entry.id);
+                    }
+                }
+            } else if (matches && in_set) {
+                result.to_send.push_back(entry);
+            } else if (!matches && in_set) {
+                audit_log_entry del;
+                del.global_id = db_->generate_global_id();
+                del.table_name = entry.table_name;
+                del.operation = "DELETE";
+                del.global_row_id = entry.global_row_id;
+                del.timestamp = entry.timestamp;
+                result.to_send.push_back(std::move(del));
+                cached_sync_set_remove(entry.table_name, entry.global_row_id);
+                result.to_mark_synced.push_back(entry.id);
+            } else {
+                result.to_mark_synced.push_back(entry.id);
+            }
         }
     }
 
-    LOG_DEBUG("synchronizer", "Filtered result: to_send=%zu to_mark_synced=%zu",
+    LOG_DEBUG("synchronizer", "Classified: to_send=%zu to_mark_synced=%zu",
               result.to_send.size(), result.to_mark_synced.size());
     return result;
 }
@@ -1187,11 +1384,36 @@ void synchronizer::mark_skipped_synced(const std::vector<int64_t>& to_mark_synce
         db_->db().begin_transaction();
         try {
             for (size_t j = i; j < end; ++j) {
+                int64_t entry_id = to_mark_synced[j];
                 db_->db().execute(
                     "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized) "
                     "VALUES (?, ?, 1) "
                     "ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1",
-                    {to_mark_synced[j], config_.sync_id});
+                    {entry_id, config_.sync_id});
+
+                // Eager cleanup: if all active sync_ids have synced this entry,
+                // collapse to isSynchronized=1 on AuditLog and remove sync_state rows.
+                auto count_rows = db_->db().query(
+                    "SELECT COUNT(*) as cnt FROM _lattice_sync_state "
+                    "WHERE audit_entry_id = ? AND is_synchronized = 1",
+                    {entry_id});
+
+                int64_t synced_count = 0;
+                if (!count_rows.empty()) {
+                    auto cnt_it = count_rows[0].find("cnt");
+                    if (cnt_it != count_rows[0].end() && std::holds_alternative<int64_t>(cnt_it->second)) {
+                        synced_count = std::get<int64_t>(cnt_it->second);
+                    }
+                }
+
+                if (synced_count >= static_cast<int64_t>(config_.all_active_sync_ids.size())) {
+                    db_->db().execute(
+                        "DELETE FROM _lattice_sync_state WHERE audit_entry_id = ?",
+                        {entry_id});
+                    db_->db().execute(
+                        "UPDATE AuditLog SET isSynchronized = 1 WHERE id = ?",
+                        {entry_id});
+                }
             }
             db_->db().commit();
         } catch (...) {
@@ -1201,6 +1423,9 @@ void synchronizer::mark_skipped_synced(const std::vector<int64_t>& to_mark_synce
             throw;
         }
     }
+
+    // No progress decrement needed — skipped entries are not counted in
+    // progress_pending_upload_ (only to_send entries are counted).
 }
 
 void synchronizer::send_entries(std::vector<audit_log_entry>& entries) {
@@ -1231,6 +1456,20 @@ void synchronizer::upload_pending_changes() {
     auto entries = query_pending_entries();
     if (entries.empty()) return;
     auto classified = classify_entries(entries);
+
+    // Update progress counters AFTER classification.
+    // Only count to_send entries as pending — skipped entries resolve immediately
+    // and shouldn't contribute to the pending/total counts.
+    // This avoids double-counting: query_pending_entries filters in-flight entries,
+    // but if we counted all queried entries, in-flight entries from prior cycles
+    // would inflate the total and cause negative pending when ACK'd.
+    if (!classified.to_send.empty()) {
+        auto count = static_cast<int64_t>(classified.to_send.size());
+        progress_pending_upload_.fetch_add(count, std::memory_order_relaxed);
+        progress_total_upload_.fetch_add(count, std::memory_order_relaxed);
+        fire_progress();
+    }
+
     mark_skipped_synced(classified.to_mark_synced);
     send_entries(classified.to_send);
 
@@ -1252,6 +1491,9 @@ std::vector<std::string> synchronizer::apply_remote_changes(const std::vector<au
 }
 
 void synchronizer::mark_as_synced(const std::vector<std::string>& global_ids) {
+    LOG_INFO("synchronizer", "[%s] mark_as_synced: %zu entries ACK'd (progress_acked was %lld)",
+             config_.sync_id.c_str(), global_ids.size(),
+             (long long)progress_acked_.load(std::memory_order_relaxed));
     mark_audit_entries_synced_for(*db_, global_ids, config_.sync_id, config_.all_active_sync_ids);
 
     // Remove ACK'd entries from in-flight set
@@ -1266,12 +1508,27 @@ void synchronizer::mark_as_synced(const std::vector<std::string>& global_ids) {
     progress_acked_.fetch_add(count, std::memory_order_relaxed);
     progress_pending_upload_.fetch_sub(count, std::memory_order_relaxed);
     fire_progress();
+
+    // After processing ACKs, check if more pending entries exist that aren't
+    // already in-flight. Without this, entries created during sync (e.g. from
+    // WSS relay) stall indefinitely since the observer only fires on new INSERTs.
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        if (in_flight_ids_.empty()) {
+            scheduler_->invoke([this] {
+                if (is_destroyed_) return;
+                upload_pending_changes();
+            });
+        }
+    }
 }
 
 void synchronizer::schedule_reconnect() {
     if (should_reconnect_ && !is_connected_ && reconnect_attempts_ < config_.max_reconnect_attempts) {
         double delay = std::pow(2.0, reconnect_attempts_) * config_.base_delay_seconds;
         ++reconnect_attempts_;
+        LOG_INFO("synchronizer", "[%s] Scheduling reconnect attempt %d/%d in %.1fs",
+                 config_.sync_id.c_str(), reconnect_attempts_.load(), config_.max_reconnect_attempts, delay);
 
         // Schedule reconnection with an interruptible sleep.
         // Short-sleep loop checks is_destroyed_ so that scheduler_->shutdown()
@@ -1497,6 +1754,7 @@ void mark_audit_entries_synced_for(lattice_db& db,
     constexpr size_t kChunkSize = 50;
     for (size_t i = 0; i < global_ids.size(); i += kChunkSize) {
         size_t end = std::min(i + kChunkSize, global_ids.size());
+        int64_t chunk_max_entry_id = 0;
 
         db.db().begin_transaction();
         try {
@@ -1512,6 +1770,10 @@ void mark_audit_entries_synced_for(lattice_db& db,
                 if (id_it == rows[0].end() || !std::holds_alternative<int64_t>(id_it->second))
                     continue;
                 int64_t entry_id = std::get<int64_t>(id_it->second);
+
+                if (entry_id > chunk_max_entry_id) {
+                    chunk_max_entry_id = entry_id;
+                }
 
                 // Insert or update sync state for this sync_id
                 db.db().execute(R"(
@@ -1552,6 +1814,13 @@ void mark_audit_entries_synced_for(lattice_db& db,
                 try { db.db().rollback(); } catch (...) {}
             }
             throw;
+        }
+
+        // Advance replication slot outside the transaction — crash between
+        // commit and advance means the slot is slightly behind, which is safe
+        // (conservative compaction).
+        if (chunk_max_entry_id > 0) {
+            advance_replication_slot(db.db(), sync_id, chunk_max_entry_id);
         }
     }
 
@@ -1662,6 +1931,31 @@ std::vector<audit_log_entry> events_after(database& db, const std::optional<std:
     } else {
         return query_audit_log(db, false, std::nullopt);
     }
+}
+
+// =========================================================================
+// Replication slot management
+// =========================================================================
+
+void register_replication_slot(database& db, const std::string& sync_id) {
+    db.execute(R"(
+        INSERT INTO _lattice_replication_slots (sync_id, last_active_at)
+        VALUES (?, datetime('now'))
+        ON CONFLICT(sync_id) DO UPDATE SET last_active_at = datetime('now')
+    )", {sync_id});
+}
+
+void advance_replication_slot(database& db, const std::string& sync_id, int64_t confirmed_audit_id) {
+    db.execute(R"(
+        UPDATE _lattice_replication_slots
+        SET confirmed_audit_id = MAX(confirmed_audit_id, ?),
+            last_active_at = datetime('now')
+        WHERE sync_id = ?
+    )", {confirmed_audit_id, sync_id});
+}
+
+void remove_replication_slot(database& db, const std::string& sync_id) {
+    db.execute("DELETE FROM _lattice_replication_slots WHERE sync_id = ?", {sync_id});
 }
 
 // Unified implementation for applying remote changes.

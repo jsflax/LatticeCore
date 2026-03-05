@@ -107,12 +107,28 @@ std::optional<swift_configuration::SchemaPair> to_optional<swift_configuration::
 class swift_lattice;
 class swift_lattice_ref;
 
-void try_catch(void (^invoke_fn)()) {
+struct cxx_error {
+    std::string msg;
+};
+
+void try_catch(void (^_try)(), void (^_catch)(cxx_error)) {
     try {
-        invoke_fn();
-    } catch (...) {
-        
+        _try();
+    } catch(const std::exception& e) {
+        _catch({e.what()});
     }
+}
+
+cxx_error last_error() {
+    try {
+        std::rethrow_exception(std::current_exception());
+    } catch (const std::exception& e) {
+        return cxx_error{e.what()};
+    }
+}
+
+void test_throws() {
+    throw std::runtime_error("test error");
 }
 
 } // namespace lattice

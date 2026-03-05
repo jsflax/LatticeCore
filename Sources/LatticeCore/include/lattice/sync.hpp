@@ -249,7 +249,12 @@ public:
     // Event handlers
     void set_on_sync_complete(on_sync_complete_handler handler) { on_sync_complete_ = std::move(handler); }
     void set_on_error(on_error_handler handler) { on_error_ = std::move(handler); }
-    void set_on_state_change(on_state_change_handler handler) { on_state_change_ = std::move(handler); }
+    void set_on_state_change(on_state_change_handler handler) {
+        on_state_change_ = std::move(handler);
+        if (on_state_change_ && is_connected_) {
+            scheduler_->invoke([this] { on_state_change_(true); });
+        }
+    }
 
     // Progress
     void set_on_progress(on_progress_handler handler);
@@ -385,6 +390,19 @@ std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
                               const std::string& sync_id);
+
+// Replication slot management for sync-safe compaction.
+// Each synchronizer registers a slot; compaction only deletes entries
+// below the minimum confirmed_audit_id across all active slots.
+
+/// Register (or touch) a replication slot for the given sync_id.
+void register_replication_slot(database& db, const std::string& sync_id);
+
+/// Advance a replication slot's confirmed cursor (monotonically forward only).
+void advance_replication_slot(database& db, const std::string& sync_id, int64_t confirmed_audit_id);
+
+/// Remove a replication slot.
+void remove_replication_slot(database& db, const std::string& sync_id);
 
 } // namespace lattice
 

@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <iostream>
 #include <concepts>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace lattice {
 
@@ -1300,6 +1303,17 @@ public:
     /// Returns true if currently connected to sync server
     bool is_sync_connected() const;
 
+    /// Returns true if this instance owns a sync agent (WSS or IPC).
+    /// Used by Swift to decide whether to observe progress from the in-process
+    /// synchronizer or fall back to AuditLog-based passive observation.
+    bool is_sync_agent() const {
+        if (sync_lock_fd_ >= 0) return true;
+        for (const auto& ipc : ipc_synchronizers_) {
+            if (ipc.lock_fd >= 0) return true;
+        }
+        return false;
+    }
+
     /// Manually trigger sync (uploads pending changes)
     void sync_now();
 
@@ -1412,7 +1426,38 @@ public:
                        const std::string& global_row_id,
                        const std::string& changed_fields_names = "") {
         std::vector<std::function<void()>> callbacks;
+        collect_observer_callbacks(table_name, operation, row_id, global_row_id, changed_fields_names, callbacks);
 
+        // Dispatch all callbacks on the scheduler
+        for (auto& cb : callbacks) {
+            scheduler_->invoke(std::move(cb));
+        }
+    }
+
+    // Batch notify — collects callbacks for multiple changes, dispatches once.
+    // Reduces N scheduler invocations (each creating a Task) to 1.
+    void notify_changes_batched(
+        const std::vector<std::tuple<std::string, std::string, int64_t, std::string, std::string>>& changes) {
+        std::vector<std::function<void()>> all_callbacks;
+        for (const auto& [table, op, row_id, global_row_id, changed_fields] : changes) {
+            collect_observer_callbacks(table, op, row_id, global_row_id, changed_fields, all_callbacks);
+        }
+        if (all_callbacks.empty()) return;
+        // Single scheduler dispatch for all callbacks
+        scheduler_->invoke([callbacks = std::move(all_callbacks)]() mutable {
+            for (auto& cb : callbacks) {
+                cb();
+            }
+        });
+    }
+
+private:
+    void collect_observer_callbacks(const std::string& table_name,
+                                     const std::string& operation,
+                                     int64_t row_id,
+                                     const std::string& global_row_id,
+                                     const std::string& changed_fields_names,
+                                     std::vector<std::function<void()>>& callbacks) {
         // Collect table-level observers
         {
             std::lock_guard<std::mutex> lock(observers_mutex_);
@@ -1446,12 +1491,8 @@ public:
                 }
             }
         }
-
-        // Dispatch all callbacks on the scheduler
-        for (auto& cb : callbacks) {
-            scheduler_->invoke(std::move(cb));
-        }
     }
+public:
 
     // Find by primary key
     template<typename T>
@@ -1511,16 +1552,37 @@ public:
     // Count rows in a table (with optional WHERE clause)
     size_t count(const std::string& table_name,
                  std::optional<std::string> where_clause = std::nullopt,
-                 std::optional<std::string> group_by = std::nullopt) {
+                 std::optional<std::string> group_by = std::nullopt,
+                 std::optional<std::string> distinct_by = std::nullopt) {
         std::string sql;
-        if (group_by.has_value()) {
+
+        bool has_distinct = distinct_by.has_value() && !distinct_by->empty();
+        bool has_group = group_by.has_value() && !group_by->empty();
+
+        if (has_distinct && has_group) {
+            // Count distinct group_by values after deduplicating by distinct_by
+            sql = "SELECT COUNT(DISTINCT " + *group_by + ") as cnt FROM (SELECT * FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
+            sql += " GROUP BY " + *distinct_by + ")";
+        } else if (has_distinct) {
+            sql = "SELECT COUNT(DISTINCT " + *distinct_by + ") as cnt FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
+        } else if (has_group) {
             sql = "SELECT COUNT(DISTINCT " + *group_by + ") as cnt FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
         } else {
             sql = "SELECT COUNT(*) as cnt FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
         }
-        if (where_clause.has_value()) {
-            sql += " WHERE " + *where_clause;
-        }
+
         auto rows = read_db().query(sql);
         if (!rows.empty()) {
             auto it = rows[0].find("cnt");
@@ -1548,13 +1610,30 @@ public:
     /// Compact the audit log by replacing all entries with INSERT records
     /// representing the current state of all objects.
     /// This drops all history and creates a fresh snapshot.
+    /// Backward-compatible wrapper for force_compact_audit_log().
     /// @return Number of INSERT entries created
     int64_t compact_audit_log() {
+        return force_compact_audit_log();
+    }
+
+    /// Nuclear compaction: deletes ALL history, regenerates INSERT snapshots,
+    /// and resets all replication slot cursors to 0.
+    /// Active synchronizers will re-sync all data.
+    /// @return Number of INSERT entries created
+    int64_t force_compact_audit_log() {
         // Clear all existing audit log entries (with sync disabled)
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
         try {
             db_->execute("DELETE FROM AuditLog");
             db_->execute("DELETE FROM _lattice_sync_state");
+            db_->execute("DELETE FROM _lattice_sync_set");
+            // Reset AUTOINCREMENT counter so new entries start from 1.
+            // Without this, VACUUM preserves the counter and new entries
+            // get IDs in the millions, causing cursor comparison confusion.
+            db_->execute("DELETE FROM sqlite_sequence WHERE name = 'AuditLog'");
+            // Reset replication slots rather than delete — synchronizers
+            // don't need to re-register, they just re-sync from the start.
+            db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0");
             db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
         } catch (...) {
             db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
@@ -1563,6 +1642,62 @@ public:
 
         // Generate fresh INSERT entries for all objects
         return generate_history();
+    }
+
+    /// Slot-aware compaction: deletes only AuditLog entries that ALL
+    /// registered synchronizers have confirmed receiving.
+    /// Safe to call during active sync — no re-sync storm.
+    /// @param stale_threshold_seconds If > 0, evict slots inactive for this long
+    /// @return Number of entries deleted, or -1 if no slots exist (no-op)
+    int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) {
+        // 1. Optionally evict stale slots
+        if (stale_threshold_seconds > 0) {
+            db_->execute(
+                "DELETE FROM _lattice_replication_slots "
+                "WHERE last_active_at < datetime('now', '-' || ? || ' seconds')",
+                {stale_threshold_seconds});
+        }
+
+        // 2. Query MIN(confirmed_audit_id) and slot count
+        auto rows = db_->query(
+            "SELECT COUNT(*) as cnt, MIN(confirmed_audit_id) as safe_id "
+            "FROM _lattice_replication_slots");
+
+        if (rows.empty()) return -1;
+
+        auto cnt_it = rows[0].find("cnt");
+        auto safe_it = rows[0].find("safe_id");
+        if (cnt_it == rows[0].end() || safe_it == rows[0].end())
+            return -1;
+
+        int64_t slot_count = 0;
+        if (std::holds_alternative<int64_t>(cnt_it->second)) {
+            slot_count = std::get<int64_t>(cnt_it->second);
+        }
+
+        // 3. If no slots or safe_id <= 0 → no-op
+        if (slot_count == 0) return -1;
+
+        int64_t safe_id = 0;
+        if (std::holds_alternative<int64_t>(safe_it->second)) {
+            safe_id = std::get<int64_t>(safe_it->second);
+        }
+        if (safe_id <= 0) return 0;
+
+        // 4. Delete confirmed entries
+        db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        int64_t deleted = 0;
+        try {
+            db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
+            deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
+            db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
+            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+        } catch (...) {
+            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            throw;
+        }
+
+        return deleted;
     }
 
     /// Generate audit log INSERT entries for objects not already in the audit log.
@@ -1582,7 +1717,7 @@ public:
             auto tables = db_->query(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name NOT LIKE 'sqlite_%' "
-                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', '_lattice_sync_set') "
+                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', '_lattice_sync_set', '_lattice_replication_slots') "
                 "AND name NOT LIKE '%_vec0' "
                 "AND name NOT LIKE '%_rtree%' "
                 "AND name NOT LIKE '\\_%' ESCAPE '\\'");
@@ -1683,16 +1818,34 @@ public:
         std::optional<std::string> order_by = std::nullopt,
         std::optional<int64_t> limit = std::nullopt,
         std::optional<int64_t> offset = std::nullopt,
-        std::optional<std::string> group_by = std::nullopt) {
+        std::optional<std::string> group_by = std::nullopt,
+        std::optional<std::string> distinct_by = std::nullopt) {
 
         std::ostringstream sql;
-        sql << "SELECT * FROM " << table_name;
-        if (where_clause && !where_clause->empty()) {
-            sql << " WHERE " << *where_clause;
-        }
-        if (group_by && !group_by->empty()) {
+
+        bool has_distinct = distinct_by && !distinct_by->empty();
+        bool has_group = group_by && !group_by->empty();
+
+        if (has_distinct && has_group) {
+            // Dedup via inner GROUP BY, then apply outer GROUP BY
+            sql << "SELECT * FROM (SELECT * FROM " << table_name;
+            if (where_clause && !where_clause->empty()) {
+                sql << " WHERE " << *where_clause;
+            }
+            sql << " GROUP BY " << *distinct_by << ")";
             sql << " GROUP BY " << *group_by;
+        } else {
+            sql << "SELECT * FROM " << table_name;
+            if (where_clause && !where_clause->empty()) {
+                sql << " WHERE " << *where_clause;
+            }
+            if (has_distinct) {
+                sql << " GROUP BY " << *distinct_by;
+            } else if (has_group) {
+                sql << " GROUP BY " << *group_by;
+            }
         }
+
         if (order_by && !order_by->empty()) {
             sql << " ORDER BY " << *order_by;
         }
@@ -2472,15 +2625,25 @@ private:
     struct ipc_sync_state {
         std::unique_ptr<ipc_endpoint> endpoint;
         std::unique_ptr<synchronizer> sync;
+        int lock_fd = -1;  // flock on <channel>.ipc.lock — mirrors sync_lock_fd_ for WSS
     };
     std::vector<ipc_sync_state> ipc_synchronizers_;
 
-    // Sync callbacks
+    // Sync callbacks — stored for retroactive application to lazily-created synchronizers.
+    // Protected by ipc_callbacks_mutex_ to avoid races between the accept thread
+    // (which creates IPC synchronizers) and the main thread (which sets callbacks).
+    std::mutex ipc_callbacks_mutex_;
     std::function<void(bool)> on_sync_state_change_;
     std::function<void(const std::string&)> on_sync_error_;
+    synchronizer::on_progress_handler on_sync_progress_;
 
     // Synchronizer flag - true if this connection handles remote changes
     bool is_synchronizer_ = false;
+
+    // Cross-process flock for WSS sync ownership.
+    // >= 0 means this process holds the lock and owns the WSS synchronizer.
+    // -1 means lock not held (another process owns it, or sync not configured).
+    int sync_lock_fd_ = -1;
 
     // Change buffering - accumulates changes until WAL hook fires
     std::mutex change_buffer_mutex_;
@@ -3069,6 +3232,17 @@ private:
             CREATE INDEX IF NOT EXISTS idx_sync_state_pending
                 ON _lattice_sync_state(sync_id, is_synchronized)
                 WHERE is_synchronized = 0
+        )");
+
+        // Create _lattice_replication_slots table for slot-aware compaction.
+        // Each synchronizer registers a slot; compaction only deletes entries
+        // below the minimum confirmed_audit_id across all active slots.
+        db_->execute(R"(
+            CREATE TABLE IF NOT EXISTS _lattice_replication_slots (
+                sync_id TEXT PRIMARY KEY,
+                confirmed_audit_id INTEGER NOT NULL DEFAULT 0,
+                last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
         )");
 
         // Create sync_disabled() SQL function
@@ -4190,6 +4364,11 @@ inline void lattice_db::teardown_sync() {
             ipc.endpoint->stop();
             ipc.endpoint.reset();
         }
+        if (ipc.lock_fd >= 0) {
+            ::flock(ipc.lock_fd, LOCK_UN);
+            ::close(ipc.lock_fd);
+            ipc.lock_fd = -1;
+        }
     }
     ipc_synchronizers_.clear();
 
@@ -4197,6 +4376,15 @@ inline void lattice_db::teardown_sync() {
     if (!synchronizer_) return;
     unregister_sync_key(config_.path, config_.websocket_url);
     synchronizer_.reset();
+
+    // Release the cross-process flock so another process (or sibling) can
+    // acquire it and take over WSS sync responsibility.
+    if (sync_lock_fd_ >= 0) {
+        ::flock(sync_lock_fd_, LOCK_UN);
+        ::close(sync_lock_fd_);
+        sync_lock_fd_ = -1;
+    }
+
     // Hand off sync responsibility to a surviving sibling instance
     bool handed_off = false;
     instance_registry::instance().for_each_alive(config_.path,
@@ -4373,13 +4561,26 @@ inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
 }
 
 inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler handler) {
+    LOG_INFO("lattice_db", "set_on_sync_progress called (this=%p, path=%s, handler=%s)",
+             (void*)this, config_.path.c_str(), handler ? "SET" : "NULL");
     // Walk all instances on the same path — the synchronizer may live on a sibling.
+    // Lock ipc_callbacks_mutex_ on each sibling to synchronize with the IPC accept
+    // callback, which creates synchronizers on the accept thread.
     instance_registry::instance().for_each_alive(config_.path,
         [&handler](lattice_db* sibling) {
+            std::lock_guard<std::mutex> lock(sibling->ipc_callbacks_mutex_);
+            sibling->on_sync_progress_ = handler;
+            LOG_INFO("lattice_db", "  visiting sibling=%p, sync=%p, ipc_count=%zu",
+                     (void*)sibling,
+                     sibling->synchronizer_ ? (void*)sibling->synchronizer_.get() : nullptr,
+                     sibling->ipc_synchronizers_.size());
             if (sibling->synchronizer_) {
                 sibling->synchronizer_->set_on_progress(handler);
             }
-            for (auto& ipc : sibling->ipc_synchronizers_) {
+            for (size_t i = 0; i < sibling->ipc_synchronizers_.size(); ++i) {
+                auto& ipc = sibling->ipc_synchronizers_[i];
+                LOG_INFO("lattice_db", "  ipc[%zu].sync=%p", i,
+                         ipc.sync ? (void*)ipc.sync.get() : nullptr);
                 if (ipc.sync) {
                     ipc.sync->set_on_progress(handler);
                 }

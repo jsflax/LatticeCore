@@ -470,9 +470,10 @@ public:
         OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
-        OptionalString group_by = std::nullopt) {
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt) {
 
-        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by);
+        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
 
@@ -525,6 +526,13 @@ public:
     
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
+                 OptionalString group_by,
+                 OptionalString distinct_by) {
+        return lattice_db::count(table_name, where_clause, group_by, distinct_by);
+    }
+
+    size_t count(const std::string& table_name,
+                 OptionalString where_clause,
                  OptionalString group_by) {
         return lattice_db::count(table_name, where_clause, group_by);
     }
@@ -550,6 +558,14 @@ public:
         return lattice_db::compact_audit_log();
     }
 
+    int64_t force_compact_audit_log() {
+        return lattice_db::force_compact_audit_log();
+    }
+
+    int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) {
+        return lattice_db::safe_compact_audit_log(stale_threshold_seconds);
+    }
+
     int64_t generate_history() {
         return lattice_db::generate_history();
     }
@@ -560,30 +576,29 @@ public:
     }
 
     /// Explicitly close all database connections and stop background services.
+    /// Also evicts this instance from the LatticeCache so subsequent opens
+    /// on the same path create a fresh instance (e.g., after nuclear compaction).
     /// Call before deleting database files to avoid "vnode unlinked while in use".
-    void close() { lattice_db::close(); }
+    void close(); // defined after LatticeCache
     bool is_sync_connected() const { return lattice_db::is_sync_connected(); }
+    bool is_sync_agent() const { return lattice_db::is_sync_agent(); }
+
+    /// Count AuditLog entries pending sync whose rows are in the sync set.
+    int64_t pending_sync_entry_count() {
+        auto rows = read_db().query(
+            "SELECT COUNT(*) FROM AuditLog a"
+            " WHERE a.isSynchronized = 0"
+            " AND EXISTS (SELECT 1 FROM _lattice_sync_set ss"
+            "             WHERE ss.table_name = a.tableName"
+            "             AND ss.global_row_id = a.globalRowId)", {}
+        );
+        if (rows.empty()) return 0;
+        auto& val = rows[0].begin()->second;
+        return std::holds_alternative<int64_t>(val) ? std::get<int64_t>(val) : 0;
+    }
 
     void update_sync_filter(const SyncFilterVector& filter);
     void clear_sync_filter();
-
-    // Sync progress — polling
-    int64_t sync_progress_pending_upload() const {
-        auto p = lattice_db::get_sync_progress();
-        return p.pending_upload;
-    }
-    int64_t sync_progress_total_upload() const {
-        auto p = lattice_db::get_sync_progress();
-        return p.total_upload;
-    }
-    int64_t sync_progress_acked() const {
-        auto p = lattice_db::get_sync_progress();
-        return p.acked;
-    }
-    int64_t sync_progress_received() const {
-        auto p = lattice_db::get_sync_progress();
-        return p.received;
-    }
 
     // Sync progress — callback (fires on synchronizer's std_thread_scheduler thread)
     void set_on_sync_progress(void* context,
@@ -605,6 +620,40 @@ public:
         lattice_db::set_on_sync_progress(
             [shared_ctx, cb](const synchronizer::sync_progress& p) {
                 cb(shared_ctx.get(), p.pending_upload, p.total_upload, p.acked, p.received);
+            });
+    }
+    
+    // Sync error — callback (fires on synchronizer's scheduler thread)
+    void set_on_sync_error(void* context,
+                           void (*callback)(void* ctx, const char* error, int64_t len),
+                           void (*destroy)(void*) = nullptr) {
+        if (!callback) {
+            lattice_db::set_on_sync_error(nullptr);
+            if (context && destroy) { destroy(context); }
+            return;
+        }
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        lattice_db::set_on_sync_error(
+            [shared_ctx, cb](const std::string& error) {
+                cb(shared_ctx.get(), error.c_str(), static_cast<int64_t>(error.size()));
+            });
+    }
+
+    // Sync state change — callback (fires on synchronizer's scheduler thread)
+    void set_on_sync_state_change(void* context,
+                                  void (*callback)(void* ctx, bool connected),
+                                  void (*destroy)(void*) = nullptr) {
+        if (!callback) {
+            lattice_db::set_on_sync_state_change(nullptr);
+            if (context && destroy) { destroy(context); }
+            return;
+        }
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        lattice_db::set_on_sync_state_change(
+            [shared_ctx, cb](bool connected) {
+                cb(shared_ctx.get(), connected);
             });
     }
 
@@ -1118,8 +1167,9 @@ public:
         OptionalString where_clause,
         const sort_descriptor& sort,
         int64_t limit,
-        OptionalString group_by = std::nullopt)
-        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:)) {
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt)
+        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
 
         // Constants for geo calculations
         constexpr double METERS_PER_DEGREE = 111000.0;
@@ -1127,10 +1177,14 @@ public:
 
         // If no constraints, just return objects with limit
         if (bounds.empty() && vectors.empty() && geos.empty() && texts.empty()) {
-            auto rows = db().query("SELECT * FROM " + table_name +
+            std::string q = "SELECT * FROM " + table_name +
                 (where_clause.has_value() && !where_clause.value().empty()
-                    ? " WHERE " + where_clause.value() : "") +
-                " LIMIT " + std::to_string(limit));
+                    ? " WHERE " + where_clause.value() : "");
+            if (distinct_by.has_value() && !distinct_by.value().empty()) {
+                q += " GROUP BY " + distinct_by.value();
+            }
+            q += " LIMIT " + std::to_string(limit);
+            auto rows = db().query(q);
 
             CombinedQueryResultVector results;
             results.reserve(rows.size());
@@ -1441,8 +1495,16 @@ public:
             sql << " WHERE " << where_clause.value();
         }
 
-        // GROUP BY clause
-        if (group_by.has_value() && !group_by.value().empty()) {
+        // DISTINCT BY / GROUP BY clause
+        bool has_distinct = distinct_by.has_value() && !distinct_by.value().empty();
+        bool has_group = group_by.has_value() && !group_by.value().empty();
+        if (has_distinct && has_group) {
+            // Deduplicate first, then group — use distinct_by as inner GROUP BY
+            // The outer GROUP BY will be applied by wrapping in a subquery below
+            sql << " GROUP BY " << distinct_by.value();
+        } else if (has_distinct) {
+            sql << " GROUP BY " << distinct_by.value();
+        } else if (has_group) {
             sql << " GROUP BY " << group_by.value();
         }
 
@@ -1471,8 +1533,16 @@ public:
         // Apply limit
         sql << " LIMIT " << limit;
 
+        // If both distinct_by and group_by, wrap in outer SELECT with GROUP BY
+        std::string final_sql;
+        if (has_distinct && has_group) {
+            final_sql = "SELECT * FROM (" + sql.str() + ") GROUP BY " + group_by.value();
+        } else {
+            final_sql = sql.str();
+        }
+
         // Execute query
-        auto rows = db().query(sql.str());
+        auto rows = db().query(final_sql);
         CombinedQueryResultVector results;
         results.reserve(rows.size());
 
@@ -1852,6 +1922,22 @@ namespace detail {
             return nullptr;
         }
 
+        /// Remove a swift_lattice from both caches so subsequent get_or_create()
+        /// for the same path creates a fresh instance.
+        void evict(swift_lattice* ptr) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Remove from key_cache_ (match by shared_ptr identity)
+            for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
+                if (auto sp = it->second.lock()) {
+                    if (sp.get() == ptr) {
+                        key_cache_.erase(it);
+                        break;
+                    }
+                }
+            }
+            ptr_cache_.erase(ptr);
+        }
+
     private:
         LatticeCache() = default;
 
@@ -1860,6 +1946,12 @@ namespace detail {
         std::unordered_map<swift_lattice*, std::weak_ptr<swift_lattice>> ptr_cache_;
     };
 } // namespace detail
+
+// Out-of-line: defined after LatticeCache so evict() is visible.
+inline void swift_lattice::close() {
+    detail::LatticeCache::instance().evict(this);
+    lattice_db::close();
+}
 
 class swift_lattice_ref {
 public:

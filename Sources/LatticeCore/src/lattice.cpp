@@ -2,8 +2,12 @@
 // This file kept for potential non-template implementations
 
 #include "lattice/lattice.hpp"
+#include "lattice/ipc.hpp"
 #include <set>
 #include <unordered_set>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace lattice {
 
@@ -155,15 +159,19 @@ void lattice_db::setup_cross_process_notifier() {
     xproc_notifier_->start_listening([path = config_.path,
                                       mtx = xproc_callback_mutex_] {
         std::lock_guard<std::mutex> lock(*mtx);
-        // Pick first alive instance to handle the xproc notification.
-        bool handled = false;
+        // Notify ALL alive instances — each has its own cursor and observers.
+        // The IPC synchronizer registers its AuditLog observer on a private
+        // lattice_db (ipc_db), so skipping instances would prevent the
+        // synchronizer from learning about cross-process writes.
+        // Each instance's handle_cross_process_notification() uses its own
+        // cursor to avoid duplicate observer firings.
+        int notified = 0;
         instance_registry::instance().for_each_alive(path,
-            [&handled](lattice_db* inst) {
-                if (!handled) {
-                    inst->handle_cross_process_notification();
-                    handled = true;
-                }
+            [&notified](lattice_db* inst) {
+                inst->handle_cross_process_notification();
+                ++notified;
             });
+        LOG_DEBUG("xproc", "Notified %d alive instances for path", notified);
     });
 }
 
@@ -214,6 +222,12 @@ void lattice_db::handle_cross_process_notification() {
         // independently receives the event and processes it. Notifying all
         // instances here would cause N^2 observer callbacks when N instances
         // share a path (e.g., migration tests that open the same DB twice).
+        //
+        // Batch all changes into a single scheduler dispatch to avoid
+        // creating N separate Tasks on the main actor (each with overhead).
+        std::vector<std::tuple<std::string, std::string, int64_t, std::string, std::string>> changes;
+        changes.reserve(rows.size() * 2);  // model change + AuditLog change per row
+
         for (const auto& row : rows) {
             auto id_it = row.find("id");
             auto table_it = row.find("tableName");
@@ -236,10 +250,10 @@ void lattice_db::handle_cross_process_notification() {
             std::string changed_fields_names = (cfn_it != row.end() && std::holds_alternative<std::string>(cfn_it->second))
                 ? std::get<std::string>(cfn_it->second) : "";
 
-            // Notify this instance's model table and object observers
-            notify_change(table, op, row_id, global_row_id, changed_fields_names);
+            // Collect model table change
+            changes.emplace_back(table, op, row_id, global_row_id, changed_fields_names);
 
-            // Notify this instance's AuditLog observers
+            // Collect AuditLog change
             auto audit_gid_rows = read_db().query(
                 "SELECT globalId FROM AuditLog WHERE id = ?", {audit_id}
             );
@@ -250,10 +264,14 @@ void lattice_db::handle_cross_process_notification() {
                     audit_global_id = std::get<std::string>(git->second);
                 }
             }
-
-            notify_change("AuditLog", "INSERT", audit_id, audit_global_id);
+            changes.emplace_back("AuditLog", "INSERT", audit_id, audit_global_id, "");
 
             last_seen_audit_id_.store(audit_id, std::memory_order_release);
+        }
+
+        // Single batched dispatch — all observer callbacks run in one Task
+        if (!changes.empty()) {
+            notify_changes_batched(changes);
         }
 
         LOG_DEBUG("xproc", "Cross-process notification handled, cursor now at %lld", (long long)last_seen_audit_id_);
@@ -299,6 +317,23 @@ static std::vector<std::string> collect_all_sync_ids(const configuration& config
 void lattice_db::setup_sync_if_configured() {
     if (!config_.is_sync_enabled()) {
         return;
+    }
+
+    // Cross-process flock: only one process may own the WSS synchronizer
+    // for a given database. If another process holds the lock, skip silently.
+    if (sync_lock_fd_ < 0) {
+        std::string lock_path = config_.path + ".sync.lock";
+        int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (fd >= 0) {
+            if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+                ::close(fd);
+                LOG_DEBUG("lattice_db", "WSS sync lock held by another process, skipping");
+                return;
+            }
+            sync_lock_fd_ = fd;
+        } else {
+            LOG_DEBUG("lattice_db", "Failed to open sync lock file %s, proceeding anyway", lock_path.c_str());
+        }
     }
 
     // Only one synchronizer per {path, websocket_url} across all instances
@@ -374,6 +409,24 @@ void lattice_db::setup_ipc_if_configured() {
     for (size_t idx : active_indices) {
         ipc_sync_state state;
         state.endpoint = std::make_unique<ipc_endpoint>(config_.ipc_targets[idx].channel);
+
+        // Acquire per-channel flock — mirrors sync_lock_fd_ for WSS.
+        // Set during construction so is_sync_agent() returns true before
+        // the accept callback creates the synchronizer (avoids timing races).
+        std::string lock_path = resolve_ipc_socket_path(config_.ipc_targets[idx].channel) + ".lock";
+        int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (lock_fd >= 0) {
+            if (::flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
+                state.lock_fd = lock_fd;
+                LOG_INFO("ipc_sync", "Acquired IPC lock: %s (fd=%d)", lock_path.c_str(), lock_fd);
+            } else {
+                // Another process holds this channel — still proceed (IPC handles roles via bind)
+                // but don't set lock_fd so is_sync_agent() reflects the true owner.
+                ::close(lock_fd);
+                LOG_INFO("ipc_sync", "IPC lock held by another process: %s", lock_path.c_str());
+            }
+        }
+
         ipc_synchronizers_.push_back(std::move(state));
     }
 
@@ -406,8 +459,28 @@ void lattice_db::setup_ipc_if_configured() {
 
                 auto sync = std::make_unique<synchronizer>(
                     std::move(ipc_db), ipc_cfg, std::move(transport));
-                sync->connect();
-                sync_slot = std::move(sync);
+
+                // Lock ipc_callbacks_mutex_ to synchronize with set_on_sync_progress/
+                // set_on_sync_state_change/set_on_sync_error on the main thread.
+                // Without this, the accept thread and main thread can race: both
+                // check-then-act on {on_sync_progress_, sync_slot} and miss each other.
+                {
+                    std::lock_guard<std::mutex> lock(ipc_callbacks_mutex_);
+
+                    // Apply stored callbacks to the newly-created synchronizer
+                    if (on_sync_progress_) {
+                        sync->set_on_progress(on_sync_progress_);
+                    }
+                    if (on_sync_state_change_) {
+                        sync->set_on_state_change(on_sync_state_change_);
+                    }
+                    if (on_sync_error_) {
+                        sync->set_on_error(on_sync_error_);
+                    }
+
+                    sync->connect();
+                    sync_slot = std::move(sync);
+                }
 
                 LOG_INFO("ipc_sync", "[%s] New synchronizer installed (this=%p)",
                          sync_id.c_str(), (void*)sync_slot.get());

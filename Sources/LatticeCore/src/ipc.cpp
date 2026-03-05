@@ -209,13 +209,19 @@ transport_state ipc_socket_client::state() const {
 
 void ipc_socket_client::send(const transport_message& message) {
     int fd = fd_.load();
-    if (fd < 0 || state_ != transport_state::open) return;
+    if (fd < 0 || state_ != transport_state::open) {
+        LOG_INFO("ipc", "send: skipped (fd=%d, state=%d)", fd, static_cast<int>(state_.load()));
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(send_mutex_);
 
     // Re-check after acquiring lock — fd may have been closed while waiting
     fd = fd_.load();
-    if (fd < 0 || state_ != transport_state::open) return;
+    if (fd < 0 || state_ != transport_state::open) {
+        LOG_INFO("ipc", "send: skipped after lock (fd=%d, state=%d)", fd, static_cast<int>(state_.load()));
+        return;
+    }
 
     bool ok;
     if (message.msg_type == transport_message::type::text) {
@@ -226,8 +232,12 @@ void ipc_socket_client::send(const transport_message& message) {
     }
 
     if (!ok) {
-        LOG_DEBUG("ipc", "send failed, disconnecting");
+        LOG_INFO("ipc", "send failed (fd=%d, size=%zu), disconnecting", fd, message.data.size());
         // Don't call disconnect() from here — the read loop will detect the broken pipe.
+    } else {
+        LOG_INFO("ipc", "send ok (fd=%d, size=%zu bytes, type=%s)",
+                 fd, message.data.size(),
+                 message.msg_type == transport_message::type::text ? "text" : "binary");
     }
 }
 
@@ -249,22 +259,25 @@ void ipc_socket_client::start_read_loop() {
 
     should_stop_ = false;
     read_thread_ = std::thread([this]() {
+        LOG_INFO("ipc", "read loop started (fd=%d)", fd_.load());
         while (!should_stop_) {
             auto payload = read_length_prefixed(fd_.load());
             if (payload.empty()) {
                 if (should_stop_) break;
                 // Connection lost
-                LOG_DEBUG("ipc", "read_length_prefixed returned empty, connection lost");
+                LOG_INFO("ipc", "read_length_prefixed returned empty, connection lost (fd=%d)", fd_.load());
                 state_ = transport_state::closed;
                 if (on_close_) on_close_(1006, "Connection lost");
                 return;
             }
+            LOG_INFO("ipc", "read loop received %zu bytes (fd=%d)", payload.size(), fd_.load());
             // IPC uses text framing (JSON) — same as the WSS protocol
             transport_message msg;
             msg.msg_type = transport_message::type::text;
             msg.data = std::move(payload);
             if (on_message_) on_message_(msg);
         }
+        LOG_INFO("ipc", "read loop exiting (fd=%d, should_stop=%d)", fd_.load(), should_stop_ ? 1 : 0);
     });
 }
 

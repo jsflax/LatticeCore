@@ -1512,14 +1512,16 @@ void synchronizer::mark_as_synced(const std::vector<std::string>& global_ids) {
     // After processing ACKs, check if more pending entries exist that aren't
     // already in-flight. Without this, entries created during sync (e.g. from
     // WSS relay) stall indefinitely since the observer only fires on new INSERTs.
+    bool should_upload = false;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        if (in_flight_ids_.empty()) {
-            scheduler_->invoke([this] {
-                if (is_destroyed_) return;
-                upload_pending_changes();
-            });
-        }
+        should_upload = in_flight_ids_.empty();
+    }
+    if (should_upload) {
+        scheduler_->invoke([this] {
+            if (is_destroyed_) return;
+            upload_pending_changes();
+        });
     }
 }
 

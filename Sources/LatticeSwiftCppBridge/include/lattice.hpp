@@ -412,6 +412,8 @@ private:
     std::unordered_map<std::string, ConstraintVector> constraints_;
     // Swift-specific configuration (stores row migration callback)
     swift_configuration swift_config_;
+    // Error from last receive_sync_data call (nullopt if none)
+    OptionalString last_receive_error_;
 
     void ensure_swift_tables(const SchemaVector& schemas);
 
@@ -1603,25 +1605,42 @@ public:
     /// Receive sync data from a client (server-side)
     /// data: JSON bytes containing ServerSentEvent
     /// Returns list of acknowledged global IDs (only successfully applied entries)
+    /// Sets last_receive_error_ on failure (check via last_receive_error())
     std::vector<std::string> receive_sync_data(const ByteVector& data) {
-        std::string json_str(data.begin(), data.end());
-        auto event = server_sent_event::from_json(json_str);
-        if (!event) {
-            return {};  // Parse failed
-        }
-        std::vector<std::string> result;
+        // C++ exceptions must NOT propagate across the Swift/C++ boundary — that
+        // causes std::terminate() → SIGTRAP. Catch here and surface via error accessor.
+        last_receive_error_.reset();
+        try {
+            std::string json_str(data.begin(), data.end());
+            auto event = server_sent_event::from_json(json_str);
+            if (!event) {
+                return {};  // Parse failed
+            }
+            std::vector<std::string> result;
 
-        if (event->event_type == server_sent_event::type::audit_log) {
-            // Apply remote changes — returns only successfully applied IDs
-            result = ::lattice::apply_remote_changes(*this, event->audit_logs);
-        } else if (event->event_type == server_sent_event::type::ack) {
-            // Mark entries as synchronized (includes observer notification)
-            ::lattice::mark_audit_entries_synced(*this, event->acked_ids);
-            result = event->acked_ids;
-        }
+            if (event->event_type == server_sent_event::type::audit_log) {
+                // Apply remote changes — returns only successfully applied IDs
+                result = ::lattice::apply_remote_changes(*this, event->audit_logs);
+            } else if (event->event_type == server_sent_event::type::ack) {
+                // Mark entries as synchronized (includes observer notification)
+                ::lattice::mark_audit_entries_synced(*this, event->acked_ids);
+                result = event->acked_ids;
+            }
 
-        return result;
+            return result;
+        } catch (const std::exception& e) {
+            last_receive_error_ = std::string(e.what());
+            LOG_ERROR("receive_sync_data", "Exception: %s", e.what());
+            return {};
+        } catch (...) {
+            last_receive_error_ = std::string("unknown C++ exception in receive_sync_data");
+            LOG_ERROR("receive_sync_data", "Unknown exception");
+            return {};
+        }
     }
+
+    /// Returns the error from the last receive_sync_data call, or nullopt if none.
+    OptionalString last_receive_error() const { return last_receive_error_; }
 } SWIFT_UNSAFE_REFERENCE;
 
 // ============================================================================

@@ -1969,27 +1969,6 @@ static std::vector<std::string> apply_remote_changes_impl(
     std::vector<std::string> applied_ids;
     if (entries.empty()) return applied_ids;
 
-    // Fast path: skip transaction entirely if all entries are duplicates.
-    // Duplicates count as "applied" since the data already exists.
-    bool any_new = false;
-    for (const auto& entry : entries) {
-        auto existing = db.db().query(
-            "SELECT id FROM AuditLog WHERE globalId = ?",
-            {entry.global_id}
-        );
-        if (existing.empty()) {
-            any_new = true;
-            break;
-        }
-    }
-    if (!any_new) {
-        applied_ids.reserve(entries.size());
-        for (const auto& entry : entries) {
-            applied_ids.push_back(entry.global_id);
-        }
-        return applied_ids;
-    }
-
     // Process in chunks to avoid holding the write lock for too long.
     const size_t chunk_size = 50;
 

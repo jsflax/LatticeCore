@@ -23,6 +23,13 @@ lattice::log_level lattice_get_log_level() {
     return lattice::get_log_level();
 }
 
+void _lattice_post_cross_process_notification(const std::string& db_path) {
+    auto notifier = lattice::make_cross_process_notifier(db_path);
+    if (notifier) {
+        notifier->post_notification();
+    }
+}
+
 // swift_lattice_ref retain/release for SWIFT_SHARED_REFERENCE
 // The ref counting is managed by swift_lattice_ref's atomic counter
 

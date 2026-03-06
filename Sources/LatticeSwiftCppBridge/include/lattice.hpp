@@ -31,6 +31,10 @@ void releaseSwiftMigrationContextRef(lattice::swift_migration_context_ref*);
 void lattice_set_log_level(lattice::log_level level);
 lattice::log_level lattice_get_log_level();
 
+// Post a cross-process change notification for the given database path.
+// Used by tests and external writers that bypass Lattice's write hooks.
+void _lattice_post_cross_process_notification(const std::string& db_path);
+
 namespace lattice {
 
 // ============================================================================

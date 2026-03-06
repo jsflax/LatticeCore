@@ -195,7 +195,14 @@ void lattice_db::handle_cross_process_notification() {
         );
 
         if (rows.empty()) {
-            LOG_DEBUG("xproc", "No new AuditLog entries (self-notification)");
+            LOG_DEBUG("xproc", "No new AuditLog entries — firing AuditLog observers for sync state changes");
+            // Even without new AuditLog rows, the notification may indicate
+            // sync state changes (e.g., isSynchronized updates by the daemon).
+            // Fire AuditLog table observers so passive sync progress observers
+            // can re-query pending_sync_entry_count().
+            std::vector<std::tuple<std::string, std::string, int64_t, std::string, std::string>> changes;
+            changes.emplace_back("AuditLog", "UPDATE", 0, "", "");
+            notify_changes_batched(changes);
             return;
         }
 

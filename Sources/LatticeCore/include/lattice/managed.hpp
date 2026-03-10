@@ -1635,7 +1635,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<T*>, std::enable_if_t<is
     global_id_t parent_global_id_;
     std::string link_table_;
     std::string target_table_;
-    
+    bool is_virtual_ = false;
+
     // Dummy unmanaged_value for macro compatibility (never used)
     std::nullptr_t unmanaged_value = nullptr;
 
@@ -1671,10 +1672,18 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<T*>, std::enable_if_t<is
         column_name = p.name;
         row_id = parent->id_;
         parent_global_id_ = parent->global_id_;
-        // Compute link table name: _ParentTable_ChildTable_propName
-        link_table_ = "_" + parent->table_name_ + "_" +
-                      p.target_table + "_" + p.name;
-        target_table_ = p.target_table;
+        if (p.kind == property_kind::virtual_list || p.kind == property_kind::virtual_link) {
+            is_virtual_ = true;
+            // Virtual list: _ParentTable_propName (no target table component)
+            link_table_ = "_" + parent->table_name_ + "_" + p.name;
+            target_table_ = "";  // no single target table
+        } else {
+            is_virtual_ = false;
+            // Regular list: _ParentTable_ChildTable_propName
+            link_table_ = "_" + parent->table_name_ + "_" +
+                          p.target_table + "_" + p.name;
+            target_table_ = p.target_table;
+        }
     }
 
     // Overload for LATTICE_SCHEMA macro (takes prop name string)
@@ -1759,6 +1768,14 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<T*>, std::enable_if_t<is
 
     // Const subscript access (read-only)
     const managed<T>& operator[](size_t index) const;
+
+    // Virtual list support
+    struct typed_link {
+        std::string type;
+        global_id_t id;
+    };
+    std::vector<typed_link> get_typed_linked_ids() const;
+    void add_virtual_link(const global_id_t& child_global_id, const std::string& child_table);
 
 private:
     friend class element_proxy;

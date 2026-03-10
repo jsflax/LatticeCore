@@ -23,7 +23,9 @@ swift_dynamic_object::swift_dynamic_object(const std::string& table,
                         values[name] = std::vector<uint8_t>{};
                         break;
                 }
-            } else if (desc.kind == property_kind::list) {
+            } else if (desc.kind == property_kind::list
+                    || desc.kind == property_kind::virtual_list
+                    || desc.kind == property_kind::virtual_link) {
                 list_values[name] = std::make_shared<link_list>();
             }
         }

@@ -1,6 +1,7 @@
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <sstream>
 #include <cmath>
 #include <iomanip>
@@ -2002,7 +2003,14 @@ static std::vector<std::string> apply_remote_changes_impl(
 
                 // If it's a link table (starts with _), ensure it exists
                 if (!entry.table_name.empty() && entry.table_name[0] == '_') {
-                    db.ensure_link_table(entry.table_name);
+                    bool is_virtual = std::find(entry.changed_fields_names.begin(),
+                                                entry.changed_fields_names.end(),
+                                                "rhs_type") != entry.changed_fields_names.end();
+                    if (is_virtual) {
+                        db.ensure_virtual_link_table(entry.table_name);
+                    } else {
+                        db.ensure_link_table(entry.table_name);
+                    }
                 }
 
                 // Generate and execute the SQL instruction

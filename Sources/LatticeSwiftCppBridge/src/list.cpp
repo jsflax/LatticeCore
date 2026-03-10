@@ -188,6 +188,11 @@ std::vector<size_t> link_list::find_where(const std::string& sql_predicate) cons
         return {};
     }
 
+    // Virtual lists don't support find_where (no single target table)
+    if (managed_.is_virtual_) {
+        return {};
+    }
+
     // Access managed list's internals
     const auto& link_table = managed_.link_table_;
     const auto& target_table = managed_.target_table_;

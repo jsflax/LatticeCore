@@ -246,6 +246,15 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     std::string debug_description() const;
     
     std::shared_ptr<dynamic_object> make_shared() const { return std::make_shared<dynamic_object>(*this); }
+
+    std::string get_table_name() const SWIFT_NAME(getTableName()) {
+        if (lattice) {
+            return managed_.table_name_;
+        } else {
+            return unmanaged_.table_name;
+        }
+    }
+
 private:
     union {
         swift_dynamic_object unmanaged_;
@@ -405,6 +414,10 @@ public:
 
     void remove_geo_bounds_at(const std::string& name, size_t index) SWIFT_NAME(removeGeoBounds(named:at:)) {
         impl_->remove_geo_bounds_at(name, index);
+    }
+
+    std::string get_table_name() const SWIFT_NAME(getTableName()) {
+        return impl_->get_table_name();
     }
 
     std::string debug_description() const {

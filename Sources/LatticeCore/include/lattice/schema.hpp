@@ -73,9 +73,11 @@ struct is_link_type<std::vector<T*>> : std::true_type {};
 
 // Property kind - distinguishes primitives from relationships
 enum class property_kind {
-    primitive,   // stored directly in table (string, int, double, bool, etc.)
-    link,        // single object reference (nullable foreign key)
-    list         // collection via join table
+    primitive,    // stored directly in table (string, int, double, bool, etc.)
+    link,         // single object reference (nullable foreign key)
+    list,         // collection via join table
+    virtual_list, // polymorphic collection via discriminated join table
+    virtual_link  // polymorphic single link via discriminated join table
 };
 
 // Property descriptor (runtime info about a property)

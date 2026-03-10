@@ -2073,6 +2073,32 @@ public:
         create_link_table_triggers(link_table_name);
     }
 
+    // Create a virtual link table on demand (for VirtualList - polymorphic collections)
+    void ensure_virtual_link_table(const std::string& link_table_name, const std::string& parent_table = "") {
+        register_internal_table(link_table_name, parent_table);
+
+        if (db_->table_exists(link_table_name)) return;
+
+        // Virtual link table adds rhs_type column for type discrimination
+        std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
+            "lhs TEXT NOT NULL, "
+            "rhs TEXT NOT NULL, "
+            "rhs_type TEXT NOT NULL, "
+            "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
+                "lower(hex(randomblob(4))) || '-' || "
+                "lower(hex(randomblob(2))) || '-' || "
+                "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
+                "substr('89AB', 1 + (abs(random()) % 4), 1) || "
+                "substr(lower(hex(randomblob(2))),2) || '-' || "
+                "lower(hex(randomblob(6)))"
+            "), "
+            "PRIMARY KEY(lhs, rhs_type, rhs)"
+        ")";
+        db_->execute(sql);
+
+        create_virtual_link_table_triggers(link_table_name);
+    }
+
     /// Get column types for a table (for sync schema lookup)
     /// Returns map of column_name -> column_type
     std::unordered_map<std::string, column_type> get_table_schema(const std::string& table_name) {
@@ -3559,6 +3585,44 @@ protected:
         db_->execute(delete_trigger);
     }
 
+    void create_virtual_link_table_triggers(const std::string& link_table_name) {
+        // INSERT trigger for virtual link table (includes rhs_type)
+        std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
+            " AFTER INSERT ON " + link_table_name +
+            " WHEN (sync_disabled() = 0)"
+            " BEGIN"
+            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
+            "   VALUES ("
+            "       '" + link_table_name + "',"
+            "       'INSERT',"
+            "       0,"
+            "       NEW.globalId,"
+            "       json_object('lhs', NEW.lhs, 'rhs', NEW.rhs, 'rhs_type', NEW.rhs_type),"
+            "       json_array('lhs', 'rhs', 'rhs_type'),"
+            "       unixepoch('subsec')"
+            "   );"
+            " END";
+        db_->execute(insert_trigger);
+
+        // DELETE trigger for virtual link table
+        std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
+            " AFTER DELETE ON " + link_table_name +
+            " WHEN (sync_disabled() = 0)"
+            " BEGIN"
+            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
+            "   VALUES ("
+            "       '" + link_table_name + "',"
+            "       'DELETE',"
+            "       0,"
+            "       OLD.globalId,"
+            "       json_object('lhs', OLD.lhs, 'rhs', OLD.rhs, 'rhs_type', OLD.rhs_type),"
+            "       json_array('lhs', 'rhs', 'rhs_type'),"
+            "       unixepoch('subsec')"
+            "   );"
+            " END";
+        db_->execute(delete_trigger);
+    }
+
     std::string generate_global_id() {
         static std::random_device rd;
         static std::mt19937_64 gen(rd());
@@ -3993,6 +4057,41 @@ std::vector<global_id_t> managed<std::vector<T*>, std::enable_if_t<is_model<T>::
 }
 
 template<typename T>
+std::vector<typename managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::typed_link>
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::get_typed_linked_ids() const {
+    if (!is_bound() || link_table_.empty()) return {};
+    if (!db->table_exists(link_table_)) return {};
+
+    std::string sql = "SELECT rhs_type, rhs FROM " + link_table_ + " WHERE lhs = ? ORDER BY rowid";
+    auto rows = db->query(sql, {parent_global_id_});
+
+    std::vector<typed_link> links;
+    links.reserve(rows.size());
+    for (const auto& row : rows) {
+        auto type_it = row.find("rhs_type");
+        auto id_it = row.find("rhs");
+        if (type_it != row.end() && id_it != row.end() &&
+            std::holds_alternative<std::string>(type_it->second) &&
+            std::holds_alternative<std::string>(id_it->second)) {
+            links.push_back({std::get<std::string>(type_it->second),
+                             std::get<std::string>(id_it->second)});
+        }
+    }
+    return links;
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::add_virtual_link(
+    const global_id_t& child_global_id, const std::string& child_table) {
+    if (!is_bound() || link_table_.empty()) return;
+
+    lattice->ensure_virtual_link_table(link_table_, table_name);
+
+    std::string sql = "INSERT OR IGNORE INTO " + link_table_ + " (lhs, rhs, rhs_type) VALUES (?, ?, ?)";
+    db->execute(sql, {parent_global_id_, child_global_id, child_table});
+}
+
+template<typename T>
 void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::add_link(const global_id_t& child_global_id) {
     if (!is_bound() || link_table_.empty()) return;
 
@@ -4008,17 +4107,28 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::load_if_nee
     if (loaded_) return;
     loaded_ = true;
 
-    auto child_gids = get_linked_ids();
     cached_objects_.clear();
-    cached_objects_.reserve(child_gids.size());
-    
-    auto target_table = !target_table_.empty() ? target_table_ : managed<T>::schema().table_name;
-    
-    for (const auto& gid : child_gids) {
-        
-        auto found = lattice->find_by_global_id<T>(gid, target_table);
-        if (found.has_value()) {
-            cached_objects_.push_back(std::make_shared<managed<T>>(std::move(*found)));
+
+    if (is_virtual_) {
+        auto typed_ids = get_typed_linked_ids();
+        cached_objects_.reserve(typed_ids.size());
+        for (const auto& [type, gid] : typed_ids) {
+            auto found = lattice->find_by_global_id<T>(gid, type);
+            if (found.has_value()) {
+                cached_objects_.push_back(std::make_shared<managed<T>>(std::move(*found)));
+            }
+        }
+    } else {
+        auto child_gids = get_linked_ids();
+        cached_objects_.reserve(child_gids.size());
+
+        auto target_table = !target_table_.empty() ? target_table_ : managed<T>::schema().table_name;
+
+        for (const auto& gid : child_gids) {
+            auto found = lattice->find_by_global_id<T>(gid, target_table);
+            if (found.has_value()) {
+                cached_objects_.push_back(std::make_shared<managed<T>>(std::move(*found)));
+            }
         }
     }
 }
@@ -4027,13 +4137,12 @@ template<typename T>
 void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::push_back(managed<T>* obj) {
     if (obj == nullptr) return;
 
-    // If the object isn't in the database yet, add it
-//    if (!obj->is_valid() && lattice != nullptr) {
-//        lattice->add(*obj);
-//    }
-
     if (is_bound() && obj->is_valid()) {
-        add_link(obj->global_id());
+        if (is_virtual_) {
+            add_virtual_link(obj->global_id(), obj->table_name_);
+        } else {
+            add_link(obj->global_id());
+        }
     }
 
     cached_objects_.push_back(std::make_shared<managed<T>>(*obj));
@@ -4049,7 +4158,11 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::push_back(c
     }
 
     if (is_bound() && m.is_valid()) {
-        add_link(m.global_id());
+        if (is_virtual_) {
+            add_virtual_link(m.global_id(), m.table_name_);
+        } else {
+            add_link(m.global_id());
+        }
     }
 
     cached_objects_.push_back(std::make_shared<managed<T>>(std::move(m)));
@@ -4060,8 +4173,13 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::erase(manag
     if (!obj || !obj->is_valid()) return;
 
     if (is_bound() && !link_table_.empty() && db->table_exists(link_table_)) {
-        std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? AND rhs = ?";
-        db->execute(sql, {parent_global_id_, obj->global_id()});
+        if (is_virtual_) {
+            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? AND rhs = ? AND rhs_type = ?";
+            db->execute(sql, {parent_global_id_, obj->global_id(), obj->table_name_});
+        } else {
+            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? AND rhs = ?";
+            db->execute(sql, {parent_global_id_, obj->global_id()});
+        }
     }
 
     // Remove from cache

@@ -690,6 +690,34 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         }
     }
 
+    // Phase 8: Eagerly create junction tables and register internal table → parent
+    // mappings. Without eager creation, polymorphic VirtualList/VirtualLink tables
+    // only exist after a local write — breaking receive() on relay/downstream nodes
+    // that never write locally (e.g. SyncRelay pattern).
+    for (const auto& entry : schemas) {
+        for (const auto& [name, desc] : entry.properties) {
+            std::string link_table_name;
+            if (desc.kind == property_kind::virtual_list || desc.kind == property_kind::virtual_link) {
+                link_table_name = "_" + entry.table_name + "_" + name;
+                ensure_virtual_link_table(link_table_name, entry.table_name);
+            } else if (desc.kind == property_kind::link && !desc.target_table.empty()) {
+                link_table_name = "_" + entry.table_name + "_" + std::string(desc.target_table) + "_" + name;
+                ensure_link_table(link_table_name, entry.table_name);
+            } else if (desc.kind == property_kind::list && !desc.is_geo_bounds && !desc.target_table.empty()) {
+                link_table_name = "_" + entry.table_name + "_" + std::string(desc.target_table) + "_" + name;
+                ensure_link_table(link_table_name, entry.table_name);
+            }
+            if (!link_table_name.empty()) {
+                // Store "parent_table:property_name" so flush_changes can
+                // build changed_fields_names for per-object observer dispatch.
+                db().execute(
+                    "INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                    {"internal_table:" + link_table_name, entry.table_name + ":" + name}
+                );
+            }
+        }
+    }
+
     // All migrations and schema setup succeeded — commit the transaction.
     // If anything above threw, the transaction destructor rolls back instead.
     LOG_INFO("swift_lattice", "ensure_swift_tables: committing transaction");

@@ -376,15 +376,20 @@ void ipc_server::stop() {
 // ipc_endpoint implementation (auto-negotiated role)
 // ============================================================================
 
-ipc_endpoint::ipc_endpoint(const std::string& channel)
+ipc_endpoint::ipc_endpoint(const std::string& channel,
+                           const std::optional<std::string>& socket_path)
     : channel_(channel)
-    , socket_path_(resolve_ipc_socket_path(channel)) {}
+    , socket_path_(socket_path.value_or(resolve_ipc_socket_path(channel))) {}
 
 ipc_endpoint::~ipc_endpoint() {
     stop();
 }
 
 void ipc_endpoint::start(transport_ready_callback callback) {
+    // Ensure parent directory exists (needed for explicit socket paths)
+    std::filesystem::create_directories(
+        std::filesystem::path(socket_path_).parent_path());
+
     // Try to bind as server first (atomic at filesystem level)
     int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {

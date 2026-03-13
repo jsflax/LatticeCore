@@ -212,6 +212,14 @@ struct geo_bounds_list {
     // Example: find_where("minLat > 37.0 AND maxLat < 38.0")
     std::vector<size_t> find_where(const std::string& sql_predicate) const;
 
+    // Get the link table name — empty for unmanaged lists
+    std::string get_link_table_name() const SWIFT_NAME(getLinkTableName()) {
+        if (lattice) {
+            return managed_.list_table_;
+        }
+        return "";
+    }
+
 private:
     union {
         std::vector<geo_bounds> unmanaged_;
@@ -256,6 +264,10 @@ public:
     bool release() { return --ref_count_ == 0; }
 
     swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY;
+
+    std::string getLinkTableName() const SWIFT_COMPUTED_PROPERTY {
+        return impl_->get_link_table_name();
+    }
 
     size_t size() const { return impl_->size(); }
     bool empty() const { return impl_->empty(); }

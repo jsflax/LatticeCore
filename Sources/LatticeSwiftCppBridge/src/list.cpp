@@ -209,7 +209,7 @@ std::vector<size_t> link_list::find_where(const std::string& sql_predicate) cons
         WITH ordered_links AS (
             SELECT rhs, (ROW_NUMBER() OVER (ORDER BY rowid)) - 1 as idx
             FROM )" + link_table + R"(
-            WHERE lhs = ?
+            WHERE lhs = ? COLLATE NOCASE
         )
         SELECT ol.idx
         FROM ordered_links ol

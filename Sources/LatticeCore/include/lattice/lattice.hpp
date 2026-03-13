@@ -412,6 +412,10 @@ struct configuration {
     struct ipc_target {
         std::string channel;
         std::optional<std::vector<sync_filter_entry>> sync_filter;
+        /// Optional explicit socket path. When set, bypasses resolve_ipc_socket_path().
+        /// Required for cross-platform IPC (e.g. macOS host ↔ iOS simulator) where
+        /// HOME differs between processes.
+        std::optional<std::string> socket_path;
     };
     std::vector<ipc_target> ipc_targets;
 
@@ -1188,6 +1192,7 @@ public:
         // parent tables. Internal table changes are translated to parent UPDATE
         // notifications — e.g. a link table INSERT becomes a parent table UPDATE.
         // The _lattice_meta value stores the parent table name.
+        // Maps link table name → "parent_table:property_name"
         std::unordered_map<std::string, std::string> internal_table_parents;
         bool had_internal_changes = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
@@ -1209,17 +1214,60 @@ public:
         for (const auto& [table, op, row_id, global_id] : changes) {
             auto it = internal_table_parents.find(table);
             if (it != internal_table_parents.end() && !it->second.empty()) {
-                // Internal table — notify as parent table UPDATE
-                LOG_DEBUG("flush_changes", "Internal table %s -> parent UPDATE %s", table.c_str(), it->second.c_str());
-                auto parent_table = it->second;
-                for_each_alive([&parent_table](lattice_db* instance) {
-                    instance->notify_change(parent_table, "UPDATE", 0, "");
+                // Internal table — notify both the link table itself (for
+                // List.observe / VirtualList.observe) and the parent table
+                // (for @LatticeQuery / table-level observers + per-object
+                // observers for Swift Observation).
+                // Parse "parent_table:property_name" from _lattice_meta value.
+                auto& meta_value = it->second;
+                auto colon_pos = meta_value.find(':');
+                std::string parent_table = (colon_pos != std::string::npos)
+                    ? meta_value.substr(0, colon_pos) : meta_value;
+                std::string property_name = (colon_pos != std::string::npos)
+                    ? meta_value.substr(colon_pos + 1) : "";
+
+                // Build changed_fields_names JSON for per-object observer dispatch.
+                // This triggers _triggerObservers_send on parent Model instances,
+                // which fires Swift Observation willSet/didSet and causes SwiftUI
+                // views tracking this property (e.g., @Bindable node.children) to
+                // re-render.
+                std::string changed_fields = property_name.empty()
+                    ? "" : "[\"" + property_name + "\"]";
+
+                LOG_DEBUG("flush_changes", "Internal table %s -> notify link + parent UPDATE %s (prop=%s)",
+                          table.c_str(), parent_table.c_str(), property_name.c_str());
+                for_each_alive([&table, &op, row_id, &global_id, &parent_table, &changed_fields](lattice_db* instance) {
+                    instance->notify_change(table, op, row_id, global_id);
+                    // row_id=0 broadcasts to all table-level observers.
+                    // Swift observer handles rowId==0 as an unconditional update.
+                    instance->notify_change(parent_table, "UPDATE", 0, "", changed_fields);
                 });
                 had_internal_changes = true;
             } else {
-                LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s", table.c_str(), op.c_str());
-                for_each_alive([&table, &op, row_id, &global_id](lattice_db* instance) {
-                    instance->notify_change(table, op, row_id, global_id);
+                // When applying remote changes (IPC sync), look up changedFieldsNames
+                // from AuditLog so object observers can trigger Swift Observation.
+                // For local setter changes, changed_fields stays empty — the Swift
+                // setter already handles observation via withMutation.
+                std::string changed_fields;
+                if (applying_remote_changes_.load(std::memory_order_acquire)
+                    && row_id > 0 && table != "AuditLog") {
+                    auto cfn_rows = read_db().query(
+                        "SELECT changedFieldsNames FROM AuditLog "
+                        "WHERE tableName = ? AND rowId = ? ORDER BY id DESC LIMIT 1",
+                        {table, row_id}
+                    );
+                    if (!cfn_rows.empty()) {
+                        auto cfn_it = cfn_rows[0].find("changedFieldsNames");
+                        if (cfn_it != cfn_rows[0].end() &&
+                            std::holds_alternative<std::string>(cfn_it->second)) {
+                            changed_fields = std::get<std::string>(cfn_it->second);
+                        }
+                    }
+                }
+                LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s changed_fields=%s",
+                          table.c_str(), op.c_str(), changed_fields.c_str());
+                for_each_alive([&table, &op, row_id, &global_id, &changed_fields](lattice_db* instance) {
+                    instance->notify_change(table, op, row_id, global_id, changed_fields);
                 });
             }
         }
@@ -1272,12 +1320,43 @@ public:
             }
         }
 
-        // Internal table changes need to reach the synchronizer but not external
-        // AuditLog observers. Only trigger when no regular AuditLog notification
-        // was fired (regular notifications already cause the synchronizer to pick
-        // up ALL unsynced entries including internal ones). Dispatch via scheduler
-        // to avoid calling sync_now() from within the WAL hook — synchronous calls
-        // race with WebSocket ACK handlers that begin_transaction on the same connection.
+        // Internal table changes also need AuditLog observer notification so that
+        // lattice.observe() callbacks fire (e.g. objectWillChange.send() in SwiftUI).
+        // apply_remote_changes stores the SOURCE rowId (not local) for link tables,
+        // so we match by tableName+operation only, not by rowId.
+        if (had_internal_changes && !is_in_memory) {
+            for (const auto& [table, op, row_id, global_id] : changes) {
+                if (!internal_table_parents.count(table)) continue;
+
+                auto audit_rows = read_db().query(
+                    "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND operation = ? ORDER BY id DESC LIMIT 1",
+                    {table, op}
+                );
+                if (!audit_rows.empty()) {
+                    const auto& row = audit_rows[0];
+                    auto id_it = row.find("id");
+                    auto gid_it = row.find("globalId");
+                    if (id_it != row.end() && gid_it != row.end() &&
+                        std::holds_alternative<int64_t>(id_it->second) &&
+                        std::holds_alternative<std::string>(gid_it->second)) {
+                        int64_t audit_row_id = std::get<int64_t>(id_it->second);
+                        std::string audit_global_id = std::get<std::string>(gid_it->second);
+                        LOG_DEBUG("flush_changes", "Notifying AuditLog observers for internal table %s: rowId=%lld",
+                                  table.c_str(), (long long)audit_row_id);
+                        for_each_alive([audit_row_id, &audit_global_id](lattice_db* instance) {
+                            instance->notify_change("AuditLog", "INSERT", audit_row_id, audit_global_id);
+                        });
+                        triggered_regular_audit = true;
+                    }
+                }
+            }
+        }
+
+        // Internal table changes need to reach the synchronizer. Only trigger
+        // when no regular AuditLog notification was fired (regular notifications
+        // already cause the synchronizer to pick up ALL unsynced entries including
+        // internal ones). Dispatch via scheduler to avoid calling sync_now() from
+        // within the WAL hook — synchronous calls race with WebSocket ACK handlers.
         if (had_internal_changes && !triggered_regular_audit) {
             trigger_sync_upload();
         }
@@ -1521,12 +1600,26 @@ private:
             std::lock_guard<std::mutex> lock(object_observers_mutex_);
             auto table_it = object_observers_.find(table_name);
             if (table_it != object_observers_.end()) {
-                auto row_it = table_it->second.find(row_id);
-                if (row_it != table_it->second.end()) {
-                    for (const auto& [id, callback] : row_it->second) {
-                        callbacks.push_back([callback, changed_fields_names] {
-                            callback(changed_fields_names);
-                        });
+                if (row_id == 0 && !changed_fields_names.empty()) {
+                    // row_id=0 with changed_fields = broadcast mode.
+                    // Used for link table changes: fire all per-object observers
+                    // for this parent table so Swift Observation triggers on every
+                    // live model instance (e.g., VStackNode.children).
+                    for (const auto& [rid, observer_map] : table_it->second) {
+                        for (const auto& [id, callback] : observer_map) {
+                            callbacks.push_back([callback, changed_fields_names] {
+                                callback(changed_fields_names);
+                            });
+                        }
+                    }
+                } else {
+                    auto row_it = table_it->second.find(row_id);
+                    if (row_it != table_it->second.end()) {
+                        for (const auto& [id, callback] : row_it->second) {
+                            callbacks.push_back([callback, changed_fields_names] {
+                                callback(changed_fields_names);
+                            });
+                        }
                     }
                 }
             }
@@ -1577,7 +1670,23 @@ public:
     void remove(managed<T>& obj, const std::string& table_name) {
         if (!obj.is_valid()) return;
 
+        auto gid = obj.global_id();
         db_->remove(table_name, obj.id_);
+
+        // Cascade: remove link table entries referencing this object as rhs
+        if (!gid.empty()) {
+            auto rows = db_->query(
+                "SELECT key FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
+            for (const auto& row : rows) {
+                auto it = row.find("key");
+                if (it == row.end() || !std::holds_alternative<std::string>(it->second)) continue;
+                auto link_table = std::get<std::string>(it->second).substr(15); // strip "internal_table:"
+                if (db_->table_exists(link_table)) {
+                    db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                }
+            }
+        }
+
         obj.notify_deleted();
         obj.db_ = nullptr;
         obj.id_ = 0;
@@ -1635,11 +1744,39 @@ public:
 
     // Delete rows from a table (with optional WHERE clause)
     bool delete_where(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt) {
-        std::string sql = "DELETE FROM " + table_name;
-        if (where_clause.has_value()) {
-            sql += " WHERE " + *where_clause;
-        }
         try {
+            // Cascade: collect globalIds of rows about to be deleted,
+            // then remove referencing link table entries before the DELETE.
+            std::string select_sql = "SELECT globalId FROM " + table_name;
+            if (where_clause.has_value()) {
+                select_sql += " WHERE " + *where_clause;
+            }
+            auto gid_rows = db_->query(select_sql);
+
+            if (!gid_rows.empty()) {
+                auto link_rows = db_->query(
+                    "SELECT key FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
+                for (const auto& gid_row : gid_rows) {
+                    auto gid_it = gid_row.find("globalId");
+                    if (gid_it == gid_row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                    auto gid = std::get<std::string>(gid_it->second);
+                    if (gid.empty()) continue;
+
+                    for (const auto& lr : link_rows) {
+                        auto it = lr.find("key");
+                        if (it == lr.end() || !std::holds_alternative<std::string>(it->second)) continue;
+                        auto link_table = std::get<std::string>(it->second).substr(15); // strip "internal_table:"
+                        if (db_->table_exists(link_table)) {
+                            db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                        }
+                    }
+                }
+            }
+
+            std::string sql = "DELETE FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
             db_->execute(sql);
             return true;
         } catch (...) {
@@ -2050,26 +2187,26 @@ public:
         // Changes are translated into UPDATE notifications on the parent table.
         register_internal_table(link_table_name, parent_table);
 
-        if (db_->table_exists(link_table_name)) return;
+        if (!db_->table_exists(link_table_name)) {
+            // Create link table with globalId for sync and PRIMARY KEY to prevent duplicates
+            // Matches Lattice.swift's createLinkTable()
+            std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
+                "lhs TEXT NOT NULL, "
+                "rhs TEXT NOT NULL, "
+                "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
+                    "lower(hex(randomblob(4))) || '-' || "
+                    "lower(hex(randomblob(2))) || '-' || "
+                    "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
+                    "substr('89AB', 1 + (abs(random()) % 4), 1) || "
+                    "substr(lower(hex(randomblob(2))),2) || '-' || "
+                    "lower(hex(randomblob(6)))"
+                "), "
+                "PRIMARY KEY(lhs, rhs)"
+            ")";
+            db_->execute(sql);
+        }
 
-        // Create link table with globalId for sync and PRIMARY KEY to prevent duplicates
-        // Matches Lattice.swift's createLinkTable()
-        std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
-            "lhs TEXT NOT NULL, "
-            "rhs TEXT NOT NULL, "
-            "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
-                "lower(hex(randomblob(4))) || '-' || "
-                "lower(hex(randomblob(2))) || '-' || "
-                "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
-                "substr('89AB', 1 + (abs(random()) % 4), 1) || "
-                "substr(lower(hex(randomblob(2))),2) || '-' || "
-                "lower(hex(randomblob(6)))"
-            "), "
-            "PRIMARY KEY(lhs, rhs)"
-        ")";
-        db_->execute(sql);
-
-        // Create audit triggers for sync/observation
+        // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
         create_link_table_triggers(link_table_name);
     }
 
@@ -2077,25 +2214,26 @@ public:
     void ensure_virtual_link_table(const std::string& link_table_name, const std::string& parent_table = "") {
         register_internal_table(link_table_name, parent_table);
 
-        if (db_->table_exists(link_table_name)) return;
+        if (!db_->table_exists(link_table_name)) {
+            // Virtual link table adds rhs_type column for type discrimination
+            std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
+                "lhs TEXT NOT NULL, "
+                "rhs TEXT NOT NULL, "
+                "rhs_type TEXT NOT NULL, "
+                "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
+                    "lower(hex(randomblob(4))) || '-' || "
+                    "lower(hex(randomblob(2))) || '-' || "
+                    "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
+                    "substr('89AB', 1 + (abs(random()) % 4), 1) || "
+                    "substr(lower(hex(randomblob(2))),2) || '-' || "
+                    "lower(hex(randomblob(6)))"
+                "), "
+                "PRIMARY KEY(lhs, rhs_type, rhs)"
+            ")";
+            db_->execute(sql);
+        }
 
-        // Virtual link table adds rhs_type column for type discrimination
-        std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
-            "lhs TEXT NOT NULL, "
-            "rhs TEXT NOT NULL, "
-            "rhs_type TEXT NOT NULL, "
-            "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
-                "lower(hex(randomblob(4))) || '-' || "
-                "lower(hex(randomblob(2))) || '-' || "
-                "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
-                "substr('89AB', 1 + (abs(random()) % 4), 1) || "
-                "substr(lower(hex(randomblob(2))),2) || '-' || "
-                "lower(hex(randomblob(6)))"
-            "), "
-            "PRIMARY KEY(lhs, rhs_type, rhs)"
-        ")";
-        db_->execute(sql);
-
+        // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
         create_virtual_link_table_triggers(link_table_name);
     }
 
@@ -2725,6 +2863,13 @@ private:
     std::vector<std::tuple<std::string, std::string, int64_t, std::string>> change_buffer_;  // (table, op, rowId, globalId)
     bool is_flushing_ = false;
 
+public:
+    /// Set by apply_remote_changes to signal that flush_changes should look up
+    /// changedFieldsNames from AuditLog and pass them to object observers.
+    /// Local Swift setter changes don't need this (the setter handles observation).
+    std::atomic<bool> applying_remote_changes_{false};
+private:
+
 protected:
     // Initialize synchronizer if configured
     void setup_sync_if_configured();
@@ -3241,8 +3386,27 @@ private:
     }
 
     void ensure_link_tables() {
-        // Link tables are now created on-demand when first used
-        // No need for manual registration
+        // Eagerly create junction tables for all registered schemas.
+        // Without this, link tables only exist after a local write — breaking
+        // receive() on relay/downstream nodes that never write locally.
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            for (const auto& prop : schema->properties) {
+                if (prop.kind == property_kind::virtual_list ||
+                    prop.kind == property_kind::virtual_link) {
+                    std::string table_name = "_" + schema->table_name + "_" + prop.name;
+                    ensure_virtual_link_table(table_name, schema->table_name);
+                } else if (prop.kind == property_kind::list && !prop.is_geo_bounds &&
+                           !prop.target_table.empty()) {
+                    std::string table_name = "_" + schema->table_name + "_" +
+                                             prop.target_table + "_" + prop.name;
+                    ensure_link_table(table_name, schema->table_name);
+                } else if (prop.kind == property_kind::link && !prop.target_table.empty()) {
+                    std::string table_name = "_" + schema->table_name + "_" +
+                                             prop.target_table + "_" + prop.name;
+                    ensure_link_table(table_name, schema->table_name);
+                }
+            }
+        }
     }
 
     void ensure_audit_log_table() {
@@ -3874,7 +4038,7 @@ std::optional<global_id_t> managed<T*, std::enable_if_t<is_model<T>::value>>::ge
         return std::nullopt;
     }
 
-    std::string sql = "SELECT rhs FROM " + link_table_ + " WHERE lhs = ?";
+    std::string sql = "SELECT rhs FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE";
     auto rows = db->query(sql, {parent_global_id_});
 
     if (rows.empty()) {
@@ -3910,7 +4074,7 @@ void managed<T*, std::enable_if_t<is_model<T>::value>>::clear_link() {
     // Link table may not exist yet
     if (!db->table_exists(link_table_)) return;
 
-    std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ?";
+    std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE";
     db->execute(sql, {parent_global_id_});
 }
 
@@ -4023,15 +4187,12 @@ size_t managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::size() co
     // Link table may not exist yet
     if (!db->table_exists(link_table_)) return 0;
 
-    std::string sql = "SELECT COUNT(*) as cnt FROM " + link_table_ + " WHERE lhs = ?";
-    auto rows = db->query(sql, {parent_global_id_});
-    if (!rows.empty()) {
-        auto it = rows[0].find("cnt");
-        if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-            return static_cast<size_t>(std::get<int64_t>(it->second));
-        }
-    }
-    return 0;
+    // Load the full object list so size() and operator[] see the same data.
+    // Without this, size() could return a different count than the number of
+    // elements load_if_needed() fetches, causing Collection conformance
+    // violations ("more than count elements") when iterating.
+    load_if_needed();
+    return cached_objects_.size();
 }
 
 template<typename T>
@@ -4042,7 +4203,7 @@ std::vector<global_id_t> managed<std::vector<T*>, std::enable_if_t<is_model<T>::
     if (!db->table_exists(link_table_)) return {};
 
     // ORDER BY rowid to preserve insertion order
-    std::string sql = "SELECT rhs FROM " + link_table_ + " WHERE lhs = ? ORDER BY rowid";
+    std::string sql = "SELECT rhs FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE ORDER BY rowid";
     auto rows = db->query(sql, {parent_global_id_});
 
     std::vector<global_id_t> ids;
@@ -4062,7 +4223,7 @@ managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::get_typed_linked
     if (!is_bound() || link_table_.empty()) return {};
     if (!db->table_exists(link_table_)) return {};
 
-    std::string sql = "SELECT rhs_type, rhs FROM " + link_table_ + " WHERE lhs = ? ORDER BY rowid";
+    std::string sql = "SELECT rhs_type, rhs FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE ORDER BY rowid";
     auto rows = db->query(sql, {parent_global_id_});
 
     std::vector<typed_link> links;
@@ -4174,10 +4335,10 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::erase(manag
 
     if (is_bound() && !link_table_.empty() && db->table_exists(link_table_)) {
         if (is_virtual_) {
-            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? AND rhs = ? AND rhs_type = ?";
+            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE AND rhs = ? COLLATE NOCASE AND rhs_type = ?";
             db->execute(sql, {parent_global_id_, obj->global_id(), obj->table_name_});
         } else {
-            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? AND rhs = ?";
+            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE AND rhs = ? COLLATE NOCASE";
             db->execute(sql, {parent_global_id_, obj->global_id()});
         }
     }
@@ -4195,7 +4356,7 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::erase(manag
 template<typename T>
 void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::clear() {
     if (is_bound() && !link_table_.empty() && db->table_exists(link_table_)) {
-        std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ?";
+        std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE";
         db->execute(sql, {parent_global_id_});
     }
     cached_objects_.clear();

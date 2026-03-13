@@ -134,6 +134,14 @@ struct link_list {
     // Find index of an object (compares by global_id for managed, pointer for unmanaged)
     std::optional<size_t> find_index(const dynamic_object_ref& obj) const;
 
+    // Get the link table name (e.g., "_VStackNode_children") — empty for unmanaged lists
+    std::string get_link_table_name() const SWIFT_NAME(getLinkTableName()) {
+        if (lattice) {
+            return managed_.link_table_;
+        }
+        return "";
+    }
+
     // Find all elements matching SQL predicate (managed lists only)
     // Example: find_where("name = 'John' AND age > 25")
     std::vector<size_t> find_where(const std::string& sql_predicate) const
@@ -223,6 +231,10 @@ public:
 
     // Delegate common operations to impl_
     swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY;
+
+    std::string getLinkTableName() const SWIFT_COMPUTED_PROPERTY {
+        return impl_->get_link_table_name();
+    }
 
     size_t size() const { return impl_->size(); }
     bool empty() const { return impl_->empty(); }

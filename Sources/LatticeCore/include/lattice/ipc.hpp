@@ -125,7 +125,8 @@ private:
 /// falls back to connecting as a client.
 class ipc_endpoint {
 public:
-    explicit ipc_endpoint(const std::string& channel);
+    explicit ipc_endpoint(const std::string& channel,
+                          const std::optional<std::string>& socket_path = std::nullopt);
     ~ipc_endpoint();
 
     // Non-copyable

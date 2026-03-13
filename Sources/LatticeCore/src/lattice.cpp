@@ -281,6 +281,83 @@ void lattice_db::handle_cross_process_notification() {
             last_seen_audit_id_.store(audit_id, std::memory_order_release);
         }
 
+        // Resolve internal tables (link tables, geo_bounds list tables) to their
+        // parent tables. Internal table changes are translated to parent UPDATE
+        // notifications — e.g. a link table INSERT becomes a parent table UPDATE.
+        // This mirrors the same resolution done in flush_changes() for same-process writes.
+        std::unordered_map<std::string, std::string> internal_table_parents;
+        for (const auto& [table, op, row_id, global_id, cfn] : changes) {
+            if (table == "AuditLog" || internal_table_parents.count(table)) continue;
+            auto meta = read_db().query(
+                "SELECT value FROM _lattice_meta WHERE key = ?",
+                {"internal_table:" + table}
+            );
+            if (!meta.empty()) {
+                auto val_it = meta[0].find("value");
+                if (val_it != meta[0].end() && std::holds_alternative<std::string>(val_it->second)) {
+                    internal_table_parents[table] = std::get<std::string>(val_it->second);
+                }
+            }
+        }
+
+        // Rewrite internal table entries to parent UPDATE notifications.
+        // Resolve the parent's actual rowId via the link table's lhs column
+        // (parent globalId) so Swift table observers can validate the object.
+        if (!internal_table_parents.empty()) {
+            for (auto& change : changes) {
+                auto& table = std::get<0>(change);
+                auto it = internal_table_parents.find(table);
+                if (it != internal_table_parents.end() && !it->second.empty()) {
+                    auto& meta_value = it->second;
+                    auto colon_pos = meta_value.find(':');
+                    std::string parent_table = (colon_pos != std::string::npos)
+                        ? meta_value.substr(0, colon_pos) : meta_value;
+                    std::string property_name = (colon_pos != std::string::npos)
+                        ? meta_value.substr(colon_pos + 1) : "";
+                    std::string changed_fields = property_name.empty()
+                        ? "" : "[\"" + property_name + "\"]";
+
+                    // Resolve parent rowId: AuditLog changedFields has {"lhs": "parent-globalId", ...}
+                    // Link table triggers store rowId=0 (no id column), so we extract
+                    // the parent globalId from changedFields JSON and look up the parent row.
+                    int64_t parent_row_id = 0;
+                    std::string parent_global_id;
+                    auto& link_global_id = std::get<3>(change);
+                    if (!link_global_id.empty()) {
+                        auto cf_rows = read_db().query(
+                            "SELECT json_extract(changedFields, '$.lhs') AS lhs FROM AuditLog "
+                            "WHERE globalRowId = ? AND tableName = ?",
+                            {link_global_id, table}
+                        );
+                        if (!cf_rows.empty()) {
+                            auto lhs_it = cf_rows[0].find("lhs");
+                            if (lhs_it != cf_rows[0].end() && std::holds_alternative<std::string>(lhs_it->second)) {
+                                parent_global_id = std::get<std::string>(lhs_it->second);
+                                auto pid_rows = read_db().query(
+                                    "SELECT id FROM \"" + parent_table + "\" WHERE globalId = ?",
+                                    {parent_global_id}
+                                );
+                                if (!pid_rows.empty()) {
+                                    auto pid_it = pid_rows[0].find("id");
+                                    if (pid_it != pid_rows[0].end() && std::holds_alternative<int64_t>(pid_it->second)) {
+                                        parent_row_id = std::get<int64_t>(pid_it->second);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    LOG_DEBUG("xproc", "Internal table %s -> parent UPDATE %s (prop=%s, parentRowId=%lld)",
+                              table.c_str(), parent_table.c_str(), property_name.c_str(), (long long)parent_row_id);
+                    table = parent_table;
+                    std::get<1>(change) = "UPDATE";
+                    std::get<2>(change) = parent_row_id;
+                    std::get<3>(change) = parent_global_id;
+                    std::get<4>(change) = changed_fields;
+                }
+            }
+        }
+
         // Single batched dispatch — all observer callbacks run in one Task
         if (!changes.empty()) {
             notify_changes_batched(changes);
@@ -420,12 +497,16 @@ void lattice_db::setup_ipc_if_configured() {
 
     for (size_t idx : active_indices) {
         ipc_sync_state state;
-        state.endpoint = std::make_unique<ipc_endpoint>(config_.ipc_targets[idx].channel);
+        state.endpoint = std::make_unique<ipc_endpoint>(config_.ipc_targets[idx].channel,
+                                                        config_.ipc_targets[idx].socket_path);
 
         // Acquire per-channel flock — mirrors sync_lock_fd_ for WSS.
         // Set during construction so is_sync_agent() returns true before
         // the accept callback creates the synchronizer (avoids timing races).
-        std::string lock_path = resolve_ipc_socket_path(config_.ipc_targets[idx].channel) + ".lock";
+        const auto& target_cfg = config_.ipc_targets[idx];
+        std::string sock_path = target_cfg.socket_path.value_or(
+            resolve_ipc_socket_path(target_cfg.channel));
+        std::string lock_path = sock_path + ".lock";
         int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
         if (lock_fd >= 0) {
             if (::flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {

@@ -764,6 +764,20 @@ void synchronizer::on_transport_message(const transport_message& msg) {
 void synchronizer::on_websocket_error(const std::string& error) {
     LOG_ERROR("synchronizer", "[%s] WebSocket error: %s (this=%p, db=%s)",
               config_.sync_id.c_str(), error.c_str(), (void*)this, db_->config().path.c_str());
+
+    // Clear in-flight tracking so entries can be re-sent after reconnect.
+    // Without this, entries added to in_flight_ids_ before the error remain
+    // permanently stuck — query_pending_entries() filters them out, and the
+    // ACK that would remove them never arrives.
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        if (!in_flight_ids_.empty()) {
+            LOG_INFO("synchronizer", "[%s] Clearing %zu in-flight entries after error",
+                     config_.sync_id.c_str(), in_flight_ids_.size());
+            in_flight_ids_.clear();
+        }
+    }
+
     if (on_error_) {
         scheduler_->invoke([this, error] { on_error_(error); });
     }
@@ -776,6 +790,16 @@ void synchronizer::on_websocket_close(int code, const std::string& reason) {
     LOG_INFO("synchronizer", "[%s] WebSocket closed (code=%d, reason=%s, this=%p, db=%s)",
              config_.sync_id.c_str(), code, reason.c_str(), (void*)this, db_->config().path.c_str());
     is_connected_ = false;
+
+    // Clear in-flight tracking so entries can be re-sent after reconnect.
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        if (!in_flight_ids_.empty()) {
+            LOG_INFO("synchronizer", "[%s] Clearing %zu in-flight entries after close",
+                     config_.sync_id.c_str(), in_flight_ids_.size());
+            in_flight_ids_.clear();
+        }
+    }
 
     if (on_state_change_) {
         scheduler_->invoke([this] { on_state_change_(false); });
@@ -1976,6 +2000,11 @@ static std::vector<std::string> apply_remote_changes_impl(
     std::vector<std::string> applied_ids;
     if (entries.empty()) return applied_ids;
 
+    // Signal flush_changes to look up changedFieldsNames from AuditLog for
+    // object observers. Without this, IPC sync changes bypass Swift setters
+    // and the Observation registrar is never triggered.
+    db.applying_remote_changes_.store(true, std::memory_order_release);
+
     // Process in chunks to avoid holding the write lock for too long.
     const size_t chunk_size = 50;
 
@@ -2122,10 +2151,12 @@ static std::vector<std::string> apply_remote_changes_impl(
             db.db().commit();
         } catch (...) {
             db.db().rollback();
+            db.applying_remote_changes_.store(false, std::memory_order_release);
             throw;
         }
     }
 
+    db.applying_remote_changes_.store(false, std::memory_order_release);
     return applied_ids;
 }
 

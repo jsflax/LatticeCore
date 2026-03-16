@@ -60,6 +60,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/schema.cpp
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/network.cpp
+    Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
     Sources/LatticeCore/src/cross_process_notifier_darwin.cpp
     Sources/LatticeCore/src/cross_process_notifier_linux.cpp
@@ -110,6 +111,9 @@ target_include_directories(LatticeCAPI PUBLIC
     Sources/LatticeCAPI/include
 )
 target_link_libraries(LatticeCAPI PRIVATE LatticeSwiftCppBridge)
+# Disable Objective-C blocks in C API to use standard C function pointer callbacks
+# (blocks are Apple-only and not compatible with ctypes/JNI callers)
+# Note: -fno-blocks removed; using observer_ctx approach in lattice.cpp instead
 
 # Set output name and properties
 set_target_properties(LatticeCAPI PROPERTIES
@@ -137,3 +141,36 @@ install(TARGETS LatticeCAPI
 install(FILES Sources/LatticeCAPI/include/lattice.h
     DESTINATION include
 )
+
+# =============================================================================
+# GoogleTest (vendored)
+# =============================================================================
+enable_testing()
+
+add_library(gtest STATIC Sources/GoogleTest/src/gtest-all.cc)
+target_include_directories(gtest PUBLIC Sources/GoogleTest/include)
+target_include_directories(gtest PRIVATE Sources/GoogleTest)
+target_link_libraries(gtest PRIVATE pthread)
+
+add_library(gtest_main STATIC Sources/GoogleTest/src/gtest_main.cc)
+target_link_libraries(gtest_main PUBLIC gtest)
+
+# =============================================================================
+# LatticeTests - GoogleTest-based test suite
+# =============================================================================
+add_executable(LatticeCoreTests
+    Tests/LatticeCoreTests/Vec0Tests.cpp
+    Tests/LatticeCoreTests/MultiConnectionTests.cpp
+    Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/CascadeDeleteTests.cpp
+    Tests/LatticeCoreTests/SchemaTests.cpp
+    Tests/LatticeCoreTests/QueryTests.cpp
+    Tests/LatticeCoreTests/ObservationTests.cpp
+    Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
+    Tests/LatticeCoreTests/BridgeTests.cpp
+)
+target_link_libraries(LatticeCoreTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+target_include_directories(LatticeCoreTests PRIVATE Tests/LatticeCoreTests)
+
+include(GoogleTest)
+gtest_discover_tests(LatticeCoreTests)

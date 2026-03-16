@@ -68,10 +68,16 @@ public:
     void start_listening(std::function<void()> callback) override {
         if (listening_) return;
 
+        // Serial queue: only one notification processes at a time, preventing
+        // GCD from spawning dozens of worker threads that all block on
+        // sqlite3LockAndPrepare when notifications arrive faster than the
+        // SQLite queries in handle_cross_process_notification complete.
+        queue_ = dispatch_queue_create("com.lattice.xproc-notify", DISPATCH_QUEUE_SERIAL);
+
         uint32_t status = notify_register_dispatch(
             key_.c_str(),
             &token_,
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+            queue_,
             ^(int token) {
                 // Look up callback from static registry — no C++ captures in this block.
                 std::function<void()> cb;
@@ -91,9 +97,11 @@ public:
                 callback_registry()[token_] = std::move(callback);
             }
             listening_ = true;
-            LOG_DEBUG("xproc", "Darwin listener registered for: %s", key_.c_str());
+            LOG_DEBUG("xproc", "Darwin listener registered for: %s (serial queue)", key_.c_str());
         } else {
             LOG_ERROR("xproc", "Failed to register Darwin notification (status=%u)", status);
+            dispatch_release(queue_);
+            queue_ = nullptr;
         }
     }
 
@@ -106,6 +114,10 @@ public:
             callback_registry().erase(token_);
         }
         notify_cancel(token_);
+        if (queue_) {
+            dispatch_release(queue_);
+            queue_ = nullptr;
+        }
         listening_ = false;
         LOG_DEBUG("xproc", "Darwin listener cancelled for: %s", key_.c_str());
     }
@@ -118,6 +130,7 @@ private:
     std::string key_;
     int token_ = 0;
     bool listening_ = false;
+    dispatch_queue_t queue_ = nullptr;
 };
 
 std::unique_ptr<cross_process_notifier> make_cross_process_notifier(const std::string& db_path) {

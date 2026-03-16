@@ -595,7 +595,7 @@ public:
 
     /// Count AuditLog entries pending sync whose rows are in the sync set.
     int64_t pending_sync_entry_count() {
-        auto rows = read_db().query(
+        auto rows = xproc_read_db().query(
             "SELECT COUNT(*) FROM AuditLog a"
             " WHERE a.isSynchronized = 0"
             " AND EXISTS (SELECT 1 FROM _lattice_sync_set ss"
@@ -609,6 +609,23 @@ public:
 
     void update_sync_filter(const SyncFilterVector& filter);
     void clear_sync_filter();
+
+    /// Register a callback for cross-process idle hints (no new AuditLog entries).
+    /// Fires directly on the xproc background thread, NOT through the scheduler.
+    void set_on_xproc_idle(void* context,
+                           void (*callback)(void*),
+                           void (*destroy)(void*) = nullptr) {
+        if (!callback) {
+            lattice_db::set_on_xproc_idle(nullptr);
+            if (context && destroy) { destroy(context); }
+            return;
+        }
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        lattice_db::set_on_xproc_idle([shared_ctx, cb]() {
+            cb(shared_ctx.get());
+        });
+    }
 
     // Sync progress — callback (fires on synchronizer's std_thread_scheduler thread)
     void set_on_sync_progress(void* context,
@@ -1211,6 +1228,43 @@ public:
             return results;
         }
 
+        // Reconcile vec0 tables before querying — another connection (e.g.
+        // IPC sync) may have written to the model table but this connection's
+        // vec0 virtual table doesn't see it.
+        for (const auto& vc : vectors) {
+            std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
+            int dims = static_cast<int>(vc.query_vector.size() / sizeof(float));
+            if (dims > 0 && !db().table_exists(vec_table)) {
+                ensure_vec0_table(table_name, vc.column, dims);
+            }
+            if (db().table_exists(vec_table)) {
+                try {
+                    auto mc = db().query(
+                        "SELECT COUNT(*) as cnt FROM " + table_name +
+                        " WHERE " + vc.column + " IS NOT NULL AND length(" + vc.column + ") > 0");
+                    auto vc_rows = db().query("SELECT COUNT(*) as cnt FROM " + vec_table);
+                    int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
+                    int64_t v = vc_rows.empty() ? 0 : std::get<int64_t>(vc_rows[0].at("cnt"));
+                    if (m != v) {
+                        auto rows = db().query(
+                            "SELECT globalId, " + vc.column + " FROM " + table_name +
+                            " WHERE " + vc.column + " IS NOT NULL AND length(" + vc.column + ") > 0");
+                        for (const auto& row : rows) {
+                            auto git = row.find("globalId");
+                            if (git == row.end() || !std::holds_alternative<std::string>(git->second)) continue;
+                            auto& gid = std::get<std::string>(git->second);
+                            auto cit = row.find(vc.column);
+                            if (cit == row.end() || !std::holds_alternative<std::vector<uint8_t>>(cit->second)) continue;
+                            auto& vd = std::get<std::vector<uint8_t>>(cit->second);
+                            if (vd.empty()) continue;
+                            db().execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {gid});
+                            db().execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)", {gid, vd});
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+
         // Build the SQL query with CTEs for each constraint type
         std::ostringstream sql;
         std::vector<std::string> cte_names;
@@ -1297,6 +1351,11 @@ public:
         // ====================================================================
         std::vector<std::string> vec_cte_names;
         for (const auto& vc : vectors) {
+            // Empty query vector would crash sqlite-vec; return empty results
+            if (vc.query_vector.empty()) {
+                return CombinedQueryResultVector{};
+            }
+
             std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
 
             // Collect schemas that have this vec table (main + attached)

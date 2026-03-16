@@ -85,6 +85,27 @@ extern "C" void lattice_db_release(lattice_db_t* db) {
     }
 }
 
+extern "C" bool lattice_db_is_sync_connected(lattice_db_t* db) {
+    if (!db) return false;
+    auto* ref = reinterpret_cast<lattice_db_internal*>(db);
+    try {
+        return ref->get()->is_sync_connected();
+    } catch (...) {
+        return false;
+    }
+}
+
+// Explicitly close database connections and stop background services.
+// Safe to call before release. After calling close(), the db handle
+// should only be released (no further operations).
+extern "C" void lattice_db_close(lattice_db_t* db) {
+    if (!db) return;
+    auto* ref = reinterpret_cast<lattice_db_internal*>(db);
+    try {
+        ref->get()->close();
+    } catch (...) {}
+}
+
 // =============================================================================
 // Helper: Convert C schemas to C++ SchemaVector
 // =============================================================================
@@ -110,6 +131,12 @@ static lattice::SchemaVector convert_schemas(const lattice_schema_t* schemas, si
             desc.nullable = p.nullable;
             if (p.target_table) desc.target_table = p.target_table;
             if (p.link_table) desc.link_table = p.link_table;
+            desc.is_indexed = p.is_indexed;
+            desc.is_unique = p.is_unique;
+            desc.is_full_text = p.is_full_text;
+            desc.is_vector = p.is_vector;
+            desc.is_geo_bounds = p.is_geo_bounds;
+            if (p.column_name) desc.column_name = p.column_name;
 
             props[p.name] = desc;
         }
@@ -486,6 +513,7 @@ extern "C" int64_t lattice_object_get_id(lattice_object_t* obj) {
     if (!obj) return 0;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
+        if (!ref->has_value("id")) return 0;
         return ref->get_int("id");
     } catch (...) {
         return 0;
@@ -496,8 +524,9 @@ extern "C" const char* lattice_object_get_global_id(lattice_object_t* obj) {
     if (!obj) return nullptr;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
+        if (!ref->has_value("globalId")) return nullptr;
         g_returned_string = ref->get_string("globalId");
-        return g_returned_string.c_str();
+        return g_returned_string.empty() ? nullptr : g_returned_string.c_str();
     } catch (...) {
         return nullptr;
     }
@@ -775,17 +804,14 @@ extern "C" uint64_t lattice_db_observe_table(
     if (!db || !table_name || !callback) return 0;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-#ifdef __BLOCKS__
-        return db_ref->get()->add_table_observer(std::string(table_name), context,
-            ^(void* ctx, const std::string& op, int64_t row_id, const std::string& gid) {
-                callback(ctx, op.c_str(), row_id, gid.c_str());
+        // Use lattice_db::add_table_observer directly (bypass swift_lattice overloads)
+        auto cb = callback;
+        auto ctx = context;
+        return static_cast<lattice::lattice_db*>(db_ref->get())->add_table_observer(
+            std::string(table_name),
+            [cb, ctx](const std::string& op, int64_t row_id, const std::string& global_id) {
+                cb(ctx, op.c_str(), row_id, global_id.c_str());
             });
-#else
-        return db_ref->get()->add_table_observer(std::string(table_name), context,
-            [callback](void* ctx, const std::string& op, int64_t row_id, const std::string& gid) {
-                callback(ctx, op.c_str(), row_id, gid.c_str());
-            });
-#endif
     } catch (...) {
         return 0;
     }
@@ -801,9 +827,19 @@ extern "C" uint64_t lattice_db_observe_object(
     if (!db || !table_name || !callback) return 0;
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
-        // Cast to base class to avoid name hiding from swift_lattice's block-based overload
-        return static_cast<lattice::lattice_db*>(db_ref->get())->add_object_observer(std::string(table_name), row_id,
-            [context, callback](const std::string&) { callback(context); });
+        struct obj_observer_ctx {
+            void* user_context;
+            lattice_object_observer_fn user_callback;
+        };
+        auto* obs_ctx = new obj_observer_ctx{context, callback};
+        return db_ref->get()->add_object_observer(std::string(table_name), row_id, obs_ctx,
+            [](const char*, void* ctx) {
+                auto* oc = static_cast<obj_observer_ctx*>(ctx);
+                oc->user_callback(oc->user_context);
+            },
+            [](void* ctx) {
+                delete static_cast<obj_observer_ctx*>(ctx);
+            });
     } catch (...) {
         return 0;
     }
@@ -1514,4 +1550,431 @@ extern "C" void lattice_db_set_network_factory(lattice_db_t* db, lattice_network
     // Store on the database (need to add this method to swift_lattice if not present)
     // For now, use global factory
     lattice::set_network_factory(shared);
+}
+
+// =============================================================================
+// Query Extensions
+// =============================================================================
+
+// Thread-local storage for KNN result counts
+static thread_local size_t g_last_knn_count = 0;
+
+extern "C" lattice_knn_result_t* lattice_db_query_nearest(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* column_name,
+    const uint8_t* query_vector,
+    size_t vector_size,
+    int k,
+    lattice_distance_metric_t metric,
+    const char* where_clause
+) {
+    if (!db || !table_name || !column_name || !query_vector || vector_size == 0 || k <= 0) {
+        set_error("Invalid arguments to lattice_db_query_nearest");
+        g_last_knn_count = 0;
+        return nullptr;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* impl = db_ref->get();
+
+        std::vector<uint8_t> vec(query_vector, query_vector + vector_size);
+        auto cpp_metric = static_cast<lattice::lattice_db::distance_metric>(metric);
+        std::optional<std::string> where_opt;
+        if (where_clause) where_opt = where_clause;
+
+        auto results = impl->knn_query(table_name, column_name, vec, k, cpp_metric, where_opt);
+
+        if (results.empty()) {
+            g_last_knn_count = 0;
+            return nullptr;
+        }
+
+        auto* c_results = static_cast<lattice_knn_result_t*>(
+            malloc(sizeof(lattice_knn_result_t) * results.size()));
+        for (size_t i = 0; i < results.size(); i++) {
+            c_results[i].global_id = strdup(results[i].global_id.c_str());
+            c_results[i].distance = results[i].distance;
+        }
+        g_last_knn_count = results.size();
+        return c_results;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        g_last_knn_count = 0;
+        return nullptr;
+    }
+}
+
+extern "C" size_t lattice_knn_results_count(lattice_knn_result_t* results) {
+    (void)results;
+    return g_last_knn_count;
+}
+
+extern "C" void lattice_knn_results_free(lattice_knn_result_t* results, size_t count) {
+    if (!results) return;
+    for (size_t i = 0; i < count; i++) {
+        free(const_cast<char*>(results[i].global_id));
+    }
+    free(results);
+}
+
+extern "C" lattice_results_t* lattice_db_query_fts(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* column_name,
+    const char* match_expression,
+    const char* order_by,
+    int64_t limit
+) {
+    if (!db || !table_name || !column_name || !match_expression) {
+        set_error("Invalid arguments to lattice_db_query_fts");
+        return nullptr;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* impl = db_ref->get();
+
+        // Build FTS5 WHERE clause using subquery
+        std::string fts_table = "_" + std::string(table_name) + "_" + column_name + "_fts";
+        std::string fts_where = "id IN (SELECT rowid FROM " + fts_table +
+                                " WHERE " + fts_table + " MATCH '" +
+                                std::string(match_expression) + "')";
+
+        std::optional<std::string> order_opt;
+        if (order_by && std::string(order_by).length() > 0) {
+            order_opt = order_by;
+        }
+        std::optional<int64_t> limit_opt;
+        if (limit > 0) limit_opt = limit;
+
+        auto managed_results = impl->objects(table_name, fts_where, order_opt, limit_opt);
+
+        auto* results = new lattice_results_internal();
+        results->objects = std::move(managed_results);
+        return reinterpret_cast<lattice_results_t*>(results);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" lattice_results_t* lattice_db_query_within_bounds(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* column_name,
+    double min_lat,
+    double max_lat,
+    double min_lon,
+    double max_lon,
+    const char* where_clause,
+    int64_t limit
+) {
+    if (!db || !table_name || !column_name) {
+        set_error("Invalid arguments to lattice_db_query_within_bounds");
+        return nullptr;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* impl = db_ref->get();
+
+        // Build WHERE clause using R*Tree subquery
+        std::string rtree_table = "_" + std::string(table_name) + "_" + column_name + "_rtree";
+        std::string bounds_where = "id IN (SELECT id FROM " + rtree_table +
+                          " WHERE minLat >= " + std::to_string(min_lat) +
+                          " AND maxLat <= " + std::to_string(max_lat) +
+                          " AND minLon >= " + std::to_string(min_lon) +
+                          " AND maxLon <= " + std::to_string(max_lon) + ")";
+        if (where_clause) {
+            bounds_where += " AND " + std::string(where_clause);
+        }
+
+        std::optional<int64_t> limit_opt;
+        if (limit > 0) limit_opt = limit;
+
+        auto managed_results = impl->objects(table_name, bounds_where, std::nullopt, limit_opt);
+
+        auto* results = new lattice_results_internal();
+        results->objects = std::move(managed_results);
+        return reinterpret_cast<lattice_results_t*>(results);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" lattice_results_t* lattice_db_query_distinct(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* distinct_by,
+    const char* where_clause,
+    const char* order_by,
+    int64_t limit,
+    int64_t offset
+) {
+    if (!db || !table_name) {
+        set_error("Invalid arguments to lattice_db_query_distinct");
+        return nullptr;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* impl = db_ref->get();
+
+        std::optional<std::string> where_opt, order_opt, distinct_opt;
+        std::optional<int64_t> limit_opt, offset_opt;
+
+        if (where_clause) where_opt = where_clause;
+        if (order_by) order_opt = order_by;
+        if (distinct_by) distinct_opt = distinct_by;
+        if (limit > 0) limit_opt = limit;
+        if (offset > 0) offset_opt = offset;
+
+        auto managed_results = impl->objects(table_name, where_opt, order_opt, limit_opt, offset_opt,
+                                              std::nullopt, distinct_opt);
+
+        auto* results = new lattice_results_internal();
+        results->objects = std::move(managed_results);
+        return reinterpret_cast<lattice_results_t*>(results);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+extern "C" size_t lattice_db_count_distinct(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* where_clause,
+    const char* group_by,
+    const char* distinct_by
+) {
+    if (!db || !table_name) {
+        set_error("Invalid arguments");
+        return 0;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* impl = db_ref->get();
+
+        std::optional<std::string> where_opt, group_opt, distinct_opt;
+        if (where_clause) where_opt = where_clause;
+        if (group_by) group_opt = group_by;
+        if (distinct_by) distinct_opt = distinct_by;
+
+        return impl->count(table_name, where_opt, group_opt, distinct_opt);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return 0;
+    }
+}
+
+// =============================================================================
+// Database Attachment
+// =============================================================================
+
+extern "C" lattice_status_t lattice_db_attach(lattice_db_t* db, lattice_db_t* other) {
+    if (!db || !other) {
+        set_error("Invalid arguments to lattice_db_attach");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* other_ref = reinterpret_cast<lattice_db_internal*>(other);
+        db_ref->get()->attach(*other_ref->get());
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+// =============================================================================
+// Migration Support
+// =============================================================================
+
+extern "C" lattice_db_t* lattice_db_create_with_migration(
+    const char* path,
+    const lattice_schema_t* schemas,
+    size_t schema_count,
+    lattice_scheduler_t* scheduler,
+    int32_t target_schema_version,
+    void* migration_context,
+    lattice_migration_row_fn migration_fn,
+    const char* migration_table
+) {
+    try {
+        std::string db_path = path ? std::string(path) : ":memory:";
+        auto schema_vec = convert_schemas(schemas, schema_count);
+
+        lattice::configuration config(db_path);
+        config.target_schema_version = target_schema_version;
+
+        if (scheduler) {
+            auto* sched = reinterpret_cast<lattice_scheduler_internal*>(scheduler);
+            config.sched = std::shared_ptr<lattice::scheduler>(sched, [](lattice::scheduler*) {});
+        }
+
+        if (migration_fn && migration_table) {
+            std::string table_name = migration_table;
+            config.migration_block = [migration_context, migration_fn, table_name](
+                lattice::migration_context& ctx) {
+                ctx.enumerate_objects(table_name, [&](const lattice::migration_row& old_row,
+                                                       lattice::migration_row& new_row) {
+                    // Serialize old row to JSON
+                    nlohmann::json old_json;
+                    for (const auto& [k, v] : old_row) {
+                        if (std::holds_alternative<std::nullptr_t>(v)) {
+                            old_json[k] = nullptr;
+                        } else if (std::holds_alternative<int64_t>(v)) {
+                            old_json[k] = std::get<int64_t>(v);
+                        } else if (std::holds_alternative<double>(v)) {
+                            old_json[k] = std::get<double>(v);
+                        } else if (std::holds_alternative<std::string>(v)) {
+                            old_json[k] = std::get<std::string>(v);
+                        }
+                    }
+
+                    char* new_json_str = nullptr;
+                    migration_fn(migration_context, old_json.dump().c_str(), &new_json_str);
+
+                    if (new_json_str) {
+                        try {
+                            auto new_json = nlohmann::json::parse(new_json_str);
+                            for (auto& [key, val] : new_json.items()) {
+                                if (val.is_null()) {
+                                    new_row[key] = nullptr;
+                                } else if (val.is_number_integer()) {
+                                    new_row[key] = val.get<int64_t>();
+                                } else if (val.is_number_float()) {
+                                    new_row[key] = val.get<double>();
+                                } else if (val.is_string()) {
+                                    new_row[key] = val.get<std::string>();
+                                }
+                            }
+                        } catch (...) {}
+                        free(new_json_str);
+                    }
+                });
+            };
+        }
+
+        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
+        ref->retain();
+        return reinterpret_cast<lattice_db_t*>(ref);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+// =============================================================================
+// Add with preserved global ID
+// =============================================================================
+
+extern "C" lattice_object_t* lattice_db_add_with_global_id(
+    lattice_db_t* db,
+    lattice_object_t* obj,
+    const char* global_id
+) {
+    if (!db || !obj || !global_id) {
+        set_error("Invalid arguments to lattice_db_add_with_global_id");
+        return nullptr;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
+
+        db_ref->get()->add_preserving_global_id(obj_ref, std::string(global_id));
+
+        obj_ref->retain();
+        return obj;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+// =============================================================================
+// IPC Sync Configuration
+// =============================================================================
+
+extern "C" lattice_db_t* lattice_db_create_with_ipc(
+    const char* path,
+    const lattice_schema_t* schemas,
+    size_t schema_count,
+    lattice_scheduler_t* scheduler,
+    const char** ipc_channels,
+    size_t ipc_channel_count
+) {
+    try {
+        std::string db_path = path ? std::string(path) : ":memory:";
+        auto schema_vec = convert_schemas(schemas, schema_count);
+
+        lattice::configuration config(db_path);
+
+        if (scheduler) {
+            auto* sched = reinterpret_cast<lattice_scheduler_internal*>(scheduler);
+            config.sched = std::shared_ptr<lattice::scheduler>(sched, [](lattice::scheduler*) {});
+        }
+
+        for (size_t i = 0; i < ipc_channel_count; i++) {
+            if (ipc_channels[i]) {
+                lattice::configuration::ipc_target target;
+                target.channel = ipc_channels[i];
+                config.ipc_targets.push_back(std::move(target));
+            }
+        }
+
+        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
+        ref->retain();
+        return reinterpret_cast<lattice_db_t*>(ref);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+// =============================================================================
+// Sync Filter
+// =============================================================================
+
+extern "C" lattice_status_t lattice_db_set_sync_filter(lattice_db_t* db, const char* filter_json) {
+    if (!db || !filter_json) {
+        set_error("Invalid arguments");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* impl = db_ref->get();
+
+        auto json = nlohmann::json::parse(filter_json);
+        std::vector<lattice::sync_filter_entry> filters;
+        for (const auto& entry : json) {
+            lattice::sync_filter_entry f;
+            f.table_name = entry.value("table", "");
+            std::string where = entry.value("where_clause", "");
+            if (!where.empty()) f.where_clause = where;
+            filters.push_back(std::move(f));
+        }
+
+        impl->update_sync_filter(filters);
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" lattice_status_t lattice_db_clear_sync_filter(lattice_db_t* db) {
+    if (!db) {
+        set_error("Invalid arguments");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        db_ref->get()->clear_sync_filter();
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
 }

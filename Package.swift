@@ -98,13 +98,25 @@ let package = Package(
                 .linkedLibrary("sqlite3")
             ]
         ),
+        .target(
+            name: "GoogleTest",
+            path: "Sources/GoogleTest",
+            sources: ["src/gtest-all.cc", "src/gtest_main.cc"],
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("."),
+                .unsafeFlags(["-std=c++20"]),
+            ]
+        ),
         .executableTarget(
             name: "LatticeCoreTests",
-            dependencies: ["LatticeCore"],
+            dependencies: ["LatticeCore", "LatticeSwiftCppBridge", "GoogleTest"],
             path: "Tests/LatticeCoreTests",
-            exclude: ["vendor"],
+            exclude: ["vendor", "LatticeCoreTests_legacy.cpp.bak", "IPCTests.hpp", "SyncIntegrationTests.hpp"],
             cxxSettings: [
                 .headerSearchPath("vendor"),
+                .headerSearchPath("../../Sources/LatticeSwiftCppBridge/include"),
+                .headerSearchPath("../../Sources/GoogleTest/include"),
                 .define("ASIO_STANDALONE"),
                 .define("_WEBSOCKETPP_CPP11_THREAD_"),
                 .unsafeFlags(["-std=c++20"]),

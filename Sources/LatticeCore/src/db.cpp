@@ -23,9 +23,11 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
     } else if (mode == open_mode::read_only) {
         // Regular read-only for WAL concurrent readers (no immutable flag)
         flags |= SQLITE_OPEN_READONLY;
+        if (path.compare(0, 5, "file:") == 0) flags |= SQLITE_OPEN_URI;
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     } else {
         flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+        if (path.compare(0, 5, "file:") == 0) flags |= SQLITE_OPEN_URI;
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
     if (rc != SQLITE_OK) {
@@ -134,13 +136,24 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
             bind_value(stmt, index++, param);
         }
 
-        rc = sqlite3_step(stmt);
+        // Step until SQLITE_DONE. Virtual tables (e.g. vec0) may return
+        // SQLITE_ROW for DML statements (DELETE returns the deleted row).
+        // Drain all rows before expecting SQLITE_DONE.
+        do {
+            rc = sqlite3_step(stmt);
+        } while (rc == SQLITE_ROW);
+
+        // Capture error message BEFORE finalize, which resets connection error state
+        std::string errmsg_str;
+        if (rc != SQLITE_DONE) {
+            errmsg_str = sqlite3_errmsg(db_) ? sqlite3_errmsg(db_) : "Unknown error";
+        }
+
         sqlite3_finalize(stmt);
 
         if (rc != SQLITE_DONE) {
-            auto errmsg = sqlite3_errmsg(db_);
-            LOG_ERROR("db", "Execution failed: %s (SQL: %s)", errmsg, sql.c_str());
-            throw db_error("Execution failed: " + std::string(errmsg));
+            LOG_ERROR("db", "Execution failed: %s (SQL: %s)", errmsg_str.c_str(), sql.c_str());
+            throw db_error("Execution failed: " + errmsg_str);
         }
     }
 }
@@ -456,6 +469,12 @@ std::vector<database::row_t> database::query(const std::string& sql,
     return results;
 }
 
+void database::refresh_wal_snapshot() {
+    // A no-op SELECT forces SQLite to release the old WAL read snapshot
+    // and acquire a fresh one on the next query.
+    sqlite3_exec(db_, "SELECT 1", nullptr, nullptr, nullptr);
+}
+
 void database::begin_transaction(bool exclusive) {
     // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).
     // EXCLUSIVE: acquires write lock AND blocks all readers.
@@ -496,6 +515,15 @@ void database::begin_transaction(bool exclusive) {
         LOG_ERROR("db", "Failed to begin transaction: %s", error.c_str());
         throw db_error("Failed to begin transaction: " + error);
     }
+}
+
+bool database::try_begin_immediate(int /*timeout_ms*/) {
+    // Non-blocking: temporarily set busy timeout to 0, try BEGIN IMMEDIATE once,
+    // then restore the original timeout. This never sleeps.
+    sqlite3_busy_timeout(db_, 0);
+    int rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+    sqlite3_busy_timeout(db_, 5000);  // Restore default
+    return rc == SQLITE_OK;
 }
 
 void database::commit() {

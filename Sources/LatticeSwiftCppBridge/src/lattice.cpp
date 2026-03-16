@@ -652,8 +652,38 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // with the correct (migrated) data rather than default values.
     ensure_geo_bounds_rtrees(all_schemas);
 
+    // Phase 6b: Ensure vec0 tables exist for vector columns
+    // vec0 is normally created lazily on first add(), but sync-only DBs
+    // receive data without calling add(), so vec0 must be created here.
+    for (const auto& schema : all_schemas) {
+        for (const auto& prop : schema.properties) {
+            if (!prop.is_vector || prop.type != column_type::blob) continue;
+            std::string vec_table = "_" + schema.table_name + "_" + prop.name + "_vec";
+            bool existed = db().table_exists(vec_table);
+            if (!existed) {
+                // Infer dimensions from existing data
+                auto rows = db().query(
+                    "SELECT length(" + prop.name + ") AS len FROM " + schema.table_name +
+                    " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0 LIMIT 1");
+                if (rows.empty()) continue;
+                int bytes = static_cast<int>(std::get<int64_t>(rows[0].at("len")));
+                int dimensions = bytes / static_cast<int>(sizeof(float));
+                if (dimensions <= 0) continue;
+                ensure_vec0_table(schema.table_name, prop.name, dimensions);
+                // Backfill vec0 from existing data
+                db().execute(
+                    "INSERT OR REPLACE INTO " + vec_table + "(global_id, embedding) "
+                    "SELECT globalId, " + prop.name + " FROM " + schema.table_name +
+                    " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
+            } else {
+                // Table exists — ensure triggers are up to date (pass 0 dimensions, ignored)
+                ensure_vec0_table(schema.table_name, prop.name, 0);
+            }
+        }
+    }
+
     LOG_INFO("swift_lattice", "ensure_swift_tables: doing fts5 (%zu schemas)", all_schemas.size());
-    // Phase 6b: Ensure FTS5 tables exist for full-text indexed columns
+    // Phase 6c: Ensure FTS5 tables exist for full-text indexed columns
     ensure_fts5_tables(all_schemas);
     LOG_INFO("swift_lattice", "ensure_swift_tables: fts5 done");
 

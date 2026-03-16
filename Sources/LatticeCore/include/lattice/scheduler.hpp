@@ -146,7 +146,10 @@ using SharedScheduler = std::shared_ptr<scheduler>;
 // This is a simple default implementation that works everywhere.
 // For production use, you'd want platform-specific schedulers that
 // integrate with the UI thread / main run loop.
+//
+// Not available on Emscripten/WASM — use immediate_scheduler instead.
 
+#ifndef __EMSCRIPTEN__
 class std_thread_scheduler : public scheduler {
 public:
     static std::atomic<int64_t>& alive_count() {
@@ -236,6 +239,7 @@ private:
     std::queue<std::function<void()>> queue_;
     std::atomic<bool> running_;
 };
+#endif // !__EMSCRIPTEN__
 
 // ============================================================================
 // Immediate scheduler - runs callbacks synchronously on calling thread

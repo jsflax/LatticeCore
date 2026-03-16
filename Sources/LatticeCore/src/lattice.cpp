@@ -21,6 +21,34 @@ instance_registry& instance_registry::instance() {
     static instance_registry* reg = new instance_registry();
     return *reg;
 }
+
+cross_process_notifier* instance_registry::get_or_create_notifier(const std::string& path) {
+    if (path.empty() || path == ":memory:") return nullptr;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = shared_notifiers_.find(path);
+    if (it != shared_notifiers_.end()) {
+        return it->second.get();
+    }
+
+    auto notifier = make_cross_process_notifier(path);
+    if (!notifier) return nullptr;
+
+    notifier->start_listening([path] {
+        int notified = 0;
+        instance_registry::instance().for_each_alive(path,
+            [&notified](lattice_db* inst) {
+                inst->handle_cross_process_notification();
+                ++notified;
+            });
+        LOG_DEBUG("xproc", "Notified %d alive instances for path", notified);
+    });
+
+    auto* raw = notifier.get();
+    shared_notifiers_[path] = std::move(notifier);
+    return raw;
+}
+
 void lattice_db::setup_change_hook() {
     LOG_DEBUG("setup_change_hook", "Setting up hooks for path: %s", config_.path.c_str());
 
@@ -48,9 +76,17 @@ void lattice_db::setup_change_hook() {
 
             // For AuditLog changes:
             // - In-memory DBs: notify directly (WAL hook won't fire)
+            // - Emscripten: notify directly (uses DELETE journal mode, no WAL)
             // - File DBs: skip (let flush_changes handle it via WAL hook to avoid double notification)
             if (table == "AuditLog") {
-                if (self->config_.path == ":memory:" || self->config_.path.empty()) {
+#ifdef __EMSCRIPTEN__
+                // Emscripten uses DELETE journal mode — WAL hook never fires,
+                // so always use the direct notification path.
+                constexpr bool use_direct_notify = true;
+#else
+                const bool use_direct_notify = self->config_.is_in_memory();
+#endif
+                if (use_direct_notify) {
                     // In-memory DBs: notify directly from update_hook.
                     // flush_changes() can't handle this because it runs during the
                     // model table's update_hook, BEFORE the AuditLog trigger fires.
@@ -66,10 +102,17 @@ void lattice_db::setup_change_hook() {
                                 global_id = std::get<std::string>(it->second);
                             }
                         }
-                        // In-memory databases each have their own isolated storage
-                        // despite sharing the ":memory:" path string, so only
-                        // notify this instance (matching flush_changes() behavior).
-                        self->notify_change("AuditLog", "INSERT", static_cast<int64_t>(rowid), global_id);
+                        // For shared cache in-memory DBs, notify all instances
+                        // sharing the path (the sync db and main db share state).
+                        // For plain :memory:, just notify this instance.
+                        if (self->config_.path.find("cache=shared") != std::string::npos) {
+                            instance_registry::instance().for_each_alive(self->config_.path,
+                                [rowid, &global_id](lattice_db* inst) {
+                                    inst->notify_change("AuditLog", "INSERT", static_cast<int64_t>(rowid), global_id);
+                                });
+                        } else {
+                            self->notify_change("AuditLog", "INSERT", static_cast<int64_t>(rowid), global_id);
+                        }
                     }
                 } else {
                     LOG_DEBUG("update_hook", "AuditLog change (file DB), skipping - WAL hook will handle");
@@ -119,13 +162,20 @@ void lattice_db::setup_change_hook() {
                    table.c_str(), op.c_str(), (long long)rowid, global_id.c_str());
             self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id);
 
-            // For in-memory databases, flush immediately since WAL hook won't fire
-            if (self->config_.path == ":memory:" || self->config_.path.empty()) {
+            // For in-memory databases, flush immediately since WAL hook won't fire.
+            // Emscripten also needs immediate flush: it uses DELETE journal mode,
+            // not WAL, so the WAL hook never fires.
+#ifdef __EMSCRIPTEN__
+            LOG_DEBUG("update_hook", "Emscripten: immediate flush_changes()");
+            self->flush_changes();
+#else
+            if (self->config_.is_in_memory()) {
                 LOG_DEBUG("update_hook", "In-memory DB, calling flush_changes()");
                 self->flush_changes();
             } else {
                 LOG_DEBUG("update_hook", "File DB (path=%s), waiting for WAL hook", self->config_.path.c_str());
             }
+#endif
         },
         this
     );
@@ -141,10 +191,14 @@ void lattice_db::setup_change_hook() {
     );
 }
 void lattice_db::setup_cross_process_notifier() {
-    xproc_notifier_ = make_cross_process_notifier(config_.path);
-    if (!xproc_notifier_) return;
+    // Use the shared per-path notifier from instance_registry.
+    // Only ONE Darwin listener per path per process — prevents N^2
+    // notification amplification when multiple lattice_db instances
+    // share the same DB file (e.g. via LatticeThreadSafeReference.resolve()).
+    shared_xproc_notifier_ = instance_registry::instance().get_or_create_notifier(config_.path);
+    if (!shared_xproc_notifier_) return;
 
-    // Initialize cursor to current max AuditLog id
+    // Initialize this instance's cursor to current max AuditLog id
     auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
     if (!max_rows.empty()) {
         auto it = max_rows[0].find("max_id");
@@ -155,24 +209,6 @@ void lattice_db::setup_cross_process_notifier() {
 
     LOG_DEBUG("xproc", "Initialized cursor at audit id=%lld for path: %s",
               (long long)last_seen_audit_id_, config_.path.c_str());
-
-    xproc_notifier_->start_listening([path = config_.path,
-                                      mtx = xproc_callback_mutex_] {
-        std::lock_guard<std::mutex> lock(*mtx);
-        // Notify ALL alive instances — each has its own cursor and observers.
-        // The IPC synchronizer registers its AuditLog observer on a private
-        // lattice_db (ipc_db), so skipping instances would prevent the
-        // synchronizer from learning about cross-process writes.
-        // Each instance's handle_cross_process_notification() uses its own
-        // cursor to avoid duplicate observer firings.
-        int notified = 0;
-        instance_registry::instance().for_each_alive(path,
-            [&notified](lattice_db* inst) {
-                inst->handle_cross_process_notification();
-                ++notified;
-            });
-        LOG_DEBUG("xproc", "Notified %d alive instances for path", notified);
-    });
 }
 
 void lattice_db::handle_cross_process_notification() {
@@ -189,20 +225,32 @@ void lattice_db::handle_cross_process_notification() {
     // prevent an uncaught exception from aborting the process.
     try {
         // Query AuditLog for entries newer than our cursor.
-        auto rows = read_db().query(
+        // Uses the dedicated xproc read connection to avoid SQLite lock contention
+        // with observer callbacks running on the scheduler (MainActor), which use
+        // read_db() for existence checks.
+        auto rows = xproc_read_db().query(
             "SELECT id, tableName, operation, rowId, globalRowId, changedFieldsNames FROM AuditLog WHERE id > ? ORDER BY id ASC",
             {cursor}
         );
 
         if (rows.empty()) {
-            LOG_DEBUG("xproc", "No new AuditLog entries — firing AuditLog observers for sync state changes");
-            // Even without new AuditLog rows, the notification may indicate
-            // sync state changes (e.g., isSynchronized updates by the daemon).
-            // Fire AuditLog table observers so passive sync progress observers
-            // can re-query pending_sync_entry_count().
-            std::vector<std::tuple<std::string, std::string, int64_t, std::string, std::string>> changes;
-            changes.emplace_back("AuditLog", "UPDATE", 0, "", "");
-            notify_changes_batched(changes);
+            // No new AuditLog entries, but the notification may indicate sync
+            // state changes (e.g., daemon marked entries as isSynchronized=1).
+            // Fire the dedicated idle hint callback directly on this thread —
+            // NOT through notify_changes_batched / scheduler, which would
+            // dispatch synthetic observer callbacks to MainActor and cause
+            // thread pile-ups under rapid notification load.
+            std::function<void()> hint;
+            {
+                std::lock_guard<std::mutex> lock(xproc_idle_mutex_);
+                hint = on_xproc_idle_;
+            }
+            if (hint) {
+                LOG_DEBUG("xproc", "No new AuditLog entries — firing xproc idle hint");
+                hint();
+            } else {
+                LOG_DEBUG("xproc", "No new AuditLog entries — no idle hint registered");
+            }
             return;
         }
 
@@ -358,6 +406,53 @@ void lattice_db::handle_cross_process_notification() {
             }
         }
 
+        // Reconcile vec0 virtual tables for synced vector columns.
+        // vec0 maintains per-connection internal state — shadow table writes
+        // from the sync db connection are not visible to this connection's
+        // vec0 virtual table. Re-insert on this connection so nearest()
+        // queries return synced data.
+        for (const auto& [table, op, row_id, global_id, cfn] : changes) {
+            if (table == "AuditLog" || table.empty() || table[0] == '_') continue;
+            if (op != "INSERT" && op != "UPDATE") continue;
+            if (global_id.empty()) continue;
+
+            auto vec_tables = db().query(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE ?",
+                {"_" + table + "_%_vec"});
+
+            for (const auto& vt_row : vec_tables) {
+                auto name_it = vt_row.find("name");
+                if (name_it == vt_row.end() || !std::holds_alternative<std::string>(name_it->second)) continue;
+                auto& vec_table = std::get<std::string>(name_it->second);
+
+                // Extract column name from vec table name: _Table_Column_vec
+                auto prefix_len = table.size() + 2; // "_" + table + "_"
+                auto suffix_len = 4; // "_vec"
+                if (vec_table.size() <= prefix_len + suffix_len) continue;
+                auto col = vec_table.substr(prefix_len, vec_table.size() - prefix_len - suffix_len);
+
+                auto data_rows = db().query(
+                    "SELECT " + col + " FROM " + table + " WHERE globalId = ?",
+                    {global_id});
+                if (data_rows.empty()) continue;
+
+                auto col_it = data_rows[0].find(col);
+                if (col_it == data_rows[0].end() ||
+                    !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                if (vec_data.empty()) continue;
+
+                try {
+                    db().execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {global_id});
+                    db().execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                {global_id, vec_data});
+                } catch (const std::exception& e) {
+                    LOG_WARN("xproc", "vec0 reconcile failed for %s: %s", vec_table.c_str(), e.what());
+                }
+            }
+        }
+
         // Single batched dispatch — all observer callbacks run in one Task
         if (!changes.empty()) {
             notify_changes_batched(changes);
@@ -372,12 +467,15 @@ void lattice_db::handle_cross_process_notification() {
 // Synchronizer registry — at most one synchronizer per {path, key}
 // Used for both WSS (key = websocket_url) and IPC (key = channel name).
 static std::mutex& sync_registry_mutex() {
-    static std::mutex m;
-    return m;
+    // Intentionally leaked: prevents use-after-destroy when destructors
+    // run during process teardown (static destruction order is undefined).
+    static auto* m = new std::mutex();
+    return *m;
 }
 static std::set<std::pair<std::string, std::string>>& active_sync_keys() {
-    static std::set<std::pair<std::string, std::string>> s;
-    return s;
+    // Intentionally leaked: same reason as sync_registry_mutex.
+    static auto* s = new std::set<std::pair<std::string, std::string>>();
+    return *s;
 }
 
 bool lattice_db::try_register_sync_key(const std::string& path, const std::string& key) {
@@ -408,8 +506,10 @@ void lattice_db::setup_sync_if_configured() {
         return;
     }
 
+#ifndef __EMSCRIPTEN__
     // Cross-process flock: only one process may own the WSS synchronizer
     // for a given database. If another process holds the lock, skip silently.
+    // Skipped on WASM — single-threaded, single-process environment.
     if (sync_lock_fd_ < 0) {
         std::string lock_path = config_.path + ".sync.lock";
         int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
@@ -424,6 +524,7 @@ void lattice_db::setup_sync_if_configured() {
             LOG_DEBUG("lattice_db", "Failed to open sync lock file %s, proceeding anyway", lock_path.c_str());
         }
     }
+#endif
 
     // Only one synchronizer per {path, websocket_url} across all instances
     if (!try_register_sync_key(config_.path, config_.websocket_url)) {
@@ -442,17 +543,45 @@ void lattice_db::setup_sync_if_configured() {
     sync_cfg.sync_id = "wss:" + config_.websocket_url;
     sync_cfg.all_active_sync_ids = all_ids;
 
-    // Create dedicated lattice_db for the synchronizer (owns its own connection,
-    // runs on std_thread_scheduler so sync work happens off the Swift actor thread).
-    // xproc notifications bridge writes between parent and sync connections.
-    configuration sync_db_config(config_.path,
+#ifdef __EMSCRIPTEN__
+    // Emscripten: single-threaded, so the synchronizer borrows our connection
+    // directly. This avoids opening a second connection to the same OPFS file,
+    // which would fail due to exclusive locking.
+    LOG_INFO("lattice_db", "sync using shared db (Emscripten), path=%s", config_.path.c_str());
+#else
+    // Native: create a dedicated lattice_db for the synchronizer (separate
+    // connection on its own thread via std_thread_scheduler).
+    std::string sync_path = resolve_path(config_);
+    configuration sync_db_config(sync_path,
                                  std::make_shared<std_thread_scheduler>());
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
     auto sync_db = std::make_unique<lattice_db>(sync_db_config);
 
+    // Debug: verify sync db can see model tables
+    LOG_INFO("lattice_db", "sync_db created for path=%s", sync_db_config.path.c_str());
+    try {
+        auto tables = sync_db->db().query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+        std::string table_list;
+        for (const auto& row : tables) {
+            auto it = row.find("name");
+            if (it != row.end() && std::holds_alternative<std::string>(it->second)) {
+                if (!table_list.empty()) table_list += ", ";
+                table_list += std::get<std::string>(it->second);
+            }
+        }
+        LOG_INFO("lattice_db", "sync_db tables: [%s]", table_list.c_str());
+    } catch (const std::exception& e) {
+        LOG_ERROR("lattice_db", "sync_db table list query failed: %s", e.what());
+    }
+#endif
+
     // Create synchronizer
+#ifdef __EMSCRIPTEN__
+    synchronizer_ = std::make_unique<synchronizer>(*this, sync_cfg);
+#else
     synchronizer_ = std::make_unique<synchronizer>(std::move(sync_db), sync_cfg);
+#endif
 
     // Wire up callbacks if set
     if (on_sync_state_change_) {
@@ -467,6 +596,7 @@ void lattice_db::setup_sync_if_configured() {
 }
 
 void lattice_db::setup_ipc_if_configured() {
+#ifndef __EMSCRIPTEN__
     if (!config_.is_ipc_enabled()) {
         return;
     }
@@ -579,6 +709,7 @@ void lattice_db::setup_ipc_if_configured() {
                          sync_id.c_str(), (void*)sync_slot.get());
             });
     }
+#endif // !__EMSCRIPTEN__
 }
 
 static std::vector<std::string> get_column_names(database* db, const std::string& schema, const std::string& table_name) {

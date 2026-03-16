@@ -1,0 +1,5 @@
+module GoogleTest {
+    textual header "gtest/gtest.h"
+    requires cplusplus
+    export *
+}

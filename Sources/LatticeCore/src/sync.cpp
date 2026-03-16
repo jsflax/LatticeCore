@@ -249,9 +249,19 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
         return it != schema.end() && it->second == column_type::blob;
     };
 
-    // Helper to get placeholder - use unhex(?) for BLOB columns
-    auto placeholder = [&is_blob](const std::string& col) -> std::string {
-        return is_blob(col) ? "unhex(?)" : "?";
+    // Helper to get placeholder - use unhex(?) only when the value is a hex
+    // string. When the value is already raw bytes (data_kind with vector<uint8_t>,
+    // e.g. after JSON deserialization), bind directly with ? to avoid
+    // unhex(raw_bytes) producing garbage.
+    auto placeholder = [&is_blob, this](const std::string& col) -> std::string {
+        if (!is_blob(col)) return "?";
+        auto it = changed_fields.find(col);
+        if (it != changed_fields.end() &&
+            it->second.kind == any_property_kind::data_kind &&
+            std::holds_alternative<std::vector<uint8_t>>(it->second.value)) {
+            return "?";  // Raw bytes — bind directly
+        }
+        return "unhex(?)";  // Hex string — needs decoding
     };
 
     if (operation == "INSERT") {
@@ -489,60 +499,53 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
 // synchronizer implementation
 // ============================================================================
 
-synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config)
-    : db_(std::move(db))
-    , config_(config)
-    , scheduler_(db_->get_scheduler() ? db_->get_scheduler() : std::make_shared<immediate_scheduler>())
-{
+// ============================================================================
+// synchronizer_base implementation
+// ============================================================================
+
+void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched) {
+    config_ = config;
+    scheduler_ = sched;
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    LOG_INFO("synchronizer", "[%s] CREATED (WSS ctor, this=%p, db=%s, alive=%lld)",
-             config_.sync_id.c_str(), (void*)this, db_->config().path.c_str(), (long long)n);
+    LOG_INFO("synchronizer", "[%s] CREATED (WSS, this=%p, db=%s, alive=%lld)",
+             config_.sync_id.c_str(), (void*)this, db().config().path.c_str(), (long long)n);
     auto factory = get_network_factory();
     ws_client_ = factory->create_sync_transport();
     setup_transport_handlers();
     setup_observer();
 }
 
-synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
-                           std::unique_ptr<sync_transport> transport)
-    : db_(std::move(db))
-    , config_(config)
-    , scheduler_(db_->get_scheduler() ? db_->get_scheduler() : std::make_shared<immediate_scheduler>())
-    , ws_client_(std::move(transport))
-{
+void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
+                                   std::unique_ptr<sync_transport> transport) {
+    config_ = config;
+    scheduler_ = sched;
+    ws_client_ = std::move(transport);
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    LOG_INFO("synchronizer", "[%s] CREATED (IPC ctor, this=%p, db=%s, alive=%lld)",
-             config_.sync_id.c_str(), (void*)this, db_->config().path.c_str(), (long long)n);
+    LOG_INFO("synchronizer", "[%s] CREATED (IPC, this=%p, db=%s, alive=%lld)",
+             config_.sync_id.c_str(), (void*)this, db().config().path.c_str(), (long long)n);
     setup_transport_handlers();
     setup_observer();
 }
 
-void synchronizer::setup_transport_handlers() {
+void synchronizer_base::setup_transport_handlers() {
     ws_client_->set_on_open([this] { on_websocket_open(); });
     ws_client_->set_on_message([this](const transport_message& msg) { on_transport_message(msg); });
     ws_client_->set_on_error([this](const std::string& err) { on_websocket_error(err); });
     ws_client_->set_on_close([this](int code, const std::string& reason) { on_websocket_close(code, reason); });
 }
 
-void synchronizer::setup_observer() {
-    // Observe AuditLog for new local changes to trigger upload.
-    // IMPORTANT: Dispatch through scheduler to avoid concurrent upload_pending_changes()
-    // calls from observer threads competing for SQLite locks with an already-running upload.
-    LOG_DEBUG("synchronizer", "Registering AuditLog observer on instance %p", (void*)db_.get());
-    audit_log_observer_id_ = db_->add_table_observer("AuditLog",
+void synchronizer_base::setup_observer() {
+    LOG_DEBUG("synchronizer", "Registering AuditLog observer on instance %p", (void*)&db());
+    audit_log_observer_id_ = db().add_table_observer("AuditLog",
         [this](const std::string& operation, int64_t row_id, const std::string& global_id) {
             LOG_DEBUG("synchronizer", "AuditLog observer: op=%s row_id=%lld is_connected=%d",
                    operation.c_str(), (long long)row_id, is_connected_ ? 1 : 0);
-            // Only upload on INSERT when connected
             if (operation == "INSERT" && is_connected_) {
-                // Check if this entry is pending for OUR sync_id.
-                // This includes entries from other transports (relay).
-                auto rows = db_->read_db().query(
+                auto rows = db().read_db().query(
                     "SELECT ss.is_synchronized FROM _lattice_sync_state ss "
                     "WHERE ss.audit_entry_id = ? AND ss.sync_id = ?",
                     {row_id, config_.sync_id}
                 );
-                // No row = pending for us; row with is_synchronized=0 = also pending
                 bool is_synced_for_us = !rows.empty() &&
                     std::holds_alternative<int64_t>(rows[0].begin()->second) &&
                     std::get<int64_t>(rows[0].begin()->second) != 0;
@@ -550,9 +553,6 @@ void synchronizer::setup_observer() {
                 if (!is_synced_for_us) {
                     LOG_DEBUG("synchronizer", "Requesting upload for entry pending on sync_id=%s",
                               config_.sync_id.c_str());
-                    // Coalesce: flag the request, schedule one upload.
-                    // The single-threaded scheduler naturally batches — by the time
-                    // the lambda runs, all rapid inserts have committed.
                     upload_requested_.store(true, std::memory_order_release);
                     scheduler_->invoke([this] {
                         if (is_destroyed_) return;
@@ -565,15 +565,15 @@ void synchronizer::setup_observer() {
         });
 }
 
-synchronizer::~synchronizer() {
+synchronizer_base::~synchronizer_base() {
     LOG_INFO("synchronizer", "[%s] ~synchronizer START (this=%p, db=%s)",
              config_.sync_id.c_str(), (void*)this,
-             db_ ? db_->config().path.c_str() : "null");
+             db().config().path.c_str());
     // Mark as destroyed so scheduled lambdas bail out.
     is_destroyed_ = true;
     // Remove AuditLog observer
     if (audit_log_observer_id_ != 0) {
-        db_->remove_table_observer("AuditLog", audit_log_observer_id_);
+        db().remove_table_observer("AuditLog", audit_log_observer_id_);
     }
     disconnect();
 
@@ -591,9 +591,9 @@ synchronizer::~synchronizer() {
     LOG_INFO("synchronizer", "[%s] ~synchronizer END (this=%p, alive=%lld)", config_.sync_id.c_str(), (void*)this, (long long)n);
 }
 
-void synchronizer::connect() {
+void synchronizer_base::connect() {
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
-             config_.sync_id.c_str(), (void*)this, db_->config().path.c_str());
+             config_.sync_id.c_str(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
         // IPC or injected transport — connect without URL/headers.
         // No auto-reconnect: IPC reconnection is handled at the endpoint
@@ -625,10 +625,10 @@ void synchronizer::connect() {
     ws_client_->connect(url, headers);
 }
 
-void synchronizer::disconnect() {
+void synchronizer_base::disconnect() {
     LOG_INFO("synchronizer", "[%s] disconnect() (this=%p, is_connected=%d, db=%s)",
              config_.sync_id.c_str(), (void*)this, is_connected_ ? 1 : 0,
-             db_->config().path.c_str());
+             db().config().path.c_str());
     should_reconnect_ = false;  // Prevent auto-reconnect
     is_connected_ = false;
     reconnect_attempts_ = 0;
@@ -642,13 +642,13 @@ void synchronizer::disconnect() {
     ws_client_->disconnect();
 }
 
-void synchronizer::sync_now() {
+void synchronizer_base::sync_now() {
     upload_pending_changes();
 }
 
-void synchronizer::on_websocket_open() {
+void synchronizer_base::on_websocket_open() {
     LOG_INFO("synchronizer", "[%s] on_websocket_open (this=%p, db=%s)",
-             config_.sync_id.c_str(), (void*)this, db_->config().path.c_str());
+             config_.sync_id.c_str(), (void*)this, db().config().path.c_str());
     is_connected_ = true;
     reconnect_attempts_ = 0;
 
@@ -662,7 +662,7 @@ void synchronizer::on_websocket_open() {
     scheduler_->invoke([this] {
         if (is_destroyed_) return;
 
-        register_replication_slot(db_->db(), config_.sync_id);
+        register_replication_slot(db().db(), config_.sync_id);
 
         if (config_.sync_filter) {
             LOG_DEBUG("synchronizer", "Reconciling sync filter on connect...");
@@ -674,7 +674,7 @@ void synchronizer::on_websocket_open() {
     });
 }
 
-void synchronizer::on_transport_message(const transport_message& msg) {
+void synchronizer_base::on_transport_message(const transport_message& msg) {
     // Guard against use-after-free: the NIO/IPC callback thread may deliver
     // a message after the destructor has started tearing down members.
     if (is_destroyed_) return;
@@ -698,7 +698,7 @@ void synchronizer::on_transport_message(const transport_message& msg) {
                  event->event_type == server_sent_event::type::audit_log ? "audit_log" : "ack",
                  event->event_type == server_sent_event::type::audit_log
                      ? event->audit_logs.size() : event->acked_ids.size(),
-                 (void*)this, db_->config().path.c_str());
+                 (void*)this, db().config().path.c_str());
 
         if (event->event_type == server_sent_event::type::audit_log) {
             // Dispatch to scheduler to serialize with upload_pending_changes.
@@ -713,11 +713,11 @@ void synchronizer::on_transport_message(const transport_message& msg) {
                     return;
                 }
                 LOG_INFO("synchronizer", "[%s] scheduler lambda: applying %zu entries (db=%s)",
-                         config_.sync_id.c_str(), entries.size(), db_->config().path.c_str());
+                         config_.sync_id.c_str(), entries.size(), db().config().path.c_str());
                 auto applied_ids = apply_remote_changes(entries);
                 LOG_INFO("synchronizer", "[%s] apply_remote_changes returned %zu/%zu (db=%s)",
                          config_.sync_id.c_str(), applied_ids.size(), entries.size(),
-                         db_->config().path.c_str());
+                         db().config().path.c_str());
 
                 // Send acknowledgment only for successfully applied entries
                 if (!applied_ids.empty()) {
@@ -726,7 +726,7 @@ void synchronizer::on_transport_message(const transport_message& msg) {
                     LOG_INFO("synchronizer", "[%s] sending ACK for %zu entries (transport_state=%d, db=%s)",
                              config_.sync_id.c_str(), applied_ids.size(),
                              static_cast<int>(ws_client_->state()),
-                             db_->config().path.c_str());
+                             db().config().path.c_str());
                     ws_client_->send(transport_message::from_binary({json_ack.begin(), json_ack.end()}));
                 }
 
@@ -761,9 +761,9 @@ void synchronizer::on_transport_message(const transport_message& msg) {
     }
 }
 
-void synchronizer::on_websocket_error(const std::string& error) {
+void synchronizer_base::on_websocket_error(const std::string& error) {
     LOG_ERROR("synchronizer", "[%s] WebSocket error: %s (this=%p, db=%s)",
-              config_.sync_id.c_str(), error.c_str(), (void*)this, db_->config().path.c_str());
+              config_.sync_id.c_str(), error.c_str(), (void*)this, db().config().path.c_str());
 
     // Clear in-flight tracking so entries can be re-sent after reconnect.
     // Without this, entries added to in_flight_ids_ before the error remain
@@ -786,9 +786,9 @@ void synchronizer::on_websocket_error(const std::string& error) {
     schedule_reconnect();
 }
 
-void synchronizer::on_websocket_close(int code, const std::string& reason) {
+void synchronizer_base::on_websocket_close(int code, const std::string& reason) {
     LOG_INFO("synchronizer", "[%s] WebSocket closed (code=%d, reason=%s, this=%p, db=%s)",
-             config_.sync_id.c_str(), code, reason.c_str(), (void*)this, db_->config().path.c_str());
+             config_.sync_id.c_str(), code, reason.c_str(), (void*)this, db().config().path.c_str());
     is_connected_ = false;
 
     // Clear in-flight tracking so entries can be re-sent after reconnect.
@@ -813,7 +813,7 @@ void synchronizer::on_websocket_close(int code, const std::string& reason) {
 // Sync Filter helpers
 // ============================================================================
 
-bool synchronizer::is_table_in_filter(const std::string& table_name) const {
+bool synchronizer_base::is_table_in_filter(const std::string& table_name) const {
     if (!config_.sync_filter) return true;  // No filter = everything passes
     for (const auto& entry : *config_.sync_filter) {
         if (entry.table_name == table_name) return true;
@@ -821,7 +821,7 @@ bool synchronizer::is_table_in_filter(const std::string& table_name) const {
     return false;
 }
 
-std::optional<std::optional<std::string>> synchronizer::get_filter_for_table(const std::string& table_name) const {
+std::optional<std::optional<std::string>> synchronizer_base::get_filter_for_table(const std::string& table_name) const {
     if (!config_.sync_filter) return std::nullopt;
     for (const auto& entry : *config_.sync_filter) {
         if (entry.table_name == table_name) return entry.where_clause;
@@ -829,7 +829,7 @@ std::optional<std::optional<std::string>> synchronizer::get_filter_for_table(con
     return std::nullopt;  // Table not in filter
 }
 
-bool synchronizer::row_matches_filter(const std::string& table_name, const std::string& global_row_id) {
+bool synchronizer_base::row_matches_filter(const std::string& table_name, const std::string& global_row_id) {
     if (!config_.sync_filter) return true;
     if (!is_table_in_filter(table_name)) return false;
 
@@ -846,15 +846,15 @@ bool synchronizer::row_matches_filter(const std::string& table_name, const std::
 
     std::string sql = "SELECT 1 FROM " + table_name +
                       " WHERE globalId = ? AND (" + where_clause->value() + ") LIMIT 1";
-    auto rows = db_->db().query(sql, {global_row_id});
+    auto rows = db().db().query(sql, {global_row_id});
     return !rows.empty();
 }
 
-std::optional<audit_log_entry> synchronizer::build_insert_entry_from_current_row(
+std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_current_row(
     const std::string& table_name, const std::string& global_row_id) {
 
     // Get column info
-    auto cols = db_->db().query("PRAGMA table_info(" + table_name + ")");
+    auto cols = db().db().query("PRAGMA table_info(" + table_name + ")");
 
     // Build SELECT with hex() for BLOB columns
     std::ostringstream select_cols;
@@ -886,7 +886,7 @@ std::optional<audit_log_entry> synchronizer::build_insert_entry_from_current_row
     // Fetch the row
     std::string sql = "SELECT id, globalId, " + select_cols.str() +
                       " FROM " + table_name + " WHERE globalId = ?";
-    auto rows = db_->db().query(sql, {global_row_id});
+    auto rows = db().db().query(sql, {global_row_id});
     if (rows.empty()) {
         LOG_DEBUG("synchronizer", "build_insert_entry_from_current_row: row not found for globalId=%s (deleted?)", global_row_id.c_str());
         return std::nullopt;
@@ -895,7 +895,7 @@ std::optional<audit_log_entry> synchronizer::build_insert_entry_from_current_row
 
     // Build audit_log_entry
     audit_log_entry entry;
-    entry.global_id = db_->generate_global_id();
+    entry.global_id = db().generate_global_id();
     entry.table_name = table_name;
     entry.operation = "INSERT";
 
@@ -910,7 +910,7 @@ std::optional<audit_log_entry> synchronizer::build_insert_entry_from_current_row
             std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0);
 
     // Populate changed_fields from current row values
-    auto schema = db_->get_table_schema(table_name);
+    auto schema = db().get_table_schema(table_name);
     for (const auto& col_name : col_names) {
         auto val_it = row.find(col_name);
         if (val_it == row.end()) continue;
@@ -941,20 +941,20 @@ std::optional<audit_log_entry> synchronizer::build_insert_entry_from_current_row
 }
 
 // Sync set CRUD
-void synchronizer::sync_set_add(const std::string& table_name, const std::string& global_row_id) {
-    db_->db().execute(
+void synchronizer_base::sync_set_add(const std::string& table_name, const std::string& global_row_id) {
+    db().db().execute(
         "INSERT OR IGNORE INTO _lattice_sync_set (table_name, global_row_id) VALUES (?, ?)",
         {table_name, global_row_id});
 }
 
-void synchronizer::sync_set_remove(const std::string& table_name, const std::string& global_row_id) {
-    db_->db().execute(
+void synchronizer_base::sync_set_remove(const std::string& table_name, const std::string& global_row_id) {
+    db().db().execute(
         "DELETE FROM _lattice_sync_set WHERE table_name = ? AND global_row_id = ?",
         {table_name, global_row_id});
 }
 
-bool synchronizer::sync_set_contains(const std::string& table_name, const std::string& global_row_id) {
-    auto rows = db_->db().query(
+bool synchronizer_base::sync_set_contains(const std::string& table_name, const std::string& global_row_id) {
+    auto rows = db().db().query(
         "SELECT 1 FROM _lattice_sync_set WHERE table_name = ? AND global_row_id = ? LIMIT 1",
         {table_name, global_row_id});
     return !rows.empty();
@@ -964,7 +964,7 @@ bool synchronizer::sync_set_contains(const std::string& table_name, const std::s
 // Sync filter update / clear
 // ============================================================================
 
-void synchronizer::update_sync_filter(std::vector<sync_filter_entry> filter) {
+void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter) {
     // Bump version BEFORE scheduling — if another update arrives before this
     // lambda runs, the version will have advanced and we skip the stale reconcile.
     // This prevents intermediate filter states (e.g., rapid sync→local→sync toggles)
@@ -986,11 +986,11 @@ void synchronizer::update_sync_filter(std::vector<sync_filter_entry> filter) {
     });
 }
 
-void synchronizer::clear_sync_filter() {
+void synchronizer_base::clear_sync_filter() {
     scheduler_->invoke([this] {
         config_.sync_filter = std::nullopt;
         // Clear the sync set — without a filter, everything syncs via normal path
-        db_->db().execute("DELETE FROM _lattice_sync_set");
+        db().db().execute("DELETE FROM _lattice_sync_set");
     });
 }
 
@@ -998,7 +998,7 @@ void synchronizer::clear_sync_filter() {
 // Reconciliation — called when filter changes at runtime
 // ============================================================================
 
-void synchronizer::reconcile_sync_filter() {
+void synchronizer_base::reconcile_sync_filter() {
     LOG_DEBUG("synchronizer", "reconcile_sync_filter called, is_connected=%d", is_connected_ ? 1 : 0);
     if (!is_connected_) return;
 
@@ -1014,7 +1014,7 @@ void synchronizer::reconcile_sync_filter() {
             if (fe.where_clause) {
                 sql += " WHERE (" + *fe.where_clause + ")";
             }
-            auto rows = db_->db().query(sql);
+            auto rows = db().db().query(sql);
             for (const auto& r : rows) {
                 auto gid_it = r.find("globalId");
                 if (gid_it != r.end()) {
@@ -1024,7 +1024,7 @@ void synchronizer::reconcile_sync_filter() {
             }
         }
     }
-    auto sync_set_rows = db_->db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
+    auto sync_set_rows = db().db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
     LOG_INFO("synchronizer", "reconcile Phase 1: %zu sync_set rows, %zu current matches",
              sync_set_rows.size(), current_matches.size());
     for (const auto& row : sync_set_rows) {
@@ -1036,11 +1036,11 @@ void synchronizer::reconcile_sync_filter() {
         std::string gid = std::get<std::string>(gid_it->second);
 
         if (current_matches.count(tn + '\0' + gid) == 0) {
-            db_->db().execute(
+            db().db().execute(
                 "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
                 "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
                 "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[]', 0, 0)",
-                {db_->generate_global_id(), tn, gid});
+                {db().generate_global_id(), tn, gid});
             has_changes = true;
         }
     }
@@ -1052,8 +1052,8 @@ void synchronizer::reconcile_sync_filter() {
     if (config_.sync_filter) {
         for (const auto& fe : *config_.sync_filter) {
             // Get column metadata once per table (not per row)
-            auto cols = db_->db().query("PRAGMA table_info(" + fe.table_name + ")");
-            auto schema = db_->get_table_schema(fe.table_name);
+            auto cols = db().db().query("PRAGMA table_info(" + fe.table_name + ")");
+            auto schema = db().get_table_schema(fe.table_name);
 
             std::ostringstream select_cols;
             std::vector<std::string> col_names;
@@ -1088,12 +1088,12 @@ void synchronizer::reconcile_sync_filter() {
             if (fe.where_clause) {
                 sql += " AND (" + *fe.where_clause + ")";
             }
-            auto all_rows = db_->db().query(sql, params);
+            auto all_rows = db().db().query(sql, params);
             LOG_INFO("synchronizer", "reconcile Phase 2: %s — %zu new rows to synthesize",
                      fe.table_name.c_str(), all_rows.size());
 
             // Synthesize INSERT audit entries from the batch-fetched rows
-            db_->db().begin_transaction();
+            db().db().begin_transaction();
             try {
                 for (const auto& fetched_row : all_rows) {
                     auto gid_it = fetched_row.find("globalId");
@@ -1101,7 +1101,7 @@ void synchronizer::reconcile_sync_filter() {
                     std::string gid = std::get<std::string>(gid_it->second);
 
                     audit_log_entry entry;
-                    entry.global_id = db_->generate_global_id();
+                    entry.global_id = db().generate_global_id();
                     entry.table_name = fe.table_name;
                     entry.operation = "INSERT";
                     entry.global_row_id = gid;
@@ -1133,7 +1133,7 @@ void synchronizer::reconcile_sync_filter() {
                         entry.changed_fields_names.push_back(col_name);
                     }
 
-                    db_->db().execute(
+                    db().db().execute(
                         "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
                         "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
                         "VALUES (?, ?, 'INSERT', ?, ?, ?, ?, 0, 0)",
@@ -1143,10 +1143,10 @@ void synchronizer::reconcile_sync_filter() {
                          entry.changed_fields_names_to_json()});
                     has_changes = true;
                 }
-                db_->db().commit();
+                db().db().commit();
             } catch (...) {
-                if (db_->db().is_in_transaction()) {
-                    try { db_->db().rollback(); } catch (...) {}
+                if (db().db().is_in_transaction()) {
+                    try { db().db().rollback(); } catch (...) {}
                 }
                 throw;
             }
@@ -1164,8 +1164,8 @@ void synchronizer::reconcile_sync_filter() {
 // Upload pending changes (with sync filter support)
 // ============================================================================
 
-std::vector<audit_log_entry> synchronizer::query_pending_entries() {
-    auto entries = query_audit_log_for_sync(db_->db(), config_.sync_id, config_.sync_filter);
+std::vector<audit_log_entry> synchronizer_base::query_pending_entries() {
+    auto entries = query_audit_log_for_sync(db().db(), config_.sync_id, config_.sync_filter);
 
     // Filter out entries already in-flight (sent but not yet ACK'd)
     {
@@ -1189,7 +1189,7 @@ std::vector<audit_log_entry> synchronizer::query_pending_entries() {
     return entries;
 }
 
-void synchronizer::classify_delete(audit_log_entry& entry, classified_entries& result) {
+void synchronizer_base::classify_delete(audit_log_entry& entry, classified_entries& result) {
     if (sync_set_contains(entry.table_name, entry.global_row_id)) {
         // Row was in sync set: forward DELETE, remove from sync set
         LOG_DEBUG("synchronizer", "  -> DELETE, in sync set: forwarding");
@@ -1202,7 +1202,7 @@ void synchronizer::classify_delete(audit_log_entry& entry, classified_entries& r
     }
 }
 
-void synchronizer::classify_insert_or_update(audit_log_entry& entry,
+void synchronizer_base::classify_insert_or_update(audit_log_entry& entry,
                                               const std::string& filter_table,
                                               bool is_link_table,
                                               classified_entries& result) {
@@ -1240,7 +1240,7 @@ void synchronizer::classify_insert_or_update(audit_log_entry& entry,
         // Row left the sync set: send synthetic DELETE, remove from sync set.
         LOG_DEBUG("synchronizer", "  -> leaving sync set: sending synthetic DELETE");
         audit_log_entry del;
-        del.global_id = db_->generate_global_id();
+        del.global_id = db().generate_global_id();
         del.table_name = entry.table_name;
         del.operation = "DELETE";
         del.global_row_id = entry.global_row_id;
@@ -1255,7 +1255,7 @@ void synchronizer::classify_insert_or_update(audit_log_entry& entry,
     }
 }
 
-synchronizer::classified_entries synchronizer::classify_entries(std::vector<audit_log_entry>& entries) {
+synchronizer_base::classified_entries synchronizer_base::classify_entries(std::vector<audit_log_entry>& entries) {
     // No sync filter: all entries go to to_send
     if (!config_.sync_filter) {
         return {std::move(entries), {}};
@@ -1268,7 +1268,7 @@ synchronizer::classified_entries synchronizer::classify_entries(std::vector<audi
     // Key is "table_name\0global_row_id" for compact hashing.
     std::unordered_set<std::string> sync_set_cache;
     {
-        auto rows = db_->db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
+        auto rows = db().db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
         sync_set_cache.reserve(rows.size());
         for (const auto& row : rows) {
             auto tn_it = row.find("table_name");
@@ -1294,7 +1294,7 @@ synchronizer::classified_entries synchronizer::classify_entries(std::vector<audi
         if (fe.where_clause) {
             sql += " WHERE (" + *fe.where_clause + ")";
         }
-        auto rows = db_->db().query(sql);
+        auto rows = db().db().query(sql);
         for (const auto& row : rows) {
             auto gid_it = row.find("globalId");
             if (gid_it != row.end()) {
@@ -1377,7 +1377,7 @@ synchronizer::classified_entries synchronizer::classify_entries(std::vector<audi
                 result.to_send.push_back(entry);
             } else if (!matches && in_set) {
                 audit_log_entry del;
-                del.global_id = db_->generate_global_id();
+                del.global_id = db().generate_global_id();
                 del.table_name = entry.table_name;
                 del.operation = "DELETE";
                 del.global_row_id = entry.global_row_id;
@@ -1396,7 +1396,7 @@ synchronizer::classified_entries synchronizer::classify_entries(std::vector<audi
     return result;
 }
 
-void synchronizer::mark_skipped_synced(const std::vector<int64_t>& to_mark_synced) {
+void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_synced) {
     if (to_mark_synced.empty()) return;
 
     // Mark entries that were skipped as synchronized in the per-sync-id table.
@@ -1406,11 +1406,11 @@ void synchronizer::mark_skipped_synced(const std::vector<int64_t>& to_mark_synce
     constexpr size_t kMarkChunkSize = 50;
     for (size_t i = 0; i < to_mark_synced.size(); i += kMarkChunkSize) {
         size_t end = std::min(i + kMarkChunkSize, to_mark_synced.size());
-        db_->db().begin_transaction();
+        db().db().begin_transaction();
         try {
             for (size_t j = i; j < end; ++j) {
                 int64_t entry_id = to_mark_synced[j];
-                db_->db().execute(
+                db().db().execute(
                     "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized) "
                     "VALUES (?, ?, 1) "
                     "ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1",
@@ -1418,7 +1418,7 @@ void synchronizer::mark_skipped_synced(const std::vector<int64_t>& to_mark_synce
 
                 // Eager cleanup: if all active sync_ids have synced this entry,
                 // collapse to isSynchronized=1 on AuditLog and remove sync_state rows.
-                auto count_rows = db_->db().query(
+                auto count_rows = db().db().query(
                     "SELECT COUNT(*) as cnt FROM _lattice_sync_state "
                     "WHERE audit_entry_id = ? AND is_synchronized = 1",
                     {entry_id});
@@ -1432,18 +1432,18 @@ void synchronizer::mark_skipped_synced(const std::vector<int64_t>& to_mark_synce
                 }
 
                 if (synced_count >= static_cast<int64_t>(config_.all_active_sync_ids.size())) {
-                    db_->db().execute(
+                    db().db().execute(
                         "DELETE FROM _lattice_sync_state WHERE audit_entry_id = ?",
                         {entry_id});
-                    db_->db().execute(
+                    db().db().execute(
                         "UPDATE AuditLog SET isSynchronized = 1 WHERE id = ?",
                         {entry_id});
                 }
             }
-            db_->db().commit();
+            db().db().commit();
         } catch (...) {
-            if (db_->db().is_in_transaction()) {
-                try { db_->db().rollback(); } catch (...) {}
+            if (db().db().is_in_transaction()) {
+                try { db().db().rollback(); } catch (...) {}
             }
             throw;
         }
@@ -1453,7 +1453,7 @@ void synchronizer::mark_skipped_synced(const std::vector<int64_t>& to_mark_synce
     // progress_pending_upload_ (only to_send entries are counted).
 }
 
-void synchronizer::send_entries(std::vector<audit_log_entry>& entries) {
+void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     if (entries.empty()) return;
 
     // Track sent entries as in-flight
@@ -1476,7 +1476,7 @@ void synchronizer::send_entries(std::vector<audit_log_entry>& entries) {
     }
 }
 
-void synchronizer::upload_pending_changes() {
+void synchronizer_base::upload_pending_changes() {
     LOG_DEBUG("synchronizer", "upload_pending_changes called");
     auto entries = query_pending_entries();
     if (entries.empty()) return;
@@ -1508,18 +1508,18 @@ void synchronizer::upload_pending_changes() {
     }
 }
 
-std::vector<std::string> synchronizer::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
-    auto applied = lattice::apply_remote_changes_for(*db_, entries, config_.sync_id);
+std::vector<std::string> synchronizer_base::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
+    auto applied = lattice::apply_remote_changes_for(db(), entries, config_.sync_id);
     progress_received_.fetch_add(static_cast<int64_t>(applied.size()), std::memory_order_relaxed);
     fire_progress();
     return applied;
 }
 
-void synchronizer::mark_as_synced(const std::vector<std::string>& global_ids) {
+void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_ids) {
     LOG_INFO("synchronizer", "[%s] mark_as_synced: %zu entries ACK'd (progress_acked was %lld)",
              config_.sync_id.c_str(), global_ids.size(),
              (long long)progress_acked_.load(std::memory_order_relaxed));
-    mark_audit_entries_synced_for(*db_, global_ids, config_.sync_id, config_.all_active_sync_ids);
+    mark_audit_entries_synced_for(db(), global_ids, config_.sync_id, config_.all_active_sync_ids);
 
     // Remove ACK'd entries from in-flight set
     {
@@ -1550,7 +1550,7 @@ void synchronizer::mark_as_synced(const std::vector<std::string>& global_ids) {
     }
 }
 
-void synchronizer::schedule_reconnect() {
+void synchronizer_base::schedule_reconnect() {
     bool within_limit = config_.max_reconnect_attempts == 0
         || reconnect_attempts_ < config_.max_reconnect_attempts;
     if (should_reconnect_ && !is_connected_ && within_limit) {
@@ -1579,8 +1579,8 @@ void synchronizer::schedule_reconnect() {
     }
 }
 
-std::optional<std::string> synchronizer::get_last_received_event_id() {
-    auto rows = db_->db().query(
+std::optional<std::string> synchronizer_base::get_last_received_event_id() {
+    auto rows = db().db().query(
         "SELECT globalId FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1"
     );
     if (!rows.empty()) {
@@ -1596,7 +1596,7 @@ std::optional<std::string> synchronizer::get_last_received_event_id() {
 // Progress
 // ============================================================================
 
-synchronizer::sync_progress synchronizer::get_progress() const {
+synchronizer_base::sync_progress synchronizer_base::get_progress() const {
     return {
         progress_pending_upload_.load(std::memory_order_relaxed),
         progress_total_upload_.load(std::memory_order_relaxed),
@@ -1605,16 +1605,16 @@ synchronizer::sync_progress synchronizer::get_progress() const {
     };
 }
 
-void synchronizer::set_on_progress(on_progress_handler handler) {
+void synchronizer_base::set_on_progress(on_progress_handler handler) {
     LOG_INFO("synchronizer", "[%s] set_on_progress: handler=%s (this=%p, db=%s)",
              config_.sync_id.c_str(),
              handler ? "SET" : "CLEARED",
-             (void*)this, db_->config().path.c_str());
+             (void*)this, db().config().path.c_str());
     std::lock_guard<std::mutex> lock(progress_handler_mutex_);
     on_progress_ = std::move(handler);
 }
 
-void synchronizer::fire_progress() {
+void synchronizer_base::fire_progress() {
     on_progress_handler handler;
     {
         std::lock_guard<std::mutex> lock(progress_handler_mutex_);
@@ -1631,6 +1631,48 @@ void synchronizer::fire_progress() {
         handler(p);
     }
 }
+
+// ============================================================================
+// Platform-specific synchronizer subclass constructors
+// ============================================================================
+
+#ifdef __EMSCRIPTEN__
+
+synchronizer::synchronizer(lattice_db& db_ref, const sync_config& config)
+{
+    db_ptr_ = &db_ref;
+    auto sched = db_ref.get_scheduler() ? db_ref.get_scheduler() : std::make_shared<immediate_scheduler>();
+    init_sync(config, sched);
+}
+
+synchronizer::synchronizer(lattice_db& db_ref, const sync_config& config,
+                           std::unique_ptr<sync_transport> transport)
+{
+    db_ptr_ = &db_ref;
+    auto sched = db_ref.get_scheduler() ? db_ref.get_scheduler() : std::make_shared<immediate_scheduler>();
+    init_sync(config, sched, std::move(transport));
+}
+
+#else
+
+synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config)
+{
+    owned_db_ = std::move(db);
+    db_ptr_ = owned_db_.get();
+    auto sched = owned_db_->get_scheduler() ? owned_db_->get_scheduler() : std::make_shared<immediate_scheduler>();
+    init_sync(config, sched);
+}
+
+synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
+                           std::unique_ptr<sync_transport> transport)
+{
+    owned_db_ = std::move(db);
+    db_ptr_ = owned_db_.get();
+    auto sched = owned_db_->get_scheduler() ? owned_db_->get_scheduler() : std::make_shared<immediate_scheduler>();
+    init_sync(config, sched, std::move(transport));
+}
+
+#endif
 
 // ============================================================================
 // Helper functions
@@ -1710,7 +1752,7 @@ static void notify_observers(lattice_db& db,
                              const std::vector<std::pair<int64_t, std::string>>& notify_list) {
     if (notify_list.empty()) return;
 
-    if (db.config().path == ":memory:" || db.config().path.empty()) {
+    if (db.config().is_in_memory()) {
         for (const auto& [row_id, gid] : notify_list) {
             db.notify_change("AuditLog", "UPDATE", row_id, gid);
         }
@@ -2042,6 +2084,30 @@ static std::vector<std::string> apply_remote_changes_impl(
                     }
                 }
 
+                // Ensure vec0 tables exist for vector columns BEFORE the INSERT,
+                // so triggers can populate the shadow tables.
+                if (!entry.table_name.empty() && entry.table_name[0] != '_') {
+                    auto* model_schema = schema_registry::instance().get_schema(entry.table_name);
+                    if (model_schema) {
+                        for (const auto& prop : model_schema->properties) {
+                            if (prop.is_vector && prop.type == column_type::blob) {
+                                auto it = entry.changed_fields.find(prop.name);
+                                if (it != entry.changed_fields.end() &&
+                                    it->second.kind == any_property_kind::data_kind &&
+                                    std::holds_alternative<std::vector<uint8_t>>(it->second.value)) {
+                                    auto& vec_data = std::get<std::vector<uint8_t>>(it->second.value);
+                                    if (!vec_data.empty()) {
+                                        int dims = static_cast<int>(vec_data.size() / sizeof(float));
+                                        if (dims > 0) {
+                                            db.ensure_vec0_table(entry.table_name, prop.name, dims);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Generate and execute the SQL instruction
                 auto schema = db.get_table_schema(entry.table_name);
                 auto [sql, params] = entry.generate_instruction(schema);
@@ -2157,6 +2223,11 @@ static std::vector<std::string> apply_remote_changes_impl(
     }
 
     db.applying_remote_changes_.store(false, std::memory_order_release);
+
+    // vec0 INSERT/UPDATE/DELETE triggers fire inside the transaction above on
+    // THIS connection, so the shadow table is already up-to-date. Other
+    // connections will reconcile lazily via knn_query's count-mismatch check.
+
     return applied_ids;
 }
 

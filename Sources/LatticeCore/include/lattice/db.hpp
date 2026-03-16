@@ -62,6 +62,10 @@ public:
 
     // Transaction support
     void begin_transaction(bool exclusive = false);
+    /// Try to begin an IMMEDIATE transaction with a short timeout.
+    /// Returns true if the transaction was started, false if the DB is busy.
+    /// Use for optional write paths (e.g. vec0 reconciliation) where blocking is worse than skipping.
+    bool try_begin_immediate(int timeout_ms = 100);
     void commit();
     void rollback();
     bool is_in_transaction() const;
@@ -69,6 +73,10 @@ public:
     // Execute SQL with optional params (for INSERT/UPDATE/DELETE without return)
     void execute(const std::string& sql,
                  const std::vector<column_value_t>& params = {});
+
+    /// Advance this connection's WAL read snapshot to see the latest committed data.
+    /// Needed when another connection wrote and this connection's mmap'd WAL index is stale.
+    void refresh_wal_snapshot();
 
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }

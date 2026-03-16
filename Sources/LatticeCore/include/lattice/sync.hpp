@@ -199,7 +199,7 @@ struct sync_config {
 // Synchronizer - matches Lattice.swift's Synchronizer actor
 // ============================================================================
 
-class synchronizer {
+class synchronizer_base {
 public:
     using on_sync_complete_handler = std::function<void(const std::vector<std::string>& synced_ids)>;
     using on_error_handler = std::function<void(const std::string& error)>;
@@ -218,22 +218,17 @@ public:
 
     using on_progress_handler = std::function<void(const sync_progress&)>;
 
-    /// Construct with an owned lattice_db (dedicated connection for sync).
-    /// Scheduler comes from db->scheduler().
-    synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);
+    virtual ~synchronizer_base();
 
-    /// Construct with an externally-provided transport (for IPC).
-    /// The transport is already connected or will be connected via connect().
-    synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
-                 std::unique_ptr<sync_transport> transport);
+protected:
+    synchronizer_base() = default;
 
-    ~synchronizer();
-
+public:
     // Non-copyable, non-moveable
-    synchronizer(const synchronizer&) = delete;
-    synchronizer& operator=(const synchronizer&) = delete;
-    synchronizer(synchronizer&&) = delete;
-    synchronizer& operator=(synchronizer&&) = delete;
+    synchronizer_base(const synchronizer_base&) = delete;
+    synchronizer_base& operator=(const synchronizer_base&) = delete;
+    synchronizer_base(synchronizer_base&&) = delete;
+    synchronizer_base& operator=(synchronizer_base&&) = delete;
 
     // Connection management
     void connect();
@@ -262,8 +257,21 @@ public:
 
     sync_progress get_progress() const;
 
-private:
-    std::unique_ptr<lattice_db> db_;
+protected:
+    /// Database accessor — set by subclass constructors.
+    lattice_db& db() { return *db_ptr_; }
+    lattice_db* db_ptr_ = nullptr;
+
+    /// Owned database (native only). Stored in the base class so it outlives
+    /// ~synchronizer_base() — base members are destroyed after the base
+    /// destructor body, avoiding use-after-free on db_ptr_.
+    std::unique_ptr<lattice_db> owned_db_;
+
+    /// Common init — call from subclass constructors after db is set up.
+    void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched);
+    void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
+                   std::unique_ptr<sync_transport> transport);
+
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<sync_transport> ws_client_;
@@ -346,6 +354,33 @@ private:
     // Get last received event ID for checkpoint
     std::optional<std::string> get_last_received_event_id();
 };
+
+// ============================================================================
+// Platform-specific synchronizer subclasses
+// ============================================================================
+
+#ifdef __EMSCRIPTEN__
+
+/// Emscripten: borrows the parent's lattice_db (single-threaded, no need for
+/// a separate connection — avoids OPFS exclusive lock conflicts).
+class synchronizer : public synchronizer_base {
+public:
+    synchronizer(lattice_db& db_ref, const sync_config& config);
+    synchronizer(lattice_db& db_ref, const sync_config& config,
+                 std::unique_ptr<sync_transport> transport);
+};
+
+#else
+
+/// Native: owns a dedicated lattice_db (separate connection on its own thread).
+class synchronizer : public synchronizer_base {
+public:
+    synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);
+    synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
+                 std::unique_ptr<sync_transport> transport);
+};
+
+#endif
 
 // ============================================================================
 // Helper: Query AuditLog entries from database

@@ -34,6 +34,7 @@ namespace lattice {
 template<typename T> class query;
 template<typename T> class results;
 class lattice_db;
+class synchronizer_base;
 class synchronizer;
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
@@ -90,16 +91,28 @@ public:
     }
 
     void unregister_instance(const std::string& path, lattice_db* db) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = instances_.find(path);
-        if (it != instances_.end()) {
-            auto& vec = it->second;
-            vec.erase(std::remove_if(vec.begin(), vec.end(),
-                [db](const entry& e) { return e.ptr == db; }), vec.end());
-            if (vec.empty()) {
-                instances_.erase(it);
+        // Move the notifier out under the lock, destroy it AFTER releasing —
+        // the notifier destructor joins the inotify thread, which may be
+        // waiting for mutex_ inside for_each_alive → get_entries.
+        std::unique_ptr<cross_process_notifier> notifier_to_destroy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = instances_.find(path);
+            if (it != instances_.end()) {
+                auto& vec = it->second;
+                vec.erase(std::remove_if(vec.begin(), vec.end(),
+                    [db](const entry& e) { return e.ptr == db; }), vec.end());
+                if (vec.empty()) {
+                    instances_.erase(it);
+                    auto nit = shared_notifiers_.find(path);
+                    if (nit != shared_notifiers_.end()) {
+                        notifier_to_destroy = std::move(nit->second);
+                        shared_notifiers_.erase(nit);
+                    }
+                }
             }
         }
+        // Notifier destroyed here, outside the lock — safe to join its thread.
     }
 
     /// Iterate alive instances for a path with guard protection.
@@ -120,6 +133,15 @@ public:
         }
     }
 
+    /// Get or create a shared cross-process notifier for a path.
+    /// Only ONE Darwin listener is registered per path per process,
+    /// preventing N^2 notification amplification when multiple lattice_db
+    /// instances share the same path. The listener distributes to all
+    /// instances via for_each_alive.
+    /// Returns a raw pointer (owned by the registry) for post_notification,
+    /// or nullptr for in-memory DBs.
+    cross_process_notifier* get_or_create_notifier(const std::string& path);
+
 private:
     instance_registry() = default;
 
@@ -134,6 +156,9 @@ private:
 
     std::mutex mutex_;
     std::map<std::string, std::vector<entry>> instances_;
+    /// One Darwin listener per unique DB path — prevents N^2 notification
+    /// amplification when multiple lattice_db instances share the same path.
+    std::map<std::string, std::unique_ptr<cross_process_notifier>> shared_notifiers_;
 };
 
 // ============================================================================
@@ -428,6 +453,11 @@ struct configuration {
     bool is_ipc_enabled() const {
         return !ipc_targets.empty();
     }
+
+    /// Returns true if this is an in-memory database (either :memory: or shared cache URI)
+    bool is_in_memory() const {
+        return path == ":memory:" || path.empty() || path.find(":memory:") != std::string::npos;
+    }
 };
 
 // Backwards compatibility alias
@@ -677,13 +707,27 @@ public:
         return count;
     }
 
+    // When using :memory: with sync enabled, we need a shared cache URI so the
+    // sync db (separate lattice_db instance) connects to the SAME in-memory database.
+    static std::string resolve_path(const configuration& config) {
+        if (config.path == ":memory:" && config.is_sync_enabled()) {
+            return "file::memory:?cache=shared";
+        }
+        return config.path;
+    }
+
     explicit lattice_db(const configuration& config, bool defer_sync = false)
         : config_(config)
-        , db_(std::make_unique<database>(config.path,
+        , db_(std::make_unique<database>(resolve_path(config),
               config.read_only ? database::open_mode::read_only_immutable : database::open_mode::read_write))
         , read_db_(config.read_only ? nullptr :
-                   (config.path != ":memory:" ? std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr))
+                   (config.path != ":memory:" && !config.is_sync_enabled() ? std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr))
+        , xproc_read_db_(config.path != ":memory:" && !config.read_only ?
+                         std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr)
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
+        // Update config_.path to the resolved path so instance_registry keys match
+        // between the main db and sync db (both use "file::memory:?cache=shared").
+        config_.path = resolve_path(config);
         auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
         LOG_INFO("lattice_db", "CREATED (this=%p, path=%s, ipc=%d, sync=%d, alive=%lld)",
                  (void*)this, config.path.c_str(), config.is_ipc_enabled() ? 1 : 0,
@@ -1161,8 +1205,10 @@ public:
 
         // Helper: iterate alive instances sharing this path, guarded by
         // refcount so the destructor waits for in-flight calls to complete.
-        // In-memory DBs each have isolated storage, so only notify this instance.
-        bool is_file_db = config_.path != ":memory:" && !config_.path.empty();
+        // Plain in-memory DBs each have isolated storage, so only notify this instance.
+        // Shared cache in-memory DBs share storage, so use registry like file DBs.
+        bool is_file_db = !config_.is_in_memory() ||
+                          config_.path.find("cache=shared") != std::string::npos;
         auto for_each_alive = [&](auto&& fn) {
             if (is_file_db) {
                 instance_registry::instance().for_each_alive(config_.path, fn);
@@ -1175,7 +1221,7 @@ public:
         // BEFORE notifying observers. This prevents any instance's
         // cross-process handler from re-dispatching entries that
         // flush_changes is about to (or just did) deliver.
-        if (xproc_notifier_) {
+        if (shared_xproc_notifier_) {
             auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
             if (!max_rows.empty()) {
                 auto it = max_rows[0].find("max_id");
@@ -1277,7 +1323,7 @@ public:
         // directly because flush_changes() runs before the trigger fires.
         // For file-based DBs, flush_changes() runs at WAL commit (after triggers), so the entry exists.
         // Internal table AuditLog entries are skipped — their sync is triggered separately.
-        bool is_in_memory = config_.path == ":memory:" || config_.path.empty();
+        bool is_in_memory = config_.is_in_memory();
         bool triggered_regular_audit = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
             // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
@@ -1362,8 +1408,8 @@ public:
         }
 
         // Post cross-process notification (cursor already advanced above)
-        if (xproc_notifier_ && !config_.read_only) {
-            xproc_notifier_->post_notification();
+        if (shared_xproc_notifier_ && !config_.read_only) {
+            shared_xproc_notifier_->post_notification();
         }
 
         {
@@ -1420,6 +1466,15 @@ public:
 
     /// Set callback for sync progress updates (fires on synchronizer thread)
     void set_on_sync_progress(synchronizer::on_progress_handler handler);
+
+    /// Set callback for cross-process idle hints. Fires on the xproc background
+    /// thread when a Darwin notification arrives but no new AuditLog entries exist
+    /// (e.g., sync daemon marked entries as synchronized). NOT dispatched through
+    /// the scheduler — runs directly on the notification thread.
+    void set_on_xproc_idle(std::function<void()> handler) {
+        std::lock_guard<std::mutex> lock(xproc_idle_mutex_);
+        on_xproc_idle_ = std::move(handler);
+    }
 
     // ========================================================================
     // Observation API
@@ -1673,7 +1728,9 @@ public:
         auto gid = obj.global_id();
         db_->remove(table_name, obj.id_);
 
-        // Cascade: remove link table entries referencing this object as rhs
+        // Cascade: remove link table entries referencing this object as rhs.
+        // internal_table: entries include both link tables (lhs/rhs) and
+        // geo_bounds list tables (parent_id) — only link tables have rhs.
         if (!gid.empty()) {
             auto rows = db_->query(
                 "SELECT key FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
@@ -1682,7 +1739,11 @@ public:
                 if (it == row.end() || !std::holds_alternative<std::string>(it->second)) continue;
                 auto link_table = std::get<std::string>(it->second).substr(15); // strip "internal_table:"
                 if (db_->table_exists(link_table)) {
-                    db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                    try {
+                        db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                    } catch (...) {
+                        // Not a link table (e.g. geo_bounds list) — skip
+                    }
                 }
             }
         }
@@ -1767,7 +1828,11 @@ public:
                         if (it == lr.end() || !std::holds_alternative<std::string>(it->second)) continue;
                         auto link_table = std::get<std::string>(it->second).substr(15); // strip "internal_table:"
                         if (db_->table_exists(link_table)) {
-                            db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                            try {
+                                db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                            } catch (...) {
+                                // Not a link table (e.g. geo_bounds list) — skip
+                            }
                         }
                     }
                 }
@@ -2164,9 +2229,13 @@ public:
     /// Get the read-only database connection (falls back to write connection for in-memory DBs)
     database& read_db() { return read_db_ ? *read_db_ : *db_; }
 
-    /// Close the read-only connection (for operations requiring exclusive access)
+    /// Get the xproc-dedicated read connection (falls back to read_db for in-memory/read-only)
+    database& xproc_read_db() { return xproc_read_db_ ? *xproc_read_db_ : read_db(); }
+
+    /// Close the read-only connections (for operations requiring exclusive access)
     void close_read_db() {
         read_db_.reset();
+        xproc_read_db_.reset();
     }
 
     /// Explicitly close all database connections and stop background services.
@@ -2174,10 +2243,11 @@ public:
     /// any further operations on this instance are undefined behavior.
     void close();
 
-    /// Reopen the read-only connection after exclusive operations
+    /// Reopen the read-only connections after exclusive operations
     void reopen_read_db() {
         if (config_.path != ":memory:" && !config_.read_only) {
             read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only);
+            xproc_read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only);
         }
     }
 
@@ -2286,12 +2356,24 @@ public:
         std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
         auto results = db_->query(check_sql, {vec_table});
         if (!results.empty()) {
-            // Table exists — verify sync triggers are intact (rebuild_table can drop them)
+            // Table exists — check if triggers need updating
             auto trig = db_->query(
-                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='"
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='"
                 + vec_table + "_insert' LIMIT 1");
-            if (!trig.empty()) return;
-            // Fall through to recreate triggers only
+            if (!trig.empty()) {
+                auto& sql_val = trig[0].at("sql");
+                auto& trig_sql = std::get<std::string>(sql_val);
+                // Current trigger format uses UPDATE+INSERT NOT EXISTS pattern
+                // (avoids DELETE on vec0 inside triggers, which is unreliable)
+                if (trig_sql.find("NOT EXISTS") != std::string::npos) {
+                    return; // Trigger already has correct pattern
+                }
+                // Stale trigger — drop all vec0 triggers to recreate
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+            }
+            // Fall through to recreate triggers
         }
 
         // Create vec0 virtual table with globalId as primary key (if it doesn't exist)
@@ -2309,15 +2391,27 @@ public:
         // even when a TEMP UNION ALL view shadows the model table (from attach()).
         // Note: SQLite forbids qualified names inside trigger bodies, but the
         // vec table references resolve correctly because ATTACH excludes virtual tables.
+        //
+        // IMPORTANT: vec0's DELETE is unreliable inside triggers (the shadow table
+        // deletion can silently fail, leaving a stale entry that causes UNIQUE
+        // constraint errors on the subsequent INSERT). Instead we use:
+        //   1. UPDATE existing vec0 entry (no-op if row doesn't exist)
+        //   2. INSERT only if no entry exists (conditional via NOT EXISTS)
+        // This avoids DELETE on vec0 entirely within trigger bodies.
+
         // INSERT trigger
         std::ostringstream insert_trigger;
         insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_insert "
                        << "AFTER INSERT ON main." << model_table << " "
                        << "WHEN NEW." << column_name << " IS NOT NULL "
+                       << "AND length(NEW." << column_name << ") > 0 "
                        << "BEGIN "
-                       << "DELETE FROM " << vec_table << " WHERE global_id = NEW.globalId; "
+                       << "UPDATE " << vec_table << " SET embedding = NEW." << column_name
+                       << " WHERE global_id = NEW.globalId; "
                        << "INSERT INTO " << vec_table << "(global_id, embedding) "
-                       << "VALUES (NEW.globalId, NEW." << column_name << "); "
+                       << "SELECT NEW.globalId, NEW." << column_name << " "
+                       << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
+                       << " WHERE global_id = NEW.globalId); "
                        << "END";
         db_->execute(insert_trigger.str());
 
@@ -2326,10 +2420,14 @@ public:
         update_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_update "
                        << "AFTER UPDATE OF " << column_name << " ON main." << model_table << " "
                        << "WHEN NEW." << column_name << " IS NOT NULL "
+                       << "AND length(NEW." << column_name << ") > 0 "
                        << "BEGIN "
-                       << "DELETE FROM " << vec_table << " WHERE global_id = NEW.globalId; "
+                       << "UPDATE " << vec_table << " SET embedding = NEW." << column_name
+                       << " WHERE global_id = NEW.globalId; "
                        << "INSERT INTO " << vec_table << "(global_id, embedding) "
-                       << "VALUES (NEW.globalId, NEW." << column_name << "); "
+                       << "SELECT NEW.globalId, NEW." << column_name << " "
+                       << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
+                       << " WHERE global_id = NEW.globalId); "
                        << "END";
         db_->execute(update_trigger.str());
 
@@ -2677,6 +2775,48 @@ public:
         db_->execute(delete_trigger);
     }
 
+    /// Reconcile vec0 entries on this connection for a synced row.
+    /// Called when another connection wrote to the model table — vec0
+    /// shadow table changes aren't visible to this connection's virtual table.
+    void reconcile_vec0(const std::string& table, const std::string& global_id) {
+        try {
+            auto pattern = "_" + table + "_%_vec";
+            auto vec_tables = db().query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                {pattern});
+            LOG_INFO("vec0_reconcile", "table=%s globalId=%s pattern=%s matches=%zu",
+                     table.c_str(), global_id.c_str(), pattern.c_str(), vec_tables.size());
+
+            for (const auto& vt_row : vec_tables) {
+                auto name_it = vt_row.find("name");
+                if (name_it == vt_row.end() || !std::holds_alternative<std::string>(name_it->second)) continue;
+                auto& vec_table = std::get<std::string>(name_it->second);
+
+                auto prefix_len = table.size() + 2; // "_" + table + "_"
+                auto suffix_len = 4; // "_vec"
+                if (vec_table.size() <= prefix_len + suffix_len) continue;
+                auto col = vec_table.substr(prefix_len, vec_table.size() - prefix_len - suffix_len);
+
+                auto data_rows = db().query(
+                    "SELECT " + col + " FROM " + table + " WHERE globalId = ?",
+                    {global_id});
+                if (data_rows.empty()) continue;
+
+                auto col_it = data_rows[0].find(col);
+                if (col_it == data_rows[0].end() ||
+                    !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                if (vec_data.empty()) continue;
+
+                db().execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {global_id});
+                db().execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                            {global_id, vec_data});
+            }
+        } catch (...) {
+            // Non-fatal — vec0 is an optimization layer
+        }
+    }
+
     /// Update or insert a vector into the vec0 table.
     /// vector_data should be packed float32 bytes (4 bytes per dimension).
     void upsert_vec0(const std::string& model_table,
@@ -2735,6 +2875,80 @@ public:
         }
 
         std::vector<knn_result> results;
+
+        // Ensure vec0 table exists. It may not have been created yet if
+        // data arrived via sync after ensure_swift_tables ran with no vector data.
+        if (!db_->table_exists(vec_table)) {
+            int dimensions = static_cast<int>(query_vector.size() / sizeof(float));
+            if (dimensions > 0) {
+                ensure_vec0_table(model_table, column_name, dimensions);
+            }
+        }
+
+        // Ensure vec0 has entries for all model rows with vector data.
+        // vec0 virtual table state is per-connection — another connection
+        // (e.g. IPC sync db) may have written to the base table but this
+        // connection's vec0 instance doesn't see it. Reconcile by comparing
+        // counts and re-inserting from the model table when they mismatch.
+        if (db_->table_exists(vec_table)) {
+            try {
+                auto model_cnt_rows = db_->query(
+                    "SELECT COUNT(*) as cnt FROM " + model_table + " "
+                    "WHERE " + column_name + " IS NOT NULL "
+                    "AND length(" + column_name + ") > 0");
+                auto vec_cnt_rows = db_->query(
+                    "SELECT COUNT(*) as cnt FROM " + vec_table);
+
+                int64_t model_cnt = model_cnt_rows.empty() ? 0
+                    : std::get<int64_t>(model_cnt_rows[0].at("cnt"));
+                int64_t vec_cnt = vec_cnt_rows.empty() ? 0
+                    : std::get<int64_t>(vec_cnt_rows[0].at("cnt"));
+
+                if (model_cnt != vec_cnt) {
+                    // Try to acquire write lock with short timeout.
+                    // If the DB is busy (sync writes in progress), skip reconciliation —
+                    // the query still works with stale vec0 data, and we'll reconcile
+                    // on the next query when the lock is free.
+                    if (!db_->try_begin_immediate(100)) {
+                        LOG_DEBUG("knn_query", "vec0 reconcile skipped (busy): %s", vec_table.c_str());
+                    } else {
+                        LOG_INFO("knn_query", "vec0 count mismatch: model=%lld vec0=%lld, reconciling %s",
+                                 (long long)model_cnt, (long long)vec_cnt, vec_table.c_str());
+                        auto all_rows = db_->query(
+                            "SELECT globalId, " + column_name + " FROM " + model_table + " "
+                            "WHERE " + column_name + " IS NOT NULL "
+                            "AND length(" + column_name + ") > 0");
+                        try {
+                            for (const auto& row : all_rows) {
+                                auto gid_it = row.find("globalId");
+                                if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                                auto& gid = std::get<std::string>(gid_it->second);
+                                auto col_it = row.find(column_name);
+                                if (col_it == row.end() ||
+                                    !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                                auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                                if (vec_data.empty()) continue;
+                                try {
+                                    db_->execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {gid});
+                                    db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                                {gid, vec_data});
+                                } catch (const std::exception& e) {
+                                    LOG_DEBUG("knn_query", "vec0 reconcile row %s skipped: %s",
+                                             gid.c_str(), e.what());
+                                }
+                            }
+                            db_->commit();
+                            LOG_INFO("knn_query", "vec0 reconciled %zu entries for %s",
+                                     all_rows.size(), vec_table.c_str());
+                        } catch (...) {
+                            db_->rollback();
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG_WARN("knn_query", "vec0 reconcile failed: %s", e.what());
+            }
+        }
 
         // Query main DB's vec table
         if (db_->table_exists(vec_table)) {
@@ -2826,11 +3040,15 @@ protected:
 private:
     template<typename U> friend class query;
     template<typename U> friend class results;
+    friend class synchronizer_base;
     friend class synchronizer;
 
     configuration config_;
     std::unique_ptr<database> db_;       // Write connection
     std::unique_ptr<database> read_db_;  // Read-only connection for concurrent reads
+    std::unique_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler
+                                               // (avoids SQLite lock contention with read_db_
+                                               // when observer callbacks query on MainActor)
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<synchronizer> synchronizer_;
 
@@ -2849,6 +3067,13 @@ private:
     std::function<void(bool)> on_sync_state_change_;
     std::function<void(const std::string&)> on_sync_error_;
     synchronizer::on_progress_handler on_sync_progress_;
+
+    // Cross-process idle hint — fires on the xproc background thread (NOT the
+    // scheduler) when a Darwin notification arrives but no new AuditLog entries
+    // exist. Used by passive sync progress observers to re-check pending counts
+    // without going through the general observer system / MainActor scheduler.
+    std::mutex xproc_idle_mutex_;
+    std::function<void()> on_xproc_idle_;
 
     // Synchronizer flag - true if this connection handles remote changes
     bool is_synchronizer_ = false;
@@ -2902,8 +3127,9 @@ private:
     // Update hook buffers changes, WAL hook flushes on commit (matches Swift's pattern)
     void setup_change_hook();
 
-    // Cross-process observation
-    std::unique_ptr<cross_process_notifier> xproc_notifier_;
+    // Cross-process observation — notifier is owned by instance_registry
+    // (one per path per process). This is a non-owning pointer for post_notification.
+    cross_process_notifier* shared_xproc_notifier_ = nullptr;
     std::atomic<int64_t> last_seen_audit_id_{0};
     // Shared mutex captured by the xproc callback lambda so it outlives this
     // object.  The destructor locks it while unregistering, preventing the
@@ -4735,15 +4961,15 @@ inline void lattice_db::close() {
     }
     // 3. Stop all sync threads while all members are still alive.
     teardown_sync();
-    // 4. Now safe to unregister — no sync threads, no in-flight notifications.
-    {
-        std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
-        instance_registry::instance().unregister_instance(config_.path, this);
-    }
-    if (xproc_notifier_) {
-        xproc_notifier_->stop_listening();
-        xproc_notifier_.reset();
-    }
+    // 4. Drain the scheduler before unregistering — the xproc callback may
+    //    have queued observer work on the scheduler. Must complete while
+    //    members (db_, read_db_, etc.) are still alive.
+    if (scheduler_) scheduler_->shutdown();
+    // 5. Unregister — must NOT hold xproc_callback_mutex_ (deadlock with notifier thread).
+    instance_registry::instance().unregister_instance(config_.path, this);
+    // shared_xproc_notifier_ is owned by instance_registry — cleaned up
+    // when the last instance for this path is unregistered.
+    shared_xproc_notifier_ = nullptr;
     read_db_.reset();
     db_.reset();
 }
@@ -4754,22 +4980,35 @@ inline lattice_db::~lattice_db() {
              (void*)this, config_.path.c_str(), (long long)n);
     // close() may have already been called; each step is idempotent.
     // 1. Mark as dying (idempotent if close() already ran).
+    LOG_INFO("lattice_db", "~dtor: setting alive=false, refcount=%d",
+             (int)guard_->notify_refcount.load(std::memory_order_seq_cst));
     guard_->alive.store(false, std::memory_order_seq_cst);
     // 2. Wait for any in-flight notify_change() calls to complete.
+    int _spin_iter = 0;
     while (guard_->notify_refcount.load(std::memory_order_seq_cst) > 0) {
+        if (++_spin_iter % 1000000 == 0) {
+            LOG_INFO("lattice_db", "~dtor: SPINNING refcount=%d iter=%d",
+                     (int)guard_->notify_refcount.load(std::memory_order_seq_cst), _spin_iter);
+        }
         std::this_thread::yield();
     }
+    LOG_INFO("lattice_db", "~dtor: refcount drained");
     // 3. Stop all sync threads.
     teardown_sync();
-    // 4. Unregister after all sync threads are stopped.
-    {
-        std::lock_guard<std::mutex> lock(*xproc_callback_mutex_);
-        instance_registry::instance().unregister_instance(config_.path, this);
-    }
-    if (xproc_notifier_) {
-        xproc_notifier_->stop_listening();
-        xproc_notifier_.reset();
-    }
+    LOG_INFO("lattice_db", "~dtor: teardown_sync done");
+    // 4. Drain scheduler.
+    LOG_INFO("lattice_db", "~dtor: shutting down scheduler");
+    if (scheduler_) scheduler_->shutdown();
+    LOG_INFO("lattice_db", "~dtor: scheduler shutdown done");
+    // 5. Unregister. Do NOT hold xproc_callback_mutex_ during unregister —
+    //    unregister_instance takes registry mutex_, and may destroy the notifier
+    //    (stop_listening → thread join). The notifier callback also takes
+    //    registry mutex_ via for_each_alive → deadlock if we hold both.
+    LOG_INFO("lattice_db", "~dtor: calling unregister_instance");
+    instance_registry::instance().unregister_instance(config_.path, this);
+    LOG_INFO("lattice_db", "~dtor: unregister done");
+    shared_xproc_notifier_ = nullptr;
+    LOG_INFO("lattice_db", "~dtor: complete");
 }
 
 inline bool lattice_db::is_sync_connected() const {

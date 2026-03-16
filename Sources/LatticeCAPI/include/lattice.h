@@ -48,6 +48,8 @@ typedef enum {
     LATTICE_KIND_PRIMITIVE = 0,
     LATTICE_KIND_LINK = 1,
     LATTICE_KIND_LINK_LIST = 2,
+    LATTICE_KIND_VIRTUAL_LIST = 3,
+    LATTICE_KIND_VIRTUAL_LINK = 4,
 } lattice_property_kind_t;
 
 typedef struct {
@@ -57,7 +59,22 @@ typedef struct {
     const char* target_table;   // For links (NULL if primitive)
     const char* link_table;     // For link lists (NULL otherwise)
     bool nullable;
+    // Index and constraint flags
+    bool is_indexed;            // Create non-unique index on this column
+    bool is_unique;             // Create unique constraint on this column
+    bool is_full_text;          // Create FTS5 virtual table for this column
+    bool is_vector;             // Create vec0 virtual table for this column
+    bool is_geo_bounds;         // Create R*Tree virtual table for this column
+    const char* column_name;    // Custom column name mapping (NULL = use field name)
 } lattice_property_t;
+
+// Compound unique constraint (across multiple columns)
+typedef struct {
+    const char* table_name;
+    const char** property_names;
+    size_t property_count;
+    bool allows_upsert;
+} lattice_unique_constraint_t;
 
 typedef struct {
     const char* table_name;
@@ -87,6 +104,13 @@ void lattice_db_retain(lattice_db_t* db);
 
 // Release a reference to the database (frees when ref_count hits 0)
 void lattice_db_release(lattice_db_t* db);
+
+// Explicitly close database connections and stop background services.
+// Call before release to ensure clean shutdown. Safe to call multiple times.
+void lattice_db_close(lattice_db_t* db);
+
+// Check if the sync WebSocket connection is established.
+bool lattice_db_is_sync_connected(lattice_db_t* db);
 
 // =============================================================================
 // Object Lifecycle
@@ -489,6 +513,171 @@ void lattice_set_network_factory(lattice_network_factory_t* factory);
 
 // Attach a network factory to a specific database
 void lattice_db_set_network_factory(lattice_db_t* db, lattice_network_factory_t* factory);
+
+// =============================================================================
+// Query Extensions (FTS5, Vector Search, Geospatial, Distinct/Group)
+// =============================================================================
+
+// Distance metric for vector search
+typedef enum {
+    LATTICE_DISTANCE_L2 = 0,       // Euclidean distance (default)
+    LATTICE_DISTANCE_COSINE = 1,   // Cosine distance
+    LATTICE_DISTANCE_L1 = 2,       // Manhattan distance
+} lattice_distance_metric_t;
+
+// KNN result: globalId + distance
+typedef struct {
+    const char* global_id;  // Caller must free with lattice_string_free()
+    double distance;
+} lattice_knn_result_t;
+
+// Perform KNN (K-Nearest Neighbors) vector search
+// Returns array of results, caller must free each global_id and the array itself
+// result_count is set to the number of results returned
+lattice_knn_result_t* lattice_db_query_nearest(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* column_name,
+    const uint8_t* query_vector,
+    size_t vector_size,
+    int k,
+    lattice_distance_metric_t metric,
+    const char* where_clause        // NULL for no filtering
+);
+// Get count from last nearest query
+size_t lattice_knn_results_count(lattice_knn_result_t* results);
+// Free KNN results
+void lattice_knn_results_free(lattice_knn_result_t* results, size_t count);
+
+// Full-text search query
+// Returns results matching the FTS5 MATCH expression on the given column
+lattice_results_t* lattice_db_query_fts(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* column_name,
+    const char* match_expression,
+    const char* order_by,           // NULL for rank order
+    int64_t limit                   // 0 for unlimited
+);
+
+// Geospatial bounding box query (R*Tree)
+// Returns objects within the given bounding box
+lattice_results_t* lattice_db_query_within_bounds(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* column_name,
+    double min_lat,
+    double max_lat,
+    double min_lon,
+    double max_lon,
+    const char* where_clause,       // NULL for no additional filtering
+    int64_t limit                   // 0 for unlimited
+);
+
+// Query with DISTINCT or GROUP BY
+lattice_results_t* lattice_db_query_distinct(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* distinct_by,        // Column name for DISTINCT (GROUP BY)
+    const char* where_clause,
+    const char* order_by,
+    int64_t limit,
+    int64_t offset
+);
+
+// Count with DISTINCT/GROUP BY support
+size_t lattice_db_count_distinct(
+    lattice_db_t* db,
+    const char* table_name,
+    const char* where_clause,
+    const char* group_by,
+    const char* distinct_by
+);
+
+// =============================================================================
+// Database Attachment (cross-database queries)
+// =============================================================================
+
+// Attach another database for cross-DB queries (UNION ALL)
+lattice_status_t lattice_db_attach(lattice_db_t* db, lattice_db_t* other);
+
+// =============================================================================
+// Migration Support
+// =============================================================================
+
+// Opaque migration context
+typedef struct lattice_migration_context lattice_migration_context_t;
+
+// Migration callback: called for each row during migration
+// old_values/new_values are JSON objects mapping column names to values
+typedef void (*lattice_migration_row_fn)(
+    void* context,
+    const char* old_values_json,
+    char** new_values_json           // Caller sets this to transformed JSON (must be malloc'd)
+);
+
+// Create a database with schema version and migration support
+lattice_db_t* lattice_db_create_with_migration(
+    const char* path,
+    const lattice_schema_t* schemas,
+    size_t schema_count,
+    lattice_scheduler_t* scheduler,
+    int32_t target_schema_version,
+    void* migration_context,
+    lattice_migration_row_fn migration_fn,
+    const char* migration_table      // Table name to migrate (NULL = no row migration)
+);
+
+// =============================================================================
+// Add with preserved global ID (for sync / cross-DB identity)
+// =============================================================================
+
+// Add an object with a specific globalId (preserving identity across databases)
+lattice_object_t* lattice_db_add_with_global_id(
+    lattice_db_t* db,
+    lattice_object_t* obj,
+    const char* global_id
+);
+
+// =============================================================================
+// IPC Sync Configuration
+// =============================================================================
+
+// Create a database with IPC sync targets
+lattice_db_t* lattice_db_create_with_ipc(
+    const char* path,
+    const lattice_schema_t* schemas,
+    size_t schema_count,
+    lattice_scheduler_t* scheduler,
+    const char** ipc_channels,
+    size_t ipc_channel_count
+);
+
+// =============================================================================
+// Sync Filter
+// =============================================================================
+
+// Set sync filter for upload (per-table predicates)
+// filter_json: JSON array of {"table": "...", "predicate": "..."} objects
+lattice_status_t lattice_db_set_sync_filter(lattice_db_t* db, const char* filter_json);
+
+// Clear sync filter (upload everything)
+lattice_status_t lattice_db_clear_sync_filter(lattice_db_t* db);
+
+// =============================================================================
+// Cross-Process Observation
+// =============================================================================
+
+// Register a cross-process observer (fires when another process modifies the DB)
+uint64_t lattice_db_observe_cross_process(
+    lattice_db_t* db,
+    const char* table_name,
+    void* context,
+    lattice_table_observer_fn callback
+);
+
+// Remove a cross-process observer
+void lattice_db_remove_cross_process_observer(lattice_db_t* db, uint64_t token);
 
 #ifdef __cplusplus
 }

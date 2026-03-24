@@ -536,15 +536,7 @@ extern "C" const char* lattice_object_get_table_name(lattice_object_t* obj) {
     if (!obj) return nullptr;
     auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
     try {
-        // Access underlying dynamic_object to get table name
-        auto* dyn = ref->get();
-        if (dyn->lattice) {
-            // Managed object - need to get from managed_
-            g_returned_string = ref->get()->debug_description();  // TODO: expose table_name properly
-        } else {
-            // Unmanaged - get directly from unmanaged_.table_name
-            // This requires friend access or a public method
-        }
+        g_returned_string = ref->get()->get_table_name();
         return g_returned_string.c_str();
     } catch (...) {
         return nullptr;

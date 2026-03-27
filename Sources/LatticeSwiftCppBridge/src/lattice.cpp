@@ -77,22 +77,21 @@ bool managed<swift_dynamic_object>::has_value(const std::string& name) const {
     if (name == "id" || name == "globalId") {
         return true;
     }
-    if (!properties_.count(name)) {
-        return false;
+    if (properties_.count(name)) {
+        const auto& property_desc = this->properties_.at(name);
+        if (property_desc.kind == property_kind::link) {
+            managed<swift_dynamic_object *> m;
+            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+            auto base = static_cast<model_base>(*this);
+            m.bind_to_parent(&base, property_desc);
+            return m.has_value();
+        }
     }
-    const auto& property_desc = this->properties_.at(name);
-
-    if (property_desc.kind == property_kind::link) {
-        managed<swift_dynamic_object *> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
-        auto base = static_cast<model_base>(*this);
-        m.bind_to_parent(&base, property_desc);
-        return m.has_value();
-    } else {
-        managed<std::optional<std::string>> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
-        return m.has_value();
-    }
+    // Fall through to DB check for non-link properties (or properties
+    // not in the schema, e.g. AuditLog queried without being in init)
+    managed<std::optional<std::string>> m;
+    m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+    return m.has_value();
 }
 
 void dynamic_object::set_int(const std::string& name, int64_t value) {
@@ -678,6 +677,30 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             } else {
                 // Table exists — ensure triggers are up to date (pass 0 dimensions, ignored)
                 ensure_vec0_table(schema.table_name, prop.name, 0);
+
+                // Reconcile missing vec0 entries. Another connection (e.g. IPC
+                // sync) may have inserted model rows whose vec0 triggers fired
+                // on that connection but not this one. Fill gaps once at init;
+                // the xproc change hook handles incremental updates afterward.
+                try {
+                    auto mc = db().query(
+                        "SELECT COUNT(*) as cnt FROM " + schema.table_name +
+                        " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
+                    auto vc = db().query(
+                        "SELECT COUNT(*) as cnt FROM " + vec_table);
+                    int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
+                    int64_t v = vc.empty() ? 0 : std::get<int64_t>(vc[0].at("cnt"));
+                    if (m > v) {
+                        LOG_INFO("swift_lattice", "vec0 init reconcile: model=%lld vec0=%lld, filling gaps in %s",
+                                 (long long)m, (long long)v, vec_table.c_str());
+                        db().execute(
+                            "INSERT OR IGNORE INTO " + vec_table + "(global_id, embedding) "
+                            "SELECT globalId, " + prop.name + " FROM " + schema.table_name +
+                            " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
+                    }
+                } catch (const std::exception& e) {
+                    LOG_WARN("swift_lattice", "vec0 init reconcile failed for %s: %s", vec_table.c_str(), e.what());
+                }
             }
         }
     }

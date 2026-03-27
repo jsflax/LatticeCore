@@ -1746,6 +1746,10 @@ public:
                     }
                 }
             }
+
+            // Defensive vec0 cleanup: the DELETE trigger should have removed
+            // the vec0 entry, but under write contention it can silently fail.
+            cleanup_vec0_entries(table_name, {gid});
         }
 
         obj.notify_deleted();
@@ -1838,11 +1842,25 @@ public:
                 }
             }
 
+            // Collect globalIds for post-delete vec0 cleanup.
+            std::vector<std::string> gids_for_vec0;
+            for (const auto& gid_row : gid_rows) {
+                auto gid_it = gid_row.find("globalId");
+                if (gid_it == gid_row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                auto& gid = std::get<std::string>(gid_it->second);
+                if (!gid.empty()) gids_for_vec0.push_back(gid);
+            }
+
             std::string sql = "DELETE FROM " + table_name;
             if (where_clause.has_value()) {
                 sql += " WHERE " + *where_clause;
             }
             db_->execute(sql);
+
+            // Defensive vec0 cleanup: the DELETE trigger should have removed
+            // vec0 entries, but under write contention it can silently fail.
+            cleanup_vec0_entries(table_name, gids_for_vec0);
+
             return true;
         } catch (...) {
             return false;
@@ -2817,6 +2835,86 @@ public:
         }
     }
 
+    /// Explicitly remove vec0 entries for the given globalIds.
+    /// Call after DELETE FROM model table to clean up entries that the
+    /// DELETE trigger may have failed to remove (vec0 DELETE is unreliable
+    /// inside triggers under write contention — SQLITE_BUSY is silently
+    /// swallowed, leaving orphan entries that bloat chunk storage).
+    void cleanup_vec0_entries(const std::string& table_name,
+                              const std::vector<std::string>& global_ids) {
+        if (global_ids.empty()) return;
+        try {
+            auto pattern = "_" + table_name + "_%_vec";
+            auto vec_tables = db_->query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                {pattern});
+            for (const auto& vt_row : vec_tables) {
+                auto name_it = vt_row.find("name");
+                if (name_it == vt_row.end() || !std::holds_alternative<std::string>(name_it->second)) continue;
+                auto& vec_table = std::get<std::string>(name_it->second);
+                for (const auto& gid : global_ids) {
+                    try {
+                        db_->execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {gid});
+                    } catch (...) {
+                        // vec0 table may not exist yet — non-fatal
+                    }
+                }
+            }
+        } catch (...) {
+            // Non-fatal — vec0 is an optimization layer
+        }
+    }
+
+    /// Rebuild the vec0 index for a model table by dropping and recreating it
+    /// with only live entries. Call when orphan accumulation has bloated the
+    /// chunk storage beyond acceptable size.
+    /// Returns the number of entries in the rebuilt index.
+    int64_t rebuild_vec0(const std::string& model_table,
+                         const std::string& column_name,
+                         int dimensions) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+
+        // Drop the existing vec0 table and all its shadow tables
+        if (db_->table_exists(vec_table)) {
+            // Drop triggers first
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+            db_->execute("DROP TABLE IF EXISTS " + vec_table);
+        }
+
+        // Recreate vec0 table and triggers
+        ensure_vec0_table(model_table, column_name, dimensions);
+
+        // Re-insert from model table (using main. to avoid TEMP views)
+        std::string main_table = "main." + model_table;
+        auto rows = db_->query(
+            "SELECT globalId, " + column_name + " FROM " + main_table + " "
+            "WHERE " + column_name + " IS NOT NULL "
+            "AND length(" + column_name + ") > 0");
+
+        int64_t count = 0;
+        for (const auto& row : rows) {
+            auto gid_it = row.find("globalId");
+            if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+            auto& gid = std::get<std::string>(gid_it->second);
+            auto col_it = row.find(column_name);
+            if (col_it == row.end() ||
+                !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+            auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+            if (vec_data.empty()) continue;
+            try {
+                db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                            {gid, vec_data});
+                ++count;
+            } catch (...) {}
+        }
+
+        LOG_INFO("vec0", "rebuild_vec0: %s rebuilt with %lld entries",
+                 vec_table.c_str(), (long long)count);
+        return count;
+    }
+
     /// Update or insert a vector into the vec0 table.
     /// vector_data should be packed float32 bytes (4 bytes per dimension).
     void upsert_vec0(const std::string& model_table,
@@ -2856,6 +2954,74 @@ public:
         }
     }
 
+    /// Drop and rebuild the vec0 virtual table for a model+column, re-inserting
+    /// all vectors from the model table. Use this to reclaim space from orphan
+    /// entries that accumulated from trigger failures or table rebuilds.
+    /// Returns the number of vectors re-inserted, or -1 on failure.
+    int64_t vacuum_vec0(const std::string& model_table,
+                        const std::string& column_name) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+        try {
+            // Infer dimensions from existing vec0 info or first non-empty embedding
+            int dimensions = 0;
+            auto info_rows = db_->query(
+                "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
+            if (!info_rows.empty()) {
+                auto it = info_rows[0].find("value");
+                if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                    dimensions = static_cast<int>(std::get<int64_t>(it->second));
+                }
+            }
+            if (dimensions == 0) {
+                auto sample = db_->query(
+                    "SELECT length(" + column_name + ") as len FROM main." + model_table +
+                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0 LIMIT 1");
+                if (!sample.empty()) {
+                    auto it = sample[0].find("len");
+                    if (it != sample[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                        dimensions = static_cast<int>(std::get<int64_t>(it->second)) / static_cast<int>(sizeof(float));
+                    }
+                }
+            }
+            if (dimensions == 0) return 0;
+
+            // Drop the vec0 virtual table (cascades to shadow tables)
+            db_->execute("DROP TABLE IF EXISTS " + vec_table);
+
+            // Recreate vec0 + triggers
+            ensure_vec0_table(model_table, column_name, dimensions);
+
+            // Re-insert all vectors from the model table
+            auto all_rows = db_->query(
+                "SELECT globalId, " + column_name + " FROM main." + model_table +
+                " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
+
+            int64_t count = 0;
+            for (const auto& row : all_rows) {
+                auto gid_it = row.find("globalId");
+                if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                auto& gid = std::get<std::string>(gid_it->second);
+                auto col_it = row.find(column_name);
+                if (col_it == row.end() ||
+                    !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                if (vec_data.empty()) continue;
+                try {
+                    db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                {gid, vec_data});
+                    count++;
+                } catch (...) {}
+            }
+
+            LOG_INFO("vacuum_vec0", "Rebuilt %s: %lld vectors from %zu rows",
+                     vec_table.c_str(), (long long)count, all_rows.size());
+            return count;
+        } catch (const std::exception& e) {
+            LOG_ERROR("vacuum_vec0", "Failed to vacuum %s: %s", vec_table.c_str(), e.what());
+            return -1;
+        }
+    }
+
     /// Perform a KNN (K-Nearest Neighbors) query.
     /// Returns up to k results sorted by distance.
     /// Optional where_clause filters on the main model table (e.g., "category = 'foo'").
@@ -2876,6 +3042,9 @@ public:
 
         std::vector<knn_result> results;
 
+        LOG_DEBUG("knn_query", "START table=%s vec=%s k=%d metric=%s",
+                  model_table.c_str(), vec_table.c_str(), k, dist_func.c_str());
+
         // Ensure vec0 table exists. It may not have been created yet if
         // data arrived via sync after ensure_swift_tables ran with no vector data.
         if (!db_->table_exists(vec_table)) {
@@ -2885,75 +3054,12 @@ public:
             }
         }
 
-        // Ensure vec0 has entries for all model rows with vector data.
-        // vec0 virtual table state is per-connection — another connection
-        // (e.g. IPC sync db) may have written to the base table but this
-        // connection's vec0 instance doesn't see it. Reconcile by comparing
-        // counts and re-inserting from the model table when they mismatch.
-        if (db_->table_exists(vec_table)) {
-            try {
-                auto model_cnt_rows = db_->query(
-                    "SELECT COUNT(*) as cnt FROM " + model_table + " "
-                    "WHERE " + column_name + " IS NOT NULL "
-                    "AND length(" + column_name + ") > 0");
-                auto vec_cnt_rows = db_->query(
-                    "SELECT COUNT(*) as cnt FROM " + vec_table);
-
-                int64_t model_cnt = model_cnt_rows.empty() ? 0
-                    : std::get<int64_t>(model_cnt_rows[0].at("cnt"));
-                int64_t vec_cnt = vec_cnt_rows.empty() ? 0
-                    : std::get<int64_t>(vec_cnt_rows[0].at("cnt"));
-
-                if (model_cnt != vec_cnt) {
-                    // Try to acquire write lock with short timeout.
-                    // If the DB is busy (sync writes in progress), skip reconciliation —
-                    // the query still works with stale vec0 data, and we'll reconcile
-                    // on the next query when the lock is free.
-                    if (!db_->try_begin_immediate(100)) {
-                        LOG_DEBUG("knn_query", "vec0 reconcile skipped (busy): %s", vec_table.c_str());
-                    } else {
-                        LOG_INFO("knn_query", "vec0 count mismatch: model=%lld vec0=%lld, reconciling %s",
-                                 (long long)model_cnt, (long long)vec_cnt, vec_table.c_str());
-                        auto all_rows = db_->query(
-                            "SELECT globalId, " + column_name + " FROM " + model_table + " "
-                            "WHERE " + column_name + " IS NOT NULL "
-                            "AND length(" + column_name + ") > 0");
-                        try {
-                            for (const auto& row : all_rows) {
-                                auto gid_it = row.find("globalId");
-                                if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
-                                auto& gid = std::get<std::string>(gid_it->second);
-                                auto col_it = row.find(column_name);
-                                if (col_it == row.end() ||
-                                    !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
-                                auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
-                                if (vec_data.empty()) continue;
-                                try {
-                                    db_->execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {gid});
-                                    db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
-                                                {gid, vec_data});
-                                } catch (const std::exception& e) {
-                                    LOG_DEBUG("knn_query", "vec0 reconcile row %s skipped: %s",
-                                             gid.c_str(), e.what());
-                                }
-                            }
-                            db_->commit();
-                            LOG_INFO("knn_query", "vec0 reconciled %zu entries for %s",
-                                     all_rows.size(), vec_table.c_str());
-                        } catch (...) {
-                            db_->rollback();
-                        }
-                    }
-                }
-            } catch (const std::exception& e) {
-                LOG_WARN("knn_query", "vec0 reconcile failed: %s", e.what());
-            }
-        }
-
         // Query main DB's vec table
         if (db_->table_exists(vec_table)) {
+            LOG_DEBUG("knn_query", "querying main vec table: %s", vec_table.c_str());
             auto main_results = knn_query_single(
                 "main", vec_table, model_table, dist_func, query_vector, k, where_clause);
+            LOG_DEBUG("knn_query", "main query returned %zu results", main_results.size());
             results.insert(results.end(), main_results.begin(), main_results.end());
         }
 
@@ -2964,10 +3070,16 @@ public:
             std::string check_sql = "SELECT name FROM \"" + alias + "\".sqlite_master "
                                     "WHERE type='table' AND name=?";
             auto check = db_->query(check_sql, {vec_table});
-            if (check.empty()) continue;
+            if (check.empty()) {
+                LOG_DEBUG("knn_query", "attached DB %s has no vec table %s, skipping",
+                         alias.c_str(), vec_table.c_str());
+                continue;
+            }
 
+            LOG_DEBUG("knn_query", "querying attached vec table: %s.%s", alias.c_str(), vec_table.c_str());
             auto attached_results = knn_query_single(
                 "\"" + alias + "\"", vec_table, model_table, dist_func, query_vector, k, where_clause);
+            LOG_DEBUG("knn_query", "attached query returned %zu results", attached_results.size());
             results.insert(results.end(), attached_results.begin(), attached_results.end());
         }
 
@@ -3010,7 +3122,12 @@ public:
                 << " ORDER BY distance LIMIT " << k;
         }
 
+        LOG_DEBUG("knn_query_single", "SQL: %s", sql.str().c_str());
+        auto t0 = std::chrono::steady_clock::now();
         auto rows = db_->query(sql.str(), {query_vector});
+        auto t1 = std::chrono::steady_clock::now();
+        auto query_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        LOG_DEBUG("knn_query_single", "query took %lldms, %zu rows", (long long)query_ms, rows.size());
 
         std::vector<knn_result> results;
         results.reserve(rows.size());
@@ -3517,10 +3634,26 @@ private:
             }
         }
 
-        // 2. Rename existing table
+        // 2. Drop and recreate vec0 virtual tables for vector columns.
+        //    The INSERT INTO...SELECT in step 6 fires vec0 INSERT triggers
+        //    which create fresh entries. Without this drop, old entries from
+        //    the pre-rebuild table persist as orphans (same globalId gets a
+        //    new vec0 rowid while the old one stays, bloating chunk storage).
+        for (const auto& prop : schema.properties) {
+            if (prop.is_vector && prop.type == column_type::blob) {
+                std::string vec_table = "_" + table + "_" + prop.name + "_vec";
+                if (db_->table_exists(vec_table)) {
+                    LOG_INFO("migrate", "rebuild_table: dropping vec0 table %s", vec_table.c_str());
+                    db_->execute("DROP TABLE IF EXISTS " + vec_table);
+                    // Shadow tables are dropped automatically by vec0
+                }
+            }
+        }
+
+        // 3. Rename existing table
         db_->execute("ALTER TABLE " + table + " RENAME TO " + tmp);
 
-        // 3. Create new table with correct schema (including fresh triggers)
+        // 4. Create new table with correct schema (including fresh triggers)
         create_model_table(schema);
 
         // 4. Build column lists for INSERT

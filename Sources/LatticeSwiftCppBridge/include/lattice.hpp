@@ -585,6 +585,14 @@ public:
         sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
     }
 
+    int64_t rebuild_vec0(const std::string& table, const std::string& column, int dims) {
+        return lattice_db::rebuild_vec0(table, column, dims);
+    }
+
+    int64_t vacuum_vec0(const std::string& table, const std::string& column) {
+        return lattice_db::vacuum_vec0(table, column);
+    }
+
     /// Explicitly close all database connections and stop background services.
     /// Also evicts this instance from the LatticeCache so subsequent opens
     /// on the same path create a fresh instance (e.g., after nuclear compaction).
@@ -1228,40 +1236,13 @@ public:
             return results;
         }
 
-        // Reconcile vec0 tables before querying — another connection (e.g.
-        // IPC sync) may have written to the model table but this connection's
-        // vec0 virtual table doesn't see it.
+        // Ensure vec0 tables exist — they may not have been created yet if
+        // data arrived via sync after ensure_swift_tables ran with no vector data.
         for (const auto& vc : vectors) {
             std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
             int dims = static_cast<int>(vc.query_vector.size() / sizeof(float));
             if (dims > 0 && !db().table_exists(vec_table)) {
                 ensure_vec0_table(table_name, vc.column, dims);
-            }
-            if (db().table_exists(vec_table)) {
-                try {
-                    auto mc = db().query(
-                        "SELECT COUNT(*) as cnt FROM " + table_name +
-                        " WHERE " + vc.column + " IS NOT NULL AND length(" + vc.column + ") > 0");
-                    auto vc_rows = db().query("SELECT COUNT(*) as cnt FROM " + vec_table);
-                    int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
-                    int64_t v = vc_rows.empty() ? 0 : std::get<int64_t>(vc_rows[0].at("cnt"));
-                    if (m != v) {
-                        auto rows = db().query(
-                            "SELECT globalId, " + vc.column + " FROM " + table_name +
-                            " WHERE " + vc.column + " IS NOT NULL AND length(" + vc.column + ") > 0");
-                        for (const auto& row : rows) {
-                            auto git = row.find("globalId");
-                            if (git == row.end() || !std::holds_alternative<std::string>(git->second)) continue;
-                            auto& gid = std::get<std::string>(git->second);
-                            auto cit = row.find(vc.column);
-                            if (cit == row.end() || !std::holds_alternative<std::vector<uint8_t>>(cit->second)) continue;
-                            auto& vd = std::get<std::vector<uint8_t>>(cit->second);
-                            if (vd.empty()) continue;
-                            db().execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {gid});
-                            db().execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)", {gid, vd});
-                        }
-                    }
-                } catch (...) {}
             }
         }
 

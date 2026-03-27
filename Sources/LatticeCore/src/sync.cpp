@@ -2109,8 +2109,19 @@ static std::vector<std::string> apply_remote_changes_impl(
                 }
 
                 // Generate and execute the SQL instruction
+                LOG_INFO("apply_remote", "entry[%zu]: table=%s op=%s globalRowId=%s changedFields=%zu changedFieldsNames=%zu",
+                         i, entry.table_name.c_str(), entry.operation.c_str(),
+                         entry.global_row_id.c_str(),
+                         entry.changed_fields.size(), entry.changed_fields_names.size());
+                for (const auto& [key, val] : entry.changed_fields) {
+                    LOG_INFO("apply_remote", "  field: %s kind=%d", key.c_str(), static_cast<int>(val.kind));
+                }
+                for (const auto& name : entry.changed_fields_names) {
+                    LOG_INFO("apply_remote", "  fieldName: %s", name.c_str());
+                }
                 auto schema = db.get_table_schema(entry.table_name);
                 auto [sql, params] = entry.generate_instruction(schema);
+                LOG_INFO("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
 
                 // Resolve the local rowId and operation for this object.
                 // flush_changes correlates model changes with AuditLog entries by

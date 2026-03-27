@@ -236,16 +236,6 @@ void database::create_table(const table_schema& schema) {
 
         if (!col.nullable) {
             sql << " NOT NULL";
-            // Always emit a type-appropriate DEFAULT for NOT NULL columns.
-            // This ensures sync-replayed INSERTs that omit columns (e.g., when
-            // new columns are added after the audit log entry was created) don't
-            // fail with NOT NULL constraint violations.
-            switch (col.type) {
-                case column_type::integer: sql << " DEFAULT 0"; break;
-                case column_type::real: sql << " DEFAULT 0.0"; break;
-                case column_type::text: sql << " DEFAULT ''"; break;
-                case column_type::blob: sql << " DEFAULT X''"; break;
-            }
         }
         if (col.is_unique) {
             sql << " UNIQUE";

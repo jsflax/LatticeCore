@@ -19,6 +19,13 @@ typedef struct lattice_results lattice_results_t;
 typedef struct lattice_link_list lattice_link_list_t;
 
 // =============================================================================
+// Logging
+// =============================================================================
+
+/// Set global log level: 0=off, 1=error, 2=warn, 3=info, 4=debug
+void lattice_set_log_level(int level);
+
+// =============================================================================
 // Error Handling
 // =============================================================================
 

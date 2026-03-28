@@ -3046,11 +3046,34 @@ public:
                   model_table.c_str(), vec_table.c_str(), k, dist_func.c_str());
 
         // Ensure vec0 table exists. It may not have been created yet if
-        // data arrived via sync after ensure_swift_tables ran with no vector data.
+        // data arrived via sync after ensure_swift_tables ran with no vector data,
+        // or if inserts happened before vec0 was created (C API path).
         if (!db_->table_exists(vec_table)) {
             int dimensions = static_cast<int>(query_vector.size() / sizeof(float));
             if (dimensions > 0) {
                 ensure_vec0_table(model_table, column_name, dimensions);
+                // Backfill: rows inserted before vec0 existed won't have
+                // triggered the INSERT trigger. Re-insert them now.
+                try {
+                    auto rows = db_->query(
+                        "SELECT globalId, " + column_name + " FROM " + model_table + " "
+                        "WHERE " + column_name + " IS NOT NULL "
+                        "AND length(" + column_name + ") > 0");
+                    for (const auto& row : rows) {
+                        auto gid_it = row.find("globalId");
+                        if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                        auto& gid = std::get<std::string>(gid_it->second);
+                        auto col_it = row.find(column_name);
+                        if (col_it == row.end() ||
+                            !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                        auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                        if (vec_data.empty()) continue;
+                        try {
+                            db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                        {gid, vec_data});
+                        } catch (...) {}
+                    }
+                } catch (...) {}
             }
         }
 

@@ -11,6 +11,10 @@
 #include <cstring>
 #include <cstdlib>
 
+extern "C" void lattice_set_log_level(int level) {
+    lattice::set_log_level(static_cast<lattice::log_level>(level));
+}
+
 // Thread-local error message storage
 static thread_local std::string g_last_error;
 

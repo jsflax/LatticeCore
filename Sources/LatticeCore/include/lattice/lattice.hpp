@@ -3816,6 +3816,14 @@ private:
             )
         )";
         db_->execute(sql);
+
+        // Partial index for sync queries — only indexes unsynchronized entries,
+        // which are the ones query_audit_log_for_sync needs to scan.
+        db_->execute(R"(
+            CREATE INDEX IF NOT EXISTS idx_audit_log_pending_sync
+                ON AuditLog(isSynchronized)
+                WHERE isSynchronized = 0
+        )");
     }
 
     void ensure_sync_control_table() {

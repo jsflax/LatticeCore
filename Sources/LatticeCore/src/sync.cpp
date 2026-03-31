@@ -1465,6 +1465,14 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     }
 
     for (size_t i = 0; i < entries.size(); i += config_.chunk_size) {
+        // Bail out early if connection dropped mid-send — remaining chunks
+        // will be re-queried and sent on the next successful connection.
+        if (!is_connected_) {
+            LOG_INFO("synchronizer", "send_entries: connection lost after %zu/%zu entries, stopping",
+                     i, entries.size());
+            break;
+        }
+
         size_t end = std::min(i + config_.chunk_size, entries.size());
         std::vector<audit_log_entry> chunk(entries.begin() + i, entries.begin() + end);
 
@@ -1478,6 +1486,10 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
 
 void synchronizer_base::upload_pending_changes() {
     LOG_DEBUG("synchronizer", "upload_pending_changes called");
+    if (!is_connected_) {
+        LOG_DEBUG("synchronizer", "upload_pending_changes: not connected, skipping");
+        return;
+    }
     auto entries = query_pending_entries();
     if (entries.empty()) return;
     auto classified = classify_entries(entries);
@@ -1915,17 +1927,9 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
     //   4. No sync_state row, isSynchronized=1 → eagerly cleaned up (all sync_ids
     //      have synced), EXCLUDED. Without this check, entries bounce in an infinite
     //      loop: sent → ACK'd → eager cleanup deletes row → re-queried as pending.
-    std::string sql = R"(
-        SELECT a.* FROM AuditLog a
-        LEFT JOIN _lattice_sync_state ss
-            ON ss.audit_entry_id = a.id AND ss.sync_id = ?
-        WHERE (ss.is_synchronized = 0
-               OR (ss.is_synchronized IS NULL AND a.isSynchronized = 0))
-    )";
-
-    // Pre-filter at the SQL level by both table name AND where_clause predicate.
-    // This avoids loading thousands of irrelevant entries from unrelated tables
-    // or entries for rows that don't match the sync filter.
+    // Build the sync filter predicate (shared by both UNION branches).
+    // Pre-filters by table name AND where_clause predicate to avoid loading
+    // thousands of irrelevant entries from unrelated tables.
     //
     // For tables with a where_clause, we still pass through:
     //   1. DELETE entries (row is gone — app layer checks sync_set membership)
@@ -1933,17 +1937,16 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
     //   3. Rows matching the where_clause predicate
     // This is safe because reconcile_sync_filter() runs BEFORE upload_pending_changes()
     // in on_websocket_open, so sync_set is already up-to-date by the time we query.
+    std::string filter_clause;
     if (sync_filter && !sync_filter->empty()) {
-        sql += " AND (";
+        filter_clause = " AND (";
         for (size_t i = 0; i < sync_filter->size(); ++i) {
-            if (i > 0) sql += " OR ";
+            if (i > 0) filter_clause += " OR ";
             const auto& entry = (*sync_filter)[i];
             if (!entry.where_clause || entry.where_clause->empty()) {
-                // No predicate — all rows for this table
-                sql += "a.tableName = '" + entry.table_name + "'";
+                filter_clause += "a.tableName = '" + entry.table_name + "'";
             } else {
-                // Predicate filter: pass DELETEs, sync-set members, and matching rows
-                sql += "(a.tableName = '" + entry.table_name + "' AND ("
+                filter_clause += "(a.tableName = '" + entry.table_name + "' AND ("
                        "a.operation = 'DELETE'"
                        " OR EXISTS (SELECT 1 FROM _lattice_sync_set"
                        " WHERE table_name = a.tableName AND global_row_id = a.globalRowId)"
@@ -1952,14 +1955,36 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
                        "))";
             }
         }
-        // Include link tables (start with _) — they follow their parent model
-        sql += " OR a.tableName LIKE '\\_%' ESCAPE '\\'";
-        sql += ")";
+        filter_clause += " OR a.tableName LIKE '\\_%' ESCAPE '\\'";
+        filter_clause += ")";
     }
 
-    sql += " ORDER BY a.id ASC";
+    // UNION query: two branches that each use indexed lookups instead of a
+    // full AuditLog scan. The LEFT JOIN formulation forced SQLite to scan every
+    // row; splitting into JOIN + NOT EXISTS lets each branch use its own index.
+    //
+    // Branch 1: entries explicitly marked pending in _lattice_sync_state
+    // Branch 2: entries with no sync_state row, using global isSynchronized flag
+    //           (uses partial index idx_audit_log_pending_sync)
+    std::string sql =
+        "SELECT a.* FROM AuditLog a"
+        " JOIN _lattice_sync_state ss"
+        "   ON ss.audit_entry_id = a.id AND ss.sync_id = ?"
+        " WHERE ss.is_synchronized = 0" + filter_clause +
 
-    auto rows = db.query(sql, {sync_id});
+        " UNION ALL"
+
+        " SELECT a.* FROM AuditLog a"
+        " WHERE a.isSynchronized = 0"
+        " AND NOT EXISTS ("
+        "   SELECT 1 FROM _lattice_sync_state ss"
+        "   WHERE ss.audit_entry_id = a.id AND ss.sync_id = ?"
+        ")" + filter_clause +
+
+        " ORDER BY id ASC";
+
+    // UNION query uses the sync_id parameter twice (once per branch)
+    auto rows = db.query(sql, {sync_id, sync_id});
 
     std::vector<audit_log_entry> entries;
     for (const auto& row : rows) {

@@ -1193,47 +1193,32 @@ public:
     /// - where_clause: Additional SQL WHERE conditions
     /// - sort: Sort descriptor (by geo distance, vector distance, or property)
     /// - limit: Maximum number of results
-    CombinedQueryResultVector combined_nearest_query(
+    /// Result of CTE building — shared between full query and count query.
+    struct CombinedQueryCtes {
+        std::string sql;  // "WITH ... final_candidates AS (...) "
+        std::vector<std::string> geo_ctes;
+        std::vector<std::string> vec_ctes;
+        std::vector<std::string> fts_ctes;
+    };
+
+    /// Builds the CTE prefix for a combined nearest query.
+    /// Returns nullopt if no results are possible (e.g. empty query vector, missing vec0 table).
+    /// Side effect: ensures vec0 tables exist for vector constraints.
+    std::optional<CombinedQueryCtes> build_combined_nearest_ctes_(
         const std::string& table_name,
         const BoundsConstraintVector& bounds,
         const VectorConstraintVector& vectors,
         const GeoConstraintVector& geos,
         const TextConstraintVector& texts,
-        OptionalString where_clause,
-        const sort_descriptor& sort,
-        int64_t limit,
-        OptionalString group_by = std::nullopt,
-        OptionalString distinct_by = std::nullopt)
-        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
+        const OptionalString& where_clause) {
 
         // Constants for geo calculations
         constexpr double METERS_PER_DEGREE = 111000.0;
         constexpr double DEG_TO_RAD = 3.14159265358979323846 / 180.0;
 
-        // If no constraints, just return objects with limit
+        // If no constraints, return empty CTEs
         if (bounds.empty() && vectors.empty() && geos.empty() && texts.empty()) {
-            std::string q = "SELECT * FROM " + table_name +
-                (where_clause.has_value() && !where_clause.value().empty()
-                    ? " WHERE " + where_clause.value() : "");
-            if (distinct_by.has_value() && !distinct_by.value().empty()) {
-                q += " GROUP BY " + distinct_by.value();
-            }
-            q += " LIMIT " + std::to_string(limit);
-            auto rows = db().query(q);
-
-            CombinedQueryResultVector results;
-            results.reserve(rows.size());
-            const SwiftSchema* props = get_properties_for_table(table_name);
-
-            for (const auto& row : rows) {
-                auto obj = hydrate<swift_dynamic_object>(row, table_name);
-                if (props) {
-                    obj.properties_ = *props;
-                    obj.source.properties = *props;
-                }
-                results.emplace_back(std::move(obj), DistanceEntryVector{});
-            }
-            return results;
+            return CombinedQueryCtes{"", {}, {}, {}};
         }
 
         // Ensure vec0 tables exist — they may not have been created yet if
@@ -1332,9 +1317,9 @@ public:
         // ====================================================================
         std::vector<std::string> vec_cte_names;
         for (const auto& vc : vectors) {
-            // Empty query vector would crash sqlite-vec; return empty results
+            // Empty query vector would crash sqlite-vec; return no results
             if (vc.query_vector.empty()) {
-                return CombinedQueryResultVector{};
+                return std::nullopt;
             }
 
             std::string vec_table = "_" + table_name + "_" + vc.column + "_vec";
@@ -1354,9 +1339,9 @@ public:
             }
 
             // vec0 table is created lazily on first vector insert (needs dimensions).
-            // If no schema has the table, return empty results.
+            // If no schema has the table, return no results.
             if (vec_schemas.empty()) {
-                return CombinedQueryResultVector{};
+                return std::nullopt;
             }
 
             std::string cte_name = "vec_" + std::to_string(cte_index++);
@@ -1497,60 +1482,78 @@ public:
         }
         sql << ") ";
 
-        // ====================================================================
-        // Step 6: Final SELECT with all distances
-        // ====================================================================
-        sql << "SELECT " << table_name << ".*";
+        return CombinedQueryCtes{sql.str(), geo_cte_names, vec_cte_names, fts_cte_names};
+    }
 
-        // Add geo distance columns
-        for (size_t i = 0; i < geos.size(); ++i) {
-            sql << ", g" << i << ".distance AS _dist_" << geos[i].column;
-        }
+    CombinedQueryResultVector combined_nearest_query(
+        const std::string& table_name,
+        const BoundsConstraintVector& bounds,
+        const VectorConstraintVector& vectors,
+        const GeoConstraintVector& geos,
+        const TextConstraintVector& texts,
+        OptionalString where_clause,
+        const sort_descriptor& sort,
+        int64_t limit,
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt)
+        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
 
-        // Add vector distance columns
-        for (size_t i = 0; i < vectors.size(); ++i) {
-            sql << ", v" << i << ".distance AS _dist_" << vectors[i].column;
-        }
+        auto ctes_opt = build_combined_nearest_ctes_(table_name, bounds, vectors, geos, texts, where_clause);
+        if (!ctes_opt) return CombinedQueryResultVector{};
+        auto& ctes = *ctes_opt;
 
-        // Add FTS rank columns
-        for (size_t i = 0; i < texts.size(); ++i) {
-            sql << ", f" << i << ".distance AS _dist_" << texts[i].column;
-        }
-
-        sql << " FROM " << table_name;
-
-        // Join final candidates
-        sql << " JOIN " << final_candidates_cte << " fc ON " << table_name << ".id = fc.id";
-
-        // Join geo CTEs for distance values
-        for (size_t i = 0; i < geo_cte_names.size(); ++i) {
-            sql << " LEFT JOIN " << geo_cte_names[i] << " g" << i
-                << " ON " << table_name << ".id = g" << i << ".id";
-        }
-
-        // Join vector CTEs for distance values
-        for (size_t i = 0; i < vec_cte_names.size(); ++i) {
-            sql << " LEFT JOIN " << vec_cte_names[i] << " v" << i
-                << " ON " << table_name << ".id = v" << i << ".id";
-        }
-
-        // Join FTS CTEs for rank values
-        for (size_t i = 0; i < fts_cte_names.size(); ++i) {
-            sql << " LEFT JOIN " << fts_cte_names[i] << " f" << i
-                << " ON " << table_name << ".id = f" << i << ".id";
-        }
-
-        // WHERE clause
-        if (where_clause.has_value() && !where_clause.value().empty()) {
-            sql << " WHERE " << where_clause.value();
-        }
-
-        // DISTINCT BY / GROUP BY clause
         bool has_distinct = distinct_by.has_value() && !distinct_by.value().empty();
         bool has_group = group_by.has_value() && !group_by.value().empty();
+
+        // No constraints — simple SELECT
+        if (ctes.sql.empty()) {
+            std::string q = "SELECT * FROM " + table_name +
+                (where_clause.has_value() && !where_clause.value().empty()
+                    ? " WHERE " + where_clause.value() : "");
+            if (has_distinct) q += " GROUP BY " + distinct_by.value();
+            q += " LIMIT " + std::to_string(limit);
+            auto rows = db().query(q);
+
+            CombinedQueryResultVector results;
+            results.reserve(rows.size());
+            const SwiftSchema* props = get_properties_for_table(table_name);
+            for (const auto& row : rows) {
+                auto obj = hydrate<swift_dynamic_object>(row, table_name);
+                if (props) { obj.properties_ = *props; obj.source.properties = *props; }
+                results.emplace_back(std::move(obj), DistanceEntryVector{});
+            }
+            return results;
+        }
+
+        // Build final SELECT with distance columns and JOINs
+        std::ostringstream sql;
+        sql << ctes.sql;
+
+        sql << "SELECT " << table_name << ".*";
+        for (size_t i = 0; i < geos.size(); ++i)
+            sql << ", g" << i << ".distance AS _dist_" << geos[i].column;
+        for (size_t i = 0; i < vectors.size(); ++i)
+            sql << ", v" << i << ".distance AS _dist_" << vectors[i].column;
+        for (size_t i = 0; i < texts.size(); ++i)
+            sql << ", f" << i << ".distance AS _dist_" << texts[i].column;
+
+        sql << " FROM " << table_name
+            << " JOIN final_candidates fc ON " << table_name << ".id = fc.id";
+
+        for (size_t i = 0; i < ctes.geo_ctes.size(); ++i)
+            sql << " LEFT JOIN " << ctes.geo_ctes[i] << " g" << i
+                << " ON " << table_name << ".id = g" << i << ".id";
+        for (size_t i = 0; i < ctes.vec_ctes.size(); ++i)
+            sql << " LEFT JOIN " << ctes.vec_ctes[i] << " v" << i
+                << " ON " << table_name << ".id = v" << i << ".id";
+        for (size_t i = 0; i < ctes.fts_ctes.size(); ++i)
+            sql << " LEFT JOIN " << ctes.fts_ctes[i] << " f" << i
+                << " ON " << table_name << ".id = f" << i << ".id";
+
+        if (where_clause.has_value() && !where_clause.value().empty())
+            sql << " WHERE " << where_clause.value();
+
         if (has_distinct && has_group) {
-            // Deduplicate first, then group — use distinct_by as inner GROUP BY
-            // The outer GROUP BY will be applied by wrapping in a subquery below
             sql << " GROUP BY " << distinct_by.value();
         } else if (has_distinct) {
             sql << " GROUP BY " << distinct_by.value();
@@ -1558,32 +1561,23 @@ public:
             sql << " GROUP BY " << group_by.value();
         }
 
-        // ORDER BY clause (based on sort descriptor)
         if (sort.type != sort_descriptor::Type::none && !sort.column.empty()) {
             std::string order_col;
             switch (sort.type) {
                 case sort_descriptor::Type::geo_distance:
                 case sort_descriptor::Type::vector_distance:
                 case sort_descriptor::Type::text_rank:
-                    // Sort by distance/rank column (alias is _dist_{column})
-                    order_col = "_dist_" + sort.column;
-                    break;
+                    order_col = "_dist_" + sort.column; break;
                 case sort_descriptor::Type::property:
-                    // Sort by property on the table
-                    order_col = table_name + "." + sort.column;
-                    break;
-                default:
-                    break;
+                    order_col = table_name + "." + sort.column; break;
+                default: break;
             }
-            if (!order_col.empty()) {
+            if (!order_col.empty())
                 sql << " ORDER BY " << order_col << (sort.ascending ? " ASC" : " DESC");
-            }
         }
 
-        // Apply limit
         sql << " LIMIT " << limit;
 
-        // If both distinct_by and group_by, wrap in outer SELECT with GROUP BY
         std::string final_sql;
         if (has_distinct && has_group) {
             final_sql = "SELECT * FROM (" + sql.str() + ") GROUP BY " + group_by.value();
@@ -1591,7 +1585,6 @@ public:
             final_sql = sql.str();
         }
 
-        // Execute query
         auto rows = db().query(final_sql);
         CombinedQueryResultVector results;
         results.reserve(rows.size());
@@ -1601,7 +1594,6 @@ public:
         for (const auto& row : rows) {
             DistanceEntryVector distances;
 
-            // Extract geo distances
             for (const auto& gc : geos) {
                 std::string dist_col = "_dist_" + gc.column;
                 auto it = row.find(dist_col);
@@ -1610,7 +1602,6 @@ public:
                 }
             }
 
-            // Extract vector distances
             for (const auto& vc : vectors) {
                 std::string dist_col = "_dist_" + vc.column;
                 auto it = row.find(dist_col);
@@ -1619,7 +1610,6 @@ public:
                 }
             }
 
-            // Extract FTS rank scores
             for (const auto& tc : texts) {
                 std::string dist_col = "_dist_" + tc.column;
                 auto it = row.find(dist_col);
@@ -1637,6 +1627,82 @@ public:
         }
 
         return results;
+    }
+
+    /// Count-only variant of combined_nearest_query.
+    /// Lean final SELECT — no distance JOINs, no ORDER BY, no SELECT *.
+    int64_t combined_nearest_query_count(
+        const std::string& table_name,
+        const BoundsConstraintVector& bounds,
+        const VectorConstraintVector& vectors,
+        const GeoConstraintVector& geos,
+        const TextConstraintVector& texts,
+        OptionalString where_clause,
+        const sort_descriptor& sort,
+        int64_t limit,
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt)
+        SWIFT_NAME(combinedNearestQueryCount(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
+
+        auto ctes_opt = build_combined_nearest_ctes_(table_name, bounds, vectors, geos, texts, where_clause);
+        if (!ctes_opt) return 0;
+        auto& ctes = *ctes_opt;
+
+        bool has_distinct = distinct_by.has_value() && !distinct_by.value().empty();
+        bool has_group = group_by.has_value() && !group_by.value().empty();
+
+        // No constraints — simple count
+        if (ctes.sql.empty()) {
+            std::string q = "SELECT COUNT(*) FROM " + table_name +
+                (where_clause.has_value() && !where_clause.value().empty()
+                    ? " WHERE " + where_clause.value() : "");
+            if (has_distinct) q += " GROUP BY " + distinct_by.value();
+            q += " LIMIT " + std::to_string(limit);
+            // GROUP BY makes COUNT per-group; wrap to get total
+            if (has_distinct) q = "SELECT COUNT(*) FROM (" + q + ")";
+            auto rows = db().query(q);
+            if (!rows.empty()) {
+                for (const auto& [key, val] : rows[0]) {
+                    if (std::holds_alternative<int64_t>(val))
+                        return std::get<int64_t>(val);
+                }
+            }
+            return 0;
+        }
+
+        // Lean query: only id, no distance JOINs, no ORDER BY
+        std::ostringstream sql;
+        sql << ctes.sql;
+        sql << "SELECT " << table_name << ".id"
+            << " FROM " << table_name
+            << " JOIN final_candidates fc ON " << table_name << ".id = fc.id";
+
+        if (where_clause.has_value() && !where_clause.value().empty())
+            sql << " WHERE " << where_clause.value();
+
+        if (has_distinct && has_group) {
+            sql << " GROUP BY " << distinct_by.value();
+        } else if (has_distinct) {
+            sql << " GROUP BY " << distinct_by.value();
+        } else if (has_group) {
+            sql << " GROUP BY " << group_by.value();
+        }
+
+        sql << " LIMIT " << limit;
+
+        std::string inner = sql.str();
+        if (has_distinct && has_group)
+            inner = "SELECT * FROM (" + inner + ") GROUP BY " + group_by.value();
+
+        std::string count_sql = "SELECT COUNT(*) FROM (" + inner + ")";
+        auto rows = db().query(count_sql);
+        if (!rows.empty()) {
+            for (const auto& [key, val] : rows[0]) {
+                if (std::holds_alternative<int64_t>(val))
+                    return std::get<int64_t>(val);
+            }
+        }
+        return 0;
     }
 
     // ========================================================================

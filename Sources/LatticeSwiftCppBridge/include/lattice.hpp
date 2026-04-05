@@ -1423,19 +1423,24 @@ public:
             // Oversample by 2x when filtering to compensate for post-filter loss.
             int fetch_k = where_conditions.empty() ? vc.k : vc.k * 2;
             bool needs_rescore = (distance_func != "vec_distance_L2");
-            // MATCH CTE returns global_id + distance. No JOIN here — the MATCH
-            // runs directly on each schema's vec0 table. The final SELECT JOINs
-            // back to the model table by globalId.
+            // MATCH CTE: each schema's vec table is queried with MATCH, then
+            // JOINed to THAT SCHEMA's model table (not the UNION ALL view) to
+            // resolve gid → id and carry the distance through.
             sql << cte_name << " AS (SELECT * FROM (";
             for (size_t si = 0; si < vec_schemas.size(); ++si) {
                 if (si > 0) sql << " UNION ALL ";
-                sql << "SELECT v.global_id AS gid, "
+                sql << "SELECT m.id AS id, "
                     << (needs_rescore
                         ? distance_func + "(v.embedding, " + query_blob + ")"
                         : "v.distance")
                     << " AS distance"
                     << " FROM " << vec_schemas[si] << "." << vec_table << " v"
+                    << " JOIN " << vec_schemas[si] << "." << table_name
+                    << " m ON m.globalId = v.global_id"
                     << " WHERE v.embedding MATCH " << query_blob << " AND v.k = " << fetch_k;
+                for (const auto& cond : where_conditions) {
+                    sql << " AND " << cond;
+                }
             }
             sql << ") ORDER BY distance ASC"
                 << "), ";
@@ -1511,20 +1516,10 @@ public:
         for (const auto& f : fts_cte_names) all_candidate_ctes.push_back(f);
 
         if (!all_candidate_ctes.empty()) {
-            // Intersect all candidates. Vec CTEs have gid (globalId), others have id.
-            // Resolve vec gids to ids via the model table for intersection.
+            // Intersect all vector and FTS candidates
             for (size_t i = 0; i < all_candidate_ctes.size(); ++i) {
                 if (i > 0) sql << " INTERSECT ";
-                bool is_vec_cte = false;
-                for (const auto& vc : vec_cte_names) {
-                    if (vc == all_candidate_ctes[i]) { is_vec_cte = true; break; }
-                }
-                if (is_vec_cte) {
-                    sql << "SELECT " << table_name << ".id FROM " << all_candidate_ctes[i]
-                        << " JOIN " << table_name << " ON " << table_name << ".globalId = " << all_candidate_ctes[i] << ".gid";
-                } else {
-                    sql << "SELECT id FROM " << all_candidate_ctes[i];
-                }
+                sql << "SELECT id FROM " << all_candidate_ctes[i];
             }
             // Also intersect with spatial candidates if present
             if (!cte_names.empty()) {
@@ -1603,7 +1598,7 @@ public:
                 << " ON " << table_name << ".id = g" << i << ".id";
         for (size_t i = 0; i < ctes.vec_ctes.size(); ++i)
             sql << " LEFT JOIN " << ctes.vec_ctes[i] << " v" << i
-                << " ON " << table_name << ".globalId = v" << i << ".gid";
+                << " ON " << table_name << ".id = v" << i << ".id";
         for (size_t i = 0; i < ctes.fts_ctes.size(); ++i)
             sql << " LEFT JOIN " << ctes.fts_ctes[i] << " f" << i
                 << " ON " << table_name << ".id = f" << i << ".id";

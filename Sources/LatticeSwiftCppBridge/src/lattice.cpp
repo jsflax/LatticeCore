@@ -691,17 +691,35 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
                     int64_t v = vc.empty() ? 0 : std::get<int64_t>(vc[0].at("cnt"));
                     if (m > v) {
-                        // Skip reconcile for IVF tables — they manage their own
-                        // internal state and reject INSERT OR IGNORE with UNIQUE
-                        // constraint errors that can corrupt the connection state.
-                        bool is_ivf = db().table_exists(vec_table + "_ivf_centroids00");
-                        if (!is_ivf) {
-                            LOG_INFO("swift_lattice", "vec0 init reconcile: model=%lld vec0=%lld, filling gaps in %s",
-                                     (long long)m, (long long)v, vec_table.c_str());
-                            db().execute(
-                                "INSERT OR IGNORE INTO " + vec_table + "(global_id, embedding) "
-                                "SELECT globalId, " + prop.name + " FROM " + schema.table_name +
-                                " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
+                        LOG_INFO("swift_lattice", "vec0 init reconcile: model=%lld vec0=%lld, filling gaps in %s",
+                                 (long long)m, (long long)v, vec_table.c_str());
+                        // Find gaps using the _rowids shadow table (regular indexed
+                        // table) instead of the vec0 virtual table. Insert missing
+                        // rows one at a time since vec0 doesn't support OR IGNORE.
+                        std::string rowids_table = vec_table + "_rowids";
+                        auto gaps = db().query(
+                            "SELECT m.globalId, m." + prop.name +
+                            " FROM " + schema.table_name + " m"
+                            " LEFT JOIN " + rowids_table + " r ON r.id = m.globalId"
+                            " WHERE m." + prop.name + " IS NOT NULL"
+                            " AND length(m." + prop.name + ") > 0"
+                            " AND r.id IS NULL");
+                        for (const auto& row : gaps) {
+                            auto gid_it = row.find("globalId");
+                            auto vec_it = row.find(prop.name);
+                            if (gid_it == row.end() || vec_it == row.end()) continue;
+                            if (!std::holds_alternative<std::string>(gid_it->second)) continue;
+                            if (!std::holds_alternative<std::vector<uint8_t>>(vec_it->second)) continue;
+                            try {
+                                db().execute(
+                                    "INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                    {std::get<std::string>(gid_it->second),
+                                     std::get<std::vector<uint8_t>>(vec_it->second)});
+                            } catch (...) {}
+                        }
+                        if (!gaps.empty()) {
+                            LOG_INFO("swift_lattice", "vec0 reconcile: filled %zu gaps in %s",
+                                     gaps.size(), vec_table.c_str());
                         }
                     }
                 } catch (const std::exception& e) {

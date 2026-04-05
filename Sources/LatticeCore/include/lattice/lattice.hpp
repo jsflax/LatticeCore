@@ -2256,6 +2256,17 @@ public:
         xproc_read_db_.reset();
     }
 
+    /// Close the write connection
+    void close_write_db() {
+        db_.reset();
+    }
+
+    /// Reopen the write connection
+    void reopen_write_db() {
+        db_ = std::make_unique<database>(config_.path, database::open_mode::read_write);
+        setup_change_hook();
+    }
+
     /// Explicitly close all database connections and stop background services.
     /// Safe to call before deleting the database files. After calling close(),
     /// any further operations on this instance are undefined behavior.
@@ -2365,9 +2376,11 @@ public:
     /// Table name format: _{ModelTable}_{column}_vec
     /// Dimensions are inferred from first insert.
     /// Also creates triggers to keep vec0 in sync with main table.
+    /// When ivf_nlist > 0, creates the table with IVF indexing.
     void ensure_vec0_table(const std::string& model_table,
                            const std::string& column_name,
-                           int dimensions) {
+                           int dimensions,
+                           int ivf_nlist = 0, int ivf_nprobe = 0) {
         std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
 
         // Check if table already exists
@@ -2400,7 +2413,14 @@ public:
             sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
                 << "global_id TEXT PRIMARY KEY, "
                 << "embedding float[" << dimensions << "]"
+                << (ivf_nlist > 0
+                    ? " indexed by ivf(nlist=" + std::to_string(ivf_nlist)
+                      + (ivf_nprobe > 0 ? ", nprobe=" + std::to_string(ivf_nprobe) : "")
+                      + ")"
+                    : "")
                 << ")";
+            LOG_INFO("ensure_vec0_table", "Creating IVF vec0 table: %s (dims=%d)", vec_table.c_str(), dimensions);
+            LOG_DEBUG("ensure_vec0_table", "SQL: %s", sql.str().c_str());
             db_->execute(sql.str());
         }
 
@@ -3015,10 +3035,113 @@ public:
 
             LOG_INFO("vacuum_vec0", "Rebuilt %s: %lld vectors from %zu rows",
                      vec_table.c_str(), (long long)count, all_rows.size());
+
             return count;
         } catch (const std::exception& e) {
             LOG_ERROR("vacuum_vec0", "Failed to vacuum %s: %s", vec_table.c_str(), e.what());
             return -1;
+        }
+    }
+
+    /// Train IVF vector index for a vec0 table.
+    /// If the table is not already IVF, rebuilds it with adaptive nlist/nprobe.
+    /// Then runs compute-centroids to build k-means clusters.
+    /// Idempotent — skips if already trained or too few vectors.
+    bool train_vec0(const std::string& model_table, const std::string& column_name) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+        try {
+            // Already trained? Skip.
+            bool is_ivf = db_->table_exists(vec_table + "_ivf_centroids00");
+            if (is_ivf) {
+                auto trained = db_->query(
+                    "SELECT value FROM " + vec_table + "_info WHERE key = 'ivf_trained_0'");
+                if (!trained.empty()) {
+                    auto it = trained[0].find("value");
+                    if (it != trained[0].end() && std::holds_alternative<int64_t>(it->second)
+                        && std::get<int64_t>(it->second) == 1)
+                        return true;
+                }
+            }
+
+            // Infer dimensions
+            int dimensions = 0;
+            if (db_->table_exists(vec_table)) {
+                auto info_rows = db_->query(
+                    "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
+                if (!info_rows.empty()) {
+                    auto it = info_rows[0].find("value");
+                    if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second))
+                        dimensions = static_cast<int>(std::get<int64_t>(it->second));
+                }
+            }
+            if (dimensions == 0) {
+                auto sample = db_->query(
+                    "SELECT length(" + column_name + ") as len FROM main." + model_table +
+                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0 LIMIT 1");
+                if (!sample.empty()) {
+                    auto it = sample[0].find("len");
+                    if (it != sample[0].end() && std::holds_alternative<int64_t>(it->second))
+                        dimensions = static_cast<int>(std::get<int64_t>(it->second)) / static_cast<int>(sizeof(float));
+                }
+            }
+            if (dimensions == 0) return false;
+
+            // Count vectors
+            int64_t count = 0;
+            auto cnt = db_->query(
+                "SELECT COUNT(*) as cnt FROM main." + model_table +
+                " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
+            if (!cnt.empty()) {
+                auto it = cnt[0].find("cnt");
+                if (it != cnt[0].end() && std::holds_alternative<int64_t>(it->second))
+                    count = std::get<int64_t>(it->second);
+            }
+            if (count < 16) {
+                LOG_INFO("train_vec0", "Skipping %s: only %lld vectors", vec_table.c_str(), (long long)count);
+                return false;
+            }
+
+            // Rebuild as IVF if not already
+            if (!is_ivf) {
+                int nlist = std::clamp(static_cast<int>(std::sqrt(static_cast<double>(count))), 4, 256);
+                int nprobe = std::max(nlist / 2, 2);
+
+                LOG_INFO("train_vec0", "Rebuilding %s as IVF (nlist=%d, nprobe=%d, %lld vectors, dims=%d)",
+                         vec_table.c_str(), nlist, nprobe, (long long)count, dimensions);
+
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+                db_->execute("DROP TABLE IF EXISTS " + vec_table);
+                ensure_vec0_table(model_table, column_name, dimensions, nlist, nprobe);
+
+                // Re-insert all vectors
+                auto all_rows = db_->query(
+                    "SELECT globalId, " + column_name + " FROM main." + model_table +
+                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
+                for (const auto& row : all_rows) {
+                    auto gid_it = row.find("globalId");
+                    if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                    auto col_it = row.find(column_name);
+                    if (col_it == row.end() || !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                    auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                    if (vec_data.empty()) continue;
+                    try {
+                        db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                    {std::get<std::string>(gid_it->second), vec_data});
+                    } catch (...) {}
+                }
+            }
+
+            // Compute centroids
+            LOG_INFO("train_vec0", "Computing centroids for %s (%lld vectors)",
+                     vec_table.c_str(), (long long)count);
+            db_->execute("INSERT INTO " + vec_table + "(" + vec_table + ") VALUES ('compute-centroids')");
+            LOG_INFO("train_vec0", "Training complete for %s", vec_table.c_str());
+            return true;
+        } catch (const std::exception& e) {
+            LOG_ERROR("train_vec0", "Failed to train %s: %s", vec_table.c_str(), e.what());
+            return false;
         }
     }
 
@@ -4262,7 +4385,7 @@ protected:
             obj.table_name_ = table_name;
         }
 
-        // Populate the source object's values from the row (only for types with 'source' member)
+        // Populate the source object's values from the row
         if constexpr (has_source_member<T>::value) {
             for (const auto& [key, value] : row) {
                 if (key != "id" && key != "globalId" && key != "_source") {

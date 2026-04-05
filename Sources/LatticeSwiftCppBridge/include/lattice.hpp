@@ -5,6 +5,8 @@
 #include <LatticeCore.hpp>
 #include <bridging.hpp>
 #include <concepts>
+#include <future>
+#include <sqlite-vec.h>
 
 #include <dynamic_object.hpp>
 #include <list.hpp>
@@ -409,6 +411,14 @@ public:
         return swift_config_.path;
     }
     
+    /// Block until background IVF training completes. No-op if no training is running.
+    void wait_for_vec0_training()
+        SWIFT_NAME(waitForVec0Training()) {
+        if (vec0_training_future_.valid()) {
+            vec0_training_future_.wait();
+        }
+    }
+
 private:
     // Stored schemas for hydration
     std::unordered_map<std::string, SwiftSchema> schemas_;
@@ -418,6 +428,7 @@ private:
     swift_configuration swift_config_;
     // Error from last receive_sync_data call (nullopt if none)
     OptionalString last_receive_error_;
+    std::future<void> vec0_training_future_;
 
     void ensure_swift_tables(const SchemaVector& schemas);
 
@@ -591,6 +602,30 @@ public:
 
     int64_t vacuum_vec0(const std::string& table, const std::string& column) {
         return lattice_db::vacuum_vec0(table, column);
+    }
+
+    /// Train all untrained IVF vec0 tables on the main write connection.
+    void train_untrained_vec0_tables()
+        SWIFT_NAME(trainUntrainedVec0Tables()) {
+        LOG_INFO("train_untrained", "Starting training scan");
+        // Disable WAL auto-checkpoint during training. compute-centroids writes
+        // ~78K WAL frames; auto-checkpoint mid-write conflicts with read connections
+        // holding stale snapshots, causing SQLITE_BUSY_SNAPSHOT.
+        sqlite3_wal_autocheckpoint(db().handle(), 0);
+        for (const auto& [table_name, schema] : schemas_) {
+            for (const auto& [prop_name, prop] : schema) {
+                if (!prop.is_vector || prop.type != column_type::blob) continue;
+                std::string vec_table = "_" + table_name + "_" + prop_name + "_vec";
+                if (!db().table_exists(vec_table)) continue;
+                train_vec0(table_name, prop_name);
+            }
+        }
+        // Re-enable auto-checkpoint, refresh read connections, then checkpoint.
+        sqlite3_wal_autocheckpoint(db().handle(), 1000);
+        close_read_db();
+        sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        reopen_read_db();
+        LOG_INFO("train_untrained", "Training scan complete");
     }
 
     /// Explicitly close all database connections and stop background services.
@@ -1381,16 +1416,28 @@ public:
                 }
             }
 
-            // Build CTE: UNION ALL across all schemas' vec tables, then ORDER + LIMIT
+            // Build CTE: UNION ALL across all schemas' vec tables.
+            // MATCH retrieves IVF candidates with L2 distance. If the requested
+            // metric is not L2, we re-score using the actual distance function.
+            // WHERE filters are applied as post-filtering on candidates.
+            // Oversample by 2x when filtering to compensate for post-filter loss.
+            int fetch_k = where_conditions.empty() ? vc.k : vc.k * 2;
+            bool needs_rescore = (distance_func != "vec_distance_L2");
+            // MATCH CTE returns global_id + distance. No JOIN here — the MATCH
+            // runs directly on each schema's vec0 table. The final SELECT JOINs
+            // back to the model table by globalId.
             sql << cte_name << " AS (SELECT * FROM (";
             for (size_t si = 0; si < vec_schemas.size(); ++si) {
                 if (si > 0) sql << " UNION ALL ";
-                sql << "SELECT m.id AS id, " << distance_func << "(v.embedding, " << query_blob << ") AS distance"
+                sql << "SELECT v.global_id AS gid, "
+                    << (needs_rescore
+                        ? distance_func + "(v.embedding, " + query_blob + ")"
+                        : "v.distance")
+                    << " AS distance"
                     << " FROM " << vec_schemas[si] << "." << vec_table << " v"
-                    << " JOIN " << table_name << " m ON m.globalId = v.global_id"
-                    << where_suffix;
+                    << " WHERE v.embedding MATCH " << query_blob << " AND v.k = " << fetch_k;
             }
-            sql << ") ORDER BY distance ASC LIMIT " << vc.k
+            sql << ") ORDER BY distance ASC"
                 << "), ";
         }
 
@@ -1464,10 +1511,20 @@ public:
         for (const auto& f : fts_cte_names) all_candidate_ctes.push_back(f);
 
         if (!all_candidate_ctes.empty()) {
-            // Intersect all vector and FTS candidates
+            // Intersect all candidates. Vec CTEs have gid (globalId), others have id.
+            // Resolve vec gids to ids via the model table for intersection.
             for (size_t i = 0; i < all_candidate_ctes.size(); ++i) {
                 if (i > 0) sql << " INTERSECT ";
-                sql << "SELECT id FROM " << all_candidate_ctes[i];
+                bool is_vec_cte = false;
+                for (const auto& vc : vec_cte_names) {
+                    if (vc == all_candidate_ctes[i]) { is_vec_cte = true; break; }
+                }
+                if (is_vec_cte) {
+                    sql << "SELECT " << table_name << ".id FROM " << all_candidate_ctes[i]
+                        << " JOIN " << table_name << " ON " << table_name << ".globalId = " << all_candidate_ctes[i] << ".gid";
+                } else {
+                    sql << "SELECT id FROM " << all_candidate_ctes[i];
+                }
             }
             // Also intersect with spatial candidates if present
             if (!cte_names.empty()) {
@@ -1482,6 +1539,7 @@ public:
         }
         sql << ") ";
 
+        LOG_DEBUG("build_ctes", "CTE SQL length: %zu", sql.str().size());
         return CombinedQueryCtes{sql.str(), geo_cte_names, vec_cte_names, fts_cte_names};
     }
 
@@ -1545,7 +1603,7 @@ public:
                 << " ON " << table_name << ".id = g" << i << ".id";
         for (size_t i = 0; i < ctes.vec_ctes.size(); ++i)
             sql << " LEFT JOIN " << ctes.vec_ctes[i] << " v" << i
-                << " ON " << table_name << ".id = v" << i << ".id";
+                << " ON " << table_name << ".globalId = v" << i << ".gid";
         for (size_t i = 0; i < ctes.fts_ctes.size(); ++i)
             sql << " LEFT JOIN " << ctes.fts_ctes[i] << " f" << i
                 << " ON " << table_name << ".id = f" << i << ".id";
@@ -1585,7 +1643,9 @@ public:
             final_sql = sql.str();
         }
 
+        LOG_DEBUG("combinedNearestQuery", "Final SQL length: %zu", final_sql.size());
         auto rows = db().query(final_sql);
+        LOG_DEBUG("combinedNearestQuery", "Query returned %zu rows", rows.size());
         CombinedQueryResultVector results;
         results.reserve(rows.size());
 
@@ -1687,8 +1747,6 @@ public:
         } else if (has_group) {
             sql << " GROUP BY " << group_by.value();
         }
-
-        sql << " LIMIT " << limit;
 
         std::string inner = sql.str();
         if (has_distinct && has_group)

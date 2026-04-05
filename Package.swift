@@ -34,13 +34,15 @@ let package = Package(
         .target(
             name: "SqliteVec",
             path: "Sources/SqliteVec",
-            sources: ["src"],
+            sources: ["src/sqlite-vec.c"],
             publicHeadersPath: "include",
             cSettings: [
                 .headerSearchPath("include"),
+                .headerSearchPath("src"),
                 .define("SQLITE_CORE"),
                 .define("SQLITE_VEC_STATIC"),
                 .define("SQLITE_VEC_ENABLE_NEON", .when(platforms: [.macOS, .iOS])),
+                .define("SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE"),
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
@@ -74,6 +76,7 @@ let package = Package(
             cxxSettings: [
                 .headerSearchPath("include"),
                 .headerSearchPath("../LatticeCore/include"),
+                .define("SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE"),
                 .unsafeFlags(["-std=c++20"]),
                 .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
             ],

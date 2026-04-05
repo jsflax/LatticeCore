@@ -314,7 +314,7 @@ void lattice_db::handle_cross_process_notification() {
             changes.emplace_back(table, op, row_id, global_row_id, changed_fields_names);
 
             // Collect AuditLog change
-            auto audit_gid_rows = read_db().query(
+            auto audit_gid_rows = xproc_read_db().query(
                 "SELECT globalId FROM AuditLog WHERE id = ?", {audit_id}
             );
             std::string audit_global_id;
@@ -336,7 +336,7 @@ void lattice_db::handle_cross_process_notification() {
         std::unordered_map<std::string, std::string> internal_table_parents;
         for (const auto& [table, op, row_id, global_id, cfn] : changes) {
             if (table == "AuditLog" || internal_table_parents.count(table)) continue;
-            auto meta = read_db().query(
+            auto meta = xproc_read_db().query(
                 "SELECT value FROM _lattice_meta WHERE key = ?",
                 {"internal_table:" + table}
             );
@@ -372,7 +372,7 @@ void lattice_db::handle_cross_process_notification() {
                     std::string parent_global_id;
                     auto& link_global_id = std::get<3>(change);
                     if (!link_global_id.empty()) {
-                        auto cf_rows = read_db().query(
+                        auto cf_rows = xproc_read_db().query(
                             "SELECT json_extract(changedFields, '$.lhs') AS lhs FROM AuditLog "
                             "WHERE globalRowId = ? AND tableName = ?",
                             {link_global_id, table}
@@ -381,7 +381,7 @@ void lattice_db::handle_cross_process_notification() {
                             auto lhs_it = cf_rows[0].find("lhs");
                             if (lhs_it != cf_rows[0].end() && std::holds_alternative<std::string>(lhs_it->second)) {
                                 parent_global_id = std::get<std::string>(lhs_it->second);
-                                auto pid_rows = read_db().query(
+                                auto pid_rows = xproc_read_db().query(
                                     "SELECT id FROM \"" + parent_table + "\" WHERE globalId = ?",
                                     {parent_global_id}
                                 );

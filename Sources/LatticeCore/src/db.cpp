@@ -88,9 +88,16 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
 database::~database() {
     if (db_) {
         if (mode_ == open_mode::read_write) {
-            sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+            int nLog = 0, nCkpt = 0;
+            int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
+            LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
         }
-        sqlite3_close(db_);
+        int rc = sqlite3_close(db_);
+        if (rc != SQLITE_OK) {
+            LOG_ERROR("db", "~database close failed: rc=%d (%s), path=%s", rc, sqlite3_errmsg(db_), path_.c_str());
+        } else {
+            LOG_DEBUG("db", "~database closed: path=%s", path_.c_str());
+        }
     }
 }
 
@@ -363,8 +370,10 @@ primary_key_t database::insert(const std::string& table,
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
+        int extended_rc = sqlite3_extended_errcode(db_);
         auto err = std::string(sqlite3_errmsg(db_));
-        LOG_ERROR("db", "Insert failed: %s", err.c_str());
+        LOG_ERROR("db", "Insert failed (rc=%d, ext=%d, db=%p, path=%s): %s",
+                  rc, extended_rc, (void*)db_, path_.c_str(), err.c_str());
         throw db_error("Insert failed: " + err);
     }
 
@@ -512,7 +521,9 @@ void database::begin_transaction(bool exclusive) {
 
     if (rc != SQLITE_OK) {
         auto error = std::string(sqlite3_errmsg(db_));
-        LOG_ERROR("db", "Failed to begin transaction: %s", error.c_str());
+        int ext = sqlite3_extended_errcode(db_);
+        LOG_ERROR("db", "Failed to begin transaction (rc=%d, ext=%d, db=%p, path=%s): %s",
+                  rc, ext, (void*)db_, path_.c_str(), error.c_str());
         throw db_error("Failed to begin transaction: " + error);
     }
 }

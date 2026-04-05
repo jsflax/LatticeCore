@@ -41,10 +41,12 @@ add_library(SqliteVec STATIC
 )
 target_include_directories(SqliteVec PUBLIC
     Sources/SqliteVec/include
+    PRIVATE Sources/SqliteVec/src
 )
 target_compile_definitions(SqliteVec PRIVATE
     SQLITE_CORE
     SQLITE_VEC_STATIC
+    SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
 )
 # Enable NEON on ARM (macOS/iOS)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")

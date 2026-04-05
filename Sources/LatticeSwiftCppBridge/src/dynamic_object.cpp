@@ -124,23 +124,19 @@ dynamic_object& dynamic_object::operator=(const dynamic_object &o) {
 }
 
 void dynamic_object::set_object(const std::string &name, dynamic_object_ref& value) {
-    // if the new link is managed
-    if (value.get()->lattice) {
-        if (lattice) {
-            managed<swift_dynamic_object> field = managed_.get_managed_field<swift_dynamic_object>(name);
-            field = value.get()->managed_;
+    if (lattice) {
+        // Use the pointer specialization which handles nil fields safely
+        managed<swift_dynamic_object *> field = managed_.get_managed_field<swift_dynamic_object *>(name);
+        if (value.get()->lattice) {
+            // Child is already managed — assign the managed object pointer
+            field = &value.get()->managed_;
         } else {
-            unmanaged_.link_values[name] = value.impl_;
-        }
-    } else {
-        // if not managd but this object is managed
-        if (lattice) {
-            managed<swift_dynamic_object *> field = managed_.get_managed_field<swift_dynamic_object *>(name);
+            // Child is unmanaged — assign unmanaged value (will be auto-managed)
             field = value.get()->unmanaged_;
             value.get()->manage(field.value());
-        } else {
-            unmanaged_.link_values[name] = value.impl_;
         }
+    } else {
+        unmanaged_.link_values[name] = value.impl_;
     }
 }
 

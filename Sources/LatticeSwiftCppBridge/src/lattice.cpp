@@ -691,12 +691,18 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
                     int64_t v = vc.empty() ? 0 : std::get<int64_t>(vc[0].at("cnt"));
                     if (m > v) {
-                        LOG_INFO("swift_lattice", "vec0 init reconcile: model=%lld vec0=%lld, filling gaps in %s",
-                                 (long long)m, (long long)v, vec_table.c_str());
-                        db().execute(
-                            "INSERT OR IGNORE INTO " + vec_table + "(global_id, embedding) "
-                            "SELECT globalId, " + prop.name + " FROM " + schema.table_name +
-                            " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
+                        // Skip reconcile for IVF tables — they manage their own
+                        // internal state and reject INSERT OR IGNORE with UNIQUE
+                        // constraint errors that can corrupt the connection state.
+                        bool is_ivf = db().table_exists(vec_table + "_ivf_centroids00");
+                        if (!is_ivf) {
+                            LOG_INFO("swift_lattice", "vec0 init reconcile: model=%lld vec0=%lld, filling gaps in %s",
+                                     (long long)m, (long long)v, vec_table.c_str());
+                            db().execute(
+                                "INSERT OR IGNORE INTO " + vec_table + "(global_id, embedding) "
+                                "SELECT globalId, " + prop.name + " FROM " + schema.table_name +
+                                " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
+                        }
                     }
                 } catch (const std::exception& e) {
                     LOG_WARN("swift_lattice", "vec0 init reconcile failed for %s: %s", vec_table.c_str(), e.what());
@@ -775,6 +781,13 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // If anything above threw, the transaction destructor rolls back instead.
     LOG_INFO("swift_lattice", "ensure_swift_tables: committing transaction");
     transaction.commit();
+
+    // TODO: Dispatch background IVF training for untrained vec0 tables.
+    // Disabled pending investigation of IVF+int8 dimension mismatch.
+    // vec0_training_future_ = std::async(std::launch::async, [this]() {
+    //     train_untrained_vec0_tables();
+    // });
+
     LOG_INFO("swift_lattice", "ensure_swift_tables done");
 }
 

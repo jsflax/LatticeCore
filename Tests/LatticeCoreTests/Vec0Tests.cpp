@@ -508,3 +508,270 @@ TEST_F(Vec0Test, InsertTrigger_PreExistingVec0Entry) {
     EXPECT_NEAR(results[0].distance, 0.0, 0.001)
         << "Vec0 should reflect the INSERT embedding, not the pre-populated one";
 }
+
+// ============================================================================
+// IVF (Inverted File Index) Tests
+// ============================================================================
+
+class IVFTest : public ::testing::Test {
+protected:
+    TempDB tmp{"ivf"};
+    TempDB tmp2{"ivf2"};
+
+    void createVectorTable(lattice::lattice_db& db, int dims = 32) {
+        db.db().execute(
+            "CREATE TABLE IF NOT EXISTS VectorDoc ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "globalId TEXT UNIQUE NOT NULL DEFAULT (lower(hex(randomblob(16)))), "
+            "title TEXT NOT NULL, "
+            "embedding BLOB"
+            ")");
+        db.ensure_vec0_table("VectorDoc", "embedding", dims);
+    }
+
+    std::vector<float> randomVec(int dims = 32) {
+        static std::mt19937 rng(42);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> v(dims);
+        for (auto& x : v) x = dist(rng);
+        return v;
+    }
+
+    void insertDoc(lattice::lattice_db& db, const std::string& gid,
+                   const std::string& title, const std::vector<float>& vec) {
+        auto blob = pack_floats(vec);
+        db.db().execute(
+            "INSERT INTO VectorDoc (globalId, title, embedding) VALUES (?, ?, ?)",
+            {gid, title, blob});
+    }
+
+    void bulkInsert(lattice::lattice_db& db, int count, int dims = 32) {
+        for (int i = 0; i < count; i++) {
+            insertDoc(db, "gid_" + std::to_string(i),
+                      "doc_" + std::to_string(i), randomVec(dims));
+        }
+    }
+};
+
+// Table creation is flat by default; IVF added by train_vec0
+TEST_F(IVFTest, TableCreation) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+
+    // vec0 table should exist (flat, no IVF yet)
+    EXPECT_TRUE(db.db().table_exists("_VectorDoc_embedding_vec"));
+    EXPECT_FALSE(db.db().table_exists("_VectorDoc_embedding_vec_ivf_centroids00"))
+        << "Default table should be flat, not IVF";
+
+    // After training, IVF shadow tables should appear
+    bulkInsert(db, 50);
+    db.train_vec0("VectorDoc", "embedding");
+    EXPECT_TRUE(db.db().table_exists("_VectorDoc_embedding_vec_ivf_centroids00"));
+    EXPECT_TRUE(db.db().table_exists("_VectorDoc_embedding_vec_ivf_cells00"));
+    EXPECT_TRUE(db.db().table_exists("_VectorDoc_embedding_vec_ivf_rowid_map00"));
+}
+
+// Insert and query BEFORE training — brute-force fallback
+TEST_F(IVFTest, QueryBeforeTraining) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+
+    insertDoc(db, "a", "close", {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
+    insertDoc(db, "b", "far",   {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f});
+
+    auto query = pack_floats({1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                              0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                              0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                              0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
+
+    auto results = db.knn_query("VectorDoc", "embedding", query, 2,
+                                lattice::lattice_db::distance_metric::l2);
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results[0].global_id, "a") << "Closest should be 'close'";
+}
+
+// Training with sufficient vectors
+TEST_F(IVFTest, TrainAndQuery) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+
+    bulkInsert(db, 200);
+
+    // Train IVF
+    bool trained = db.train_vec0("VectorDoc", "embedding");
+    EXPECT_TRUE(trained) << "Training should succeed with 200 vectors";
+
+    // Verify trained flag
+    auto info = db.db().query(
+        "SELECT value FROM _VectorDoc_embedding_vec_info WHERE key = 'ivf_trained_0'");
+    ASSERT_FALSE(info.empty());
+    EXPECT_EQ(std::get<int64_t>(info[0].at("value")), 1);
+
+    // Query should still return results
+    auto query = pack_floats(randomVec());
+    auto results = db.knn_query("VectorDoc", "embedding", query, 10,
+                                lattice::lattice_db::distance_metric::l2);
+    EXPECT_GT(results.size(), 0u) << "Trained IVF should return results";
+}
+
+// Training is idempotent — second call skips
+TEST_F(IVFTest, TrainIdempotent) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+    bulkInsert(db, 50);
+
+    bool first = db.train_vec0("VectorDoc", "embedding");
+    EXPECT_TRUE(first);
+
+    bool second = db.train_vec0("VectorDoc", "embedding");
+    EXPECT_TRUE(second) << "Second train should return true (already trained)";
+}
+
+// Training skipped with too few vectors
+TEST_F(IVFTest, TrainSkippedFewVectors) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+    bulkInsert(db, 5);
+
+    bool trained = db.train_vec0("VectorDoc", "embedding");
+    EXPECT_FALSE(trained) << "Training should skip with only 5 vectors";
+}
+
+// Insert AFTER training — should auto-assign to centroid
+TEST_F(IVFTest, InsertAfterTraining) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+    bulkInsert(db, 100);
+
+    db.train_vec0("VectorDoc", "embedding");
+
+    // Insert new doc after training
+    insertDoc(db, "new_doc", "new", randomVec());
+
+    // Should be findable via query
+    auto query = pack_floats(randomVec());
+    auto results = db.knn_query("VectorDoc", "embedding", query, 110,
+                                lattice::lattice_db::distance_metric::l2);
+    // IVF is approximate — may not return all 101 due to nprobe
+    EXPECT_GE(results.size(), 50u) << "Should find most docs including post-training insert";
+}
+
+// Vacuum rebuilds flat, then train_vec0 converts to IVF + trains
+TEST_F(IVFTest, VacuumThenTrain) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+    bulkInsert(db, 100);
+
+    // Vacuum rebuilds as flat
+    int64_t count = db.vacuum_vec0("VectorDoc", "embedding");
+    EXPECT_EQ(count, 100);
+    EXPECT_FALSE(db.db().table_exists("_VectorDoc_embedding_vec_ivf_centroids00"))
+        << "Vacuum should create flat table, not IVF";
+
+    // Explicit train converts to IVF and trains centroids
+    bool trained = db.train_vec0("VectorDoc", "embedding");
+    EXPECT_TRUE(trained);
+
+    auto info = db.db().query(
+        "SELECT value FROM _VectorDoc_embedding_vec_info WHERE key = 'ivf_trained_0'");
+    ASSERT_FALSE(info.empty());
+    EXPECT_EQ(std::get<int64_t>(info[0].at("value")), 1);
+}
+
+// WAL state after training — subsequent inserts should work
+TEST_F(IVFTest, InsertAfterTrainNoWALConflict) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+    bulkInsert(db, 100);
+
+    db.train_vec0("VectorDoc", "embedding");
+
+    // Insert 50 more docs — should not get SQLITE_BUSY_SNAPSHOT
+    for (int i = 0; i < 50; i++) {
+        EXPECT_NO_THROW(
+            insertDoc(db, "post_train_" + std::to_string(i),
+                      "post_" + std::to_string(i), randomVec())
+        ) << "Insert after training should not fail (iteration " << i << ")";
+    }
+}
+
+// Two connections: training on one, reads on other
+TEST_F(IVFTest, CrossConnectionAfterTraining) {
+    {
+        lattice::lattice_db db1(tmp.str());
+        createVectorTable(db1);
+        bulkInsert(db1, 100);
+        db1.train_vec0("VectorDoc", "embedding");
+    }
+    // Reopen — simulates another process opening the DB after training
+    lattice::lattice_db db2(tmp.str());
+    createVectorTable(db2, 32); // ensure table (already exists)
+
+    auto query = pack_floats(randomVec());
+    auto results = db2.knn_query("VectorDoc", "embedding", query, 10,
+                                 lattice::lattice_db::distance_metric::l2);
+    EXPECT_GT(results.size(), 0u) << "Second connection should read trained IVF data";
+}
+
+// Attach two DBs with IVF vec0 tables
+TEST_F(IVFTest, AttachWithIVF) {
+    // Create and populate two DBs
+    {
+        lattice::lattice_db db1(tmp.str());
+        createVectorTable(db1);
+        bulkInsert(db1, 50);
+    }
+    {
+        lattice::lattice_db db2(tmp2.str());
+        createVectorTable(db2);
+        for (int i = 0; i < 50; i++) {
+            insertDoc(db2, "db2_" + std::to_string(i),
+                      "db2_doc_" + std::to_string(i), randomVec());
+        }
+    }
+
+    // Open both and attach
+    lattice::lattice_db db1(tmp.str());
+    lattice::lattice_db db2_reopen(tmp2.str());
+    createVectorTable(db1, 32);
+    createVectorTable(db2_reopen, 32);
+    EXPECT_NO_THROW(db1.attach(db2_reopen))
+        << "Attaching a DB with IVF vec0 tables should not crash";
+
+    // Query should work across both
+    auto query = pack_floats(randomVec());
+    auto results = db1.knn_query("VectorDoc", "embedding", query, 100,
+                                 lattice::lattice_db::distance_metric::l2);
+    EXPECT_GT(results.size(), 50u)
+        << "Attached query should return results from both DBs";
+}
+
+// MATCH query with WHERE filter
+TEST_F(IVFTest, MatchQueryWithFilter) {
+    lattice::lattice_db db(tmp.str());
+    createVectorTable(db);
+    bulkInsert(db, 100);
+    db.train_vec0("VectorDoc", "embedding");
+
+    // Query with a WHERE filter
+    auto query = pack_floats(randomVec());
+    auto results = db.knn_query("VectorDoc", "embedding", query, 10,
+                                lattice::lattice_db::distance_metric::l2,
+                                std::string("title LIKE 'doc_1%'"));
+    // Should only return docs matching the filter
+    for (const auto& r : results) {
+        // Verify by querying back
+        auto rows = db.db().query(
+            "SELECT title FROM VectorDoc WHERE globalId = ?", {r.global_id});
+        ASSERT_FALSE(rows.empty());
+        auto title = std::get<std::string>(rows[0].at("title"));
+        EXPECT_TRUE(title.substr(0, 5) == "doc_1")
+            << "Filtered result should match: " << title;
+    }
+}

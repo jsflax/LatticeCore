@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <atomic>
+#include <mutex>
 
 namespace lattice {
 
@@ -31,12 +32,7 @@ inline log_level get_log_level() {
 #define LATTICE_LOG(level, tag, fmt, ...) \
     do { \
         if (static_cast<int>(level) <= static_cast<int>(lattice::g_log_level.load(std::memory_order_relaxed))) { \
-            if (auto* _lf = lattice::g_log_file.load(std::memory_order_relaxed)) { \
-                std::fprintf(_lf, "[%s] " fmt "\n", tag, ##__VA_ARGS__); \
-                std::fflush(_lf); \
-            } else { \
-                std::fprintf(stderr, "[%s] " fmt "\n", tag, ##__VA_ARGS__); \
-            } \
+            lattice::log_write("[" tag "] " fmt "\n", ##__VA_ARGS__); \
         } \
     } while(0)
 
@@ -44,7 +40,27 @@ namespace lattice {
 /// When non-null, LATTICE_LOG writes to this file instead of stderr.
 /// Set via set_log_file(). Caller owns the FILE* lifetime.
 inline std::atomic<FILE*> g_log_file{nullptr};
-inline void set_log_file(FILE* f) { g_log_file.store(f, std::memory_order_relaxed); }
+// Intentionally leaked: prevents use-after-destroy during process teardown.
+inline std::mutex& g_log_mutex() {
+    static auto* m = new std::mutex();
+    return *m;
+}
+inline void set_log_file(FILE* f) {
+    std::lock_guard<std::mutex> lock(g_log_mutex());
+    g_log_file.store(f, std::memory_order_release);
+}
+/// Thread-safe log write. Holds mutex to prevent races with set_log_file.
+template<typename... Args>
+inline void log_write(const char* fmt, Args... args) {
+    std::lock_guard<std::mutex> lock(g_log_mutex());
+    auto* f = g_log_file.load(std::memory_order_acquire);
+    if (f) {
+        std::fprintf(f, fmt, args...);
+        std::fflush(f);
+    } else {
+        std::fprintf(stderr, fmt, args...);
+    }
+}
 }
 
 #define LOG_ERROR(tag, fmt, ...) LATTICE_LOG(lattice::log_level::error, tag, fmt, ##__VA_ARGS__)

@@ -2381,7 +2381,13 @@ public:
                            const std::string& column_name,
                            int dimensions,
                            int ivf_nlist = 0, int ivf_nprobe = 0) {
-        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+        // Strip schema prefix (e.g. "main.Memory" → "Memory") — vec0 tables
+        // are always in the default schema, but hydrated objects from attached
+        // databases carry schema-qualified table names.
+        auto dot = model_table.find('.');
+        const std::string& bare_table = (dot != std::string::npos)
+            ? model_table.substr(dot + 1) : model_table;
+        std::string vec_table = "_" + bare_table + "_" + column_name + "_vec";
 
         // Check if table already exists
         std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";

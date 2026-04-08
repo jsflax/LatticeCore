@@ -77,7 +77,29 @@ enum class property_kind {
     link,         // single object reference (nullable foreign key)
     list,         // collection via join table
     virtual_list, // polymorphic collection via discriminated join table
-    virtual_link  // polymorphic single link via discriminated join table
+    virtual_link, // polymorphic single link via discriminated join table
+    union_type    // owned union table reference (parent stores globalId as TEXT)
+};
+
+// Describes one associated value within a union case.
+struct union_case_value {
+    std::string param_name;    // label; empty for single unlabeled values
+    column_type type;          // SQL column type (text for links/embedded, native for primitives)
+    bool is_link = false;      // true = globalId ref to another model table
+    std::string link_target;   // target table name if is_link (e.g., "Dog")
+};
+
+// Describes one case of a union enum.
+// Bare cases (no associated values) have an empty `values` vector.
+struct union_case {
+    std::string case_name;
+    std::vector<union_case_value> values;
+};
+
+// Describes a full union type — used to create and manage the union's internal table.
+struct union_descriptor {
+    std::string union_table_name;  // e.g., "_FeedItem"
+    std::vector<union_case> cases;
 };
 
 // Property descriptor (runtime info about a property)
@@ -85,7 +107,7 @@ struct property_descriptor {
     std::string name;
     column_type type;                           // SQL type (for primitives)
     property_kind kind = property_kind::primitive;
-    std::string target_table;                   // for link/list: the referenced table
+    std::string target_table;                   // for link/list: referenced table; for union_type: union table name
     std::string link_table;                     // for list: the join table name
     bool nullable = false;
     bool is_vector = false;                     // true if this is a vector for similarity search
@@ -94,6 +116,8 @@ struct property_descriptor {
     bool is_indexed = false;                    // true if this property should have a non-unique index
     bool is_unique = false;                     // true if this property should have a unique constraint
     std::string column_name;                    // custom column name (empty = use field name)
+    bool is_union = false;                      // true when kind == union_type
+    union_descriptor union_desc;                // populated when is_union == true
 };
 
 // Type trait to detect geo_bounds types (single value)

@@ -49,6 +49,92 @@ using OptionalString = std::optional<std::string>;
 using OptionalInt64 = std::optional<int64_t>;
 using ByteVector = std::vector<uint8_t>;
 
+// ============================================================================
+// union_value - Type-erased representation of a union field's current value.
+// Typed getters/setters mirror dynamic_object's pattern for Swift-C++ interop.
+// ============================================================================
+
+struct union_value {
+    std::string case_name;  // discriminator (empty = no value / nil)
+
+    void set_string(const std::string& key, const std::string& value)
+        SWIFT_NAME(setString(_:_:)) { string_fields_[key] = value; }
+    std::string get_string(const std::string& key) const
+        SWIFT_NAME(getString(_:)) {
+        auto it = string_fields_.find(key);
+        return it != string_fields_.end() ? it->second : "";
+    }
+    bool has_string(const std::string& key) const
+        SWIFT_NAME(hasString(_:)) { return string_fields_.count(key) > 0; }
+
+    void set_int(const std::string& key, int64_t value)
+        SWIFT_NAME(setInt(_:_:)) { int_fields_[key] = value; }
+    int64_t get_int(const std::string& key) const
+        SWIFT_NAME(getInt(_:)) {
+        auto it = int_fields_.find(key);
+        return it != int_fields_.end() ? it->second : 0;
+    }
+    bool has_int(const std::string& key) const
+        SWIFT_NAME(hasInt(_:)) { return int_fields_.count(key) > 0; }
+
+    void set_double(const std::string& key, double value)
+        SWIFT_NAME(setDouble(_:_:)) { double_fields_[key] = value; }
+    double get_double(const std::string& key) const
+        SWIFT_NAME(getDouble(_:)) {
+        auto it = double_fields_.find(key);
+        return it != double_fields_.end() ? it->second : 0.0;
+    }
+    bool has_double(const std::string& key) const
+        SWIFT_NAME(hasDouble(_:)) { return double_fields_.count(key) > 0; }
+
+    void set_blob(const std::string& key, const std::vector<uint8_t>& value)
+        SWIFT_NAME(setBlob(_:_:)) { blob_fields_[key] = value; }
+    std::vector<uint8_t> get_blob(const std::string& key) const
+        SWIFT_NAME(getBlob(_:)) {
+        auto it = blob_fields_.find(key);
+        return it != blob_fields_.end() ? it->second : std::vector<uint8_t>{};
+    }
+    bool has_blob(const std::string& key) const
+        SWIFT_NAME(hasBlob(_:)) { return blob_fields_.count(key) > 0; }
+
+    bool has_field(const std::string& key) const
+        SWIFT_NAME(hasField(_:)) {
+        return has_string(key) || has_int(key) || has_double(key) || has_blob(key);
+    }
+
+    // Link object references — for unmanaged objects where globalId isn't set yet.
+    // persist_union_values resolves these to globalIds at add() time.
+    void set_link_ref(const std::string& key, dynamic_object_ref& ref)
+        SWIFT_NAME(setLinkRef(_:_:)) { link_refs_[key] = ref.impl_; }
+    // Returns a wrapped ref for Swift interop (caller owns the returned ref).
+    // For C++ internal use, access link_refs() directly.
+    dynamic_object_ref* get_link_ref(const std::string& key) const
+        SWIFT_NAME(getLinkRef(_:)) {
+        auto it = link_refs_.find(key);
+        if (it == link_refs_.end() || !it->second) return nullptr;
+        return dynamic_object_ref::wrap(it->second);
+    }
+    bool has_link_ref(const std::string& key) const
+        SWIFT_NAME(hasLinkRef(_:)) { return link_refs_.count(key) > 0; }
+
+    // All field keys across all types
+    std::vector<std::string> all_keys() const SWIFT_NAME(allKeys());
+
+    // Convert a field to column_value_t for SQL binding
+    column_value_t field_as_column_value(const std::string& key) const;
+
+    // Link refs map (for persist_union_values)
+    const std::unordered_map<std::string, std::shared_ptr<dynamic_object>>& link_refs() const { return link_refs_; }
+    std::unordered_map<std::string, std::shared_ptr<dynamic_object>>& link_refs() { return link_refs_; }
+
+private:
+    std::unordered_map<std::string, std::string> string_fields_;
+    std::unordered_map<std::string, int64_t> int_fields_;
+    std::unordered_map<std::string, double> double_fields_;
+    std::unordered_map<std::string, std::vector<uint8_t>> blob_fields_;
+    std::unordered_map<std::string, std::shared_ptr<dynamic_object>> link_refs_;
+};
+
 // Constraint definition for Swift interop
 struct swift_constraint {
     std::vector<std::string> columns;
@@ -424,6 +510,8 @@ private:
     std::unordered_map<std::string, SwiftSchema> schemas_;
     // Stored constraints per table
     std::unordered_map<std::string, ConstraintVector> constraints_;
+    // Union table descriptors (union_table_name -> descriptor)
+    std::unordered_map<std::string, union_descriptor> union_schemas_;
     // Swift-specific configuration (stores row migration callback)
     swift_configuration swift_config_;
     // Error from last receive_sync_data call (nullopt if none)
@@ -431,6 +519,8 @@ private:
     std::future<void> vec0_training_future_;
 
     void ensure_swift_tables(const SchemaVector& schemas);
+    void persist_union_values(swift_dynamic_object& unmanaged_obj,
+                              const std::string& table_name, int64_t parent_id);
 
 public:
     // Add with schema from the object instance

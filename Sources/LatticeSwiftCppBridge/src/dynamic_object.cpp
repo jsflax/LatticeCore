@@ -165,6 +165,229 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
     }
 }
 
+// ============================================================================
+// dynamic_object_ref — union delegates
+// ============================================================================
+
+union_value dynamic_object_ref::get_union(const std::string& name) const {
+    return impl_->get_union(name);
+}
+
+void dynamic_object_ref::set_union(const std::string& name, const union_value& value) {
+    impl_->set_union(name, value);
+}
+
+// ============================================================================
+// union_value
+// ============================================================================
+
+std::vector<std::string> union_value::all_keys() const {
+    std::vector<std::string> keys;
+    for (const auto& [k, _] : string_fields_) keys.push_back(k);
+    for (const auto& [k, _] : int_fields_) keys.push_back(k);
+    for (const auto& [k, _] : double_fields_) keys.push_back(k);
+    for (const auto& [k, _] : blob_fields_) keys.push_back(k);
+    return keys;
+}
+
+column_value_t union_value::field_as_column_value(const std::string& key) const {
+    if (has_string(key)) return get_string(key);
+    if (has_int(key)) return get_int(key);
+    if (has_double(key)) return get_double(key);
+    if (has_blob(key)) return get_blob(key);
+    return nullptr;
+}
+
+// ============================================================================
+// dynamic_object — union accessors
+// ============================================================================
+
+union_value dynamic_object::get_union(const std::string& name) const {
+    if (lattice) {
+        // Managed: read globalId from parent column, query union table
+        std::string union_gid = managed_.get_string(name);
+        if (union_gid.empty()) {
+            return union_value{};
+        }
+
+        // Look up the union table name from the property descriptor
+        auto prop_it = managed_.properties_.find(name);
+        if (prop_it == managed_.properties_.end() || !prop_it->second.is_union) {
+            return union_value{};
+        }
+        const auto& union_table = prop_it->second.union_desc.union_table_name;
+
+        // Query the union row by globalId
+        auto rows = managed_.db_->query(
+            "SELECT * FROM " + union_table + " WHERE globalId = ?",
+            {union_gid});
+        if (rows.empty()) {
+            return union_value{};
+        }
+
+        const auto& row = rows[0];
+        union_value result;
+
+        // Extract "case" discriminator
+        auto case_it = row.find("case");
+        if (case_it != row.end() && std::holds_alternative<std::string>(case_it->second)) {
+            result.case_name = std::get<std::string>(case_it->second);
+        }
+
+        // Build col_name → field_key mapping from the active case in the descriptor
+        const auto& udesc = prop_it->second.union_desc;
+        std::unordered_map<std::string, std::string> col_to_key;  // DB col → macro key
+        std::unordered_map<std::string, bool> col_is_link;
+        std::unordered_map<std::string, std::string> col_link_target;
+        for (const auto& c : udesc.cases) {
+            if (c.case_name != result.case_name) continue;
+            for (size_t vi = 0; vi < c.values.size(); ++vi) {
+                const auto& v = c.values[vi];
+                std::string key = v.param_name.empty()
+                    ? ("_" + std::to_string(vi)) : v.param_name;
+                std::string col = (c.values.size() == 1 && v.param_name.empty())
+                    ? c.case_name : c.case_name + "__" + key;
+                col_to_key[col] = key;
+                col_is_link[col] = v.is_link;
+                if (v.is_link) col_link_target[col] = v.link_target;
+            }
+            break;
+        }
+
+        // Extract non-null value columns, storing under field keys (not column names)
+        for (const auto& [col, val] : row) {
+            if (col == "id" || col == "globalId" || col == "case") continue;
+            if (std::holds_alternative<std::nullptr_t>(val)) continue;
+            auto key_it = col_to_key.find(col);
+            if (key_it == col_to_key.end()) continue;
+            const auto& key = key_it->second;
+
+            std::visit(overloaded{
+                [&](std::nullptr_t) {},
+                [&](int64_t v) { result.set_int(key, v); },
+                [&](double v) { result.set_double(key, v); },
+                [&](const std::string& v) { result.set_string(key, v); },
+                [&](const std::vector<uint8_t>& v) { result.set_blob(key, v); },
+            }, val);
+
+            // Hydrate link fields into link_refs via object_by_global_id
+            if (col_is_link[col]) {
+                std::string link_gid = result.get_string(key);
+                if (!link_gid.empty()) {
+                    auto obj = lattice->get()->object_by_global_id(link_gid, col_link_target[col]);
+                    if (obj) {
+                        result.link_refs()[key] = std::make_shared<dynamic_object>(std::move(*obj));
+                    }
+                }
+            }
+        }
+
+        return result;
+    } else {
+        // Unmanaged: read from local map
+        auto it = unmanaged_.union_values.find(name);
+        if (it != unmanaged_.union_values.end() && it->second) {
+            return *it->second;
+        }
+        return union_value{};
+    }
+}
+
+void dynamic_object::set_union(const std::string& name, const union_value& value) {
+    if (lattice) {
+        // Managed: update or insert union row, then update parent FK
+        auto prop_it = managed_.properties_.find(name);
+        if (prop_it == managed_.properties_.end() || !prop_it->second.is_union) return;
+
+        const auto& union_table = prop_it->second.union_desc.union_table_name;
+        const auto& union_desc = prop_it->second.union_desc;
+        std::string existing_gid = managed_.get_string(name);
+
+        if (value.case_name.empty()) {
+            // Clearing the union (for optional fields)
+            if (!existing_gid.empty()) {
+                managed_.db_->execute(
+                    "DELETE FROM " + union_table + " WHERE globalId = ?",
+                    {existing_gid});
+                managed_.set_string(name, "");
+            }
+            return;
+        }
+
+        // Build col_name ↔ field_key mapping from the descriptor
+        struct col_info { std::string case_name; std::string col_name; std::string field_key; };
+        std::vector<col_info> all_cols;
+        for (const auto& c : union_desc.cases) {
+            if (c.values.empty()) continue;
+            if (c.values.size() == 1 && c.values[0].param_name.empty()) {
+                all_cols.push_back({c.case_name, c.case_name, "_0"});
+            } else {
+                for (size_t vi = 0; vi < c.values.size(); ++vi) {
+                    const auto& v = c.values[vi];
+                    std::string key = v.param_name.empty()
+                        ? ("_" + std::to_string(vi)) : v.param_name;
+                    all_cols.push_back({c.case_name, c.case_name + "__" + key, key});
+                }
+            }
+        }
+
+        if (!existing_gid.empty()) {
+            // UPDATE existing union row — only set values for the active case, NULL others
+            std::string sql = "UPDATE " + union_table + " SET \"case\" = ?";
+            std::vector<column_value_t> params;
+            params.push_back(value.case_name);
+
+            for (const auto& ci : all_cols) {
+                sql += ", " + ci.col_name + " = ?";
+                if (ci.case_name == value.case_name && value.has_field(ci.field_key)) {
+                    params.push_back(value.field_as_column_value(ci.field_key));
+                } else {
+                    params.push_back(nullptr);
+                }
+            }
+            sql += " WHERE globalId = ?";
+            params.push_back(existing_gid);
+            managed_.db_->execute(sql, params);
+        } else {
+            // INSERT new union row
+            auto gid_rows = managed_.db_->query(
+                "SELECT lower(hex(randomblob(4))) || '-' || "
+                "lower(hex(randomblob(2))) || '-' || "
+                "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
+                "substr('89ab', 1 + (abs(random()) % 4), 1) || "
+                "substr(lower(hex(randomblob(2))),2) || '-' || "
+                "lower(hex(randomblob(6))) AS gid");
+            std::string new_gid = std::get<std::string>(gid_rows[0].at("gid"));
+
+            std::string cols = "globalId, \"case\"";
+            std::string placeholders = "?, ?";
+            std::vector<column_value_t> params;
+            params.push_back(new_gid);
+            params.push_back(value.case_name);
+
+            for (const auto& ci : all_cols) {
+                cols += ", " + ci.col_name;
+                placeholders += ", ?";
+                if (ci.case_name == value.case_name && value.has_field(ci.field_key)) {
+                    params.push_back(value.field_as_column_value(ci.field_key));
+                } else {
+                    params.push_back(nullptr);
+                }
+            }
+
+            managed_.db_->execute(
+                "INSERT INTO " + union_table + " (" + cols + ") VALUES (" + placeholders + ")",
+                params);
+
+            // Update parent FK to point to the new union row's globalId
+            managed_.set_string(name, new_gid);
+        }
+    } else {
+        // Unmanaged: store in local map
+        unmanaged_.union_values[name] = std::make_shared<union_value>(value);
+    }
+}
+
 }
 
 // Implement retain/release for Swift shared reference

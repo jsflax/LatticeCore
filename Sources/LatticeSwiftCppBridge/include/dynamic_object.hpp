@@ -15,6 +15,7 @@
 namespace lattice {
     class dynamic_object_ref;
     class geo_bounds_list_ref;
+    struct union_value;
 }
 // Forward declarations for Swift shared reference
 void retainDynamicObjectRef(lattice::dynamic_object_ref* p);
@@ -237,10 +238,14 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
         }
     }
 
+    // union accessors
+    union_value get_union(const std::string& name) const SWIFT_NAME(getUnion(named:));
+    void set_union(const std::string& name, const union_value& value) SWIFT_NAME(setUnion(named:_:));
+
     dynamic_object copy() const {
         return *this;
     }
-    
+
     void manage(managed<swift_dynamic_object> o);
     
     std::string debug_description() const;
@@ -386,6 +391,10 @@ public:
         return dynamic_object_ref::wrap(impl_->get_object(name).make_shared());
     }
 
+    // union accessors (implemented in dynamic_object.cpp — union_value is incomplete here)
+    union_value get_union(const std::string& name) const SWIFT_NAME(getUnion(named:));
+    void set_union(const std::string& name, const union_value& value) SWIFT_NAME(setUnion(named:_:));
+
     link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:)) {
         return impl_->get_link_list(name);
     }
@@ -439,6 +448,7 @@ private:
     friend struct dynamic_object;
     friend struct swift_lattice;
     friend struct link_list;
+    friend struct union_value;
     std::shared_ptr<dynamic_object> impl_;
     std::atomic<int> ref_count_{0};
     

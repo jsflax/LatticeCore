@@ -12,6 +12,7 @@ namespace lattice {
 
 struct dynamic_object;
 struct link_list;
+struct union_value;
 
 struct SWIFT_CONFORMS_TO_PROTOCOL(LatticeSwiftModule.OptionalProtocol) swift_dynamic_object {
     using Wrapped = swift_dynamic_object;
@@ -22,7 +23,8 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(LatticeSwiftModule.OptionalProtocol) swift_dyn
     std::unordered_map<std::string, std::shared_ptr<dynamic_object>> link_values;
     std::unordered_map<std::string, std::shared_ptr<link_list>> list_values;
     std::unordered_map<std::string, std::vector<geo_bounds>> geo_bounds_lists;
-    
+    std::unordered_map<std::string, std::shared_ptr<union_value>> union_values;
+
     swift_dynamic_object() = default;
 
     swift_dynamic_object(const std::string& table,

@@ -1264,30 +1264,40 @@ public:
                 // List.observe / VirtualList.observe) and the parent table
                 // (for @LatticeQuery / table-level observers + per-object
                 // observers for Swift Observation).
-                // Parse "parent_table:property_name" from _lattice_meta value.
+                // Parse potentially semicolon-separated "parent:property" entries
+                // (union tables can have multiple parents: "Feed:item;Post:featured").
                 auto& meta_value = it->second;
-                auto colon_pos = meta_value.find(':');
-                std::string parent_table = (colon_pos != std::string::npos)
-                    ? meta_value.substr(0, colon_pos) : meta_value;
-                std::string property_name = (colon_pos != std::string::npos)
-                    ? meta_value.substr(colon_pos + 1) : "";
+                size_t pos = 0;
+                bool first_notify = true;
+                while (pos < meta_value.size()) {
+                    auto semi = meta_value.find(';', pos);
+                    auto segment = (semi == std::string::npos)
+                        ? meta_value.substr(pos) : meta_value.substr(pos, semi - pos);
+                    auto colon_pos = segment.find(':');
+                    std::string parent_table = (colon_pos != std::string::npos)
+                        ? segment.substr(0, colon_pos) : segment;
+                    std::string property_name = (colon_pos != std::string::npos)
+                        ? segment.substr(colon_pos + 1) : "";
 
-                // Build changed_fields_names JSON for per-object observer dispatch.
-                // This triggers _triggerObservers_send on parent Model instances,
-                // which fires Swift Observation willSet/didSet and causes SwiftUI
-                // views tracking this property (e.g., @Bindable node.children) to
-                // re-render.
-                std::string changed_fields = property_name.empty()
-                    ? "" : "[\"" + property_name + "\"]";
+                    std::string changed_fields = property_name.empty()
+                        ? "" : "[\"" + property_name + "\"]";
 
-                LOG_DEBUG("flush_changes", "Internal table %s -> notify link + parent UPDATE %s (prop=%s)",
-                          table.c_str(), parent_table.c_str(), property_name.c_str());
-                for_each_alive([&table, &op, row_id, &global_id, &parent_table, &changed_fields](lattice_db* instance) {
-                    instance->notify_change(table, op, row_id, global_id);
-                    // row_id=0 broadcasts to all table-level observers.
-                    // Swift observer handles rowId==0 as an unconditional update.
-                    instance->notify_change(parent_table, "UPDATE", 0, "", changed_fields);
-                });
+                    LOG_DEBUG("flush_changes", "Internal table %s -> notify link + parent UPDATE %s (prop=%s)",
+                              table.c_str(), parent_table.c_str(), property_name.c_str());
+
+                    // Notify the internal table itself only once (on first parent iteration)
+                    if (first_notify) {
+                        for_each_alive([&table, &op, row_id, &global_id](lattice_db* instance) {
+                            instance->notify_change(table, op, row_id, global_id);
+                        });
+                        first_notify = false;
+                    }
+                    for_each_alive([&parent_table, &changed_fields](lattice_db* instance) {
+                        instance->notify_change(parent_table, "UPDATE", 0, "", changed_fields);
+                    });
+
+                    pos = (semi == std::string::npos) ? meta_value.size() : semi + 1;
+                }
                 had_internal_changes = true;
             } else {
                 // When applying remote changes (IPC sync), look up changedFieldsNames
@@ -2334,6 +2344,147 @@ public:
 
         // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
         create_virtual_link_table_triggers(link_table_name);
+    }
+
+    // Create a union table on demand. Union tables are internal tables that store
+    // one row per union field instance. The parent model stores the union row's
+    // globalId as a TEXT column.
+    void ensure_union_table(const std::string& union_table_name,
+                            const union_descriptor& desc,
+                            const std::string& parent_table,
+                            const std::string& property_name) {
+        register_union_internal_table(union_table_name, parent_table, property_name);
+
+        if (db_->table_exists(union_table_name)) {
+            // TODO: migration — compare existing columns vs descriptor, rebuild if needed
+            return;
+        }
+
+        std::ostringstream sql;
+        sql << "CREATE TABLE IF NOT EXISTS " << union_table_name << "("
+            << "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
+            <<   "lower(hex(randomblob(4))) || '-' || "
+            <<   "lower(hex(randomblob(2))) || '-' || "
+            <<   "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
+            <<   "substr('89ab', 1 + (abs(random()) % 4), 1) || "
+            <<   "substr(lower(hex(randomblob(2))),2) || '-' || "
+            <<   "lower(hex(randomblob(6)))"
+            << "), "
+            << "\"case\" TEXT NOT NULL";
+
+        // Collect column info for triggers and CHECK constraint
+        std::vector<std::pair<std::string, column_type>> columns;
+        columns.push_back({"\"case\"", column_type::text});
+
+        // Map: case_name -> list of column names belonging to that case
+        std::map<std::string, std::vector<std::string>> case_to_cols;
+        std::vector<std::string> all_case_cols;
+
+        for (const auto& c : desc.cases) {
+            std::vector<std::string> cols;
+            if (c.values.empty()) {
+                // Bare case (e.g., `case empty`) — no extra columns
+                case_to_cols[c.case_name] = {};
+                continue;
+            }
+            if (c.values.size() == 1 && c.values[0].param_name.empty()) {
+                // Single unlabeled value: column name is just the case name
+                std::string col = c.case_name;
+                sql << ", " << col << " " << sql_type_string(c.values[0].type);
+                columns.push_back({col, c.values[0].type});
+                cols.push_back(col);
+            } else {
+                // Multi-value or labeled: column name is case__param
+                for (const auto& val : c.values) {
+                    std::string col = c.case_name + "__" + val.param_name;
+                    sql << ", " << col << " " << sql_type_string(val.type);
+                    columns.push_back({col, val.type});
+                    cols.push_back(col);
+                }
+            }
+            case_to_cols[c.case_name] = cols;
+            all_case_cols.insert(all_case_cols.end(), cols.begin(), cols.end());
+        }
+
+        // CHECK constraint: for each case, its columns NOT NULL and all others NULL
+        if (!all_case_cols.empty()) {
+            sql << ", CHECK(";
+            bool first_case = true;
+            for (const auto& c : desc.cases) {
+                if (!first_case) sql << " OR ";
+                first_case = false;
+
+                sql << "(\"case\" = '" << c.case_name << "'";
+
+                auto my_cols_it = case_to_cols.find(c.case_name);
+                const auto& my_cols = (my_cols_it != case_to_cols.end())
+                    ? my_cols_it->second : std::vector<std::string>{};
+
+                // My columns must be NOT NULL
+                for (const auto& col : my_cols) {
+                    sql << " AND " << col << " IS NOT NULL";
+                }
+                // All other columns must be NULL
+                for (const auto& col : all_case_cols) {
+                    bool is_mine = std::find(my_cols.begin(), my_cols.end(), col) != my_cols.end();
+                    if (!is_mine) {
+                        sql << " AND " << col << " IS NULL";
+                    }
+                }
+                sql << ")";
+            }
+            sql << ")";
+        }
+
+        sql << ")";
+        db_->execute(sql.str());
+
+        // Auto-index the discriminator for case-level queries
+        db_->execute("CREATE INDEX IF NOT EXISTS idx_" + union_table_name +
+                     "_case ON " + union_table_name + "(\"case\")");
+
+        // Reuse standard model table triggers (union tables have id + globalId)
+        create_model_table_triggers(union_table_name, columns);
+    }
+
+    // Register a union table as internal, supporting multiple parents.
+    // Format: "Feed:item" or "Feed:item;Post:featured" for multi-parent.
+    void register_union_internal_table(const std::string& table_name,
+                                       const std::string& parent_table,
+                                       const std::string& property_name) {
+        std::string new_entry = parent_table + ":" + property_name;
+        auto rows = db_->query(
+            "SELECT value FROM _lattice_meta WHERE key = ?",
+            {"internal_table:" + table_name});
+
+        if (rows.empty()) {
+            db_->execute(
+                "INSERT INTO _lattice_meta(key, value) VALUES(?, ?)",
+                {"internal_table:" + table_name, new_entry});
+        } else {
+            auto existing = std::get<std::string>(rows[0].at("value"));
+            if (existing.find(new_entry) == std::string::npos) {
+                db_->execute(
+                    "UPDATE _lattice_meta SET value = ? WHERE key = ?",
+                    {existing + ";" + new_entry, "internal_table:" + table_name});
+            }
+        }
+    }
+
+    // Cascade-delete owned union rows when the parent is deleted.
+    void create_union_cascade_trigger(const std::string& parent_table,
+                                      const std::string& field_name,
+                                      const std::string& union_table_name) {
+        std::string trigger_name = "_cascade_delete_" + parent_table + "_" + field_name + "_union";
+        std::string sql =
+            "CREATE TRIGGER IF NOT EXISTS " + trigger_name +
+            " BEFORE DELETE ON " + parent_table +
+            " WHEN OLD." + field_name + " IS NOT NULL AND OLD." + field_name + " != ''"
+            " BEGIN"
+            "   DELETE FROM " + union_table_name + " WHERE globalId = OLD." + field_name + ";"
+            " END";
+        db_->execute(sql);
     }
 
     /// Get column types for a table (for sync schema lookup)

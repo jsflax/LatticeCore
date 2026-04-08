@@ -213,6 +213,8 @@ void swift_lattice::add(dynamic_object &obj) {
             const_cast<managed<std::vector<geo_bounds>>&>(geo_list_field).push_back(bounds);
         }
     }
+    // Handle union values — insert union rows and update parent FK
+    persist_union_values(unmanaged_obj, table_name, object.id());
     obj.manage(object);
 }
 
@@ -256,6 +258,8 @@ void swift_lattice::add_preserving_global_id(dynamic_object &obj, const std::str
             const_cast<managed<std::vector<geo_bounds>>&>(geo_list_field).push_back(bounds);
         }
     }
+    // Handle union values
+    persist_union_values(unmanaged_obj, table_name, object.id());
     obj.manage(object);
 }
 
@@ -340,6 +344,90 @@ std::optional<managed<swift_dynamic_object>> swift_lattice::object(int64_t prima
    return result;
 }
 
+void swift_lattice::persist_union_values(swift_dynamic_object& unmanaged_obj,
+                                         const std::string& table_name,
+                                         int64_t parent_id) {
+    for (auto& [name, uval_ptr] : unmanaged_obj.union_values) {
+        if (!uval_ptr || uval_ptr->case_name.empty()) continue;
+
+        auto prop_it = unmanaged_obj.properties.find(name);
+        if (prop_it == unmanaged_obj.properties.end() || !prop_it->second.is_union) continue;
+
+        const auto& union_table = prop_it->second.union_desc.union_table_name;
+        auto udesc_it = union_schemas_.find(union_table);
+        if (udesc_it == union_schemas_.end()) continue;
+        const auto& udesc = udesc_it->second;
+
+        // Persist any unmanaged linked objects and fill in their globalIds
+        for (const auto& [field_key, link_obj] : uval_ptr->link_refs()) {
+            if (link_obj && !link_obj->lattice) {
+                add(*link_obj);
+            }
+            // Now the linked object is managed — grab its globalId
+            if (link_obj && link_obj->lattice) {
+                uval_ptr->set_string(field_key, link_obj->managed_.global_id());
+            }
+        }
+
+        // Generate globalId for the union row
+        auto gid_rows = db().query(
+            "SELECT lower(hex(randomblob(4))) || '-' || "
+            "lower(hex(randomblob(2))) || '-' || "
+            "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
+            "substr('89ab', 1 + (abs(random()) % 4), 1) || "
+            "substr(lower(hex(randomblob(2))),2) || '-' || "
+            "lower(hex(randomblob(6))) AS gid");
+        std::string new_gid = std::get<std::string>(gid_rows[0].at("gid"));
+
+        // Build column info: for each case, map field_key → column_name
+        struct col_info {
+            std::string case_name;  // which case this column belongs to
+            std::string col_name;   // DB column name
+            std::string field_key;  // key used by macro in union_value
+        };
+        std::vector<col_info> all_cols;
+        for (const auto& c : udesc.cases) {
+            if (c.values.empty()) continue;
+            if (c.values.size() == 1 && c.values[0].param_name.empty()) {
+                all_cols.push_back({c.case_name, c.case_name, "_0"});
+            } else {
+                for (size_t vi = 0; vi < c.values.size(); ++vi) {
+                    const auto& v = c.values[vi];
+                    std::string key = v.param_name.empty()
+                        ? ("_" + std::to_string(vi)) : v.param_name;
+                    all_cols.push_back({c.case_name, c.case_name + "__" + key, key});
+                }
+            }
+        }
+
+        // Build INSERT — only read values for the ACTIVE case, NULL for all others
+        std::string cols = "globalId, \"case\"";
+        std::string placeholders = "?, ?";
+        std::vector<column_value_t> params;
+        params.push_back(new_gid);
+        params.push_back(uval_ptr->case_name);
+
+        for (const auto& ci : all_cols) {
+            cols += ", " + ci.col_name;
+            placeholders += ", ?";
+            if (ci.case_name == uval_ptr->case_name && uval_ptr->has_field(ci.field_key)) {
+                params.push_back(uval_ptr->field_as_column_value(ci.field_key));
+            } else {
+                params.push_back(nullptr);
+            }
+        }
+
+        db().execute(
+            "INSERT INTO " + union_table + " (" + cols + ") VALUES (" + placeholders + ")",
+            params);
+
+        // Update parent FK to the new union row's globalId
+        db().execute(
+            "UPDATE " + table_name + " SET " + name + " = ? WHERE id = ?",
+            {new_gid, parent_id});
+    }
+}
+
 void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     LOG_INFO("swift_lattice", "ensure_swift_tables: acquiring exclusive transaction");
     auto transaction = lattice::transaction(this->db(), /*exclusive=*/true);
@@ -360,8 +448,14 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         model_schema schema;
         schema.table_name = entry.table_name;
         for (const auto& [name, desc] : entry.properties) {
-            if (desc.kind == property_kind::primitive ||
-                (desc.kind == property_kind::list && desc.is_geo_bounds)) {
+            if (desc.kind == property_kind::union_type) {
+                // Union FK column: TEXT storing the union row's globalId
+                auto col_desc = desc;
+                col_desc.type = column_type::text;
+                col_desc.nullable = true;
+                schema.properties.push_back(col_desc);
+            } else if (desc.kind == property_kind::primitive ||
+                       (desc.kind == property_kind::list && desc.is_geo_bounds)) {
                 schema.properties.push_back(desc);
             }
         }
@@ -791,6 +885,19 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     "INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
                     {"internal_table:" + link_table_name, entry.table_name + ":" + name}
                 );
+            }
+        }
+    }
+
+    // Phase 9: Create union tables and cascade triggers
+    for (const auto& entry : schemas) {
+        for (const auto& [name, desc] : entry.properties) {
+            if (desc.is_union) {
+                ensure_union_table(desc.union_desc.union_table_name, desc.union_desc,
+                                   entry.table_name, name);
+                create_union_cascade_trigger(entry.table_name, name,
+                                             desc.union_desc.union_table_name);
+                union_schemas_[desc.union_desc.union_table_name] = desc.union_desc;
             }
         }
     }

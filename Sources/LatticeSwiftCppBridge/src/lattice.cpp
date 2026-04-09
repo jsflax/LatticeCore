@@ -500,6 +500,14 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     }
 
     // Incremental migration loop
+    // Stash for union values set during migration callbacks (persisted after table rebuild)
+    struct pending_union_ref {
+        std::string table_name;
+        int64_t row_id;
+        swift_dynamic_object unmanaged;
+    };
+    std::vector<pending_union_ref> pending_migration_union_refs;
+
     int current_version = get_schema_version();
     int target_version = swift_config_.target_schema_version;
     LOG_INFO("swift_lattice", "migration: current_version=%d, target_version=%d", current_version, target_version);
@@ -709,8 +717,11 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     }
                 }
 
-                // Process union_values set by the migration callback
-                persist_union_values(new_ref->impl_->unmanaged_, table_name, row_id);
+                // Stash union values for persistence after table rebuild.
+                // Can't persist now — the table still has the old schema.
+                if (!new_ref->impl_->unmanaged_.union_values.empty()) {
+                    pending_migration_union_refs.push_back({table_name, row_id, new_ref->impl_->unmanaged_});
+                }
             }
 
             // Now update schemas_ to NEW schema and apply table migration
@@ -730,6 +741,12 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         // Apply queued row updates for this version
         LOG_INFO("swift_lattice", "  applying pending updates for version %d", version);
         migration_ctx.apply_pending_updates();
+
+        // Persist union values set during migration callbacks (table now has new schema)
+        for (auto& ref : pending_migration_union_refs) {
+            persist_union_values(ref.unmanaged, ref.table_name, ref.row_id);
+        }
+        pending_migration_union_refs.clear();
 
         // Update version in _lattice_meta
         LOG_INFO("swift_lattice", "  setting schema version to %d", version);

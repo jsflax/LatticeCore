@@ -2355,13 +2355,43 @@ public:
                             const std::string& property_name) {
         register_union_internal_table(union_table_name, parent_table, property_name);
 
+        // Check if table exists and needs migration (new cases added)
+        std::vector<std::string> old_col_names;
         if (db_->table_exists(union_table_name)) {
-            // TODO: migration — compare existing columns vs descriptor, rebuild if needed
-            return;
+            auto existing_cols = db_->get_table_info(union_table_name);
+            bool needs_rebuild = false;
+            for (const auto& c : desc.cases) {
+                if (c.values.empty()) continue;
+                if (c.values.size() == 1 && c.values[0].param_name.empty()) {
+                    if (existing_cols.find(c.case_name) == existing_cols.end())
+                        needs_rebuild = true;
+                } else {
+                    for (const auto& v : c.values) {
+                        if (existing_cols.find(c.case_name + "__" + v.param_name) == existing_cols.end())
+                            needs_rebuild = true;
+                    }
+                }
+                if (needs_rebuild) break;
+            }
+            if (!needs_rebuild) return;
+
+            // Collect old column names for data copy
+            for (const auto& [col, _] : existing_cols) old_col_names.push_back(col);
+
+            // Drop old triggers + rename
+            drop_model_table_triggers(union_table_name);
+            db_->execute("DROP INDEX IF EXISTS idx_" + union_table_name + "_case");
+            db_->execute("ALTER TABLE " + union_table_name + " RENAME TO " + union_table_name + "_old");
         }
 
+        // Build column info from descriptor
+        std::vector<std::pair<std::string, column_type>> columns;
+        columns.push_back({"\"case\"", column_type::text});
+        std::map<std::string, std::vector<std::string>> case_to_cols;
+        std::vector<std::string> all_case_cols;
+
         std::ostringstream sql;
-        sql << "CREATE TABLE IF NOT EXISTS " << union_table_name << "("
+        sql << "CREATE TABLE " << union_table_name << "("
             << "id INTEGER PRIMARY KEY AUTOINCREMENT, "
             << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
             <<   "lower(hex(randomblob(4))) || '-' || "
@@ -2373,29 +2403,18 @@ public:
             << "), "
             << "\"case\" TEXT NOT NULL";
 
-        // Collect column info for triggers and CHECK constraint
-        std::vector<std::pair<std::string, column_type>> columns;
-        columns.push_back({"\"case\"", column_type::text});
-
-        // Map: case_name -> list of column names belonging to that case
-        std::map<std::string, std::vector<std::string>> case_to_cols;
-        std::vector<std::string> all_case_cols;
-
         for (const auto& c : desc.cases) {
             std::vector<std::string> cols;
             if (c.values.empty()) {
-                // Bare case (e.g., `case empty`) — no extra columns
                 case_to_cols[c.case_name] = {};
                 continue;
             }
             if (c.values.size() == 1 && c.values[0].param_name.empty()) {
-                // Single unlabeled value: column name is just the case name
                 std::string col = c.case_name;
                 sql << ", " << col << " " << sql_type_string(c.values[0].type);
                 columns.push_back({col, c.values[0].type});
                 cols.push_back(col);
             } else {
-                // Multi-value or labeled: column name is case__param
                 for (const auto& val : c.values) {
                     std::string col = c.case_name + "__" + val.param_name;
                     sql << ", " << col << " " << sql_type_string(val.type);
@@ -2407,28 +2426,22 @@ public:
             all_case_cols.insert(all_case_cols.end(), cols.begin(), cols.end());
         }
 
-        // CHECK constraint: for each case, its columns NOT NULL and all others NULL
+        // CHECK constraint
         if (!all_case_cols.empty()) {
             sql << ", CHECK(";
             bool first_case = true;
             for (const auto& c : desc.cases) {
                 if (!first_case) sql << " OR ";
                 first_case = false;
-
                 sql << "(\"case\" = '" << c.case_name << "'";
-
                 auto my_cols_it = case_to_cols.find(c.case_name);
                 const auto& my_cols = (my_cols_it != case_to_cols.end())
                     ? my_cols_it->second : std::vector<std::string>{};
-
-                // My columns must be NOT NULL
                 for (const auto& col : my_cols) {
                     sql << " AND " << col << " IS NOT NULL";
                 }
-                // All other columns must be NULL
                 for (const auto& col : all_case_cols) {
-                    bool is_mine = std::find(my_cols.begin(), my_cols.end(), col) != my_cols.end();
-                    if (!is_mine) {
+                    if (std::find(my_cols.begin(), my_cols.end(), col) == my_cols.end()) {
                         sql << " AND " << col << " IS NULL";
                     }
                 }
@@ -2440,11 +2453,21 @@ public:
         sql << ")";
         db_->execute(sql.str());
 
-        // Auto-index the discriminator for case-level queries
+        // If rebuilding, copy old data and drop the old table
+        if (!old_col_names.empty()) {
+            // Build column list common to both old and new tables
+            std::string common_cols = "id, globalId, \"case\"";
+            for (const auto& col : old_col_names) {
+                if (col == "id" || col == "globalId" || col == "case") continue;
+                common_cols += ", " + col;
+            }
+            db_->execute("INSERT INTO " + union_table_name + " (" + common_cols + ") "
+                        "SELECT " + common_cols + " FROM " + union_table_name + "_old");
+            db_->execute("DROP TABLE " + union_table_name + "_old");
+        }
+
         db_->execute("CREATE INDEX IF NOT EXISTS idx_" + union_table_name +
                      "_case ON " + union_table_name + "(\"case\")");
-
-        // Reuse standard model table triggers (union tables have id + globalId)
         create_model_table_triggers(union_table_name, columns);
     }
 

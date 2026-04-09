@@ -486,6 +486,19 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         schemas_[entry.table_name] = entry.properties;
     }
 
+    // Create union tables before migration so persist_union_values works during migration callbacks
+    for (const auto& entry : schemas) {
+        for (const auto& [name, desc] : entry.properties) {
+            if (desc.is_union) {
+                ensure_union_table(desc.union_desc.union_table_name, desc.union_desc,
+                                   entry.table_name, name);
+                create_union_cascade_trigger(entry.table_name, name,
+                                             desc.union_desc.union_table_name);
+                union_schemas_[desc.union_desc.union_table_name] = desc.union_desc;
+            }
+        }
+    }
+
     // Incremental migration loop
     int current_version = get_schema_version();
     int target_version = swift_config_.target_schema_version;
@@ -695,6 +708,9 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                             " (lhs, rhs) VALUES ('" + parent_gid + "', '" + child_gid + "')");
                     }
                 }
+
+                // Process union_values set by the migration callback
+                persist_union_values(new_ref->impl_->unmanaged_, table_name, row_id);
             }
 
             // Now update schemas_ to NEW schema and apply table migration
@@ -889,18 +905,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         }
     }
 
-    // Phase 9: Create union tables and cascade triggers
-    for (const auto& entry : schemas) {
-        for (const auto& [name, desc] : entry.properties) {
-            if (desc.is_union) {
-                ensure_union_table(desc.union_desc.union_table_name, desc.union_desc,
-                                   entry.table_name, name);
-                create_union_cascade_trigger(entry.table_name, name,
-                                             desc.union_desc.union_table_name);
-                union_schemas_[desc.union_desc.union_table_name] = desc.union_desc;
-            }
-        }
-    }
+    // Union tables already created before migration loop (see above)
 
     // All migrations and schema setup succeeded — commit the transaction.
     // If anything above threw, the transaction destructor rolls back instead.

@@ -1739,15 +1739,26 @@ public:
         db_->remove(table_name, obj.id_);
 
         // Cascade: remove link table entries referencing this object as rhs.
-        // internal_table: entries include both link tables (lhs/rhs) and
-        // geo_bounds list tables (parent_id) — only link tables have rhs.
+        // internal_table: entries include link tables (lhs/rhs), geo_bounds list
+        // tables (parent_id), and union tables (globalId) — only link tables have rhs.
+        // Union tables are cleaned up by their BEFORE DELETE trigger, not here.
         if (!gid.empty()) {
             auto rows = db_->query(
-                "SELECT key FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
+                "SELECT key, value FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
             for (const auto& row : rows) {
-                auto it = row.find("key");
-                if (it == row.end() || !std::holds_alternative<std::string>(it->second)) continue;
-                auto link_table = std::get<std::string>(it->second).substr(15); // strip "internal_table:"
+                auto key_it = row.find("key");
+                if (key_it == row.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
+                auto link_table = std::get<std::string>(key_it->second).substr(15);
+
+                // Skip union tables — they use cascade triggers, not rhs-based cleanup.
+                // Union tables are registered with "Parent:field" or "P1:f1;P2:f2" values
+                // containing a colon, while link tables have just "ParentTable" or empty.
+                auto val_it = row.find("value");
+                if (val_it != row.end() && std::holds_alternative<std::string>(val_it->second)) {
+                    auto& val = std::get<std::string>(val_it->second);
+                    if (val.find(':') != std::string::npos) continue; // union table
+                }
+
                 if (db_->table_exists(link_table)) {
                     try {
                         db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
@@ -1830,7 +1841,7 @@ public:
 
             if (!gid_rows.empty()) {
                 auto link_rows = db_->query(
-                    "SELECT key FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
+                    "SELECT key, value FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
                 for (const auto& gid_row : gid_rows) {
                     auto gid_it = gid_row.find("globalId");
                     if (gid_it == gid_row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
@@ -1838,9 +1849,16 @@ public:
                     if (gid.empty()) continue;
 
                     for (const auto& lr : link_rows) {
-                        auto it = lr.find("key");
-                        if (it == lr.end() || !std::holds_alternative<std::string>(it->second)) continue;
-                        auto link_table = std::get<std::string>(it->second).substr(15); // strip "internal_table:"
+                        auto key_it = lr.find("key");
+                        if (key_it == lr.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
+                        auto link_table = std::get<std::string>(key_it->second).substr(15);
+
+                        // Skip union tables — cleaned up by BEFORE DELETE trigger
+                        auto val_it = lr.find("value");
+                        if (val_it != lr.end() && std::holds_alternative<std::string>(val_it->second)) {
+                            if (std::get<std::string>(val_it->second).find(':') != std::string::npos) continue;
+                        }
+
                         if (db_->table_exists(link_table)) {
                             try {
                                 db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});

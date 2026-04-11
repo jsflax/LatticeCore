@@ -863,6 +863,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
     LOG_INFO("swift_lattice", "ensure_swift_tables: creating indexes");
     // Phase 7: Create UNIQUE indexes for constraints
+    // If @Unique was added after rows were already inserted, deduplicate
+    // before creating the index (keeps the newest row per unique group).
     for (const auto& entry : schemas) {
         for (size_t i = 0; i < entry.constraints.size(); ++i) {
             const auto& constraint = entry.constraints[i];
@@ -871,15 +873,29 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             std::ostringstream idx_name;
             idx_name << "unique_" << entry.table_name << "_" << i;
 
+            // Build column list
+            std::ostringstream cols;
+            for (size_t j = 0; j < constraint.columns.size(); ++j) {
+                if (j > 0) cols << ", ";
+                cols << constraint.columns[j];
+            }
+            std::string col_list = cols.str();
+
             std::ostringstream sql;
             sql << "CREATE UNIQUE INDEX IF NOT EXISTS " << idx_name.str()
-                << " ON " << entry.table_name << "(";
-            for (size_t j = 0; j < constraint.columns.size(); ++j) {
-                if (j > 0) sql << ", ";
-                sql << constraint.columns[j];
+                << " ON " << entry.table_name << "(" << col_list << ")";
+            try {
+                db().execute(sql.str());
+            } catch (...) {
+                // Duplicate data exists — deduplicate (keep newest row per group)
+                LOG_WARN("swift_lattice", "Deduplicating %s for unique constraint on (%s)",
+                         entry.table_name.c_str(), col_list.c_str());
+                db().execute(
+                    "DELETE FROM " + entry.table_name + " WHERE id NOT IN ("
+                    "SELECT MAX(id) FROM " + entry.table_name + " GROUP BY " + col_list + ")");
+                // Retry index creation
+                db().execute(sql.str());
             }
-            sql << ")";
-            db().execute(sql.str());
         }
     }
 

@@ -2002,13 +2002,21 @@ public:
     /// entries for objects that are missing from the audit log.
     /// Useful for initial migration when enabling sync on existing data.
     /// @return Number of INSERT entries created
-    int64_t generate_history() {
+    int64_t generate_history(int64_t batch_size = 20000) {
+        if (batch_size <= 0) batch_size = 20000;
+
+        // Transient index on (tableName, globalRowId) for the NOT EXISTS check
+        // below. Created here and dropped at the end so we don't pay ongoing
+        // write-maintenance cost on the audit triggers' hot path. One-time
+        // build cost is proportional to current AuditLog size.
+        db_->execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_table_global_tmp "
+            "ON AuditLog(tableName, globalRowId)");
+
         // Temporarily disable sync to prevent triggers from firing
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
 
         try {
-            db_->begin_transaction();
-
             // Get all user tables (exclude system tables and virtual/auxiliary tables)
             // R*Tree creates shadow tables like _Table_col_rtree_node, _Table_col_rtree_rowid, etc.
             auto tables = db_->query(
@@ -2068,8 +2076,9 @@ public:
 
                 if (first) continue;  // No columns to track
 
-                // Insert audit entries only for rows NOT already in AuditLog
-                // A row is considered "in audit log" if there's any entry for that globalRowId
+                // Insert audit entries in batches to avoid a single huge INSERT.
+                // Each iteration commits its own transaction; the `NOT EXISTS` check
+                // naturally excludes rows already audited in earlier batches.
                 std::ostringstream sql;
                 sql << "INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, "
                     << "changedFields, changedFieldsNames, isSynchronized, timestamp) "
@@ -2082,27 +2091,35 @@ public:
                     << "  SELECT 1 FROM AuditLog a "
                     << "  WHERE a.tableName = '" << table_name << "' "
                     << "  AND a.globalRowId = t.globalId"
-                    << ")";
+                    << ") "
+                    << "ORDER BY t.id "
+                    << "LIMIT " << batch_size;
+                std::string batch_sql = sql.str();
 
-                db_->execute(sql.str());
-
-                // Count how many were inserted (use changes())
-                auto changes = db_->query("SELECT changes() as cnt");
-                if (!changes.empty()) {
-                    auto cnt_it = changes[0].find("cnt");
-                    if (cnt_it != changes[0].end() && std::holds_alternative<int64_t>(cnt_it->second)) {
-                        total_entries += std::get<int64_t>(cnt_it->second);
+                for (;;) {
+                    db_->begin_transaction();
+                    try {
+                        db_->execute(batch_sql);
+                    } catch (...) {
+                        db_->rollback();
+                        throw;
                     }
+
+                    int64_t inserted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
+
+                    db_->commit();
+                    total_entries += inserted;
+
+                    if (inserted < batch_size) break;
                 }
             }
 
-            db_->commit();
             db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
-
+            db_->execute("DROP INDEX IF EXISTS idx_audit_log_table_global_tmp");
             return total_entries;
         } catch (...) {
-            db_->rollback();
             db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            db_->execute("DROP INDEX IF EXISTS idx_audit_log_table_global_tmp");
             throw;
         }
     }

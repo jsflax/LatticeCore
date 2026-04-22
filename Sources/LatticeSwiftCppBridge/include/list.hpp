@@ -115,7 +115,7 @@ struct link_list {
         const std::shared_ptr<dynamic_object> operator->() const { return object; }
         operator dynamic_object&() { return *object; }
         operator const dynamic_object&() const { return *object; }
-        RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY { return dynamic_object_ref::wrap(object); }
+        RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY SWIFT_RETURNS_UNRETAINED { return dynamic_object_ref::wrap(object); }
     };
 
     // Element access
@@ -199,20 +199,20 @@ public:
     using ElementProxy = link_list::element_proxy;
     
     // Factory methods for heap allocation
-    static link_list_ref* create() SWIFT_NAME(create())  {
+    static link_list_ref* create() SWIFT_NAME(create()) SWIFT_RETURNS_UNRETAINED  {
         auto ref = new link_list_ref();
         ref->impl_ = std::make_shared<link_list>();
         return ref;
     }
 
-    static link_list_ref* wrap(std::shared_ptr<link_list> list) {
+    static link_list_ref* wrap(std::shared_ptr<link_list> list) SWIFT_RETURNS_UNRETAINED {
         auto ref = new link_list_ref();
         ref->impl_ = list;
         return ref;
     }
 
     // Create an owning link_list_ref from a managed vector
-    static link_list_ref* create(const managed<std::vector<swift_dynamic_object*>>& m) {
+    static link_list_ref* create(const managed<std::vector<swift_dynamic_object*>>& m) SWIFT_RETURNS_UNRETAINED {
         auto ref = new link_list_ref();
         ref->impl_ = std::make_shared<link_list>(m);
         return ref;

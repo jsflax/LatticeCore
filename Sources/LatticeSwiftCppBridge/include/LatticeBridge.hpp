@@ -107,23 +107,25 @@ std::optional<swift_configuration::SchemaPair> to_optional<swift_configuration::
 class swift_lattice;
 class swift_lattice_ref;
 
-struct cxx_error {
-    std::string msg;
-};
+static std::optional<cxx_error> last_error_;
 
 void try_catch(void (^_try)(), void (^_catch)(cxx_error)) {
     try {
         _try();
     } catch(const std::exception& e) {
-        _catch({e.what()});
+        _catch(e);
     }
 }
 
-cxx_error last_error() {
+static std::optional<cxx_error> last_caught_error() {
+    return last_error_;
+}
+
+cxx_error last_uncaught_error() {
     try {
         std::rethrow_exception(std::current_exception());
     } catch (const std::exception& e) {
-        return cxx_error{e.what()};
+        return cxx_error(e);
     }
 }
 

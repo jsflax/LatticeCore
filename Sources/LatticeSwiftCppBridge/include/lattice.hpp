@@ -10,6 +10,7 @@
 
 #include <dynamic_object.hpp>
 #include <list.hpp>
+#include <error.hpp>
 
 #if defined(__BLOCKS__) && defined(__APPLE__) && !defined(__swift__)
 #include <Block.h>
@@ -109,7 +110,7 @@ struct union_value {
     // Returns a wrapped ref for Swift interop (caller owns the returned ref).
     // For C++ internal use, access link_refs() directly.
     dynamic_object_ref* get_link_ref(const std::string& key) const
-        SWIFT_NAME(getLinkRef(_:)) {
+        SWIFT_NAME(getLinkRef(_:)) SWIFT_RETURNS_UNRETAINED {
         auto it = link_refs_.find(key);
         if (it == link_refs_.end() || !it->second) return nullptr;
         return dynamic_object_ref::wrap(it->second);
@@ -529,6 +530,15 @@ public:
     void add(dynamic_object_ref* ref) {
         add(*ref->impl_);
     }
+    void add(dynamic_object_ref* ref,
+             cxx_error& err) {
+        try {
+            add(*ref->impl_);
+        } catch (std::exception& e) {
+            err = e;
+        }
+    }
+    
     void add_preserving_global_id(dynamic_object_ref* ref, const std::string& preserved_global_id) {
         add_preserving_global_id(*ref->impl_, preserved_global_id);
     }
@@ -2232,19 +2242,19 @@ inline void swift_lattice::close() {
 class swift_lattice_ref {
 public:
     // Factory method - creates or reuses instance based on config path, with schemas
-    static swift_lattice_ref* create(const configuration& config, const SchemaVector& schemas) {
+    static swift_lattice_ref* create(const configuration& config, const SchemaVector& schemas) SWIFT_RETURNS_UNRETAINED {
         auto ref = new swift_lattice_ref();
         ref->impl_ = get_or_create_shared(config, schemas);
         return ref;
     }
 
     // Factory for path-only config
-    static swift_lattice_ref* create_with_path(const std::string& path) {
+    static swift_lattice_ref* create_with_path(const std::string& path) SWIFT_RETURNS_UNRETAINED {
         return create(configuration(path), {});
     }
 
     // Factory for in-memory
-    static swift_lattice_ref* create_in_memory() {
+    static swift_lattice_ref* create_in_memory() SWIFT_RETURNS_UNRETAINED {
         return create(configuration(), {});
     }
 
@@ -2271,7 +2281,7 @@ public:
         const configuration& config,
         const SchemaVector& schemas,
         swift_migration_block_t migration_block
-    ) SWIFT_NAME(create(config:schemas:migration:)) {
+    ) SWIFT_NAME(create(config:schemas:migration:)) SWIFT_RETURNS_UNRETAINED {
         // Create a modified config with the migration block wrapped
         configuration new_config = config;
         new_config.migration_block = [migration_block](migration_context& ctx) {
@@ -2295,21 +2305,27 @@ public:
         ref->impl_ = get_or_create_shared(new_config, schemas);
         return ref;
     }
+    
+    static swift_lattice_ref* create(const swift_configuration& config,
+                                     const SchemaVector& schemas)
+    SWIFT_NAME(create(swiftConfig:schemas:)) SWIFT_RETURNS_UNRETAINED {
+        auto ref = new swift_lattice_ref();
+        LOG_DEBUG("swift_lattice_ref", "create() start path=%s schemas=%zu", config.path.c_str(), schemas.size());
+        LOG_DEBUG("swift_lattice_ref", "create() calling get_or_create_shared");
+        ref->impl_ = get_or_create_shared(config, schemas);
+        LOG_DEBUG("swift_lattice_ref", "create() done, impl=%p", ref->impl_.get());
+        return ref;
+    }
 
     /// Factory method with swift_configuration (supports row migration callback).
     /// Called for each row in tables with schema changes.
     /// The callback receives (table_name, old_row, new_row) where:
     /// - old_row: populated with current row data
     /// - new_row: should be filled with transformed data
-    static swift_lattice_ref* create(const swift_configuration& config, const SchemaVector& schemas)
-        SWIFT_NAME(create(swiftConfig:schemas:)) {
-        LOG_DEBUG("swift_lattice_ref", "create() start path=%s schemas=%zu", config.path.c_str(), schemas.size());
-        auto ref = new swift_lattice_ref();
-        LOG_DEBUG("swift_lattice_ref", "create() calling get_or_create_shared");
-        ref->impl_ = get_or_create_shared(config, schemas);
-        LOG_DEBUG("swift_lattice_ref", "create() done, impl=%p", ref->impl_.get());
-        return ref;
-    }
+    static swift_lattice_ref* create(const swift_configuration& config,
+                                     const SchemaVector& schemas,
+                                     cxx_error& err) SWIFT_NAME(create(swiftConfig:schemas:error:)) SWIFT_RETURNS_UNRETAINED;
+
 
     // Access the underlying swift_lattice (returns pointer for Swift interop)
     swift_lattice* get() { return impl_.get(); }
@@ -2335,7 +2351,7 @@ private:
 public:
     // Get or create a swift_lattice_ref for an existing lattice_db pointer
     // Returns nullptr if the lattice was not created via swift_lattice_ref
-    static swift_lattice_ref* get_ref_for_lattice(lattice_db* lattice) {
+    static swift_lattice_ref* get_ref_for_lattice(lattice_db* lattice) SWIFT_RETURNS_UNRETAINED {
         if (!lattice)
             return nullptr;
         auto* swift_lat = static_cast<swift_lattice*>(lattice);
@@ -2374,17 +2390,17 @@ bool migration_lookup_by_global_id(const std::string& table_name, const std::str
 /// Take the result of the last successful migration_lookup call.
 /// Returns an empty ref if no lookup result is available.
 dynamic_object_ref* migration_take_lookup_result()
-    SWIFT_NAME(migrationTakeLookupResult());
+    SWIFT_NAME(migrationTakeLookupResult()) SWIFT_RETURNS_UNRETAINED;
 
 /// Get the old row ref during a row migration callback.
 /// Only valid inside a setRowMigrationCallback callback.
 dynamic_object_ref* migration_get_old_row()
-    SWIFT_NAME(migrationGetOldRow());
+    SWIFT_NAME(migrationGetOldRow()) SWIFT_RETURNS_UNRETAINED;
 
 /// Get the new row ref during a row migration callback.
 /// Only valid inside a setRowMigrationCallback callback.
 dynamic_object_ref* migration_get_new_row()
-    SWIFT_NAME(migrationGetNewRow());
+    SWIFT_NAME(migrationGetNewRow()) SWIFT_RETURNS_UNRETAINED;
 
 } // namespace lattice
 

@@ -134,8 +134,8 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     
     dynamic_object get_object(const std::string& name) const SWIFT_NAME(getObject(named:)) SWIFT_RETURNS_INDEPENDENT_VALUE;
     
-    link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:));
-    geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:));
+    link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:)) SWIFT_RETURNS_UNRETAINED;
+    geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) SWIFT_RETURNS_UNRETAINED;
 
     template <typename T>
     void set_field(const std::string& name, const T& value) {
@@ -277,27 +277,27 @@ private:
 class dynamic_object_ref {
 public:
     // Factory methods for heap allocation
-    static dynamic_object_ref* create() {
+    static dynamic_object_ref* create() SWIFT_RETURNS_UNRETAINED {
         auto ref = new dynamic_object_ref();
         ref->impl_ = std::make_shared<dynamic_object>();
         return ref;
     }
 
-    static dynamic_object_ref* create(const std::string& table_name) {
+    static dynamic_object_ref* create(const std::string& table_name) SWIFT_RETURNS_UNRETAINED {
         auto ref = new dynamic_object_ref();
         ref->impl_ = std::make_shared<dynamic_object>();
         ref->impl_->unmanaged_.table_name = table_name;
         return ref;
     }
 
-    static dynamic_object_ref* wrap(std::shared_ptr<dynamic_object> obj) {
+    static dynamic_object_ref* wrap(std::shared_ptr<dynamic_object> obj) SWIFT_RETURNS_UNRETAINED {
         auto ref = new dynamic_object_ref();
         ref->impl_ = obj;
         return ref;
     }
 
     // Factory that copies the dynamic_object (avoids passing shared_ptr through Swift)
-    static dynamic_object_ref* wrap(const dynamic_object& obj) {
+    static dynamic_object_ref* wrap(const dynamic_object& obj) SWIFT_RETURNS_UNRETAINED {
         auto ref = new dynamic_object_ref();
         ref->impl_ = std::make_shared<dynamic_object>(obj);
         return ref;
@@ -387,7 +387,7 @@ public:
         impl_->set_object(name, value);
     }
 
-    dynamic_object_ref* get_object(const std::string& name) const SWIFT_NAME(getObject(named:)) {
+    dynamic_object_ref* get_object(const std::string& name) const SWIFT_NAME(getObject(named:)) SWIFT_RETURNS_UNRETAINED {
         return dynamic_object_ref::wrap(impl_->get_object(name).make_shared());
     }
 
@@ -395,11 +395,11 @@ public:
     union_value get_union(const std::string& name) const SWIFT_NAME(getUnion(named:));
     void set_union(const std::string& name, const union_value& value) SWIFT_NAME(setUnion(named:_:));
 
-    link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:)) {
+    link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:)) SWIFT_RETURNS_UNRETAINED {
         return impl_->get_link_list(name);
     }
 
-    geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) {
+    geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) SWIFT_RETURNS_UNRETAINED {
         return impl_->get_geo_bounds_list(name);
     }
 

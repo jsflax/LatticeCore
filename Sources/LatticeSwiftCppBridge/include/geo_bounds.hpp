@@ -31,20 +31,20 @@ public:
     using ManagedType = geo_bounds;
     
     // Factory methods for heap allocation
-    static geo_bounds_ref* create() {
+    static geo_bounds_ref* create() SWIFT_RETURNS_UNRETAINED {
         auto ref = new geo_bounds_ref();
         ref->impl_ = std::make_shared<geo_bounds>();
         return ref;
     }
-    
-    static geo_bounds_ref* create(const std::string& table_name) {
+
+    static geo_bounds_ref* create(const std::string& table_name) SWIFT_RETURNS_UNRETAINED {
         auto ref = new geo_bounds_ref();
         ref->impl_ = std::make_shared<geo_bounds>();
 //        ref->impl_->unmanaged_.table_name = table_name;
         return ref;
     }
-    
-    static geo_bounds_ref* wrap(std::shared_ptr<geo_bounds> obj) {
+
+    static geo_bounds_ref* wrap(std::shared_ptr<geo_bounds> obj) SWIFT_RETURNS_UNRETAINED {
         auto ref = new geo_bounds_ref();
         ref->impl_ = obj;
         return ref;

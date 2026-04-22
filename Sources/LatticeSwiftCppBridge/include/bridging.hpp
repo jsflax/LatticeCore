@@ -35,6 +35,12 @@
     #ifndef SWIFT_RETURNS_INDEPENDENT_VALUE
         #define SWIFT_RETURNS_INDEPENDENT_VALUE
     #endif
+    #ifndef SWIFT_RETURNS_RETAINED
+        #define SWIFT_RETURNS_RETAINED
+    #endif
+    #ifndef SWIFT_RETURNS_UNRETAINED
+        #define SWIFT_RETURNS_UNRETAINED
+    #endif
 #endif
 
 #endif // __cplusplus

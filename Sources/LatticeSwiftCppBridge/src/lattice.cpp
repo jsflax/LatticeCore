@@ -4,6 +4,7 @@
 #include <dynamic_object.hpp>
 #include <geo_bounds.hpp>
 #include <util.hpp>
+#include <LatticeBridge.hpp>
 
 // Thread-local state for migration lookup functions
 static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;
@@ -1096,4 +1097,23 @@ void lattice::swift_lattice::update_sync_filter(const SyncFilterVector& filter) 
 
 void lattice::swift_lattice::clear_sync_filter() {
     lattice_db::clear_sync_filter();
+}
+
+lattice::swift_lattice_ref* lattice::swift_lattice_ref::create(const swift_configuration& config,
+                                                               const SchemaVector& schemas,
+                                                               cxx_error& err)
+SWIFT_NAME(create(swiftConfig:schemas:error:)) {
+    auto ref = new swift_lattice_ref();
+    try {
+        LOG_DEBUG("swift_lattice_ref", "create() start path=%s schemas=%zu", config.path.c_str(), schemas.size());
+        LOG_DEBUG("swift_lattice_ref", "create() calling get_or_create_shared");
+        ref->impl_ = get_or_create_shared(config, schemas);
+        LOG_DEBUG("swift_lattice_ref", "create() done, impl=%p", ref->impl_.get());
+    } catch (const std::exception& e) {
+        auto msg = e.what();
+        LOG_ERROR("swift_lattice", "%s", e.what());
+        last_error_ = e;
+        err = e;
+    }
+    return ref;
 }

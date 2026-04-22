@@ -415,8 +415,9 @@ void database::update(const std::string& table,
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
-        LOG_ERROR("db", "Update failed: %s", sqlite3_errmsg(db_));
-        throw db_error("Update failed: " + std::string(sqlite3_errmsg(db_)));
+        auto errmsg = sqlite3_errmsg(db_);
+        LOG_ERROR("db", "Update failed: %s", errmsg);
+        throw db_error("Update failed: " + std::string(errmsg));
     }
 }
 
@@ -445,9 +446,10 @@ std::vector<database::row_t> database::query(const std::string& sql,
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        LOG_ERROR("db", "%s in %s", sqlite3_errmsg(db_), sql.c_str());
-        std::cerr<<"db: "<<sqlite3_errmsg(db_)<<" "<<sql.c_str()<<std::endl;
-        throw db_error("Failed to prepare query: " + std::string(sqlite3_errmsg(db_)));
+        auto errmsg = sqlite3_errmsg(db_);
+        LOG_ERROR("db", "%s in %s", errmsg, sql.c_str());
+        std::cerr<<"db: "<<errmsg<<" "<<sql.c_str()<<std::endl;
+        throw db_error("Failed to prepare query: " + std::string(errmsg));
     }
 
     int index = 1;

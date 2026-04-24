@@ -863,58 +863,15 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     LOG_INFO("swift_lattice", "ensure_swift_tables: fts5 done");
 
     LOG_INFO("swift_lattice", "ensure_swift_tables: creating indexes");
-    // Phase 7: Create UNIQUE indexes for constraints
-    // If @Unique was added after rows were already inserted, deduplicate
-    // before creating the index (keeps the newest row per unique group).
-    for (const auto& entry : schemas) {
-        for (size_t i = 0; i < entry.constraints.size(); ++i) {
-            const auto& constraint = entry.constraints[i];
-            if (constraint.columns.empty()) continue;
 
-            std::ostringstream idx_name;
-            idx_name << "unique_" << entry.table_name << "_" << i;
-
-            // Build column list
-            std::ostringstream cols;
-            for (size_t j = 0; j < constraint.columns.size(); ++j) {
-                if (j > 0) cols << ", ";
-                cols << constraint.columns[j];
-            }
-            std::string col_list = cols.str();
-
-            std::ostringstream sql;
-            sql << "CREATE UNIQUE INDEX IF NOT EXISTS " << idx_name.str()
-                << " ON " << entry.table_name << "(" << col_list << ")";
-            try {
-                db().execute(sql.str());
-            } catch (...) {
-                // Duplicate data exists — deduplicate (keep newest row per group)
-                LOG_WARN("swift_lattice", "Deduplicating %s for unique constraint on (%s)",
-                         entry.table_name.c_str(), col_list.c_str());
-                db().execute(
-                    "DELETE FROM " + entry.table_name + " WHERE id NOT IN ("
-                    "SELECT MAX(id) FROM " + entry.table_name + " GROUP BY " + col_list + ")");
-                // Retry index creation
-                db().execute(sql.str());
-            }
-        }
-    }
-
-    // Phase 7b: Create non-unique indexes for @Indexed properties
-    for (const auto& schema : all_schemas) {
-        for (const auto& prop : schema.properties) {
-            if (!prop.is_indexed) continue;
-            std::ostringstream sql;
-            sql << "CREATE INDEX IF NOT EXISTS idx_" << schema.table_name << "_" << prop.name
-                << " ON " << schema.table_name << "(" << prop.name << ")";
-            db().execute(sql.str());
-        }
-    }
-
-    // Phase 8: Eagerly create junction tables and register internal table → parent
-    // mappings. Without eager creation, polymorphic VirtualList/VirtualLink tables
-    // only exist after a local write — breaking receive() on relay/downstream nodes
-    // that never write locally (e.g. SyncRelay pattern).
+    // Phase 7: Eagerly create junction tables and register internal table →
+    // parent mappings. This MUST run before the unique-index phase because
+    // a compound `@Unique` that references a link field needs the link
+    // table to exist first (shadow-column triggers fire on link inserts).
+    //
+    // Without eager creation, polymorphic VirtualList/VirtualLink tables
+    // only exist after a local write — breaking receive() on relay/downstream
+    // nodes that never write locally (e.g. SyncRelay pattern).
     for (const auto& entry : schemas) {
         for (const auto& [name, desc] : entry.properties) {
             std::string link_table_name;
@@ -936,6 +893,144 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     {"internal_table:" + link_table_name, entry.table_name + ":" + name}
                 );
             }
+        }
+    }
+
+    // Phase 8: Create UNIQUE indexes for constraints.
+    //
+    // A compound `@Unique` may reference `Member?`-style link fields whose
+    // storage is a link table, not a column on the parent. SQLite's UNIQUE
+    // INDEX can only target columns on a single table, so for each link
+    // column in a constraint we materialize a shadow TEXT column
+    // `<field>__link_gid` on the parent table and keep it in sync via
+    // triggers on the link table:
+    //
+    //   AFTER INSERT on link table → UPDATE parent SET shadow = NEW.rhs
+    //   AFTER DELETE on link table → UPDATE parent SET shadow = NULL
+    //
+    // The UNIQUE INDEX then targets the shadow column(s). Shadow cols
+    // aren't in the swift schema, so the parent's audit trigger (built
+    // from schema-declared cols only) ignores them — no sync pollution.
+    //
+    // If @Unique was added after rows were already inserted, deduplicate
+    // before creating the index (keeps the newest row per unique group).
+    for (const auto& entry : schemas) {
+        for (size_t i = 0; i < entry.constraints.size(); ++i) {
+            const auto& constraint = entry.constraints[i];
+            if (constraint.columns.empty()) continue;
+
+            // Resolve each constraint column. Link-kind cols are replaced
+            // with their shadow column name after ensuring the shadow col
+            // and its maintenance triggers exist.
+            std::vector<std::string> resolved_cols;
+            resolved_cols.reserve(constraint.columns.size());
+
+            for (const auto& col : constraint.columns) {
+                auto prop_it = entry.properties.find(col);
+                if (prop_it == entry.properties.end()) {
+                    // Not in the schema map — treat as a literal column name
+                    // (matches existing behavior for primitive fields).
+                    resolved_cols.push_back(col);
+                    continue;
+                }
+                const auto& desc = prop_it->second;
+
+                if (desc.kind == property_kind::link && !desc.target_table.empty()) {
+                    const std::string shadow_col = col + "__link_gid";
+                    const std::string link_table =
+                        "_" + entry.table_name + "_" + std::string(desc.target_table) + "_" + col;
+
+                    // 1) Add shadow column if missing. ALTER TABLE ADD COLUMN
+                    //    can't be wrapped in IF NOT EXISTS, so gate on
+                    //    PRAGMA table_info.
+                    auto cols_map = db().get_table_info(entry.table_name);
+                    if (cols_map.find(shadow_col) == cols_map.end()) {
+                        db().execute("ALTER TABLE " + entry.table_name +
+                                     " ADD COLUMN " + shadow_col + " TEXT");
+                    }
+
+                    // 2) Shadow-maintenance triggers on the link table.
+                    //    Not gated by sync_disabled() — shadow is derived
+                    //    state, not user-owned data; safe to update during
+                    //    sync-apply too (the original link INSERT audit is
+                    //    what syncs; peers recompute their own shadow).
+                    const std::string ins_trig =
+                        "LinkShadow_" + link_table + "_Insert_" + shadow_col;
+                    db().execute(
+                        "CREATE TRIGGER IF NOT EXISTS " + ins_trig +
+                        " AFTER INSERT ON " + link_table +
+                        " BEGIN"
+                        "   UPDATE " + entry.table_name +
+                        "   SET " + shadow_col + " = NEW.rhs"
+                        "   WHERE globalId = NEW.lhs;"
+                        " END");
+
+                    const std::string del_trig =
+                        "LinkShadow_" + link_table + "_Delete_" + shadow_col;
+                    // Guard with `shadow = OLD.rhs` so a stale delete doesn't
+                    // clobber a freshly re-assigned link.
+                    db().execute(
+                        "CREATE TRIGGER IF NOT EXISTS " + del_trig +
+                        " AFTER DELETE ON " + link_table +
+                        " BEGIN"
+                        "   UPDATE " + entry.table_name +
+                        "   SET " + shadow_col + " = NULL"
+                        "   WHERE globalId = OLD.lhs"
+                        "     AND " + shadow_col + " = OLD.rhs;"
+                        " END");
+
+                    // 3) Backfill from the current link-table state so
+                    //    rows inserted before the constraint was added
+                    //    participate in the unique index.
+                    db().execute(
+                        "UPDATE " + entry.table_name +
+                        " SET " + shadow_col + " ="
+                        " (SELECT rhs FROM " + link_table +
+                        " WHERE lhs = " + entry.table_name + ".globalId LIMIT 1)"
+                        " WHERE " + shadow_col + " IS NULL");
+
+                    resolved_cols.push_back(shadow_col);
+                } else {
+                    resolved_cols.push_back(col);
+                }
+            }
+
+            std::ostringstream idx_name;
+            idx_name << "unique_" << entry.table_name << "_" << i;
+
+            std::ostringstream cols_ss;
+            for (size_t j = 0; j < resolved_cols.size(); ++j) {
+                if (j > 0) cols_ss << ", ";
+                cols_ss << resolved_cols[j];
+            }
+            std::string col_list = cols_ss.str();
+
+            std::ostringstream sql;
+            sql << "CREATE UNIQUE INDEX IF NOT EXISTS " << idx_name.str()
+                << " ON " << entry.table_name << "(" << col_list << ")";
+            try {
+                db().execute(sql.str());
+            } catch (...) {
+                // Duplicate data exists — deduplicate (keep newest row per group).
+                LOG_WARN("swift_lattice", "Deduplicating %s for unique constraint on (%s)",
+                         entry.table_name.c_str(), col_list.c_str());
+                db().execute(
+                    "DELETE FROM " + entry.table_name + " WHERE id NOT IN ("
+                    "SELECT MAX(id) FROM " + entry.table_name + " GROUP BY " + col_list + ")");
+                // Retry index creation
+                db().execute(sql.str());
+            }
+        }
+    }
+
+    // Phase 8b: Create non-unique indexes for @Indexed properties
+    for (const auto& schema : all_schemas) {
+        for (const auto& prop : schema.properties) {
+            if (!prop.is_indexed) continue;
+            std::ostringstream sql;
+            sql << "CREATE INDEX IF NOT EXISTS idx_" << schema.table_name << "_" << prop.name
+                << " ON " << schema.table_name << "(" << prop.name << ")";
+            db().execute(sql.str());
         }
     }
 

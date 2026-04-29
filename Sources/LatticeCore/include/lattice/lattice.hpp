@@ -1048,9 +1048,33 @@ public:
         // Ensure table exists
         db_->ensure_table({schema.table_name, columns});
 
-        // Collect values and add globalId
+        // Collect values and add globalId.
+        //
+        // `preserved_global_id` arrives from sync replay (and from
+        // any other caller bridge — Swift `add(_:preservingGlobalId:)`,
+        // the C-API, etc.) bearing whatever case the source emitted.
+        // Swift's `UUID.uuidString` defaults to UPPERCASE; our own
+        // `generate_global_id()` emits LOWERCASE (std::hex). Without
+        // canonicalising here, sync-replayed rows land with uppercase
+        // `globalId` while the same logical row's locally-created
+        // counterpart on the originator is stored lowercase. The
+        // mismatch is silent for direct equality reads (the C++
+        // globalId-lookup paths happen to normalise) but breaks any
+        // TEXT-on-TEXT join through link tables — SQLite default
+        // `BINARY` collation is case-sensitive, so a `WHERE rhs IN
+        // (SELECT globalId FROM Target ...)` chain (which `@Relation`
+        // backlinks generate) silently filters synced rows out.
+        // Found via ClaudeCodeIRC's AskQuestion / AskVote: peers'
+        // votes synced and `vote.question` resolved correctly, but
+        // `q.votes` returned 0 on the host. Lowering at this single
+        // ingestion point also propagates to `obj.global_id_` (used
+        // by every later `set_link` insert into `_<S>_<T>_<f>` link
+        // tables) and the geo-list parent_id, so the canonical form
+        // is enforced uniformly downstream.
         auto values = obj.collect_values();
         auto gid = preserved_global_id.empty() ? generate_global_id() : preserved_global_id;
+        std::transform(gid.begin(), gid.end(), gid.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         values.insert(values.begin(), {"globalId", gid});
 
         // Ensure vec0 tables exist for any vector columns (with triggers)

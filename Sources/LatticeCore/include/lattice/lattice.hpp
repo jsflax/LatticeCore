@@ -1604,15 +1604,19 @@ public:
     }
 
     // Batch notify — single scheduler dispatch for all observer callbacks.
-    // Model table callbacks fire individually (observers need per-row info).
-    // AuditLog callbacks are coalesced per observer (consumers only need
-    // "something changed", not per-row details — saves 50% of total callbacks).
+    // Every change in `changes` fires its table-level observers once. An
+    // earlier version of this function deduplicated AuditLog observer fires
+    // per batch on the theory that "consumers only need a 'something
+    // changed' signal" — but Lattice's own changeStream (and any consumer
+    // built on top of it) closes over the specific (rowId, globalRowId)
+    // delivered to the callback and yields exactly that one audit row.
+    // Dropping the rest silently strands them: they sit in AuditLog with
+    // isSynchronized=0 forever and never reach the wire. That made
+    // multi-row transactions arriving via cross-process notification look
+    // like single-row transactions to any sync relay.
     void notify_changes_batched(
         const std::vector<std::tuple<std::string, std::string, int64_t, std::string, std::string>>& changes) {
         std::vector<std::function<void()>> all_callbacks;
-
-        // Track which AuditLog observers have already been collected
-        std::set<uint64_t> seen_audit_observers;
 
         for (const auto& [table, op, row_id, global_row_id, changed_fields] : changes) {
             // Collect table-level observers
@@ -1620,12 +1624,7 @@ public:
                 std::lock_guard<std::mutex> lock(observers_mutex_);
                 auto it = table_observers_.find(table);
                 if (it != table_observers_.end()) {
-                    bool is_audit = (table == "AuditLog");
                     for (const auto& [id, cb] : it->second) {
-                        if (is_audit) {
-                            // AuditLog: fire each observer at most once per batch
-                            if (!seen_audit_observers.insert(id).second) continue;
-                        }
                         all_callbacks.push_back([cb, op, row_id, global_row_id] {
                             cb(op, row_id, global_row_id);
                         });

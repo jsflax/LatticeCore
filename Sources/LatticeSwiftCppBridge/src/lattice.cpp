@@ -1084,9 +1084,56 @@ void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
     }
 }
 
+// Cascade-clean union table rows whose linked-case payload pointed at
+// `gid` in `deleted_table`. Unlike link tables (handled by
+// `lattice_db::remove`'s `WHERE rhs = ?` loop), union tables store the
+// linked entity's globalId in a case-specific column — `<case>` for
+// single-value cases or `<case>__<param>` for multi-value cases — so
+// rhs-based cleanup misses them entirely.
+//
+// Without this, deleting a model leaves union rows whose payload
+// references a non-existent row. Reading the union later re-loads the
+// missing target via `find_by_global_id` and SIGSEGVs in
+// `dynamic_object::get_object` the same way the link-table orphan
+// case did.
+//
+// The matching DELETE on the union table fires its AuditDelete
+// trigger, so peers receive the cleanup over sync just like primary
+// model deletes.
+static void cascade_clean_union_tables(
+    lattice::swift_lattice& self,
+    const std::unordered_map<std::string, lattice::union_descriptor>& union_schemas,
+    const std::string& deleted_table,
+    const std::string& gid)
+{
+    for (const auto& [union_table, desc] : union_schemas) {
+        if (!self.db().table_exists(union_table)) continue;
+        for (const auto& c : desc.cases) {
+            for (const auto& v : c.values) {
+                if (!v.is_link || v.link_target != deleted_table) continue;
+                std::string col = v.param_name.empty()
+                    ? c.case_name
+                    : c.case_name + "__" + v.param_name;
+                try {
+                    self.db().execute(
+                        "DELETE FROM " + union_table + " WHERE \"" + col + "\" = ?",
+                        {gid});
+                } catch (...) {
+                    // Column may not exist on older schemas — skip silently.
+                }
+            }
+        }
+    }
+}
+
 bool lattice::swift_lattice::remove(dynamic_object &&obj) {
     if (!obj.lattice) return false;
-    lattice_db::remove(obj.managed_, obj.managed_.table_name());
+    auto gid = obj.managed_.global_id();
+    auto table = obj.managed_.table_name();
+    lattice_db::remove(obj.managed_, table);
+    if (!gid.empty()) {
+        cascade_clean_union_tables(*this, union_schemas_, table, gid);
+    }
     obj.lattice = nullptr;
     return true;
 }
@@ -1096,7 +1143,11 @@ bool lattice::swift_lattice::remove(dynamic_object_ref* obj) {
         return false;
     const auto table_name = obj->impl_->managed_.table_name();
     const auto properties = obj->impl_->managed_.properties_;
+    auto gid = obj->impl_->managed_.global_id();
     lattice_db::remove(obj->impl_->managed_, obj->impl_->managed_.table_name());
+    if (!gid.empty()) {
+        cascade_clean_union_tables(*this, union_schemas_, table_name, gid);
+    }
     obj->impl_->lattice = nullptr;
     // Properly transition union from managed to unmanaged:
     // 1. Destroy managed_ (while lattice is still set so destructor works correctly)

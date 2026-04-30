@@ -1763,8 +1763,25 @@ public:
 
         // Cascade: remove link table entries referencing this object as rhs.
         // internal_table: entries include link tables (lhs/rhs), geo_bounds list
-        // tables (parent_id), and union tables (globalId) — only link tables have rhs.
-        // Union tables are cleaned up by their BEFORE DELETE trigger, not here.
+        // tables (parent_id), virtual link tables (lhs/rhs/rhs_type), and
+        // union tables. The Swift schema bridge stores every link's value as
+        // "Parent:property" (lattice.cpp:893) so the older `find(':')` filter
+        // accidentally skipped every link AND every union — the cascade
+        // never DELETEd anything, no AuditLog DELETE rows fired, and peers
+        // ended up with orphaned `_Parent_Child_field` rows pointing at
+        // already-deleted targets. Following such an orphan via
+        // `Optional<Child>.getField` SIGSEGVs in
+        // `swift_lattice::get_properties_for_table` because the C++ to-one
+        // binding's `cached_object_` is null and `m->table_name()` is read
+        // off a nullptr.
+        //
+        // Skip only the cases the cascade can't safely target:
+        //  • Multi-parent union tables (`P1:f1;P2:f2`) — the trailing
+        //    `Parent:field` segment they carry isn't a single owning
+        //    relationship; they have their own BEFORE DELETE cascade.
+        //    The `;` is the unambiguous discriminator.
+        //  • Tables without an `rhs` column (e.g. geo_bounds list with
+        //    `parent_id`) — covered by the try/catch below.
         if (!gid.empty()) {
             auto rows = db_->query(
                 "SELECT key, value FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
@@ -1773,13 +1790,12 @@ public:
                 if (key_it == row.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
                 auto link_table = std::get<std::string>(key_it->second).substr(15);
 
-                // Skip union tables — they use cascade triggers, not rhs-based cleanup.
-                // Union tables are registered with "Parent:field" or "P1:f1;P2:f2" values
-                // containing a colon, while link tables have just "ParentTable" or empty.
                 auto val_it = row.find("value");
                 if (val_it != row.end() && std::holds_alternative<std::string>(val_it->second)) {
                     auto& val = std::get<std::string>(val_it->second);
-                    if (val.find(':') != std::string::npos) continue; // union table
+                    // Multi-parent unions only — distinguished by the
+                    // semicolon separator between segments.
+                    if (val.find(';') != std::string::npos) continue;
                 }
 
                 if (db_->table_exists(link_table)) {
@@ -1876,10 +1892,15 @@ public:
                         if (key_it == lr.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
                         auto link_table = std::get<std::string>(key_it->second).substr(15);
 
-                        // Skip union tables — cleaned up by BEFORE DELETE trigger
+                        // See `remove(...)` above for the matching cascade
+                        // pass and the `;` discriminator rationale: every
+                        // link's metadata value is now `Parent:property`,
+                        // so `:` no longer distinguishes union tables.
+                        // Only multi-parent unions (`P1:f1;P2:f2`) need to
+                        // skip the rhs cascade.
                         auto val_it = lr.find("value");
                         if (val_it != lr.end() && std::holds_alternative<std::string>(val_it->second)) {
-                            if (std::get<std::string>(val_it->second).find(':') != std::string::npos) continue;
+                            if (std::get<std::string>(val_it->second).find(';') != std::string::npos) continue;
                         }
 
                         if (db_->table_exists(link_table)) {

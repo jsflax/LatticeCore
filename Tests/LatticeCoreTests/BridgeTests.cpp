@@ -563,10 +563,12 @@ TEST(Bridge, TableObserverViaBridge) {
     auto* lattice_ref = lattice::swift_lattice_ref::create(config, schemas);
     auto& db = *lattice_ref->get();
 
-    // Use the lattice_db parent's observer API (std::function based)
+    // Use the lattice_db parent's observer API (std::function based,
+    // batched). One fire per WAL flush; the single-row insert below
+    // produces a count=1 batch.
     int callback_count = 0;
     auto obs_id = static_cast<lattice::lattice_db&>(db).add_table_observer("BridgePerson",
-        [&](const std::string& op, int64_t row_id, const std::string& gid) {
+        [&](const std::vector<lattice::lattice_db::change_event>&) {
             callback_count++;
         });
 

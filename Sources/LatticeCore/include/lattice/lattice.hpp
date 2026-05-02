@@ -1279,12 +1279,23 @@ public:
             }
         }
 
-        // Notify observers on all instances for each buffered change.
-        // Internal table changes are translated to parent table UPDATEs.
+        // Build one batched event vector for this flush. All five
+        // notification kinds (model change, internal-table change,
+        // parent-table UPDATE for an internal-table change, AuditLog
+        // INSERT for the model change, AuditLog INSERT for the
+        // internal-table change) accumulate here. One
+        // `notify_changes_batched(events)` dispatch per alive instance
+        // happens at the bottom of this function — that's what makes
+        // a multi-row transaction (and a cascade delete) reach
+        // observers as a single fire.
+        std::vector<change_event> events;
+        events.reserve(changes.size() * 2);   // roughly one model + one audit per change
+
+        // Pass 1: model changes + internal-table → parent-UPDATE translation.
         for (const auto& [table, op, row_id, global_id] : changes) {
             auto it = internal_table_parents.find(table);
             if (it != internal_table_parents.end() && !it->second.empty()) {
-                // Internal table — notify both the link table itself (for
+                // Internal table — emit both the link table itself (for
                 // List.observe / VirtualList.observe) and the parent table
                 // (for @LatticeQuery / table-level observers + per-object
                 // observers for Swift Observation).
@@ -1309,16 +1320,15 @@ public:
                     LOG_DEBUG("flush_changes", "Internal table %s -> notify link + parent UPDATE %s (prop=%s)",
                               table.c_str(), parent_table.c_str(), property_name.c_str());
 
-                    // Notify the internal table itself only once (on first parent iteration)
+                    // Emit the internal table itself only once (on first parent iteration).
                     if (first_notify) {
-                        for_each_alive([&table, &op, row_id, &global_id](lattice_db* instance) {
-                            instance->notify_change(table, op, row_id, global_id);
-                        });
+                        events.emplace_back(table, op, row_id, global_id, "");
                         first_notify = false;
                     }
-                    for_each_alive([&parent_table, &changed_fields](lattice_db* instance) {
-                        instance->notify_change(parent_table, "UPDATE", 0, "", changed_fields);
-                    });
+                    // Parent-table UPDATE with row_id=0 + changed_fields = broadcast
+                    // mode in notify_changes_batched (fires per-object observers on
+                    // every live row of `parent_table`).
+                    events.emplace_back(parent_table, "UPDATE", 0, "", changed_fields);
 
                     pos = (semi == std::string::npos) ? meta_value.size() : semi + 1;
                 }
@@ -1344,19 +1354,17 @@ public:
                         }
                     }
                 }
-                LOG_DEBUG("flush_changes", "Notifying model change: table=%s op=%s changed_fields=%s",
+                LOG_DEBUG("flush_changes", "Buffering model change: table=%s op=%s changed_fields=%s",
                           table.c_str(), op.c_str(), changed_fields.c_str());
-                for_each_alive([&table, &op, row_id, &global_id, &changed_fields](lattice_db* instance) {
-                    instance->notify_change(table, op, row_id, global_id, changed_fields);
-                });
+                events.emplace_back(table, op, row_id, global_id, changed_fields);
             }
         }
 
-        // Also notify AuditLog observers for entries created by SQL triggers.
+        // Pass 2: AuditLog INSERT events for each non-internal model change.
         // For in-memory DBs, skip this — the update_hook notifies AuditLog observers
         // directly because flush_changes() runs before the trigger fires.
         // For file-based DBs, flush_changes() runs at WAL commit (after triggers), so the entry exists.
-        // Internal table AuditLog entries are skipped — their sync is triggered separately.
+        // Internal table AuditLog entries are skipped — handled in pass 3.
         bool is_in_memory = config_.is_in_memory();
         bool triggered_regular_audit = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
@@ -1364,7 +1372,7 @@ public:
             if (table == "AuditLog") continue;
             // In-memory DBs: AuditLog notification handled by update_hook directly
             if (is_in_memory) continue;
-            // Internal tables — AuditLog entries handled by async sync trigger below
+            // Internal tables — AuditLog entries handled in pass 3 below
             if (internal_table_parents.count(table)) continue;
 
             LOG_DEBUG("flush_changes", "Querying AuditLog for table=%s rowId=%lld op=%s", table.c_str(), (long long)row_id, op.c_str());
@@ -1387,12 +1395,8 @@ public:
                     int64_t audit_row_id = std::get<int64_t>(id_it->second);
                     std::string audit_global_id = std::get<std::string>(gid_it->second);
 
-                    LOG_DEBUG("flush_changes", "Notifying AuditLog observers: rowId=%lld", (long long)audit_row_id);
-
-                    // Notify AuditLog observers on all instances
-                    for_each_alive([audit_row_id, &audit_global_id](lattice_db* instance) {
-                        instance->notify_change("AuditLog", "INSERT", audit_row_id, audit_global_id);
-                    });
+                    LOG_DEBUG("flush_changes", "Buffering AuditLog observer fire: rowId=%lld", (long long)audit_row_id);
+                    events.emplace_back("AuditLog", "INSERT", audit_row_id, audit_global_id, "");
                     triggered_regular_audit = true;
                 }
             } else {
@@ -1400,10 +1404,11 @@ public:
             }
         }
 
-        // Internal table changes also need AuditLog observer notification so that
-        // lattice.observe() callbacks fire (e.g. objectWillChange.send() in SwiftUI).
-        // apply_remote_changes stores the SOURCE rowId (not local) for link tables,
-        // so we match by tableName+operation only, not by rowId.
+        // Pass 3: AuditLog INSERT events for internal-table changes — also
+        // need to reach lattice.observe() consumers (e.g. objectWillChange
+        // dispatches in SwiftUI). apply_remote_changes stores the SOURCE
+        // rowId (not local) for link tables, so we match by
+        // tableName+operation only, not by rowId.
         if (had_internal_changes && !is_in_memory) {
             for (const auto& [table, op, row_id, global_id] : changes) {
                 if (!internal_table_parents.count(table)) continue;
@@ -1421,15 +1426,24 @@ public:
                         std::holds_alternative<std::string>(gid_it->second)) {
                         int64_t audit_row_id = std::get<int64_t>(id_it->second);
                         std::string audit_global_id = std::get<std::string>(gid_it->second);
-                        LOG_DEBUG("flush_changes", "Notifying AuditLog observers for internal table %s: rowId=%lld",
+                        LOG_DEBUG("flush_changes", "Buffering AuditLog observer fire (internal table %s): rowId=%lld",
                                   table.c_str(), (long long)audit_row_id);
-                        for_each_alive([audit_row_id, &audit_global_id](lattice_db* instance) {
-                            instance->notify_change("AuditLog", "INSERT", audit_row_id, audit_global_id);
-                        });
+                        events.emplace_back("AuditLog", "INSERT", audit_row_id, audit_global_id, "");
                         triggered_regular_audit = true;
                     }
                 }
             }
+        }
+
+        // Single batched dispatch — one observer fire per (observer × table)
+        // for this WAL flush. This is what gives wire-relay consumers
+        // (e.g. ClaudeCodeIRC's RoomSyncServer) one frame per logical
+        // transaction even when that transaction spans the parent DELETE
+        // plus its cascade link-table DELETEs.
+        if (!events.empty()) {
+            for_each_alive([&events](lattice_db* instance) {
+                instance->notify_changes_batched(events);
+            });
         }
 
         // Internal table changes need to reach the synchronizer. Only trigger
@@ -1517,12 +1531,26 @@ public:
     // Observer ID type
     using observer_id = uint64_t;
 
-    // Register a table observer - called when any row in the table changes
-    // Returns an ID that can be used to unregister
+    // One row's worth of change metadata, batched into the observer
+    // callback's vector. Same fields the per-row signature exposed
+    // historically — table name, operation, row id, global row id,
+    // changedFieldsNames JSON. `notify_changes_batched` and `flush_changes`
+    // both produce vectors of these.
+    using change_event = std::tuple<std::string,   // table
+                                    std::string,   // operation ("INSERT"|"UPDATE"|"DELETE")
+                                    int64_t,       // row_id
+                                    std::string,   // global_row_id
+                                    std::string>;  // changed_fields_names
+
+    // Register a table observer. The callback fires once per WAL flush
+    // (or per single-row update for in-memory DBs) with the batch of
+    // rows from that flush whose tableName matches `table_name`. A single
+    // logical transaction is one fire; per-row delivery is just the
+    // degenerate case (one-element batch).
+    //
+    // Returns an ID that can be used to unregister.
     observer_id add_table_observer(const std::string& table_name,
-                                    std::function<void(const std::string& operation,
-                                                      int64_t row_id,
-                                                      const std::string& global_row_id)> callback) {
+                                    std::function<void(const std::vector<change_event>&)> callback) {
         std::lock_guard<std::mutex> lock(observers_mutex_);
         auto id = next_observer_id_++;
         table_observers_[table_name][id] = std::move(callback);
@@ -1588,132 +1616,88 @@ public:
         }
     }
 
-    // Notify observers of a change (called internally by triggers/hooks)
-    void notify_change(const std::string& table_name,
-                       const std::string& operation,
-                       int64_t row_id,
-                       const std::string& global_row_id,
-                       const std::string& changed_fields_names = "") {
-        std::vector<std::function<void()>> callbacks;
-        collect_observer_callbacks(table_name, operation, row_id, global_row_id, changed_fields_names, callbacks);
-
-        // Dispatch all callbacks on the scheduler
-        for (auto& cb : callbacks) {
-            scheduler_->invoke(std::move(cb));
+    // Single notification path. Fires once per (table observer × table)
+    // with that table's slice of `changes`, all inside one scheduler
+    // dispatch. Per-object observers stay per-row but dispatched in the
+    // SAME invoke, in input order so commit ordering is preserved.
+    //
+    // History note: an earlier per-row implementation called the observer
+    // callback once per change. That broke wire-relay consumers (e.g.
+    // ClaudeCodeIRC's RoomSyncServer.broadcastEntries) because the relay
+    // shipped one wire frame per fire — cascade audits (parent DELETE + N
+    // link-table DELETEs from one transaction) fragmented across N
+    // frames, leaving a window where the receiving lattice had a
+    // non-null FK to a deleted row → SIGSEGV in
+    // dynamic_object::get_object. Per-batch delivery here, combined with
+    // the cascade-transaction wrap in lattice_db::remove, makes one wire
+    // frame per logical transaction.
+    //
+    // The earlier `notify_change` (singular) and `collect_observer_callbacks`
+    // helper are gone — single-row events become one-element batches.
+    void notify_changes_batched(const std::vector<change_event>& changes) {
+        // Group by table (preserves intra-table order from input vector).
+        std::unordered_map<std::string, std::vector<change_event>> by_table;
+        by_table.reserve(changes.size());
+        for (const auto& c : changes) {
+            by_table[std::get<0>(c)].push_back(c);
         }
-    }
 
-    // Batch notify — single scheduler dispatch for all observer callbacks.
-    // Every change in `changes` fires its table-level observers once. An
-    // earlier version of this function deduplicated AuditLog observer fires
-    // per batch on the theory that "consumers only need a 'something
-    // changed' signal" — but Lattice's own changeStream (and any consumer
-    // built on top of it) closes over the specific (rowId, globalRowId)
-    // delivered to the callback and yields exactly that one audit row.
-    // Dropping the rest silently strands them: they sit in AuditLog with
-    // isSynchronized=0 forever and never reach the wire. That made
-    // multi-row transactions arriving via cross-process notification look
-    // like single-row transactions to any sync relay.
-    void notify_changes_batched(
-        const std::vector<std::tuple<std::string, std::string, int64_t, std::string, std::string>>& changes) {
         std::vector<std::function<void()>> all_callbacks;
 
-        for (const auto& [table, op, row_id, global_row_id, changed_fields] : changes) {
-            // Collect table-level observers
-            {
-                std::lock_guard<std::mutex> lock(observers_mutex_);
+        // Table-level observers: ONE callback per (observer × table) with
+        // the table's full batch.
+        {
+            std::lock_guard<std::mutex> lock(observers_mutex_);
+            for (auto& [table, batch] : by_table) {
                 auto it = table_observers_.find(table);
-                if (it != table_observers_.end()) {
-                    for (const auto& [id, cb] : it->second) {
-                        all_callbacks.push_back([cb, op, row_id, global_row_id] {
-                            cb(op, row_id, global_row_id);
-                        });
-                    }
+                if (it == table_observers_.end()) continue;
+                for (const auto& [id, cb] : it->second) {
+                    all_callbacks.push_back([cb, batch] { cb(batch); });
                 }
             }
+        }
 
-            // Per-object observers — always fire (specific to individual rows)
-            {
-                std::lock_guard<std::mutex> lock(object_observers_mutex_);
+        // Per-object observers: per-row, in input commit order. Two cases:
+        //  (a) row_id > 0 → match observers for that specific (table, rowId).
+        //  (b) row_id == 0 with non-empty changed_fields → broadcast: fire
+        //      every per-object observer registered on this table.
+        //      Used by flush_changes when an internal-table change
+        //      translates to a parent-table UPDATE — every live model
+        //      instance for that parent table needs Swift Observation
+        //      to trigger (e.g. VStackNode.children).
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            for (const auto& [table, op, row_id, global_row_id, changed_fields] : changes) {
                 auto table_it = object_observers_.find(table);
-                if (table_it != object_observers_.end()) {
-                    auto row_it = table_it->second.find(row_id);
-                    if (row_it != table_it->second.end()) {
-                        for (const auto& [id, callback] : row_it->second) {
+                if (table_it == object_observers_.end()) continue;
+
+                if (row_id == 0 && !changed_fields.empty()) {
+                    for (const auto& [rid, observer_map] : table_it->second) {
+                        for (const auto& [id, callback] : observer_map) {
                             all_callbacks.push_back([callback, changed_fields] {
                                 callback(changed_fields);
                             });
                         }
+                    }
+                } else {
+                    auto row_it = table_it->second.find(row_id);
+                    if (row_it == table_it->second.end()) continue;
+                    for (const auto& [id, callback] : row_it->second) {
+                        all_callbacks.push_back([callback, changed_fields] {
+                            callback(changed_fields);
+                        });
                     }
                 }
             }
         }
 
         if (all_callbacks.empty()) return;
-        // Single scheduler dispatch for all callbacks
         scheduler_->invoke([callbacks = std::move(all_callbacks)]() mutable {
             for (auto& cb : callbacks) {
                 cb();
             }
         });
     }
-
-private:
-    void collect_observer_callbacks(const std::string& table_name,
-                                     const std::string& operation,
-                                     int64_t row_id,
-                                     const std::string& global_row_id,
-                                     const std::string& changed_fields_names,
-                                     std::vector<std::function<void()>>& callbacks) {
-        // Collect table-level observers
-        {
-            std::lock_guard<std::mutex> lock(observers_mutex_);
-            auto it = table_observers_.find(table_name);
-            if (it != table_observers_.end()) {
-                LOG_DEBUG("notify_change", "table=%s found %zu observers on instance %p",
-                          table_name.c_str(), it->second.size(), (void*)this);
-                for (const auto& [id, cb] : it->second) {
-                    callbacks.push_back([cb, operation, row_id, global_row_id] {
-                        cb(operation, row_id, global_row_id);
-                    });
-                }
-            } else {
-                LOG_DEBUG("notify_change", "table=%s NO observers on instance %p",
-                          table_name.c_str(), (void*)this);
-            }
-        }
-
-        // Collect per-object observers
-        {
-            std::lock_guard<std::mutex> lock(object_observers_mutex_);
-            auto table_it = object_observers_.find(table_name);
-            if (table_it != object_observers_.end()) {
-                if (row_id == 0 && !changed_fields_names.empty()) {
-                    // row_id=0 with changed_fields = broadcast mode.
-                    // Used for link table changes: fire all per-object observers
-                    // for this parent table so Swift Observation triggers on every
-                    // live model instance (e.g., VStackNode.children).
-                    for (const auto& [rid, observer_map] : table_it->second) {
-                        for (const auto& [id, callback] : observer_map) {
-                            callbacks.push_back([callback, changed_fields_names] {
-                                callback(changed_fields_names);
-                            });
-                        }
-                    }
-                } else {
-                    auto row_it = table_it->second.find(row_id);
-                    if (row_it != table_it->second.end()) {
-                        for (const auto& [id, callback] : row_it->second) {
-                            callbacks.push_back([callback, changed_fields_names] {
-                                callback(changed_fields_names);
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-public:
 
     // Find by primary key
     template<typename T>
@@ -1759,57 +1743,90 @@ public:
         if (!obj.is_valid()) return;
 
         auto gid = obj.global_id();
-        db_->remove(table_name, obj.id_);
 
-        // Cascade: remove link table entries referencing this object as rhs.
-        // internal_table: entries include link tables (lhs/rhs), geo_bounds list
-        // tables (parent_id), virtual link tables (lhs/rhs/rhs_type), and
-        // union tables. The Swift schema bridge stores every link's value as
-        // "Parent:property" (lattice.cpp:893) so the older `find(':')` filter
-        // accidentally skipped every link AND every union — the cascade
-        // never DELETEd anything, no AuditLog DELETE rows fired, and peers
-        // ended up with orphaned `_Parent_Child_field` rows pointing at
-        // already-deleted targets. Following such an orphan via
-        // `Optional<Child>.getField` SIGSEGVs in
-        // `swift_lattice::get_properties_for_table` because the C++ to-one
-        // binding's `cached_object_` is null and `m->table_name()` is read
-        // off a nullptr.
-        //
-        // Skip only the cases the cascade can't safely target:
-        //  • Multi-parent union tables (`P1:f1;P2:f2`) — the trailing
-        //    `Parent:field` segment they carry isn't a single owning
-        //    relationship; they have their own BEFORE DELETE cascade.
-        //    The `;` is the unambiguous discriminator.
-        //  • Tables without an `rhs` column (e.g. geo_bounds list with
-        //    `parent_id`) — covered by the try/catch below.
-        if (!gid.empty()) {
-            auto rows = db_->query(
-                "SELECT key, value FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
-            for (const auto& row : rows) {
-                auto key_it = row.find("key");
-                if (key_it == row.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
-                auto link_table = std::get<std::string>(key_it->second).substr(15);
-
-                auto val_it = row.find("value");
-                if (val_it != row.end() && std::holds_alternative<std::string>(val_it->second)) {
-                    auto& val = std::get<std::string>(val_it->second);
-                    // Multi-parent unions only — distinguished by the
-                    // semicolon separator between segments.
-                    if (val.find(';') != std::string::npos) continue;
-                }
-
-                if (db_->table_exists(link_table)) {
-                    try {
-                        db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
-                    } catch (...) {
-                        // Not a link table (e.g. geo_bounds list) — skip
-                    }
-                }
+        // Wrap the parent DELETE + cascade loop in a single transaction
+        // so all audit rows commit together. Without this each
+        // statement auto-commits separately, the WAL hook flushes once
+        // per statement, and the changeStream yields the parent
+        // DELETE and each link-table DELETE in different batches.
+        // Wire-relay consumers that re-frame per yield (e.g.
+        // ClaudeCodeIRC's `RoomSyncServer.broadcastEntries`) then ship
+        // multiple wire frames for one logical delete; the receiver
+        // applies them as separate transactions, opening a window
+        // where reading the link traverses a non-null FK pointing at a
+        // row that's already gone — SIGSEGV in
+        // `dynamic_object::get_object`. Re-entrancy: respect callers
+        // already inside a transaction (matches the `add_bulk` / sync
+        // pattern at line ~909).
+        bool was_in_transaction = false;
+        try {
+            if (!db_->is_in_transaction()) {
+                db_->begin_transaction();
+            } else {
+                was_in_transaction = true;
             }
 
-            // Defensive vec0 cleanup: the DELETE trigger should have removed
-            // the vec0 entry, but under write contention it can silently fail.
-            cleanup_vec0_entries(table_name, {gid});
+            db_->remove(table_name, obj.id_);
+
+            // Cascade: remove link table entries referencing this object as rhs.
+            // internal_table: entries include link tables (lhs/rhs), geo_bounds list
+            // tables (parent_id), virtual link tables (lhs/rhs/rhs_type), and
+            // union tables. The Swift schema bridge stores every link's value as
+            // "Parent:property" (lattice.cpp:893) so the older `find(':')` filter
+            // accidentally skipped every link AND every union — the cascade
+            // never DELETEd anything, no AuditLog DELETE rows fired, and peers
+            // ended up with orphaned `_Parent_Child_field` rows pointing at
+            // already-deleted targets. Following such an orphan via
+            // `Optional<Child>.getField` SIGSEGVs in
+            // `swift_lattice::get_properties_for_table` because the C++ to-one
+            // binding's `cached_object_` is null and `m->table_name()` is read
+            // off a nullptr.
+            //
+            // Skip only the cases the cascade can't safely target:
+            //  • Multi-parent union tables (`P1:f1;P2:f2`) — the trailing
+            //    `Parent:field` segment they carry isn't a single owning
+            //    relationship; they have their own BEFORE DELETE cascade.
+            //    The `;` is the unambiguous discriminator.
+            //  • Tables without an `rhs` column (e.g. geo_bounds list with
+            //    `parent_id`) — covered by the try/catch below.
+            if (!gid.empty()) {
+                auto rows = db_->query(
+                    "SELECT key, value FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
+                for (const auto& row : rows) {
+                    auto key_it = row.find("key");
+                    if (key_it == row.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
+                    auto link_table = std::get<std::string>(key_it->second).substr(15);
+
+                    auto val_it = row.find("value");
+                    if (val_it != row.end() && std::holds_alternative<std::string>(val_it->second)) {
+                        auto& val = std::get<std::string>(val_it->second);
+                        // Multi-parent unions only — distinguished by the
+                        // semicolon separator between segments.
+                        if (val.find(';') != std::string::npos) continue;
+                    }
+
+                    if (db_->table_exists(link_table)) {
+                        try {
+                            db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                        } catch (...) {
+                            // Not a link table (e.g. geo_bounds list) — skip
+                        }
+                    }
+                }
+
+                // Defensive vec0 cleanup: the DELETE trigger should have removed
+                // the vec0 entry, but under write contention it can silently fail.
+                cleanup_vec0_entries(table_name, {gid});
+            }
+
+            if (!was_in_transaction) {
+                db_->commit();
+            }
+        } catch (...) {
+            if (!was_in_transaction && db_->is_in_transaction()) {
+                db_->rollback();
+            }
+            throw;
         }
 
         obj.notify_deleted();
@@ -3638,7 +3655,7 @@ private:
     // Table-level observer storage (for Results observation)
     std::mutex observers_mutex_;
     observer_id next_observer_id_ = 1;
-    std::map<std::string, std::map<observer_id, std::function<void(const std::string&, int64_t, const std::string&)>>> table_observers_;
+    std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>> table_observers_;
 
     // Per-object observer storage (for individual model observation)
     // Maps: tableName -> rowId -> [observer callbacks]
@@ -5277,10 +5294,14 @@ notification_token results<T>::observe(observer_t callback) {
     const auto& schema = managed<T>::schema();
     std::string table_name = schema.table_name;
 
-    // Register observer that re-queries and calls the callback
+    // Register observer that re-queries and calls the callback. The
+    // batched fire still re-queries once and delivers the snapshot —
+    // the legacy `observe(observer_t)` API doesn't surface per-row
+    // info, so the batch size is irrelevant; it just triggers a refresh.
     auto observer_id = db_->add_table_observer(table_name,
         [db = db_, callback = std::move(callback), table_name](
-            const std::string& operation, int64_t row_id, const std::string& global_row_id) {
+            const std::vector<lattice_db::change_event>& batch) {
+            (void)batch;
             // Re-query to get fresh results using read connection
             std::string sql = "SELECT * FROM " + table_name;
             auto rows = db->read_db().query(sql);
@@ -5318,10 +5339,14 @@ notification_token results<T>::observe(change_observer_t callback) {
         prev_ids->push_back(item.id());
     }
 
-    // Register observer that computes change info
+    // Register observer that computes change info. Each batched fire
+    // produces one merged `results_change` covering every row in the
+    // batch — preserves the existing `observe(change_observer_t)` shape
+    // (one callback per fire) while honoring batched delivery from the
+    // notification path.
     auto observer_id = db_->add_table_observer(table_name,
         [this, db = db_, callback = std::move(callback), table_name, prev_ids](
-            const std::string& operation, int64_t row_id, const std::string& global_row_id) {
+            const std::vector<lattice_db::change_event>& batch) {
 
             // Re-query to get current state using read connection
             std::string sql = "SELECT id FROM " + table_name;
@@ -5354,16 +5379,15 @@ notification_token results<T>::observe(change_observer_t callback) {
                 }
             }
 
-            // Find modifications (same id but changed - we mark all existing as potentially modified
-            // since SQLite update hook doesn't tell us the exact row for UPDATE on this table)
-            if (operation == "UPDATE") {
+            // Find modifications: any UPDATE entry in the batch whose
+            // row_id is still present in current_ids contributes a
+            // modification at that row's index.
+            for (const auto& [_, op, row_id, __, ___] : batch) {
+                if (op != "UPDATE") continue;
                 for (size_t i = 0; i < current_ids.size(); ++i) {
                     auto it = std::find(prev_ids->begin(), prev_ids->end(), current_ids[i]);
-                    if (it != prev_ids->end()) {
-                        // Check if this is the modified row
-                        if (current_ids[i] == row_id) {
-                            change.modifications.push_back(i);
-                        }
+                    if (it != prev_ids->end() && current_ids[i] == row_id) {
+                        change.modifications.push_back(i);
                     }
                 }
             }
@@ -5403,16 +5427,21 @@ change_stream<collection_change> results<T>::changes() {
     auto db = db_;
 
     return change_stream<collection_change>([db, table_name](auto push) {
-        // Register observer that pushes changes to the stream
+        // Register observer that pushes changes to the stream. Each
+        // batched fire pushes ONE collection_change containing every
+        // row in the batch — preserves stream-of-changes semantics
+        // while honoring batched delivery.
         auto observer_id = db->add_table_observer(table_name,
-            [push, table_name](const std::string& operation, int64_t row_id, const std::string& global_row_id) {
+            [push, table_name](const std::vector<lattice_db::change_event>& batch) {
                 collection_change change;
-                if (operation == "INSERT") {
-                    change.insertions.push_back(static_cast<uint64_t>(row_id));
-                } else if (operation == "UPDATE") {
-                    change.modifications.push_back(static_cast<uint64_t>(row_id));
-                } else if (operation == "DELETE") {
-                    change.deletions.push_back(static_cast<uint64_t>(row_id));
+                for (const auto& [_, op, row_id, __, ___] : batch) {
+                    if (op == "INSERT") {
+                        change.insertions.push_back(static_cast<uint64_t>(row_id));
+                    } else if (op == "UPDATE") {
+                        change.modifications.push_back(static_cast<uint64_t>(row_id));
+                    } else if (op == "DELETE") {
+                        change.deletions.push_back(static_cast<uint64_t>(row_id));
+                    }
                 }
                 push(change);
             }

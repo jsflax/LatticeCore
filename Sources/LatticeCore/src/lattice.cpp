@@ -105,13 +105,18 @@ void lattice_db::setup_change_hook() {
                         // For shared cache in-memory DBs, notify all instances
                         // sharing the path (the sync db and main db share state).
                         // For plain :memory:, just notify this instance.
+                        // Single-element batch — `notify_change` (singular) is
+                        // gone; per-row delivery is the degenerate case.
+                        std::vector<lattice_db::change_event> events;
+                        events.emplace_back("AuditLog", "INSERT",
+                                            static_cast<int64_t>(rowid), global_id, "");
                         if (self->config_.path.find("cache=shared") != std::string::npos) {
                             instance_registry::instance().for_each_alive(self->config_.path,
-                                [rowid, &global_id](lattice_db* inst) {
-                                    inst->notify_change("AuditLog", "INSERT", static_cast<int64_t>(rowid), global_id);
+                                [&events](lattice_db* inst) {
+                                    inst->notify_changes_batched(events);
                                 });
                         } else {
-                            self->notify_change("AuditLog", "INSERT", static_cast<int64_t>(rowid), global_id);
+                            self->notify_changes_batched(events);
                         }
                     }
                 } else {

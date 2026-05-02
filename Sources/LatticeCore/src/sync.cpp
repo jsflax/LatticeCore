@@ -537,10 +537,17 @@ void synchronizer_base::setup_transport_handlers() {
 void synchronizer_base::setup_observer() {
     LOG_DEBUG("synchronizer", "Registering AuditLog observer on instance %p", (void*)&db());
     audit_log_observer_id_ = db().add_table_observer("AuditLog",
-        [this](const std::string& operation, int64_t row_id, const std::string& global_id) {
-            LOG_DEBUG("synchronizer", "AuditLog observer: op=%s row_id=%lld is_connected=%d",
-                   operation.c_str(), (long long)row_id, is_connected_ ? 1 : 0);
-            if (operation == "INSERT" && is_connected_) {
+        [this](const std::vector<lattice_db::change_event>& batch) {
+            // The synchronizer only cares about INSERTs (new entries
+            // pending upload). Walk the batch and decide whether to
+            // request an upload. Whether the batch has 1 or N rows, we
+            // need at most one upload request per fire — the upload
+            // path drains all pending changes regardless of which entry
+            // triggered it.
+            bool any_unsynced_insert = false;
+            for (const auto& [_, op, row_id, __, ___] : batch) {
+                if (op != "INSERT") continue;
+                if (!is_connected_) continue;
                 auto rows = db().read_db().query(
                     "SELECT ss.is_synchronized FROM _lattice_sync_state ss "
                     "WHERE ss.audit_entry_id = ? AND ss.sync_id = ?",
@@ -549,18 +556,23 @@ void synchronizer_base::setup_observer() {
                 bool is_synced_for_us = !rows.empty() &&
                     std::holds_alternative<int64_t>(rows[0].begin()->second) &&
                     std::get<int64_t>(rows[0].begin()->second) != 0;
-
                 if (!is_synced_for_us) {
-                    LOG_DEBUG("synchronizer", "Requesting upload for entry pending on sync_id=%s",
-                              config_.sync_id.c_str());
-                    upload_requested_.store(true, std::memory_order_release);
-                    scheduler_->invoke([this] {
-                        if (is_destroyed_) return;
-                        if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
-                            upload_pending_changes();
-                        }
-                    });
+                    any_unsynced_insert = true;
+                    LOG_DEBUG("synchronizer", "AuditLog batch has unsynced INSERT row_id=%lld",
+                              (long long)row_id);
+                    break;
                 }
+            }
+            if (any_unsynced_insert) {
+                LOG_DEBUG("synchronizer", "Requesting upload for entries pending on sync_id=%s",
+                          config_.sync_id.c_str());
+                upload_requested_.store(true, std::memory_order_release);
+                scheduler_->invoke([this] {
+                    if (is_destroyed_) return;
+                    if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
+                        upload_pending_changes();
+                    }
+                });
             }
         });
 }
@@ -1759,22 +1771,27 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 
 // Notify AuditLog observers on ALL instances sharing this database path.
 // The synchronizer lives on one instance, but changeStream listeners may
-// be on other instances (different isolation contexts).
+// be on other instances (different isolation contexts). Builds a single
+// batched event vector so all UPDATEs from this synchronizer pass reach
+// each observer in one fire — keeps wire-relay framing aligned with the
+// rest of the notification path (see notify_changes_batched).
 static void notify_observers(lattice_db& db,
                              const std::vector<std::pair<int64_t, std::string>>& notify_list) {
     if (notify_list.empty()) return;
 
+    std::vector<lattice_db::change_event> events;
+    events.reserve(notify_list.size());
+    for (const auto& [row_id, gid] : notify_list) {
+        events.emplace_back("AuditLog", "UPDATE", row_id, gid, "");
+    }
+
     if (db.config().is_in_memory()) {
-        for (const auto& [row_id, gid] : notify_list) {
-            db.notify_change("AuditLog", "UPDATE", row_id, gid);
-        }
+        db.notify_changes_batched(events);
     } else {
-        for (const auto& [row_id, gid] : notify_list) {
-            instance_registry::instance().for_each_alive(db.config().path,
-                [&](lattice_db* instance) {
-                    instance->notify_change("AuditLog", "UPDATE", row_id, gid);
-                });
-        }
+        instance_registry::instance().for_each_alive(db.config().path,
+            [&events](lattice_db* instance) {
+                instance->notify_changes_batched(events);
+            });
     }
 }
 

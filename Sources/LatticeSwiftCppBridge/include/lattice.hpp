@@ -858,18 +858,38 @@ public:
 
     // C function pointer observers (Swift-visible).
     // Same pattern as generic_scheduler: void* context + C fn pointers.
+    //
+    // The callback receives parallel arrays of the same per-row fields
+    // the singular API exposed historically — `count` rows worth of
+    // (op, row_id, global_row_id). One call per WAL flush. Single-row
+    // events are delivered as a count=1 batch; this matches the C++
+    // observer contract one-to-one and lets Swift consumers iterate.
     uint64_t add_table_observer(const std::string& table_name,
                                  void* context,
                                  void (*callback)(void* ctx,
-                                                  const char* operation,
-                                                  int64_t row_id,
-                                                  const char* global_row_id),
+                                                  const char* const* operations,
+                                                  const int64_t* row_ids,
+                                                  const char* const* global_row_ids,
+                                                  size_t count),
                                  void (*destroy)(void*) = nullptr) {
         auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
         auto cb = callback;
         return lattice_db::add_table_observer(table_name,
-            [shared_ctx, cb](const std::string& op, int64_t row_id, const std::string& global_id) {
-                cb(shared_ctx.get(), op.c_str(), row_id, global_id.c_str());
+            [shared_ctx, cb](const std::vector<change_event>& batch) {
+                if (batch.empty()) return;
+                // Build parallel arrays into stable storage that lives
+                // for the duration of this synchronous callback. The C
+                // pointers we hand to Swift point into these vectors;
+                // they're valid until cb() returns.
+                std::vector<const char*> ops; ops.reserve(batch.size());
+                std::vector<int64_t> row_ids; row_ids.reserve(batch.size());
+                std::vector<const char*> gids; gids.reserve(batch.size());
+                for (const auto& [_, op, row_id, gid, __] : batch) {
+                    ops.push_back(op.c_str());
+                    row_ids.push_back(row_id);
+                    gids.push_back(gid.c_str());
+                }
+                cb(shared_ctx.get(), ops.data(), row_ids.data(), gids.data(), batch.size());
             });
     }
 
@@ -887,18 +907,17 @@ public:
     }
 
 #if defined(__BLOCKS__) && !defined(__swift__)
-    // Block-based observers (C++ callers on Apple only — hidden from Swift)
+    // Block-based observers (C++ callers on Apple only — hidden from Swift).
+    // The block receives the same batched view as the lattice_db API.
     using swift_table_observer_callback = void (^)(void* context,
-                                                   const std::string& operation,
-                                                   int64_t row_id,
-                                                   const std::string& global_row_id);
+                                                   const std::vector<change_event>& batch);
 
     uint64_t add_table_observer(const std::string& table_name,
                                  void* context,
                                  swift_table_observer_callback callback) {
         return lattice_db::add_table_observer(table_name,
-            [context, callback](const std::string& op, int64_t row_id, const std::string& global_id) {
-                callback(context, op, row_id, global_id);
+            [context, callback](const std::vector<change_event>& batch) {
+                callback(context, batch);
             });
     }
 

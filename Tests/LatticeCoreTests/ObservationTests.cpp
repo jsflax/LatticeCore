@@ -10,7 +10,7 @@ TEST(Observe, InsertFires) {
 
     int callback_count = 0;
     auto id = db.add_table_observer("TestPerson",
-        [&](const std::string&, int64_t, const std::string&) {
+        [&](const std::vector<lattice::lattice_db::change_event>&) {
             callback_count++;
         });
 
@@ -26,7 +26,7 @@ TEST(Observe, UpdateFires) {
 
     int callback_count = 0;
     auto id = db.add_table_observer("TestPerson",
-        [&](const std::string&, int64_t, const std::string&) {
+        [&](const std::vector<lattice::lattice_db::change_event>&) {
             callback_count++;
         });
 
@@ -42,7 +42,7 @@ TEST(Observe, DeleteFires) {
 
     int callback_count = 0;
     auto id = db.add_table_observer("TestPerson",
-        [&](const std::string&, int64_t, const std::string&) {
+        [&](const std::vector<lattice::lattice_db::change_event>&) {
             callback_count++;
         });
 
@@ -57,7 +57,7 @@ TEST(Observe, RemoveStops) {
 
     int callback_count = 0;
     auto id = db.add_table_observer("TestPerson",
-        [&](const std::string&, int64_t, const std::string&) {
+        [&](const std::vector<lattice::lattice_db::change_event>&) {
             callback_count++;
         });
 
@@ -76,9 +76,9 @@ TEST(Observe, MultipleObservers) {
 
     int count_a = 0, count_b = 0;
     auto id_a = db.add_table_observer("TestPerson",
-        [&](const std::string&, int64_t, const std::string&) { count_a++; });
+        [&](const std::vector<lattice::lattice_db::change_event>&) { count_a++; });
     auto id_b = db.add_table_observer("TestPerson",
-        [&](const std::string&, int64_t, const std::string&) { count_b++; });
+        [&](const std::vector<lattice::lattice_db::change_event>&) { count_b++; });
 
     db.add(TestPerson{"Multi", 25, std::nullopt});
     EXPECT_GE(count_a, 1);
@@ -219,7 +219,7 @@ TEST(Observe, CrossInstance) {
 
     int callback_count = 0;
     auto id = db_b.add_table_observer("TestPerson",
-        [&](const std::string&, int64_t, const std::string&) {
+        [&](const std::vector<lattice::lattice_db::change_event>&) {
             callback_count++;
         });
 

@@ -805,8 +805,13 @@ extern "C" uint64_t lattice_db_observe_table(
         auto ctx = context;
         return static_cast<lattice::lattice_db*>(db_ref->get())->add_table_observer(
             std::string(table_name),
-            [cb, ctx](const std::string& op, int64_t row_id, const std::string& global_id) {
-                cb(ctx, op.c_str(), row_id, global_id.c_str());
+            [cb, ctx](const std::vector<lattice::lattice_db::change_event>& events) {
+                for (const auto& ev : events) {
+                    const auto& op = std::get<1>(ev);
+                    int64_t row_id = std::get<2>(ev);
+                    const auto& global_id = std::get<3>(ev);
+                    cb(ctx, op.c_str(), row_id, global_id.c_str());
+                }
             });
     } catch (...) {
         return 0;

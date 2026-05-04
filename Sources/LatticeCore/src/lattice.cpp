@@ -512,21 +512,58 @@ void lattice_db::setup_sync_if_configured() {
     }
 
 #ifndef __EMSCRIPTEN__
-    // Cross-process flock: only one process may own the WSS synchronizer
-    // for a given database. If another process holds the lock, skip silently.
+    // Cross-process flock: only one in-process lattice_db at a time may
+    // own the WSS synchronizer for a given path. If the lock is held, we
+    // distinguish three cases:
+    //   1. Held by another *process* — silent skip (today's behavior).
+    //   2. Held by an in-process sibling on the SAME wssEndpoint — silent
+    //      skip (legitimate dormant duplicate, e.g. cross-actor cache miss).
+    //   3. Held by an in-process sibling on a DIFFERENT wssEndpoint — this
+    //      is a URL-change scenario (e.g. peer rejoining after host
+    //      republished). Kick the sibling and take over.
+    //
     // Skipped on WASM — single-threaded, single-process environment.
     if (sync_lock_fd_ < 0) {
-        std::string lock_path = config_.path + ".sync.lock";
-        int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
-        if (fd >= 0) {
+        const std::string lock_path = config_.path + ".sync.lock";
+
+        auto try_acquire_lock = [&]() -> bool {
+            int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
+            if (fd < 0) return false;
             if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
                 ::close(fd);
-                LOG_DEBUG("lattice_db", "WSS sync lock held by another process, skipping");
-                return;
+                return false;
             }
             sync_lock_fd_ = fd;
-        } else {
-            LOG_DEBUG("lattice_db", "Failed to open sync lock file %s, proceeding anyway", lock_path.c_str());
+            return true;
+        };
+
+        if (!try_acquire_lock()) {
+            // Try to find a kickable in-process sibling — one that owns
+            // sync (synchronizer_ != nullptr) on a DIFFERENT URL.
+            //
+            // The kick must happen INSIDE the registry callback so the
+            // registry's notify_refcount keeps the victim alive while
+            // teardown_sync runs. fire_handoff=false prevents the victim's
+            // own teardown from waking another same-URL sibling, which
+            // would re-hold the flock against our new URL.
+            bool kicked = false;
+            instance_registry::instance().for_each_alive(config_.path,
+                [&](lattice_db* sibling) {
+                    if (kicked) return;
+                    if (sibling == this) return;
+                    if (sibling->synchronizer_ == nullptr) return;
+                    if (sibling->config_.websocket_url == config_.websocket_url) return;
+                    LOG_INFO("lattice_db",
+                             "kicking sibling=%p (URL=%s) for URL change to %s",
+                             (void*)sibling, sibling->config_.websocket_url.c_str(),
+                             config_.websocket_url.c_str());
+                    sibling->teardown_sync(/*fire_handoff=*/false);
+                    kicked = true;
+                });
+            if (!kicked || !try_acquire_lock()) {
+                LOG_DEBUG("lattice_db", "WSS sync lock held, skipping setup");
+                return;
+            }
         }
     }
 #endif

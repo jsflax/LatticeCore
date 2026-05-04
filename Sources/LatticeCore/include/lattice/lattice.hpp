@@ -3642,8 +3642,18 @@ protected:
     void setup_ipc_if_configured();
 
 private:
-    // Tear down synchronizer and hand off to a sibling instance if one exists
-    void teardown_sync();
+    // Tear down synchronizer and (when fire_handoff) hand off to a sibling
+    // instance with the same wssEndpoint URL. The hand-off block resurrects
+    // a dormant sibling so cross-instance sync continuity survives the
+    // closing of the current owner.
+    //
+    // `fire_handoff = false` skips the hand-off block. Used by the URL-
+    // change kick path in `setup_sync_if_configured`: when a new instance
+    // with a different URL kicks an old instance to take over the flock,
+    // we MUST NOT let the kicked instance resurrect another same-URL
+    // sibling — that would re-hold the flock against our new URL and
+    // re-trigger the same bug.
+    void teardown_sync(bool fire_handoff = true);
 
     // Synchronizer registry — ensures at most one synchronizer per {path, websocket_url}
     static bool try_register_sync_key(const std::string& path, const std::string& ws_url);
@@ -5467,7 +5477,7 @@ namespace lattice {
 // (synchronizer is fully defined via sync.hpp included above)
 // ============================================================================
 
-inline void lattice_db::teardown_sync() {
+inline void lattice_db::teardown_sync(bool fire_handoff) {
     // Phase 1: Disconnect ALL synchronizers (joins transport read threads,
     // removes AuditLog observers). This must complete for every synchronizer
     // BEFORE destroying any of them, because flush_changes() on one sync's
@@ -5514,7 +5524,12 @@ inline void lattice_db::teardown_sync() {
         sync_lock_fd_ = -1;
     }
 
-    // Hand off sync responsibility to a surviving sibling instance
+    // Hand off sync responsibility to a surviving sibling instance with
+    // the same URL. Skipped when caller passed `fire_handoff = false` —
+    // i.e. the URL-change kick path in `setup_sync_if_configured`, which
+    // wants the flock free WITHOUT another sibling immediately re-grabbing
+    // it under the now-stale URL.
+    if (!fire_handoff) return;
     bool handed_off = false;
     instance_registry::instance().for_each_alive(config_.path,
         [&](lattice_db* sibling) {

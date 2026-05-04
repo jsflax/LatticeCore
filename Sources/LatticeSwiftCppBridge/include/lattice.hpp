@@ -2141,7 +2141,7 @@ namespace detail {
         template<typename ConfigT>
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
 
             // Build schema hash from table names and properties (sorted for consistency)
             std::string schema_hash;
@@ -2215,7 +2215,7 @@ namespace detail {
 
         // Look up swift_lattice by raw pointer (reverse lookup from lattice_db*)
         std::shared_ptr<swift_lattice> get_by_pointer(swift_lattice* ptr) {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
 
             auto it = ptr_cache_.find(ptr);
             if (it != ptr_cache_.end()) {
@@ -2230,7 +2230,7 @@ namespace detail {
         /// Remove a swift_lattice from both caches so subsequent get_or_create()
         /// for the same path creates a fresh instance.
         void evict(swift_lattice* ptr) {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
             // Remove from key_cache_ (match by shared_ptr identity)
             for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
                 if (auto sp = it->second.lock()) {
@@ -2246,7 +2246,16 @@ namespace detail {
     private:
         LatticeCache() = default;
 
-        std::mutex mutex_;
+        // Recursive: SQLite's commit hook fires synchronously inside
+        // `swift_lattice`'s ctor (`ensure_swift_tables` -> COMMIT). The
+        // hook walks `instance_registry::for_each_alive` and notifies
+        // sibling changeStream observers, whose `dynamic_object` ctors
+        // call back into `get_by_pointer`. With a non-recursive mutex
+        // that re-entry self-deadlocks, and any other thread sitting in
+        // `get_or_create` deadlocks behind it. Same-thread re-entry is
+        // safe here: the sibling being looked up is already published
+        // in `ptr_cache_` (that's how `for_each_alive` found it).
+        std::recursive_mutex mutex_;
         std::vector<std::pair<LatticeRefCacheKey, std::weak_ptr<swift_lattice>>> key_cache_;
         std::unordered_map<swift_lattice*, std::weak_ptr<swift_lattice>> ptr_cache_;
     };

@@ -25,7 +25,7 @@ namespace lattice {
 
 struct link_list;
 class link_list_ref;
-struct swift_lattice_ref;
+class swift_lattice_ref;
 class dynamic_object_ref;
 
 // MARK: Dynamic Object

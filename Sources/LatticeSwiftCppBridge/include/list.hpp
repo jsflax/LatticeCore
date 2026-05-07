@@ -20,8 +20,8 @@ void releaseLinkListRef(lattice::link_list_ref* p);
 namespace lattice {
 
 struct swift_dynamic_object;
-struct swift_lattice_ref;
-struct dynamic_object_ref;
+class swift_lattice_ref;
+class dynamic_object_ref;
 struct swift_lattice;
 
 struct link_list {

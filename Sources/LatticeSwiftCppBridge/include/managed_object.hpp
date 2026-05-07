@@ -16,7 +16,7 @@
 
 namespace lattice {
 
-struct swift_lattice_ref;
+class swift_lattice_ref;
 
 #define get_managed_field_fn(type) \
 template <> \

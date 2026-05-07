@@ -338,7 +338,8 @@ primary_key_t database::insert(const std::string& table,
             sql << col;
             first = false;
         }
-        sql << ") DO UPDATE SET ";
+        sql << ")";
+        std::ostringstream set_clause;
         first = true;
         for (const auto& [col, _] : values) {
             // Skip conflict columns and globalId in UPDATE
@@ -348,9 +349,15 @@ primary_key_t database::insert(const std::string& table,
                 if (cc == col) { is_conflict = true; break; }
             }
             if (is_conflict) continue;
-            if (!first) sql << ", ";
-            sql << col << " = excluded." << col;
+            if (!first) set_clause << ", ";
+            set_clause << col << " = excluded." << col;
             first = false;
+        }
+        if (first) {
+            // No columns to update — every non-globalId column is part of the conflict key.
+            sql << " DO NOTHING";
+        } else {
+            sql << " DO UPDATE SET " << set_clause.str();
         }
     }
 

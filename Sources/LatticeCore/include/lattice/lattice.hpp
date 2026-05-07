@@ -879,7 +879,8 @@ public:
                 sql << col;
                 first = false;
             }
-            sql << ") DO UPDATE SET ";
+            sql << ")";
+            std::ostringstream set_clause;
             first = true;
             for (const auto& prop : schema.properties) {
                 if (prop.kind != property_kind::primitive) continue;
@@ -889,9 +890,15 @@ public:
                     if (cc == prop.name) { is_conflict = true; break; }
                 }
                 if (is_conflict) continue;
-                if (!first) sql << ", ";
-                sql << prop.name << " = excluded." << prop.name;
+                if (!first) set_clause << ", ";
+                set_clause << prop.name << " = excluded." << prop.name;
                 first = false;
+            }
+            if (first) {
+                // No columns to update — every primitive column is part of the conflict key.
+                sql << " DO NOTHING";
+            } else {
+                sql << " DO UPDATE SET " << set_clause.str();
             }
         }
 

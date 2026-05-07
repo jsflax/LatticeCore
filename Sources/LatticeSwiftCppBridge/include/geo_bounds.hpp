@@ -22,7 +22,7 @@ void releaseGeoBoundsListRef(lattice::geo_bounds_list_ref* p);
 
 namespace lattice {
 
-struct swift_lattice_ref;
+class swift_lattice_ref;
 
 // MARK: - GeoBounds Ref
 // Reference-counted wrapper for Swift interop

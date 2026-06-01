@@ -46,6 +46,7 @@ link_list::element_proxy& link_list::element_proxy::operator=(dynamic_object_ref
 }
 
 link_list::element_proxy link_list::operator[](size_t idx) const {
+    LATTICE_CLOSED_GUARD_PTR(lattice, (element_proxy{}));
     element_proxy proxy;
     proxy.idx = idx;
     proxy.list = const_cast<link_list*>(this);
@@ -67,6 +68,7 @@ link_list::element_proxy link_list::operator[](size_t idx) const {
 
 // Capacity
 size_t link_list::size() const {
+    LATTICE_CLOSED_GUARD_PTR(lattice, 0);
     if (lattice) {
         return managed_.size();
     } else {
@@ -183,6 +185,7 @@ std::optional<size_t> link_list::find_index(const dynamic_object_ref& obj) const
 }
 
 std::vector<size_t> link_list::find_where(const std::string& sql_predicate) const {
+    LATTICE_CLOSED_GUARD_PTR(lattice, {});
     // Only supported for managed lists
     if (!lattice) {
         return {};

@@ -570,7 +570,6 @@ public:
     std::optional<managed<swift_dynamic_object>> object(int64_t primary_key, const std::string& table_name);
 
     std::optional<managed<swift_dynamic_object>> object_by_global_id(const std::string& global_id, const std::string& table_name) {
-        LATTICE_CLOSED_GUARD(std::nullopt);
         auto result = lattice_db::find_by_global_id<swift_dynamic_object>(global_id, table_name);
         if (result) {
             if (auto* props = get_properties_for_table(table_name)) {
@@ -591,7 +590,6 @@ public:
         OptionalString group_by = std::nullopt,
         OptionalString distinct_by = std::nullopt) {
 
-        LATTICE_CLOSED_GUARD({});
         auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
@@ -618,7 +616,6 @@ public:
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt) {
 
-        LATTICE_CLOSED_GUARD({});
         auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset);
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
@@ -978,7 +975,6 @@ public:
         int metric = 0,
         const std::optional<std::string>& where_clause = std::nullopt) {
 
-        LATTICE_CLOSED_GUARD({});
         auto dm = static_cast<distance_metric>(metric);
         auto knn_results = lattice_db::knn_query(table_name, column_name, query_vector, k, dm, where_clause);
 
@@ -1002,7 +998,6 @@ public:
         int k,
         int metric = 0) {
 
-        LATTICE_CLOSED_GUARD({});
         auto dm = static_cast<distance_metric>(metric);
         return lattice_db::knn_query(table_name, column_name, query_vector, k, dm);
     }
@@ -1025,7 +1020,6 @@ public:
         OptionalString group_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
 
-        LATTICE_CLOSED_GUARD({});
         // Build spatial query SQL using R*Tree
         std::string list_table = "_" + table_name + "_" + geo_column;
         std::string list_rtree = list_table + "_rtree";
@@ -1105,7 +1099,6 @@ public:
         OptionalString where_clause = std::nullopt)
         SWIFT_NAME(countWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
 
-        LATTICE_CLOSED_GUARD(0);
         std::string list_table = "_" + table_name + "_" + geo_column;
         std::string list_rtree = list_table + "_rtree";
         std::string single_rtree = "_" + table_name + "_" + geo_column + "_rtree";
@@ -2238,7 +2231,8 @@ namespace detail {
         /// for the same path creates a fresh instance.
         void evict(swift_lattice* ptr) {
             std::lock_guard<std::recursive_mutex> lock(mutex_);
-            // Remove from key_cache_ (match by shared_ptr identity)
+            // Remove from key_cache_ so a subsequent open on the same path/schema
+            // creates a fresh instance (match by shared_ptr identity).
             for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
                 if (auto sp = it->second.lock()) {
                     if (sp.get() == ptr) {
@@ -2247,7 +2241,11 @@ namespace detail {
                     }
                 }
             }
-            ptr_cache_.erase(ptr);
+            // Do NOT erase ptr_cache_[ptr]: the instance may still be alive (Swift
+            // holds a ref) and a concurrent reader's managed objects resolve the
+            // lattice via get_by_pointer(). The weak_ptr expires when the instance
+            // is destroyed and is reaped lazily by get_by_pointer (same invariant
+            // the migration path in get_or_create relies on).
         }
 
     private:

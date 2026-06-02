@@ -95,6 +95,35 @@ TEST(Bridge, CreateAndReadViaDynamicObject) {
     EXPECT_EQ(int(results[0].get_int("age")), 30);
 }
 
+// Deterministic regression for the close-during-read crash: evict() (which
+// swift_lattice::close() calls) must NOT erase ptr_cache_ while the instance is
+// still alive — a live managed object resolves its lattice via get_by_pointer(),
+// and erasing the entry returns null → use-after-free during a concurrent read.
+// (The Swift-level repro, CloseGuardTests.test_ConcurrentReadsDuringClose, is
+// timing-based; this asserts the invariant directly.)
+TEST(Bridge, EvictPreservesPtrCacheWhileInstanceAlive) {
+    TempDB tmp{"bridge_evict"};
+    lattice::SchemaVector schemas = {
+        make_schema("EvictPerson", {
+            {"name", text_prop("name")},
+            {"age", int_prop("age")},
+        })
+    };
+    lattice::swift_configuration config(tmp.str());
+    auto* lattice_ref = lattice::swift_lattice_ref::create(config, schemas);
+    lattice::swift_lattice* ptr = lattice_ref->get();
+
+    // Resolvable before eviction.
+    ASSERT_NE(lattice::detail::LatticeCache::instance().get_by_pointer(ptr), nullptr);
+
+    // Evict — exactly what swift_lattice::close() does. The instance is STILL
+    // alive (lattice_ref holds the shared_ptr), so it must still resolve.
+    lattice::detail::LatticeCache::instance().evict(ptr);
+
+    EXPECT_NE(lattice::detail::LatticeCache::instance().get_by_pointer(ptr), nullptr)
+        << "evict() must not erase ptr_cache_ for a still-alive instance";
+}
+
 TEST(Bridge, UpdateViaDynamicObject) {
     TempDB tmp{"bridge_update"};
     lattice::SchemaVector schemas = {

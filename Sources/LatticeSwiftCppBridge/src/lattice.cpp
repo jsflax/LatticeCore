@@ -175,7 +175,7 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
 }
 
 void swift_lattice::add(dynamic_object &obj) {
-    LATTICE_CLOSED_GUARD();
+    if (is_closed()) return;   // writes are multi-step (insert+manage+notify); no-op whole op when closed
     if (obj.lattice) {
         LOG_ERROR("swift_lattice", "Cannot add already managed object (table: %s)", obj.unmanaged_.table_name.c_str());
         throw std::runtime_error("Cannot add already managed object");
@@ -221,7 +221,7 @@ void swift_lattice::add(dynamic_object &obj) {
 }
 
 void swift_lattice::add_preserving_global_id(dynamic_object &obj, const std::string& preserved_global_id) {
-    LATTICE_CLOSED_GUARD();
+    if (is_closed()) return;
     if (obj.lattice) {
         LOG_ERROR("swift_lattice", "Cannot add already managed object (table: %s)", obj.unmanaged_.table_name.c_str());
         throw std::runtime_error("Cannot add already managed object");
@@ -267,7 +267,7 @@ void swift_lattice::add_preserving_global_id(dynamic_object &obj, const std::str
 }
 
 void swift_lattice::add_bulk(std::vector<dynamic_object_ref*>& objects) {
-    LATTICE_CLOSED_GUARD();
+    if (is_closed()) return;
     if (objects.empty()) {
         return;
     }
@@ -298,7 +298,7 @@ void swift_lattice::add_bulk(std::vector<dynamic_object_ref*>& objects) {
 }
 
 void swift_lattice::add_bulk(std::vector<dynamic_object*>& objects) {
-    LATTICE_CLOSED_GUARD();
+    if (is_closed()) return;
     if (objects.empty()) {
         return;
     }
@@ -339,7 +339,6 @@ void swift_lattice::add_bulk(std::vector<dynamic_object*>& objects) {
 
 
 std::optional<managed<swift_dynamic_object>> swift_lattice::object(int64_t primary_key, const std::string& table_name) {
-   LATTICE_CLOSED_GUARD(std::nullopt);
    auto result = lattice_db::find<swift_dynamic_object>(primary_key, table_name);
    if (result) {
        if (auto* props = get_properties_for_table(table_name)) {
@@ -1058,7 +1057,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 } // namespace lattice
 
 void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
-    LATTICE_CLOSED_GUARD();
+    if (is_closed()) return;
     if (objects.empty()) {
         return;
     }
@@ -1133,7 +1132,7 @@ static void cascade_clean_union_tables(
 }
 
 bool lattice::swift_lattice::remove(dynamic_object &&obj) {
-    LATTICE_CLOSED_GUARD(false);
+    if (is_closed()) return false;
     if (!obj.lattice) return false;
     auto gid = obj.managed_.global_id();
     auto table = obj.managed_.table_name();
@@ -1146,7 +1145,7 @@ bool lattice::swift_lattice::remove(dynamic_object &&obj) {
 }
 
 bool lattice::swift_lattice::remove(dynamic_object_ref* obj) {
-    LATTICE_CLOSED_GUARD(false);
+    if (is_closed()) return false;
     if (!obj->is_managed())
         return false;
     const auto table_name = obj->impl_->managed_.table_name();

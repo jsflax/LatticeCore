@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 #include <stdexcept>
 #include <unordered_map>
+#include <atomic>
 
 namespace lattice {
 
@@ -25,6 +26,12 @@ public:
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write);
     ~database();
+
+    /// Logically close the connection: subsequent ops short-circuit to empty/no-op.
+    /// The underlying sqlite3* is NOT freed here — it is released in ~database (which
+    /// is single-threaded), so a reader on another thread can never deref a freed
+    /// handle. Use instead of destroying the wrapper while readers may still hold it.
+    void close();
 
     // Non-copyable
     database(const database&) = delete;
@@ -84,10 +91,16 @@ public:
     // Bind a value to a prepared statement (public for lattice_db bulk insert)
     void bind_value(sqlite3_stmt* stmt, int index, const column_value_t& value);
 
+    /// Whether close() has been called. Ops check this and short-circuit.
+    bool is_closed() const { return closed_.load(std::memory_order_acquire); }
+
 private:
     sqlite3* db_ = nullptr;
     std::string path_;
     open_mode mode_;
+    // Set by close(); ops short-circuit when set. db_ stays valid until ~database,
+    // so this is a logical-close flag, not a lifetime guard.
+    std::atomic<bool> closed_{false};
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
 };
 

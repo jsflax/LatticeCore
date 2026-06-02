@@ -672,24 +672,6 @@ private:
 // Main database interface
 // ============================================================================
 
-// Guard for read/write funnels on lattice_db (or any subclass, e.g. swift_lattice):
-// opens an access_scope so close() can drain in-flight calls, and bails to
-// `empty_return` when the handle has been closed. Use at the top of every method
-// that dereferences read_db()/db_ on behalf of the Swift API.
-#define LATTICE_CLOSED_GUARD(empty_return) \
-    access_scope _lattice_access_scope{this}; \
-    if (_lattice_access_scope.closed) return empty_return
-
-// Variant for callers that aren't a lattice_db themselves but hold a pointer to
-// one (e.g. link_list::lattice). No-op when the pointer is null (unmanaged list,
-// which never touches the DB).
-#define LATTICE_CLOSED_GUARD_PTR(db_ptr, empty_return) \
-    std::optional<lattice_db::access_scope> _lattice_access_scope; \
-    if (db_ptr) { \
-        _lattice_access_scope.emplace(db_ptr); \
-        if (_lattice_access_scope->closed) return empty_return; \
-    }
-
 class lattice_db {
 public:
     // Construct with path (uses default scheduler, no sync)
@@ -725,27 +707,9 @@ public:
         return count;
     }
 
-    /// True once close() has begun tearing down connections. Read/write funnels
-    /// short-circuit instead of dereferencing the null read_db_/db_ close() leaves.
+    /// True once close() has been called. Reads/writes on the connections
+    /// short-circuit to empty (the guard lives in the `database` wrapper).
     bool is_closed() const { return closed_.load(std::memory_order_seq_cst); }
-
-    /// RAII scope for read/write funnels. Increments query_refcount_ on entry,
-    /// THEN captures the closed flag — so the handshake with close() is race-free:
-    /// close() stores closed_=true, then spins until query_refcount_ hits 0; a
-    /// funnel increments the refcount, then reads closed_. Either the funnel sees
-    /// closed_ and backs out (returning empty), or close() sees the live refcount
-    /// and waits for the in-flight read/write to finish before resetting db_.
-    struct access_scope {
-        lattice_db* db;
-        bool closed;
-        explicit access_scope(lattice_db* d) : db(d) {
-            db->query_refcount_.fetch_add(1, std::memory_order_seq_cst);
-            closed = db->closed_.load(std::memory_order_seq_cst);
-        }
-        ~access_scope() { db->query_refcount_.fetch_sub(1, std::memory_order_seq_cst); }
-        access_scope(const access_scope&) = delete;
-        access_scope& operator=(const access_scope&) = delete;
-    };
 
     // When using :memory: with sync enabled, we need a shared cache URI so the
     // sync db (separate lattice_db instance) connects to the SAME in-memory database.
@@ -952,6 +916,14 @@ public:
         std::vector<managed<U>> results;
         results.reserve(objects.size());
 
+        // For a bulk upsert, any row that collides resolves to an UPDATE of an existing row
+        // a live @Model instance may be backing. Signal flush_changes (which runs on this
+        // thread at commit) to populate changed_fields so those live instances refresh.
+        // Harmless for rows that insert fresh: they have no registered observer yet.
+        if (!conflict_columns.empty()) {
+            tls_notify_local_object_observers_ = true;
+        }
+
         // Use a transaction for efficiency
         bool was_in_transaction = false;
         try {
@@ -1143,6 +1115,14 @@ public:
         }
 
         // Insert row (triggers will handle vec0 sync)
+        // For an upsert, the insert may resolve to an UPDATE of an existing row that a
+        // live @Model instance is backing. That UPDATE never runs a Swift setter, so signal
+        // flush_changes (which runs synchronously on this thread inside db_->insert for a
+        // file DB) to populate changed_fields and fire the live instance's object observers.
+        // Harmless on a pure INSERT: the new row has no registered observer yet.
+        if (!conflict_columns.empty()) {
+            tls_notify_local_object_observers_ = true;
+        }
         auto id = db_->insert(schema.table_name, values, conflict_columns);
 
         // For upsert, last_insert_rowid returns 0 if only update happened
@@ -1272,6 +1252,14 @@ public:
             change_buffer_.clear();
         }
 
+        // Read-and-clear the one-shot upsert flag set by add()/add_bulk on THIS thread
+        // (flush_changes always runs on the writing thread). When set, populate
+        // changed_fields for local UPDATEs below so live object observers fire — an upsert
+        // mutates the row in SQL without a Swift setter, so nothing else notifies them.
+        // Cleared up-front (before any throwing DB query) so an exception can't leak it.
+        const bool notify_local_objects = tls_notify_local_object_observers_;
+        tls_notify_local_object_observers_ = false;
+
         LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
         // Helper: iterate alive instances sharing this path, guarded by
@@ -1381,12 +1369,16 @@ public:
                 }
                 had_internal_changes = true;
             } else {
-                // When applying remote changes (IPC sync), look up changedFieldsNames
-                // from AuditLog so object observers can trigger Swift Observation.
-                // For local setter changes, changed_fields stays empty — the Swift
-                // setter already handles observation via withMutation.
+                // Look up changedFieldsNames from AuditLog so object observers can trigger
+                // Swift Observation, in two cases that bypass a Swift setter:
+                //   - applying remote changes (IPC sync)
+                //   - a local upsert/bulk-insert (notify_local_objects) that resolved to an
+                //     UPDATE — SQL mutated the row, no setter ran, so nothing else notifies
+                //     the live instance.
+                // For local setter changes, changed_fields stays empty — the Swift setter
+                // already handles observation via withMutation.
                 std::string changed_fields;
-                if (applying_remote_changes_.load(std::memory_order_acquire)
+                if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
                     && row_id > 0 && table != "AuditLog") {
                     auto cfn_rows = read_db().query(
                         "SELECT changedFieldsNames FROM AuditLog "
@@ -1892,7 +1884,6 @@ public:
                  std::optional<std::string> where_clause = std::nullopt,
                  std::optional<std::string> group_by = std::nullopt,
                  std::optional<std::string> distinct_by = std::nullopt) {
-        LATTICE_CLOSED_GUARD(0);
         std::string sql;
 
         bool has_distinct = distinct_by.has_value() && !distinct_by->empty();
@@ -3636,13 +3627,10 @@ private:
     std::unique_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler
                                                // (avoids SQLite lock contention with read_db_
                                                // when observer callbacks query on MainActor)
-    // Set true at the top of close() (NEVER by close_read_db()). Once set, every
-    // read/write funnel guarded by LATTICE_CLOSED_GUARD early-returns empty/no-op
-    // instead of touching db_/read_db_, which close() resets to null → prevents
-    // read/write-after-close UB. query_refcount_ counts in-flight guarded calls so
-    // close() can drain them before resetting connections (mirrors notify_refcount).
+    // Set by close() for is_closed(). The actual read/write-after-close guard lives
+    // in the `database` wrapper (which stays alive until ~lattice_db), so the
+    // connections are never freed out from under a reader on another thread.
     std::atomic<bool> closed_{false};
-    std::atomic<int> query_refcount_{0};
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<synchronizer> synchronizer_;
 
@@ -3687,6 +3675,16 @@ public:
     /// changedFieldsNames from AuditLog and pass them to object observers.
     /// Local Swift setter changes don't need this (the setter handles observation).
     std::atomic<bool> applying_remote_changes_{false};
+
+    /// Set by the upsert/bulk-insert paths so flush_changes() populates changed_fields
+    /// for the resulting local UPDATE — lets live object instances backing the conflicted
+    /// row refresh (objectWillChange / Observation / .observe). Unlike a direct Swift
+    /// setter, an upsert mutates the row entirely in SQL and never self-notifies, so the
+    /// object observer would otherwise see empty changed_fields and skip the row.
+    /// thread_local (not a shared atomic) because flush_changes always runs synchronously
+    /// on the writing thread (driven by the update/WAL hook inside sqlite3_step), so each
+    /// write pairs with its own flush — no cross-thread race on a shared flag.
+    static inline thread_local bool tls_notify_local_object_observers_ = false;
 private:
 
 protected:
@@ -5598,14 +5596,8 @@ inline void lattice_db::teardown_sync(bool fire_handoff) {
 }
 
 inline void lattice_db::close() {
-    // 0. Block new reads/writes, then drain any in-flight ones BEFORE we reset
-    //    read_db_/db_ below. A funnel increments query_refcount_ then checks
-    //    closed_, so once we observe refcount==0 no guarded access can still be
-    //    holding a db_ pointer. (Same handshake as the notify_refcount drain.)
+    // 0. Logical close: reads/writes short-circuit to empty from here on.
     closed_.store(true, std::memory_order_seq_cst);
-    while (query_refcount_.load(std::memory_order_seq_cst) > 0) {
-        std::this_thread::yield();
-    }
     // 1. Mark as dying — prevents new notify_change() calls from starting.
     guard_->alive.store(false, std::memory_order_seq_cst);
     // 2. Wait for any in-flight notify_change() calls to complete.
@@ -5623,8 +5615,14 @@ inline void lattice_db::close() {
     // shared_xproc_notifier_ is owned by instance_registry — cleaned up
     // when the last instance for this path is unregistered.
     shared_xproc_notifier_ = nullptr;
-    read_db_.reset();
-    db_.reset();
+    // Logically close the connections but DO NOT destroy the wrappers: a reader on
+    // another thread may still hold a `database&` from read_db()/db(). The wrappers
+    // are owned as unique_ptr members and freed in ~lattice_db (after the threads
+    // above are joined), where the sqlite3* is released single-threaded. close() on
+    // the wrapper just flips its flag so post-close ops return empty.
+    if (db_)            db_->close();
+    if (read_db_)       read_db_->close();
+    if (xproc_read_db_) xproc_read_db_->close();
 }
 
 inline lattice_db::~lattice_db() {

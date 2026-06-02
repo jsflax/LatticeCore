@@ -32,7 +32,7 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
     }
     if (rc != SQLITE_OK) {
         std::string error = sqlite3_errmsg(db_);
-        sqlite3_close(db_);
+        sqlite3_close_v2(db_);
         db_ = nullptr;
         LOG_ERROR("db", "Failed to open database: %s", error.c_str());
         throw db_error("Failed to open database: " + error);
@@ -78,7 +78,7 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
     // Initialize sqlite-vec extension for vector search
     int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
     if (vec_rc != SQLITE_OK) {
-        sqlite3_close(db_);
+        sqlite3_close_v2(db_);
         db_ = nullptr;
         LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
         throw db_error("Failed to initialize sqlite-vec extension");
@@ -92,13 +92,21 @@ database::~database() {
             int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
             LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
         }
-        int rc = sqlite3_close(db_);
+        int rc = sqlite3_close_v2(db_);
         if (rc != SQLITE_OK) {
             LOG_ERROR("db", "~database close failed: rc=%d (%s), path=%s", rc, sqlite3_errmsg(db_), path_.c_str());
         } else {
             LOG_DEBUG("db", "~database closed: path=%s", path_.c_str());
         }
     }
+}
+
+void database::close() {
+    // Logical close: ops short-circuit after this. The sqlite3* itself is freed in
+    // ~database (single-threaded), so a concurrent reader holding this wrapper can
+    // never deref a freed handle — it either sees closed_ and returns empty, or runs
+    // a final query on the still-open connection.
+    closed_.store(true, std::memory_order_release);
 }
 
 database::database(database&& other) noexcept
@@ -109,7 +117,7 @@ database::database(database&& other) noexcept
 database& database::operator=(database&& other) noexcept {
     if (this != &other) {
         if (db_) {
-            sqlite3_close(db_);
+            sqlite3_close_v2(db_);
         }
         db_ = other.db_;
         path_ = std::move(other.path_);
@@ -119,6 +127,7 @@ database& database::operator=(database&& other) noexcept {
 }
 
 void database::execute(const std::string& sql, const std::vector<column_value_t>& params) {
+    if (closed_.load(std::memory_order_acquire)) return;
     if (params.empty()) {
         // Fast path for parameterless queries
         char* errmsg = nullptr;
@@ -310,6 +319,7 @@ column_value_t database::extract_column(sqlite3_stmt* stmt, int index) {
 primary_key_t database::insert(const std::string& table,
                                const std::vector<std::pair<std::string, column_value_t>>& values,
                                const std::vector<std::string>& conflict_columns) {
+    if (closed_.load(std::memory_order_acquire)) return {};
     std::ostringstream sql;
     sql << "INSERT INTO main." << table << " (";
 
@@ -390,6 +400,7 @@ primary_key_t database::insert(const std::string& table,
 void database::update(const std::string& table,
                        primary_key_t id,
                        const std::vector<std::pair<std::string, column_value_t>>& values) {
+    if (closed_.load(std::memory_order_acquire)) return;
     if (values.empty()) return;
 
     std::ostringstream sql;
@@ -429,6 +440,7 @@ void database::update(const std::string& table,
 }
 
 void database::remove(const std::string& table, primary_key_t id) {
+    if (closed_.load(std::memory_order_acquire)) return;
     std::string sql = "DELETE FROM " + table + " WHERE id = ?";
 
     sqlite3_stmt* stmt = nullptr;
@@ -450,6 +462,7 @@ void database::remove(const std::string& table, primary_key_t id) {
 
 std::vector<database::row_t> database::query(const std::string& sql,
                                              const std::vector<column_value_t>& params) {
+    if (closed_.load(std::memory_order_acquire)) return {};
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
@@ -494,6 +507,7 @@ void database::refresh_wal_snapshot() {
 }
 
 void database::begin_transaction(bool exclusive) {
+    if (closed_.load(std::memory_order_acquire)) return;
     // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).
     // EXCLUSIVE: acquires write lock AND blocks all readers.
     // Use exclusive for migrations so stale connections can't read mid-migration.
@@ -538,6 +552,7 @@ void database::begin_transaction(bool exclusive) {
 }
 
 bool database::try_begin_immediate(int /*timeout_ms*/) {
+    if (closed_.load(std::memory_order_acquire)) return false;
     // Non-blocking: temporarily set busy timeout to 0, try BEGIN IMMEDIATE once,
     // then restore the original timeout. This never sleeps.
     sqlite3_busy_timeout(db_, 0);

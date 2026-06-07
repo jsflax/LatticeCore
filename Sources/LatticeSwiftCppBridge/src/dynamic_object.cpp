@@ -1,8 +1,30 @@
 #include <stdio.h>
 #include <dynamic_object.hpp>
-#include <format>
 #include <list.hpp>
 #include <lattice.hpp>
+
+// std::format / std::vformat parse the format string at runtime, so libc++
+// unconditionally instantiates the floating-point formatter, which depends on
+// std::to_chars(float). On Apple platforms that symbol is only available at
+// iOS 16.3 / macOS 13.3 / tvOS 16.3 / watchOS 9.3. When the deployment target
+// is lower we fall back to manual string concatenation.
+#if defined(__cpp_lib_format)
+#  if defined(__APPLE__)
+#    include <Availability.h>
+#    if (defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && __IPHONE_OS_VERSION_MIN_REQUIRED >= 160300) || \
+        (defined(__MAC_OS_X_VERSION_MIN_REQUIRED)  && __MAC_OS_X_VERSION_MIN_REQUIRED  >= 130300) || \
+        (defined(__TV_OS_VERSION_MIN_REQUIRED)     && __TV_OS_VERSION_MIN_REQUIRED     >= 160300) || \
+        (defined(__WATCH_OS_VERSION_MIN_REQUIRED)  && __WATCH_OS_VERSION_MIN_REQUIRED  >=  90300)
+#      define LATTICE_HAS_STD_FORMAT 1
+#    endif
+#  else
+#    define LATTICE_HAS_STD_FORMAT 1
+#  endif
+#endif
+
+#if defined(LATTICE_HAS_STD_FORMAT)
+#  include <format>
+#endif
 
 // helper type for the visitor #4
 template<class... Ts>
@@ -87,6 +109,7 @@ std::string dynamic_object::debug_description() const {
     std::string val_s = value_ss.str();
     std::string managed_val_s = managed_value_ss.str();
 
+#if defined(LATTICE_HAS_STD_FORMAT)
     return std::vformat(R"(
     table_name: {}
     is managed: {}
@@ -94,6 +117,16 @@ std::string dynamic_object::debug_description() const {
     unmanaged list values: {}
     managed values: {}
     )", std::make_format_args(table_name, is_managed, val_s, list_s, managed_val_s));
+#else
+    std::string out;
+    out += "\n    table_name: ";            out += table_name;
+    out += "\n    is managed: ";            out += (is_managed ? "true" : "false");
+    out += "\n    unmanaged values: ";      out += val_s;
+    out += "\n    unmanaged list values: "; out += list_s;
+    out += "\n    managed values: ";        out += managed_val_s;
+    out += "\n    ";
+    return out;
+#endif
 }
 
 dynamic_object::dynamic_object(const dynamic_object& o) : lattice(o.lattice) {

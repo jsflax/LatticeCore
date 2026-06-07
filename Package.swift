@@ -6,7 +6,7 @@ let package = Package(
     name: "LatticeCore",
     platforms: [
         .macOS(.v14),
-        .iOS(.v17)
+        .iOS(.v15)
     ],
     products: [
         .library(

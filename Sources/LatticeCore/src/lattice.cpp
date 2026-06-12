@@ -3,6 +3,7 @@
 
 #include "lattice/lattice.hpp"
 #include "lattice/ipc.hpp"
+#include <cstdlib>
 #include <set>
 #include <unordered_set>
 #include <sys/file.h>
@@ -12,7 +13,18 @@
 namespace lattice {
 
 // Single definition of the global log level (declared extern in log.hpp).
-std::atomic<log_level> g_log_level{log_level::off};
+// Seed from the LATTICE_LOG_LEVEL env var (0=off..4=debug) so logging can be
+// enabled for a test/run without code changes, e.g. `LATTICE_LOG_LEVEL=4 swift test`.
+static log_level initial_log_level() {
+    if (const char* s = std::getenv("LATTICE_LOG_LEVEL")) {
+        int v = std::atoi(s);
+        if (v >= 0 && v <= static_cast<int>(log_level::debug)) {
+            return static_cast<log_level>(v);
+        }
+    }
+    return log_level::off;
+}
+std::atomic<log_level> g_log_level{initial_log_level()};
 
 // Singleton instance - defined here to ensure single copy across all translation units
 instance_registry& instance_registry::instance() {

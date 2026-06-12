@@ -286,3 +286,181 @@ TEST(Schema, GeoBoundsType) {
     EXPECT_EQ(bbox, lattice::geo_bounds(37.0, 38.0, -123.0, -122.0));
     EXPECT_NE(bbox, overlapping);
 }
+
+// ============================================================================
+// Schema fingerprint fast path — write-free reopen, invalidation, coverage
+// ============================================================================
+
+// Lift protected fingerprint statics into test scope via a derived probe.
+namespace {
+struct FingerprintProbe : lattice::lattice_db {
+    using lattice::lattice_db::serialize_property_for_fingerprint;
+    using lattice::lattice_db::fnv1a_hash;
+};
+
+std::string serialize_prop_for_test(const lattice::property_descriptor& p) {
+    std::ostringstream out;
+    FingerprintProbe::serialize_property_for_fingerprint(out, p);
+    return out.str();
+}
+
+int64_t data_version_of(lattice::database& db) {
+    auto rows = db.query("PRAGMA data_version");
+    return std::get<int64_t>(rows[0].begin()->second);
+}
+} // namespace
+
+TEST(Schema, ReopenIsWriteFree) {
+    TempDB tmp{"writefree"};
+
+    // Opens #1-#3: first open runs the full ensure pass; close-time
+    // "PRAGMA optimize" may create sqlite_stat1 (DDL → cookie bump), which
+    // forces at most one revalidation pass. By open #4 the state is stable.
+    { lattice::lattice_db db(tmp.str()); db.add(TestPerson{"A", 1, std::nullopt}); }
+    { lattice::lattice_db db(tmp.str()); }
+    { lattice::lattice_db db(tmp.str()); }
+
+    // Independent connection observes whether the final open commits anything.
+    lattice::database observer(tmp.str(), lattice::database::open_mode::read_only);
+    int64_t dv_before = data_version_of(observer);
+
+    {
+        lattice::lattice_db db(tmp.str());
+        // Zero row writes on the opener's connection...
+        EXPECT_EQ(sqlite3_total_changes(db.db().handle()), 0);
+        // ...and no committed changes visible to an independent connection.
+        EXPECT_EQ(data_version_of(observer), dv_before);
+        // The fast-path marker exists.
+        auto markers = db.db().query(
+            "SELECT key FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%'");
+        EXPECT_GE(markers.size(), 1u);
+    }
+}
+
+TEST(Schema, FingerprintMarkerRefreshOnExternalDDL) {
+    TempDB tmp{"fpinv"};
+    { lattice::lattice_db db(tmp.str()); db.add(TestPerson{"A", 1, std::nullopt}); }
+    { lattice::lattice_db db(tmp.str()); }
+
+    auto read_marker = [&](lattice::database& raw) {
+        auto rows = raw.query(
+            "SELECT value FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' LIMIT 1");
+        return rows.empty() ? std::string{}
+                            : std::get<std::string>(rows[0].at("value"));
+    };
+
+    std::string marker_before;
+    {
+        // External bare DDL bumps the schema cookie → marker goes stale.
+        lattice::database raw(tmp.str());
+        marker_before = read_marker(raw);
+        ASSERT_FALSE(marker_before.empty());
+        raw.execute("CREATE TABLE extraneous(x INTEGER)");
+    }
+
+    {
+        // Next open revalidates (slow path), still works, and re-stamps the
+        // marker with the advanced cookie.
+        lattice::lattice_db db(tmp.str());
+        db.add(TestPerson{"B", 2, std::nullopt});
+        EXPECT_EQ(db.objects<TestPerson>().size(), 2u);
+
+        lattice::database raw(tmp.str(), lattice::database::open_mode::read_only);
+        std::string marker_after = read_marker(raw);
+        ASSERT_FALSE(marker_after.empty());
+        EXPECT_NE(marker_after, marker_before);
+    }
+}
+
+TEST(Schema, FingerprintCoversDDLDrivingAttributes) {
+    lattice::property_descriptor base;
+    base.name = "col";
+    base.type = lattice::column_type::text;
+    base.kind = lattice::property_kind::primitive;
+    const std::string baseline = serialize_prop_for_test(base);
+
+    auto expect_differs = [&](auto mutate, const char* what) {
+        auto p = base;
+        mutate(p);
+        EXPECT_NE(serialize_prop_for_test(p), baseline)
+            << "fingerprint must change when " << what << " changes";
+    };
+
+    expect_differs([](auto& p) { p.is_indexed = true; }, "is_indexed");
+    expect_differs([](auto& p) { p.is_full_text = true; }, "is_full_text");
+    expect_differs([](auto& p) { p.is_vector = true; }, "is_vector");
+    expect_differs([](auto& p) { p.is_geo_bounds = true; }, "is_geo_bounds");
+    expect_differs([](auto& p) { p.is_unique = true; }, "is_unique");
+    expect_differs([](auto& p) { p.nullable = true; }, "nullable");
+    expect_differs([](auto& p) { p.type = lattice::column_type::integer; }, "type");
+    expect_differs([](auto& p) {
+        p.kind = lattice::property_kind::link;
+        p.target_table = "Other";
+    }, "kind/target_table");
+    expect_differs([](auto& p) { p.column_name = "renamed"; }, "column_name");
+    expect_differs([](auto& p) {
+        p.is_union = true;
+        p.union_desc.union_table_name = "_U";
+    }, "union descriptor");
+}
+
+TEST(Schema, SchemaCookieVisibleInsideTransaction) {
+    // The fast path stores PRAGMA schema_version read INSIDE the slow path's
+    // transaction as the marker value. That only works if in-transaction DDL
+    // bumps are visible to the same connection AND survive the commit
+    // unchanged. Guard the platform assumption loudly.
+    TempDB tmp{"cookievis"};
+    lattice::database db(tmp.str());
+    auto cookie = [&] {
+        auto rows = db.query("PRAGMA schema_version");
+        return std::get<int64_t>(rows[0].begin()->second);
+    };
+
+    int64_t before = cookie();
+    db.begin_transaction();
+    db.execute("CREATE TABLE cookie_probe(x INTEGER)");
+    int64_t inside = cookie();
+    db.commit();
+    int64_t after = cookie();
+
+    EXPECT_GT(inside, before);
+    EXPECT_EQ(inside, after)
+        << "schema cookie read inside the transaction must equal the "
+           "post-commit value, or every fast-path open would miss";
+}
+
+TEST(Schema, MachineryShadowColumnIsNotARemoval) {
+    // Phase 8 materializes `<link>__link_gid` shadow columns for @Unique
+    // constraints that include a to-one link. They are NOT part of the user
+    // schema — a binary opening the database without knowledge of the shadow
+    // must not treat it as a removed column and rebuild the table (the
+    // rebuild drops the shadow, the next pass re-adds it, and the cycle
+    // repeats on every open while holding the write lock for a full table
+    // copy).
+    TempDB tmp{"shadowcol"};
+
+    { lattice::lattice_db db(tmp.str()); db.add(TestPerson{"A", 1, std::nullopt}); }
+
+    {
+        // Simulate Phase 8: machinery column added outside the schema.
+        // (Through a lattice_db handle — the audit trigger on UPDATE calls
+        // the per-connection sync_disabled() function.)
+        lattice::lattice_db db(tmp.str());
+        db.db().execute("ALTER TABLE TestPerson ADD COLUMN boss__link_gid TEXT");
+        db.db().execute("UPDATE TestPerson SET boss__link_gid = 'gid-1'");
+    }
+
+    {
+        // Reopen with the schema that does NOT declare the shadow column.
+        // detect/migrate must ignore it: no rebuild, data intact.
+        lattice::lattice_db db(tmp.str());
+        auto info = db.db().get_table_info("TestPerson");
+        EXPECT_NE(info.find("boss__link_gid"), info.end())
+            << "machinery column was dropped by a table rebuild";
+        auto rows = db.db().query(
+            "SELECT boss__link_gid FROM TestPerson WHERE name = 'A'");
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(rows[0].at("boss__link_gid")), "gid-1")
+            << "shadow data lost — table was rebuilt";
+    }
+}

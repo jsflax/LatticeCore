@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **No more `ANALYZE` at open.** `database::database` no longer runs `ANALYZE` on
+  every read-write open — on multi-GB databases this scanned every index (seconds
+  of I/O) while holding the write lock at the worst possible moment. Stats now
+  refresh incrementally: `PRAGMA analysis_limit=400` is set at open and a
+  best-effort `PRAGMA optimize` runs in the destructor. Long-lived processes that
+  never destruct cleanly should run `PRAGMA optimize` from their own maintenance
+  paths.
+- **WAL bounded via `journal_size_limit`.** Read-write connections set
+  `PRAGMA journal_size_limit=256MB` so successful TRUNCATE/RESTART checkpoints
+  shrink the `-wal` file instead of leaving it fully allocated.
+- **Busy timeout is configurable and defaults to 30s.** New
+  `configuration::busy_timeout_ms` (default `kDefaultBusyTimeoutMs` = 30000,
+  previously hardcoded 5000) applies to all connections of a `lattice_db`.
+  Interactive apps that write on the main thread should set a small value
+  (e.g. 5000). `begin_transaction` now zeroes the statement-level timeout during
+  its retry loop and uses a wall-clock 30s deadline — previously each BEGIN
+  attempt busy-waited the full statement timeout *and* the loop only counted its
+  own sleeps, multiplying the worst-case wait far past the intended budget.
+- **LatticeCache: build on-disk instances outside the cache lock.** `get_or_create`
+  no longer holds `mutex_` across `swift_lattice` construction (DB open, migration,
+  `ensure_swift_tables` COMMIT, sync/IPC setup). Concurrent opens of the same key now
+  de-dup via a per-key in-flight `std::shared_future` instead of serializing the whole
+  function, so `get_by_pointer` (the per-object materialization / `resolve()` hot path)
+  and unrelated opens no longer block while another connection is opening or migrating.
+  The `:memory:` path is unchanged (still constructs under the lock; each open stays a
+  distinct instance).
+
 ## [0.7.0] - 2026-03-03
 
 ### Added

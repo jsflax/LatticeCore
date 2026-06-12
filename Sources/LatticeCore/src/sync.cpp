@@ -2092,6 +2092,10 @@ static std::vector<std::string> apply_remote_changes_impl(
     // Process in chunks to avoid holding the write lock for too long.
     const size_t chunk_size = 50;
 
+    // Restore the user's persistent disabled flag after each chunk rather
+    // than hardcoding 0 — deliberately disabled auditing must stay disabled.
+    const int64_t prev_disabled = db.read_sync_disabled_flag();
+
     for (size_t chunk_start = 0; chunk_start < entries.size(); chunk_start += chunk_size) {
         size_t chunk_end = std::min(chunk_start + chunk_size, entries.size());
 
@@ -2264,8 +2268,8 @@ static std::vector<std::string> apply_remote_changes_impl(
                 applied_ids.push_back(entry.global_id);
             }
 
-            // Re-enable sync triggers
-            db.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            // Re-enable sync triggers (restore the pre-existing flag value)
+            db.db().execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
 
             db.db().commit();
         } catch (...) {

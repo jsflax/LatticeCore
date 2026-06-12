@@ -1702,6 +1702,12 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<T*>, std::enable_if_t<is
     size_t size() const;
     bool empty() const { return size() == 0; }
 
+    /// Load the cache and bounds-check `index`. A stale cache (another
+    /// connection mutated the list since it loaded) is reloaded once; an
+    /// index that is still out of range throws std::out_of_range instead of
+    /// reading past the end of cached_objects_ (undefined behavior).
+    void checked_load(size_t index) const;
+
     // Add items - implemented in lattice.hpp
     void push_back(const T& obj);       // trip.destinations.push_back(Destination{...})
     void push_back(managed<T>* obj);

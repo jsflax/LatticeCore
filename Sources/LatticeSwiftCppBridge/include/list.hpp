@@ -155,6 +155,14 @@ struct link_list {
     std::vector<size_t> find_where(const std::string& sql_predicate) const
         SWIFT_NAME(findWhere(predicate:));
 
+    // Positions of elements matching `sql_predicate` (empty = all), ordered
+    // by `order_column` on the target table (empty = list order). Positions
+    // only — no row data is loaded; callers hydrate elements lazily.
+    std::vector<size_t> find_indices(const std::string& sql_predicate,
+                                     const std::string& order_column,
+                                     bool ascending) const
+        SWIFT_NAME(findIndices(predicate:orderBy:ascending:));
+
     // Iterator support (C++ only - Swift uses subscript access)
     struct iterator {
     public:
@@ -301,6 +309,13 @@ public:
     std::vector<size_t> find_where(const std::string& sql_predicate) const
         SWIFT_NAME(findWhere(_:)) {
         return impl_->find_where(sql_predicate);
+    }
+
+    std::vector<size_t> find_indices(const std::string& sql_predicate,
+                                     const std::string& order_column,
+                                     bool ascending) const
+        SWIFT_NAME(findIndices(predicate:orderBy:ascending:)) {
+        return impl_->find_indices(sql_predicate, order_column, ascending);
     }
 
     link_list::iterator begin() {

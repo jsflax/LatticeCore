@@ -162,3 +162,52 @@ TEST(Cascade, BulkDeleteCascade) {
     // Pets should still exist (not cascade-deleted)
     EXPECT_EQ(db.objects<TestPet>().size(), 100u);
 }
+
+// Regression: deleteHistory() (Swift) → delete_where("AuditLog", ...) used
+// to walk every registered link table per AuditLog row, issuing a
+// `DELETE FROM <link_table> WHERE rhs = <auditGid>` for each combination.
+// AuditLog globalIds are never link rhs targets, so all those DELETEs were
+// no-ops that bloated the WAL. Verify link rows survive an AuditLog purge,
+// even when an AuditLog globalId happens to collide with a real link rhs.
+TEST(Cascade, DeleteAuditLogDoesNotTouchLinkTables) {
+    lattice::lattice_db db;
+
+    // Create an owner+pet so the link table is registered in _lattice_meta.
+    auto owner = db.add(TestOwner{"Owner", nullptr});
+    owner.pet = TestPet{"Pet", 10.0};
+    ASSERT_TRUE(owner.pet.has_value());
+
+    auto pets = db.objects<TestPet>();
+    ASSERT_EQ(pets.size(), 1u);
+    auto pet_gid = pets[0].global_id();
+
+    const std::string link_table = "_TestOwner_TestPet_pet";
+    auto link_before = db.db().query("SELECT lhs, rhs FROM " + link_table);
+    ASSERT_EQ(link_before.size(), 1u);
+
+    // Force an AuditLog row whose globalId collides with the pet's globalId.
+    // If the buggy cascade path runs, it will issue
+    //   DELETE FROM _TestOwner_TestPet_pet WHERE rhs = <pet_gid>
+    // and wipe the real link row.
+    db.db().execute(
+        "INSERT INTO AuditLog (globalId, tableName, operation, rowId) "
+        "VALUES (?, 'TestPet', 'INSERT', 1)",
+        {pet_gid});
+
+    auto audit_before = db.db().query("SELECT COUNT(*) AS c FROM AuditLog");
+    ASSERT_FALSE(audit_before.empty());
+
+    EXPECT_TRUE(db.delete_where("AuditLog"));
+
+    auto audit_after = db.db().query("SELECT COUNT(*) AS c FROM AuditLog");
+    ASSERT_FALSE(audit_after.empty());
+    EXPECT_EQ(std::get<int64_t>(audit_after[0]["c"]), 0);
+
+    // Critical assertion: the link row must still be there.
+    auto link_after = db.db().query("SELECT lhs, rhs FROM " + link_table);
+    EXPECT_EQ(link_after.size(), 1u);
+
+    // And the pet itself should still exist — vec0 cleanup must also be skipped.
+    EXPECT_EQ(db.objects<TestPet>().size(), 1u);
+    EXPECT_EQ(db.objects<TestOwner>().size(), 1u);
+}

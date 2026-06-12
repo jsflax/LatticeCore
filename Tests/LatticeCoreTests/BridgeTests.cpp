@@ -641,4 +641,303 @@ TEST(Bridge, SwiftLatticeRefCreate) {
     delete ref;
 }
 
+// ============================================================================
+// LatticeCache concurrency — on-disk get_or_create builds outside the lock and
+// de-dups concurrent opens of the same key to a single instance.
+// ============================================================================
+
+TEST(Bridge, CacheConcurrentSamePathDedup) {
+    TempDB tmp{"bridge_cache_dedup"};
+    lattice::SchemaVector schemas = {
+        make_schema("BridgePerson", {
+            {"name", text_prop("name")},
+            {"age", int_prop("age")},
+        })
+    };
+
+    constexpr int kThreads = 16;
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    std::vector<lattice::swift_lattice_ref*> refs(kThreads, nullptr);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            // All threads target the SAME on-disk path. Release into the lock
+            // simultaneously to maximize the chance of racing construction.
+            lattice::swift_configuration config(tmp.str());
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            refs[i] = lattice::swift_lattice_ref::create(config, schemas);
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& t : threads) t.join();
+
+    // Every concurrent open of the same key must resolve to ONE instance —
+    // no duplicate SQLite connection to the same file.
+    ASSERT_NE(refs[0], nullptr);
+    auto* first = refs[0]->get();
+    ASSERT_NE(first, nullptr);
+    for (int i = 0; i < kThreads; ++i) {
+        ASSERT_NE(refs[i], nullptr) << "create() returned null on thread " << i;
+        EXPECT_EQ(refs[i]->get(), first)
+            << "thread " << i << " got a different swift_lattice instance";
+        EXPECT_EQ(refs[i]->hash_value(), refs[0]->hash_value());
+    }
+
+    // The shared instance is usable.
+    auto sdo = make_sdo("BridgePerson", schemas[0].properties);
+    sdo.values["name"] = std::string("Concurrent");
+    sdo.values["age"] = int64_t(1);
+    { lattice::dynamic_object obj(sdo); first->add(obj); }
+    EXPECT_EQ(first->objects("BridgePerson").size(), 1u);
+
+    for (auto* r : refs) delete r;
+}
+
+TEST(Bridge, CacheConcurrentCreateResolveStress) {
+    // TSan target: hammer get_or_create's cache-hit path and get_by_pointer
+    // (the per-object hot path) concurrently. A seed ref keeps the cached
+    // instance alive so every create() resolves to it.
+    TempDB tmp{"bridge_cache_stress"};
+    lattice::SchemaVector schemas = {
+        make_schema("BridgePerson", {
+            {"name", text_prop("name")},
+            {"age", int_prop("age")},
+        })
+    };
+
+    auto* seed = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    ASSERT_NE(seed, nullptr);
+    auto seed_hash = seed->hash_value();
+
+    constexpr int kThreads = 12;
+    constexpr int kIters = 25;
+    std::atomic<bool> go{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&] {
+            lattice::swift_configuration config(tmp.str());
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int j = 0; j < kIters; ++j) {
+                auto* ref = lattice::swift_lattice_ref::create(config, schemas);
+                if (!ref || ref->hash_value() != seed_hash) { failures++; if (ref) delete ref; continue; }
+                // Reverse lookup exercises get_by_pointer under contention.
+                auto* back = lattice::swift_lattice_ref::get_ref_for_lattice(ref->get());
+                if (!back || back->hash_value() != seed_hash) failures++;
+                delete back;
+                delete ref;
+            }
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& t : threads) t.join();
+
+    EXPECT_EQ(failures.load(), 0);
+    delete seed;
+}
+
+// ============================================================================
+// Bridge fingerprint fast path — write-free reopen at the swift_lattice layer
+// ============================================================================
+
+TEST(Bridge, ReopenIsWriteFree) {
+    TempDB tmp{"bridge_writefree"};
+    lattice::SchemaVector schemas = {
+        make_schema("BridgeFpPerson", {
+            {"name", text_prop("name")},
+            {"age", int_prop("age")},
+        })
+    };
+
+    // NOTE: direct swift_lattice construction (no swift_lattice_ref) — safe
+    // for SQL + objects() but NOT for dynamic_object add(), which requires a
+    // registered ref. Writes below go through raw SQL so the audit triggers
+    // (and their sync_disabled() call) still exercise the trigger path.
+
+    // Opens #1-#3 settle the schema + close-time stats; each open really
+    // re-runs the ensure path (no LatticeCache involved).
+    {
+        lattice::swift_configuration config(tmp.str());
+        lattice::swift_lattice db(config, schemas);
+        db.db().execute(
+            "INSERT INTO BridgeFpPerson(name, age) VALUES('Alice', 30)");
+    }
+    {
+        lattice::swift_configuration config(tmp.str());
+        lattice::swift_lattice db(config, schemas);
+    }
+    {
+        lattice::swift_configuration config(tmp.str());
+        lattice::swift_lattice db(config, schemas);
+    }
+
+    // Open #4 must be write-free AND fully functional from in-memory state.
+    {
+        lattice::swift_configuration config(tmp.str());
+        lattice::swift_lattice db(config, schemas);
+        EXPECT_EQ(sqlite3_total_changes(db.db().handle()), 0);
+
+        // Hydration works (schemas_ populated by the fast path)
+        auto results = db.objects("BridgeFpPerson");
+        ASSERT_EQ(results.size(), 1u);
+        EXPECT_EQ(results[0].get_string("name"), "Alice");
+
+        // Writes still work: the INSERT fires the audit trigger, which calls
+        // sync_disabled() — this throws if the per-connection SQL function
+        // wasn't registered on the fast path.
+        db.db().execute(
+            "INSERT INTO BridgeFpPerson(name, age) VALUES('Bob', 25)");
+        EXPECT_EQ(db.objects("BridgeFpPerson").size(), 2u);
+    }
+}
+
+// ============================================================================
+// Link-list position coherence — dangling junction rows must not shift
+// positions off the element cache (EXC_BAD_ACCESS via ListSlice.first)
+// ============================================================================
+
+static lattice::property_descriptor list_prop(const std::string& name,
+                                              const std::string& target) {
+    lattice::property_descriptor desc;
+    desc.name = name;
+    desc.kind = lattice::property_kind::list;
+    desc.target_table = target;
+    desc.type = lattice::column_type::text;
+    return desc;
+}
+
+TEST(Bridge, ListPositionsSkipDanglingLinks) {
+    TempDB tmp{"bridge_dangling"};
+    lattice::SchemaVector schemas = {
+        make_schema("FpBand", {
+            {"name", text_prop("name")},
+            {"albums", list_prop("albums", "FpAlbum")},
+        }),
+        make_schema("FpAlbum", {
+            {"title", text_prop("title")},
+            {"year", int_prop("year")},
+        }),
+    };
+
+    auto* lattice_ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *lattice_ref->get();
+
+    db.db().execute("INSERT INTO FpBand(globalId, name) VALUES('band-1', 'Zeppelin')");
+    db.db().execute("INSERT INTO FpAlbum(globalId, title, year) VALUES('al-1', 'IV', 1971)");
+    db.db().execute("INSERT INTO FpAlbum(globalId, title, year) VALUES('al-2', 'Houses', 1973)");
+    db.db().execute("INSERT INTO FpAlbum(globalId, title, year) VALUES('al-3', 'Graffiti', 1975)");
+    db.db().execute("INSERT INTO _FpBand_FpAlbum_albums(lhs, rhs) VALUES('band-1', 'al-1')");
+    db.db().execute("INSERT INTO _FpBand_FpAlbum_albums(lhs, rhs) VALUES('band-1', 'al-2')");
+    db.db().execute("INSERT INTO _FpBand_FpAlbum_albums(lhs, rhs) VALUES('band-1', 'al-3')");
+
+    // Dangle the FIRST link: target row deleted, junction row lingers (what
+    // upsert churn / cross-process deletes leave behind). The element cache
+    // skips it, so positions numbered over ALL link rows would shift by one —
+    // hydrating the wrong element or walking off the end of the cache.
+    db.db().execute("DELETE FROM FpAlbum WHERE globalId = 'al-1'");
+
+    auto bands = db.objects("FpBand");
+    ASSERT_EQ(bands.size(), 1u);
+    auto field = bands[0].get_managed_field<std::vector<lattice::swift_dynamic_object*>>("albums");
+    lattice::link_list list(field);
+
+    EXPECT_EQ(list.size(), 2u);  // live membership only
+
+    // Newest-first positions — the exact ListSlice.sortedBy(...).first shape
+    // that crashed in the field.
+    auto positions = list.find_indices("", "year", /*ascending=*/false);
+    ASSERT_EQ(positions.size(), 2u);
+    for (auto pos : positions) {
+        EXPECT_LT(pos, list.size()) << "position indexes past the element cache";
+    }
+
+    auto top = list[positions[0]];
+    EXPECT_EQ(int(top.object->get_int("year")), 1975);
+    auto next = list[positions[1]];
+    EXPECT_EQ(int(next.object->get_int("year")), 1973);
+
+    // Out-of-range access is a catchable error, not undefined behavior.
+    EXPECT_THROW(list[99].object->get_int("year"), std::out_of_range);
+
+    delete lattice_ref;
+}
+
+TEST(Bridge, UpsertRebindsToExistingRowAndAppendIsIdempotent) {
+    TempDB tmp{"bridge_upsert_rebind"};
+    lattice::swift_schema_entry sig_entry = make_schema("FpSig", {
+        {"key", text_prop("key")},
+        {"val", int_prop("val")},
+    });
+    sig_entry.constraints.push_back(lattice::swift_constraint({"key"}, /*upsert=*/true));
+    lattice::SchemaVector schemas = {
+        make_schema("FpOwner", {
+            {"name", text_prop("name")},
+            {"sigs", list_prop("sigs", "FpSig")},
+        }),
+        sig_entry,
+    };
+
+    auto* lattice_ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *lattice_ref->get();
+
+    db.db().execute("INSERT INTO FpOwner(globalId, name) VALUES('own-1', 'O')");
+
+    // First write: plain insert.
+    {
+        auto sdo = make_sdo("FpSig", schemas[1].properties);
+        sdo.values["key"] = std::string("k1");
+        sdo.values["val"] = int64_t(1);
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+    auto gid_rows = db.db().query("SELECT globalId FROM FpSig");
+    ASSERT_EQ(gid_rows.size(), 1u);
+    auto original_gid = std::get<std::string>(gid_rows[0].at("globalId"));
+
+    // Second write: same unique key — ON CONFLICT DO UPDATE. The object MUST
+    // rebind to the surviving row's identity; binding to the freshly
+    // generated globalId points every later link write at a row that doesn't
+    // exist (this is how signal lists accumulated dangling junction rows).
+    auto sdo2 = make_sdo("FpSig", schemas[1].properties);
+    sdo2.values["key"] = std::string("k1");
+    sdo2.values["val"] = int64_t(2);
+    lattice::dynamic_object obj2(sdo2);
+    db.add(obj2);
+
+    EXPECT_EQ(obj2.get_string("globalId"), original_gid)
+        << "upsert did not rebind to the existing row";
+    auto rows = db.db().query("SELECT COUNT(*) AS c, MAX(val) AS v FROM FpSig");
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("c")), 1);
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("v")), 2);
+
+    // Append the rebound object to the owner's list — buildSignalHistory's
+    // add-then-append flow. The junction row must reference the REAL row.
+    auto owners = db.objects("FpOwner");
+    ASSERT_EQ(owners.size(), 1u);
+    auto field = owners[0].get_managed_field<std::vector<lattice::swift_dynamic_object*>>("sigs");
+    lattice::link_list list(field);
+    auto* obj2_ref = lattice::dynamic_object_ref::wrap(obj2);
+    list.push_back(obj2_ref);
+
+    auto junction = db.db().query(
+        "SELECT rhs FROM _FpOwner_FpSig_sigs WHERE lhs = 'own-1'");
+    ASSERT_EQ(junction.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(junction[0].at("rhs")), original_gid)
+        << "junction row references a phantom globalId (dangling link)";
+
+    // Re-append is a set-semantics no-op, not a PRIMARY KEY violation.
+    list.push_back(obj2_ref);
+    delete obj2_ref;
+    auto recount = db.db().query(
+        "SELECT COUNT(*) AS c FROM _FpOwner_FpSig_sigs WHERE lhs = 'own-1'");
+    EXPECT_EQ(std::get<int64_t>(recount[0].at("c")), 1);
+
+    delete lattice_ref;
+}
+
 #endif // !__linux__

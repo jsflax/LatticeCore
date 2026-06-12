@@ -10,6 +10,11 @@
 
 namespace lattice {
 
+/// Default statement-level busy timeout. Headless/server processes tolerate long
+/// waits; interactive apps should pass a smaller value (e.g. 5000) via
+/// configuration::busy_timeout_ms so a stuck writer can't hang the UI thread.
+inline constexpr int kDefaultBusyTimeoutMs = 30000;
+
 class db_error : public std::runtime_error {
 public:
     explicit db_error(const std::string& msg) : std::runtime_error(msg) {}
@@ -24,7 +29,8 @@ public:
         read_only_immutable ///< Read-only for truly immutable/bundled databases (skips WAL checks)
     };
 
-    explicit database(const std::string& path, open_mode mode = open_mode::read_write);
+    explicit database(const std::string& path, open_mode mode = open_mode::read_write,
+                      int busy_timeout_ms = kDefaultBusyTimeoutMs);
     ~database();
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.
@@ -101,6 +107,7 @@ private:
     // Set by close(); ops short-circuit when set. db_ stays valid until ~database,
     // so this is a logical-close flag, not a lifetime guard.
     std::atomic<bool> closed_{false};
+    int busy_timeout_ms_ = kDefaultBusyTimeoutMs;
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
 };
 

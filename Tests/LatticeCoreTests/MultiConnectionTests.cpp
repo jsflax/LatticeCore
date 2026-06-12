@@ -117,3 +117,61 @@ TEST_F(MultiConnTest, FilePersistence) {
         EXPECT_EQ(int(trips[0].days), 7);
     }
 }
+
+// ============================================================================
+// Open-path contention — concurrent first opens must wait, not throw
+// ============================================================================
+
+TEST(MultiConnection, ConcurrentFirstOpenWaitsForWriteLock) {
+    TempDB tmp{"concopen"};
+
+    // External connection holds the write lock on a FRESH database while a
+    // lattice_db opens it. The slow path's BEGIN IMMEDIATE must wait via
+    // begin_transaction's backoff and then succeed — previously the bare
+    // ensure writes threw "database is locked" and killed the open.
+    lattice::database raw(tmp.str());
+    raw.begin_transaction();
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> failed{false};
+    std::thread opener([&] {
+        try {
+            lattice::lattice_db db(tmp.str());
+            db.add(TestPerson{"Concurrent", 1, std::nullopt});
+            opened.store(true);
+        } catch (...) {
+            failed.store(true);
+        }
+    });
+
+    // Hold the lock long enough that the opener definitely contends.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    EXPECT_FALSE(opened.load());  // opener should still be waiting
+    raw.rollback();
+
+    opener.join();
+    EXPECT_TRUE(opened.load());
+    EXPECT_FALSE(failed.load());
+}
+
+TEST(MultiConnection, BeginTransactionDeadlineBounded) {
+    // begin_transaction must give up within ~30s wall clock when the lock is
+    // never released. The old code busy-waited the statement timeout inside
+    // EVERY retry attempt while only counting its own sleeps — worst case
+    // measured in tens of minutes.
+    TempDB tmp{"deadline"};
+    lattice::database holder(tmp.str());
+    holder.execute("CREATE TABLE t(x INTEGER)");
+    holder.begin_transaction();
+
+    lattice::database contender(tmp.str());
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_THROW(contender.begin_transaction(), lattice::db_error);
+    auto waited = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start);
+
+    EXPECT_GE(waited.count(), 25);
+    EXPECT_LE(waited.count(), 45);
+
+    holder.rollback();
+}

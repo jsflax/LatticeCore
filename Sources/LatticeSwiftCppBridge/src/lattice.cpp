@@ -9,6 +9,7 @@
 // Thread-local state for migration lookup functions
 static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;
 static thread_local std::shared_ptr<lattice::dynamic_object> g_migration_lookup_result;
+static thread_local std::vector<std::shared_ptr<lattice::dynamic_object>> g_migration_backlink_results;
 
 // Thread-local state for row migration callback refs
 // Set before calling the row migration callback, read by Swift via accessor functions.
@@ -22,6 +23,12 @@ static thread_local lattice::dynamic_object_ref* g_migration_new_row = nullptr;
 #else
 #  define LATTICE_DEREF_REF(x) (x)
 #endif
+
+// The schema version step currently being migrated. The incremental migration
+// loop walks current+1...target one version at a time; Swift must dispatch the
+// row callback to THAT version's Migration, not the target's (a v1→v3 walk
+// would otherwise send v2 tables' rows to the v3 blocks and crash).
+static thread_local int g_migration_current_version = 0;
 
 // Log level control
 void lattice_set_log_level(lattice::log_level level) {
@@ -195,6 +202,25 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
     }
 }
 
+// A `@Unique(..., allowsUpsert: true)` whose conflict set includes a to-one link
+// uses the `<link>__link_gid` shadow column (Phase 8a). That column is normally
+// filled by the post-insert link-table trigger — too late for `ON CONFLICT` to
+// see the conflict — so write the link's globalId into the shadow column as part
+// of the row INSERT here. (Already-managed targets only; if the target isn't yet
+// persisted the shadow stays NULL, i.e. distinct — same as before.)
+void swift_lattice::materialize_link_shadow_conflict_cols(swift_dynamic_object& obj,
+                                                         const std::vector<std::string>& upsert_cols) {
+    static const std::string suffix = "__link_gid";
+    for (const auto& cc : upsert_cols) {
+        if (cc.size() <= suffix.size() ||
+            cc.compare(cc.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        auto it = obj.link_values.find(cc.substr(0, cc.size() - suffix.size()));
+        if (it == obj.link_values.end() || !it->second || !it->second->lattice) continue;
+        obj.properties[cc] = property_descriptor{cc, column_type::text};   // shadow col isn't in the Swift schema
+        obj.values[cc] = it->second->managed_.global_id();
+    }
+}
+
 void swift_lattice::add(dynamic_object &obj) {
     if (lattice_db::is_closed()) return;   // writes are multi-step (insert+manage+notify); no-op whole op when closed
     if (obj.lattice) {
@@ -208,6 +234,7 @@ void swift_lattice::add(dynamic_object &obj) {
     auto& unmanaged_obj = obj.unmanaged_;
     const std::string& table_name = unmanaged_obj.table_name;
     auto upsert_cols = get_upsert_columns(table_name);
+    materialize_link_shadow_conflict_cols(unmanaged_obj, upsert_cols);
 
     // Add with optional conflict columns for upsert
     const managed<swift_dynamic_object> object = lattice_db::add(
@@ -254,6 +281,7 @@ void swift_lattice::add_preserving_global_id(dynamic_object &obj, const std::str
     auto& unmanaged_obj = obj.unmanaged_;
     const std::string& table_name = unmanaged_obj.table_name;
     auto upsert_cols = get_upsert_columns(table_name);
+    materialize_link_shadow_conflict_cols(unmanaged_obj, upsert_cols);
 
     // Add with optional conflict columns for upsert, preserving globalId
     const managed<swift_dynamic_object> object = lattice_db::add(
@@ -455,9 +483,67 @@ void swift_lattice::persist_union_values(swift_dynamic_object& unmanaged_obj,
 }
 
 void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
+    // FAST PATH: when the fingerprint marker matches the schema cookie AND the
+    // stored schema version equals this binary's target, every DDL statement
+    // below is provably a no-op — populate in-memory state only and return
+    // without taking the write lock. The marker + cookie + version are read
+    // under one read transaction so the triple can't be torn by concurrent DDL.
+    const std::string fp_key = compute_swift_fingerprint_key(schemas);
+    {
+        bool fast = false;
+        int current_version = 0;
+        const int target_version = swift_config_.target_schema_version;
+        bool db_newer = false;
+        try {
+            db().execute("BEGIN");
+            if (fingerprint_marker_valid_in_txn(fp_key)) {
+                current_version = get_schema_version();
+                if (current_version > target_version) {
+                    db_newer = true;
+                } else if (current_version == target_version) {
+                    fast = true;
+                }
+            }
+            db().execute("COMMIT");
+        } catch (const db_error&) {
+            try { db().execute("ROLLBACK"); } catch (...) {}
+            fast = false;
+            db_newer = false;
+        }
+        if (db_newer) {
+            // Preserve the version guard: a no-DDL row-transform migration by a
+            // newer binary leaves the cookie (and thus the marker) intact, but
+            // this binary must still refuse to operate on the newer database.
+            LOG_ERROR("swift_lattice", "Database schema version (%d) is newer than this binary supports (%d). "
+                      "Update the application to a version that supports schema v%d.",
+                      current_version, target_version, current_version);
+            throw std::runtime_error(
+                "Database schema version (" + std::to_string(current_version) +
+                ") is newer than this binary supports (" + std::to_string(target_version) +
+                "). Update the application.");
+        }
+        if (fast) {
+            populate_swift_in_memory_state(schemas);
+            LOG_INFO("swift_lattice", "ensure_swift_tables: fast path (fingerprint match)");
+            dispatch_vec0_reconcile(schemas);
+            return;
+        }
+    }
+
     LOG_INFO("swift_lattice", "ensure_swift_tables: acquiring exclusive transaction");
     auto transaction = lattice::transaction(this->db(), /*exclusive=*/true);
     LOG_INFO("swift_lattice", "ensure_swift_tables: exclusive transaction acquired");
+
+    // Double-checked: another process may have completed this exact ensure
+    // pass between our probe above and acquiring the write lock.
+    if (fingerprint_marker_valid_in_txn(fp_key) &&
+        get_schema_version() == swift_config_.target_schema_version) {
+        populate_swift_in_memory_state(schemas);
+        transaction.commit();
+        LOG_INFO("swift_lattice", "ensure_swift_tables: fast path after lock (sibling completed)");
+        dispatch_vec0_reconcile(schemas);
+        return;
+    }
     // NOTE: No unconditional defer{commit} — if an exception occurs during
     // migration, the transaction destructor will rollback, preventing
     // partial migration state (table rebuilt but version not bumped).
@@ -554,6 +640,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
         // Set migration lattice for Migration.lookup() calls from Swift
         g_migration_lattice = this;
+        g_migration_current_version = version;
 
         // For each existing table, check if it needs migration at this version
         for (const auto& table_name : existing_tables) {
@@ -733,7 +820,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     if (parent_gid.empty() || child_gid.empty()) continue;
 
                     std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + link_name;
-                    lattice_db::ensure_link_table(link_table, table_name);
+                    lattice_db::ensure_link_table(link_table, table_name, prop.target_table);
                     db().execute("INSERT OR REPLACE INTO " + link_table +
                         " (lhs, rhs) VALUES ('" + parent_gid + "', '" + child_gid + "')");
                 }
@@ -748,7 +835,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     if (prop.kind != property_kind::list || prop.is_geo_bounds) continue;
 
                     std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + list_name;
-                    lattice_db::ensure_link_table(link_table, table_name);
+                    lattice_db::ensure_link_table(link_table, table_name, prop.target_table);
 
                     for (auto& elem_ptr : list_ptr->unmanaged_) {
                         if (!elem_ptr) continue;
@@ -797,6 +884,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         // Clear migration lattice pointer
         g_migration_lattice = nullptr;
         g_migration_lookup_result.reset();
+        g_migration_backlink_results.clear();
+        g_migration_current_version = 0;
     }
 
     // Finally, store all final schemas and handle any tables that didn't need migration
@@ -846,54 +935,10 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             } else {
                 // Table exists — ensure triggers are up to date (pass 0 dimensions, ignored)
                 lattice_db::ensure_vec0_table(schema.table_name, prop.name, 0);
-
-                // Reconcile missing vec0 entries. Another connection (e.g. IPC
-                // sync) may have inserted model rows whose vec0 triggers fired
-                // on that connection but not this one. Fill gaps once at init;
-                // the xproc change hook handles incremental updates afterward.
-                try {
-                    auto mc = db().query(
-                        "SELECT COUNT(*) as cnt FROM " + schema.table_name +
-                        " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
-                    auto vc = db().query(
-                        "SELECT COUNT(*) as cnt FROM " + vec_table);
-                    int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
-                    int64_t v = vc.empty() ? 0 : std::get<int64_t>(vc[0].at("cnt"));
-                    if (m > v) {
-                        LOG_INFO("swift_lattice", "vec0 init reconcile: model=%lld vec0=%lld, filling gaps in %s",
-                                 (long long)m, (long long)v, vec_table.c_str());
-                        // Find gaps using the _rowids shadow table (regular indexed
-                        // table) instead of the vec0 virtual table. Insert missing
-                        // rows one at a time since vec0 doesn't support OR IGNORE.
-                        std::string rowids_table = vec_table + "_rowids";
-                        auto gaps = db().query(
-                            "SELECT m.globalId, m." + prop.name +
-                            " FROM " + schema.table_name + " m"
-                            " LEFT JOIN " + rowids_table + " r ON r.id = m.globalId"
-                            " WHERE m." + prop.name + " IS NOT NULL"
-                            " AND length(m." + prop.name + ") > 0"
-                            " AND r.id IS NULL");
-                        for (const auto& row : gaps) {
-                            auto gid_it = row.find("globalId");
-                            auto vec_it = row.find(prop.name);
-                            if (gid_it == row.end() || vec_it == row.end()) continue;
-                            if (!std::holds_alternative<std::string>(gid_it->second)) continue;
-                            if (!std::holds_alternative<std::vector<uint8_t>>(vec_it->second)) continue;
-                            try {
-                                db().execute(
-                                    "INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
-                                    {std::get<std::string>(gid_it->second),
-                                     std::get<std::vector<uint8_t>>(vec_it->second)});
-                            } catch (...) {}
-                        }
-                        if (!gaps.empty()) {
-                            LOG_INFO("swift_lattice", "vec0 reconcile: filled %zu gaps in %s",
-                                     gaps.size(), vec_table.c_str());
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    LOG_WARN("swift_lattice", "vec0 init reconcile failed for %s: %s", vec_table.c_str(), e.what());
-                }
+                // Gap reconciliation (rows inserted by other connections whose
+                // vec0 triggers fired elsewhere) moved off the open path — it
+                // scans the model table. dispatch_vec0_reconcile() heals gaps
+                // in the background after the transaction commits.
             }
         }
     }
@@ -921,10 +966,10 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                 lattice_db::ensure_virtual_link_table(link_table_name, entry.table_name);
             } else if (desc.kind == property_kind::link && !desc.target_table.empty()) {
                 link_table_name = "_" + entry.table_name + "_" + std::string(desc.target_table) + "_" + name;
-                lattice_db::ensure_link_table(link_table_name, entry.table_name);
+                lattice_db::ensure_link_table(link_table_name, entry.table_name, std::string(desc.target_table));
             } else if (desc.kind == property_kind::list && !desc.is_geo_bounds && !desc.target_table.empty()) {
                 link_table_name = "_" + entry.table_name + "_" + std::string(desc.target_table) + "_" + name;
-                lattice_db::ensure_link_table(link_table_name, entry.table_name);
+                lattice_db::ensure_link_table(link_table_name, entry.table_name, std::string(desc.target_table));
             }
             if (!link_table_name.empty()) {
                 // Store "parent_table:property_name" so flush_changes can
@@ -985,7 +1030,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     //    can't be wrapped in IF NOT EXISTS, so gate on
                     //    PRAGMA table_info.
                     auto cols_map = db().get_table_info(entry.table_name);
-                    if (cols_map.find(shadow_col) == cols_map.end()) {
+                    const bool shadow_added = cols_map.find(shadow_col) == cols_map.end();
+                    if (shadow_added) {
                         db().execute("ALTER TABLE " + entry.table_name +
                                      " ADD COLUMN " + shadow_col + " TEXT");
                     }
@@ -1020,15 +1066,20 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                         "     AND " + shadow_col + " = OLD.rhs;"
                         " END");
 
-                    // 3) Backfill from the current link-table state so
-                    //    rows inserted before the constraint was added
-                    //    participate in the unique index.
-                    db().execute(
-                        "UPDATE " + entry.table_name +
-                        " SET " + shadow_col + " ="
-                        " (SELECT rhs FROM " + link_table +
-                        " WHERE lhs = " + entry.table_name + ".globalId LIMIT 1)"
-                        " WHERE " + shadow_col + " IS NULL");
+                    // 3) Backfill from the current link-table state so rows
+                    //    inserted before the constraint was added participate
+                    //    in the unique index. Only when the shadow column was
+                    //    just created — on revalidation passes the triggers
+                    //    have been maintaining it, and this UPDATE scans the
+                    //    whole parent table.
+                    if (shadow_added) {
+                        db().execute(
+                            "UPDATE " + entry.table_name +
+                            " SET " + shadow_col + " ="
+                            " (SELECT rhs FROM " + link_table +
+                            " WHERE lhs = " + entry.table_name + ".globalId LIMIT 1)"
+                            " WHERE " + shadow_col + " IS NULL");
+                    }
 
                     resolved_cols.push_back(shadow_col);
                 } else {
@@ -1077,10 +1128,18 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
     // Union tables already created before migration loop (see above)
 
+    // Stamp both layers' fingerprint markers inside the transaction, AFTER all
+    // DDL, so the captured schema cookie reflects this pass. The core-layer
+    // marker is re-stamped because this pass's DDL bumped the cookie and would
+    // otherwise leave it permanently one-open stale.
+    store_fingerprint_marker(fp_key);
+    store_fingerprint_marker(compute_core_fingerprint_key());
+
     // All migrations and schema setup succeeded — commit the transaction.
     // If anything above threw, the transaction destructor rolls back instead.
     LOG_INFO("swift_lattice", "ensure_swift_tables: committing transaction");
     transaction.commit();
+    dispatch_vec0_reconcile(schemas);
 
     // TODO: Dispatch background IVF training for untrained vec0 tables.
     // Disabled pending investigation of IVF+int8 dimension mismatch.
@@ -1089,6 +1148,137 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // });
 
     LOG_INFO("swift_lattice", "ensure_swift_tables done");
+}
+
+std::string swift_lattice::compute_swift_fingerprint_key(const SchemaVector& schemas) const {
+    std::ostringstream out;
+    out << "swift\n"
+        << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
+        << "target_schema_version:" << swift_config_.target_schema_version << '\n';
+    // Sort tables and property names: SchemaVector order follows the Swift
+    // call site and SwiftSchema is an unordered_map — neither is stable.
+    std::vector<const swift_schema_entry*> sorted;
+    sorted.reserve(schemas.size());
+    for (const auto& e : schemas) sorted.push_back(&e);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const swift_schema_entry* a, const swift_schema_entry* b) {
+                  return a->table_name < b->table_name;
+              });
+    for (const auto* entry : sorted) {
+        out << "table:" << entry->table_name << '\n';
+        std::vector<std::string> prop_names;
+        prop_names.reserve(entry->properties.size());
+        for (const auto& [name, desc] : entry->properties) prop_names.push_back(name);
+        std::sort(prop_names.begin(), prop_names.end());
+        for (const auto& name : prop_names) {
+            out << "prop:" << name << '\x01';
+            serialize_property_for_fingerprint(out, entry->properties.at(name));
+        }
+        // Constraints drive Phase 8 DDL (unique indexes, link-shadow columns
+        // and triggers); allows_upsert affects conflict-clause generation.
+        for (const auto& c : entry->constraints) {
+            out << "constraint:";
+            for (const auto& col : c.columns) out << col << '\x01';
+            out << (c.allows_upsert ? 1 : 0) << '\n';
+        }
+    }
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0') << std::setw(16) << fnv1a_hash(out.str());
+    return "schema_fingerprint:" + hex.str();
+}
+
+void swift_lattice::populate_swift_in_memory_state(const SchemaVector& schemas) {
+    for (const auto& entry : schemas) {
+        schemas_[entry.table_name] = entry.properties;
+        constraints_[entry.table_name] = entry.constraints;
+        for (const auto& [name, desc] : entry.properties) {
+            if (desc.is_union) {
+                union_schemas_[desc.union_desc.union_table_name] = desc.union_desc;
+            }
+            // Mirror Phase 7's link-table naming with in-memory-only helpers.
+            if (desc.kind == property_kind::virtual_list ||
+                desc.kind == property_kind::virtual_link) {
+                note_virtual_link_table("_" + entry.table_name + "_" + name);
+            } else if (desc.kind == property_kind::list && desc.is_geo_bounds) {
+                note_geo_list_table(entry.table_name, "_" + entry.table_name + "_" + name);
+            } else if ((desc.kind == property_kind::link ||
+                        desc.kind == property_kind::list) &&
+                       !desc.target_table.empty()) {
+                note_link_table("_" + entry.table_name + "_" +
+                                std::string(desc.target_table) + "_" + name,
+                                std::string(desc.target_table));
+            }
+        }
+    }
+}
+
+void swift_lattice::dispatch_vec0_reconcile(const SchemaVector& schemas) {
+    // Collect (table, vector-column) pairs; other connections (e.g. IPC sync)
+    // may have inserted model rows whose vec0 triggers fired on their
+    // connection but not ours. Heal in the background — the scan is O(table)
+    // and must not block open. The future member blocks destruction until the
+    // task drains, so `this` stays valid.
+    std::vector<std::pair<std::string, std::string>> vec_props;
+    for (const auto& entry : schemas) {
+        for (const auto& [name, desc] : entry.properties) {
+            if (desc.is_vector && desc.type == column_type::blob) {
+                vec_props.emplace_back(entry.table_name, name);
+            }
+        }
+    }
+    if (vec_props.empty()) return;
+    vec0_reconcile_future_ = std::async(std::launch::async, [this, vec_props]() {
+        for (const auto& [table, prop] : vec_props) {
+            reconcile_vec0_gaps_for(table, prop);
+        }
+    });
+}
+
+void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std::string& prop) {
+    std::string vec_table = "_" + table + "_" + prop + "_vec";
+    try {
+        if (!db().table_exists(vec_table)) return;
+        auto mc = db().query(
+            "SELECT COUNT(*) as cnt FROM " + table +
+            " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0");
+        auto vc = db().query(
+            "SELECT COUNT(*) as cnt FROM " + vec_table);
+        int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
+        int64_t v = vc.empty() ? 0 : std::get<int64_t>(vc[0].at("cnt"));
+        if (m <= v) return;
+        LOG_INFO("swift_lattice", "vec0 reconcile: model=%lld vec0=%lld, filling gaps in %s",
+                 (long long)m, (long long)v, vec_table.c_str());
+        // Find gaps using the _rowids shadow table (regular indexed table)
+        // instead of the vec0 virtual table. Insert missing rows one at a
+        // time since vec0 doesn't support OR IGNORE.
+        std::string rowids_table = vec_table + "_rowids";
+        auto gaps = db().query(
+            "SELECT m.globalId, m." + prop +
+            " FROM " + table + " m"
+            " LEFT JOIN " + rowids_table + " r ON r.id = m.globalId"
+            " WHERE m." + prop + " IS NOT NULL"
+            " AND length(m." + prop + ") > 0"
+            " AND r.id IS NULL");
+        for (const auto& row : gaps) {
+            auto gid_it = row.find("globalId");
+            auto vec_it = row.find(prop);
+            if (gid_it == row.end() || vec_it == row.end()) continue;
+            if (!std::holds_alternative<std::string>(gid_it->second)) continue;
+            if (!std::holds_alternative<std::vector<uint8_t>>(vec_it->second)) continue;
+            try {
+                db().execute(
+                    "INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                    {std::get<std::string>(gid_it->second),
+                     std::get<std::vector<uint8_t>>(vec_it->second)});
+            } catch (...) {}
+        }
+        if (!gaps.empty()) {
+            LOG_INFO("swift_lattice", "vec0 reconcile: filled %zu gaps in %s",
+                     gaps.size(), vec_table.c_str());
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("swift_lattice", "vec0 reconcile failed for %s: %s", vec_table.c_str(), e.what());
+    }
 }
 
 } // namespace lattice
@@ -1276,6 +1466,68 @@ lattice::dynamic_object_ref* lattice::migration_take_lookup_result() {
     return dynamic_object_ref::wrap(result);
 }
 
+int64_t lattice::migration_lookup_backlinks(const std::string& child_table,
+                                            const std::string& parent_table,
+                                            const std::string& link_property,
+                                            const std::string& parent_global_id) {
+    g_migration_backlink_results.clear();
+    if (!g_migration_lattice) {
+        return 0;
+    }
+    auto& database = g_migration_lattice->db();
+
+    // Single links store the linked row's globalId in a shadow column
+    // `<link>__link_gid` on the child table when the link is referenced by a
+    // @Unique constraint; otherwise only the `_<Child>_<Parent>_<link>`
+    // junction has the association. Prefer the shadow column (no stale rows);
+    // the junction can carry rows for since-deleted children, which the JOIN
+    // filters out. COLLATE NOCASE: stored gids are lowercase hex, Swift's
+    // UUID.uuidString is uppercase.
+    std::vector<int64_t> child_ids;
+    auto cols = database.get_table_info(child_table);
+    std::string shadow_col = link_property + "__link_gid";
+    if (cols.count(shadow_col)) {
+        auto rows = database.query(
+            "SELECT id FROM " + child_table +
+            " WHERE " + shadow_col + " = ? COLLATE NOCASE",
+            {parent_global_id});
+        for (const auto& row : rows) {
+            child_ids.push_back(std::get<int64_t>(row.at("id")));
+        }
+    } else {
+        std::string link_table = "_" + child_table + "_" + parent_table + "_" + link_property;
+        if (!database.table_exists(link_table)) {
+            return 0;
+        }
+        auto rows = database.query(
+            "SELECT c.id AS id FROM " + link_table + " j"
+            " JOIN " + child_table + " c ON c.globalId = j.lhs"
+            " WHERE j.rhs = ? COLLATE NOCASE",
+            {parent_global_id});
+        for (const auto& row : rows) {
+            child_ids.push_back(std::get<int64_t>(row.at("id")));
+        }
+    }
+
+    for (int64_t child_id : child_ids) {
+        auto obj = g_migration_lattice->object(child_id, child_table);
+        if (!obj) {
+            continue;
+        }
+        filter_properties_to_existing_columns(*obj, child_table);
+        swift_dynamic_object detached = obj->detach();
+        g_migration_backlink_results.push_back(std::make_shared<dynamic_object>(detached));
+    }
+    return static_cast<int64_t>(g_migration_backlink_results.size());
+}
+
+lattice::dynamic_object_ref* lattice::migration_take_backlink_result(int64_t index) {
+    if (index < 0 || index >= static_cast<int64_t>(g_migration_backlink_results.size())) {
+        return dynamic_object_ref::create();
+    }
+    return dynamic_object_ref::wrap(g_migration_backlink_results[static_cast<size_t>(index)]);
+}
+
 lattice::dynamic_object_ref* lattice::migration_get_old_row() {
     return g_migration_old_row;
 }
@@ -1303,6 +1555,10 @@ lattice::dynamic_object_ref lattice::migration_get_new_row() {
                                : dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
 }
 #endif
+
+int lattice::migration_get_current_version() {
+    return g_migration_current_version;
+}
 
 void lattice::swift_lattice::update_sync_filter(const SyncFilterVector& filter) {
     lattice_db::update_sync_filter(std::vector<sync_filter_entry>(filter.begin(), filter.end()));

@@ -193,12 +193,18 @@ std::optional<size_t> link_list::find_index(const dynamic_object_ref& obj) const
 }
 
 std::vector<size_t> link_list::find_where(const std::string& sql_predicate) const {
+    return find_indices(sql_predicate, "", true);
+}
+
+std::vector<size_t> link_list::find_indices(const std::string& sql_predicate,
+                                            const std::string& order_column,
+                                            bool ascending) const {
     // Only supported for managed lists
     if (!lattice) {
         return {};
     }
 
-    // Virtual lists don't support find_where (no single target table)
+    // Virtual lists don't support find_indices (no single target table)
     if (managed_.is_virtual_) {
         return {};
     }
@@ -213,28 +219,48 @@ std::vector<size_t> link_list::find_where(const std::string& sql_predicate) cons
         return {};
     }
 
-    // Query to find all indices of matching elements
-    // Uses ROW_NUMBER to get position in the ordered list
+    // List positions of matching elements, ordered by a target-table column
+    // when requested (list order otherwise; `__pos` tie-break keeps sorts
+    // stable). Returns positions only — no row data is loaded, so callers
+    // can hydrate elements lazily.
+    //
+    // Positions MUST index the same membership load_if_needed() builds:
+    // the cache skips dangling links (junction rows whose target row was
+    // deleted), so number rows AFTER the join — numbering all link rows
+    // would shift every position past a dangling link, hydrating the wrong
+    // element or walking off the end of the cache.
     std::string sql = R"(
         WITH ordered_links AS (
-            SELECT rhs, (ROW_NUMBER() OVER (ORDER BY rowid)) - 1 as idx
-            FROM )" + link_table + R"(
-            WHERE lhs = ? COLLATE NOCASE
+            SELECT t.*, (ROW_NUMBER() OVER (ORDER BY l.rowid)) - 1 AS __pos
+            FROM )" + link_table + R"( l
+            INNER JOIN )" + target_table + R"( t ON t.globalId = l.rhs
+            WHERE l.lhs = ? COLLATE NOCASE
         )
-        SELECT ol.idx
-        FROM ordered_links ol
-        INNER JOIN )" + target_table + R"( t ON t.globalId = ol.rhs
-        WHERE )" + sql_predicate + R"(
-        ORDER BY ol.idx
+        SELECT __pos FROM ordered_links
     )";
+    if (!sql_predicate.empty()) {
+        sql += " WHERE " + sql_predicate;
+    }
+    if (!order_column.empty()) {
+        sql += " ORDER BY " + order_column + (ascending ? " ASC" : " DESC") + ", __pos";
+    } else {
+        sql += " ORDER BY __pos";
+    }
 
     auto rows = db->query(sql, {parent_id});
+
+    // Positions reflect the database NOW; drop the element cache so the
+    // next access reloads against the same snapshot. Without this, a list
+    // loaded earlier (and never invalidated by other connections' writes)
+    // can be shorter than — or ordered differently from — these positions.
+    managed_.loaded_ = false;
+    managed_.cached_objects_.clear();
 
     std::vector<size_t> indices;
     indices.reserve(rows.size());
 
     for (const auto& row : rows) {
-        auto it = row.find("idx");
+        auto it = row.find("__pos");
         if (it != row.end() && std::holds_alternative<int64_t>(it->second)) {
             indices.push_back(static_cast<size_t>(std::get<int64_t>(it->second)));
         }

@@ -20,7 +20,10 @@
 #include <mutex>
 #include <map>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <array>
+#include <algorithm>
 #include <stdio.h>
 #include <iostream>
 #include <concepts>
@@ -413,6 +416,11 @@ struct configuration {
     /// Use this for bundled template databases in app resources.
     bool read_only = false;
 
+    /// Statement-level busy timeout (ms) for all connections of this database.
+    /// Headless/server processes keep the default; interactive apps should set
+    /// a small value (e.g. 5000) so a stuck writer can't hang the UI thread.
+    int busy_timeout_ms = kDefaultBusyTimeoutMs;
+
     // Default constructor - in-memory, no sync
     configuration() = default;
 
@@ -723,11 +731,12 @@ public:
     explicit lattice_db(const configuration& config, bool defer_sync = false)
         : config_(config)
         , db_(std::make_unique<database>(resolve_path(config),
-              config.read_only ? database::open_mode::read_only_immutable : database::open_mode::read_write))
+              config.read_only ? database::open_mode::read_only_immutable : database::open_mode::read_write,
+              config.busy_timeout_ms))
         , read_db_(config.read_only ? nullptr :
-                   (config.path != ":memory:" && !config.is_sync_enabled() ? std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr))
+                   (config.path != ":memory:" && !config.is_sync_enabled() ? std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
         , xproc_read_db_(config.path != ":memory:" && !config.read_only ?
-                         std::make_unique<database>(config.path, database::open_mode::read_only) : nullptr)
+                         std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
@@ -1125,31 +1134,45 @@ public:
         }
         auto id = db_->insert(schema.table_name, values, conflict_columns);
 
-        // For upsert, last_insert_rowid returns 0 if only update happened
-        // Query back to get the actual id/globalId
+        // Upserts must rebind to the row that actually holds the data: when
+        // ON CONFLICT takes the DO UPDATE path the pre-existing row keeps its
+        // id AND globalId — binding the object to the freshly generated gid
+        // would point every subsequent link write (junction rows reference
+        // rows by globalId) at a row that doesn't exist. insert() reports the
+        // affected rowid via RETURNING (0 for DO NOTHING); re-read identity on
+        // the WRITE connection — read_db() can't see rows inside an open
+        // transaction.
         primary_key_t actual_id = id;
         global_id_t actual_gid = gid;
-        if (!conflict_columns.empty() && id == 0) {
-            // Build WHERE clause from conflict columns
-            std::ostringstream where;
-            std::vector<column_value_t> params;
-            bool first = true;
-            for (const auto& col : conflict_columns) {
-                for (const auto& [name, val] : values) {
-                    if (name == col) {
-                        if (!first) where << " AND ";
-                        where << col << " = ?";
-                        params.push_back(val);
-                        first = false;
-                        break;
+        if (!conflict_columns.empty()) {
+            if (id != 0) {
+                auto rows = db_->query(
+                    "SELECT globalId FROM " + schema.table_name + " WHERE id = ?", {id});
+                if (!rows.empty()) {
+                    actual_gid = std::get<std::string>(rows[0].at("globalId"));
+                }
+            } else {
+                // DO NOTHING hit a conflict: look the row up by its conflict key.
+                std::ostringstream where;
+                std::vector<column_value_t> params;
+                bool first = true;
+                for (const auto& col : conflict_columns) {
+                    for (const auto& [name, val] : values) {
+                        if (name == col) {
+                            if (!first) where << " AND ";
+                            where << col << " = ?";
+                            params.push_back(val);
+                            first = false;
+                            break;
+                        }
                     }
                 }
-            }
-            auto rows = read_db().query("SELECT id, globalId FROM " + schema.table_name +
-                                        " WHERE " + where.str(), params);
-            if (!rows.empty()) {
-                actual_id = std::get<int64_t>(rows[0].at("id"));
-                actual_gid = std::get<std::string>(rows[0].at("globalId"));
+                auto rows = db_->query("SELECT id, globalId FROM " + schema.table_name +
+                                       " WHERE " + where.str(), params);
+                if (!rows.empty()) {
+                    actual_id = std::get<int64_t>(rows[0].at("id"));
+                    actual_gid = std::get<std::string>(rows[0].at("globalId"));
+                }
             }
         }
 
@@ -1807,48 +1830,63 @@ public:
 
             db_->remove(table_name, obj.id_);
 
-            // Cascade: remove link table entries referencing this object as rhs.
-            // internal_table: entries include link tables (lhs/rhs), geo_bounds list
-            // tables (parent_id), virtual link tables (lhs/rhs/rhs_type), and
-            // union tables. The Swift schema bridge stores every link's value as
-            // "Parent:property" (lattice.cpp:893) so the older `find(':')` filter
-            // accidentally skipped every link AND every union — the cascade
-            // never DELETEd anything, no AuditLog DELETE rows fired, and peers
-            // ended up with orphaned `_Parent_Child_field` rows pointing at
-            // already-deleted targets. Following such an orphan via
-            // `Optional<Child>.getField` SIGSEGVs in
-            // `swift_lattice::get_properties_for_table` because the C++ to-one
-            // binding's `cached_object_` is null and `m->table_name()` is read
-            // off a nullptr.
+            // Cascade: clean up internal-table rows that referenced this object.
             //
-            // Skip only the cases the cascade can't safely target:
-            //  • Multi-parent union tables (`P1:f1;P2:f2`) — the trailing
-            //    `Parent:field` segment they carry isn't a single owning
-            //    relationship; they have their own BEFORE DELETE cascade.
-            //    The `;` is the unambiguous discriminator.
-            //  • Tables without an `rhs` column (e.g. geo_bounds list with
-            //    `parent_id`) — covered by the try/catch below.
+            // Three kinds of internal tables coexist in `_lattice_meta`:
+            //  • Link tables (regular + virtual): have an `rhs` column, need
+            //    `DELETE … WHERE rhs = ?`.
+            //  • Single-parent `@Union` tables: have no `rhs` column. Their
+            //    parent's `BEFORE DELETE` trigger (see
+            //    `create_union_cascade_trigger`) already removed the union row
+            //    inside this transaction — nothing to do here.
+            //  • Geo_bounds list tables: have `parent_id`, not `rhs`. Need
+            //    `DELETE … WHERE parent_id = ?` when the parent is deleted.
+            //
+            // We dispatch via the in-memory side indexes (`link_tables_`,
+            // `list_tables_by_parent_`) populated at registration time so the
+            // cascade walker only issues queries that match each table's
+            // schema. This replaces the older "iterate every `internal_table:%`
+            // and rely on try/catch as a column-existence test" pattern, which
+            // was both O(all_internal_tables) per delete and noisy — every
+            // attempt against a union or list table hit the SQLite error
+            // logger before being swallowed.
             if (!gid.empty()) {
-                auto rows = db_->query(
-                    "SELECT key, value FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
-                for (const auto& row : rows) {
-                    auto key_it = row.find("key");
-                    if (key_it == row.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
-                    auto link_table = std::get<std::string>(key_it->second).substr(15);
-
-                    auto val_it = row.find("value");
-                    if (val_it != row.end() && std::holds_alternative<std::string>(val_it->second)) {
-                        auto& val = std::get<std::string>(val_it->second);
-                        // Multi-parent unions only — distinguished by the
-                        // semicolon separator between segments.
-                        if (val.find(';') != std::string::npos) continue;
+                // Regular link tables that target this type — typically a
+                // small set, often empty for leaf types (e.g. historical
+                // signals nothing else points at).
+                auto target_it = link_tables_by_rhs_target_.find(table_name);
+                if (target_it != link_tables_by_rhs_target_.end()) {
+                    for (const auto& link_table : target_it->second) {
+                        if (db_->table_exists(link_table)) {
+                            db_->execute(
+                                "DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                        }
                     }
-
+                }
+                // Defensive: link tables registered without a known target
+                // (rare; normally empty after `ensure_link_tables()`).
+                for (const auto& link_table : link_tables_unknown_target_) {
                     if (db_->table_exists(link_table)) {
-                        try {
-                            db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
-                        } catch (...) {
-                            // Not a link table (e.g. geo_bounds list) — skip
+                        db_->execute(
+                            "DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                    }
+                }
+                // Virtual link tables — polymorphic rhs, scope by rhs_type.
+                for (const auto& link_table : virtual_link_tables_) {
+                    if (db_->table_exists(link_table)) {
+                        db_->execute(
+                            "DELETE FROM " + link_table +
+                            " WHERE rhs = ? AND rhs_type = ?",
+                            {gid, table_name});
+                    }
+                }
+                auto list_it = list_tables_by_parent_.find(table_name);
+                if (list_it != list_tables_by_parent_.end()) {
+                    for (const auto& list_table : list_it->second) {
+                        if (db_->table_exists(list_table)) {
+                            db_->execute(
+                                "DELETE FROM " + list_table + " WHERE parent_id = ?",
+                                {gid});
                         }
                     }
                 }
@@ -1923,60 +1961,87 @@ public:
         return 0;
     }
 
+    // Framework tables whose globalIds are never the rhs of a link, and
+    // which have no vec0 columns. Skipping the cascade for these turns
+    // delete_history (millions of AuditLog rows × N link tables of no-op
+    // DELETEs that bloat the WAL) into a single DELETE.
+    static bool is_non_cascading_table(const std::string& t) {
+        if (t == "AuditLog") return true;
+        if (t == "_SyncControl") return true;
+        if (t.rfind("_lattice_", 0) == 0) return true;
+        return false;
+    }
+
     // Delete rows from a table (with optional WHERE clause)
     bool delete_where(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt) {
         try {
-            // Cascade: collect globalIds of rows about to be deleted,
-            // then remove referencing link table entries before the DELETE.
-            std::string select_sql = "SELECT globalId FROM " + table_name;
-            if (where_clause.has_value()) {
-                select_sql += " WHERE " + *where_clause;
-            }
-            auto gid_rows = db_->query(select_sql);
+            const bool skip_cascade = is_non_cascading_table(table_name);
 
-            if (!gid_rows.empty()) {
-                auto link_rows = db_->query(
-                    "SELECT key, value FROM _lattice_meta WHERE key LIKE 'internal_table:%'");
+            std::vector<std::string> gids_for_vec0;
+
+            if (!skip_cascade) {
+                // Collect gids first for vec0 cleanup, then issue one bulk
+                // DELETE per cascade target table. See `remove(...)` for the
+                // per-kind rationale (link vs union vs list).
+                std::string select_sql = "SELECT globalId FROM " + table_name;
+                if (where_clause.has_value()) {
+                    select_sql += " WHERE " + *where_clause;
+                }
+                auto gid_rows = db_->query(select_sql);
+
                 for (const auto& gid_row : gid_rows) {
                     auto gid_it = gid_row.find("globalId");
                     if (gid_it == gid_row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
                     auto gid = std::get<std::string>(gid_it->second);
                     if (gid.empty()) continue;
+                    gids_for_vec0.push_back(gid);
+                }
 
-                    for (const auto& lr : link_rows) {
-                        auto key_it = lr.find("key");
-                        if (key_it == lr.end() || !std::holds_alternative<std::string>(key_it->second)) continue;
-                        auto link_table = std::get<std::string>(key_it->second).substr(15);
+                if (!gids_for_vec0.empty()) {
+                    // Build the subquery once; reuse for every cascade target.
+                    // Re-running the parent SELECT inside each DELETE keeps the
+                    // statement parameter-free and lets SQLite stream rows.
+                    std::string parent_sub = "SELECT globalId FROM " + table_name;
+                    if (where_clause.has_value()) {
+                        parent_sub += " WHERE " + *where_clause;
+                    }
 
-                        // See `remove(...)` above for the matching cascade
-                        // pass and the `;` discriminator rationale: every
-                        // link's metadata value is now `Parent:property`,
-                        // so `:` no longer distinguishes union tables.
-                        // Only multi-parent unions (`P1:f1;P2:f2`) need to
-                        // skip the rhs cascade.
-                        auto val_it = lr.find("value");
-                        if (val_it != lr.end() && std::holds_alternative<std::string>(val_it->second)) {
-                            if (std::get<std::string>(val_it->second).find(';') != std::string::npos) continue;
+                    auto target_it = link_tables_by_rhs_target_.find(table_name);
+                    if (target_it != link_tables_by_rhs_target_.end()) {
+                        for (const auto& link_table : target_it->second) {
+                            if (db_->table_exists(link_table)) {
+                                db_->execute(
+                                    "DELETE FROM " + link_table +
+                                    " WHERE rhs IN (" + parent_sub + ")");
+                            }
                         }
-
+                    }
+                    for (const auto& link_table : link_tables_unknown_target_) {
                         if (db_->table_exists(link_table)) {
-                            try {
-                                db_->execute("DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
-                            } catch (...) {
-                                // Not a link table (e.g. geo_bounds list) — skip
+                            db_->execute(
+                                "DELETE FROM " + link_table +
+                                " WHERE rhs IN (" + parent_sub + ")");
+                        }
+                    }
+                    for (const auto& link_table : virtual_link_tables_) {
+                        if (db_->table_exists(link_table)) {
+                            db_->execute(
+                                "DELETE FROM " + link_table +
+                                " WHERE rhs_type = ? AND rhs IN (" + parent_sub + ")",
+                                {table_name});
+                        }
+                    }
+                    auto list_it = list_tables_by_parent_.find(table_name);
+                    if (list_it != list_tables_by_parent_.end()) {
+                        for (const auto& list_table : list_it->second) {
+                            if (db_->table_exists(list_table)) {
+                                db_->execute(
+                                    "DELETE FROM " + list_table +
+                                    " WHERE parent_id IN (" + parent_sub + ")");
                             }
                         }
                     }
                 }
-            }
-
-            // Collect globalIds for post-delete vec0 cleanup.
-            std::vector<std::string> gids_for_vec0;
-            for (const auto& gid_row : gid_rows) {
-                auto gid_it = gid_row.find("globalId");
-                if (gid_it == gid_row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
-                auto& gid = std::get<std::string>(gid_it->second);
-                if (!gid.empty()) gids_for_vec0.push_back(gid);
             }
 
             std::string sql = "DELETE FROM " + table_name;
@@ -1985,9 +2050,11 @@ public:
             }
             db_->execute(sql);
 
-            // Defensive vec0 cleanup: the DELETE trigger should have removed
-            // vec0 entries, but under write contention it can silently fail.
-            cleanup_vec0_entries(table_name, gids_for_vec0);
+            if (!skip_cascade) {
+                // Defensive vec0 cleanup: the DELETE trigger should have removed
+                // vec0 entries, but under write contention it can silently fail.
+                cleanup_vec0_entries(table_name, gids_for_vec0);
+            }
 
             return true;
         } catch (...) {
@@ -2004,12 +2071,27 @@ public:
         return force_compact_audit_log();
     }
 
+    /// Current value of the persistent _SyncControl.disabled flag (0 if unset).
+    /// Internal operations that temporarily disable sync must restore THIS
+    /// value, not hardcode 0 — a user who deliberately disabled auditing
+    /// keeps it disabled across compaction/history operations.
+    int64_t read_sync_disabled_flag() const {
+        try {
+            auto rows = db_->query("SELECT disabled FROM _SyncControl WHERE id = 1");
+            if (!rows.empty()) {
+                if (const auto* i = std::get_if<int64_t>(&rows[0].at("disabled"))) return *i;
+            }
+        } catch (...) {}
+        return 0;
+    }
+
     /// Nuclear compaction: deletes ALL history, regenerates INSERT snapshots,
     /// and resets all replication slot cursors to 0.
     /// Active synchronizers will re-sync all data.
     /// @return Number of INSERT entries created
     int64_t force_compact_audit_log() {
         // Clear all existing audit log entries (with sync disabled)
+        const int64_t prev_disabled = read_sync_disabled_flag();
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
         try {
             db_->execute("DELETE FROM AuditLog");
@@ -2022,9 +2104,9 @@ public:
             // Reset replication slots rather than delete — synchronizers
             // don't need to re-register, they just re-sync from the start.
             db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0");
-            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
         } catch (...) {
-            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
             throw;
         }
 
@@ -2073,15 +2155,16 @@ public:
         if (safe_id <= 0) return 0;
 
         // 4. Delete confirmed entries
+        const int64_t prev_disabled = read_sync_disabled_flag();
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
         int64_t deleted = 0;
         try {
             db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
             deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
             db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
-            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
         } catch (...) {
-            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
             throw;
         }
 
@@ -2114,6 +2197,7 @@ public:
             "ON AuditLog(tableName, globalRowId)");
 
         // Temporarily disable sync to prevent triggers from firing
+        const int64_t prev_disabled = read_sync_disabled_flag();
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
 
         try {
@@ -2214,11 +2298,11 @@ public:
                 }
             }
 
-            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
             db_->execute("DROP INDEX IF EXISTS idx_audit_log_table_global_tmp");
             return total_entries;
         } catch (...) {
-            db_->execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
             db_->execute("DROP INDEX IF EXISTS idx_audit_log_table_global_tmp");
             throw;
         }
@@ -2408,7 +2492,9 @@ public:
 
     /// Reopen the write connection
     void reopen_write_db() {
-        db_ = std::make_unique<database>(config_.path, database::open_mode::read_write);
+        db_ = std::make_unique<database>(config_.path, database::open_mode::read_write,
+                                         config_.busy_timeout_ms);
+        register_sql_functions();  // per-connection: triggers need sync_disabled()
         setup_change_hook();
     }
 
@@ -2420,16 +2506,55 @@ public:
     /// Reopen the read-only connections after exclusive operations
     void reopen_read_db() {
         if (config_.path != ":memory:" && !config_.read_only) {
-            read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only);
-            xproc_read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only);
+            read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only,
+                                                  config_.busy_timeout_ms);
+            xproc_read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only,
+                                                        config_.busy_timeout_ms);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // In-memory-only registration helpers. These populate the same
+    // registries the ensure_* functions maintain, with no SQL writes —
+    // used by the write-free fast path when the schema fingerprint proves
+    // the backing tables already exist.
+    // ------------------------------------------------------------------
+    void note_link_table(const std::string& link_table_name,
+                         const std::string& rhs_target_table) {
+        // Record by rhs target if known, otherwise into the defensive bucket.
+        // Both buckets accept idempotent re-insert (set semantics).
+        if (!rhs_target_table.empty()) {
+            link_tables_by_rhs_target_[rhs_target_table].insert(link_table_name);
+            // Drop any stale "unknown target" entry from a prior bare call.
+            link_tables_unknown_target_.erase(link_table_name);
+        } else if (!is_known_link_table(link_table_name)) {
+            link_tables_unknown_target_.insert(link_table_name);
+        }
+    }
+
+    void note_virtual_link_table(const std::string& link_table_name) {
+        virtual_link_tables_.insert(link_table_name);
+    }
+
+    void note_geo_list_table(const std::string& model_table,
+                             const std::string& list_table) {
+        // Cascade walker side index: parent-row deletes need to clean these
+        // by `parent_id = ?` (no `rhs` column on geo_bounds list tables).
+        auto& parent_lists = list_tables_by_parent_[model_table];
+        if (std::find(parent_lists.begin(), parent_lists.end(), list_table) ==
+            parent_lists.end()) {
+            parent_lists.push_back(list_table);
         }
     }
 
     // Create a link table on demand (public for managed<T*> access)
-    void ensure_link_table(const std::string& link_table_name, const std::string& parent_table = "") {
+    void ensure_link_table(const std::string& link_table_name,
+                           const std::string& parent_table = "",
+                           const std::string& rhs_target_table = "") {
         // Register as internal table — AuditLog entries won't be surfaced to observers.
         // Changes are translated into UPDATE notifications on the parent table.
         register_internal_table(link_table_name, parent_table);
+        note_link_table(link_table_name, rhs_target_table);
 
         if (!db_->table_exists(link_table_name)) {
             // Create link table with globalId for sync and PRIMARY KEY to prevent duplicates
@@ -2457,6 +2582,7 @@ public:
     // Create a virtual link table on demand (for VirtualList - polymorphic collections)
     void ensure_virtual_link_table(const std::string& link_table_name, const std::string& parent_table = "") {
         register_internal_table(link_table_name, parent_table);
+        note_virtual_link_table(link_table_name);
 
         if (!db_->table_exists(link_table_name)) {
             // Virtual link table adds rhs_type column for type discrimination
@@ -3007,6 +3133,7 @@ public:
         // Register as internal table — AuditLog entries won't be surfaced to observers.
         // Always register (idempotent) so existing databases get the metadata.
         register_internal_table(list_table, model_table);
+        note_geo_list_table(model_table, list_table);
 
         // Check if table already exists
         if (db_->table_exists(list_table)) {
@@ -3740,13 +3867,82 @@ private:
     /// Heap-allocated guard for safe cross-instance notification.
     /// Set alive=false before teardown; spin on refcount before destroying members.
     std::shared_ptr<instance_guard> guard_ = std::make_shared<instance_guard>();
+
+    // Cascade walker side indexes — populated by the `ensure_*` registration
+    // sites at startup, read by `remove(...)` and `delete_where(...)` to
+    // dispatch only the cleanup queries that actually match each table's
+    // schema. Avoids iterating every `_lattice_meta` `internal_table:%` row
+    // and avoids issuing `DELETE … WHERE rhs = ?` against tables (unions,
+    // geo_bounds lists) that have no `rhs` column. Written only during
+    // single-threaded `ensure_tables`; read after init under the DB write
+    // lock — no separate mutex required.
+    //
+    // Regular link tables, indexed by their rhs target type. A delete of T
+    // only needs to clean junction rows whose `rhs` references T, so the
+    // walker iterates `link_tables_by_rhs_target_[T]` — typically a small
+    // set, often empty for leaf types like LatticeHistoricalSignal.
+    std::unordered_map<std::string, std::unordered_set<std::string>> link_tables_by_rhs_target_;
+    // Defensive bucket for regular link tables registered without a known
+    // target (e.g. the idempotent `ensure_link_table(name)` re-call from
+    // `managed<T*>::set_link`). After `ensure_link_tables()` has run during
+    // init, every link table is also recorded under its rhs target, so this
+    // set is normally empty — but the walker still iterates it for safety.
+    std::unordered_set<std::string> link_tables_unknown_target_;
+    // Virtual link tables — rhs is polymorphic, but `rhs_type` scopes per
+    // row, so the walker can issue `WHERE rhs = ? AND rhs_type = ?` to
+    // target precisely without per-target indexing.
+    std::unordered_set<std::string> virtual_link_tables_;
+    // parent_table -> list tables to clean via `parent_id = ?`.
+    std::unordered_map<std::string, std::vector<std::string>> list_tables_by_parent_;
+
+    // True if `link_table_name` is already recorded under a known rhs target.
+    // Used so a later bare `ensure_link_table(name)` call doesn't pollute the
+    // unknown-target bucket when the target was registered earlier.
+    bool is_known_link_table(const std::string& link_table_name) const {
+        for (const auto& [target, set] : link_tables_by_rhs_target_) {
+            if (set.find(link_table_name) != set.end()) return true;
+        }
+        return false;
+    }
+
     void setup_cross_process_notifier();
 public:
     void handle_cross_process_notification();
 private:
 
     void ensure_tables() {
-        // First create sync control table and register sync_disabled() function
+        // Per-connection SQL function registration — required on BOTH paths
+        // (triggers call sync_disabled() at execution time on this connection).
+        register_sql_functions();
+
+        // FAST PATH: when the schema fingerprint marker matches the current
+        // schema cookie, every statement below is provably a no-op. Populate
+        // in-memory registries only — zero writes, no write lock taken.
+        const std::string fp_key = compute_core_fingerprint_key();
+        if (fingerprint_marker_valid(fp_key)) {
+            note_tables_for_all_schemas();
+            LOG_DEBUG("lattice_db", "ensure_tables: fast path (fingerprint match)");
+            return;
+        }
+
+        // SLOW PATH: first open, schema change, or external DDL since the
+        // marker was stored. One IMMEDIATE transaction so concurrent opens
+        // serialize via begin_transaction's backoff instead of failing with
+        // "database is locked", and so the marker commits atomically with the
+        // DDL it describes. Note: config_.migration_block runs inside this
+        // transaction — it must not manage its own transactions.
+        transaction txn(*db_, /*exclusive=*/false);
+
+        // Double-checked: another process may have completed this exact pass
+        // between our probe above and acquiring the write lock.
+        if (fingerprint_marker_valid_in_txn(fp_key)) {
+            note_tables_for_all_schemas();
+            txn.commit();
+            LOG_DEBUG("lattice_db", "ensure_tables: fast path after lock (sibling completed)");
+            return;
+        }
+
+        // First create sync control table
         ensure_sync_control_table();
 
         // Create meta table for schema versioning
@@ -3793,6 +3989,9 @@ private:
         migration_ctx.apply_pending_updates();
 
         ensure_link_tables();
+
+        store_fingerprint_marker(fp_key);
+        txn.commit();
     }
 
     /// Detect schema changes for a table without applying them.
@@ -3829,14 +4028,29 @@ private:
             }
         }
 
-        // Find removed columns
+        // Find removed columns. Machinery columns are never "removed": Phase 8
+        // materializes `<link>__link_gid` shadow columns for @Unique
+        // constraints that reference links — they're owned by the constraint
+        // machinery, not the user schema. Treating them as removals rebuilds
+        // the whole table on EVERY open (and the rebuild drops the shadow that
+        // Phase 8 then re-adds — an endless rebuild cycle across binaries).
         for (const auto& [col, type] : existing) {
+            if (is_machinery_column(col)) continue;
             if (model_cols.find(col) == model_cols.end()) {
                 changes.removed_columns.push_back(col);
             }
         }
 
         return changes;
+    }
+
+    /// Columns created and maintained by Lattice machinery rather than the
+    /// user schema. The `__link_gid` suffix is reserved: Phase 8 shadow
+    /// columns for @Unique constraints that include to-one links.
+    static bool is_machinery_column(const std::string& col) {
+        static const std::string suffix = "__link_gid";
+        return col.size() > suffix.size() &&
+               col.compare(col.size() - suffix.size(), suffix.size(), suffix) == 0;
     }
 
     void create_model_table(const model_schema& schema) {
@@ -3960,6 +4174,10 @@ private:
             }
         }
         for (const auto& [col, type] : existing) {
+            // Machinery columns (`<link>__link_gid` Phase-8 shadows) are not
+            // user schema — counting them as removals rebuilds the table on
+            // every open by any binary whose schema doesn't carry them.
+            if (is_machinery_column(col)) continue;
             if (model_cols.find(col) == model_cols.end()) {
                 removed.push_back(col);
             }
@@ -4243,11 +4461,36 @@ private:
                            !prop.target_table.empty()) {
                     std::string table_name = "_" + schema->table_name + "_" +
                                              prop.target_table + "_" + prop.name;
-                    ensure_link_table(table_name, schema->table_name);
+                    ensure_link_table(table_name, schema->table_name, prop.target_table);
                 } else if (prop.kind == property_kind::link && !prop.target_table.empty()) {
                     std::string table_name = "_" + schema->table_name + "_" +
                                              prop.target_table + "_" + prop.name;
-                    ensure_link_table(table_name, schema->table_name);
+                    ensure_link_table(table_name, schema->table_name, prop.target_table);
+                }
+            }
+        }
+    }
+
+    /// In-memory-only counterpart of the ensure path for the write-free fast
+    /// path: populates the same registries (link-table buckets, virtual link
+    /// set, geo-list parent index) using the same naming rules as
+    /// ensure_link_tables() / ensure_geo_bounds_list_table(), but issues no
+    /// SQL writes — the tables provably exist when the fingerprint matches.
+    void note_tables_for_all_schemas() {
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            for (const auto& prop : schema->properties) {
+                if (prop.kind == property_kind::virtual_list ||
+                    prop.kind == property_kind::virtual_link) {
+                    note_virtual_link_table("_" + schema->table_name + "_" + prop.name);
+                } else if (prop.kind == property_kind::list && prop.is_geo_bounds) {
+                    note_geo_list_table(schema->table_name,
+                                        "_" + schema->table_name + "_" + prop.name);
+                } else if ((prop.kind == property_kind::list ||
+                            prop.kind == property_kind::link) &&
+                           !prop.target_table.empty()) {
+                    note_link_table("_" + schema->table_name + "_" +
+                                    prop.target_table + "_" + prop.name,
+                                    prop.target_table);
                 }
             }
         }
@@ -4335,9 +4578,13 @@ private:
                 last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         )");
+    }
 
-        // Create sync_disabled() SQL function
-        // This allows triggers to check if sync is disabled
+    /// Register per-connection SQL functions. This is connection state, not a
+    /// database write — it must run on EVERY open, including the write-free
+    /// fast path (triggers reference sync_disabled() at execution time).
+    void register_sql_functions() {
+        // sync_disabled() lets triggers check if sync is disabled
         sqlite3_create_function(
             db_->handle(),
             "sync_disabled",
@@ -4376,6 +4623,149 @@ protected:
         )");
         // Initialize schema version to 1 if not set
         db_->execute("INSERT OR IGNORE INTO _lattice_meta(key, value) VALUES('schema_version', '1')");
+    }
+
+    // ========================================================================
+    // Schema fingerprint fast path
+    //
+    // Steady-state opens of an unchanged database are write-free: a marker row
+    // in _lattice_meta records (fingerprint of the binary's registered schemas
+    // → SQLite schema cookie at the time the schemas were last ensured). When
+    // the marker matches and the cookie hasn't moved, every CREATE/INSERT in
+    // the ensure path is provably a no-op and is skipped entirely — no write
+    // lock is taken at open. Any DDL by any process bumps the cookie and
+    // forces one slow-path revalidation, which re-stores the marker.
+    // ========================================================================
+
+    /// Bump this whenever the SQL *templates* for internal DDL change:
+    /// audit/link/shadow trigger bodies, internal table DDL (_SyncControl,
+    /// _lattice_meta, AuditLog, link/virtual-link/geo-list/union tables),
+    /// vec0/FTS5/R*Tree creation SQL. Existing databases only re-run the
+    /// ensure path when the fingerprint changes — a template edit without an
+    /// epoch bump leaves stale triggers in already-fingerprinted databases.
+    static constexpr int kLatticeSchemaFormatEpoch = 1;
+
+    static uint64_t fnv1a_hash(const std::string& s) {
+        uint64_t h = 1469598103934665603ULL;
+        for (unsigned char c : s) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    /// Canonical serialization of one property covering every DDL-driving
+    /// attribute. If an attribute can change the generated DDL (columns,
+    /// indexes, FTS5, vec0, R*Tree, union tables), it MUST appear here —
+    /// otherwise a code change to that attribute is silently skipped forever.
+    static void serialize_property_for_fingerprint(std::ostringstream& out,
+                                                   const property_descriptor& p) {
+        out << p.name << '\x01'
+            << static_cast<int>(p.type) << '\x01'
+            << static_cast<int>(p.kind) << '\x01'
+            << (p.nullable ? 1 : 0)
+            << (p.is_vector ? 1 : 0)
+            << (p.is_geo_bounds ? 1 : 0)
+            << (p.is_full_text ? 1 : 0)
+            << (p.is_indexed ? 1 : 0)
+            << (p.is_unique ? 1 : 0)
+            << (p.is_union ? 1 : 0) << '\x01'
+            << p.target_table << '\x01'
+            << p.link_table << '\x01'
+            << p.column_name;
+        if (p.is_union) {
+            out << '\x02' << p.union_desc.union_table_name;
+            for (const auto& c : p.union_desc.cases) {
+                out << '\x03' << c.case_name;
+                for (const auto& v : c.values) {
+                    out << '\x04' << v.param_name << '\x01'
+                        << static_cast<int>(v.type)
+                        << (v.is_link ? 1 : 0) << '\x01'
+                        << v.link_target;
+                }
+            }
+        }
+        out << '\n';
+    }
+
+    /// Fingerprint key for the C++ schema registry (the core layer's view).
+    /// Schemas are sorted by table name — the registry is an unordered_map, so
+    /// iteration order is not stable across runs.
+    std::string compute_core_fingerprint_key() const {
+        std::ostringstream out;
+        out << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
+            << "target_schema_version:" << config_.target_schema_version << '\n';
+        auto schemas = schema_registry::instance().all_schemas();
+        std::sort(schemas.begin(), schemas.end(),
+                  [](const model_schema* a, const model_schema* b) {
+                      return a->table_name < b->table_name;
+                  });
+        for (const auto* schema : schemas) {
+            out << "table:" << schema->table_name << '\n';
+            for (const auto& prop : schema->properties) {
+                serialize_property_for_fingerprint(out, prop);
+            }
+        }
+        std::ostringstream hex;
+        hex << std::hex << std::setfill('0') << std::setw(16) << fnv1a_hash(out.str());
+        return "schema_fingerprint:" + hex.str();
+    }
+
+    /// Current value of SQLite's schema cookie. Bumped by any DDL from any
+    /// connection/process (and read inside an open transaction it reflects
+    /// in-transaction DDL on this connection).
+    int64_t read_schema_cookie() const {
+        auto rows = db_->query("PRAGMA schema_version");
+        if (rows.empty() || rows[0].empty()) return -1;
+        const auto& v = rows[0].begin()->second;
+        if (const auto* i = std::get_if<int64_t>(&v)) return *i;
+        if (const auto* s = std::get_if<std::string>(&v)) return std::atoll(s->c_str());
+        return -1;
+    }
+
+    /// Check the fingerprint marker WITHOUT wrapping in a transaction.
+    /// Call either inside an explicit read transaction (fast-path probe) or
+    /// inside the slow path's IMMEDIATE transaction (double-checked locking).
+    bool fingerprint_marker_valid_in_txn(const std::string& key) const {
+        if (!db_->table_exists("_lattice_meta")) return false;  // fresh DB
+        auto rows = db_->query("SELECT value FROM _lattice_meta WHERE key = ?", {key});
+        if (rows.empty()) return false;
+        const auto* stored = std::get_if<std::string>(&rows[0].at("value"));
+        if (!stored) return false;
+        int64_t stored_cookie = std::atoll(stored->c_str());
+        int64_t current_cookie = read_schema_cookie();
+        return current_cookie >= 0 && stored_cookie == current_cookie;
+    }
+
+    /// Fast-path probe: marker + cookie read under one read transaction so the
+    /// pair can't be torn by concurrent DDL between the two statements.
+    bool fingerprint_marker_valid(const std::string& key) const {
+        bool valid = false;
+        try {
+            db_->execute("BEGIN");
+            valid = fingerprint_marker_valid_in_txn(key);
+            db_->execute("COMMIT");
+        } catch (const db_error&) {
+            try { db_->execute("ROLLBACK"); } catch (...) {}
+            valid = false;
+        }
+        return valid;
+    }
+
+    /// Store/refresh the marker for `key` with the current schema cookie.
+    /// Must run inside the slow path's transaction, AFTER all DDL, so the
+    /// captured cookie reflects this pass's schema changes. Prunes markers
+    /// whose cookie no longer matches (they would revalidate anyway).
+    void store_fingerprint_marker(const std::string& key) {
+        int64_t cookie = read_schema_cookie();
+        if (cookie < 0) return;
+        const std::string cookie_str = std::to_string(cookie);
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {key, cookie_str});
+        db_->execute(
+            "DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' "
+            "AND key <> ? AND value <> ?",
+            {key, cookie_str});
     }
 
     /// Register a table as internal. Its AuditLog entries will be used for sync
@@ -5111,7 +5501,12 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::add_link(co
     // Ensure link table exists
     lattice->ensure_link_table(link_table_);
 
-    std::string sql = "INSERT INTO " + link_table_ + " (lhs, rhs) VALUES (?, ?)";
+    // OR IGNORE: list membership is a set — PRIMARY KEY(lhs, rhs) — so
+    // appending an element that is already a member is a no-op, not a
+    // constraint failure. Upsert paths re-append after rebinding to a
+    // pre-existing row; erroring there would make every upsert+append
+    // caller check membership first.
+    std::string sql = "INSERT OR IGNORE INTO " + link_table_ + " (lhs, rhs) VALUES (?, ?)";
     db->execute(sql, {parent_global_id_, child_global_id});
 }
 
@@ -5144,6 +5539,21 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::load_if_nee
             }
         }
     }
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::checked_load(size_t index) const {
+    load_if_needed();
+    if (index < cached_objects_.size()) return;
+    // Stale cache: another connection may have appended to the list since it
+    // loaded. Reload once at current database state before giving up.
+    loaded_ = false;
+    cached_objects_.clear();
+    load_if_needed();
+    if (index < cached_objects_.size()) return;
+    throw std::out_of_range(
+        "lattice: list index " + std::to_string(index) + " out of range (" +
+        std::to_string(cached_objects_.size()) + " elements) for link table " + link_table_);
 }
 
 template<typename T>
@@ -5238,7 +5648,7 @@ managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::operator[](size_
 
 template<typename T>
 const managed<T>& managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::operator[](size_t index) const {
-    load_if_needed();
+    checked_load(index);
     return *cached_objects_[index];
 }
 
@@ -5274,13 +5684,13 @@ void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::replace_lin
 // element_proxy implementations
 template<typename T>
 managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy::operator managed<T>&() const {
-    list_->load_if_needed();
+    list_->checked_load(index_);
     return *list_->cached_objects_[index_];
 }
 
 template<typename T>
 managed<T>* managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy::operator->() const {
-    list_->load_if_needed();
+    list_->checked_load(index_);
     return list_->cached_objects_[index_].get();
 }
 

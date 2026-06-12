@@ -496,12 +496,39 @@ public:
         return false;
     }
 
-    // Get columns for upsert ON CONFLICT clause
+    // Get columns for the upsert ON CONFLICT clause. Link-kind constraint
+    // columns are materialized on the base table as `<col>__link_gid` shadow
+    // columns (see ensure_swift_tables Phase 8a), so resolve them here too —
+    // otherwise the prepared INSERT carries `ON CONFLICT (<linkName>)` against
+    // a column that doesn't exist and SQLite fails to compile it.
+    //
+    // NOTE: the shadow column is populated by the post-insert link-table
+    // maintenance trigger, so it is NULL at row-INSERT time and `ON CONFLICT`
+    // can't actually detect a *link* conflict on a fresh insert — a real
+    // duplicate surfaces as a UNIQUE violation on the trigger's UPDATE. Callers
+    // that need overwrite-in-place against a link-bearing key should find the
+    // existing row and mutate it rather than relying on this upsert path.
     std::vector<std::string> get_upsert_columns(const std::string& table_name) const {
         auto* constraints = get_constraints_for_table(table_name);
         if (!constraints) return {};
+        const SwiftSchema* props = get_properties_for_table(table_name);
         for (const auto& c : *constraints) {
-            if (c.allows_upsert) return c.columns;
+            if (!c.allows_upsert) continue;
+            std::vector<std::string> resolved;
+            resolved.reserve(c.columns.size());
+            for (const auto& col : c.columns) {
+                if (props) {
+                    auto it = props->find(col);
+                    if (it != props->end()
+                        && it->second.kind == property_kind::link
+                        && !it->second.target_table.empty()) {
+                        resolved.push_back(col + "__link_gid");
+                        continue;
+                    }
+                }
+                resolved.push_back(col);
+            }
+            return resolved;
         }
         return {};
     }
@@ -530,10 +557,26 @@ private:
     // Error from last receive_sync_data call (nullopt if none)
     OptionalString last_receive_error_;
     std::future<void> vec0_training_future_;
+    // Background vec0 gap healing dispatched after open (off the open path).
+    std::future<void> vec0_reconcile_future_;
 
     void ensure_swift_tables(const SchemaVector& schemas);
+    /// Fingerprint of the Swift-declared schemas covering every DDL-driving
+    /// attribute (properties, constraints, unions). See kLatticeSchemaFormatEpoch.
+    std::string compute_swift_fingerprint_key(const SchemaVector& schemas) const;
+    /// Populate schemas_/constraints_/union_schemas_ and the core link-table
+    /// registries with zero SQL writes (write-free fast path).
+    void populate_swift_in_memory_state(const SchemaVector& schemas);
+    /// Heal vec0 rows missed by other connections' triggers, asynchronously.
+    void dispatch_vec0_reconcile(const SchemaVector& schemas);
+    void reconcile_vec0_gaps_for(const std::string& table, const std::string& prop);
     void persist_union_values(swift_dynamic_object& unmanaged_obj,
                               const std::string& table_name, int64_t parent_id);
+    // For an `allowsUpsert` constraint that includes a to-one link column, write
+    // the link's globalId into the `<link>__link_gid` shadow column as part of
+    // the row INSERT so `ON CONFLICT (..., <link>__link_gid)` can fire.
+    static void materialize_link_shadow_conflict_cols(swift_dynamic_object& obj,
+                                                      const std::vector<std::string>& upsert_cols);
 
 public:
     // Add with schema from the object instance
@@ -708,8 +751,24 @@ public:
     }
 
     /// Checkpoint the WAL file, flushing all changes to the main database file.
+    /// Logs the outcome — TRUNCATE checkpoints silently fail under concurrent
+    /// readers, and an ignored rc is how multi-GB WAL files accumulate.
     void checkpoint() {
-        sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        int nLog = 0, nCkpt = 0;
+        int rc = sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt);
+        if (rc != SQLITE_OK || (nLog >= 0 && nCkpt < nLog)) {
+            LOG_INFO("swift_lattice", "checkpoint(TRUNCATE): rc=%d, frames=%d, checkpointed=%d%s",
+                     rc, nLog, nCkpt,
+                     (rc == SQLITE_OK && nCkpt < nLog) ? " (partial — readers held the WAL)" : "");
+        }
+    }
+
+    /// Incremental statistics refresh ("PRAGMA optimize", bounded by
+    /// analysis_limit). Cheap; safe to run from maintenance paths. Long-lived
+    /// processes should call this periodically — the automatic close-time
+    /// optimize never runs when the process is killed.
+    void optimize() {
+        sqlite3_exec(db().handle(), "PRAGMA optimize", nullptr, nullptr, nullptr);
     }
 
     int64_t rebuild_vec0(const std::string& table, const std::string& column, int dims) {
@@ -858,7 +917,17 @@ public:
 
     const std::string& path() const { return config().path; }
 
-    void begin_transaction() { lattice_db::begin_transaction(); }
+    void begin_transaction() {
+        lattice_db::begin_transaction();
+    }
+    void begin_transaction(cxx_error& e) {
+        try {
+            lattice_db::begin_transaction();
+        } catch (const std::exception& ex) {
+            e = ex;
+        }
+    }
+    
     void commit() { lattice_db::commit(); }
     void write(void (*fn)()) {
         begin_transaction();
@@ -2174,9 +2243,10 @@ namespace detail {
         template<typename ConfigT>
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
-            std::lock_guard<std::recursive_mutex> lock(mutex_);
 
-            // Build schema hash from table names and properties (sorted for consistency)
+            // Build schema hash from table names and properties (sorted for
+            // consistency). Pure computation over `schemas` — done before locking
+            // so the (potentially long) hash never holds mutex_.
             std::string schema_hash;
             {
                 std::vector<std::string> schema_strings;
@@ -2212,37 +2282,94 @@ namespace detail {
 
             LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version};
 
-            // Find existing entry (unless migration requires fresh connection)
-            if (!skip_cache) {
+            // ---- :memory: path -------------------------------------------------
+            // Constructs under the lock (unchanged). These opens are rare and fast,
+            // each must yield a distinct instance (no de-dup), and the under-lock
+            // construct relies on the recursive mutex for its commit-hook re-entry
+            // into get_by_pointer (see member comment).
+            if (skip_cache) {
+                std::lock_guard<std::recursive_mutex> lock(mutex_);
+                // Remove any stale key entry so a fresh instance is created; preserve
+                // ptr_cache_ — an old instance may still be alive and its managed
+                // objects need get_by_pointer() to resolve the lattice ref.
+                for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
+                    if (it->first == key) { key_cache_.erase(it); break; }
+                }
+                LOG_DEBUG("LatticeCache", "Creating new in-memory swift_lattice for path=%s", config.path.c_str());
+                auto inst = std::make_shared<swift_lattice>(config, schemas);
+                LOG_DEBUG("LatticeCache", "swift_lattice created, ptr=%p", inst.get());
+                key_cache_.emplace_back(key, inst);
+                ptr_cache_[inst.get()] = inst;
+                return inst;
+            }
+
+            // ---- on-disk path --------------------------------------------------
+            // Construct OUTSIDE the lock so an open/migration on one thread never
+            // blocks get_by_pointer (per-object hot path) or unrelated opens on
+            // other threads. Concurrent opens of the SAME key de-dup via in_flight_:
+            // the first caller publishes a shared_future and builds; others wait on
+            // it instead of opening a second connection to the same file.
+            std::promise<std::shared_ptr<swift_lattice>> my_promise;
+            std::shared_future<std::shared_ptr<swift_lattice>> wait_future;
+            {
+                std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+                // 1. Live cached instance?
                 for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
                     if (it->first == key) {
                         if (auto existing = it->second.lock()) {
                             return existing;
                         }
-                        // Expired, remove from both caches
-                        key_cache_.erase(it);
+                        key_cache_.erase(it);  // expired
                         break;
                     }
                 }
-            } else {
-                // For migration: remove key_cache_ entry so a fresh instance is created,
-                // but preserve ptr_cache_ — the old instance may still be alive and its
-                // managed objects need get_by_pointer() to resolve the lattice ref.
-                // The ptr_cache_ weak_ptr will expire naturally when the instance is released.
-                for (auto it = key_cache_.begin(); it != key_cache_.end(); ++it) {
-                    if (it->first == key) {
-                        key_cache_.erase(it);
+                // 2. Construction already in flight for this key? Wait on its result.
+                for (auto& entry : in_flight_) {
+                    if (entry.first == key) {
+                        wait_future = entry.second;
                         break;
                     }
+                }
+                // 3. Otherwise claim construction of this key for ourselves.
+                if (!wait_future.valid()) {
+                    in_flight_.emplace_back(key, my_promise.get_future().share());
                 }
             }
 
-            // Create new instance - ConfigT selects the right constructor
+            // Another thread is building this exact key — wait without holding the
+            // lock. Note: if that builder failed, get() rethrows its exception, so
+            // concurrent waiters share the failure (later arrivals retry fresh).
+            if (wait_future.valid()) {
+                return wait_future.get();
+            }
+
+            // We own construction. Build outside the lock.
             LOG_DEBUG("LatticeCache", "Creating new swift_lattice for path=%s", config.path.c_str());
-            auto inst = std::make_shared<swift_lattice>(config, schemas);
+            std::shared_ptr<swift_lattice> inst;
+            try {
+                inst = std::make_shared<swift_lattice>(config, schemas);
+            } catch (...) {
+                // Erase the in-flight marker FIRST so it can never linger as a
+                // poison entry, then propagate the failure to any waiters.
+                std::lock_guard<std::recursive_mutex> lock(mutex_);
+                erase_in_flight(key);
+                my_promise.set_exception(std::current_exception());
+                throw;
+            }
             LOG_DEBUG("LatticeCache", "swift_lattice created, ptr=%p", inst.get());
-            key_cache_.emplace_back(key, inst);
-            ptr_cache_[inst.get()] = inst;
+
+            // Publish + fulfill under the lock. Erase the in-flight marker first
+            // (guarantees no poison/leak regardless of the inserts below); insert
+            // into key_cache_ + ptr_cache_ together so a late waiter never observes
+            // "no live instance AND no in-flight future".
+            {
+                std::lock_guard<std::recursive_mutex> lock(mutex_);
+                erase_in_flight(key);
+                key_cache_.emplace_back(key, inst);
+                ptr_cache_[inst.get()] = inst;
+                my_promise.set_value(inst);
+            }
             return inst;
         }
 
@@ -2284,18 +2411,33 @@ namespace detail {
     private:
         LatticeCache() = default;
 
-        // Recursive: SQLite's commit hook fires synchronously inside
-        // `swift_lattice`'s ctor (`ensure_swift_tables` -> COMMIT). The
-        // hook walks `instance_registry::for_each_alive` and notifies
-        // sibling changeStream observers, whose `dynamic_object` ctors
-        // call back into `get_by_pointer`. With a non-recursive mutex
-        // that re-entry self-deadlocks, and any other thread sitting in
-        // `get_or_create` deadlocks behind it. Same-thread re-entry is
-        // safe here: the sibling being looked up is already published
-        // in `ptr_cache_` (that's how `for_each_alive` found it).
+        // Remove the in-flight construction marker for `key`, if present.
+        // Caller must hold mutex_.
+        void erase_in_flight(const LatticeRefCacheKey& key) {
+            for (auto it = in_flight_.begin(); it != in_flight_.end(); ++it) {
+                if (it->first == key) { in_flight_.erase(it); break; }
+            }
+        }
+
+        // Recursive: the :memory: path in `get_or_create` still constructs a
+        // `swift_lattice` while holding mutex_, and SQLite's commit hook fires
+        // synchronously inside that ctor (`ensure_swift_tables` -> COMMIT). The
+        // hook walks `instance_registry::for_each_alive` and notifies sibling
+        // changeStream observers, whose `dynamic_object` ctors call back into
+        // `get_by_pointer`. With a non-recursive mutex that re-entry self-
+        // deadlocks. Same-thread re-entry is safe: the sibling being looked up
+        // is already published in `ptr_cache_` (that's how `for_each_alive`
+        // found it). The on-disk path builds OUTSIDE the lock (see in_flight_),
+        // so for that path mutex_ is only held for short map operations.
         std::recursive_mutex mutex_;
         std::vector<std::pair<LatticeRefCacheKey, std::weak_ptr<swift_lattice>>> key_cache_;
         std::unordered_map<swift_lattice*, std::weak_ptr<swift_lattice>> ptr_cache_;
+        // On-disk construction-in-progress markers. A thread building a given key
+        // publishes a shared_future here so concurrent callers for the same key
+        // wait on the result instead of opening a duplicate connection.
+        // Construction itself runs without holding mutex_. Not used for :memory:.
+        std::vector<std::pair<LatticeRefCacheKey,
+                              std::shared_future<std::shared_ptr<swift_lattice>>>> in_flight_;
     };
 } // namespace detail
 
@@ -2703,6 +2845,21 @@ bool migration_lookup(const std::string& table_name, int64_t primary_key)
 bool migration_lookup_by_global_id(const std::string& table_name, const std::string& global_id)
     SWIFT_NAME(migrationLookupByGlobalId(table:globalId:));
 
+/// Find all rows in `child_table` whose single-link `link_property` points at
+/// the parent with `parent_global_id` (FK-to-List backfill helper). Fills a
+/// thread-local result buffer and returns the match count. Only valid during
+/// a migration callback. Retrieve results with migration_take_backlink_result.
+int64_t migration_lookup_backlinks(const std::string& child_table,
+                                   const std::string& parent_table,
+                                   const std::string& link_property,
+                                   const std::string& parent_global_id)
+    SWIFT_NAME(migrationLookupBacklinks(childTable:parentTable:linkProperty:parentGlobalId:));
+
+/// Take result `index` from the last migration_lookup_backlinks call.
+/// Returns an empty ref when index is out of range.
+dynamic_object_ref* migration_take_backlink_result(int64_t index)
+    SWIFT_NAME(migrationTakeBacklinkResult(at:)) SWIFT_RETURNS_UNRETAINED;
+
 /// Take the result of the last successful migration_lookup call.
 /// When no lookup result is available the FRT path returns nullptr (imports as
 /// nil) and the value path returns an empty by-value ref (isValid()==false) —
@@ -2730,6 +2887,13 @@ dynamic_object_ref migration_get_old_row()
 dynamic_object_ref migration_get_new_row()
     SWIFT_NAME(migrationGetNewRow());
 #endif
+
+/// The schema version step currently being migrated (the incremental loop
+/// walks one version at a time). Only valid inside a row migration callback;
+/// returns 0 outside one. Swift uses this to dispatch the row to the correct
+/// version's Migration instead of the final target's.
+int migration_get_current_version()
+    SWIFT_NAME(migrationGetCurrentVersion());
 
 } // namespace lattice
 

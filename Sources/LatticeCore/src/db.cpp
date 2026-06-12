@@ -8,7 +8,8 @@
 
 namespace lattice {
 
-database::database(const std::string& path, open_mode mode) : path_(path), mode_(mode) {
+database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
+    : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
     int rc;
@@ -61,18 +62,26 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
     execute("PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #endif
 
-    // Set busy timeout to handle lock contention (5 seconds)
-    // Must be set before ANALYZE or any query that might contend with other connections.
-    sqlite3_busy_timeout(db_, 5000);
+    // Statement-level busy timeout for lock contention. Configurable per
+    // database: headless processes default to kDefaultBusyTimeoutMs, interactive
+    // apps should pass a small value so a stuck writer can't hang the UI.
+    sqlite3_busy_timeout(db_, busy_timeout_ms_);
 
-    // Only run ANALYZE on read-write connections (best-effort — don't fail init if locked)
     if (mode == open_mode::read_write) {
-        try {
-            sqlite3_exec(db_, "ANALYZE", nullptr, nullptr, nullptr);
-//            execute("ANALYZE");
-        } catch (const db_error&) {
-            LOG_WARN("db", "ANALYZE skipped (database busy)");
-        }
+        // No ANALYZE here: it scans every index (O(GB) on large databases) and
+        // takes the write lock at the worst possible moment — open. Stats are
+        // refreshed incrementally via "PRAGMA optimize" (dtor + maintenance
+        // paths); analysis_limit bounds the cost of any future stats scan.
+        sqlite3_exec(db_, "PRAGMA analysis_limit=400", nullptr, nullptr, nullptr);
+        // Bound the WAL file: successful TRUNCATE/RESTART checkpoints shrink
+        // the -wal file back to this size instead of leaving it fully allocated.
+        sqlite3_exec(db_, "PRAGMA journal_size_limit=268435456", nullptr, nullptr, nullptr);
+        // Materialize the WAL index (-shm/-wal) with a no-op read transaction.
+        // Read-only connections CANNOT create the -shm file — on a fresh
+        // database they fail with "unable to open database file" unless a
+        // writable connection has started a transaction first. (ANALYZE used
+        // to do this as a side effect.)
+        sqlite3_exec(db_, "SELECT count(*) FROM sqlite_master", nullptr, nullptr, nullptr);
     }
 
     // Initialize sqlite-vec extension for vector search
@@ -88,6 +97,19 @@ database::database(const std::string& path, open_mode mode) : path_(path), mode_
 database::~database() {
     if (db_) {
         if (mode_ == open_mode::read_write) {
+            // The connection is closing — silence change/commit hooks first.
+            // PRAGMA optimize below may write sqlite_stat rows; firing hooks
+            // into an owner that is mid-destruction locks destroyed mutexes.
+            sqlite3_update_hook(db_, nullptr, nullptr);
+            sqlite3_wal_hook(db_, nullptr, nullptr);
+            sqlite3_commit_hook(db_, nullptr, nullptr);
+            // Best-effort incremental stats refresh (bounded by analysis_limit).
+            // Only re-analyzes tables this connection queried whose stats are
+            // missing or stale. Never throw from a destructor.
+            int orc = sqlite3_exec(db_, "PRAGMA optimize", nullptr, nullptr, nullptr);
+            if (orc != SQLITE_OK) {
+                LOG_DEBUG("db", "~database optimize skipped: rc=%d, path=%s", orc, path_.c_str());
+            }
             int nLog = 0, nCkpt = 0;
             int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
             LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
@@ -369,6 +391,14 @@ primary_key_t database::insert(const std::string& table,
         } else {
             sql << " DO UPDATE SET " << set_clause.str();
         }
+        // Truthful row identity for upserts. last_insert_rowid() is NOT
+        // updated when the DO UPDATE path runs — it keeps the rowid of the
+        // last unrelated INSERT on this connection, silently binding the
+        // caller's object to the wrong row. RETURNING reports the rowid of
+        // the row actually inserted OR updated; DO NOTHING returns no row,
+        // which we surface as 0 so the caller can look the row up by its
+        // conflict key.
+        sql << " RETURNING rowid";
     }
 
     sqlite3_stmt* stmt = nullptr;
@@ -384,6 +414,24 @@ primary_key_t database::insert(const std::string& table,
     }
 
     rc = sqlite3_step(stmt);
+
+    if (!conflict_columns.empty()) {
+        primary_key_t affected_rowid = 0;
+        if (rc == SQLITE_ROW) {
+            affected_rowid = sqlite3_column_int64(stmt, 0);
+            rc = sqlite3_step(stmt);  // drain RETURNING
+        }
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) {
+            int extended_rc = sqlite3_extended_errcode(db_);
+            auto err = std::string(sqlite3_errmsg(db_));
+            LOG_ERROR("db", "Upsert failed (rc=%d, ext=%d, db=%p, path=%s): %s",
+                      rc, extended_rc, (void*)db_, path_.c_str(), err.c_str());
+            throw db_error("Insert failed: " + err);
+        }
+        return affected_rowid;
+    }
+
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
@@ -512,35 +560,46 @@ void database::begin_transaction(bool exclusive) {
     // EXCLUSIVE: acquires write lock AND blocks all readers.
     // Use exclusive for migrations so stale connections can't read mid-migration.
     const char* sql = exclusive ? "BEGIN EXCLUSIVE" : "BEGIN IMMEDIATE";
-    int rc = sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
 
-    // Retry with exponential backoff for transient errors:
-    // - SQLITE_BUSY/SQLITE_LOCKED: another connection holds the WAL write lock
-    // - SQLITE_ERROR + already in transaction: another thread on this same serialized
-    //   connection (SQLITE_OPEN_FULLMUTEX) started a transaction between our caller's
-    //   is_in_transaction() check and this call. The other thread's transaction will
-    //   finish shortly, so we retry.
-    int backoff_ms = 1;
-    const int max_backoff_ms = 1000;
-    const int max_total_wait_ms = 30000;  // 30 seconds total
-    int total_waited_ms = 0;
+    // Wall-clock budget for acquiring the transaction. Each attempt blocks
+    // INSIDE SQLite's busy handler for the remaining budget — the handler
+    // re-polls the lock with sub-millisecond cadence, so the lock is acquired
+    // the moment it frees. (A previous version zeroed the statement timeout
+    // and slept between attempts; under heavy writer traffic that sparse
+    // polling starves — long write transactions hand the lock to whoever is
+    // inside the busy handler, never to a sleeper.) The deadline, not the
+    // per-attempt timeout, bounds the total wait: attempts repeat only for
+    // same-connection transaction races, which resolve quickly.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30000);
+    int rc;
+    for (;;) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining < 1) remaining = 1;
+        sqlite3_busy_timeout(db_, static_cast<int>(remaining));
 
-    while (rc != SQLITE_OK && total_waited_ms < max_total_wait_ms) {
-        bool should_retry = false;
-        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-            should_retry = true;
-        } else if (rc == SQLITE_ERROR && is_in_transaction()) {
-            // "cannot start a transaction within a transaction" — another thread
-            // on this connection has an active transaction. Wait for it to finish.
-            should_retry = true;
-        }
-        if (!should_retry) break;
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-        total_waited_ms += backoff_ms;
-        backoff_ms = std::min(backoff_ms * 2, max_backoff_ms);  // Exponential backoff, capped
         rc = sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
+        if (rc == SQLITE_OK) break;
+
+        const bool past_deadline = std::chrono::steady_clock::now() >= deadline;
+        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+            // The busy handler already waited out `remaining` — only retry if
+            // wall clock says budget is left (e.g. spurious early return).
+            if (past_deadline) break;
+            continue;
+        }
+        if (rc == SQLITE_ERROR && is_in_transaction()) {
+            // "cannot start a transaction within a transaction" — another
+            // thread on this serialized connection (SQLITE_OPEN_FULLMUTEX)
+            // holds a transaction. Brief sleep; it finishes shortly.
+            if (past_deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        break;  // non-retryable error
     }
+
+    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // Restore statement-level timeout
 
     if (rc != SQLITE_OK) {
         auto error = std::string(sqlite3_errmsg(db_));
@@ -557,7 +616,7 @@ bool database::try_begin_immediate(int /*timeout_ms*/) {
     // then restore the original timeout. This never sleeps.
     sqlite3_busy_timeout(db_, 0);
     int rc = sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
-    sqlite3_busy_timeout(db_, 5000);  // Restore default
+    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // Restore configured timeout
     return rc == SQLITE_OK;
 }
 

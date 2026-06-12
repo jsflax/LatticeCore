@@ -2662,6 +2662,7 @@ public:
     int64_t force_compact_audit_log() const { return impl().force_compact_audit_log(); }
     void backdate_replication_slots(int64_t seconds) const { impl().backdate_replication_slots(seconds); }
     void checkpoint() const { impl().checkpoint(); }
+    void optimize() const { impl().optimize(); }
     void begin_transaction() const { impl().begin_transaction(); }
     void commit() const { impl().commit(); }
     void close() const { impl().close(); }

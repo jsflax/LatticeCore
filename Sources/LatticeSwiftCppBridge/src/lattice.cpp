@@ -15,6 +15,14 @@ static thread_local std::shared_ptr<lattice::dynamic_object> g_migration_lookup_
 static thread_local lattice::dynamic_object_ref* g_migration_old_row = nullptr;
 static thread_local lattice::dynamic_object_ref* g_migration_new_row = nullptr;
 
+// Normalize a DynamicObjectRefPtrVector element to a dynamic_object_ref&: the
+// FRT vector holds pointers, the value-path vector holds values.
+#if LATTICE_HAS_FRT
+#  define LATTICE_DEREF_REF(x) (*(x))
+#else
+#  define LATTICE_DEREF_REF(x) (x)
+#endif
+
 // Log level control
 void lattice_set_log_level(lattice::log_level level) {
     lattice::set_log_level(level);
@@ -32,8 +40,9 @@ void _lattice_post_cross_process_notification(const std::string& db_path) {
 }
 
 // swift_lattice_ref retain/release for SWIFT_SHARED_REFERENCE
-// The ref counting is managed by swift_lattice_ref's atomic counter
-
+// The ref counting is managed by swift_lattice_ref's atomic counter.
+// FRT-only: below the floor swift_lattice_ref is a value type (shared_ptr owns).
+#if LATTICE_HAS_FRT
 void retainSwiftLatticeRef(lattice::swift_lattice_ref* ptr) {
     // std::cerr << "[DEBUG] retainSwiftLatticeRef ptr=" << ptr << std::endl;
     if (!ptr) return;
@@ -48,8 +57,11 @@ void releaseSwiftLatticeRef(lattice::swift_lattice_ref* ptr) {
         delete ptr;
     }
 }
+#endif
 
 // swift_migration_context_ref retain/release for SWIFT_SHARED_REFERENCE
+// FRT-only: below the floor it's a plain value type (stack-allocated).
+#if LATTICE_HAS_FRT
 void retainSwiftMigrationContextRef(lattice::swift_migration_context_ref* ptr) {
     if (!ptr) return;
     ptr->retain();
@@ -61,9 +73,10 @@ void releaseSwiftMigrationContextRef(lattice::swift_migration_context_ref* ptr) 
         delete ptr;
     }
 }
+#endif
 
-lattice::swift_lattice_ref* lattice::managed<lattice::swift_dynamic_object>::lattice_ref() const {
-    return lattice::swift_lattice_ref::get_ref_for_lattice(this->lattice_);
+std::shared_ptr<lattice::swift_lattice> lattice::managed<lattice::swift_dynamic_object>::lattice_shared() const {
+    return lattice::swift_lattice_ref::shared_for_lattice(this->lattice_);
 }
 
 lattice::detail::LatticeCache& lattice::detail::LatticeCache::instance() {
@@ -99,7 +112,11 @@ void dynamic_object::set_int(const std::string& name, int64_t value) {
     set_field(name, value);
 }
 
+#if LATTICE_HAS_FRT
 link_list_ref* dynamic_object::get_link_list(const std::string &name) const {
+#else
+link_list_ref dynamic_object::get_link_list(const std::string &name) const {
+#endif
     if (lattice) {
         // Create a fresh managed vector bound to this object's property
         managed<std::vector<swift_dynamic_object *>> m;
@@ -115,7 +132,11 @@ link_list_ref* dynamic_object::get_link_list(const std::string &name) const {
     }
 }
 
+#if LATTICE_HAS_FRT
 geo_bounds_list_ref* dynamic_object::get_geo_bounds_list(const std::string &name) const {
+#else
+geo_bounds_list_ref dynamic_object::get_geo_bounds_list(const std::string &name) const {
+#endif
     if (lattice) {
         // Create a fresh managed vector bound to this object's property
         managed<std::vector<geo_bounds*>> m;
@@ -134,7 +155,7 @@ geo_bounds_list_ref* dynamic_object::get_geo_bounds_list(const std::string &name
 void dynamic_object::manage(managed<swift_dynamic_object> o) {
     unmanaged_.~swift_dynamic_object();
     new (&managed_) managed(o);
-    lattice = lattice::swift_lattice_ref::get_ref_for_lattice(o.lattice_);
+    lattice = o.lattice_shared();
 }
 
 // MARK: Swift Lattice
@@ -147,8 +168,8 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
         ensure_swift_tables(schemas);
         LOG_DEBUG("swift_lattice", "ensure_swift_tables done");
         // Sync setup after all tables exist (Swift tables created by ensure_swift_tables)
-        setup_sync_if_configured();
-        setup_ipc_if_configured();
+        lattice_db::setup_sync_if_configured();
+        lattice_db::setup_ipc_if_configured();
     } else {
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
@@ -163,8 +184,8 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
     : lattice_db(config, /*defer_sync=*/true), swift_config_(std::move(config)) {
     if (!swift_config_.read_only) {
         ensure_swift_tables(schemas);
-        setup_sync_if_configured();
-        setup_ipc_if_configured();
+        lattice_db::setup_sync_if_configured();
+        lattice_db::setup_ipc_if_configured();
     } else {
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
@@ -175,7 +196,7 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
 }
 
 void swift_lattice::add(dynamic_object &obj) {
-    if (is_closed()) return;   // writes are multi-step (insert+manage+notify); no-op whole op when closed
+    if (lattice_db::is_closed()) return;   // writes are multi-step (insert+manage+notify); no-op whole op when closed
     if (obj.lattice) {
         LOG_ERROR("swift_lattice", "Cannot add already managed object (table: %s)", obj.unmanaged_.table_name.c_str());
         throw std::runtime_error("Cannot add already managed object");
@@ -221,7 +242,7 @@ void swift_lattice::add(dynamic_object &obj) {
 }
 
 void swift_lattice::add_preserving_global_id(dynamic_object &obj, const std::string& preserved_global_id) {
-    if (is_closed()) return;
+    if (lattice_db::is_closed()) return;
     if (obj.lattice) {
         LOG_ERROR("swift_lattice", "Cannot add already managed object (table: %s)", obj.unmanaged_.table_name.c_str());
         throw std::runtime_error("Cannot add already managed object");
@@ -266,39 +287,39 @@ void swift_lattice::add_preserving_global_id(dynamic_object &obj, const std::str
     obj.manage(object);
 }
 
-void swift_lattice::add_bulk(std::vector<dynamic_object_ref*>& objects) {
-    if (is_closed()) return;
+void swift_lattice::add_bulk(DynamicObjectRefPtrVector& objects) {
+    if (lattice_db::is_closed()) return;
     if (objects.empty()) {
         return;
     }
     for (auto& o : objects) {
-        if (o->impl_->deleted_) {
+        if (LATTICE_DEREF_REF(o).impl_->deleted_) {
             LOG_ERROR("swift_lattice", "Cannot add a deleted object in add_bulk (ref)");
             throw std::runtime_error("Cannot add a deleted object");
         }
     }
     // Use schema from first object (all objects in the batch should have the same schema)
-    auto schema = objects[0]->impl_->unmanaged_.instance_schema();
+    auto schema = LATTICE_DEREF_REF(objects[0]).impl_->unmanaged_.instance_schema();
     auto upsert_cols = get_upsert_columns(schema.table_name);
     std::vector<swift_dynamic_object> v;
-    for (auto& o : objects) { v.push_back(o->impl_->unmanaged_); }
+    for (auto& o : objects) { v.push_back(LATTICE_DEREF_REF(o).impl_->unmanaged_); }
     auto managed_vector = lattice_db::add_bulk_with_schema(std::move(v), schema, upsert_cols);
     for (size_t i = 0; i < managed_vector.size(); i++) {
         auto unmanaged_obj = v[i];
-        objects[i]->impl_->manage(managed_vector[i]);
+        LATTICE_DEREF_REF(objects[i]).impl_->manage(managed_vector[i]);
         for (auto& [name, link] : unmanaged_obj.link_values) {
             if (!link->lattice) {
                 add(*link);
             }
 
-            managed<swift_dynamic_object*> link_field = objects[i]->impl_->managed_.get_managed_field<swift_dynamic_object*>(name);
+            managed<swift_dynamic_object*> link_field = LATTICE_DEREF_REF(objects[i]).impl_->managed_.get_managed_field<swift_dynamic_object*>(name);
             link_field = link->managed_.as_link();
         }
     }
 }
 
 void swift_lattice::add_bulk(std::vector<dynamic_object*>& objects) {
-    if (is_closed()) return;
+    if (lattice_db::is_closed()) return;
     if (objects.empty()) {
         return;
     }
@@ -479,7 +500,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     for (const auto& schema : all_schemas) {
         if (std::find(new_tables.begin(), new_tables.end(), schema.table_name) != new_tables.end()) {
             LOG_INFO("swift_lattice", "ensure_swift_tables: creating table %s", schema.table_name.c_str());
-            create_model_table_public(schema);
+            lattice_db::create_model_table_public(schema);
         }
     }
 
@@ -495,9 +516,9 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     for (const auto& entry : schemas) {
         for (const auto& [name, desc] : entry.properties) {
             if (desc.is_union) {
-                ensure_union_table(desc.union_desc.union_table_name, desc.union_desc,
+                lattice_db::ensure_union_table(desc.union_desc.union_table_name, desc.union_desc,
                                    entry.table_name, name);
-                create_union_cascade_trigger(entry.table_name, name,
+                lattice_db::create_union_cascade_trigger(entry.table_name, name,
                                              desc.union_desc.union_table_name);
                 union_schemas_[desc.union_desc.union_table_name] = desc.union_desc;
             }
@@ -513,7 +534,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     };
     std::vector<pending_union_ref> pending_migration_union_refs;
 
-    int current_version = get_schema_version();
+    int current_version = lattice_db::get_schema_version();
     int target_version = swift_config_.target_schema_version;
     LOG_INFO("swift_lattice", "migration: current_version=%d, target_version=%d", current_version, target_version);
 
@@ -572,7 +593,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                 schemas_[table_name] = new_schema;
                 for (const auto& s : all_schemas) {
                     if (s.table_name == table_name) {
-                        migrate_model_table_public(s);
+                        lattice_db::migrate_model_table_public(s);
                         break;
                     }
                 }
@@ -622,22 +643,38 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     }
                 }
 
-                // Wrap for Swift callback
+                // Wrap for Swift callback. On the FRT path `wrap` returns a heap
+                // `dynamic_object_ref*`; on the value path it returns a value. Bind
+                // uniform `dynamic_object_ref*` aliases (old_ptr/new_ptr) so the
+                // rest of this body — and the thread-local globals — use `->`
+                // identically regardless of path. On the value path the pointers
+                // address the stack-local refs, which outlive the synchronous
+                // callback (the globals are cleared before they go out of scope).
                 auto old_ref = dynamic_object_ref::wrap(std::make_shared<dynamic_object>(old_obj));
                 auto new_ref = dynamic_object_ref::wrap(std::make_shared<dynamic_object>(new_obj));
 
+#if LATTICE_HAS_FRT
                 old_ref->retain();
                 new_ref->retain();
                 defer([&old_ref, &new_ref] {
-                    old_ref->release();
-                    new_ref->release();
+                    // Mirror releaseDynamicObjectRef: delete when the count
+                    // hits zero, otherwise these heap refs leak once per
+                    // migrated row (Swift's retain/release nets to zero here).
+                    if (old_ref->release()) delete old_ref;
+                    if (new_ref->release()) delete new_ref;
                 });
-                
+                dynamic_object_ref* old_ptr = old_ref;
+                dynamic_object_ref* new_ptr = new_ref;
+#else
+                dynamic_object_ref* old_ptr = &old_ref;
+                dynamic_object_ref* new_ptr = &new_ref;
+#endif
+
                 // Call Swift migration callback
                 if (swift_config_.row_migration_fn_) {
-                    g_migration_old_row = old_ref;
-                    g_migration_new_row = new_ref;
-                    swift_config_.row_migration_fn_(table_name, old_ref, new_ref);
+                    g_migration_old_row = old_ptr;
+                    g_migration_new_row = new_ptr;
+                    swift_config_.row_migration_fn_(table_name, old_ptr, new_ptr);
                     g_migration_old_row = nullptr;
                     g_migration_new_row = nullptr;
                 }
@@ -650,8 +687,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
                     // Handle geo_bounds specially - expands to 4 columns
                     if (prop_desc.is_geo_bounds) {
-                        if (new_ref->has_geo_bounds(prop_name)) {
-                            geo_bounds bounds = new_ref->get_geo_bounds(prop_name);
+                        if (new_ptr->has_geo_bounds(prop_name)) {
+                            geo_bounds bounds = new_ptr->get_geo_bounds(prop_name);
                             new_row[prop_name + "_minLat"] = bounds.min_lat;
                             new_row[prop_name + "_maxLat"] = bounds.max_lat;
                             new_row[prop_name + "_minLon"] = bounds.min_lon;
@@ -660,20 +697,20 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                         continue;
                     }
 
-                    if (!new_ref->has_value(prop_name)) continue;
+                    if (!new_ptr->has_value(prop_name)) continue;
 
                     switch (prop_desc.type) {
                         case column_type::integer:
-                            new_row[prop_name] = new_ref->get_int(prop_name);
+                            new_row[prop_name] = new_ptr->get_int(prop_name);
                             break;
                         case column_type::real:
-                            new_row[prop_name] = new_ref->get_double(prop_name);
+                            new_row[prop_name] = new_ptr->get_double(prop_name);
                             break;
                         case column_type::text:
-                            new_row[prop_name] = new_ref->get_string(prop_name);
+                            new_row[prop_name] = new_ptr->get_string(prop_name);
                             break;
                         case column_type::blob:
-                            new_row[prop_name] = new_ref->get_data(prop_name);
+                            new_row[prop_name] = new_ptr->get_data(prop_name);
                             break;
                         default:
                             break;
@@ -683,8 +720,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                 migration_ctx.queue_row_update(table_name, row_id, std::move(new_row));
 
                 // Process link_values set by the migration callback (FK-to-Link)
-                std::string parent_gid = new_ref->get_string("globalId");
-                for (auto& [link_name, link_obj_ptr] : new_ref->impl_->unmanaged_.link_values) {
+                std::string parent_gid = new_ptr->get_string("globalId");
+                for (auto& [link_name, link_obj_ptr] : new_ptr->impl_->unmanaged_.link_values) {
                     if (!link_obj_ptr) continue;
 
                     auto prop_it = new_schema.find(link_name);
@@ -696,13 +733,13 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     if (parent_gid.empty() || child_gid.empty()) continue;
 
                     std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + link_name;
-                    ensure_link_table(link_table, table_name);
+                    lattice_db::ensure_link_table(link_table, table_name);
                     db().execute("INSERT OR REPLACE INTO " + link_table +
                         " (lhs, rhs) VALUES ('" + parent_gid + "', '" + child_gid + "')");
                 }
 
                 // Process list_values set by the migration callback (FK-to-List)
-                for (auto& [list_name, list_ptr] : new_ref->impl_->unmanaged_.list_values) {
+                for (auto& [list_name, list_ptr] : new_ptr->impl_->unmanaged_.list_values) {
                     if (!list_ptr) continue;
 
                     auto prop_it = new_schema.find(list_name);
@@ -711,7 +748,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     if (prop.kind != property_kind::list || prop.is_geo_bounds) continue;
 
                     std::string link_table = "_" + table_name + "_" + prop.target_table + "_" + list_name;
-                    ensure_link_table(link_table, table_name);
+                    lattice_db::ensure_link_table(link_table, table_name);
 
                     for (auto& elem_ptr : list_ptr->unmanaged_) {
                         if (!elem_ptr) continue;
@@ -724,8 +761,8 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
                 // Stash union values for persistence after table rebuild.
                 // Can't persist now — the table still has the old schema.
-                if (!new_ref->impl_->unmanaged_.union_values.empty()) {
-                    pending_migration_union_refs.push_back({table_name, row_id, new_ref->impl_->unmanaged_});
+                if (!new_ptr->impl_->unmanaged_.union_values.empty()) {
+                    pending_migration_union_refs.push_back({table_name, row_id, new_ptr->impl_->unmanaged_});
                 }
             }
 
@@ -736,7 +773,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             // Find the model_schema for this table and migrate
             for (const auto& schema : all_schemas) {
                 if (schema.table_name == table_name) {
-                    migrate_model_table_public(schema);
+                    lattice_db::migrate_model_table_public(schema);
                     break;
                 }
             }
@@ -755,7 +792,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
         // Update version in _lattice_meta
         LOG_INFO("swift_lattice", "  setting schema version to %d", version);
-        set_schema_version(version);
+        lattice_db::set_schema_version(version);
 
         // Clear migration lattice pointer
         g_migration_lattice = nullptr;
@@ -770,7 +807,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         if (std::find(existing_tables.begin(), existing_tables.end(), entry.table_name) != existing_tables.end()) {
             for (const auto& schema : all_schemas) {
                 if (schema.table_name == entry.table_name) {
-                    migrate_model_table_public(schema);
+                    lattice_db::migrate_model_table_public(schema);
                     break;
                 }
             }
@@ -781,7 +818,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // Phase 6: Ensure geo_bounds rtree tables exist with correct data
     // This is called AFTER all migration updates are applied, so rtrees are created
     // with the correct (migrated) data rather than default values.
-    ensure_geo_bounds_rtrees(all_schemas);
+    lattice_db::ensure_geo_bounds_rtrees(all_schemas);
 
     // Phase 6b: Ensure vec0 tables exist for vector columns
     // vec0 is normally created lazily on first add(), but sync-only DBs
@@ -800,7 +837,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                 int bytes = static_cast<int>(std::get<int64_t>(rows[0].at("len")));
                 int dimensions = bytes / static_cast<int>(sizeof(float));
                 if (dimensions <= 0) continue;
-                ensure_vec0_table(schema.table_name, prop.name, dimensions);
+                lattice_db::ensure_vec0_table(schema.table_name, prop.name, dimensions);
                 // Backfill vec0 from existing data
                 db().execute(
                     "INSERT OR REPLACE INTO " + vec_table + "(global_id, embedding) "
@@ -808,7 +845,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
                     " WHERE " + prop.name + " IS NOT NULL AND length(" + prop.name + ") > 0");
             } else {
                 // Table exists — ensure triggers are up to date (pass 0 dimensions, ignored)
-                ensure_vec0_table(schema.table_name, prop.name, 0);
+                lattice_db::ensure_vec0_table(schema.table_name, prop.name, 0);
 
                 // Reconcile missing vec0 entries. Another connection (e.g. IPC
                 // sync) may have inserted model rows whose vec0 triggers fired
@@ -863,7 +900,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 
     LOG_INFO("swift_lattice", "ensure_swift_tables: doing fts5 (%zu schemas)", all_schemas.size());
     // Phase 6c: Ensure FTS5 tables exist for full-text indexed columns
-    ensure_fts5_tables(all_schemas);
+    lattice_db::ensure_fts5_tables(all_schemas);
     LOG_INFO("swift_lattice", "ensure_swift_tables: fts5 done");
 
     LOG_INFO("swift_lattice", "ensure_swift_tables: creating indexes");
@@ -881,13 +918,13 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
             std::string link_table_name;
             if (desc.kind == property_kind::virtual_list || desc.kind == property_kind::virtual_link) {
                 link_table_name = "_" + entry.table_name + "_" + name;
-                ensure_virtual_link_table(link_table_name, entry.table_name);
+                lattice_db::ensure_virtual_link_table(link_table_name, entry.table_name);
             } else if (desc.kind == property_kind::link && !desc.target_table.empty()) {
                 link_table_name = "_" + entry.table_name + "_" + std::string(desc.target_table) + "_" + name;
-                ensure_link_table(link_table_name, entry.table_name);
+                lattice_db::ensure_link_table(link_table_name, entry.table_name);
             } else if (desc.kind == property_kind::list && !desc.is_geo_bounds && !desc.target_table.empty()) {
                 link_table_name = "_" + entry.table_name + "_" + std::string(desc.target_table) + "_" + name;
-                ensure_link_table(link_table_name, entry.table_name);
+                lattice_db::ensure_link_table(link_table_name, entry.table_name);
             }
             if (!link_table_name.empty()) {
                 // Store "parent_table:property_name" so flush_changes can
@@ -1057,7 +1094,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 } // namespace lattice
 
 void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
-    if (is_closed()) return;
+    if (lattice_db::is_closed()) return;
     if (objects.empty()) {
         return;
     }
@@ -1085,7 +1122,7 @@ void lattice::swift_lattice::add_bulk(std::vector<dynamic_object>& objects) {
     for (size_t i = 0; i < managed_vector.size(); i++) {
         objects[i].unmanaged_.~swift_dynamic_object();
         objects[i].managed_ = managed_vector[i];
-        objects[i].lattice = lattice::swift_lattice_ref::get_ref_for_lattice(this);
+        objects[i].lattice = lattice::swift_lattice_ref::shared_for_lattice(this);
     }
 }
 
@@ -1132,7 +1169,7 @@ static void cascade_clean_union_tables(
 }
 
 bool lattice::swift_lattice::remove(dynamic_object &&obj) {
-    if (is_closed()) return false;
+    if (lattice_db::is_closed()) return false;
     if (!obj.lattice) return false;
     auto gid = obj.managed_.global_id();
     auto table = obj.managed_.table_name();
@@ -1144,27 +1181,27 @@ bool lattice::swift_lattice::remove(dynamic_object &&obj) {
     return true;
 }
 
-bool lattice::swift_lattice::remove(dynamic_object_ref* obj) {
-    if (is_closed()) return false;
-    if (!obj->is_managed())
+bool lattice::swift_lattice::remove(const dynamic_object_ref& obj) {
+    if (lattice_db::is_closed()) return false;
+    if (!obj.is_managed())
         return false;
-    const auto table_name = obj->impl_->managed_.table_name();
-    const auto properties = obj->impl_->managed_.properties_;
-    auto gid = obj->impl_->managed_.global_id();
-    lattice_db::remove(obj->impl_->managed_, obj->impl_->managed_.table_name());
+    const auto table_name = obj.impl_->managed_.table_name();
+    const auto properties = obj.impl_->managed_.properties_;
+    auto gid = obj.impl_->managed_.global_id();
+    lattice_db::remove(obj.impl_->managed_, obj.impl_->managed_.table_name());
     if (!gid.empty()) {
         cascade_clean_union_tables(*this, union_schemas_, table_name, gid);
     }
-    obj->impl_->lattice = nullptr;
+    obj.impl_->lattice = nullptr;
     // Properly transition union from managed to unmanaged:
     // 1. Destroy managed_ (while lattice is still set so destructor works correctly)
-    obj->impl_->managed_.~managed();
+    obj.impl_->managed_.~managed();
     // 2. Construct unmanaged_ in the same storage
-    new (&obj->impl_->unmanaged_) swift_dynamic_object(table_name, properties);
+    new (&obj.impl_->unmanaged_) swift_dynamic_object(table_name, properties);
     // 3. NOW clear lattice to indicate unmanaged state
-    obj->impl_->lattice = nullptr;
+    obj.impl_->lattice = nullptr;
     // 4. Mark as deleted so link list append can detect stale objects
-    obj->impl_->deleted_ = true;
+    obj.impl_->deleted_ = true;
 
     return true;
 }
@@ -1227,9 +1264,12 @@ bool lattice::migration_lookup_by_global_id(const std::string& table_name, const
     return true;
 }
 
+#if LATTICE_HAS_FRT
 lattice::dynamic_object_ref* lattice::migration_take_lookup_result() {
     if (!g_migration_lookup_result) {
-        return dynamic_object_ref::create();
+        // nullptr imports as nil — the same "absent" answer the value path
+        // gives via an empty ref (isValid()==false).
+        return nullptr;
     }
     auto result = g_migration_lookup_result;
     g_migration_lookup_result = nullptr;
@@ -1243,6 +1283,26 @@ lattice::dynamic_object_ref* lattice::migration_get_old_row() {
 lattice::dynamic_object_ref* lattice::migration_get_new_row() {
     return g_migration_new_row;
 }
+#else
+lattice::dynamic_object_ref lattice::migration_take_lookup_result() {
+    if (!g_migration_lookup_result) {
+        return dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));  // empty: isValid()==false
+    }
+    auto result = g_migration_lookup_result;
+    g_migration_lookup_result = nullptr;
+    return dynamic_object_ref::wrap(result);
+}
+
+lattice::dynamic_object_ref lattice::migration_get_old_row() {
+    return g_migration_old_row ? *g_migration_old_row
+                               : dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
+}
+
+lattice::dynamic_object_ref lattice::migration_get_new_row() {
+    return g_migration_new_row ? *g_migration_new_row
+                               : dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
+}
+#endif
 
 void lattice::swift_lattice::update_sync_filter(const SyncFilterVector& filter) {
     lattice_db::update_sync_filter(std::vector<sync_filter_entry>(filter.begin(), filter.end()));
@@ -1252,6 +1312,7 @@ void lattice::swift_lattice::clear_sync_filter() {
     lattice_db::clear_sync_filter();
 }
 
+#if LATTICE_HAS_FRT
 lattice::swift_lattice_ref* lattice::swift_lattice_ref::create(const swift_configuration& config,
                                                                const SchemaVector& schemas,
                                                                cxx_error& err)
@@ -1270,3 +1331,20 @@ SWIFT_NAME(create(swiftConfig:schemas:error:)) {
     }
     return ref;
 }
+#else
+lattice::swift_lattice_ref lattice::swift_lattice_ref::create(const swift_configuration& config,
+                                                              const SchemaVector& schemas,
+                                                              cxx_error& err)
+SWIFT_NAME(create(swiftConfig:schemas:error:)) {
+    std::shared_ptr<swift_lattice> impl;
+    try {
+        LOG_DEBUG("swift_lattice_ref", "create() start path=%s schemas=%zu", config.path.c_str(), schemas.size());
+        impl = get_or_create_shared(config, schemas);
+    } catch (const std::exception& e) {
+        LOG_ERROR("swift_lattice", "%s", e.what());
+        last_error_ = e;
+        err = e;
+    }
+    return _make(impl);
+}
+#endif

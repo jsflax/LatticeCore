@@ -561,7 +561,7 @@ TEST(Bridge, DynamicObjectRefCRUD) {
     auto sdo = make_sdo("BridgePerson", schemas[0].properties);
     sdo.values["name"] = std::string("RefPerson");
     sdo.values["age"] = int64_t(28);
-    auto* ref = new lattice::dynamic_object_ref(sdo);
+    lattice::dynamic_object_ref ref(sdo);
 
     db.add(ref);
 
@@ -570,9 +570,6 @@ TEST(Bridge, DynamicObjectRefCRUD) {
     ASSERT_EQ(results.size(), 1u);
     EXPECT_EQ(results[0].get_string("name"), "RefPerson");
     EXPECT_EQ(int(results[0].get_int("age")), 28);
-
-    // Cleanup
-    delete ref;
 }
 
 // ============================================================================

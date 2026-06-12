@@ -26,11 +26,16 @@ namespace lattice {
 struct link_list;
 class link_list_ref;
 class swift_lattice_ref;
+class swift_lattice;
 class dynamic_object_ref;
 
 // MARK: Dynamic Object
 struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
-    swift_lattice_ref* lattice = nullptr;
+    // Shared handle to the owning db wrapper; doubles as the managed/unmanaged
+    // discriminant (null == unmanaged). Holding the shared_ptr directly (rather
+    // than a heap swift_lattice_ref*) keeps the db alive with no per-object
+    // allocation to free; Swift-facing refs are minted on demand in getLattice.
+    std::shared_ptr<swift_lattice> lattice;
     bool deleted_ = false;
 
     dynamic_object() : lattice(nullptr) {
@@ -82,12 +87,12 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     
     dynamic_object(const managed<swift_dynamic_object>& o) : lattice(nullptr) {
         new (&managed_) managed<swift_dynamic_object>(o);
-        lattice = managed_.lattice_ref();
+        lattice = managed_.lattice_shared();
     }
 
     dynamic_object(const managed<swift_dynamic_object*>& o) : lattice(nullptr) {
         new (&managed_) managed<swift_dynamic_object>(*o.get_value());
-        lattice = managed_.lattice_ref();
+        lattice = managed_.lattice_shared();
     }
     
     bool has_value(const std::string& name) const SWIFT_NAME(hasValue(named:)) {
@@ -134,8 +139,13 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     
     dynamic_object get_object(const std::string& name) const SWIFT_NAME(getObject(named:)) SWIFT_RETURNS_INDEPENDENT_VALUE;
     
+#if LATTICE_HAS_FRT
     link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:)) SWIFT_RETURNS_UNRETAINED;
     geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) SWIFT_RETURNS_UNRETAINED;
+#else
+    link_list_ref get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:));
+    geo_bounds_list_ref get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:));
+#endif
 
     template <typename T>
     void set_field(const std::string& name, const T& value) {
@@ -170,7 +180,7 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
             unmanaged_.set_nil(name);
         }
     }
-    void set_object(const std::string& name, dynamic_object_ref& value) SWIFT_NAME(setObject(named:_:));
+    void set_object(const std::string& name, const dynamic_object_ref& value) SWIFT_NAME(setObject(named:_:));
 
     // geo_bounds accessors
     geo_bounds get_geo_bounds(const std::string& name) const SWIFT_NAME(getGeoBounds(named:)) {
@@ -276,32 +286,48 @@ private:
 // Reference-counted wrapper for Swift interop
 class dynamic_object_ref {
 public:
-    // Factory methods for heap allocation
-    static dynamic_object_ref* create() SWIFT_RETURNS_UNRETAINED {
+    // Single-source factories (same pattern as swift_lattice_ref): on the FRT
+    // path they heap-allocate and Swift imports them as returning the class
+    // (optional pointer, unretained); on the iOS-15 value path they return by
+    // value — the inner shared_ptr carries ownership either way.
+#if LATTICE_HAS_FRT
+#  define LATTICE_DOREF_RET dynamic_object_ref*
+#  define LATTICE_DOREF_UNRETAINED SWIFT_RETURNS_UNRETAINED
+    static dynamic_object_ref* _make(std::shared_ptr<dynamic_object> impl) {
         auto ref = new dynamic_object_ref();
-        ref->impl_ = std::make_shared<dynamic_object>();
+        ref->impl_ = impl;
         return ref;
     }
-
-    static dynamic_object_ref* create(const std::string& table_name) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new dynamic_object_ref();
-        ref->impl_ = std::make_shared<dynamic_object>();
-        ref->impl_->unmanaged_.table_name = table_name;
+#else
+#  define LATTICE_DOREF_RET dynamic_object_ref
+#  define LATTICE_DOREF_UNRETAINED
+    static dynamic_object_ref _make(std::shared_ptr<dynamic_object> impl) {
+        dynamic_object_ref ref;
+        ref.impl_ = impl;
         return ref;
     }
+#endif
 
-    static dynamic_object_ref* wrap(std::shared_ptr<dynamic_object> obj) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new dynamic_object_ref();
-        ref->impl_ = obj;
-        return ref;
+    static LATTICE_DOREF_RET create() LATTICE_DOREF_UNRETAINED {
+        return _make(std::make_shared<dynamic_object>());
+    }
+
+    static LATTICE_DOREF_RET create(const std::string& table_name) LATTICE_DOREF_UNRETAINED {
+        auto impl = std::make_shared<dynamic_object>();
+        impl->unmanaged_.table_name = table_name;
+        return _make(impl);
+    }
+
+    static LATTICE_DOREF_RET wrap(std::shared_ptr<dynamic_object> obj) LATTICE_DOREF_UNRETAINED {
+        return _make(obj);
     }
 
     // Factory that copies the dynamic_object (avoids passing shared_ptr through Swift)
-    static dynamic_object_ref* wrap(const dynamic_object& obj) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new dynamic_object_ref();
-        ref->impl_ = std::make_shared<dynamic_object>(obj);
-        return ref;
+    static LATTICE_DOREF_RET wrap(const dynamic_object& obj) LATTICE_DOREF_UNRETAINED {
+        return _make(std::make_shared<dynamic_object>(obj));
     }
+#undef LATTICE_DOREF_RET
+#undef LATTICE_DOREF_UNRETAINED
 
     dynamic_object_ref(managed<swift_dynamic_object>& o) {
         impl_ = std::make_shared<dynamic_object>(o);
@@ -311,10 +337,20 @@ public:
         impl_ = std::make_shared<dynamic_object>(o);
     }
     
-    swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY {
-        return impl_->lattice;
-    }
-    
+#if LATTICE_HAS_FRT
+    // Mints a fresh Swift-owned ref per access (unretained: Swift retains it
+    // and deletes it on release; the object itself keeps the db alive via its
+    // shared_ptr member). Defined out-of-line in dynamic_object.cpp where
+    // swift_lattice_ref is a complete type. nullptr when unmanaged.
+    swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY SWIFT_RETURNS_UNRETAINED;
+#else
+    // Value-type path: return by value (Swift imports the FRT-path pointer as
+    // UnsafeMutablePointer otherwise). Defined out-of-line in dynamic_object.cpp
+    // where swift_lattice_ref is a complete type. Empty ref (isValid()==false)
+    // when there is no backing lattice.
+    swift_lattice_ref getLattice() const SWIFT_COMPUTED_PROPERTY;
+#endif
+
     // Access the underlying dynamic_object
     dynamic_object* get() { return impl_.get(); }
     const dynamic_object* get() const { return impl_.get(); }
@@ -322,9 +358,11 @@ public:
     // Get the shared_ptr (for storing in link_values)
     std::shared_ptr<dynamic_object> shared() const { return impl_; }
 
+#if LATTICE_HAS_FRT
     // For SWIFT_SHARED_REFERENCE
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
+#endif
 
     // Delegate common operations to impl_
     bool has_value(const std::string& name) const SWIFT_NAME(hasValue(named:)) {
@@ -355,46 +393,53 @@ public:
         return impl_->get_float(name);
     }
 
-    void set_int(const std::string& name, int64_t value) SWIFT_NAME(setInt(named:_:)) {
+    void set_int(const std::string& name, int64_t value) const SWIFT_NAME(setInt(named:_:)) {
         impl_->set_int(name, value);
     }
 
-    void set_string(const std::string& name, const std::string& value) SWIFT_NAME(setString(named:_:)) {
+    void set_string(const std::string& name, const std::string& value) const SWIFT_NAME(setString(named:_:)) {
         impl_->set_string(name, value);
     }
 
-    void set_bool(const std::string& name, bool value) SWIFT_NAME(setBool(named:_:)) {
+    void set_bool(const std::string& name, bool value) const SWIFT_NAME(setBool(named:_:)) {
         impl_->set_bool(name, value);
     }
 
-    void set_data(const std::string& name, const std::vector<uint8_t>& value) SWIFT_NAME(setData(named:_:)) {
+    void set_data(const std::string& name, const std::vector<uint8_t>& value) const SWIFT_NAME(setData(named:_:)) {
         impl_->set_data(name, value);
     }
 
-    void set_double(const std::string& name, double value) SWIFT_NAME(setDouble(named:_:)) {
+    void set_double(const std::string& name, double value) const SWIFT_NAME(setDouble(named:_:)) {
         impl_->set_double(name, value);
     }
 
-    void set_float(const std::string& name, float value) SWIFT_NAME(setFloat(named:_:)) {
+    void set_float(const std::string& name, float value) const SWIFT_NAME(setFloat(named:_:)) {
         impl_->set_float(name, value);
     }
 
-    void set_nil(const std::string& name) SWIFT_NAME(setNil(named:)) {
+    void set_nil(const std::string& name) const SWIFT_NAME(setNil(named:)) {
         impl_->set_nil(name);
     }
 
-    void set_object(const std::string& name, dynamic_object_ref& value) SWIFT_NAME(setObject(named:_:)) {
+    void set_object(const std::string& name, const dynamic_object_ref& value) const SWIFT_NAME(setObject(named:_:)) {
         impl_->set_object(name, value);
     }
 
+#if LATTICE_HAS_FRT
     dynamic_object_ref* get_object(const std::string& name) const SWIFT_NAME(getObject(named:)) SWIFT_RETURNS_UNRETAINED {
         return dynamic_object_ref::wrap(impl_->get_object(name).make_shared());
     }
+#else
+    dynamic_object_ref get_object(const std::string& name) const SWIFT_NAME(getObject(named:)) {
+        return dynamic_object_ref::wrap(impl_->get_object(name).make_shared());
+    }
+#endif
 
     // union accessors (implemented in dynamic_object.cpp — union_value is incomplete here)
     union_value get_union(const std::string& name) const SWIFT_NAME(getUnion(named:));
-    void set_union(const std::string& name, const union_value& value) SWIFT_NAME(setUnion(named:_:));
+    void set_union(const std::string& name, const union_value& value) const SWIFT_NAME(setUnion(named:_:));
 
+#if LATTICE_HAS_FRT
     link_list_ref* get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:)) SWIFT_RETURNS_UNRETAINED {
         return impl_->get_link_list(name);
     }
@@ -402,17 +447,24 @@ public:
     geo_bounds_list_ref* get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:)) SWIFT_RETURNS_UNRETAINED {
         return impl_->get_geo_bounds_list(name);
     }
+#else
+    // Value path: returning by value needs the complete type, which is not
+    // available here (forward-declared), so these are defined out-of-line in
+    // dynamic_object.cpp.
+    link_list_ref get_link_list(const std::string& name) const SWIFT_NAME(getLinkList(named:));
+    geo_bounds_list_ref get_geo_bounds_list(const std::string& name) const SWIFT_NAME(getGeoBoundsList(named:));
+#endif
 
     // geo_bounds accessors
     geo_bounds get_geo_bounds(const std::string& name) const SWIFT_NAME(getGeoBounds(named:)) {
         return impl_->get_geo_bounds(name);
     }
 
-    void set_geo_bounds(const std::string& name, const geo_bounds& value) SWIFT_NAME(setGeoBounds(named:_:)) {
+    void set_geo_bounds(const std::string& name, const geo_bounds& value) const SWIFT_NAME(setGeoBounds(named:_:)) {
         impl_->set_geo_bounds(name, value);
     }
 
-    void set_geo_bounds(const std::string& name, double minLat, double maxLat, double minLon, double maxLon) SWIFT_NAME(setGeoBounds(named:minLat:maxLat:minLon:maxLon:)) {
+    void set_geo_bounds(const std::string& name, double minLat, double maxLat, double minLon, double maxLon) const SWIFT_NAME(setGeoBounds(named:minLat:maxLat:minLon:maxLon:)) {
         impl_->set_geo_bounds(name, minLat, maxLat, minLon, maxLon);
     }
 
@@ -421,7 +473,7 @@ public:
     }
 
 
-    void remove_geo_bounds_at(const std::string& name, size_t index) SWIFT_NAME(removeGeoBounds(named:at:)) {
+    void remove_geo_bounds_at(const std::string& name, size_t index) const SWIFT_NAME(removeGeoBounds(named:at:)) {
         impl_->remove_geo_bounds_at(name, index);
     }
 
@@ -433,13 +485,17 @@ public:
         return impl_->debug_description();
     }
 
-    // Check if this is a managed (persisted) object
-    bool is_managed() const {
-        return impl_->lattice != nullptr;
+    // Whether this ref backs an actual object. Used as the cross-path "non-null"
+    // signal: below the FRT floor the nullable getters return an *empty* ref
+    // (impl_ == nullptr) rather than a null pointer, so callers test isValid()
+    // uniformly instead of optional-unwrapping a foreign-reference pointer.
+    bool valid() const SWIFT_NAME(isValid()) {
+        return impl_ != nullptr;
     }
 
-    swift_lattice_ref* lattice_ref() const {
-        return impl_->lattice;
+    // Check if this is a managed (persisted) object
+    bool is_managed() const {
+        return impl_ != nullptr && impl_->lattice != nullptr;
     }
 
 private:
@@ -450,11 +506,15 @@ private:
     friend struct link_list;
     friend struct union_value;
     std::shared_ptr<dynamic_object> impl_;
+#if LATTICE_HAS_FRT
     std::atomic<int> ref_count_{0};
-    
+
     friend void ::retainDynamicObjectRef(lattice::dynamic_object_ref* p);
     friend void ::releaseDynamicObjectRef(lattice::dynamic_object_ref* p);
 } SWIFT_SHARED_REFERENCE(retainDynamicObjectRef, releaseDynamicObjectRef);
+#else
+};
+#endif
 
 }
 

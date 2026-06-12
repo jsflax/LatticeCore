@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <dynamic_object.hpp>
 #include <list.hpp>
+#include <geo_bounds.hpp>
 #include <lattice.hpp>
 
 // std::format / std::vformat parse the format string at runtime, so libc++
@@ -156,22 +157,27 @@ dynamic_object& dynamic_object::operator=(const dynamic_object &o) {
     return *this;
 }
 
-void dynamic_object::set_object(const std::string &name, dynamic_object_ref& value) {
+void dynamic_object::set_object(const std::string &name, const dynamic_object_ref& value) {
+    // impl_-> gives non-const access to the pointee even through a const ref
+    // (shared_ptr::operator-> is const but yields a non-const T*), so a const
+    // ref suffices and avoids the Swift inout-& asymmetry between the FRT (class)
+    // and value-type imports.
     if (lattice) {
         // Use the pointer specialization which handles nil fields safely
         managed<swift_dynamic_object *> field = managed_.get_managed_field<swift_dynamic_object *>(name);
-        if (value.get()->lattice) {
+        if (value.impl_->lattice) {
             // Child is already managed — assign the managed object pointer
-            field = &value.get()->managed_;
+            field = &value.impl_->managed_;
         } else {
             // Child is unmanaged — assign unmanaged value (will be auto-managed)
-            field = value.get()->unmanaged_;
-            value.get()->manage(field.value());
+            field = value.impl_->unmanaged_;
+            value.impl_->manage(field.value());
         }
     } else {
         unmanaged_.link_values[name] = value.impl_;
     }
 }
+
 
 dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_NAME(getObject(named:)) SWIFT_RETURNS_INDEPENDENT_VALUE {
     if (lattice) {
@@ -184,7 +190,7 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
         const property_descriptor& property = managed_.properties_.at(name);
         auto base = static_cast<model_base>(managed_);
         m.bind_to_parent(&base, property);
-        const auto& schema = lattice->get()->get_properties_for_table(m->table_name());
+        const auto& schema = lattice->get_properties_for_table(m->table_name());
         for (auto& [name, column_type] : *schema) {
             m->properties_[name] = column_type;
             m->property_types_[name] = column_type.type;
@@ -206,7 +212,7 @@ union_value dynamic_object_ref::get_union(const std::string& name) const {
     return impl_->get_union(name);
 }
 
-void dynamic_object_ref::set_union(const std::string& name, const union_value& value) {
+void dynamic_object_ref::set_union(const std::string& name, const union_value& value) const {
     impl_->set_union(name, value);
 }
 
@@ -307,7 +313,7 @@ union_value dynamic_object::get_union(const std::string& name) const {
             if (col_is_link[col]) {
                 std::string link_gid = result.get_string(key);
                 if (!link_gid.empty()) {
-                    auto obj = lattice->get()->object_by_global_id(link_gid, col_link_target[col]);
+                    auto obj = lattice->object_by_global_id(link_gid, col_link_target[col]);
                     if (obj) {
                         result.link_refs()[key] = std::make_shared<dynamic_object>(std::move(*obj));
                     }
@@ -421,9 +427,37 @@ void dynamic_object::set_union(const std::string& name, const union_value& value
     }
 }
 
+// getLattice mints a Swift-facing handle from the object's shared db wrapper.
+// Defined here (not in the header) because swift_lattice_ref is a complete
+// type only after lattice.hpp. FRT path: a fresh unretained heap ref that
+// Swift retains and frees — the object itself keeps the db alive via its
+// shared_ptr member. Value path: a by-value copy (empty when unmanaged).
+#if LATTICE_HAS_FRT
+swift_lattice_ref* dynamic_object_ref::getLattice() const {
+    return swift_lattice_ref::_make(impl_->lattice);
+}
+#else
+swift_lattice_ref dynamic_object_ref::getLattice() const {
+    return swift_lattice_ref::_make(impl_->lattice);
 }
 
-// Implement retain/release for Swift shared reference
+// Value path: the ref types are complete here, so the by-value wrappers can be
+// defined (they are forward-declared at their call site in dynamic_object.hpp).
+link_list_ref dynamic_object_ref::get_link_list(const std::string& name) const {
+    return impl_->get_link_list(name);
+}
+
+geo_bounds_list_ref dynamic_object_ref::get_geo_bounds_list(const std::string& name) const {
+    return impl_->get_geo_bounds_list(name);
+}
+#endif
+
+}
+
+#if LATTICE_HAS_FRT
+// Implement retain/release for Swift shared reference. Below the FRT floor
+// (iOS 15) dynamic_object_ref is a plain value type whose inner shared_ptr owns
+// the impl, so these hooks are not needed.
 void retainDynamicObjectRef(lattice::dynamic_object_ref* p) {
     if (p) {
         p->retain();
@@ -437,3 +471,4 @@ void releaseDynamicObjectRef(lattice::dynamic_object_ref* p) {
         }
     }
 }
+#endif

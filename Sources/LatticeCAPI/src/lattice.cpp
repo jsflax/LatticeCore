@@ -627,7 +627,7 @@ extern "C" lattice_status_t lattice_db_remove(lattice_db_t* db, lattice_object_t
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
 
-        bool success = db_ref->get()->remove(obj_ref);
+        bool success = db_ref->get()->remove(*obj_ref);
         return success ? LATTICE_OK : LATTICE_ERROR_NOT_FOUND;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -943,7 +943,7 @@ extern "C" void lattice_link_list_push_back(lattice_link_list_t* list, lattice_o
     try {
         auto* list_ref = reinterpret_cast<lattice_link_list_internal*>(list);
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
-        list_ref->push_back(obj_ref);
+        list_ref->push_back(*obj_ref);
     } catch (...) {}
 }
 
@@ -1884,7 +1884,7 @@ extern "C" lattice_object_t* lattice_db_add_with_global_id(
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto* obj_ref = reinterpret_cast<lattice_object_internal*>(obj);
 
-        db_ref->get()->add_preserving_global_id(obj_ref, std::string(global_id));
+        db_ref->get()->add_preserving_global_id(*obj_ref, std::string(global_id));
 
         obj_ref->retain();
         return obj;

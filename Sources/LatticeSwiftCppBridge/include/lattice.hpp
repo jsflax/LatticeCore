@@ -4,6 +4,7 @@
 
 #include <LatticeCore.hpp>
 #include <bridging.hpp>
+#include <cassert>
 #include <concepts>
 #include <future>
 #include <sqlite-vec.h>
@@ -105,16 +106,27 @@ struct union_value {
 
     // Link object references — for unmanaged objects where globalId isn't set yet.
     // persist_union_values resolves these to globalIds at add() time.
-    void set_link_ref(const std::string& key, dynamic_object_ref& ref)
+    void set_link_ref(const std::string& key, const dynamic_object_ref& ref)
         SWIFT_NAME(setLinkRef(_:_:)) { link_refs_[key] = ref.impl_; }
-    // Returns a wrapped ref for Swift interop (caller owns the returned ref).
-    // For C++ internal use, access link_refs() directly.
+    // Returns a wrapped ref for Swift interop. FRT path: heap pointer (nullptr
+    // when absent). Value path: by value, empty ref (isValid()==false) when
+    // absent — callers test isValid() instead of optional-unwrapping.
+#if LATTICE_HAS_FRT
     dynamic_object_ref* get_link_ref(const std::string& key) const
         SWIFT_NAME(getLinkRef(_:)) SWIFT_RETURNS_UNRETAINED {
         auto it = link_refs_.find(key);
         if (it == link_refs_.end() || !it->second) return nullptr;
         return dynamic_object_ref::wrap(it->second);
     }
+#else
+    dynamic_object_ref get_link_ref(const std::string& key) const
+        SWIFT_NAME(getLinkRef(_:)) {
+        auto it = link_refs_.find(key);
+        if (it == link_refs_.end() || !it->second)
+            return dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
+        return dynamic_object_ref::wrap(it->second);
+    }
+#endif
     bool has_link_ref(const std::string& key) const
         SWIFT_NAME(hasLinkRef(_:)) { return link_refs_.count(key) > 0; }
 
@@ -451,7 +463,7 @@ public:
     swift_config_(std::move(config))
     {
     }
-    
+
     // Construct with swift_configuration (includes row migration callback)
     swift_lattice(const swift_configuration& config, const SchemaVector& schemas);
     swift_lattice(swift_configuration&& config, const SchemaVector& schemas);
@@ -527,25 +539,29 @@ public:
     // Add with schema from the object instance
     void add(dynamic_object& obj);
     void add_preserving_global_id(dynamic_object& obj, const std::string& preserved_global_id);
-    void add(dynamic_object_ref* ref) {
-        add(*ref->impl_);
+    void add(const dynamic_object_ref& ref) {
+        add(*ref.impl_);
     }
-    void add(dynamic_object_ref* ref,
+    void add(const dynamic_object_ref& ref,
              cxx_error& err) {
         try {
-            add(*ref->impl_);
+            add(*ref.impl_);
         } catch (std::exception& e) {
             err = e;
         }
     }
-    
-    void add_preserving_global_id(dynamic_object_ref* ref, const std::string& preserved_global_id) {
-        add_preserving_global_id(*ref->impl_, preserved_global_id);
+
+    void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id) {
+        add_preserving_global_id(*ref.impl_, preserved_global_id);
     }
 
     void add_bulk(std::vector<dynamic_object>& objects);
     void add_bulk(std::vector<dynamic_object*>& objects);
+#if LATTICE_HAS_FRT
     void add_bulk(std::vector<dynamic_object_ref*>& objects);
+#else
+    void add_bulk(std::vector<dynamic_object_ref>& objects);
+#endif
     
     // Bulk add with schema from the first object instance
     std::vector<managed<swift_dynamic_object>> add_bulk(std::vector<swift_dynamic_object>&& objects) {
@@ -559,7 +575,7 @@ public:
 
     // Remove using the object's table name
     bool remove(dynamic_object&& obj);
-    bool remove(dynamic_object_ref* obj);
+    bool remove(const dynamic_object_ref& obj);
     
     bool remove(managed<swift_dynamic_object>& obj) {
         if (!obj.is_valid()) return false;
@@ -1953,14 +1969,18 @@ struct swift_table_changes {
 /// Uses column_value_t which Swift can work with via bridging
 class swift_migration_context_ref {
 public:
-    /// Create a migration context ref wrapping an existing context
+    /// Create a migration context ref wrapping an existing context.
+    /// All mutable state (the wrapped context pointer and the queued row
+    /// updates) lives behind one shared_ptr, so — like every other *_ref
+    /// handle — value-path copies alias the same state instead of forking it,
+    /// and the methods below can be const (importing non-mutating into Swift).
     explicit swift_migration_context_ref(migration_context* ctx)
-        : ctx_(ctx) {}
+        : state_(std::make_shared<state>(ctx)) {}
 
     /// Get all pending schema changes
     std::vector<swift_table_changes> pending_changes() const SWIFT_NAME(pendingChanges()) {
         std::vector<swift_table_changes> result;
-        for (const auto& tc : ctx_->pending_changes()) {
+        for (const auto& tc : state_->ctx->pending_changes()) {
             result.emplace_back(tc);
         }
         return result;
@@ -1968,12 +1988,12 @@ public:
 
     /// Check if a specific table has pending changes
     bool has_changes_for(const std::string& table_name) const SWIFT_NAME(hasChanges(for:)) {
-        return ctx_->has_changes_for(table_name);
+        return state_->ctx->has_changes_for(table_name);
     }
 
     /// Get pending changes for a specific table (returns empty if none)
     swift_table_changes changes_for(const std::string& table_name) const SWIFT_NAME(changes(for:)) {
-        auto* tc = ctx_->changes_for(table_name);
+        auto* tc = state_->ctx->changes_for(table_name);
         return tc ? swift_table_changes(*tc) : swift_table_changes();
     }
 #ifdef __BLOCKS__
@@ -1983,8 +2003,8 @@ public:
     void enumerate_objects(
         const std::string& table_name,
         void(^callback)(int64_t row_id, const std::unordered_map<std::string, column_value_t>& old_row)
-    ) SWIFT_NAME(enumerateObjects(table:callback:)) {
-        ctx_->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
+    ) const SWIFT_NAME(enumerateObjects(table:callback:)) {
+        state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
             // Get row_id
             int64_t row_id = 0;
             auto id_it = old_row.find("id");
@@ -2003,8 +2023,8 @@ public:
     void enumerate_objects(
         const std::string& table_name,
         std::function<void(int64_t row_id, const std::unordered_map<std::string, column_value_t>& old_row)> callback
-    ) SWIFT_NAME(enumerateObjects(table:callback:)) {
-        ctx_->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
+    ) const SWIFT_NAME(enumerateObjects(table:callback:)) {
+        state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
             // Get row_id
             int64_t row_id = 0;
             auto id_it = old_row.find("id");
@@ -2020,44 +2040,46 @@ public:
     /// Set a value for a row during migration
     /// Call this from within your enumeration callback to transform data
     void set_row_value(const std::string& table_name, int64_t row_id,
-                       const std::string& column_name, const column_value_t& value)
+                       const std::string& column_name, const column_value_t& value) const
         SWIFT_NAME(setRowValue(table:rowId:column:value:)) {
         // Queue the update for application after migration
-        pending_row_updates_[table_name][row_id][column_name] = value;
+        state_->pending_row_updates[table_name][row_id][column_name] = value;
     }
 
     /// Rename a property (copies old column value to new column name)
     void rename_property(const std::string& table_name,
                          const std::string& old_name,
-                         const std::string& new_name) SWIFT_NAME(renameProperty(table:from:to:)) {
-        ctx_->rename_property(table_name, old_name, new_name);
+                         const std::string& new_name) const SWIFT_NAME(renameProperty(table:from:to:)) {
+        state_->ctx->rename_property(table_name, old_name, new_name);
     }
 
     /// Delete all objects in a table
-    void delete_all(const std::string& table_name) SWIFT_NAME(deleteAll(table:)) {
-        ctx_->delete_all(table_name);
+    void delete_all(const std::string& table_name) const SWIFT_NAME(deleteAll(table:)) {
+        state_->ctx->delete_all(table_name);
     }
 
     /// Execute raw SQL for complex migrations
-    void execute_sql(const std::string& sql) SWIFT_NAME(executeSQL(_:)) {
-        ctx_->execute_sql(sql);
+    void execute_sql(const std::string& sql) const SWIFT_NAME(executeSQL(_:)) {
+        state_->ctx->execute_sql(sql);
     }
 
     /// Query raw SQL for reading data
-    std::vector<std::unordered_map<std::string, column_value_t>> query_sql(const std::string& sql)
+    std::vector<std::unordered_map<std::string, column_value_t>> query_sql(const std::string& sql) const
         SWIFT_NAME(querySQL(_:)) {
-        return ctx_->query_sql(sql);
+        return state_->ctx->query_sql(sql);
     }
 
+#if LATTICE_HAS_FRT
     // For SWIFT_SHARED_REFERENCE
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
+#endif
 
     // Apply pending row updates to the context
     // Called internally before migration context goes out of scope
-    void apply_row_updates() {
-        for (const auto& [table_name, rows] : pending_row_updates_) {
-            ctx_->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
+    void apply_row_updates() const {
+        for (const auto& [table_name, rows] : state_->pending_row_updates) {
+            state_->ctx->enumerate_objects(table_name, [&](const migration_row& old_row, migration_row& new_row) {
                 int64_t row_id = 0;
                 auto id_it = old_row.find("id");
                 if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
@@ -2075,11 +2097,22 @@ public:
     }
 
 private:
-    migration_context* ctx_;
+    // Shared state: the wrapped context + queued row updates
+    // (table_name -> row_id -> column_name -> value).
+    struct state {
+        explicit state(migration_context* c) : ctx(c) {}
+        migration_context* ctx;
+        std::unordered_map<std::string, std::unordered_map<int64_t, std::unordered_map<std::string, column_value_t>>> pending_row_updates;
+    };
+    std::shared_ptr<state> state_;
+#if LATTICE_HAS_FRT
     std::atomic<int> ref_count_{0};
-    // Pending row updates: table_name -> row_id -> column_name -> value
-    std::unordered_map<std::string, std::unordered_map<int64_t, std::unordered_map<std::string, column_value_t>>> pending_row_updates_;
+#endif
+#if LATTICE_HAS_FRT
 } SWIFT_SHARED_REFERENCE(retainSwiftMigrationContextRef, releaseSwiftMigrationContextRef);
+#else
+};
+#endif
 
 #ifdef __BLOCKS__
 /// Migration block type for Swift callbacks
@@ -2274,20 +2307,41 @@ inline void swift_lattice::close() {
 
 class swift_lattice_ref {
 public:
-    // Factory method - creates or reuses instance based on config path, with schemas
-    static swift_lattice_ref* create(const configuration& config, const SchemaVector& schemas) SWIFT_RETURNS_UNRETAINED {
+    // FRT path: the factories return a heap `swift_lattice_ref*` foreign
+    // reference. Value path (iOS 15): they return a `swift_lattice_ref` by value
+    // whose inner shared_ptr<swift_lattice> keeps the db alive. RefRet + _make +
+    // the UNRETAINED macro let every factory body stay single-source.
+#if LATTICE_HAS_FRT
+#  define LATTICE_SLREF_RET swift_lattice_ref*
+#  define LATTICE_SLREF_UNRETAINED SWIFT_RETURNS_UNRETAINED
+    static swift_lattice_ref* _make(std::shared_ptr<swift_lattice> impl) {
+        if (!impl) return nullptr;  // preserve nullptr-for-absent on the FRT path
         auto ref = new swift_lattice_ref();
-        ref->impl_ = get_or_create_shared(config, schemas);
+        ref->impl_ = impl;
         return ref;
+    }
+#else
+#  define LATTICE_SLREF_RET swift_lattice_ref
+#  define LATTICE_SLREF_UNRETAINED
+    static swift_lattice_ref _make(std::shared_ptr<swift_lattice> impl) {
+        swift_lattice_ref ref;
+        ref.impl_ = impl;
+        return ref;
+    }
+#endif
+
+    // Factory method - creates or reuses instance based on config path, with schemas
+    static LATTICE_SLREF_RET create(const configuration& config, const SchemaVector& schemas) LATTICE_SLREF_UNRETAINED {
+        return _make(get_or_create_shared(config, schemas));
     }
 
     // Factory for path-only config
-    static swift_lattice_ref* create_with_path(const std::string& path) SWIFT_RETURNS_UNRETAINED {
+    static LATTICE_SLREF_RET create_with_path(const std::string& path) LATTICE_SLREF_UNRETAINED {
         return create(configuration(path), {});
     }
 
     // Factory for in-memory
-    static swift_lattice_ref* create_in_memory() SWIFT_RETURNS_UNRETAINED {
+    static LATTICE_SLREF_RET create_in_memory() LATTICE_SLREF_UNRETAINED {
         return create(configuration(), {});
     }
 
@@ -2310,14 +2364,15 @@ public:
     ///     }
     /// }
     /// ```
-    static swift_lattice_ref* create_with_migration(
+    static LATTICE_SLREF_RET create_with_migration(
         const configuration& config,
         const SchemaVector& schemas,
         swift_migration_block_t migration_block
-    ) SWIFT_NAME(create(config:schemas:migration:)) SWIFT_RETURNS_UNRETAINED {
+    ) SWIFT_NAME(create(config:schemas:migration:)) LATTICE_SLREF_UNRETAINED {
         // Create a modified config with the migration block wrapped
         configuration new_config = config;
         new_config.migration_block = [migration_block](migration_context& ctx) {
+#if LATTICE_HAS_FRT
             // Wrap the C++ migration_context in a Swift-friendly ref
             auto* swift_ctx = new swift_migration_context_ref(&ctx);
             swift_ctx->retain();  // Keep alive during callback
@@ -2332,22 +2387,25 @@ public:
             if (swift_ctx->release()) {
                 delete swift_ctx;
             }
+#else
+            // Value-type path: the ref is a plain stack value; no retain/release.
+            swift_migration_context_ref swift_ctx(&ctx);
+            migration_block(&swift_ctx);
+            swift_ctx.apply_row_updates();
+#endif
         };
 
-        auto ref = new swift_lattice_ref();
-        ref->impl_ = get_or_create_shared(new_config, schemas);
-        return ref;
+        return _make(get_or_create_shared(new_config, schemas));
     }
     
-    static swift_lattice_ref* create(const swift_configuration& config,
+    static LATTICE_SLREF_RET create(const swift_configuration& config,
                                      const SchemaVector& schemas)
-    SWIFT_NAME(create(swiftConfig:schemas:)) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new swift_lattice_ref();
+    SWIFT_NAME(create(swiftConfig:schemas:)) LATTICE_SLREF_UNRETAINED {
         LOG_DEBUG("swift_lattice_ref", "create() start path=%s schemas=%zu", config.path.c_str(), schemas.size());
         LOG_DEBUG("swift_lattice_ref", "create() calling get_or_create_shared");
-        ref->impl_ = get_or_create_shared(config, schemas);
-        LOG_DEBUG("swift_lattice_ref", "create() done, impl=%p", ref->impl_.get());
-        return ref;
+        auto impl = get_or_create_shared(config, schemas);
+        LOG_DEBUG("swift_lattice_ref", "create() done, impl=%p", impl.get());
+        return _make(impl);
     }
 
     /// Factory method with swift_configuration (supports row migration callback).
@@ -2355,54 +2413,279 @@ public:
     /// The callback receives (table_name, old_row, new_row) where:
     /// - old_row: populated with current row data
     /// - new_row: should be filled with transformed data
-    static swift_lattice_ref* create(const swift_configuration& config,
+    static LATTICE_SLREF_RET create(const swift_configuration& config,
                                      const SchemaVector& schemas,
-                                     cxx_error& err) SWIFT_NAME(create(swiftConfig:schemas:error:)) SWIFT_RETURNS_UNRETAINED;
+                                     cxx_error& err) SWIFT_NAME(create(swiftConfig:schemas:error:)) LATTICE_SLREF_UNRETAINED;
 
 
     // Access the underlying swift_lattice (returns pointer for Swift interop)
     swift_lattice* get() { return impl_.get(); }
     const swift_lattice* get() const { return impl_.get(); }
 
+#if LATTICE_HAS_FRT
     // For SWIFT_SHARED_REFERENCE
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
+#endif
 
-    int64_t hash_value() {
+    // Whether this ref backs a real lattice (cross-path non-null signal; the
+    // value path returns an empty ref instead of nullptr).
+    bool valid() const SWIFT_NAME(isValid()) { return impl_ != nullptr; }
+
+    // const so it's callable on a `let` value-type ref below the FRT floor.
+    int64_t hash_value() const {
         return reinterpret_cast<intptr_t>(impl_.get());
     }
-    
+
     std::string path() const {
-        return impl_.get()->path();
+        return impl().path();
     }
+
+private:
+    // Single deref point for the forwarders below. Asserts (debug builds) on an
+    // empty ref: calling db ops on an invalid handle is a programmer error on
+    // both paths — the FRT factories return nullptr instead, and the value-path
+    // factories return an empty ref that callers must isValid()-check first.
+    swift_lattice& impl() const {
+        assert(impl_ && "swift_lattice_ref used while empty/invalid");
+        return *impl_;
+    }
+
+public:
+    // ---- Thin const forwarders to the underlying swift_lattice, so the db ops
+    //      are callable on this handle on both paths: on iOS 16.4+ it is a
+    //      foreign-reference class; below the floor it is a copyable value type
+    //      whose inner shared_ptr aliases the same db. `const` is load-bearing:
+    //      const member functions import into Swift as non-mutating, so the
+    //      Swift side can hold the handle in a `let` (shallow const — calling
+    //      non-const swift_lattice methods through the shared_ptr member is
+    //      legal in a const method). ----
+
+    // CRUD
+    void add(const dynamic_object_ref& ref, cxx_error& err) const { impl().add(ref, err); }
+    void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id) const {
+        impl().add_preserving_global_id(ref, preserved_global_id);
+    }
+#if LATTICE_HAS_FRT
+    void add_bulk(std::vector<dynamic_object_ref*>& objects) const { impl().add_bulk(objects); }
+#else
+    void add_bulk(std::vector<dynamic_object_ref>& objects) const { impl().add_bulk(objects); }
+#endif
+    bool remove(const dynamic_object_ref& obj) const { return impl().remove(obj); }
+
+    std::optional<managed<swift_dynamic_object>> object(int64_t primary_key, const std::string& table_name) const {
+        return impl().object(primary_key, table_name);
+    }
+    std::optional<managed<swift_dynamic_object>> object_by_global_id(const std::string& global_id, const std::string& table_name) const {
+        return impl().object_by_global_id(global_id, table_name);
+    }
+    std::vector<managed<swift_dynamic_object>> objects(
+        const std::string& table_name,
+        OptionalString where_clause = std::nullopt,
+        OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt,
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt) const {
+        return impl().objects(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
+    }
+    std::vector<managed<swift_dynamic_object>> union_objects(
+        const std::vector<std::string>& table_names,
+        OptionalString where_clause = std::nullopt,
+        OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt,
+        OptionalInt64 offset = std::nullopt) const {
+        return impl().union_objects(table_names, where_clause, order_by, limit, offset);
+    }
+    size_t count(const std::string& table_name,
+                 OptionalString where_clause,
+                 OptionalString group_by,
+                 OptionalString distinct_by) const {
+        return impl().count(table_name, where_clause, group_by, distinct_by);
+    }
+    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause) const {
+        return impl().delete_where(table_name, where_clause);
+    }
+
+    // Maintenance
+    void train_untrained_vec0_tables() const SWIFT_NAME(trainUntrainedVec0Tables()) { impl().train_untrained_vec0_tables(); }
+    void wait_for_vec0_training() const SWIFT_NAME(waitForVec0Training()) { impl().wait_for_vec0_training(); }
+    int64_t vacuum_vec0(const std::string& table, const std::string& column) const {
+        return impl().vacuum_vec0(table, column);
+    }
+    void vacuum() const { impl().vacuum(); }
+    int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
+        return impl().safe_compact_audit_log(stale_threshold_seconds);
+    }
+    int64_t force_compact_audit_log() const { return impl().force_compact_audit_log(); }
+    void backdate_replication_slots(int64_t seconds) const { impl().backdate_replication_slots(seconds); }
+    void checkpoint() const { impl().checkpoint(); }
+    void begin_transaction() const { impl().begin_transaction(); }
+    void commit() const { impl().commit(); }
+    void close() const { impl().close(); }
+
+    // Sync status
+    bool is_sync_agent() const { return impl().is_sync_agent(); }
+    bool is_sync_connected() const { return impl().is_sync_connected(); }
+    void clear_sync_filter() const { impl().clear_sync_filter(); }
+
+    // Spatial (R*Tree)
+    std::vector<managed<swift_dynamic_object>> objects_within_bbox(
+        const std::string& table_name,
+        const std::string& geo_column,
+        double min_lat, double max_lat,
+        double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt,
+        OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt,
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt) const
+        SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
+        return impl().objects_within_bbox(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+                                          where_clause, order_by, limit, offset, group_by);
+    }
+    int64_t count_within_bbox(
+        const std::string& table_name,
+        const std::string& geo_column,
+        double min_lat, double max_lat,
+        double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt) const
+        SWIFT_NAME(countWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
+        return impl().count_within_bbox(table_name, geo_column, min_lat, max_lat, min_lon, max_lon, where_clause);
+    }
+
+    // Combined proximity
+    CombinedQueryResultVector combined_nearest_query(
+        const std::string& table_name,
+        const BoundsConstraintVector& bounds,
+        const VectorConstraintVector& vectors,
+        const GeoConstraintVector& geos,
+        const TextConstraintVector& texts,
+        OptionalString where_clause,
+        const sort_descriptor& sort,
+        int64_t limit,
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt) const
+        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
+        return impl().combined_nearest_query(table_name, bounds, vectors, geos, texts,
+                                             where_clause, sort, limit, group_by, distinct_by);
+    }
+    int64_t combined_nearest_query_count(
+        const std::string& table_name,
+        const BoundsConstraintVector& bounds,
+        const VectorConstraintVector& vectors,
+        const GeoConstraintVector& geos,
+        const TextConstraintVector& texts,
+        OptionalString where_clause,
+        const sort_descriptor& sort,
+        int64_t limit,
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt) const
+        SWIFT_NAME(combinedNearestQueryCount(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
+        return impl().combined_nearest_query_count(table_name, bounds, vectors, geos, texts,
+                                                   where_clause, sort, limit, group_by, distinct_by);
+    }
+
+    // Attach another lattice's underlying handle. Takes a swift_lattice_ref so the
+    // argument is iOS-15-safe (vs the raw swift_lattice). On the FRT path the ref
+    // is a foreign-reference class (heap-only) so it must be passed by pointer; on
+    // the value path it's a plain value passed by copy (shares impl_).
+#if LATTICE_HAS_FRT
+    void attach(swift_lattice_ref* other) const { impl().attach(*other->get()); }
+#else
+    void attach(swift_lattice_ref other) const { impl().attach(*other.get()); }
+#endif
+
+    // Sync data ingestion
+    std::vector<std::string> receive_sync_data(const ByteVector& data) const { return impl().receive_sync_data(data); }
+    OptionalString last_receive_error() const { return impl().last_receive_error(); }
+
+    // Sync filter
+    void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }
+
+    // Observers
+    void remove_table_observer(const std::string& table_name, uint64_t observer_id) const {
+        impl().remove_table_observer(table_name, observer_id);
+    }
+    uint64_t add_table_observer(const std::string& table_name,
+                                void* context,
+                                void (*callback)(void* ctx,
+                                                 const char* const* operations,
+                                                 const int64_t* row_ids,
+                                                 const char* const* global_row_ids,
+                                                 size_t count),
+                                void (*destroy)(void*) = nullptr) const {
+        return impl().add_table_observer(table_name, context, callback, destroy);
+    }
+    uint64_t add_object_observer(const std::string& table_name,
+                                 int64_t row_id,
+                                 void* context,
+                                 void (*callback)(const char* changed_field_names, void* ctx),
+                                 void (*destroy)(void*) = nullptr) const {
+        return impl().add_object_observer(table_name, row_id, context, callback, destroy);
+    }
+    void remove_object_observer(const std::string& table_name, int64_t row_id, uint64_t observer_id) const {
+        impl().remove_object_observer(table_name, row_id, observer_id);
+    }
+
+    int64_t pending_sync_entry_count() const { return impl().pending_sync_entry_count(); }
+
+    // Sync callbacks (C trampolines)
+    void set_on_sync_progress(void* context,
+                              void (*callback)(void* ctx,
+                                               int64_t pending_upload,
+                                               int64_t total_upload,
+                                               int64_t acked,
+                                               int64_t received),
+                              void (*destroy)(void*) = nullptr) const {
+        impl().set_on_sync_progress(context, callback, destroy);
+    }
+    void set_on_sync_error(void* context,
+                           void (*callback)(void* ctx, const char* error, int64_t len),
+                           void (*destroy)(void*) = nullptr) const {
+        impl().set_on_sync_error(context, callback, destroy);
+    }
+    void set_on_sync_state_change(void* context,
+                                  void (*callback)(void* ctx, bool connected),
+                                  void (*destroy)(void*) = nullptr) const {
+        impl().set_on_sync_state_change(context, callback, destroy);
+    }
+    void set_on_xproc_idle(void* context,
+                           void (*callback)(void*),
+                           void (*destroy)(void*) = nullptr) const {
+        impl().set_on_xproc_idle(context, callback, destroy);
+    }
+
+    // INTERNAL C++ lookup: the shared db wrapper for a raw lattice_db*
+    // (nullptr when absent/not cached). dynamic_object holds this shared_ptr
+    // directly; the *_ref::getLattice accessors combine it with `_make` to mint
+    // a Swift-facing handle on demand (FRT: fresh unretained heap ref that
+    // Swift owns and frees; value path: a by-value copy).
+    static std::shared_ptr<swift_lattice> shared_for_lattice(lattice_db* lattice) {
+        if (!lattice)
+            return nullptr;
+        return detail::LatticeCache::instance().get_by_pointer(static_cast<swift_lattice*>(lattice));
+    }
+
 private:
     swift_lattice_ref() = default;
 
     std::shared_ptr<swift_lattice> impl_;
+#if LATTICE_HAS_FRT
     std::atomic<int> ref_count_{0};
+#endif
 
-public:
-    // Get or create a swift_lattice_ref for an existing lattice_db pointer
-    // Returns nullptr if the lattice was not created via swift_lattice_ref
-    static swift_lattice_ref* get_ref_for_lattice(lattice_db* lattice) SWIFT_RETURNS_UNRETAINED {
-        if (!lattice)
-            return nullptr;
-        auto* swift_lat = static_cast<swift_lattice*>(lattice);
-        auto shared = detail::LatticeCache::instance().get_by_pointer(swift_lat);
-        if (!shared)
-            return nullptr;
-
-        auto ref = new swift_lattice_ref();
-        ref->impl_ = shared;
-        return ref;
-    }
-
-private:
     // Delegate to LatticeCache - template to preserve config type
     static std::shared_ptr<swift_lattice> get_or_create_shared(const swift_configuration& config, const SchemaVector& schemas) {
         return detail::LatticeCache::instance().get_or_create(config, schemas);
     }
+#if LATTICE_HAS_FRT
 } SWIFT_SHARED_REFERENCE(retainSwiftLatticeRef, releaseSwiftLatticeRef);
+#else
+};
+#endif
+#undef LATTICE_SLREF_RET
+#undef LATTICE_SLREF_UNRETAINED
 
 // ============================================================================
 // Migration Lookup Functions
@@ -2421,7 +2704,10 @@ bool migration_lookup_by_global_id(const std::string& table_name, const std::str
     SWIFT_NAME(migrationLookupByGlobalId(table:globalId:));
 
 /// Take the result of the last successful migration_lookup call.
-/// Returns an empty ref if no lookup result is available.
+/// When no lookup result is available the FRT path returns nullptr (imports as
+/// nil) and the value path returns an empty by-value ref (isValid()==false) —
+/// Swift normalizes both through `_optRef`.
+#if LATTICE_HAS_FRT
 dynamic_object_ref* migration_take_lookup_result()
     SWIFT_NAME(migrationTakeLookupResult()) SWIFT_RETURNS_UNRETAINED;
 
@@ -2434,6 +2720,16 @@ dynamic_object_ref* migration_get_old_row()
 /// Only valid inside a setRowMigrationCallback callback.
 dynamic_object_ref* migration_get_new_row()
     SWIFT_NAME(migrationGetNewRow()) SWIFT_RETURNS_UNRETAINED;
+#else
+dynamic_object_ref migration_take_lookup_result()
+    SWIFT_NAME(migrationTakeLookupResult());
+
+dynamic_object_ref migration_get_old_row()
+    SWIFT_NAME(migrationGetOldRow());
+
+dynamic_object_ref migration_get_new_row()
+    SWIFT_NAME(migrationGetNewRow());
+#endif
 
 } // namespace lattice
 

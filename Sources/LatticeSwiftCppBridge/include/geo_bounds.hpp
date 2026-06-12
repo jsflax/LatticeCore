@@ -30,26 +30,9 @@ class geo_bounds_ref {
 public:
     using ManagedType = geo_bounds;
     
-    // Factory methods for heap allocation
-    static geo_bounds_ref* create() SWIFT_RETURNS_UNRETAINED {
-        auto ref = new geo_bounds_ref();
-        ref->impl_ = std::make_shared<geo_bounds>();
-        return ref;
-    }
+    // (No static factories: every producer — Swift's asRefType and the C++
+    // element proxies — uses the converting constructors below.)
 
-    static geo_bounds_ref* create(const std::string& table_name) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new geo_bounds_ref();
-        ref->impl_ = std::make_shared<geo_bounds>();
-//        ref->impl_->unmanaged_.table_name = table_name;
-        return ref;
-    }
-
-    static geo_bounds_ref* wrap(std::shared_ptr<geo_bounds> obj) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new geo_bounds_ref();
-        ref->impl_ = obj;
-        return ref;
-    }
-    
     geo_bounds_ref(managed<geo_bounds>& o) {
         impl_ = std::make_shared<geo_bounds>(o);
     }
@@ -57,21 +40,22 @@ public:
     geo_bounds_ref(const geo_bounds& o) {
         impl_ = std::make_shared<geo_bounds>(o);
     }
-//    
-//    swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY {
-//        return impl_->lattice;
-//    }
-    
     // Access the underlying dynamic_object
     geo_bounds* get() { return impl_.get(); }
     const geo_bounds* get() const { return impl_.get(); }
     
     // Get the shared_ptr (for storing in link_values)
     std::shared_ptr<geo_bounds> shared() const { return impl_; }
-    
+
+    // Whether this ref backs a real geo_bounds (cross-path non-null signal,
+    // same contract as the rest of the *_ref family).
+    bool valid() const SWIFT_NAME(isValid()) { return impl_ != nullptr; }
+
+#if LATTICE_HAS_FRT
     // For SWIFT_SHARED_REFERENCE
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
+#endif
 
 private:
     geo_bounds_ref() = default;
@@ -80,11 +64,15 @@ private:
     friend struct swift_lattice;
     friend struct geo_bounds_list;
     std::shared_ptr<geo_bounds> impl_;
+#if LATTICE_HAS_FRT
     std::atomic<int> ref_count_{0};
 
     friend void ::retainGeoBoundsRef(lattice::geo_bounds_ref* p);
     friend void ::releaseGeoBoundsRef(lattice::geo_bounds_ref* p);
 } SWIFT_SHARED_REFERENCE(retainGeoBoundsRef, releaseGeoBoundsRef);
+#else
+};
+#endif
 
 // MARK: - GeoBounds List
 // List of geo_bounds with managed/unmanaged union (like link_list for dynamic objects)
@@ -161,7 +149,11 @@ struct geo_bounds_list {
 
     // Proxy for element access with assignment support
     struct element_proxy {
+#if LATTICE_HAS_FRT
         using RefType = geo_bounds_ref*;
+#else
+        using RefType = geo_bounds_ref;
+#endif
 
         geo_bounds value;
         size_t idx;
@@ -171,7 +163,11 @@ struct geo_bounds_list {
         element_proxy& operator=(const geo_bounds& bounds);
 
         // For Swift protocol conformance
+#if LATTICE_HAS_FRT
         void assign(geo_bounds_ref* ref) SWIFT_NAME(assign(_:));
+#else
+        void assign(const geo_bounds_ref& ref) SWIFT_NAME(assign(_:));
+#endif
         RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY;
 
         // Access the underlying geo_bounds
@@ -234,36 +230,61 @@ private:
 // Reference-counted wrapper for Swift interop
 class geo_bounds_list_ref final {
 public:
-    using RefType = geo_bounds_ref*;
     using ElementProxy = geo_bounds_list::element_proxy;
-
-    static geo_bounds_list_ref* create() {
+    // Single-source factories (same pattern as swift_lattice_ref): FRT path
+    // heap-allocates; the iOS-15 value path returns by value — the inner
+    // shared_ptr carries ownership either way.
+#if LATTICE_HAS_FRT
+    using RefType = geo_bounds_ref*;
+#  define LATTICE_GBLREF_RET geo_bounds_list_ref*
+    static geo_bounds_list_ref* _make(std::shared_ptr<geo_bounds_list> impl) {
         auto ref = new geo_bounds_list_ref();
-        ref->impl_ = std::make_shared<geo_bounds_list>();
+        ref->impl_ = impl;
         return ref;
     }
-
-    static geo_bounds_list_ref* wrap(std::shared_ptr<geo_bounds_list> list) {
-        auto ref = new geo_bounds_list_ref();
-        ref->impl_ = list;
+#else
+    using RefType = geo_bounds_ref;
+#  define LATTICE_GBLREF_RET geo_bounds_list_ref
+    static geo_bounds_list_ref _make(std::shared_ptr<geo_bounds_list> impl) {
+        geo_bounds_list_ref ref;
+        ref.impl_ = impl;
         return ref;
     }
+#endif
 
-    static geo_bounds_list_ref* create(const managed<std::vector<geo_bounds*>>& m) {
-        auto ref = new geo_bounds_list_ref();
-        ref->impl_ = std::make_shared<geo_bounds_list>(m);
-        return ref;
+    static LATTICE_GBLREF_RET create() {
+        return _make(std::make_shared<geo_bounds_list>());
     }
+
+    static LATTICE_GBLREF_RET wrap(std::shared_ptr<geo_bounds_list> list) {
+        return _make(list);
+    }
+
+    static LATTICE_GBLREF_RET create(const managed<std::vector<geo_bounds*>>& m) {
+        return _make(std::make_shared<geo_bounds_list>(m));
+    }
+#undef LATTICE_GBLREF_RET
 
     geo_bounds_list* get() { return impl_.get(); }
     const geo_bounds_list* get() const { return impl_.get(); }
 
     std::shared_ptr<geo_bounds_list> shared() const { return impl_; }
 
+#if LATTICE_HAS_FRT
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
+#endif
 
-    swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY;
+#if LATTICE_HAS_FRT
+    // Fresh unretained heap ref per access; Swift retains and frees it.
+    swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY SWIFT_RETURNS_UNRETAINED;
+#else
+    // Value-type path: by value (see dynamic_object_ref::getLattice) — like
+    // every handle in the family, geo_bounds_list_ref compiles as a copyable
+    // value type below the FRT floor, and a pointer return would import as
+    // UnsafeMutablePointer.
+    swift_lattice_ref getLattice() const SWIFT_COMPUTED_PROPERTY;
+#endif
 
     std::string getLinkTableName() const SWIFT_COMPUTED_PROPERTY {
         return impl_->get_link_table_name();
@@ -276,23 +297,31 @@ public:
         return (*impl_)[idx];
     }
 
-    void push_back(const geo_bounds& bounds) {
+    // const (shallow): these mutate the pointee through the shared_ptr, so on
+    // the value path they import non-mutating and are callable on a `let`.
+    void push_back(const geo_bounds& bounds) const {
         impl_->push_back(bounds);
     }
 
-    void push_back(geo_bounds_ref* ref) SWIFT_NAME(pushBack(_:)) {
+#if LATTICE_HAS_FRT
+    void push_back(geo_bounds_ref* ref) const SWIFT_NAME(pushBack(_:)) {
         impl_->push_back(ref);
     }
+#else
+    void push_back(const geo_bounds_ref& ref) const SWIFT_NAME(pushBack(_:)) {
+        impl_->push_back(*ref.get());
+    }
+#endif
 
-    void erase(size_t idx) {
+    void erase(size_t idx) const {
         impl_->erase(idx);
     }
 
-    void clear() {
+    void clear() const {
         impl_->clear();
     }
 
-    void set(size_t idx, const geo_bounds& bounds) {
+    void set(size_t idx, const geo_bounds& bounds) const {
         impl_->set(idx, bounds);
     }
 
@@ -313,11 +342,15 @@ private:
     geo_bounds_list_ref() = default;
 
     std::shared_ptr<geo_bounds_list> impl_;
+#if LATTICE_HAS_FRT
     std::atomic<int> ref_count_{0};
 
     friend void ::retainGeoBoundsListRef(lattice::geo_bounds_list_ref* p);
     friend void ::releaseGeoBoundsListRef(lattice::geo_bounds_list_ref* p);
 } SWIFT_SHARED_REFERENCE(retainGeoBoundsListRef, releaseGeoBoundsListRef);
+#else
+};
+#endif
 
 }
 

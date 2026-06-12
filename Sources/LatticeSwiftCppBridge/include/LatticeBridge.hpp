@@ -58,6 +58,14 @@ using ManagedTimestamp = managed<timestamp_t>;
 using ManagedOptionalTimestamp = managed<std::optional<timestamp_t>>;
 using ManagedListTimestamp = managed<std::vector<timestamp_t>>;
 
+// Build a timestamp from seconds-since-epoch without going through Swift's
+// `Duration` (iOS 16+). Equivalent to the `Duration.seconds(_:)` bridge but
+// available on every deployment target, so the Date marshaling back-deploys.
+inline timestamp_t timestamp_from_seconds(double seconds) {
+    return timestamp_t(std::chrono::duration_cast<timestamp_t::duration>(
+        std::chrono::duration<double>(seconds)));
+}
+
 using ManagedData = managed<ByteVector>;
 using ManagedOptionalData = managed<std::optional<ByteVector>>;
 using ManagedListData = managed<std::vector<ByteVector>>;
@@ -79,6 +87,10 @@ using ManagedOptionalModel = managed<std::optional<swift_dynamic_object>>;
 using ModelVector = std::vector<swift_dynamic_object>;
 using DynamicObjectVector = std::vector<dynamic_object>;
 using DynamicObjectPtrVector = std::vector<dynamic_object*>;
+// FRT path: a vector of foreign-reference pointers. Value path (iOS 15):
+// dynamic_object_ref is a copyable value type, so the bulk vector holds values
+// directly (the inner shared_ptr keeps each object alive).
+#if LATTICE_HAS_FRT
 using DynamicObjectRefPtrVector = std::vector<dynamic_object_ref*>;
 
 // Helper function for Swift to push to vector
@@ -87,6 +99,13 @@ using DynamicObjectRefPtrVector = std::vector<dynamic_object_ref*>;
 inline void push_dynamic_object_ref(DynamicObjectRefPtrVector& vec, dynamic_object_ref* ptr) {
     vec.push_back(ptr);
 }
+#else
+using DynamicObjectRefPtrVector = std::vector<dynamic_object_ref>;
+
+inline void push_dynamic_object_ref(DynamicObjectRefPtrVector& vec, const dynamic_object_ref& r) {
+    vec.push_back(r);
+}
+#endif
 
 using OptionalManagedModel = std::optional<managed<swift_dynamic_object>>;
 

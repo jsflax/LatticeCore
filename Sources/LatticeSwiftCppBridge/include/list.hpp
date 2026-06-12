@@ -100,22 +100,30 @@ struct link_list {
     link_list(const managed<std::vector<swift_dynamic_object*>>& o);
     
     struct element_proxy {
+#if LATTICE_HAS_FRT
         using RefType = dynamic_object_ref*;
+#else
+        using RefType = dynamic_object_ref;
+#endif
         using ActualType = std::shared_ptr<dynamic_object>;
-        
+
         std::shared_ptr<dynamic_object> object;
         size_t idx;
         link_list* list;
 
-        element_proxy& operator=(dynamic_object_ref* o);
-        void assign(dynamic_object_ref* o) SWIFT_NAME(assign(_:)) { this->operator=(o); }
-        
+        element_proxy& operator=(const dynamic_object_ref& o);
+        void assign(const dynamic_object_ref& o) SWIFT_NAME(assign(_:)) { this->operator=(o); }
+
         // Access the underlying object
         std::shared_ptr<dynamic_object> operator->() { return object; }
         const std::shared_ptr<dynamic_object> operator->() const { return object; }
         operator dynamic_object&() { return *object; }
         operator const dynamic_object&() const { return *object; }
+#if LATTICE_HAS_FRT
         RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY SWIFT_RETURNS_UNRETAINED { return dynamic_object_ref::wrap(object); }
+#else
+        RefType getObjectRef() const SWIFT_COMPUTED_PROPERTY { return dynamic_object_ref::wrap(object); }
+#endif
     };
 
     // Element access
@@ -126,7 +134,7 @@ struct link_list {
     bool empty() const;
 
     // Modifiers
-    void push_back(dynamic_object_ref* obj);
+    void push_back(const dynamic_object_ref& obj);
     void push_back(const swift_dynamic_object& obj);
     void erase(size_t idx);
     void clear();
@@ -195,28 +203,45 @@ class link_list_ref final {
 public:
     using UnmanagedType = swift_dynamic_object;
     using ManagedType = dynamic_object;
-    using RefType = dynamic_object_ref*;
     using ElementProxy = link_list::element_proxy;
-    
-    // Factory methods for heap allocation
-    static link_list_ref* create() SWIFT_NAME(create()) SWIFT_RETURNS_UNRETAINED  {
+    // Single-source factories (same pattern as swift_lattice_ref): FRT path
+    // heap-allocates (Swift imports an optional pointer, unretained); the
+    // iOS-15 value path returns by value — the inner shared_ptr carries
+    // ownership either way.
+#if LATTICE_HAS_FRT
+    using RefType = dynamic_object_ref*;
+#  define LATTICE_LLREF_RET link_list_ref*
+#  define LATTICE_LLREF_UNRETAINED SWIFT_RETURNS_UNRETAINED
+    static link_list_ref* _make(std::shared_ptr<link_list> impl) {
         auto ref = new link_list_ref();
-        ref->impl_ = std::make_shared<link_list>();
+        ref->impl_ = impl;
         return ref;
     }
-
-    static link_list_ref* wrap(std::shared_ptr<link_list> list) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new link_list_ref();
-        ref->impl_ = list;
+#else
+    using RefType = dynamic_object_ref;
+#  define LATTICE_LLREF_RET link_list_ref
+#  define LATTICE_LLREF_UNRETAINED
+    static link_list_ref _make(std::shared_ptr<link_list> impl) {
+        link_list_ref ref;
+        ref.impl_ = impl;
         return ref;
+    }
+#endif
+
+    static LATTICE_LLREF_RET create() SWIFT_NAME(create()) LATTICE_LLREF_UNRETAINED {
+        return _make(std::make_shared<link_list>());
+    }
+
+    static LATTICE_LLREF_RET wrap(std::shared_ptr<link_list> list) LATTICE_LLREF_UNRETAINED {
+        return _make(list);
     }
 
     // Create an owning link_list_ref from a managed vector
-    static link_list_ref* create(const managed<std::vector<swift_dynamic_object*>>& m) SWIFT_RETURNS_UNRETAINED {
-        auto ref = new link_list_ref();
-        ref->impl_ = std::make_shared<link_list>(m);
-        return ref;
+    static LATTICE_LLREF_RET create(const managed<std::vector<swift_dynamic_object*>>& m) LATTICE_LLREF_UNRETAINED {
+        return _make(std::make_shared<link_list>(m));
     }
+#undef LATTICE_LLREF_RET
+#undef LATTICE_LLREF_UNRETAINED
 
     // Access the underlying link_list
     link_list* get() { return impl_.get(); }
@@ -225,12 +250,20 @@ public:
     // Get the shared_ptr
     std::shared_ptr<link_list> shared() const { return impl_; }
 
+#if LATTICE_HAS_FRT
     // For SWIFT_SHARED_REFERENCE
     void retain() { ref_count_++; }
     bool release() { return --ref_count_ == 0; }
+#endif
 
     // Delegate common operations to impl_
-    swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY;
+#if LATTICE_HAS_FRT
+    // Fresh unretained heap ref per access; Swift retains and frees it.
+    swift_lattice_ref* getLattice() const SWIFT_COMPUTED_PROPERTY SWIFT_RETURNS_UNRETAINED;
+#else
+    // Value-type path: by value (see dynamic_object_ref::getLattice).
+    swift_lattice_ref getLattice() const SWIFT_COMPUTED_PROPERTY;
+#endif
 
     std::string getLinkTableName() const SWIFT_COMPUTED_PROPERTY {
         return impl_->get_link_table_name();
@@ -243,19 +276,21 @@ public:
         return (*impl_)[idx];
     }
 
-    void push_back(dynamic_object_ref* obj) SWIFT_NAME(pushBack(_:)) {
+    // const (shallow): these mutate the pointee through the shared_ptr, so on
+    // the value path they import non-mutating and are callable on a `let`.
+    void push_back(const dynamic_object_ref& obj) const SWIFT_NAME(pushBack(_:)) {
         impl_->push_back(obj);
     }
 
-    void push_back(const swift_dynamic_object& obj) {
+    void push_back(const swift_dynamic_object& obj) const {
         impl_->push_back(obj);
     }
 
-    void erase(size_t idx) {
+    void erase(size_t idx) const {
         impl_->erase(idx);
     }
 
-    void clear() {
+    void clear() const {
         impl_->clear();
     }
 
@@ -280,11 +315,15 @@ private:
     link_list_ref() = default;
 
     std::shared_ptr<link_list> impl_;
+#if LATTICE_HAS_FRT
     std::atomic<int> ref_count_{0};
 
     friend void ::retainLinkListRef(lattice::link_list_ref* p);
     friend void ::releaseLinkListRef(lattice::link_list_ref* p);
 } SWIFT_SHARED_REFERENCE(retainLinkListRef, releaseLinkListRef);
+#else
+};
+#endif
 
 using optional_size_t = std::optional<size_t>;
 using vec_size_t = std::vector<size_t>;

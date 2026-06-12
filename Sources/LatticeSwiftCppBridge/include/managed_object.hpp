@@ -5,6 +5,7 @@
 
 #include <array>
 #include <bridging.hpp>
+#include <memory>
 #include <string>
 #include <unmanaged_object.hpp>
 #include <LatticeCore.hpp>
@@ -17,6 +18,7 @@
 namespace lattice {
 
 class swift_lattice_ref;
+class swift_lattice;
 
 #define get_managed_field_fn(type) \
 template <> \
@@ -125,7 +127,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     
     swift_dynamic_object detach() const;
     
-    // Required by lattice_db::add/remove - returns schema from instance
+    // Required by db_.add/remove - returns schema from instance
     // For dynamic objects, schema comes from the source object
     static const model_schema& schema() {
         // This is a placeholder - actual schema is per-instance
@@ -386,8 +388,10 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
                         name, this->id_);
     }
     
-    swift_lattice_ref* lattice_ref() const;
-    
+    // Shared handle to the owning db wrapper (nullptr when not attached).
+    // Defined out-of-line in src/lattice.cpp where the LatticeCache is visible.
+    std::shared_ptr<swift_lattice> lattice_shared() const;
+
     friend struct dynamic_object;
     friend struct link_list;
 };

@@ -6,6 +6,7 @@
 #include <geo_bounds.hpp>
 
 // MARK: - Link List Ref retain/release for SWIFT_SHARED_REFERENCE
+#if LATTICE_HAS_FRT
 void retainLinkListRef(lattice::link_list_ref* p) {
     if (p) {
         p->retain();
@@ -19,6 +20,7 @@ void releaseLinkListRef(lattice::link_list_ref* p) {
         }
     }
 }
+#endif
 
 namespace lattice {
 
@@ -27,20 +29,28 @@ link_list::link_list(const managed<std::vector<swift_dynamic_object*>>& o) : lat
     lattice = static_cast<swift_lattice*>(managed_.lattice);
 }
 
-swift_lattice_ref* link_list_ref::getLattice() const SWIFT_COMPUTED_PROPERTY {
-   return swift_lattice_ref::get_ref_for_lattice(impl_->lattice);
+// Mint a Swift-facing db handle on demand (FRT: fresh unretained heap ref the
+// Swift side owns and frees; value path: by-value copy, empty when absent).
+#if LATTICE_HAS_FRT
+swift_lattice_ref* link_list_ref::getLattice() const {
+   return swift_lattice_ref::_make(swift_lattice_ref::shared_for_lattice(impl_->lattice));
 }
+#else
+swift_lattice_ref link_list_ref::getLattice() const {
+   return swift_lattice_ref::_make(swift_lattice_ref::shared_for_lattice(impl_->lattice));
+}
+#endif
 
-link_list::element_proxy& link_list::element_proxy::operator=(dynamic_object_ref* o) {
+link_list::element_proxy& link_list::element_proxy::operator=(const dynamic_object_ref& o) {
     if (list->lattice) {
-        if (o->is_managed()) {
-            list->managed_[idx] = &o->impl_->managed_;
+        if (o.is_managed()) {
+            list->managed_[idx] = &o.impl_->managed_;
         } else {
-            list->lattice->add(*o->impl_.get());
-            list->managed_[idx] = &o->impl_->managed_;
+            list->lattice->add(*o.impl_.get());
+            list->managed_[idx] = &o.impl_->managed_;
         }
     } else {
-        list->unmanaged_[idx] = o->shared();
+        list->unmanaged_[idx] = o.shared();
     }
     return *this;
 }
@@ -79,11 +89,11 @@ bool link_list::empty() const {
 }
 
 // Modifiers
-void link_list::push_back(dynamic_object_ref* obj) {
+void link_list::push_back(const dynamic_object_ref& obj) {
     if (lattice) {
-        if (obj->is_managed()) {
+        if (obj.is_managed()) {
             // Already managed - just add the link
-            managed_.push_back(&obj->impl_->managed_);
+            managed_.push_back(&obj.impl_->managed_);
         } else {
             // Not managed - add to database first, then link.
             // Wrap in a transaction so both AuditLog entries (child INSERT +
@@ -93,8 +103,8 @@ void link_list::push_back(dynamic_object_ref* obj) {
             bool own_txn = !db.is_in_transaction();
             if (own_txn) db.begin_transaction();
             try {
-                lattice->add(*obj->impl_.get());
-                managed_.push_back(&obj->impl_->managed_);
+                lattice->add(*obj.impl_.get());
+                managed_.push_back(&obj.impl_->managed_);
                 if (own_txn) db.commit();
             } catch (...) {
                 if (own_txn && db.is_in_transaction()) {
@@ -105,7 +115,7 @@ void link_list::push_back(dynamic_object_ref* obj) {
         }
     } else {
         // Store shared_ptr to keep the dynamic_object alive
-        unmanaged_.push_back(obj->shared());
+        unmanaged_.push_back(obj.shared());
     }
 }
 
@@ -261,6 +271,7 @@ geo_bounds_list::element_proxy& geo_bounds_list::element_proxy::operator=(const 
     return *this;
 }
 
+#if LATTICE_HAS_FRT
 void geo_bounds_list::element_proxy::assign(geo_bounds_ref* ref) {
     if (ref) {
         *this = *ref->get();
@@ -270,6 +281,17 @@ void geo_bounds_list::element_proxy::assign(geo_bounds_ref* ref) {
 geo_bounds_ref* geo_bounds_list::element_proxy::getObjectRef() const {
     return new geo_bounds_ref(value);
 }
+#else
+void geo_bounds_list::element_proxy::assign(const geo_bounds_ref& ref) {
+    if (ref.get()) {
+        *this = *ref.get();
+    }
+}
+
+geo_bounds_ref geo_bounds_list::element_proxy::getObjectRef() const {
+    return geo_bounds_ref(value);
+}
+#endif
 
 size_t geo_bounds_list::size() const {
     if (lattice) {
@@ -420,13 +442,21 @@ std::vector<size_t> geo_bounds_list::find_where(const std::string& sql_predicate
     return indices;
 }
 
-swift_lattice_ref* geo_bounds_list_ref::getLattice() const SWIFT_COMPUTED_PROPERTY {
-    return swift_lattice_ref::get_ref_for_lattice(impl_->lattice);
+// See link_list_ref::getLattice above — same on-demand mint.
+#if LATTICE_HAS_FRT
+swift_lattice_ref* geo_bounds_list_ref::getLattice() const {
+    return swift_lattice_ref::_make(swift_lattice_ref::shared_for_lattice(impl_->lattice));
 }
+#else
+swift_lattice_ref geo_bounds_list_ref::getLattice() const {
+    return swift_lattice_ref::_make(swift_lattice_ref::shared_for_lattice(impl_->lattice));
+}
+#endif
 
 }
 
 // MARK: - GeoBounds Ref retain/release for SWIFT_SHARED_REFERENCE
+#if LATTICE_HAS_FRT
 void retainGeoBoundsRef(lattice::geo_bounds_ref* p) {
     if (p) {
         p->retain();
@@ -455,3 +485,4 @@ void releaseGeoBoundsListRef(lattice::geo_bounds_list_ref* p) {
         }
     }
 }
+#endif

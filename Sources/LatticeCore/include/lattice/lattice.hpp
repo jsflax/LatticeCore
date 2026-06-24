@@ -409,11 +409,13 @@ struct configuration {
     migration_block_t migration_block;
 
     /// Read-only mode. When true:
-    /// - Database is opened with SQLITE_OPEN_READONLY
-    /// - No WAL mode (uses existing journal mode)
+    /// - Database is opened with a plain SQLITE_OPEN_READONLY connection that
+    ///   joins a concurrent writer's WAL (sees committed-but-not-yet-
+    ///   checkpointed rows). NOT immutable — immutable opens ignore the WAL,
+    ///   which is wrong for any live, WAL-backed Lattice database.
     /// - No table creation or schema changes
     /// - No sync, no change hooks
-    /// Use this for bundled template databases in app resources.
+    /// Use this for read-only/dynamic opens of live databases.
     bool read_only = false;
 
     /// Statement-level busy timeout (ms) for all connections of this database.
@@ -731,7 +733,7 @@ public:
     explicit lattice_db(const configuration& config, bool defer_sync = false)
         : config_(config)
         , db_(std::make_unique<database>(resolve_path(config),
-              config.read_only ? database::open_mode::read_only_immutable : database::open_mode::read_write,
+              config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
               config.busy_timeout_ms))
         , read_db_(config.read_only ? nullptr :
                    (config.path != ":memory:" && !config.is_sync_enabled() ? std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
@@ -2112,6 +2114,22 @@ public:
 
         // Generate fresh INSERT entries for all objects
         return generate_history();
+    }
+
+    /// Re-arm a synchronizer's filtered snapshot for a fresh peer: forget
+    /// per-sync upload tracking and filtered-set membership so the next
+    /// reconcile_sync_filter() re-synthesizes INSERTs for the full filtered
+    /// subset. Local data is untouched; upload volume stays proportional to
+    /// the filter, never the whole AuditLog.
+    ///
+    /// LIMITATION: _lattice_sync_set has no sync_id column, so its wipe is
+    /// global. Only safe when at most one FILTERED synchronizer exists on
+    /// this database (the Engram daemon topology). Callers gate on that.
+    void reset_sync_state(const std::string& sync_id) {
+        db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
+        db_->execute("DELETE FROM _lattice_sync_set");
+        db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0 WHERE sync_id = ?", {sync_id});
+        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state + sync set", sync_id.c_str());
     }
 
     /// Slot-aware compaction: deletes only AuditLog entries that ALL
@@ -6083,6 +6101,8 @@ inline void lattice_db::sync_now() {
 }
 
 inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
+    LOG_INFO("lattice_db", "update_sync_filter: %zu entries, wss=%d, ipc_syncs=%zu (db=%s)",
+             filter.size(), synchronizer_ ? 1 : 0, ipc_synchronizers_.size(), config_.path.c_str());
     if (synchronizer_) {
         synchronizer_->update_sync_filter(filter);
     }

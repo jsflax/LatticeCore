@@ -2585,11 +2585,9 @@ public:
     /// table/property accessors and the normal objects(table:)/count(table:)
     /// query surface.
     ///
-    /// NOTE: read-only uses immutable open mode, which does not consult the WAL.
-    /// A concurrent writer's uncheckpointed changes are therefore not visible;
-    /// point this at a checkpointed file (or have the writer checkpoint first).
-    /// WAL-aware read-only is a separate, larger change (it alters the shared
-    /// open path) deferred until it can be tested on its own.
+    /// The read-only connection is WAL-aware: it joins a concurrent writer's
+    /// WAL, so committed-but-not-yet-checkpointed rows ARE visible. Point it at a
+    /// live database directly — no checkpoint required.
     static LATTICE_SLREF_RET create_dynamic(const swift_configuration& config)
         SWIFT_NAME(createDynamic(config:)) LATTICE_SLREF_UNRETAINED {
         swift_configuration cfg = config;

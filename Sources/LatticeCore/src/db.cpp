@@ -14,15 +14,13 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
     int rc;
 
-    if (mode == open_mode::read_only_immutable) {
-        // Use URI mode with immutable=1 for truly immutable databases.
-        // This tells SQLite to skip WAL/journal file checks, which is required
-        // for bundled databases in app resources where -wal/-shm files don't exist.
-        flags |= SQLITE_OPEN_READONLY | SQLITE_OPEN_URI;
-        std::string uri = "file:" + path + "?immutable=1";
-        rc = sqlite3_open_v2(uri.c_str(), &db_, flags, nullptr);
-    } else if (mode == open_mode::read_only) {
-        // Regular read-only for WAL concurrent readers (no immutable flag)
+    if (mode == open_mode::read_only) {
+        // WAL-aware read-only reader: a plain SQLITE_OPEN_READONLY connection
+        // joins a concurrent writer's WAL and sees committed-but-not-yet-
+        // checkpointed rows. Never immutable=1 — that ignores the -wal entirely,
+        // which is wrong for any live, WAL-backed Lattice database. Modern SQLite
+        // (>=3.22) reads a read-only WAL database even on read-only media by
+        // falling back to a heap-memory wal-index, so this also covers bundled DBs.
         flags |= SQLITE_OPEN_READONLY;
         if (path.compare(0, 5, "file:") == 0) flags |= SQLITE_OPEN_URI;
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);

@@ -190,11 +190,22 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
         const property_descriptor& property = managed_.properties_.at(name);
         auto base = static_cast<model_base>(managed_);
         m.bind_to_parent(&base, property);
-        const auto& schema = lattice->get_properties_for_table(m->table_name());
-        for (auto& [name, column_type] : *schema) {
-            m->properties_[name] = column_type;
-            m->property_types_[name] = column_type.type;
-            m->property_names_.push_back(name);
+        // Nil to-one link: no related row exists. get_value() is null here, so
+        // m->table_name() (and the std::move(m) below) would dereference a null
+        // pointer. Return an empty (unmanaged) object instead — callers test
+        // is_managed()/hasLattice and treat that as "no linked object".
+        if (!m.has_value()) {
+            return dynamic_object{};
+        }
+        // Target table may be absent from the schema (e.g. a partially
+        // reconstructed dynamic schema); guard the deref.
+        const SwiftSchema* schema = lattice->get_properties_for_table(m->table_name());
+        if (schema) {
+            for (auto& [col_name, column_type] : *schema) {
+                m->properties_[col_name] = column_type;
+                m->property_types_[col_name] = column_type.type;
+                m->property_names_.push_back(col_name);
+            }
         }
         return std::move(m);
     } else {
@@ -202,6 +213,8 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
             return std::move(*unmanaged_.link_values.at(name));
         }
     }
+    // Unmanaged with no staged link value: no object.
+    return dynamic_object{};
 }
 
 // ============================================================================

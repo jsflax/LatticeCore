@@ -545,7 +545,59 @@ public:
         }
     }
 
+    // ---- Dynamic (schema-from-file) support --------------------------------
+    // These let a process open a `.lattice` file with NO compile-time model
+    // types and still query it via the ORM. The full SwiftSchema (property
+    // descriptors + constraints) is persisted into _lattice_meta on the DDL
+    // path; a dynamic open reads it back and rebuilds in-memory state with no
+    // DDL. See store_swift_schema_snapshot / reconstruct_swift_schema_from_db.
+
+    /// Serialize the Swift schema (full property descriptors + constraints) to
+    /// _lattice_meta. Called from the slow/DDL path of ensure_swift_tables,
+    /// inside its exclusive transaction, so the snapshot commits atomically
+    /// with the DDL it describes.
+    void store_swift_schema_snapshot(const SchemaVector& schemas);
+
+    /// Rebuild the SchemaVector from the persisted snapshot. Falls back to a
+    /// best-effort reconstruction from sqlite_master/_lattice_meta for
+    /// pre-snapshot databases (lossy: embedded-vs-string and union case detail
+    /// are not recoverable without the snapshot).
+    SchemaVector reconstruct_swift_schema_from_db();
+
+    /// Read-only open without compile-time types: reconstruct the schema from
+    /// the file and populate in-memory state (no DDL). Call once right after
+    /// constructing a read-only swift_lattice. Used by create_dynamic().
+    void open_dynamic() {
+        SchemaVector schemas = reconstruct_swift_schema_from_db();
+        populate_swift_in_memory_state(schemas);
+    }
+
+    /// Names of all user model tables known to a dynamically-opened lattice.
+    std::vector<std::string> dynamic_table_names() const
+        SWIFT_NAME(dynamicTableNames()) {
+        std::vector<std::string> out;
+        out.reserve(schemas_.size());
+        for (const auto& kv : schemas_) out.push_back(kv.first);
+        return out;
+    }
+
+    /// Property descriptors for a table, for building a dynamic schema in Swift.
+    std::vector<property_descriptor> dynamic_properties_for(const std::string& table_name) const
+        SWIFT_NAME(dynamicPropertiesFor(_:)) {
+        std::vector<property_descriptor> out;
+        auto it = schemas_.find(table_name);
+        if (it != schemas_.end()) {
+            out.reserve(it->second.size());
+            for (const auto& kv : it->second) out.push_back(kv.second);
+        }
+        return out;
+    }
+
 private:
+    /// Best-effort schema reconstruction for databases written before the
+    /// snapshot existed. Enumerates user tables from sqlite_master, reads column
+    /// types via PRAGMA table_info, and detects link / vec / fts / geo sidecars.
+    SchemaVector reconstruct_swift_schema_fallback();
     // Stored schemas for hydration
     std::unordered_map<std::string, SwiftSchema> schemas_;
     // Stored constraints per table
@@ -2202,18 +2254,46 @@ using swift_migration_block_t = std::function<void(swift_migration_context_ref*)
 // Cache key for swift_lattice_ref - defined at namespace scope to avoid
 // Swift-C++ interop issues with nested types
 namespace detail {
+    /// Deterministic fingerprint of a config's IPC targets (channel, socket
+    /// path, filter tables + WHERE clauses). Without this in the cache key, an
+    /// open WITHOUT ipc targets (e.g. a maintenance/compact connection) would
+    /// alias an existing instance WITH a live synchronizer — and vice versa —
+    /// silently dropping the requested config and accumulating sync progress
+    /// across logically separate sessions.
+    template <typename ConfigT>
+    inline std::string ipc_targets_fingerprint(const ConfigT& config) {
+        std::string fp;
+        for (const auto& t : config.ipc_targets) {
+            fp += t.channel;
+            if (t.socket_path) { fp += '@'; fp += *t.socket_path; }
+            if (t.sync_filter) {
+                fp += '[';
+                for (const auto& e : *t.sync_filter) {
+                    fp += e.table_name;
+                    if (e.where_clause) { fp += ':'; fp += *e.where_clause; }
+                    fp += ',';
+                }
+                fp += ']';
+            }
+            fp += ';';
+        }
+        return fp;
+    }
+
     struct LatticeRefCacheKey {
         std::string path;
         std::shared_ptr<scheduler> sched;
         std::string websocket_url;  // Include sync config in cache key
         std::string schema_hash;    // Hash of table names + property types
         int32_t schema_version;     // Target schema version (differentiates pre/post migration)
+        std::string ipc_fingerprint; // Channels + socket paths + sync filter (see ipc_targets_fingerprint)
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if (path != other.path) return path < other.path;
             if (websocket_url != other.websocket_url) return websocket_url < other.websocket_url;
             if (schema_hash != other.schema_hash) return schema_hash < other.schema_hash;
             if (schema_version != other.schema_version) return schema_version < other.schema_version;
+            if (ipc_fingerprint != other.ipc_fingerprint) return ipc_fingerprint < other.ipc_fingerprint;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -2227,6 +2307,7 @@ namespace detail {
             if (websocket_url != other.websocket_url) return false;
             if (schema_hash != other.schema_hash) return false;
             if (schema_version != other.schema_version) return false;
+            if (ipc_fingerprint != other.ipc_fingerprint) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -2280,7 +2361,7 @@ namespace detail {
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config)};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,
@@ -2387,6 +2468,17 @@ namespace detail {
             return nullptr;
         }
 
+        /// Register a bare-constructed instance (e.g. a dynamic/read-only open
+        /// that bypasses get_or_create) into ptr_cache_ only, so its managed
+        /// objects can resolve the owning lattice via get_by_pointer /
+        /// shared_for_lattice. NOT added to key_cache_: dynamic opens are not
+        /// shared or deduped by config key.
+        void register_pointer(const std::shared_ptr<swift_lattice>& inst) {
+            if (!inst) return;
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
+            ptr_cache_[inst.get()] = inst;
+        }
+
         /// Remove a swift_lattice from both caches so subsequent get_or_create()
         /// for the same path creates a fresh instance.
         void evict(swift_lattice* ptr) {
@@ -2485,6 +2577,30 @@ public:
     // Factory for in-memory
     static LATTICE_SLREF_RET create_in_memory() LATTICE_SLREF_UNRETAINED {
         return create(configuration(), {});
+    }
+
+    /// Factory for a generic, read-only "dynamic" open with NO compile-time
+    /// model types. Opens read-only (no DDL), reconstructs the schema from the
+    /// file, and populates in-memory state. Afterwards use the dynamic
+    /// table/property accessors and the normal objects(table:)/count(table:)
+    /// query surface.
+    ///
+    /// NOTE: read-only uses immutable open mode, which does not consult the WAL.
+    /// A concurrent writer's uncheckpointed changes are therefore not visible;
+    /// point this at a checkpointed file (or have the writer checkpoint first).
+    /// WAL-aware read-only is a separate, larger change (it alters the shared
+    /// open path) deferred until it can be tested on its own.
+    static LATTICE_SLREF_RET create_dynamic(const swift_configuration& config)
+        SWIFT_NAME(createDynamic(config:)) LATTICE_SLREF_UNRETAINED {
+        swift_configuration cfg = config;
+        cfg.read_only = true;
+        auto impl = std::make_shared<swift_lattice>(std::move(cfg));
+        // Register so managed objects hydrated from queries can resolve their
+        // owning lattice (managed::lattice_shared -> shared_for_lattice ->
+        // get_by_pointer). Bare make_shared bypasses get_or_create's cache.
+        detail::LatticeCache::instance().register_pointer(impl);
+        impl->open_dynamic();
+        return _make(impl);
     }
 
     /// Factory method with Swift migration block.
@@ -2631,6 +2747,17 @@ public:
         OptionalString distinct_by = std::nullopt) const {
         return impl().objects(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
     }
+
+    // Dynamic (schema-from-file) introspection — forwarders to the schema
+    // reconstructed by a dynamic open. See swift_lattice::open_dynamic.
+    std::vector<std::string> dynamic_table_names() const SWIFT_NAME(dynamicTableNames()) {
+        return impl().dynamic_table_names();
+    }
+    std::vector<property_descriptor> dynamic_properties_for(const std::string& table_name) const
+        SWIFT_NAME(dynamicPropertiesFor(_:)) {
+        return impl().dynamic_properties_for(table_name);
+    }
+
     std::vector<managed<swift_dynamic_object>> union_objects(
         const std::vector<std::string>& table_names,
         OptionalString where_clause = std::nullopt,

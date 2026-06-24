@@ -5,6 +5,7 @@
 #include <geo_bounds.hpp>
 #include <util.hpp>
 #include <LatticeBridge.hpp>
+#include <nlohmann/json.hpp>  // bundled in ../LatticeCore/include (header search path)
 
 // Thread-local state for migration lookup functions
 static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;
@@ -1135,6 +1136,11 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     store_fingerprint_marker(fp_key);
     store_fingerprint_marker(compute_core_fingerprint_key());
 
+    // Persist the full Swift schema so a later dynamic (no-types) open can
+    // rebuild it. Inside this exclusive transaction so it commits atomically
+    // with the DDL it describes.
+    store_swift_schema_snapshot(schemas);
+
     // All migrations and schema setup succeeded — commit the transaction.
     // If anything above threw, the transaction destructor rolls back instead.
     LOG_INFO("swift_lattice", "ensure_swift_tables: committing transaction");
@@ -1210,6 +1216,253 @@ void swift_lattice::populate_swift_in_memory_state(const SchemaVector& schemas) 
             }
         }
     }
+}
+
+// ===========================================================================
+// Dynamic schema snapshot: persist the full Swift schema (property descriptors
+// + constraints) so a later no-compile-time-types open can rebuild it. nlohmann
+// gives correct JSON escaping; enums are stored as stable string names so a
+// future reordering of the C++ enums can't corrupt an existing snapshot.
+// ===========================================================================
+namespace {
+
+const char* ct_name(column_type t) {
+    switch (t) {
+        case column_type::integer: return "integer";
+        case column_type::real:    return "real";
+        case column_type::text:    return "text";
+        case column_type::blob:    return "blob";
+    }
+    return "text";
+}
+column_type ct_from(const std::string& s) {
+    if (s == "integer") return column_type::integer;
+    if (s == "real")    return column_type::real;
+    if (s == "blob")    return column_type::blob;
+    return column_type::text;
+}
+const char* pk_name(property_kind k) {
+    switch (k) {
+        case property_kind::primitive:    return "primitive";
+        case property_kind::link:         return "link";
+        case property_kind::list:         return "list";
+        case property_kind::virtual_list: return "virtual_list";
+        case property_kind::virtual_link: return "virtual_link";
+        case property_kind::union_type:   return "union_type";
+    }
+    return "primitive";
+}
+property_kind pk_from(const std::string& s) {
+    if (s == "link")         return property_kind::link;
+    if (s == "list")         return property_kind::list;
+    if (s == "virtual_list") return property_kind::virtual_list;
+    if (s == "virtual_link") return property_kind::virtual_link;
+    if (s == "union_type")   return property_kind::union_type;
+    return property_kind::primitive;
+}
+
+nlohmann::json descriptor_to_json(const property_descriptor& d) {
+    nlohmann::json j;
+    j["type"] = ct_name(d.type);
+    j["kind"] = pk_name(d.kind);
+    j["nullable"] = d.nullable;
+    if (!d.target_table.empty()) j["target_table"] = d.target_table;
+    if (!d.link_table.empty())   j["link_table"]   = d.link_table;
+    if (d.is_vector)     j["is_vector"] = true;
+    if (d.is_geo_bounds) j["is_geo_bounds"] = true;
+    if (d.is_full_text)  j["is_full_text"] = true;
+    if (d.is_indexed)    j["is_indexed"] = true;
+    if (d.is_unique)     j["is_unique"] = true;
+    if (!d.column_name.empty()) j["column_name"] = d.column_name;
+    if (d.is_union) {
+        j["is_union"] = true;
+        nlohmann::json u;
+        u["union_table_name"] = d.union_desc.union_table_name;
+        nlohmann::json cases = nlohmann::json::array();
+        for (const auto& c : d.union_desc.cases) {
+            nlohmann::json cj;
+            cj["case_name"] = c.case_name;
+            nlohmann::json vals = nlohmann::json::array();
+            for (const auto& v : c.values) {
+                nlohmann::json vj;
+                vj["param_name"] = v.param_name;
+                vj["type"] = ct_name(v.type);
+                vj["is_link"] = v.is_link;
+                if (!v.link_target.empty()) vj["link_target"] = v.link_target;
+                vals.push_back(std::move(vj));
+            }
+            cj["values"] = std::move(vals);
+            cases.push_back(std::move(cj));
+        }
+        u["cases"] = std::move(cases);
+        j["union_desc"] = std::move(u);
+    }
+    return j;
+}
+
+property_descriptor descriptor_from_json(const std::string& name, const nlohmann::json& j) {
+    property_descriptor d;
+    d.name = name;
+    d.type = ct_from(j.value("type", std::string("text")));
+    d.kind = pk_from(j.value("kind", std::string("primitive")));
+    d.nullable = j.value("nullable", false);
+    d.target_table = j.value("target_table", std::string());
+    d.link_table = j.value("link_table", std::string());
+    d.is_vector = j.value("is_vector", false);
+    d.is_geo_bounds = j.value("is_geo_bounds", false);
+    d.is_full_text = j.value("is_full_text", false);
+    d.is_indexed = j.value("is_indexed", false);
+    d.is_unique = j.value("is_unique", false);
+    d.column_name = j.value("column_name", std::string());
+    d.is_union = j.value("is_union", false);
+    if (d.is_union && j.contains("union_desc")) {
+        const auto& u = j["union_desc"];
+        d.union_desc.union_table_name = u.value("union_table_name", std::string());
+        if (u.contains("cases")) {
+            for (const auto& cj : u["cases"]) {
+                union_case c;
+                c.case_name = cj.value("case_name", std::string());
+                if (cj.contains("values")) {
+                    for (const auto& vj : cj["values"]) {
+                        union_case_value v;
+                        v.param_name = vj.value("param_name", std::string());
+                        v.type = ct_from(vj.value("type", std::string("text")));
+                        v.is_link = vj.value("is_link", false);
+                        v.link_target = vj.value("link_target", std::string());
+                        c.values.push_back(std::move(v));
+                    }
+                }
+                d.union_desc.cases.push_back(std::move(c));
+            }
+        }
+    }
+    return d;
+}
+
+} // anonymous namespace
+
+void swift_lattice::store_swift_schema_snapshot(const SchemaVector& schemas) {
+    nlohmann::json root;
+    root["format"] = 1;
+    root["version"] = swift_config_.target_schema_version;
+    nlohmann::json tables = nlohmann::json::array();
+    for (const auto& entry : schemas) {
+        nlohmann::json t;
+        t["name"] = entry.table_name;
+        nlohmann::json props = nlohmann::json::object();
+        for (const auto& [name, desc] : entry.properties) {
+            props[name] = descriptor_to_json(desc);
+        }
+        t["properties"] = std::move(props);
+        nlohmann::json constraints = nlohmann::json::array();
+        for (const auto& c : entry.constraints) {
+            nlohmann::json cj;
+            cj["columns"] = c.columns;
+            cj["allows_upsert"] = c.allows_upsert;
+            constraints.push_back(std::move(cj));
+        }
+        t["constraints"] = std::move(constraints);
+        tables.push_back(std::move(t));
+    }
+    root["tables"] = std::move(tables);
+    try {
+        db().execute(
+            "INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES('lattice_swift_schema', ?)",
+            { root.dump() });
+    } catch (const std::exception& e) {
+        LOG_WARN("swift_lattice", "store_swift_schema_snapshot failed: %s", e.what());
+    }
+}
+
+SchemaVector swift_lattice::reconstruct_swift_schema_from_db() {
+    std::string raw;
+    try {
+        auto rows = db().query("SELECT value FROM _lattice_meta WHERE key = 'lattice_swift_schema'");
+        if (!rows.empty()) {
+            const auto& v = rows[0].at("value");
+            if (std::holds_alternative<std::string>(v)) raw = std::get<std::string>(v);
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("swift_lattice", "schema snapshot read failed: %s", e.what());
+    }
+
+    if (!raw.empty()) {
+        try {
+            nlohmann::json root = nlohmann::json::parse(raw);
+            SchemaVector out;
+            if (root.contains("tables")) {
+                for (const auto& t : root["tables"]) {
+                    swift_schema_entry entry;
+                    entry.table_name = t.value("name", std::string());
+                    if (t.contains("properties")) {
+                        for (auto it = t["properties"].begin(); it != t["properties"].end(); ++it) {
+                            entry.properties[it.key()] = descriptor_from_json(it.key(), it.value());
+                        }
+                    }
+                    if (t.contains("constraints")) {
+                        for (const auto& cj : t["constraints"]) {
+                            swift_constraint c;
+                            c.columns = cj.value("columns", std::vector<std::string>{});
+                            c.allows_upsert = cj.value("allows_upsert", false);
+                            entry.constraints.push_back(std::move(c));
+                        }
+                    }
+                    out.push_back(std::move(entry));
+                }
+            }
+            if (!out.empty()) return out;
+        } catch (const std::exception& e) {
+            LOG_WARN("swift_lattice", "schema snapshot parse failed: %s; using fallback", e.what());
+        }
+    }
+    return reconstruct_swift_schema_fallback();
+}
+
+SchemaVector swift_lattice::reconstruct_swift_schema_fallback() {
+    // Best-effort for databases written before the snapshot existed: enumerate
+    // user model tables and expose their columns as PRIMITIVE properties. Link /
+    // embedded / union distinctions are NOT recoverable here (documented
+    // limitation) — a single open by a snapshot-aware build writes the snapshot
+    // and upgrades subsequent dynamic opens to full fidelity.
+    SchemaVector out;
+    std::vector<std::string> tables;
+    try {
+        auto rows = db().query("SELECT name FROM sqlite_master WHERE type='table'");
+        for (const auto& row : rows) {
+            auto it = row.find("name");
+            if (it == row.end() || !std::holds_alternative<std::string>(it->second)) continue;
+            const std::string& name = std::get<std::string>(it->second);
+            if (name.empty() || name[0] == '_') continue;        // internal + sidecar tables
+            if (name == "AuditLog") continue;                    // audit log
+            if (name.rfind("sqlite_", 0) == 0) continue;         // sqlite internal
+            tables.push_back(name);
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("swift_lattice", "fallback table enumeration failed: %s", e.what());
+        return out;
+    }
+    for (const auto& table : tables) {
+        swift_schema_entry entry;
+        entry.table_name = table;
+        try {
+            auto info = db().get_table_info(table);
+            for (const auto& [col, sql_type] : info) {
+                property_descriptor d;
+                d.name = col;
+                d.kind = property_kind::primitive;
+                if (sql_type == "INTEGER")   d.type = column_type::integer;
+                else if (sql_type == "REAL") d.type = column_type::real;
+                else if (sql_type == "BLOB") d.type = column_type::blob;
+                else                         d.type = column_type::text;
+                d.nullable = true;
+                entry.properties[col] = std::move(d);
+            }
+        } catch (const std::exception& e) {
+            LOG_WARN("swift_lattice", "fallback PRAGMA failed for %s: %s", table.c_str(), e.what());
+        }
+        out.push_back(std::move(entry));
+    }
+    return out;
 }
 
 void swift_lattice::dispatch_vec0_reconcile(const SchemaVector& schemas) {

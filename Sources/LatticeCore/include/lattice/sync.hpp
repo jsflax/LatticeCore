@@ -238,6 +238,14 @@ public:
     // Manual sync trigger (uploads pending changes)
     void sync_now();
 
+    /// Bounded flush before teardown: if connected, run one upload pass and
+    /// wait until all sent entries are ACKed or the deadline passes. Dropping
+    /// the last reference to a Lattice mid-write must not cut in-flight sync
+    /// entries — the daemon shutting down, a task-scoped instance going out
+    /// of scope, and the A→B handoff all rely on this.
+    /// Never blocks past `deadline`; returns immediately when disconnected.
+    void drain(std::chrono::steady_clock::time_point deadline);
+
     // Sync filter management
     void update_sync_filter(std::vector<sync_filter_entry> filter);
     void clear_sync_filter();

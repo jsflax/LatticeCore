@@ -5959,6 +5959,22 @@ namespace lattice {
 // ============================================================================
 
 inline void lattice_db::teardown_sync(bool fire_handoff) {
+    // Phase 0: Bounded drain — give connected synchronizers a short window to
+    // flush pending uploads and collect ACKs before disconnecting. Without
+    // this, dropping the last reference to a Lattice right after a write cuts
+    // the in-flight entry: the daemon shutting down, a task-scoped instance
+    // going out of scope, and the A→B sync handoff all lose data otherwise.
+    // The deadline is shared across all synchronizers so teardown latency is
+    // bounded regardless of how many are attached.
+    {
+        auto drain_deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(2000);
+        for (auto& ipc : ipc_synchronizers_) {
+            if (ipc.sync) ipc.sync->drain(drain_deadline);
+        }
+        if (synchronizer_) synchronizer_->drain(drain_deadline);
+    }
+
     // Phase 1: Disconnect ALL synchronizers (joins transport read threads,
     // removes AuditLog observers). This must complete for every synchronizer
     // BEFORE destroying any of them, because flush_changes() on one sync's

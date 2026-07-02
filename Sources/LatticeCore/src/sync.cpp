@@ -664,6 +664,31 @@ void synchronizer_base::sync_now() {
     upload_pending_changes();
 }
 
+void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
+    if (!is_connected_ || is_destroyed_) return;
+
+    // Run one upload pass on the scheduler so entries written since the last
+    // cycle are picked up and sent. The flag tells us the pass has actually
+    // executed — progress_pending_upload_ being 0 before that is meaningless.
+    auto pass_done = std::make_shared<std::atomic<bool>>(false);
+    scheduler_->invoke([this, pass_done] {
+        if (!is_destroyed_) upload_pending_changes();
+        pass_done->store(true, std::memory_order_release);
+    });
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (is_destroyed_ || !is_connected_) return;  // connection died — nothing to wait for
+        if (pass_done->load(std::memory_order_acquire) &&
+            progress_pending_upload_.load(std::memory_order_relaxed) <= 0) {
+            return;  // upload pass ran and everything sent has been ACKed
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    LOG_INFO("synchronizer", "[%s] drain: deadline reached with pending=%lld — disconnecting anyway",
+             config_.sync_id.c_str(),
+             (long long)progress_pending_upload_.load(std::memory_order_relaxed));
+}
+
 void synchronizer_base::on_websocket_open() {
     LOG_INFO("synchronizer", "[%s] on_websocket_open (this=%p, db=%s)",
              config_.sync_id.c_str(), (void*)this, db().config().path.c_str());

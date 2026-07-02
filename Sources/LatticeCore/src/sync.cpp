@@ -667,6 +667,23 @@ void synchronizer_base::sync_now() {
 void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
     if (!is_connected_ || is_destroyed_) return;
 
+    // Fast path: nothing sent-and-unACKed and no unsynchronized AuditLog
+    // entries at all — definitively idle, skip the scheduler round-trip.
+    // drain runs on the CALLER's thread during teardown: when dozens of
+    // instances tear down concurrently (test suites, bulk close), holding
+    // each caller in the poll loop just to learn "nothing to send" starves
+    // the calling thread pool. A false positive here (an entry pending for a
+    // different sync_id) falls through to the slow path, which resolves it.
+    bool maybe_pending = progress_pending_upload_.load(std::memory_order_relaxed) > 0;
+    if (!maybe_pending) {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        maybe_pending = !in_flight_ids_.empty();
+    }
+    if (!maybe_pending) {
+        auto rows = db().db().query("SELECT 1 FROM AuditLog WHERE isSynchronized = 0 LIMIT 1");
+        if (rows.empty()) return;
+    }
+
     // Run one upload pass on the scheduler so entries written since the last
     // cycle are picked up and sent. The flag tells us the pass has actually
     // executed — progress_pending_upload_ being 0 before that is meaningless.

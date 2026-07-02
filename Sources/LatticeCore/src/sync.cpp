@@ -608,9 +608,15 @@ void synchronizer_base::connect() {
              config_.sync_id.c_str(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
         // IPC or injected transport — connect without URL/headers.
-        // No auto-reconnect: IPC reconnection is handled at the endpoint
-        // level (server re-accepts, client retries via endpoint).
-        should_reconnect_ = false;
+        // Dialer-side IPC clients auto-reconnect with backoff (they redial
+        // the endpoint socket, picking up a restarted server). Server-accepted
+        // connections cannot redial — the accept loop replaces them — so their
+        // synchronizers never reconnect. (The old blanket `false` here left
+        // IPC clients permanently dead after a peer restart: the claimed
+        // "client retries via endpoint" path never existed.)
+        should_reconnect_ = ws_client_->supports_reconnect();
+        LOG_INFO("synchronizer", "[%s] IPC connect: supports_reconnect=%d",
+                 config_.sync_id.c_str(), should_reconnect_ ? 1 : 0);
         ws_client_->connect("", {});
         return;
     }
@@ -1577,6 +1583,10 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
 void synchronizer_base::schedule_reconnect() {
     bool within_limit = config_.max_reconnect_attempts == 0
         || reconnect_attempts_ < config_.max_reconnect_attempts;
+    if (!(should_reconnect_ && !is_connected_ && within_limit)) {
+        LOG_INFO("synchronizer", "[%s] schedule_reconnect: NOT reconnecting (should=%d connected=%d within_limit=%d)",
+                 config_.sync_id.c_str(), should_reconnect_ ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
+    }
     if (should_reconnect_ && !is_connected_ && within_limit) {
         double delay = std::min(
             std::pow(2.0, reconnect_attempts_) * config_.base_delay_seconds,

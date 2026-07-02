@@ -112,6 +112,12 @@ public:
     virtual void disconnect() = 0;
     virtual transport_state state() const = 0;
 
+    /// Whether this transport can re-establish its connection by calling
+    /// connect() again after a loss. True for endpoint dialers (WSS clients,
+    /// IPC socket dialers); false for server-accepted connections, which are
+    /// replaced by a fresh transport on the next accept.
+    virtual bool supports_reconnect() const { return true; }
+
     // Send message
     virtual void send(const transport_message& message) = 0;
 

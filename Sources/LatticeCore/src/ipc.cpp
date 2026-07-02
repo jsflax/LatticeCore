@@ -127,6 +127,13 @@ ipc_socket_client::ipc_socket_client(int accepted_fd)
     // This ensures the synchronizer can set callbacks before messages are processed.
 }
 
+ipc_socket_client::ipc_socket_client(int connected_fd, const std::string& socket_path)
+    : socket_path_(socket_path), fd_(connected_fd) {
+    // Same deferred-start semantics as the accepted-fd constructor, but the
+    // endpoint path is retained so a lost connection can be redialed
+    // (supports_reconnect() == true).
+}
+
 ipc_socket_client::~ipc_socket_client() {
     should_stop_ = true;
     close_fd();
@@ -264,8 +271,12 @@ void ipc_socket_client::start_read_loop() {
             auto payload = read_length_prefixed(fd_.load());
             if (payload.empty()) {
                 if (should_stop_) break;
-                // Connection lost
+                // Connection lost. Release the dead fd BEFORE announcing the
+                // close: a dialer's reconnect path re-enters connect(), which
+                // treats any fd_ >= 0 as a live server-accepted connection —
+                // leaving the dead fd in place would "reopen" a dead socket.
                 LOG_INFO("ipc", "read_length_prefixed returned empty, connection lost (fd=%d)", fd_.load());
+                close_fd();
                 state_ = transport_state::closed;
                 if (on_close_) on_close_(1006, "Connection lost");
                 return;
@@ -455,9 +466,11 @@ void ipc_endpoint::start(transport_ready_callback callback) {
                 bind_result = ::bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
                 // Fall through to bind_result check below
             } else {
-                // Live server — reuse the already-connected socket as the client.
+                // Live server — reuse the already-connected socket as the
+                // client, retaining the endpoint path so the transport can
+                // redial (auto-reconnect) if the server restarts.
                 suppress_sigpipe(sock);
-                client_ = std::make_unique<ipc_socket_client>(sock);
+                client_ = std::make_unique<ipc_socket_client>(sock, socket_path_);
                 callback(std::move(client_));
                 LOG_DEBUG("ipc_endpoint", "Channel '%s': acting as client to %s (reused probe fd=%d)",
                           channel_.c_str(), socket_path_.c_str(), sock);

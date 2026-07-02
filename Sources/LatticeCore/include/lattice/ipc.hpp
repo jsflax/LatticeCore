@@ -43,6 +43,12 @@ public:
     /// Construct by wrapping an already-accepted file descriptor (server side).
     explicit ipc_socket_client(int accepted_fd);
 
+    /// Construct from an already-connected fd WITH the endpoint path retained
+    /// (client side, when the endpoint's liveness probe already dialed the
+    /// server and the fd is reused). Keeping the path preserves redial
+    /// capability (supports_reconnect) after a connection loss.
+    ipc_socket_client(int connected_fd, const std::string& socket_path);
+
     ~ipc_socket_client() override;
 
     // Non-copyable
@@ -55,6 +61,11 @@ public:
     void disconnect() override;
     transport_state state() const override;
     void send(const transport_message& message) override;
+
+    /// Dialers (constructed with a socket path) can redial after a loss;
+    /// server-accepted wrappers (constructed from an fd) cannot — the accept
+    /// loop replaces them with a fresh transport on the next connection.
+    bool supports_reconnect() const override { return !socket_path_.empty(); }
 
     void set_on_open(on_open_handler handler) override;
     void set_on_message(on_message_handler handler) override;

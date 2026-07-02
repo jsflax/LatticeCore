@@ -136,7 +136,7 @@ using AuditLogEntryVector = std::vector<audit_log_entry>;
 // ============================================================================
 
 struct server_sent_event {
-    enum class type { audit_log, ack };
+    enum class type { audit_log, ack, replay_request };
 
     type event_type;
     std::vector<audit_log_entry> audit_logs;  // For audit_log type
@@ -155,6 +155,12 @@ struct server_sent_event {
 
     static server_sent_event make_ack(std::vector<std::string> ids) {
         return {type::ack, {}, std::move(ids)};
+    }
+
+    /// Fresh-peer catch-up request. IPC transports ONLY — never sent over WSS
+    /// (deployed servers on older protocol versions would fail to parse it).
+    static server_sent_event make_replay_request() {
+        return {type::replay_request, {}, {}};
     }
 };
 

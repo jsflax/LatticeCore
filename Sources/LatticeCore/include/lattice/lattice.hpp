@@ -2123,13 +2123,33 @@ public:
     /// the filter, never the whole AuditLog.
     ///
     /// LIMITATION: _lattice_sync_set has no sync_id column, so its wipe is
-    /// global. Only safe when at most one FILTERED synchronizer exists on
-    /// this database (the Engram daemon topology). Callers gate on that.
+    /// global. It is therefore SKIPPED whenever more than one replication
+    /// slot exists on this database (a hub with IPC + WSS, or multiple
+    /// channels) — wiping it there would corrupt the other synchronizers'
+    /// filtered-set membership and re-send/loop their data. The cost of
+    /// skipping: Phase 1 (removals) of the next reconcile sees stale set
+    /// rows and may emit redundant removals to the fresh peer, which are
+    /// harmless (the peer is empty). Single-sync databases (the Engram
+    /// daemon topology) keep the full re-arm.
     void reset_sync_state(const std::string& sync_id) {
         db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
-        db_->execute("DELETE FROM _lattice_sync_set");
+        auto slot_rows = db_->query("SELECT COUNT(*) AS n FROM _lattice_replication_slots");
+        int64_t slot_count = 0;
+        if (!slot_rows.empty()) {
+            auto it = slot_rows[0].find("n");
+            if (it != slot_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                slot_count = std::get<int64_t>(it->second);
+            }
+        }
+        if (slot_count <= 1) {
+            db_->execute("DELETE FROM _lattice_sync_set");
+        } else {
+            LOG_INFO("lattice_db", "reset_sync_state(%s): %lld replication slots — keeping global _lattice_sync_set",
+                     sync_id.c_str(), (long long)slot_count);
+        }
         db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0 WHERE sync_id = ?", {sync_id});
-        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state + sync set", sync_id.c_str());
+        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_set wiped: %s)",
+                 sync_id.c_str(), slot_count <= 1 ? "yes" : "no");
     }
 
     /// Slot-aware compaction: deletes only AuditLog entries that ALL

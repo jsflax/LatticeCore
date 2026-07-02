@@ -453,6 +453,9 @@ std::string server_sent_event::to_json() const {
             audit_array.push_back(json::parse(entry.to_json()));
         }
         j["auditLog"] = audit_array;
+    } else if (event_type == type::replay_request) {
+        j["kind"] = "replayRequest";
+        j["replayRequest"] = true;
     } else {
         j["kind"] = "ack";
         j["ack"] = acked_ids;
@@ -486,6 +489,11 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
                     event.acked_ids.push_back(id.get<std::string>());
                 }
             }
+            return event;
+
+        } else if (j.contains("replayRequest")) {
+            server_sent_event event;
+            event.event_type = type::replay_request;
             return event;
         }
     } catch (...) {
@@ -724,6 +732,19 @@ void synchronizer_base::on_websocket_open() {
 
         register_replication_slot(db().db(), config_.sync_id);
 
+        // Fresh-peer catch-up (IPC only — never on WSS, where the deployed
+        // server may not parse the event): if this side has never applied a
+        // remote entry, its DB is virgin for this channel. Ask the peer to
+        // re-arm its filtered snapshot so we receive the full filtered subset
+        // — without this, a recreated synced DB receives nothing because the
+        // peer's _lattice_sync_set still marks every row as already-synced.
+        if (config_.sync_id.rfind("ipc:", 0) == 0 && !get_last_received_event_id()) {
+            LOG_INFO("synchronizer", "[%s] fresh peer (no applied remote entries) — sending replay request",
+                     config_.sync_id.c_str());
+            auto req = server_sent_event::make_replay_request().to_json();
+            ws_client_->send(transport_message::from_binary({req.begin(), req.end()}));
+        }
+
         if (config_.sync_filter) {
             LOG_DEBUG("synchronizer", "Reconciling sync filter on connect...");
             reconcile_sync_filter();
@@ -755,7 +776,8 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 
         LOG_INFO("synchronizer", "[%s] on_transport_message: type=%s entries=%zu (this=%p, db=%s)",
                  config_.sync_id.c_str(),
-                 event->event_type == server_sent_event::type::audit_log ? "audit_log" : "ack",
+                 event->event_type == server_sent_event::type::audit_log ? "audit_log"
+                     : event->event_type == server_sent_event::type::replay_request ? "replay_request" : "ack",
                  event->event_type == server_sent_event::type::audit_log
                      ? event->audit_logs.size() : event->acked_ids.size(),
                  (void*)this, db().config().path.c_str());
@@ -808,6 +830,26 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 if (on_sync_complete_) {
                     on_sync_complete_(ids);
                 }
+            });
+
+        } else if (event->event_type == server_sent_event::type::replay_request) {
+            // Peer announced a fresh DB. Re-arm the filtered snapshot so
+            // reconcile re-synthesizes INSERTs for the filtered subset.
+            // Gated on having a filter: reset_sync_state's sync-set wipe is
+            // global, and an unfiltered sync has no synthesis path to re-send
+            // from anyway (see reset_sync_state's documented limitation).
+            scheduler_->invoke([this] {
+                if (is_destroyed_) return;
+                if (!config_.sync_filter) {
+                    LOG_INFO("synchronizer", "[%s] replay request ignored (no sync filter on this side)",
+                             config_.sync_id.c_str());
+                    return;
+                }
+                LOG_INFO("synchronizer", "[%s] replay request from fresh peer — re-arming filtered snapshot",
+                         config_.sync_id.c_str());
+                db().reset_sync_state(config_.sync_id);
+                reconcile_sync_filter();
+                upload_pending_changes();
             });
         }
     } catch (const std::exception& e) {
@@ -1043,6 +1085,12 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
         }
         config_.sync_filter = std::move(filter);
         reconcile_sync_filter();
+        // A filter change can make ALREADY-PENDING entries newly eligible
+        // (reconcile's Phase-2 dedup intentionally does not re-synthesize rows
+        // whose INSERT entries are still pending). Reconcile only uploads when
+        // it synthesized something, so kick the pipeline unconditionally —
+        // a no-op when nothing is pending.
+        upload_pending_changes();
     });
 }
 
@@ -1140,11 +1188,25 @@ void synchronizer_base::reconcile_sync_filter() {
                 col_names.push_back(col_name);
             }
 
-            // Batch-fetch all matching rows not in sync set
+            // Batch-fetch all matching rows not in sync set. Also skip rows
+            // that already have an INSERT entry still pending for THIS sync
+            // (compacted snapshot or a prior synthesis): synthesizing again
+            // would double-send — the pending entry already carries the row
+            // through the normal upload pipeline.
             std::string sql = "SELECT id, globalId, " + select_cols.str() +
                               " FROM " + fe.table_name +
-                              " WHERE globalId NOT IN (SELECT global_row_id FROM _lattice_sync_set WHERE table_name = ?)";
-            std::vector<column_value_t> params = {fe.table_name};
+                              " WHERE globalId NOT IN (SELECT global_row_id FROM _lattice_sync_set WHERE table_name = ?)"
+                              " AND globalId NOT IN ("
+                              "   SELECT a.globalRowId FROM AuditLog a"
+                              "   WHERE a.tableName = ?"
+                              "     AND a.operation = 'INSERT'"
+                              "     AND a.isSynchronized = 0"
+                              "     AND NOT EXISTS ("
+                              "       SELECT 1 FROM _lattice_sync_state ss"
+                              "       WHERE ss.audit_entry_id = a.id"
+                              "         AND ss.sync_id = ?"
+                              "         AND ss.is_synchronized = 1))";
+            std::vector<column_value_t> params = {fe.table_name, fe.table_name, config_.sync_id};
             if (fe.where_clause) {
                 sql += " AND (" + *fe.where_clause + ")";
             }

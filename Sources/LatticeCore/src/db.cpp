@@ -37,6 +37,15 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
         throw db_error("Failed to open database: " + error);
     }
 
+    // Statement-level busy timeout MUST be installed before ANY statement runs.
+    // It used to be set after the open-time pragmas, so the very first
+    // `PRAGMA journal_mode = WAL` had no busy handler — a concurrent open or
+    // an in-flight writer on the same file made it throw
+    // "database is locked" instantly instead of waiting. Instances now
+    // genuinely close and reopen (weak instance cache), so open-time races
+    // are common rather than exceptional.
+    sqlite3_busy_timeout(db_, busy_timeout_ms_);
+
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
 
@@ -60,10 +69,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     execute("PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #endif
 
-    // Statement-level busy timeout for lock contention. Configurable per
-    // database: headless processes default to kDefaultBusyTimeoutMs, interactive
-    // apps should pass a small value so a stuck writer can't hang the UI.
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);
+    // (busy timeout installed immediately after open, above — before the
+    // journal-mode/cache pragmas, which are themselves subject to locking.)
 
     if (mode == open_mode::read_write) {
         // No ANALYZE here: it scans every index (O(GB) on large databases) and

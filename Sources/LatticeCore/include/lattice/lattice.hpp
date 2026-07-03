@@ -751,6 +751,7 @@ public:
         if (!config.read_only) {
             LOG_DEBUG("lattice_db", "ensure_tables");
             ensure_tables();
+            heal_collapsed_sync_state();
             LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
             if (!defer_sync) {
@@ -765,6 +766,54 @@ public:
         LOG_DEBUG("lattice_db", "setup_cross_process_notifier");
         setup_cross_process_notifier();
         LOG_DEBUG("lattice_db", "ctor done");
+    }
+
+    /// One-time repair at open: collapse audit entries whose per-sync state
+    /// rows already cover every registered replication slot. Historic
+    /// binaries compared against a stale config snapshot instead of the live
+    /// slot registry, leaving entries marked-synced-but-never-collapsed —
+    /// which also made the passive pending count (sync progress UI) grow
+    /// forever. Safe by construction: only touches entries every live slot
+    /// has acknowledged.
+    void heal_collapsed_sync_state() {
+        if (!db().table_exists("_lattice_sync_state") ||
+            !db().table_exists("_lattice_replication_slots")) {
+            return;
+        }
+        try {
+            auto slot_rows = db().query(
+                "SELECT COUNT(*) AS cnt FROM _lattice_replication_slots", {});
+            int64_t slots = 0;
+            if (!slot_rows.empty()) {
+                auto it = slot_rows[0].find("cnt");
+                if (it != slot_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                    slots = std::get<int64_t>(it->second);
+                }
+            }
+            if (slots < 1) return;
+
+            db().begin_transaction();
+            db().execute(
+                "UPDATE AuditLog SET isSynchronized = 1 WHERE id IN ("
+                "  SELECT st.audit_entry_id FROM _lattice_sync_state st"
+                "  WHERE st.is_synchronized = 1"
+                "  GROUP BY st.audit_entry_id"
+                "  HAVING COUNT(DISTINCT st.sync_id) >= ?)",
+                {slots});
+            db().execute(
+                "DELETE FROM _lattice_sync_state WHERE audit_entry_id IN ("
+                "  SELECT audit_entry_id FROM _lattice_sync_state"
+                "  WHERE is_synchronized = 1"
+                "  GROUP BY audit_entry_id"
+                "  HAVING COUNT(DISTINCT sync_id) >= ?)",
+                {slots});
+            db().commit();
+        } catch (...) {
+            if (db().is_in_transaction()) {
+                try { db().rollback(); } catch (...) {}
+            }
+            LOG_WARN("lattice_db", "heal_collapsed_sync_state failed (non-fatal)");
+        }
     }
 
     ~lattice_db();

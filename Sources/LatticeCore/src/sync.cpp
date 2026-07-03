@@ -1569,6 +1569,28 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
     return result;
 }
 
+// Number of sync channels an audit entry must be marked synced for before it
+// collapses to AuditLog.isSynchronized=1. Uses the LIVE replication-slot
+// registry: the config snapshot (all_active_sync_ids) goes stale when a
+// configured sync never actually runs — production accumulated thousands of
+// marked-but-uncollapsed state rows (and a permanently wrong passive pending
+// count) because a snapshot listed a channel that never registered. Newly
+// configured syncs that haven't registered yet don't need audit-history
+// waiting: they bootstrap via reconcile/replay, not audit replay.
+static int64_t required_sync_count_for_collapse(lattice_db& db,
+                                                const std::vector<std::string>& all_active_sync_ids) {
+    auto rows = db.db().query("SELECT COUNT(*) AS cnt FROM _lattice_replication_slots", {});
+    int64_t live = 0;
+    if (!rows.empty()) {
+        auto it = rows[0].find("cnt");
+        if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+            live = std::get<int64_t>(it->second);
+        }
+    }
+    if (live >= 1) return live;
+    return std::max<int64_t>(1, static_cast<int64_t>(all_active_sync_ids.size()));
+}
+
 void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_synced) {
     if (to_mark_synced.empty()) return;
 
@@ -1604,7 +1626,7 @@ void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_
                     }
                 }
 
-                if (synced_count >= static_cast<int64_t>(config_.all_active_sync_ids.size())) {
+                if (synced_count >= required_sync_count_for_collapse(db(), config_.all_active_sync_ids)) {
                     db().db().execute(
                         "DELETE FROM _lattice_sync_state WHERE audit_entry_id = ?",
                         {entry_id});
@@ -2074,6 +2096,8 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
     notify_observers(db, notify_list);
 }
 
+
+
 void mark_audit_entries_synced_for(lattice_db& db,
                                    const std::vector<std::string>& global_ids,
                                    const std::string& sync_id,
@@ -2126,8 +2150,9 @@ void mark_audit_entries_synced_for(lattice_db& db,
                     }
                 }
 
-                if (synced_count >= static_cast<int64_t>(all_active_sync_ids.size())) {
-                    // All synchronizers have synced — clean up and collapse to isSynchronized=1
+                if (synced_count >= required_sync_count_for_collapse(db, all_active_sync_ids)) {
+                    // All registered synchronizers have synced — clean up and
+                    // collapse to isSynchronized=1
                     db.db().execute(
                         "DELETE FROM _lattice_sync_state WHERE audit_entry_id = ?",
                         {entry_id});

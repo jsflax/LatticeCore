@@ -793,8 +793,30 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             // Running apply_remote_changes on the IPC read thread causes
             // SQLite write contention (busy/locked) with the scheduler thread.
             auto entries = std::move(event->audit_logs);
+            // Defense in depth: filter-removal DELETEs arriving over a WSS hop
+            // are never applied (an old peer or relay may still forward them —
+            // unshare must not delete this device's local rows). They ARE
+            // acked below so the sender doesn't retry them forever.
+            std::vector<std::string> skipped_filter_removals;
+            if (config_.sync_id.rfind("wss:", 0) == 0) {
+                auto it = std::remove_if(entries.begin(), entries.end(),
+                    [&](const audit_log_entry& e) {
+                        bool marked = e.operation == "DELETE" &&
+                            std::find(e.changed_fields_names.begin(),
+                                      e.changed_fields_names.end(),
+                                      "__lattice_filter_removal") != e.changed_fields_names.end();
+                        if (marked) skipped_filter_removals.push_back(e.global_id);
+                        return marked;
+                    });
+                if (it != entries.end()) {
+                    LOG_INFO("synchronizer", "[%s] skipping %zu filter-removal DELETE(s) from WSS peer",
+                             config_.sync_id.c_str(), skipped_filter_removals.size());
+                    entries.erase(it, entries.end());
+                }
+            }
             auto entry_count = entries.size();
-            scheduler_->invoke([this, entries = std::move(entries), entry_count] {
+            scheduler_->invoke([this, entries = std::move(entries), entry_count,
+                                skipped_filter_removals = std::move(skipped_filter_removals)] {
                 if (is_destroyed_) {
                     LOG_INFO("synchronizer", "[%s] scheduler lambda: is_destroyed_, skipping apply of %zu entries",
                              config_.sync_id.c_str(), entry_count);
@@ -803,6 +825,10 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 LOG_INFO("synchronizer", "[%s] scheduler lambda: applying %zu entries (db=%s)",
                          config_.sync_id.c_str(), entries.size(), db().config().path.c_str());
                 auto applied_ids = apply_remote_changes(entries);
+                // Ack skipped filter-removals as if applied (see above).
+                applied_ids.insert(applied_ids.end(),
+                                   skipped_filter_removals.begin(),
+                                   skipped_filter_removals.end());
                 LOG_INFO("synchronizer", "[%s] apply_remote_changes returned %zu/%zu (db=%s)",
                          config_.sync_id.c_str(), applied_ids.size(), entries.size(),
                          db().config().path.c_str());
@@ -1150,10 +1176,15 @@ void synchronizer_base::reconcile_sync_filter() {
         std::string gid = std::get<std::string>(gid_it->second);
 
         if (current_matches.count(tn + '\0' + gid) == 0) {
+            // Marked as a filter removal: this DELETE means "stop syncing this
+            // row here", not "the user deleted it". It propagates at most one
+            // IPC hop (local -> the device's own synced DB) and never crosses
+            // a WSS hop — unshare must not become a fleet-wide delete on the
+            // user's other devices (see classify_entries / apply gates).
             db().db().execute(
                 "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
                 "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
-                "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[]', 0, 0)",
+                "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
                 {db().generate_global_id(), tn, gid});
             has_changes = true;
         }
@@ -1475,8 +1506,22 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
         }
 
         if (entry.operation == "DELETE") {
+            // Filter-removal DELETEs stop at the device's own synced DB: over
+            // IPC they remove the row from the local synced mirror, but they
+            // must never ride the WSS uplink — the server would relay them to
+            // the user's other devices and destroy their local copies.
+            bool is_filter_removal =
+                std::find(entry.changed_fields_names.begin(),
+                          entry.changed_fields_names.end(),
+                          "__lattice_filter_removal") != entry.changed_fields_names.end();
+            if (is_filter_removal && config_.sync_id.rfind("wss:", 0) == 0) {
+                // Still leave the shared set so a later filter-widen re-syncs
+                // the row via reconcile Phase 2.
+                cached_sync_set_remove(entry.table_name, entry.global_row_id);
+                result.to_mark_synced.push_back(entry.id);
+            }
             // Inline classify_delete with cached lookups
-            if (cached_sync_set_contains(entry.table_name, entry.global_row_id)) {
+            else if (cached_sync_set_contains(entry.table_name, entry.global_row_id)) {
                 result.to_send.push_back(entry);
                 cached_sync_set_remove(entry.table_name, entry.global_row_id);
             } else {

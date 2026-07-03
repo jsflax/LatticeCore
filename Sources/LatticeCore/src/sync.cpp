@@ -591,6 +591,12 @@ synchronizer_base::~synchronizer_base() {
              db().config().path.c_str());
     // Mark as destroyed so scheduled lambdas bail out.
     is_destroyed_ = true;
+    // Invalidate the ack-timeout guard before ANY teardown: the detached
+    // retry thread only touches `this` under this mutex while alive==true.
+    {
+        std::lock_guard<std::mutex> g(ack_guard_->m);
+        ack_guard_->alive = false;
+    }
     // Remove AuditLog observer
     if (audit_log_observer_id_ != 0) {
         db().remove_table_observer("AuditLog", audit_log_observer_id_);
@@ -1604,6 +1610,53 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
                   chunk.size(), json_str.substr(0, 200).c_str());
         ws_client_->send(transport_message::from_binary({json_str.begin(), json_str.end()}));
     }
+
+    // At-least-once delivery: a sent frame can vanish without any error —
+    // e.g. the peer registers its frame handlers a beat after the upgrade
+    // completes (WebSocketKit discards unhandled frames), or plain network
+    // loss. If these entries are still unACKed after the timeout, release
+    // them from in-flight and re-upload; applies are idempotent
+    // (ON CONFLICT(globalId) DO UPDATE), so re-delivery is safe.
+    //
+    // Runs on a detached thread, NOT the scheduler: ACK processing is
+    // serialized through the (single-threaded) scheduler, so a blocking
+    // wait there would deadlock its own exit condition. Lifetime is
+    // guarded by ack_guard_ (see its declaration).
+    std::vector<std::string> sent_ids;
+    sent_ids.reserve(entries.size());
+    for (const auto& e : entries) sent_ids.push_back(e.global_id);
+    std::thread([guard = ack_guard_, self = this, sent_ids = std::move(sent_ids)] {
+        constexpr auto kAckTimeout = std::chrono::seconds(10);
+        const auto deadline = std::chrono::steady_clock::now() + kAckTimeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> g(guard->m);
+                if (!guard->alive) return;
+                std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
+                bool any = false;
+                for (const auto& id : sent_ids) {
+                    if (self->in_flight_ids_.count(id)) { any = true; break; }
+                }
+                if (!any) return;  // everything ACKed
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::lock_guard<std::mutex> g(guard->m);
+        if (!guard->alive || !self->is_connected_) return;
+        size_t released = 0;
+        {
+            std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
+            for (const auto& id : sent_ids) released += self->in_flight_ids_.erase(id);
+        }
+        if (released > 0) {
+            LOG_WARN("synchronizer", "[%s] %zu entries unACKed after timeout — resending",
+                     self->config_.sync_id.c_str(), released);
+            self->scheduler_->invoke([self] {
+                if (self->is_destroyed_) return;
+                self->upload_pending_changes();
+            });
+        }
+    }).detach();
 }
 
 void synchronizer_base::upload_pending_changes() {

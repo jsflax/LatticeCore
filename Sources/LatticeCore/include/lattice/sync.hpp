@@ -244,6 +244,15 @@ public:
     // Manual sync trigger (uploads pending changes)
     void sync_now();
 
+    /// Liveness guard for the detached ack-timeout thread. The thread holds
+    /// a shared_ptr; the destructor flips `alive` under the mutex BEFORE
+    /// teardown, and the thread only touches the synchronizer while holding
+    /// the same mutex with alive==true — no use-after-free window.
+    struct ack_retry_guard {
+        std::mutex m;
+        bool alive = true;
+    };
+
     /// Bounded flush before teardown: if connected, run one upload pass and
     /// wait until all sent entries are ACKed or the deadline passes. Dropping
     /// the last reference to a Lattice mid-write must not cut in-flight sync
@@ -251,6 +260,8 @@ public:
     /// of scope, and the A→B handoff all rely on this.
     /// Never blocks past `deadline`; returns immediately when disconnected.
     void drain(std::chrono::steady_clock::time_point deadline);
+
+    std::shared_ptr<ack_retry_guard> ack_guard_ = std::make_shared<ack_retry_guard>();
 
     // Sync filter management
     void update_sync_filter(std::vector<sync_filter_entry> filter);

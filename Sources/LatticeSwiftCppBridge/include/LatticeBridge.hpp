@@ -128,6 +128,9 @@ class swift_lattice_ref;
 
 static std::optional<cxx_error> last_error_;
 
+// Swift-interop only (Apple blocks). Non-blocks compilers — the WASM
+// build — never call this; Swift is not in that graph.
+#ifdef __BLOCKS__
 void try_catch(void (^_try)(), void (^_catch)(cxx_error)) {
     try {
         _try();
@@ -135,6 +138,7 @@ void try_catch(void (^_try)(), void (^_catch)(cxx_error)) {
         _catch(e);
     }
 }
+#endif  // __BLOCKS__
 
 static std::optional<cxx_error> last_caught_error() {
     return last_error_;

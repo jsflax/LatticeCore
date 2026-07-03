@@ -1480,11 +1480,20 @@ void swift_lattice::dispatch_vec0_reconcile(const SchemaVector& schemas) {
         }
     }
     if (vec_props.empty()) return;
+#ifdef __EMSCRIPTEN__
+    // No threads in the browser build — std::launch::async would abort (and
+    // hangs the opening tab). Run inline: fresh DBs return immediately
+    // (vec table missing or counts match), and wasm datasets are small.
+    for (const auto& [table, prop] : vec_props) {
+        reconcile_vec0_gaps_for(table, prop);
+    }
+#else
     vec0_reconcile_future_ = std::async(std::launch::async, [this, vec_props]() {
         for (const auto& [table, prop] : vec_props) {
             reconcile_vec0_gaps_for(table, prop);
         }
     });
+#endif
 }
 
 void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std::string& prop) {

@@ -1667,6 +1667,11 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     // serialized through the (single-threaded) scheduler, so a blocking
     // wait there would deadlock its own exit condition. Lifetime is
     // guarded by ack_guard_ (see its declaration).
+    //
+    // Not on Emscripten: the WASM build has no pthreads. Browser clients
+    // forgo the client-side resend — a dropped frame is recovered on the
+    // next reconnect (tab visibility / socket cycle) instead.
+#ifndef __EMSCRIPTEN__
     std::vector<std::string> sent_ids;
     sent_ids.reserve(entries.size());
     for (const auto& e : entries) sent_ids.push_back(e.global_id);
@@ -1702,6 +1707,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
             });
         }
     }).detach();
+#endif  // !__EMSCRIPTEN__
 }
 
 void synchronizer_base::upload_pending_changes() {
@@ -1790,6 +1796,16 @@ void synchronizer_base::schedule_reconnect() {
                  config_.sync_id.c_str(), should_reconnect_ ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
     }
     if (should_reconnect_ && !is_connected_ && within_limit) {
+#ifdef __EMSCRIPTEN__
+        // The browser build is single-threaded (immediate_scheduler runs
+        // inline on the main thread): the blocking backoff below would freeze
+        // the tab AND prevent the async WebSocket handshake from ever
+        // completing. Browser clients reconnect at the app layer (tab
+        // visibility / reload) instead.
+        LOG_INFO("synchronizer", "[%s] schedule_reconnect: skipped on Emscripten (app-level reconnect)",
+                 config_.sync_id.c_str());
+        return;
+#endif
         double delay = std::min(
             std::pow(2.0, reconnect_attempts_) * config_.base_delay_seconds,
             config_.max_delay_seconds);

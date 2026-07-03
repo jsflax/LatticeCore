@@ -2981,11 +2981,6 @@ int64_t migration_lookup_backlinks(const std::string& child_table,
                                    const std::string& parent_global_id)
     SWIFT_NAME(migrationLookupBacklinks(childTable:parentTable:linkProperty:parentGlobalId:));
 
-/// Take result `index` from the last migration_lookup_backlinks call.
-/// Returns an empty ref when index is out of range.
-dynamic_object_ref* migration_take_backlink_result(int64_t index)
-    SWIFT_NAME(migrationTakeBacklinkResult(at:)) SWIFT_RETURNS_UNRETAINED;
-
 /// Take the result of the last successful migration_lookup call.
 /// When no lookup result is available the FRT path returns nullptr (imports as
 /// nil) and the value path returns an empty by-value ref (isValid()==false) —
@@ -2993,6 +2988,12 @@ dynamic_object_ref* migration_take_backlink_result(int64_t index)
 #if LATTICE_HAS_FRT
 dynamic_object_ref* migration_take_lookup_result()
     SWIFT_NAME(migrationTakeLookupResult()) SWIFT_RETURNS_UNRETAINED;
+
+/// Take result `index` from the last migration_lookup_backlinks call.
+/// Returns a wrapped empty ref when index is out of range — Swift
+/// normalizes through `_optRef` (same contract as the value path).
+dynamic_object_ref* migration_take_backlink_result(int64_t index)
+    SWIFT_NAME(migrationTakeBacklinkResult(at:)) SWIFT_RETURNS_UNRETAINED;
 
 /// Get the old row ref during a row migration callback.
 /// Only valid inside a setRowMigrationCallback callback.
@@ -3006,6 +3007,9 @@ dynamic_object_ref* migration_get_new_row()
 #else
 dynamic_object_ref migration_take_lookup_result()
     SWIFT_NAME(migrationTakeLookupResult());
+
+dynamic_object_ref migration_take_backlink_result(int64_t index)
+    SWIFT_NAME(migrationTakeBacklinkResult(at:));
 
 dynamic_object_ref migration_get_old_row()
     SWIFT_NAME(migrationGetOldRow());

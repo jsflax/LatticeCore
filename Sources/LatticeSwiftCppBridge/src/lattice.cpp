@@ -1728,6 +1728,49 @@ lattice::dynamic_object_ref* lattice::migration_take_lookup_result() {
     return dynamic_object_ref::wrap(result);
 }
 
+
+lattice::dynamic_object_ref* lattice::migration_take_backlink_result(int64_t index) {
+    if (index < 0 || index >= static_cast<int64_t>(g_migration_backlink_results.size())) {
+        return dynamic_object_ref::create();
+    }
+    return dynamic_object_ref::wrap(g_migration_backlink_results[static_cast<size_t>(index)]);
+}
+
+lattice::dynamic_object_ref* lattice::migration_get_old_row() {
+    return g_migration_old_row;
+}
+
+lattice::dynamic_object_ref* lattice::migration_get_new_row() {
+    return g_migration_new_row;
+}
+#else
+lattice::dynamic_object_ref lattice::migration_take_lookup_result() {
+    if (!g_migration_lookup_result) {
+        return dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));  // empty: isValid()==false
+    }
+    auto result = g_migration_lookup_result;
+    g_migration_lookup_result = nullptr;
+    return dynamic_object_ref::wrap(result);
+}
+
+lattice::dynamic_object_ref lattice::migration_get_old_row() {
+    return g_migration_old_row ? *g_migration_old_row
+                               : dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
+}
+
+lattice::dynamic_object_ref lattice::migration_get_new_row() {
+    return g_migration_new_row ? *g_migration_new_row
+                               : dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
+}
+
+lattice::dynamic_object_ref lattice::migration_take_backlink_result(int64_t index) {
+    if (index < 0 || index >= static_cast<int64_t>(g_migration_backlink_results.size())) {
+        return dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));  // empty: isValid()==false
+    }
+    return dynamic_object_ref::wrap(g_migration_backlink_results[static_cast<size_t>(index)]);
+}
+#endif
+
 int64_t lattice::migration_lookup_backlinks(const std::string& child_table,
                                             const std::string& parent_table,
                                             const std::string& link_property,
@@ -1782,41 +1825,6 @@ int64_t lattice::migration_lookup_backlinks(const std::string& child_table,
     }
     return static_cast<int64_t>(g_migration_backlink_results.size());
 }
-
-lattice::dynamic_object_ref* lattice::migration_take_backlink_result(int64_t index) {
-    if (index < 0 || index >= static_cast<int64_t>(g_migration_backlink_results.size())) {
-        return dynamic_object_ref::create();
-    }
-    return dynamic_object_ref::wrap(g_migration_backlink_results[static_cast<size_t>(index)]);
-}
-
-lattice::dynamic_object_ref* lattice::migration_get_old_row() {
-    return g_migration_old_row;
-}
-
-lattice::dynamic_object_ref* lattice::migration_get_new_row() {
-    return g_migration_new_row;
-}
-#else
-lattice::dynamic_object_ref lattice::migration_take_lookup_result() {
-    if (!g_migration_lookup_result) {
-        return dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));  // empty: isValid()==false
-    }
-    auto result = g_migration_lookup_result;
-    g_migration_lookup_result = nullptr;
-    return dynamic_object_ref::wrap(result);
-}
-
-lattice::dynamic_object_ref lattice::migration_get_old_row() {
-    return g_migration_old_row ? *g_migration_old_row
-                               : dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
-}
-
-lattice::dynamic_object_ref lattice::migration_get_new_row() {
-    return g_migration_new_row ? *g_migration_new_row
-                               : dynamic_object_ref::wrap(std::shared_ptr<dynamic_object>(nullptr));
-}
-#endif
 
 int lattice::migration_get_current_version() {
     return g_migration_current_version;

@@ -806,12 +806,26 @@ public:
     /// Logs the outcome — TRUNCATE checkpoints silently fail under concurrent
     /// readers, and an ignored rc is how multi-GB WAL files accumulate.
     void checkpoint() {
-        int nLog = 0, nCkpt = 0;
-        int rc = sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt);
-        if (rc != SQLITE_OK || (nLog >= 0 && nCkpt < nLog)) {
-            LOG_INFO("swift_lattice", "checkpoint(TRUNCATE): rc=%d, frames=%d, checkpointed=%d%s",
-                     rc, nLog, nCkpt,
-                     (rc == SQLITE_OK && nCkpt < nLog) ? " (partial — readers held the WAL)" : "");
+        // PRAGMA instead of sqlite3_wal_checkpoint_v2: on Linux this header is
+        // compiled in TUs that include sqlite3ext.h, where the C API names are
+        // macros over the undeclared sqlite3_api extension pointer. The pragma
+        // returns one row: (busy, log-frames, checkpointed-frames).
+        long long busy = 1, nLog = -1, nCkpt = -1;
+        try {
+            auto rows = db().query("PRAGMA wal_checkpoint(TRUNCATE)", {});
+            if (!rows.empty()) {
+                auto get = [&](const char* k) -> long long {
+                    auto it = rows[0].find(k);
+                    return (it != rows[0].end() && std::holds_alternative<int64_t>(it->second))
+                        ? std::get<int64_t>(it->second) : -1;
+                };
+                busy = get("busy"); nLog = get("log"); nCkpt = get("checkpointed");
+            }
+        } catch (...) { busy = 1; }
+        if (busy != 0 || (nLog >= 0 && nCkpt < nLog)) {
+            LOG_INFO("swift_lattice", "checkpoint(TRUNCATE): busy=%lld, frames=%lld, checkpointed=%lld%s",
+                     busy, nLog, nCkpt,
+                     (busy == 0 && nCkpt < nLog) ? " (partial — readers held the WAL)" : "");
         }
     }
 
@@ -820,7 +834,7 @@ public:
     /// processes should call this periodically — the automatic close-time
     /// optimize never runs when the process is killed.
     void optimize() {
-        sqlite3_exec(db().handle(), "PRAGMA optimize", nullptr, nullptr, nullptr);
+        try { db().execute("PRAGMA optimize", {}); } catch (...) {}
     }
 
     int64_t rebuild_vec0(const std::string& table, const std::string& column, int dims) {
@@ -838,7 +852,7 @@ public:
         // Disable WAL auto-checkpoint during training. compute-centroids writes
         // ~78K WAL frames; auto-checkpoint mid-write conflicts with read connections
         // holding stale snapshots, causing SQLITE_BUSY_SNAPSHOT.
-        sqlite3_wal_autocheckpoint(db().handle(), 0);
+        db().execute("PRAGMA wal_autocheckpoint=0", {});
         for (const auto& [table_name, schema] : schemas_) {
             for (const auto& [prop_name, prop] : schema) {
                 if (!prop.is_vector || prop.type != column_type::blob) continue;
@@ -848,9 +862,9 @@ public:
             }
         }
         // Re-enable auto-checkpoint, refresh read connections, then checkpoint.
-        sqlite3_wal_autocheckpoint(db().handle(), 1000);
+        db().execute("PRAGMA wal_autocheckpoint=1000", {});
         close_read_db();
-        sqlite3_wal_checkpoint_v2(db().handle(), nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        try { db().query("PRAGMA wal_checkpoint(TRUNCATE)", {}); } catch (...) {}
         reopen_read_db();
         LOG_INFO("train_untrained", "Training scan complete");
     }

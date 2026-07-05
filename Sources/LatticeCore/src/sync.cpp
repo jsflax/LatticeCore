@@ -899,6 +899,14 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
     LOG_ERROR("synchronizer", "[%s] WebSocket error: %s (this=%p, db=%s)",
               config_.sync_id.c_str(), error.c_str(), (void*)this, db().config().path.c_str());
 
+    // The transport is dead: mark disconnected BEFORE scheduling the
+    // reconnect. A transport error without a close event (connection reset
+    // mid-send) left is_connected_ true, so schedule_reconnect's
+    // !is_connected_ gate refused to reconnect and the synchronizer sat
+    // dead until a process restart (production: every drop needed a manual
+    // daemon kickstart).
+    is_connected_ = false;
+
     // Clear in-flight tracking so entries can be re-sent after reconnect.
     // Without this, entries added to in_flight_ids_ before the error remain
     // permanently stuck — query_pending_entries() filters them out, and the
@@ -1651,15 +1659,28 @@ void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_
 void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     if (entries.empty()) return;
 
-    // Track sent entries as in-flight
+    // Flow control: send at most a small window of chunks per invocation.
+    // Blasting the whole backlog (25 x 1MB frames in one burst) overran the
+    // server, which applies each frame synchronously on its socket's event
+    // loop — production reset the connection mid-burst. Entries beyond the
+    // window stay PENDING (not in-flight): when the window's ACKs drain the
+    // in-flight set, mark_as_synced re-invokes upload_pending_changes and the
+    // next window ships. The ack-timeout resend covers a lost window.
+    const size_t window_end = std::min(entries.size(), config_.chunk_size * 2);
+
+    // Track only the entries actually sent as in-flight.
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        for (const auto& e : entries) {
-            in_flight_ids_.insert(e.global_id);
+        for (size_t i = 0; i < window_end; ++i) {
+            in_flight_ids_.insert(entries[i].global_id);
         }
     }
+    if (window_end < entries.size()) {
+        LOG_INFO("synchronizer", "[%s] send window: %zu of %zu entries (rest pend on ACKs)",
+                 config_.sync_id.c_str(), window_end, entries.size());
+    }
 
-    for (size_t i = 0; i < entries.size(); i += config_.chunk_size) {
+    for (size_t i = 0; i < window_end; i += config_.chunk_size) {
         // Bail out early if connection dropped mid-send — remaining chunks
         // will be re-queried and sent on the next successful connection.
         if (!is_connected_) {
@@ -1668,7 +1689,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
             break;
         }
 
-        size_t end = std::min(i + config_.chunk_size, entries.size());
+        size_t end = std::min(i + config_.chunk_size, window_end);
         std::vector<audit_log_entry> chunk(entries.begin() + i, entries.begin() + end);
 
         auto event = server_sent_event::make_audit_log(chunk);
@@ -1677,6 +1698,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
                   chunk.size(), json_str.substr(0, 200).c_str());
         ws_client_->send(transport_message::from_binary({json_str.begin(), json_str.end()}));
     }
+    entries.resize(window_end);
 
     // At-least-once delivery: a sent frame can vanish without any error —
     // e.g. the peer registers its frame handlers a beat after the upgrade

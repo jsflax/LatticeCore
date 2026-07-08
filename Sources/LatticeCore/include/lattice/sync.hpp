@@ -15,6 +15,7 @@
 #include <memory>
 #include <atomic>
 #include <thread>
+#include <condition_variable>
 #include <variant>
 #include <unordered_map>
 #include <unordered_set>
@@ -190,6 +191,18 @@ struct sync_config {
     /// (open→error every cycle) re-arming ~1s reconnect storms.
     int64_t stable_connection_ms = 60'000;
 
+    /// Upload-tick coalescing window. The first request after an idle period
+    /// dispatches immediately (leading edge — zero added latency for isolated
+    /// writes and synchronous sync_now() semantics); further requests inside
+    /// the window collapse into ONE trailing-edge tick. 0 = legacy behavior:
+    /// every request dispatches its own scheduler pass — which, combined with
+    /// four zero-delay re-invocation sites, busy-spun the daemon at 90-160%
+    /// CPU. Engram sets WSS=750ms (each tick re-diffs the audit log; pacing
+    /// it is pure win) and IPC=50ms (relay stays effectively latency-free via
+    /// the leading edge). No pacer thread on Emscripten — requests degrade to
+    /// direct dispatch.
+    int upload_coalesce_ms = 0;
+
     /// Upload filter. nullopt = sync everything (default).
     /// Empty vector = sync nothing. Non-empty = whitelist.
     std::optional<std::vector<sync_filter_entry>> sync_filter;
@@ -321,6 +334,32 @@ protected:
     /// ≥ config_.stable_connection_ms. Called from on_websocket_close/error
     /// with was_open = is_connected_.exchange(false).
     void maybe_reset_backoff_after_stable_connection(bool was_open);
+
+    /// Coalesced upload trigger — replaces direct scheduler dispatch at the
+    /// hot re-invocation sites (observer, post-ACK, ack-timeout resend,
+    /// sync_now). Leading edge dispatches inline; in-window requests are
+    /// absorbed by the pacer thread's single trailing-edge tick. Thread-safe;
+    /// no-op after destruction begins.
+    void request_upload();
+
+    /// Consecutive ack-timeout failures (no ACK before the resend deadline).
+    /// Grows the resend deadline (10s, 20s, 40s… capped) so a stalled server
+    /// is not re-hammered with the same window at a fixed cadence. Reset on
+    /// any ACK.
+    std::atomic<int> ack_resend_failures_{0};
+
+#ifndef __EMSCRIPTEN__
+    // Pacer thread: owns trailing-edge coalescing. Started by init_sync when
+    // upload_coalesce_ms > 0; joined in the destructor BEFORE scheduler
+    // shutdown (it only ever enqueues to the scheduler, never blocks on it).
+    std::thread pacer_thread_;
+    std::mutex pacer_mutex_;
+    std::condition_variable pacer_cv_;
+    bool pacer_stop_ = false;
+    std::chrono::steady_clock::time_point next_allowed_tick_{};
+    void start_pacer();
+    void stop_pacer();
+#endif
     std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
 

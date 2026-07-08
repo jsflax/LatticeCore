@@ -521,6 +521,9 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     ws_client_ = factory->create_sync_transport();
     setup_transport_handlers();
     setup_observer();
+#ifndef __EMSCRIPTEN__
+    start_pacer();
+#endif
 }
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
@@ -533,7 +536,102 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
              config_.sync_id.c_str(), (void*)this, db().config().path.c_str(), (long long)n);
     setup_transport_handlers();
     setup_observer();
+#ifndef __EMSCRIPTEN__
+    start_pacer();
+#endif
 }
+
+void synchronizer_base::request_upload() {
+    if (is_destroyed_) return;
+#ifdef __EMSCRIPTEN__
+    // Single-threaded build: no pacer thread. Legacy immediate dispatch —
+    // without this, browser builds would never upload.
+    upload_requested_.store(true, std::memory_order_release);
+    scheduler_->invoke([this] {
+        if (is_destroyed_) return;
+        if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
+            upload_pending_changes();
+        }
+    });
+#else
+    if (config_.upload_coalesce_ms <= 0) {
+        // Legacy behavior: one dispatch per request, exchange-guarded so
+        // bursts still collapse to one pass per queued invoke.
+        upload_requested_.store(true, std::memory_order_release);
+        scheduler_->invoke([this] {
+            if (is_destroyed_) return;
+            if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
+                upload_pending_changes();
+            }
+        });
+        return;
+    }
+    bool fire_now = false;
+    {
+        std::lock_guard<std::mutex> lock(pacer_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_allowed_tick_) {
+            // Leading edge: dispatch immediately (inline enqueue on the
+            // requesting thread — preserves sync_now()'s synchronous
+            // semantics under immediate_scheduler and adds zero latency to
+            // isolated IPC writes) and open a coalescing window.
+            next_allowed_tick_ = now + std::chrono::milliseconds(config_.upload_coalesce_ms);
+            fire_now = true;
+        } else {
+            // In-window: absorbed into the pacer's single trailing-edge tick.
+            upload_requested_.store(true, std::memory_order_release);
+        }
+    }
+    if (fire_now) {
+        scheduler_->invoke([this] {
+            if (is_destroyed_) return;
+            upload_pending_changes();
+        });
+    } else {
+        pacer_cv_.notify_one();
+    }
+#endif
+}
+
+#ifndef __EMSCRIPTEN__
+void synchronizer_base::start_pacer() {
+    if (config_.upload_coalesce_ms <= 0) return;
+    pacer_thread_ = std::thread([this] {
+        std::unique_lock<std::mutex> lock(pacer_mutex_);
+        for (;;) {
+            pacer_cv_.wait(lock, [this] {
+                return pacer_stop_ || upload_requested_.load(std::memory_order_acquire);
+            });
+            if (pacer_stop_) return;
+            // Trailing edge: wait out the remainder of the window opened by
+            // the leading edge, then fire ONE coalesced tick for however many
+            // requests landed meanwhile.
+            while (!pacer_stop_ &&
+                   std::chrono::steady_clock::now() < next_allowed_tick_) {
+                pacer_cv_.wait_until(lock, next_allowed_tick_);
+            }
+            if (pacer_stop_) return;
+            if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
+                next_allowed_tick_ = std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(config_.upload_coalesce_ms);
+                scheduler_->invoke([this] {
+                    if (is_destroyed_) return;
+                    upload_pending_changes();
+                });
+            }
+        }
+    });
+}
+
+void synchronizer_base::stop_pacer() {
+    {
+        std::lock_guard<std::mutex> lock(pacer_mutex_);
+        pacer_stop_ = true;
+    }
+    pacer_cv_.notify_all();
+    if (pacer_thread_.joinable()) pacer_thread_.join();
+}
+#endif  // !__EMSCRIPTEN__
 
 void synchronizer_base::setup_transport_handlers() {
     ws_client_->set_on_open([this] { on_websocket_open(); });
@@ -574,13 +672,7 @@ void synchronizer_base::setup_observer() {
             if (any_unsynced_insert) {
                 LOG_DEBUG("synchronizer", "Requesting upload for entries pending on sync_id=%s",
                           config_.sync_id.c_str());
-                upload_requested_.store(true, std::memory_order_release);
-                scheduler_->invoke([this] {
-                    if (is_destroyed_) return;
-                    if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
-                        upload_pending_changes();
-                    }
-                });
+                request_upload();
             }
         });
 }
@@ -591,6 +683,12 @@ synchronizer_base::~synchronizer_base() {
              db().config().path.c_str());
     // Mark as destroyed so scheduled lambdas bail out.
     is_destroyed_ = true;
+#ifndef __EMSCRIPTEN__
+    // Stop the pacer BEFORE scheduler shutdown: it only enqueues to the
+    // scheduler (never blocks on it), and requests arriving after
+    // is_destroyed_ are no-ops, so join order is deadlock-free.
+    stop_pacer();
+#endif
     // Invalidate the ack-timeout guard before ANY teardown: the detached
     // retry thread only touches `this` under this mutex while alive==true.
     {
@@ -675,7 +773,12 @@ void synchronizer_base::disconnect() {
 }
 
 void synchronizer_base::sync_now() {
-    upload_pending_changes();
+    // Routed through request_upload: (a) inherits coalescing, (b) fixes a
+    // pre-existing hazard — the direct call ran the whole upload path on the
+    // caller's thread, unserialized with the scheduler that every other
+    // upload pass runs on. Under immediate_scheduler (tests) the leading
+    // edge dispatches inline, preserving synchronous semantics.
+    request_upload();
 }
 
 void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
@@ -1747,8 +1850,16 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     sent_ids.reserve(entries.size());
     for (const auto& e : entries) sent_ids.push_back(e.global_id);
     std::thread([guard = ack_guard_, self = this, sent_ids = std::move(sent_ids)] {
-        constexpr auto kAckTimeout = std::chrono::seconds(10);
-        const auto deadline = std::chrono::steady_clock::now() + kAckTimeout;
+        // Consecutive-failure backoff: a server that stalls (accepts frames,
+        // never ACKs) must not be re-hammered with the same window every 10s
+        // while each resend pass re-queries the audit log. 10s, 20s, 40s...
+        // capped at 5 min; reset to 10s by any ACK (mark_as_synced).
+        constexpr auto kAckTimeoutBase = std::chrono::seconds(10);
+        constexpr auto kAckTimeoutMax = std::chrono::minutes(5);
+        const int failures = self->ack_resend_failures_.load(std::memory_order_relaxed);
+        const auto timeout = std::min<std::chrono::steady_clock::duration>(
+            kAckTimeoutBase * (int64_t(1) << std::min(failures, 5)), kAckTimeoutMax);
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline) {
             {
                 std::lock_guard<std::mutex> g(guard->m);
@@ -1772,12 +1883,10 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
                 static_cast<int64_t>(self->in_flight_ids_.size()), std::memory_order_relaxed);
         }
         if (released > 0) {
-            LOG_WARN("synchronizer", "[%s] %zu entries unACKed after timeout — resending",
-                     self->config_.sync_id.c_str(), released);
-            self->scheduler_->invoke([self] {
-                if (self->is_destroyed_) return;
-                self->upload_pending_changes();
-            });
+            const int f = self->ack_resend_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+            LOG_WARN("synchronizer", "[%s] %zu entries unACKed after timeout — resending (consecutive failures: %d)",
+                     self->config_.sync_id.c_str(), released, f);
+            self->request_upload();
         }
     }).detach();
 #endif  // !__EMSCRIPTEN__
@@ -1804,14 +1913,11 @@ void synchronizer_base::upload_pending_changes() {
     mark_skipped_synced(classified.to_mark_synced);
     send_entries(classified.to_send);
 
-    // Tail-call: if new entries arrived during upload, re-schedule.
-    // Goes to back of scheduler queue — doesn't starve other work.
-    if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
-        scheduler_->invoke([this] {
-            if (is_destroyed_) return;
-            upload_pending_changes();
-        });
-    }
+    // No tail-call: requests that arrived during this pass were routed
+    // through request_upload(), which either queued its own scheduler pass
+    // (leading edge / legacy mode) or armed the pacer's trailing-edge tick.
+    // The old zero-delay tail-call was one of four sites that, combined,
+    // busy-spun the daemon.
 }
 
 std::vector<std::string> synchronizer_base::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
@@ -1850,11 +1956,10 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         should_upload = in_flight_ids_.empty();
     }
+    // ACKs mean the server is alive and consuming — reset the resend backoff.
+    ack_resend_failures_.store(0, std::memory_order_relaxed);
     if (should_upload) {
-        scheduler_->invoke([this] {
-            if (is_destroyed_) return;
-            upload_pending_changes();
-        });
+        request_upload();
     }
 }
 

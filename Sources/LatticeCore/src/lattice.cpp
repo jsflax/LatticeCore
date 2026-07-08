@@ -596,6 +596,9 @@ void lattice_db::setup_sync_if_configured() {
     auto all_ids = collect_all_sync_ids(config_);
     sync_cfg.sync_id = "wss:" + config_.websocket_url;
     sync_cfg.all_active_sync_ids = all_ids;
+    // WSS: every upload tick re-diffs the audit log and the server applies
+    // frames synchronously — coalesce bursts into ≤1 tick per window.
+    sync_cfg.upload_coalesce_ms = 750;
 
 #ifdef __EMSCRIPTEN__
     // Emscripten: single-threaded, so the synchronizer borrows our connection
@@ -723,6 +726,9 @@ void lattice_db::setup_ipc_if_configured() {
                 ipc_cfg.sync_id = sync_id;
                 ipc_cfg.all_active_sync_ids = all_ids;
                 ipc_cfg.sync_filter = target.sync_filter;
+                // IPC relay: the leading edge keeps isolated writes
+                // latency-free; 50ms only coalesces the 2nd+ event of a burst.
+                ipc_cfg.upload_coalesce_ms = 50;
 
                 // Create dedicated lattice_db for this IPC synchronizer
                 configuration ipc_db_config(config_.path,

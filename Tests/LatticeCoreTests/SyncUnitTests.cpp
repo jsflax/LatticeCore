@@ -1025,3 +1025,76 @@ TEST(Sync, WindowedCounterSanity) {
     (void)sent_before;
     sync.disconnect();
 }
+
+// ----------------------------------------------------------------------------
+// Throttle: a write burst coalesces into leading-edge + one trailing tick
+// ----------------------------------------------------------------------------
+
+TEST(Sync, ThrottleCoalescing) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"throttle"};
+    auto owned_db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    // The synchronizer takes ownership; the raw pointer stays valid for the
+    // test's lifetime and lets writes hit the AuditLog observer synchronously
+    // (no cross-process notification fuzz).
+    auto* db_ptr = owned_db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "throttle-sync";
+    cfg.all_active_sync_ids = {"throttle-sync"};
+    cfg.upload_coalesce_ms = 200;
+
+    lattice::synchronizer sync(std::move(owned_db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+    ASSERT_TRUE(sync.is_connected());
+
+    auto audit_frames = [&] {
+        size_t n = 0;
+        for (const auto& msg : mock_ws->get_sent_messages()) {
+            if (msg.as_string().find("\"auditLog\"") != std::string::npos) n++;
+        }
+        return n;
+    };
+    ASSERT_EQ(audit_frames(), 0u) << "empty DB must send nothing on connect";
+
+    // First write after idle: leading edge — must ship without waiting for
+    // the window.
+    db_ptr->add(TestPerson{"burst-0", 0, std::nullopt});
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        while (audit_frames() < 1 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    EXPECT_EQ(audit_frames(), 1u) << "leading edge did not fire immediately";
+
+    // Burst inside the window: all coalesce into ONE trailing-edge tick.
+    for (int i = 1; i < 10; ++i) {
+        db_ptr->add(TestPerson{"burst-" + std::to_string(i), i, std::nullopt});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // window 200 + slack
+
+    const auto frames = audit_frames();
+    EXPECT_GE(frames, 2u) << "trailing-edge tick never fired — burst entries stranded";
+    EXPECT_LE(frames, 3u) << "burst was not coalesced (" << frames << " audit frames for 10 writes; "
+                             "pre-fix behavior sent one pass per write)";
+
+    // Every entry must have shipped despite the coalescing.
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> ids;
+    for (const auto& msg : mock_ws->get_sent_messages()) {
+        auto s = msg.as_string();
+        for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+            ids.insert((*it)[1].str());
+        }
+    }
+    EXPECT_EQ(ids.size(), 10u) << "coalescing dropped entries";
+
+    sync.disconnect();
+}

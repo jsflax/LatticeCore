@@ -802,6 +802,14 @@ public:
         return lattice_db::generate_history();
     }
 
+    /// Process-global count of SQL statements issued through the database
+    /// layer's public funnels, across ALL connections and lattices. Exposed
+    /// for statement-budget regression tests (e.g. "a depth-1 recall issues
+    /// O(K+C+F) statements, not O(fields×K)").
+    static uint64_t total_sql_statement_count() SWIFT_NAME(totalSQLStatementCount()) {
+        return database::total_statement_count();
+    }
+
     /// Checkpoint the WAL file, flushing all changes to the main database file.
     /// Logs the outcome — TRUNCATE checkpoints silently fail under concurrent
     /// readers, and an ignored rc is how multi-GB WAL files accumulate.

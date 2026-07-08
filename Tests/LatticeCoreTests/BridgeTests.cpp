@@ -940,3 +940,157 @@ TEST(Bridge, UpsertRebindsToExistingRowAndAppendIsIdempotent) {
 }
 
 #endif // !__linux__
+
+// ============================================================================
+// Row cache — materialized reads (see dynamic_object.hpp contract)
+// ============================================================================
+
+namespace {
+lattice::property_descriptor nullable_text_prop(const std::string& name) {
+    lattice::property_descriptor desc;
+    desc.name = name;
+    desc.type = lattice::column_type::text;
+    desc.kind = lattice::property_kind::primitive;
+    desc.nullable = true;
+    return desc;
+}
+}  // namespace
+
+TEST(Bridge, RowCacheMaterializedReads) {
+    TempDB tmp{"rowcache"};
+    lattice::SchemaVector schemas = {
+        make_schema("RcPerson", {
+            {"name", text_prop("name")},
+            {"age", int_prop("age")},
+        })
+    };
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    ASSERT_NE(ref, nullptr);
+    auto& db = *ref->get();
+
+    {
+        auto sdo = make_sdo("RcPerson", schemas[0].properties);
+        sdo.values["name"] = std::string("Alice");
+        sdo.values["age"] = int64_t(30);
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+
+    auto results = db.objects("RcPerson");
+    ASSERT_EQ(results.size(), 1u);
+
+    // Materialized reads: the query already hydrated the row — ZERO further
+    // SQL for any number of property reads.
+    lattice::dynamic_object cached(results[0]);
+    cached.enable_row_cache();
+    const auto base = lattice::database::total_statement_count();
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(cached.get_string("name"), "Alice");
+        EXPECT_EQ(cached.get_int("age"), 30);
+    }
+    EXPECT_EQ(lattice::database::total_statement_count() - base, 0u)
+        << "materialized reads issued SQL";
+
+    // The live path (default) pays one statement per read — the recall
+    // N-statements pathology this exists to kill. Documents the contrast.
+    lattice::dynamic_object live(results[0]);
+    const auto live_base = lattice::database::total_statement_count();
+    for (int i = 0; i < 5; ++i) {
+        (void)live.get_string("name");
+        (void)live.get_int("age");
+    }
+    EXPECT_GE(lattice::database::total_statement_count() - live_base, 10u)
+        << "expected the live path to issue one statement per read";
+
+    // Write-through: DB row updates AND the cached read sees the new value.
+    cached.set_int("age", 31);
+    const auto after_write = lattice::database::total_statement_count();
+    EXPECT_EQ(cached.get_int("age"), 31);
+    EXPECT_EQ(lattice::database::total_statement_count() - after_write, 0u)
+        << "read-your-writes should be served from the cache";
+    auto verify = db.objects("RcPerson");
+    EXPECT_EQ(verify[0].get_int("age"), 31) << "write-through missed the DB";
+
+    delete ref;
+}
+
+TEST(Bridge, RowCacheSnapshotAndRefresh) {
+    TempDB tmp{"rowcache_refresh"};
+    lattice::SchemaVector schemas = {
+        make_schema("RcSnap", {
+            {"name", text_prop("name")},
+            {"age", int_prop("age")},
+        })
+    };
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    {
+        auto sdo = make_sdo("RcSnap", schemas[0].properties);
+        sdo.values["name"] = std::string("Snap");
+        sdo.values["age"] = int64_t(1);
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+    auto results = db.objects("RcSnap");
+    lattice::dynamic_object cached(results[0]);
+    cached.enable_row_cache();
+    ASSERT_EQ(cached.get_int("age"), 1);
+
+    // External write behind the object's back: the materialized object is a
+    // SNAPSHOT — stale until explicitly refreshed. That is the documented
+    // trade (and exactly what recall wants).
+    db.db().execute("UPDATE RcSnap SET age = 99");
+    EXPECT_EQ(cached.get_int("age"), 1) << "snapshot unexpectedly saw an external write";
+    cached.refresh_row_cache();
+    EXPECT_EQ(cached.get_int("age"), 99) << "refreshRowCache did not pick up the external write";
+
+    // Disabled → live reads again.
+    cached.disable_row_cache();
+    db.db().execute("UPDATE RcSnap SET age = 100");
+    EXPECT_EQ(cached.get_int("age"), 100);
+
+    delete ref;
+}
+
+TEST(Bridge, RowCacheNullRoundTrip) {
+    TempDB tmp{"rowcache_null"};
+    lattice::SchemaVector schemas = {
+        make_schema("RcOpt", {
+            {"name", text_prop("name")},
+            {"email", nullable_text_prop("email")},
+        })
+    };
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    {
+        auto sdo = make_sdo("RcOpt", schemas[0].properties);
+        sdo.values["name"] = std::string("Opt");
+        sdo.values["email"] = std::string("a@b.c");
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+    auto results = db.objects("RcOpt");
+    lattice::dynamic_object cached(results[0]);
+    cached.enable_row_cache();
+
+    const auto base = lattice::database::total_statement_count();
+    EXPECT_TRUE(cached.has_value("email"));
+    EXPECT_EQ(lattice::database::total_statement_count() - base, 0u);
+
+    // set_nil must write through: a cached read after setNil returning the
+    // stale value would be silent wrong-value corruption for optionals.
+    cached.set_nil("email");
+    EXPECT_FALSE(cached.has_value("email"))
+        << "cache returned stale non-nil after setNil";
+    // And back:
+    cached.set_field<std::string>("email", "x@y.z");
+    const auto reread = lattice::database::total_statement_count();
+    EXPECT_TRUE(cached.has_value("email"));
+    EXPECT_EQ(cached.get_string("email"), "x@y.z");
+    EXPECT_EQ(lattice::database::total_statement_count() - reread, 0u);
+
+    delete ref;
+}

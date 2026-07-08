@@ -95,18 +95,68 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
         lattice = managed_.lattice_shared();
     }
     
+    // ------------------------------------------------------------------
+    // Row cache (materialized reads)
+    //
+    // Every query path already hydrates the full row into
+    // managed_.source.values and then throws it away: each property get
+    // minted a fresh managed<T> and ran its own `SELECT col WHERE id=?`
+    // (~10-14 statements per object; Engram's recall paid ~300 statements
+    // per call, each scanning a WAL bloated by the sync daemon — 228s
+    // observed). Materialized mode serves gets from the hydrated snapshot.
+    //
+    // Contract:
+    // - Opt-in; default read path is bit-for-bit untouched.
+    // - A materialized object is a read SNAPSHOT as of hydration/refresh;
+    //   concurrent writers are invisible until refreshRowCache().
+    // - Fail-safe: any miss or variant/type mismatch falls through to the
+    //   live per-column read — slower, never wrong.
+    // - nullptr_t in the snapshot means KNOWN NULL (get falls through to the
+    //   live path's NULL convention; hasValue returns false); an ABSENT key
+    //   falls through entirely.
+    // - Writes are write-through and update the snapshot with exactly the
+    //   stored form (bool→int64 0/1, float→double — mirroring
+    //   managed<T>::operator=), so read-your-writes holds.
+    // - Links/lists/unions always use the live path (v1).
+    // ------------------------------------------------------------------
+
+    void enable_row_cache() SWIFT_NAME(enableRowCache()) {
+        if (!lattice) return;  // unmanaged objects are already value snapshots
+        if (managed_.source.values.empty()) refresh_row_cache();
+        row_cache_enabled_ = true;
+    }
+    void disable_row_cache() SWIFT_NAME(disableRowCache()) { row_cache_enabled_ = false; }
+    bool is_row_cache_enabled() const SWIFT_NAME(isRowCacheEnabled()) { return row_cache_enabled_; }
+    /// Re-fetch the full row in ONE statement (the staleness escape hatch).
+    void refresh_row_cache() SWIFT_NAME(refreshRowCache());
+
     bool has_value(const std::string& name) const SWIFT_NAME(hasValue(named:)) {
         if (lattice) {
+            if (row_cache_enabled_) {
+                auto it = managed_.source.values.find(name);
+                if (it != managed_.source.values.end()) {
+                    return !std::holds_alternative<std::nullptr_t>(it->second);
+                }
+                // absent → fall through to the live check
+            }
             return managed_.has_value(name);
         } else {
             return unmanaged_.has_value(name);
         }
         return true;
     }
-    
+
     template <typename T>
     T get_field(const std::string& name) const {
         if (lattice) {
+            if (row_cache_enabled_) {
+                auto it = managed_.source.values.find(name);
+                if (it != managed_.source.values.end()) {
+                    if (auto* v = std::get_if<T>(&it->second)) return *v;
+                    // KNOWN NULL or stored-type mismatch → live path decides
+                    // (NULL convention, affinity coercion) — never guess here.
+                }
+            }
             return managed_.get_managed_field<T>(name);
         } else {
             auto value = unmanaged_.get(name);
@@ -151,11 +201,34 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     void set_field(const std::string& name, const T& value) {
         if (lattice) {
             managed<T> field = managed_.get_managed_field<T>(name);
-            field = value;
+            field = value;  // DB write first — a throw must not poison the cache
+            update_row_cache_value(name, value);
         } else {
             unmanaged_.set(name, value);
         }
     }
+
+private:
+    /// Write-through mirror of managed<T>::operator='s stored forms.
+    /// Updated UNCONDITIONALLY (cache on or off): the hydrated snapshot must
+    /// never go stale from this instance's own writes. Types the variant
+    /// cannot represent drop the cached key so reads fall through live.
+    template <typename T>
+    void update_row_cache_value(const std::string& name, const T& value) {
+        if constexpr (std::is_same_v<T, bool>) {
+            managed_.source.values[name] = value ? int64_t{1} : int64_t{0};
+        } else if constexpr (std::is_same_v<T, float>) {
+            managed_.source.values[name] = static_cast<double>(value);
+        } else if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, double> ||
+                             std::is_same_v<T, std::string> ||
+                             std::is_same_v<T, std::vector<uint8_t>>) {
+            managed_.source.values[name] = value;
+        } else {
+            managed_.source.values.erase(name);
+        }
+    }
+
+public:
     
     void set_int(const std::string& name, int64_t value) SWIFT_NAME(setInt(named:_:));
     void set_string(const std::string& name, const std::string& value) SWIFT_NAME(setString(named:_:)) {
@@ -176,6 +249,10 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     void set_nil(const std::string& name) SWIFT_NAME(setNil(named:)) {
         if (lattice) {
             managed_.set_nil(name);
+            // Write-through: without this, a cached read after setNil would
+            // return the stale pre-nil value — silent wrong-value corruption
+            // for optionals (nullptr_t = KNOWN NULL in the cache contract).
+            managed_.source.values[name] = nullptr;
         } else {
             unmanaged_.set_nil(name);
         }
@@ -275,6 +352,9 @@ private:
         swift_dynamic_object unmanaged_;
         managed<swift_dynamic_object> managed_;
     };
+
+    // Materialized-read mode (see the row-cache contract above the accessors).
+    bool row_cache_enabled_ = false;
 
     friend class swift_lattice;
     friend struct link_list;

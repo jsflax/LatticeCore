@@ -110,6 +110,13 @@ public:
     /// closed connections, and Emscripten (DELETE journal mode).
     checkpoint_result wal_checkpoint(bool truncate, int busy_budget_ms = 250);
 
+    /// Process-global count of SQL statements issued through the public
+    /// funnels (query/execute/insert/update/remove) across ALL connections.
+    /// Test/bench primitive: recall-style code paths span multiple
+    /// connections (read/write/xproc, attached lattices), so a per-connection
+    /// counter undercounts — tests assert on deltas of this global.
+    static uint64_t total_statement_count();
+
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }
 

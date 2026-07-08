@@ -485,3 +485,22 @@ void releaseDynamicObjectRef(lattice::dynamic_object_ref* p) {
     }
 }
 #endif
+
+// MARK: - Row cache
+
+void lattice::dynamic_object::refresh_row_cache() {
+    if (!lattice) return;
+    auto* db = managed_.db_;
+    if (!db) return;
+    // table_name_ may be schema-qualified for attached/UNION objects
+    // ("alias".Table) — valid SQL, use as-is. One SELECT * replaces the
+    // per-column reads the live path would otherwise issue.
+    auto rows = db->query(
+        "SELECT * FROM " + managed_.table_name_ + " WHERE id = ?",
+        {managed_.id_});
+    if (rows.empty()) return;
+    for (auto& [key, value] : rows[0]) {
+        if (key == "id") continue;
+        managed_.source.values[key] = value;
+    }
+}

@@ -8,6 +8,14 @@
 
 namespace lattice {
 
+// Process-global statement counter (see db.hpp::total_statement_count).
+static std::atomic<uint64_t> g_statement_count{0};
+
+uint64_t database::total_statement_count() {
+    return g_statement_count.load(std::memory_order_relaxed);
+}
+
+
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
     // Determine SQLite open flags based on mode
@@ -155,6 +163,7 @@ database& database::operator=(database&& other) noexcept {
 
 void database::execute(const std::string& sql, const std::vector<column_value_t>& params) {
     if (closed_.load(std::memory_order_acquire)) return;
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
     if (params.empty()) {
         // Fast path for parameterless queries
         char* errmsg = nullptr;
@@ -347,6 +356,7 @@ primary_key_t database::insert(const std::string& table,
                                const std::vector<std::pair<std::string, column_value_t>>& values,
                                const std::vector<std::string>& conflict_columns) {
     if (closed_.load(std::memory_order_acquire)) return {};
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
     std::ostringstream sql;
     sql << "INSERT INTO main." << table << " (";
 
@@ -455,6 +465,7 @@ void database::update(const std::string& table,
                        const std::vector<std::pair<std::string, column_value_t>>& values) {
     if (closed_.load(std::memory_order_acquire)) return;
     if (values.empty()) return;
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
 
     std::ostringstream sql;
     sql << "UPDATE " << table << " SET ";
@@ -494,6 +505,7 @@ void database::update(const std::string& table,
 
 void database::remove(const std::string& table, primary_key_t id) {
     if (closed_.load(std::memory_order_acquire)) return;
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
     std::string sql = "DELETE FROM " + table + " WHERE id = ?";
 
     sqlite3_stmt* stmt = nullptr;
@@ -515,6 +527,7 @@ void database::remove(const std::string& table, primary_key_t id) {
 
 std::vector<database::row_t> database::query(const std::string& sql,
                                              const std::vector<column_value_t>& params) {
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
     if (closed_.load(std::memory_order_acquire)) return {};
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);

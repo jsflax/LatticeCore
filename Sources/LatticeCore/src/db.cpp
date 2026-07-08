@@ -559,6 +559,48 @@ void database::refresh_wal_snapshot() {
     sqlite3_exec(db_, "SELECT 1", nullptr, nullptr, nullptr);
 }
 
+database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_budget_ms) {
+    checkpoint_result result;
+#ifdef __EMSCRIPTEN__
+    // DELETE journal mode — there is no WAL to checkpoint.
+    (void)truncate; (void)busy_budget_ms;
+    return result;
+#else
+    if (closed_.load(std::memory_order_acquire) || mode_ != open_mode::read_write || !db_) {
+        return result;
+    }
+    // PRAGMA (not the C API) so the (busy, log, checkpointed) row comes back
+    // through the ordinary query path; same style as the Swift bridge's
+    // checkpoint(). Bound the wait: TRUNCATE holds the writer lock while
+    // waiting out readers, so a held snapshot must fail fast (retry next
+    // cycle) rather than stall every writer behind it.
+    sqlite3_busy_timeout(db_, truncate ? busy_budget_ms : 0);
+    try {
+        auto rows = query(truncate ? "PRAGMA wal_checkpoint(TRUNCATE)"
+                                   : "PRAGMA wal_checkpoint(PASSIVE)");
+        result.rc = SQLITE_OK;
+        if (!rows.empty()) {
+            auto get = [&](const char* key) -> int64_t {
+                auto it = rows[0].find(key);
+                if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                    return std::get<int64_t>(it->second);
+                }
+                return -1;
+            };
+            result.busy = static_cast<int>(get("busy"));
+            result.log_frames = get("log");
+            result.checkpointed = get("checkpointed");
+        }
+    } catch (const std::exception& e) {
+        result.rc = SQLITE_ERROR;
+        LOG_DEBUG("db", "wal_checkpoint(%s) failed: %s, path=%s",
+                  truncate ? "TRUNCATE" : "PASSIVE", e.what(), path_.c_str());
+    }
+    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // restore statement-level timeout
+    return result;
+#endif
+}
+
 void database::begin_transaction(bool exclusive) {
     if (closed_.load(std::memory_order_acquire)) return;
     // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).

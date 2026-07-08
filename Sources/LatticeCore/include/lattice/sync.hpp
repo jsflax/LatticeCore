@@ -203,6 +203,16 @@ struct sync_config {
     /// direct dispatch.
     int upload_coalesce_ms = 0;
 
+    /// Periodic WAL maintenance, driven by the pacer thread (requires
+    /// upload_coalesce_ms > 0; no-op on Emscripten). PASSIVE checkpoints run
+    /// unconditionally on this cadence, even while disconnected, which is
+    /// precisely when the WAL previously grew unbounded (observed 1.1GB:
+    /// long-lived sync connections pinned the autocheckpoint while the
+    /// daemon busy-spun). TRUNCATE additionally runs when the synchronizer
+    /// is idle (nothing in flight) to return the file to ~zero. 0 disables.
+    int checkpoint_passive_interval_ms = 60'000;
+    int checkpoint_truncate_interval_ms = 300'000;
+
     /// Upload filter. nullopt = sync everything (default).
     /// Empty vector = sync nothing. Non-empty = whitelist.
     std::optional<std::vector<sync_filter_entry>> sync_filter;
@@ -349,16 +359,23 @@ protected:
     std::atomic<int> ack_resend_failures_{0};
 
 #ifndef __EMSCRIPTEN__
-    // Pacer thread: owns trailing-edge coalescing. Started by init_sync when
-    // upload_coalesce_ms > 0; joined in the destructor BEFORE scheduler
-    // shutdown (it only ever enqueues to the scheduler, never blocks on it).
+    // Pacer thread: owns trailing-edge coalescing and periodic WAL
+    // maintenance. Started by init_sync when upload_coalesce_ms > 0; joined
+    // in the destructor BEFORE scheduler shutdown (it only ever enqueues to
+    // the scheduler, never blocks on it).
     std::thread pacer_thread_;
     std::mutex pacer_mutex_;
     std::condition_variable pacer_cv_;
     bool pacer_stop_ = false;
     std::chrono::steady_clock::time_point next_allowed_tick_{};
+    std::chrono::steady_clock::time_point last_passive_ckpt_{};
+    std::chrono::steady_clock::time_point last_truncate_ckpt_{};
     void start_pacer();
     void stop_pacer();
+    /// Called from the pacer loop on every wakeup (request or timeout).
+    /// Dispatches PASSIVE/TRUNCATE checkpoints per the config cadences;
+    /// TRUNCATE only when idle (in-flight empty — pending mirrors it).
+    void maybe_checkpoint();
 #endif
     std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting

@@ -90,6 +90,26 @@ public:
     /// Needed when another connection wrote and this connection's mmap'd WAL index is stale.
     void refresh_wal_snapshot();
 
+    /// Result of a wal_checkpoint() call. rc is the PRAGMA's SQLite result
+    /// code; busy is 1 when the checkpoint could not complete because a
+    /// reader/writer held the WAL; log_frames/checkpointed mirror the PRAGMA
+    /// row (-1 when unavailable).
+    struct checkpoint_result {
+        int rc = 0;
+        int busy = 1;
+        int64_t log_frames = -1;
+        int64_t checkpointed = -1;
+    };
+
+    /// Run a WAL checkpoint on this (read-write) connection.
+    /// PASSIVE (truncate=false) backfills as far as the oldest live reader
+    /// allows and never blocks anyone. TRUNCATE (truncate=true) additionally
+    /// resets the -wal file to zero length, but must wait out readers — the
+    /// busy_budget_ms bounds that wait so a held snapshot makes it FAIL FAST
+    /// instead of stalling writers. No-op (busy=1) on read-only connections,
+    /// closed connections, and Emscripten (DELETE journal mode).
+    checkpoint_result wal_checkpoint(bool truncate, int busy_budget_ms = 250);
+
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }
 

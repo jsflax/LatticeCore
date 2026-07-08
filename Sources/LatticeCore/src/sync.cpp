@@ -594,15 +594,74 @@ void synchronizer_base::request_upload() {
 }
 
 #ifndef __EMSCRIPTEN__
+void synchronizer_base::maybe_checkpoint() {
+    if (config_.checkpoint_passive_interval_ms <= 0) return;
+    const auto now = std::chrono::steady_clock::now();
+
+    // TRUNCATE first when due AND idle — a successful truncate subsumes the
+    // passive pass. "Idle" = nothing sent-but-unACKed; pending mirrors the
+    // in-flight set (see send_entries), so this gate is actually reachable
+    // during/after catch-up, unlike the old whole-backlog counter.
+    const bool truncate_due =
+        config_.checkpoint_truncate_interval_ms > 0 &&
+        now - last_truncate_ckpt_ >=
+            std::chrono::milliseconds(config_.checkpoint_truncate_interval_ms);
+    const bool idle =
+        progress_pending_upload_.load(std::memory_order_relaxed) == 0;
+    const bool passive_due =
+        now - last_passive_ckpt_ >=
+            std::chrono::milliseconds(config_.checkpoint_passive_interval_ms);
+
+    LOG_DEBUG("synchronizer", "[%s] maybe_checkpoint: pending=%lld truncate_due=%d idle=%d passive_due=%d",
+              config_.sync_id.c_str(),
+              (long long)progress_pending_upload_.load(std::memory_order_relaxed),
+              truncate_due ? 1 : 0, idle ? 1 : 0, passive_due ? 1 : 0);
+    if (!(passive_due || (truncate_due && idle))) return;
+    last_passive_ckpt_ = now;
+    const bool try_truncate = truncate_due && idle;
+    if (try_truncate) last_truncate_ckpt_ = now;
+
+    // Run on the scheduler: the checkpoint uses the synchronizer's WRITE
+    // connection, and the scheduler serializes it against upload passes on
+    // the same connection. Enqueue-only from here — never blocks the pacer.
+    scheduler_->invoke([this, try_truncate] {
+        if (is_destroyed_) return;
+        auto res = db().db().wal_checkpoint(try_truncate, /*busy_budget_ms=*/250);
+        if (try_truncate && res.busy != 0) {
+            // Readers held the WAL — fall back to PASSIVE in the same cycle
+            // so backfill progress always happens; truncate retries next due.
+            res = db().db().wal_checkpoint(false);
+            LOG_DEBUG("synchronizer", "[%s] TRUNCATE checkpoint busy — PASSIVE fallback: log=%lld ckpt=%lld",
+                      config_.sync_id.c_str(), (long long)res.log_frames, (long long)res.checkpointed);
+        } else if (try_truncate) {
+            LOG_INFO("synchronizer", "[%s] WAL TRUNCATE checkpoint: log=%lld ckpt=%lld",
+                     config_.sync_id.c_str(), (long long)res.log_frames, (long long)res.checkpointed);
+        } else {
+            LOG_DEBUG("synchronizer", "[%s] WAL PASSIVE checkpoint: busy=%d log=%lld ckpt=%lld",
+                      config_.sync_id.c_str(), res.busy, (long long)res.log_frames, (long long)res.checkpointed);
+        }
+    });
+}
+
 void synchronizer_base::start_pacer() {
     if (config_.upload_coalesce_ms <= 0) return;
     pacer_thread_ = std::thread([this] {
         std::unique_lock<std::mutex> lock(pacer_mutex_);
+        last_passive_ckpt_ = std::chrono::steady_clock::now();
+        last_truncate_ckpt_ = last_passive_ckpt_;
         for (;;) {
-            pacer_cv_.wait(lock, [this] {
+            // Timed wait: requests wake us for coalescing; the timeout drives
+            // periodic WAL maintenance even when fully idle or disconnected.
+            const auto heartbeat = std::chrono::milliseconds(
+                config_.checkpoint_passive_interval_ms > 0
+                    ? std::min(config_.checkpoint_passive_interval_ms, 60'000)
+                    : 60'000);
+            pacer_cv_.wait_for(lock, heartbeat, [this] {
                 return pacer_stop_ || upload_requested_.load(std::memory_order_acquire);
             });
             if (pacer_stop_) return;
+            maybe_checkpoint();
+            if (!upload_requested_.load(std::memory_order_acquire)) continue;
             // Trailing edge: wait out the remainder of the window opened by
             // the leading edge, then fire ONE coalesced tick for however many
             // requests landed meanwhile.

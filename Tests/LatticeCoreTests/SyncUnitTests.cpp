@@ -1098,3 +1098,135 @@ TEST(Sync, ThrottleCoalescing) {
 
     sync.disconnect();
 }
+
+// ----------------------------------------------------------------------------
+// WAL checkpoint: primitive fail-fast semantics + pacer-driven truncation
+// ----------------------------------------------------------------------------
+
+TEST(Sync, CheckpointPrimitiveUnderLoad) {
+    TempDB tmp{"ckptprim"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    const auto wal_path = tmp.str() + "-wal";
+
+    for (int i = 0; i < 200; ++i) {
+        db.add(TestPerson{"wal-" + std::to_string(i), i, std::nullopt});
+    }
+    ASSERT_TRUE(std::filesystem::exists(wal_path));
+    ASSERT_GT(std::filesystem::file_size(wal_path), 0u);
+
+    // No readers: TRUNCATE must fully reset the WAL.
+    auto res = db.db().wal_checkpoint(true, 250);
+    EXPECT_EQ(res.busy, 0);
+    EXPECT_EQ(std::filesystem::file_size(wal_path), 0u);
+
+    // Grow again, then pin the WAL with a held read transaction on a second
+    // connection — TRUNCATE must FAIL FAST (bounded by the busy budget),
+    // not stall the writer indefinitely.
+    for (int i = 0; i < 50; ++i) {
+        db.add(TestPerson{"wal2-" + std::to_string(i), i, std::nullopt});
+    }
+    lattice::lattice_db reader{lattice::configuration(tmp.str())};
+    reader.db().execute("BEGIN");
+    (void)reader.db().query("SELECT COUNT(*) FROM TestPerson");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto busy_res = db.db().wal_checkpoint(true, 250);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    EXPECT_NE(busy_res.busy, 0) << "checkpoint should report busy with a pinned reader";
+    EXPECT_LT(elapsed, 1500) << "TRUNCATE must fail fast, not stall (took " << elapsed << "ms)";
+
+    // PASSIVE never blocks and still makes backfill progress.
+    auto passive = db.db().wal_checkpoint(false);
+    EXPECT_EQ(passive.rc, 0);
+
+    reader.db().execute("COMMIT");
+    auto after = db.db().wal_checkpoint(true, 250);
+    EXPECT_EQ(after.busy, 0);
+    EXPECT_EQ(std::filesystem::file_size(wal_path), 0u);
+}
+
+TEST(Sync, PacerDrivenTruncateWhenIdle) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"ckptpacer"};
+    auto owned_db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = owned_db.get();
+    const auto sync_wal = tmp.str() + "-wal";
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "ckpt-sync";
+    cfg.all_active_sync_ids = {"ckpt-sync"};
+    cfg.upload_coalesce_ms = 50;
+    cfg.checkpoint_passive_interval_ms = 100;
+    cfg.checkpoint_truncate_interval_ms = 150;
+
+    lattice::synchronizer sync(std::move(owned_db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+
+    for (int i = 0; i < 100; ++i) {
+        db_ptr->add(TestPerson{"pcw-" + std::to_string(i), i, std::nullopt});
+    }
+    // ACK until ALL 100 entries are confirmed — the burst ships in a leading
+    // tick + a trailing tick ~coalesce_ms later, so an early pending==0 (after
+    // ACKing just the leading entry) does NOT mean the backlog is done.
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> acked;
+    for (int round = 0; round < 60 && (int)acked.size() < 100; ++round) {
+        std::vector<std::string> to_ack;
+        for (const auto& msg : mock_ws->get_sent_messages()) {
+            auto s = msg.as_string();
+            for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+                auto id = (*it)[1].str();
+                if (acked.insert(id).second) to_ack.push_back(id);
+            }
+        }
+        if (!to_ack.empty()) {
+            mock_ws->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_ack(to_ack).to_json()));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_EQ((int)acked.size(), 100) << "not all burst entries were sent";
+    // Pending drains to 0 once the last ACK lands.
+    {
+        const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (sync.get_progress().pending_upload != 0 &&
+               std::chrono::steady_clock::now() < ack_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(sync.get_progress().pending_upload, 0);
+
+    // Within a few heartbeat cycles the idle-gated TRUNCATE must land and
+    // reset the -wal (there are no other connections pinning it).
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    uintmax_t wal_size = std::filesystem::exists(sync_wal)
+        ? std::filesystem::file_size(sync_wal) : 0;
+    while (wal_size > 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wal_size = std::filesystem::exists(sync_wal)
+            ? std::filesystem::file_size(sync_wal) : 0;
+    }
+    if (wal_size > 0) {
+        // Diagnostic split: if a direct TRUNCATE succeeds, the pacer path is
+        // broken; if it reports busy, a connection is pinning the WAL.
+        auto direct = db_ptr->db().wal_checkpoint(true, 250);
+        std::cerr << "[diag] direct TRUNCATE: rc=" << direct.rc
+                  << " busy=" << direct.busy
+                  << " log=" << direct.log_frames
+                  << " ckpt=" << direct.checkpointed
+                  << " wal_now=" << (std::filesystem::exists(sync_wal)
+                                         ? std::filesystem::file_size(sync_wal) : 0)
+                  << std::endl;
+    }
+    EXPECT_EQ(wal_size, 0u) << "pacer never truncated the WAL while idle";
+
+    sync.disconnect();
+}

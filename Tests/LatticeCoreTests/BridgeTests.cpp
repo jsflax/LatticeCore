@@ -725,9 +725,8 @@ TEST(Bridge, CacheConcurrentCreateResolveStress) {
                 auto* ref = lattice::swift_lattice_ref::create(config, schemas);
                 if (!ref || ref->hash_value() != seed_hash) { failures++; if (ref) delete ref; continue; }
                 // Reverse lookup exercises get_by_pointer under contention.
-                auto* back = lattice::swift_lattice_ref::get_ref_for_lattice(ref->get());
-                if (!back || back->hash_value() != seed_hash) failures++;
-                delete back;
+                auto back = lattice::swift_lattice_ref::shared_for_lattice(ref->get());
+                if (!back || back.get() != ref->get()) failures++;
                 delete ref;
             }
         });
@@ -922,7 +921,7 @@ TEST(Bridge, UpsertRebindsToExistingRowAndAppendIsIdempotent) {
     auto field = owners[0].get_managed_field<std::vector<lattice::swift_dynamic_object*>>("sigs");
     lattice::link_list list(field);
     auto* obj2_ref = lattice::dynamic_object_ref::wrap(obj2);
-    list.push_back(obj2_ref);
+    list.push_back(*obj2_ref);
 
     auto junction = db.db().query(
         "SELECT rhs FROM _FpOwner_FpSig_sigs WHERE lhs = 'own-1'");
@@ -931,7 +930,7 @@ TEST(Bridge, UpsertRebindsToExistingRowAndAppendIsIdempotent) {
         << "junction row references a phantom globalId (dangling link)";
 
     // Re-append is a set-semantics no-op, not a PRIMARY KEY violation.
-    list.push_back(obj2_ref);
+    list.push_back(*obj2_ref);
     delete obj2_ref;
     auto recount = db.db().query(
         "SELECT COUNT(*) AS c FROM _FpOwner_FpSig_sigs WHERE lhs = 'own-1'");

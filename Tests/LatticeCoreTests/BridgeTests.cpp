@@ -1012,6 +1012,13 @@ TEST(Bridge, RowCacheMaterializedReads) {
     auto verify = db.objects("RcPerson");
     EXPECT_EQ(verify[0].get_int("age"), 31) << "write-through missed the DB";
 
+    // Atomic SQL-side increment: lands in the DB, drops the cached key so
+    // the next materialized read falls through live (no stale value).
+    cached.increment_int_field("age", 1);
+    EXPECT_EQ(cached.get_int("age"), 32);
+    auto verify2 = db.objects("RcPerson");
+    EXPECT_EQ(verify2[0].get_int("age"), 32) << "increment missed the DB";
+
     delete ref;
 }
 

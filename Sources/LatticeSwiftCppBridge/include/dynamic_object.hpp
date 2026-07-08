@@ -257,6 +257,31 @@ public:
             unmanaged_.set_nil(name);
         }
     }
+
+    /// SQL-side atomic increment: `SET col = col + delta` under the write
+    /// lock — no read-modify-write race, and half the statements of get+set.
+    /// Built for access-count bumps (Engram recall): two concurrent recalls
+    /// both land their +1 instead of last-writer-wins on a stale read.
+    /// `name` is a macro-generated column name, not user input (same
+    /// interpolation convention as the query layer's filter clauses).
+    void increment_int_field(const std::string& name, int64_t delta) SWIFT_NAME(incrementIntField(named:by:)) {
+        if (lattice) {
+            auto* db = managed_.db_;
+            if (!db) return;
+            db->execute(
+                "UPDATE " + managed_.table_name_ + " SET " + name + " = " + name +
+                    " + ? WHERE id = ?",
+                {delta, managed_.id_});
+            // New value unknown here — drop the cached key so the next
+            // materialized read falls through live instead of going stale.
+            managed_.source.values.erase(name);
+        } else {
+            auto v = unmanaged_.get(name);
+            if (auto* i = std::get_if<int64_t>(&v)) {
+                unmanaged_.set(name, *i + delta);
+            }
+        }
+    }
     void set_object(const std::string& name, const dynamic_object_ref& value) SWIFT_NAME(setObject(named:_:));
 
     // geo_bounds accessors

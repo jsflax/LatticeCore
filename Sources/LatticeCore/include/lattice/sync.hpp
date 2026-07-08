@@ -19,6 +19,7 @@
 #include <variant>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <mutex>
 
 namespace lattice {
@@ -213,6 +214,14 @@ struct sync_config {
     int checkpoint_passive_interval_ms = 60'000;
     int checkpoint_truncate_interval_ms = 300'000;
 
+    /// Incremental upload cursor. When true, query_audit_log_for_sync's
+    /// no-sync-state branch is bounded below by the slot's upload_floor and
+    /// the whole query is LIMITed to one send window — per-pass cost becomes
+    /// O(window) instead of O(entire AuditLog) (202k-row scans per tick were
+    /// the daemon's main CPU burn). The floor is only ever a scan bound;
+    /// disabling this restores the exact unbounded pre-floor queries.
+    bool use_upload_floor = true;
+
     /// Upload filter. nullopt = sync everything (default).
     /// Empty vector = sync nothing. Non-empty = whitelist.
     std::optional<std::vector<sync_filter_entry>> sync_filter;
@@ -380,11 +389,34 @@ protected:
     std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
 
-    // In-flight tracking: entries sent but not yet ACK'd.
+    // In-flight tracking: entries sent but not yet ACK'd, mapping the entry's
+    // global_id to its AuditLog id (0 for synthetic entries, which have no
+    // audit row — they must never gate the upload floor).
     // Prevents upload_pending_changes from re-sending entries on each cycle.
     // Accessed from scheduler thread (upload) and WebSocket/IPC thread (ACK) — needs mutex.
     std::mutex in_flight_mutex_;
-    std::unordered_set<std::string> in_flight_ids_;
+    std::unordered_map<std::string, int64_t> in_flight_ids_;
+
+    // Upload-floor bookkeeping (guarded by in_flight_mutex_). open_audit_ids_
+    // holds every real audit id enumerated but not yet resolved (ACKed or
+    // skipped); the floor advances to min(open)-1, or to the highest id ever
+    // enumerated when the set drains. NOT cleared on disconnect — unACKed
+    // entries must stay above the floor so the (now bounded) reconnect
+    // re-query finds exactly them. The floor itself is read from the DB each
+    // pass rather than cached: the accept-side IPC synchronizer is replaced
+    // on every client reconnect, and the monotonic UPDATE makes brief
+    // old/new coexistence benign.
+    std::set<int64_t> open_audit_ids_;
+    int64_t last_enumerated_id_ = 0;
+    // Poison-entry observability: if min(open) hasn't moved for this long,
+    // some entry is permanently failing to resolve (pre-existing apply-failure
+    // loop) — the floor makes it visible instead of silent.
+    int64_t stall_min_open_ = -1;
+    std::chrono::steady_clock::time_point stall_since_{};
+    /// Erase resolved audit ids from the open set and persist the advanced
+    /// floor (monotonic). Call ONLY after the resolving transactions have
+    /// committed. Takes in_flight_mutex_ internally.
+    void resolve_audit_ids(const std::vector<int64_t>& audit_ids);
 
     on_sync_complete_handler on_sync_complete_;
     on_error_handler on_error_;
@@ -491,10 +523,20 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 /// Returns entries that have no sync_state row (or is_synchronized=0) for the given sync_id.
 /// Unlike the single-sync query, this does NOT filter on isFromRemote — any entry not yet
 /// synced by this sync_id is returned, enabling cross-transport relay.
+/// min_id_exclusive bounds the no-sync-state branch (`a.id > ?`) — pass the
+/// slot's upload_floor. limit (0 = unbounded) caps the result to one send
+/// window; entries are ordered by id ASC so the window is always the oldest
+/// pending work.
 std::vector<audit_log_entry> query_audit_log_for_sync(
     database& db,
     const std::string& sync_id,
-    const std::optional<std::vector<sync_filter_entry>>& sync_filter = std::nullopt);
+    const std::optional<std::vector<sync_filter_entry>>& sync_filter = std::nullopt,
+    int64_t min_id_exclusive = 0,
+    size_t limit = 0);
+
+/// Read the slot's upload_floor (0 when absent). Monotonic advance helper.
+int64_t read_upload_floor(database& db, const std::string& sync_id);
+void advance_upload_floor(database& db, const std::string& sync_id, int64_t floor);
 
 // Mark audit entries as synchronized (with observer notification)
 void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& global_ids);

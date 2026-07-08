@@ -1230,3 +1230,276 @@ TEST(Sync, PacerDrivenTruncateWhenIdle) {
 
     sync.disconnect();
 }
+
+// ----------------------------------------------------------------------------
+// Upload floor: incremental cursor — bounded scans, at-least-once preserved
+// ----------------------------------------------------------------------------
+
+namespace {
+int64_t read_floor(lattice::database& db, const std::string& sync_id) {
+    auto rows = db.query(
+        "SELECT upload_floor FROM _lattice_replication_slots WHERE sync_id = ?",
+        {sync_id});
+    if (rows.empty()) return -1;
+    return std::get<int64_t>(rows[0].at("upload_floor"));
+}
+
+std::set<std::string> collect_and_ack_all(lattice::mock_sync_transport* ws,
+                                          lattice::synchronizer& sync,
+                                          int expected,
+                                          int max_rounds = 60) {
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> acked;
+    for (int round = 0; round < max_rounds && (int)acked.size() < expected; ++round) {
+        std::vector<std::string> to_ack;
+        for (const auto& msg : ws->get_sent_messages()) {
+            auto s = msg.as_string();
+            for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+                auto id = (*it)[1].str();
+                if (acked.insert(id).second) to_ack.push_back(id);
+            }
+        }
+        if (!to_ack.empty()) {
+            ws->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_ack(to_ack).to_json()));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    return acked;
+}
+}  // namespace
+
+TEST(Sync, CursorAdvancesOnAck) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorack"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "cursor-sync";
+    cfg.all_active_sync_ids = {"cursor-sync"};
+
+    const int kEntries = 25;
+    for (int i = 0; i < kEntries; ++i) {
+        db_ptr->add(TestPerson{"cur-" + std::to_string(i), i, std::nullopt});
+    }
+    auto max_id_rows = db_ptr->db().query("SELECT MAX(id) AS m FROM AuditLog");
+    const int64_t max_audit_id = std::get<int64_t>(max_id_rows[0].at("m"));
+
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+
+    auto acked = collect_and_ack_all(mock_ws, sync, kEntries);
+    ASSERT_EQ((int)acked.size(), kEntries);
+
+    // Floor reaches the highest enumerated audit id once everything resolves.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    int64_t floor = -1;
+    while (std::chrono::steady_clock::now() < deadline) {
+        floor = read_floor(db_ptr->db(), "cursor-sync");
+        if (floor >= max_audit_id) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    EXPECT_GE(floor, max_audit_id) << "floor did not advance after full ACK";
+
+    // A fresh pass finds nothing (bounded query returns empty; no re-sends).
+    auto frames_before = mock_ws->get_sent_messages().size();
+    sync.sync_now();
+    EXPECT_EQ(mock_ws->get_sent_messages().size(), frames_before)
+        << "fully-ACKed backlog was re-sent";
+    sync.disconnect();
+}
+
+TEST(Sync, CursorHoldsBelowUnackedAndResendsAfterReconnect) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorhold"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "hold-sync";
+    cfg.all_active_sync_ids = {"hold-sync"};
+    cfg.chunk_size = 3;  // window = 6 < backlog
+
+    const int kEntries = 20;
+    for (int i = 0; i < kEntries; ++i) {
+        db_ptr->add(TestPerson{"hold-" + std::to_string(i), i, std::nullopt});
+    }
+
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+
+    // ACK exactly the FIRST window, nothing more: floor must stay below the
+    // first unACKed id.
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::vector<std::string> first_window;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (first_window.empty() && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& msg : mock_ws->get_sent_messages()) {
+                auto s = msg.as_string();
+                for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+                    first_window.push_back((*it)[1].str());
+                }
+            }
+            if (first_window.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_FALSE(first_window.empty());
+    ASSERT_LE(first_window.size(), 6u) << "send window exceeded 2*chunk_size";
+    mock_ws->simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_ack(first_window).to_json()));
+
+    // Everything eventually ships window by window (post-ACK kicks) — but at
+    // this instant, unACKed entries exist and the floor must sit below them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto pending_rows = db_ptr->db().query(
+        "SELECT MIN(a.id) AS m FROM AuditLog a WHERE a.isSynchronized = 0"
+        " AND NOT EXISTS (SELECT 1 FROM _lattice_sync_state ss"
+        "  WHERE ss.audit_entry_id = a.id AND ss.sync_id = 'hold-sync' AND ss.is_synchronized = 1)");
+    if (!pending_rows.empty() &&
+        std::holds_alternative<int64_t>(pending_rows[0].at("m"))) {
+        const int64_t min_pending = std::get<int64_t>(pending_rows[0].at("m"));
+        const int64_t floor = read_floor(db_ptr->db(), "hold-sync");
+        EXPECT_LT(floor, min_pending)
+            << "floor advanced past a pending (unACKed) entry — data loss";
+    }
+
+    // Sever the transport mid-backlog, reconnect: the remaining entries are
+    // re-queried (bounded) and re-sent — none skipped.
+    mock_ws->simulate_error("simulated drop");
+    sync.connect();
+    auto acked = collect_and_ack_all(mock_ws, sync, kEntries);
+    EXPECT_EQ((int)acked.size(), kEntries)
+        << "entries were lost across the reconnect (floor skipped them)";
+    sync.disconnect();
+}
+
+TEST(Sync, CursorCrashRecoveryStaleLowFloor) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorcrash"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "crash-sync";
+    cfg.all_active_sync_ids = {"crash-sync"};
+
+    for (int i = 0; i < 10; ++i) {
+        db_ptr->add(TestPerson{"cr-" + std::to_string(i), i, std::nullopt});
+    }
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    sync.connect();
+    auto acked = collect_and_ack_all(mock_ws, sync, 10);
+    ASSERT_EQ((int)acked.size(), 10);
+
+    // Simulate a crash BEFORE the floor persisted: force it stale-low.
+    db_ptr->db().execute(
+        "UPDATE _lattice_replication_slots SET upload_floor = 0 WHERE sync_id = 'crash-sync'");
+
+    // Reconnect: worst case is a re-scan; the sync_state conditions filter
+    // everything back out — nothing is re-sent, and the floor re-advances.
+    mock_ws->simulate_error("crash");
+    auto frames_before = mock_ws->get_sent_messages().size();
+    sync.connect();
+    sync.sync_now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> post;
+    for (size_t i = frames_before; i < mock_ws->get_sent_messages().size(); ++i) {
+        auto s = mock_ws->get_sent_messages()[i].as_string();
+        for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+            post.insert((*it)[1].str());
+        }
+    }
+    EXPECT_TRUE(post.empty()) << "stale-low floor caused re-sends of synced entries";
+    sync.disconnect();
+}
+
+TEST(Sync, CursorBoundedQueryUnderStall) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorstall"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "stall-sync";
+    cfg.all_active_sync_ids = {"stall-sync"};
+    cfg.chunk_size = 2;  // window = 4
+
+    const int kBacklog = 50;
+    for (int i = 0; i < kBacklog; ++i) {
+        db_ptr->add(TestPerson{"st-" + std::to_string(i), i, std::nullopt});
+    }
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    sync.connect();  // server never ACKs — stalled
+
+    // Multiple passes against the stalled server: every audit frame must be
+    // window-bounded (the pre-floor behavior re-sent/re-parsed the whole
+    // backlog per pass).
+    std::regex entries_re("\"globalId\"");
+    for (int i = 0; i < 3; ++i) {
+        sync.sync_now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    for (const auto& msg : mock_ws->get_sent_messages()) {
+        auto s = msg.as_string();
+        if (s.find("\"auditLog\"") == std::string::npos) continue;
+        size_t n = 0;
+        for (std::sregex_iterator it(s.begin(), s.end(), entries_re), end; it != end; ++it) n++;
+        // Each entry serializes exactly one top-level globalId; chunks are
+        // ≤ chunk_size entries. Generous bound: ≤ 3x chunk to absorb nested
+        // globalId-like fields in changedFields payloads.
+        EXPECT_LE(n, cfg.chunk_size * 3)
+            << "a frame carried far more than one chunk — unbounded re-send";
+    }
+    // pending stays window-bounded, never inflates toward the backlog size.
+    EXPECT_LE(sync.get_progress().pending_upload, (int64_t)(cfg.chunk_size * 2));
+    sync.disconnect();
+}
+
+TEST(Sync, ExistingDbGainsUploadFloor) {
+    TempDB tmp{"floormigrate"};
+    // Create a DB and fingerprint it, then verify a reopen exposes the new
+    // column (the epoch bump forces the slow path through the guarded ALTER).
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        db.add(TestPerson{"mig", 1, std::nullopt});
+    }
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        // Must not throw, and the column must exist with default 0.
+        db.db().execute(R"(
+            INSERT INTO _lattice_replication_slots (sync_id, last_active_at)
+            VALUES ('mig-sync', datetime('now'))
+            ON CONFLICT(sync_id) DO UPDATE SET last_active_at = datetime('now')
+        )");
+        auto rows = db.db().query(
+            "SELECT upload_floor FROM _lattice_replication_slots WHERE sync_id = 'mig-sync'");
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::get<int64_t>(rows[0].at("upload_floor")), 0);
+    }
+}

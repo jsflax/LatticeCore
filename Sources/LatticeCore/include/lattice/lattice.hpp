@@ -2154,7 +2154,10 @@ public:
             db_->execute("DELETE FROM sqlite_sequence WHERE name = 'AuditLog'");
             // Reset replication slots rather than delete — synchronizers
             // don't need to re-register, they just re-sync from the start.
-            db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0");
+            // upload_floor must reset with the cursor: sqlite_sequence was
+            // just zeroed, so a surviving floor would sit above every new id
+            // and silently skip the entire regenerated history.
+            db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0");
             db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
         } catch (...) {
             db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
@@ -2196,7 +2199,7 @@ public:
             LOG_INFO("lattice_db", "reset_sync_state(%s): %lld replication slots — keeping global _lattice_sync_set",
                      sync_id.c_str(), (long long)slot_count);
         }
-        db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0 WHERE sync_id = ?", {sync_id});
+        db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0 WHERE sync_id = ?", {sync_id});
         LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_set wiped: %s)",
                  sync_id.c_str(), slot_count <= 1 ? "yes" : "no");
     }
@@ -4665,6 +4668,22 @@ private:
                 last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         )");
+
+        // upload_floor: per-slot SCAN BOUND for query_audit_log_for_sync —
+        // invariant: no entry pending for this sync_id has id <= upload_floor.
+        // Strictly a bound, never the source of truth (the sync_state
+        // conditions remain authoritative), so an under-advanced floor is
+        // always safe: crash recovery is "re-scan a window the conditions
+        // filter back out". Distinct from confirmed_audit_id, which advances
+        // to ACK-chunk MAX and can therefore sit above still-unACKed lower
+        // entries. Guarded ALTER for existing DBs — reaching it on the open
+        // fast path requires the kLatticeSchemaFormatEpoch bump below.
+        try {
+            db_->execute(
+                "ALTER TABLE _lattice_replication_slots ADD COLUMN upload_floor INTEGER NOT NULL DEFAULT 0");
+        } catch (const std::exception&) {
+            // Column already exists.
+        }
     }
 
     /// Register per-connection SQL functions. This is connection state, not a
@@ -4730,7 +4749,12 @@ protected:
     /// vec0/FTS5/R*Tree creation SQL. Existing databases only re-run the
     /// ensure path when the fingerprint changes — a template edit without an
     /// epoch bump leaves stale triggers in already-fingerprinted databases.
-    static constexpr int kLatticeSchemaFormatEpoch = 1;
+    ///
+    /// Epoch 2: _lattice_replication_slots gained upload_floor (guarded
+    /// ALTER in ensure_sync_control_table — without this bump the fast path
+    /// skips the ALTER on every existing DB and the sync engine SELECTs a
+    /// missing column on its hot path).
+    static constexpr int kLatticeSchemaFormatEpoch = 2;
 
     static uint64_t fnv1a_hash(const std::string& s) {
         uint64_t h = 1469598103934665603ULL;

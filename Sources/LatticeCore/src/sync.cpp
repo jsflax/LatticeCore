@@ -906,6 +906,17 @@ void synchronizer_base::on_websocket_open() {
 
         register_replication_slot(db().db(), config_.sync_id);
 
+        // Fresh floor-bookkeeping baseline for this connection: unresolved
+        // ids will be re-enumerated by the (bounded) queries; carrying stale
+        // enumeration state across connects risks advancing the floor from a
+        // last_enumerated_id_ that no longer reflects pending reality.
+        {
+            std::lock_guard<std::mutex> lock(in_flight_mutex_);
+            open_audit_ids_.clear();
+            last_enumerated_id_ = 0;
+            stall_min_open_ = -1;
+        }
+
         // Fresh-peer catch-up (IPC only — never on WSS, where the deployed
         // server may not parse the event): if this side has never applied a
         // remote entry, its DB is virgin for this channel. Ask the peer to
@@ -1048,6 +1059,16 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 LOG_INFO("synchronizer", "[%s] replay request from fresh peer — re-arming filtered snapshot",
                          config_.sync_id.c_str());
                 db().reset_sync_state(config_.sync_id);
+                // reset_sync_state zeroed the persisted upload_floor and made
+                // previously-resolved entries pending again — the in-memory
+                // floor bookkeeping must reset with it, or a stale
+                // last_enumerated_id_ could re-advance the floor past them.
+                {
+                    std::lock_guard<std::mutex> lock(in_flight_mutex_);
+                    open_audit_ids_.clear();
+                    last_enumerated_id_ = 0;
+                    stall_min_open_ = -1;
+                }
                 reconcile_sync_filter();
                 upload_pending_changes();
             });
@@ -1512,11 +1533,36 @@ void synchronizer_base::reconcile_sync_filter() {
 // ============================================================================
 
 std::vector<audit_log_entry> synchronizer_base::query_pending_entries() {
-    auto entries = query_audit_log_for_sync(db().db(), config_.sync_id, config_.sync_filter);
+    int64_t floor = 0;
+    size_t limit = 0;
+    if (config_.use_upload_floor) {
+        // Read the floor from the DB every pass (never cache across passes —
+        // accept-side synchronizers are replaced per client reconnect) and
+        // cap the scan at one send window plus whatever is already in flight.
+        floor = read_upload_floor(db().db(), config_.sync_id);
+        size_t in_flight_count;
+        {
+            std::lock_guard<std::mutex> lock(in_flight_mutex_);
+            in_flight_count = in_flight_ids_.size();
+        }
+        limit = config_.chunk_size * 2 + in_flight_count;
+    }
+    auto entries = query_audit_log_for_sync(
+        db().db(), config_.sync_id, config_.sync_filter, floor, limit);
 
-    // Filter out entries already in-flight (sent but not yet ACK'd)
+    // Filter out entries already in-flight (sent but not yet ACK'd), and
+    // record every enumerated real audit id as OPEN — the floor may only
+    // pass ids once they resolve (ACK or skip).
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        if (config_.use_upload_floor) {
+            for (const auto& e : entries) {
+                if (e.id > 0) {
+                    open_audit_ids_.insert(e.id);
+                    if (e.id > last_enumerated_id_) last_enumerated_id_ = e.id;
+                }
+            }
+        }
         if (!in_flight_ids_.empty()) {
             auto original_size = entries.size();
             entries.erase(
@@ -1834,6 +1880,43 @@ void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_
 
     // No progress decrement needed — skipped entries are not counted in
     // progress_pending_upload_ (only to_send entries are counted).
+
+    // Skipped entries are resolved for the upload floor: their sync_state
+    // transactions committed above, so they can never be pending again.
+    if (config_.use_upload_floor && !to_mark_synced.empty()) {
+        resolve_audit_ids(to_mark_synced);
+    }
+}
+
+void synchronizer_base::resolve_audit_ids(const std::vector<int64_t>& audit_ids) {
+    int64_t new_floor = 0;
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        for (auto id : audit_ids) {
+            if (id > 0) open_audit_ids_.erase(id);
+        }
+        if (open_audit_ids_.empty()) {
+            new_floor = last_enumerated_id_;
+            stall_min_open_ = -1;
+        } else {
+            new_floor = *open_audit_ids_.begin() - 1;
+            // Poison-entry observability: an entry that never resolves pins
+            // the floor and silently re-enters every bounded pass. Surface it.
+            const auto now = std::chrono::steady_clock::now();
+            const int64_t min_open = *open_audit_ids_.begin();
+            if (min_open != stall_min_open_) {
+                stall_min_open_ = min_open;
+                stall_since_ = now;
+            } else if (now - stall_since_ >= std::chrono::minutes(5)) {
+                LOG_WARN("synchronizer", "[%s] upload floor stalled below audit id %lld for >5min — an entry is repeatedly failing to resolve",
+                         config_.sync_id.c_str(), (long long)min_open);
+                stall_since_ = now;  // rate-limit the warning
+            }
+        }
+    }
+    if (new_floor > 0) {
+        advance_upload_floor(db().db(), config_.sync_id, new_floor);
+    }
 }
 
 void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
@@ -1846,7 +1929,13 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     // window stay PENDING (not in-flight): when the window's ACKs drain the
     // in-flight set, mark_as_synced re-invokes upload_pending_changes and the
     // next window ships. The ack-timeout resend covers a lost window.
-    const size_t window_end = std::min(entries.size(), config_.chunk_size * 2);
+    // The window caps TOTAL in-flight, not sends-per-invocation: against a
+    // stalled server every pass used to ship ANOTHER window on top of the
+    // un-ACKed ones (in-flight grew by 2*chunk_size per tick, unbounded).
+    // With the cap, a stalled transport plateaus at one window and the next
+    // ships only as ACKs (or the ack-timeout release) free space.
+    const size_t window_cap = config_.chunk_size * 2;
+    size_t window_end = 0;
 
     // Track only the entries actually sent as in-flight, and account progress
     // for exactly the windowed portion: pending mirrors the in-flight set
@@ -1855,11 +1944,22 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     // never the whole backlog).
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        const size_t in_flight = in_flight_ids_.size();
+        const size_t space = in_flight >= window_cap ? 0 : window_cap - in_flight;
+        window_end = std::min(entries.size(), space);
         for (size_t i = 0; i < window_end; ++i) {
-            in_flight_ids_.insert(entries[i].global_id);
+            // Map to the AuditLog id so an ACK can resolve the upload floor;
+            // synthetic entries carry id 0 and never gate the floor.
+            in_flight_ids_[entries[i].global_id] = entries[i].id;
         }
         progress_pending_upload_.store(
             static_cast<int64_t>(in_flight_ids_.size()), std::memory_order_relaxed);
+    }
+    if (window_end == 0) {
+        LOG_DEBUG("synchronizer", "[%s] send window full (%zu in flight) — %zu entries stay pending",
+                  config_.sync_id.c_str(), window_cap, entries.size());
+        entries.clear();
+        return;
     }
     progress_total_upload_.fetch_add(
         static_cast<int64_t>(window_end), std::memory_order_relaxed);
@@ -1994,14 +2094,24 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
 
     // Remove ACK'd entries from in-flight set; pending mirrors the set size
     // (store, not fetch_sub — an ACK straddling a reconnect clear must not
-    // drive the counter negative).
+    // drive the counter negative). Capture the resolved audit ids while the
+    // map still has them: mark_audit_entries_synced_for's transactions have
+    // already committed above, so advancing the floor past them is safe.
+    std::vector<int64_t> resolved_audit_ids;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (const auto& id : global_ids) {
-            in_flight_ids_.erase(id);
+            auto it = in_flight_ids_.find(id);
+            if (it != in_flight_ids_.end()) {
+                if (it->second > 0) resolved_audit_ids.push_back(it->second);
+                in_flight_ids_.erase(it);
+            }
         }
         progress_pending_upload_.store(
             static_cast<int64_t>(in_flight_ids_.size()), std::memory_order_relaxed);
+    }
+    if (config_.use_upload_floor) {
+        resolve_audit_ids(resolved_audit_ids);
     }
 
     progress_acked_.fetch_add(static_cast<int64_t>(global_ids.size()), std::memory_order_relaxed);
@@ -2411,7 +2521,9 @@ void mark_audit_entries_synced_for(lattice_db& db,
 std::vector<audit_log_entry> query_audit_log_for_sync(
         database& db,
         const std::string& sync_id,
-        const std::optional<std::vector<sync_filter_entry>>& sync_filter) {
+        const std::optional<std::vector<sync_filter_entry>>& sync_filter,
+        int64_t min_id_exclusive,
+        size_t limit) {
     // Query entries not yet synced for this specific sync_id.
     // No isFromRemote filter — any entry not synced by this sync_id is pending,
     // enabling cross-transport relay (IPC→WSS, WSS→BLE, etc.)
@@ -2462,6 +2574,13 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
     // Branch 1: entries explicitly marked pending in _lattice_sync_state
     // Branch 2: entries with no sync_state row, using global isSynchronized flag
     //           (uses partial index idx_audit_log_pending_sync)
+    // Branch 2 is additionally bounded below by the caller's upload floor
+    // (`a.id > ?`): explicit is_synchronized=0 sync_state rows (branch 1)
+    // ride idx_sync_state_pending and are ~empty in practice, so the floor
+    // invariant only has to hold for the no-sync-state flow we control. The
+    // LIMIT caps a pass at one send window — without it, a stalled server
+    // (nothing resolving, floor pinned) still re-reads and JSON-parses the
+    // whole backlog every resend cycle.
     std::string sql =
         "SELECT a.* FROM AuditLog a"
         " JOIN _lattice_sync_state ss"
@@ -2472,6 +2591,7 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
 
         " SELECT a.* FROM AuditLog a"
         " WHERE a.isSynchronized = 0"
+        " AND a.id > ?"
         " AND NOT EXISTS ("
         "   SELECT 1 FROM _lattice_sync_state ss"
         "   WHERE ss.audit_entry_id = a.id AND ss.sync_id = ?"
@@ -2479,8 +2599,12 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
 
         " ORDER BY id ASC";
 
-    // UNION query uses the sync_id parameter twice (once per branch)
-    auto rows = db.query(sql, {sync_id, sync_id});
+    std::vector<column_value_t> params = {sync_id, min_id_exclusive, sync_id};
+    if (limit > 0) {
+        sql += " LIMIT ?";
+        params.push_back(static_cast<int64_t>(limit));
+    }
+    auto rows = db.query(sql, params);
 
     std::vector<audit_log_entry> entries;
     for (const auto& row : rows) {
@@ -2550,6 +2674,28 @@ void advance_replication_slot(database& db, const std::string& sync_id, int64_t 
 
 void remove_replication_slot(database& db, const std::string& sync_id) {
     db.execute("DELETE FROM _lattice_replication_slots WHERE sync_id = ?", {sync_id});
+}
+
+int64_t read_upload_floor(database& db, const std::string& sync_id) {
+    auto rows = db.query(
+        "SELECT upload_floor FROM _lattice_replication_slots WHERE sync_id = ?",
+        {sync_id});
+    if (rows.empty()) return 0;
+    auto it = rows[0].find("upload_floor");
+    if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+        return std::get<int64_t>(it->second);
+    }
+    return 0;
+}
+
+void advance_upload_floor(database& db, const std::string& sync_id, int64_t floor) {
+    // Monotonic: a stale synchronizer instance (accept-side replacement race)
+    // can only under-advance, never regress the floor.
+    db.execute(R"(
+        UPDATE _lattice_replication_slots
+        SET upload_floor = MAX(upload_floor, ?)
+        WHERE sync_id = ?
+    )", {floor, sync_id});
 }
 
 // Unified implementation for applying remote changes.

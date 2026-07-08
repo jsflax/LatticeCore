@@ -133,6 +133,9 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     bool has_value(const std::string& name) const SWIFT_NAME(hasValue(named:)) {
         if (lattice) {
             if (row_cache_enabled_) {
+                // "id" is deliberately absent from the hydrated values (it
+                // must never ride a write); serve it from the handle itself.
+                if (name == "id") return managed_.id_ != 0;
                 auto it = managed_.source.values.find(name);
                 if (it != managed_.source.values.end()) {
                     return !std::holds_alternative<std::nullptr_t>(it->second);
@@ -150,6 +153,14 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     T get_field(const std::string& name) const {
         if (lattice) {
             if (row_cache_enabled_) {
+                // Serve the primary key from the handle's own id_ member —
+                // it is excluded from the hydrated values by design (so it
+                // can never leak into a write), which otherwise made every
+                // `primaryKey` read (e.g. inside detached()) fall through to
+                // a live SELECT.
+                if constexpr (std::is_same_v<T, int64_t>) {
+                    if (name == "id") return managed_.id_;
+                }
                 auto it = managed_.source.values.find(name);
                 if (it != managed_.source.values.end()) {
                     if (auto* v = std::get_if<T>(&it->second)) return *v;
@@ -524,6 +535,15 @@ public:
 
     void set_nil(const std::string& name) const SWIFT_NAME(setNil(named:)) {
         impl_->set_nil(name);
+    }
+
+    // Materialized reads (row cache) — see dynamic_object's contract.
+    void enable_row_cache() const SWIFT_NAME(enableRowCache()) { impl_->enable_row_cache(); }
+    void disable_row_cache() const SWIFT_NAME(disableRowCache()) { impl_->disable_row_cache(); }
+    void refresh_row_cache() const SWIFT_NAME(refreshRowCache()) { impl_->refresh_row_cache(); }
+    bool is_row_cache_enabled() const SWIFT_NAME(isRowCacheEnabled()) { return impl_->is_row_cache_enabled(); }
+    void increment_int_field(const std::string& name, int64_t delta) const SWIFT_NAME(incrementIntField(named:by:)) {
+        impl_->increment_int_field(name, delta);
     }
 
     void set_object(const std::string& name, const dynamic_object_ref& value) const SWIFT_NAME(setObject(named:_:)) {

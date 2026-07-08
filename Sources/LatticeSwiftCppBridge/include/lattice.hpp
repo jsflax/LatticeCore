@@ -810,6 +810,11 @@ public:
         return database::total_statement_count();
     }
 
+    /// Thread-local twin — exact budgets on single-threaded read paths.
+    static uint64_t thread_sql_statement_count() SWIFT_NAME(threadSQLStatementCount()) {
+        return database::thread_statement_count();
+    }
+
     /// Checkpoint the WAL file, flushing all changes to the main database file.
     /// Logs the outcome — TRUNCATE checkpoints silently fail under concurrent
     /// readers, and an ignored rc is how multi-GB WAL files accumulate.

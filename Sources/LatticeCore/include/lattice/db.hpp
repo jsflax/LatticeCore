@@ -117,6 +117,11 @@ public:
     /// counter undercounts — tests assert on deltas of this global.
     static uint64_t total_statement_count();
 
+    /// Thread-local twin of total_statement_count(): counts only statements
+    /// issued from the calling thread. Exact budgets for single-threaded
+    /// read paths, immune to parallel test suites in the same process.
+    static uint64_t thread_statement_count();
+
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }
 

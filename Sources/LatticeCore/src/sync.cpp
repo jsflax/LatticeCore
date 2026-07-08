@@ -724,7 +724,13 @@ void synchronizer_base::on_websocket_open() {
     LOG_INFO("synchronizer", "[%s] on_websocket_open (this=%p, db=%s)",
              config_.sync_id.c_str(), (void*)this, db().config().path.c_str());
     is_connected_ = true;
-    reconnect_attempts_ = 0;
+    // Do NOT reset reconnect_attempts_ here: a flapping endpoint fires
+    // open→error every cycle, and resetting on open pinned the backoff at
+    // base_delay forever (~1s reconnect storm). The counter resets in
+    // on_websocket_close/error instead, and only after the connection
+    // proved stable (see kStableConnectionMs).
+    last_open_time_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
     if (on_state_change_) {
         scheduler_->invoke([this] { on_state_change_(true); });
@@ -905,12 +911,18 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
     // !is_connected_ gate refused to reconnect and the synchronizer sat
     // dead until a process restart (production: every drop needed a manual
     // daemon kickstart).
-    is_connected_ = false;
+    //
+    // exchange() distinguishes "an open connection died" from "a connect
+    // attempt failed" (on_error also fires for failed attempts, when
+    // is_connected_ is already false — last_open_time_ms_ would be stale).
+    const bool was_open = is_connected_.exchange(false);
+    maybe_reset_backoff_after_stable_connection(was_open);
 
     // Clear in-flight tracking so entries can be re-sent after reconnect.
     // Without this, entries added to in_flight_ids_ before the error remain
     // permanently stuck — query_pending_entries() filters them out, and the
-    // ACK that would remove them never arrives.
+    // ACK that would remove them never arrives. Nothing is outstanding on a
+    // dead transport, so pending drops to 0 with it.
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         if (!in_flight_ids_.empty()) {
@@ -918,7 +930,9 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
                      config_.sync_id.c_str(), in_flight_ids_.size());
             in_flight_ids_.clear();
         }
+        progress_pending_upload_.store(0, std::memory_order_relaxed);
     }
+    fire_progress();
 
     if (on_error_) {
         scheduler_->invoke([this, error] { on_error_(error); });
@@ -931,9 +945,11 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
 void synchronizer_base::on_websocket_close(int code, const std::string& reason) {
     LOG_INFO("synchronizer", "[%s] WebSocket closed (code=%d, reason=%s, this=%p, db=%s)",
              config_.sync_id.c_str(), code, reason.c_str(), (void*)this, db().config().path.c_str());
-    is_connected_ = false;
+    const bool was_open = is_connected_.exchange(false);
+    maybe_reset_backoff_after_stable_connection(was_open);
 
     // Clear in-flight tracking so entries can be re-sent after reconnect.
+    // Pending mirrors the (now empty) in-flight set.
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         if (!in_flight_ids_.empty()) {
@@ -941,7 +957,9 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
                      config_.sync_id.c_str(), in_flight_ids_.size());
             in_flight_ids_.clear();
         }
+        progress_pending_upload_.store(0, std::memory_order_relaxed);
     }
+    fire_progress();
 
     if (on_state_change_) {
         scheduler_->invoke([this] { on_state_change_(false); });
@@ -1668,13 +1686,22 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     // next window ships. The ack-timeout resend covers a lost window.
     const size_t window_end = std::min(entries.size(), config_.chunk_size * 2);
 
-    // Track only the entries actually sent as in-flight.
+    // Track only the entries actually sent as in-flight, and account progress
+    // for exactly the windowed portion: pending mirrors the in-flight set
+    // (store, not add — self-healing across reconnect clears), total counts
+    // real sends only (a resend after a drop re-counts at most one window,
+    // never the whole backlog).
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (size_t i = 0; i < window_end; ++i) {
             in_flight_ids_.insert(entries[i].global_id);
         }
+        progress_pending_upload_.store(
+            static_cast<int64_t>(in_flight_ids_.size()), std::memory_order_relaxed);
     }
+    progress_total_upload_.fetch_add(
+        static_cast<int64_t>(window_end), std::memory_order_relaxed);
+    fire_progress();
     if (window_end < entries.size()) {
         LOG_INFO("synchronizer", "[%s] send window: %zu of %zu entries (rest pend on ACKs)",
                  config_.sync_id.c_str(), window_end, entries.size());
@@ -1741,6 +1768,8 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
         {
             std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
             for (const auto& id : sent_ids) released += self->in_flight_ids_.erase(id);
+            self->progress_pending_upload_.store(
+                static_cast<int64_t>(self->in_flight_ids_.size()), std::memory_order_relaxed);
         }
         if (released > 0) {
             LOG_WARN("synchronizer", "[%s] %zu entries unACKed after timeout — resending",
@@ -1764,18 +1793,13 @@ void synchronizer_base::upload_pending_changes() {
     if (entries.empty()) return;
     auto classified = classify_entries(entries);
 
-    // Update progress counters AFTER classification.
-    // Only count to_send entries as pending — skipped entries resolve immediately
-    // and shouldn't contribute to the pending/total counts.
-    // This avoids double-counting: query_pending_entries filters in-flight entries,
-    // but if we counted all queried entries, in-flight entries from prior cycles
-    // would inflate the total and cause negative pending when ACK'd.
-    if (!classified.to_send.empty()) {
-        auto count = static_cast<int64_t>(classified.to_send.size());
-        progress_pending_upload_.fetch_add(count, std::memory_order_relaxed);
-        progress_total_upload_.fetch_add(count, std::memory_order_relaxed);
-        fire_progress();
-    }
+    // Progress accounting happens in send_entries AFTER windowing: counting
+    // the full classified backlog here (pre-window) meant `pending` never
+    // returned to 0 during a multi-window catch-up — every pass re-counted
+    // the un-sent remainder, inflating pending/total unboundedly (observed
+    // 180MB "pending"), permanently blocking drain()'s pending==0 exit and
+    // any idle-gated work. The invariant is now: pending == in-flight
+    // (sent-but-unACKed) exactly; total counts only entries actually sent.
 
     mark_skipped_synced(classified.to_mark_synced);
     send_entries(classified.to_send);
@@ -1803,17 +1827,19 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
              (long long)progress_acked_.load(std::memory_order_relaxed));
     mark_audit_entries_synced_for(db(), global_ids, config_.sync_id, config_.all_active_sync_ids);
 
-    // Remove ACK'd entries from in-flight set
+    // Remove ACK'd entries from in-flight set; pending mirrors the set size
+    // (store, not fetch_sub — an ACK straddling a reconnect clear must not
+    // drive the counter negative).
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (const auto& id : global_ids) {
             in_flight_ids_.erase(id);
         }
+        progress_pending_upload_.store(
+            static_cast<int64_t>(in_flight_ids_.size()), std::memory_order_relaxed);
     }
 
-    auto count = static_cast<int64_t>(global_ids.size());
-    progress_acked_.fetch_add(count, std::memory_order_relaxed);
-    progress_pending_upload_.fetch_sub(count, std::memory_order_relaxed);
+    progress_acked_.fetch_add(static_cast<int64_t>(global_ids.size()), std::memory_order_relaxed);
     fire_progress();
 
     // After processing ACKs, check if more pending entries exist that aren't
@@ -1829,6 +1855,20 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
             if (is_destroyed_) return;
             upload_pending_changes();
         });
+    }
+}
+
+void synchronizer_base::maybe_reset_backoff_after_stable_connection(bool was_open) {
+    if (!was_open) return;  // failed connect attempt — stale last_open_time_ms_
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto open_ms = last_open_time_ms_.load(std::memory_order_relaxed);
+    if (open_ms > 0 && now_ms - open_ms >= config_.stable_connection_ms) {
+        const int prior = reconnect_attempts_.exchange(0);
+        if (prior > 0) {
+            LOG_INFO("synchronizer", "[%s] connection was stable %llds — backoff reset (attempts were %d)",
+                     config_.sync_id.c_str(), (long long)((now_ms - open_ms) / 1000), prior);
+        }
     }
 }
 

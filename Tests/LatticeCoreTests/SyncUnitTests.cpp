@@ -1,4 +1,6 @@
 #include "TestHelpers.hpp"
+#include <regex>
+#include <set>
 
 // ============================================================================
 // Sync Unit Tests — AuditLog, sync protocol, synchronizer
@@ -844,4 +846,182 @@ TEST(Sync, DuplicateEntrySkipped) {
     // Apply again — should be skipped (same globalId)
     lattice::apply_remote_changes(db, {entry});
     EXPECT_EQ(db.objects<TestPerson>().size(), 1u);
+}
+
+// ----------------------------------------------------------------------------
+// Backoff: flapping endpoint must walk the exponential ladder
+// ----------------------------------------------------------------------------
+
+namespace {
+/// Transport that opens successfully and then immediately errors — the
+/// "flapping endpoint" shape that used to pin backoff at base_delay forever
+/// (reconnect_attempts_ was reset on every open).
+class flappy_mock_transport : public lattice::sync_transport {
+public:
+    void connect(const std::string&,
+                 const std::map<std::string, std::string>&) override {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            connect_times_.push_back(std::chrono::steady_clock::now());
+        }
+        state_ = lattice::transport_state::open;
+        if (on_open_) on_open_();
+        state_ = lattice::transport_state::closed;
+        if (on_error_) on_error_("simulated flap");
+    }
+    void disconnect() override { state_ = lattice::transport_state::closed; }
+    lattice::transport_state state() const override { return state_; }
+    void send(const lattice::transport_message&) override {}
+    void set_on_open(on_open_handler h) override { on_open_ = h; }
+    void set_on_message(on_message_handler) override {}
+    void set_on_error(on_error_handler h) override { on_error_ = h; }
+    void set_on_close(on_close_handler) override {}
+
+    size_t connect_count() {
+        std::lock_guard<std::mutex> lock(m_);
+        return connect_times_.size();
+    }
+    std::vector<std::chrono::steady_clock::time_point> connect_times() {
+        std::lock_guard<std::mutex> lock(m_);
+        return connect_times_;
+    }
+private:
+    std::mutex m_;
+    std::vector<std::chrono::steady_clock::time_point> connect_times_;
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_open_handler on_open_;
+    on_error_handler on_error_;
+};
+}  // namespace
+
+TEST(Sync, BackoffNotResetOnFlappyOpen) {
+    TempDB tmp{"flappybackoff"};
+    lattice::configuration db_cfg(tmp.str(),
+                                  std::make_shared<lattice::std_thread_scheduler>());
+    auto db = std::make_unique<lattice::lattice_db>(db_cfg);
+
+    lattice::sync_config cfg;
+    cfg.sync_id = "flappy";
+    cfg.all_active_sync_ids = {"flappy"};
+    cfg.base_delay_seconds = 0.2;
+    cfg.max_delay_seconds = 10.0;
+    cfg.stable_connection_ms = 60'000;  // flaps are instant — never "stable"
+
+    auto transport = std::make_unique<flappy_mock_transport>();
+    auto* flappy = transport.get();
+    auto sync = std::make_unique<lattice::synchronizer>(
+        std::move(db), cfg, std::move(transport));
+
+    sync->connect();
+
+    // Wait for at least 4 connects (initial + 3 backoff reconnects:
+    // 0.2s + 0.4s + 0.8s ≈ 1.4s plus scheduling slack).
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (flappy->connect_count() < 4 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    auto times = flappy->connect_times();
+    ASSERT_GE(times.size(), 4u) << "expected ≥4 connect attempts, got " << times.size();
+
+    // Inter-connect gaps must grow: with attempts never reset on open, gap i
+    // is ~base * 2^i. Assert the 3rd gap comfortably exceeds the 1st — a
+    // reset-on-open regression pins every gap at ~base and fails this.
+    auto gap = [&](size_t i) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   times[i + 1] - times[i]).count();
+    };
+    EXPECT_GE(gap(2), gap(0) * 2)
+        << "backoff did not escalate: gaps " << gap(0) << "ms, "
+        << gap(1) << "ms, " << gap(2) << "ms";
+
+    sync.reset();
+}
+
+// ----------------------------------------------------------------------------
+// Progress counters: windowed catch-up keeps pending == in-flight, exactly
+// ----------------------------------------------------------------------------
+
+TEST(Sync, WindowedCounterSanity) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"windowcounters"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "window-sync";
+    cfg.all_active_sync_ids = {"window-sync"};
+    cfg.chunk_size = 2;  // window = 2 * chunk_size = 4
+
+    const int kEntries = 10;
+    for (int i = 0; i < kEntries; ++i) {
+        db->add(TestPerson{"win-" + std::to_string(i), i, std::nullopt});
+    }
+
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+
+    sync.connect();
+    ASSERT_TRUE(sync.is_connected());
+
+    // The catch-up ships in windows of ≤4. Repeatedly ACK whatever was sent;
+    // at every step pending must equal the (windowed) in-flight count — the
+    // pre-fix accounting counted the whole classified backlog per pass, so
+    // pending ratcheted upward and never returned to 0.
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> acked_ids;
+    int64_t max_pending_seen = 0;
+
+    for (int round = 0; round < 20 && (int)acked_ids.size() < kEntries; ++round) {
+        auto progress = sync.get_progress();
+        max_pending_seen = std::max(max_pending_seen, progress.pending_upload);
+        ASSERT_LE(progress.pending_upload, 4)
+            << "pending exceeded the send window during catch-up";
+
+        // Collect globalIds from every frame sent so far and ACK the new ones.
+        std::vector<std::string> to_ack;
+        for (const auto& msg : mock_ws->get_sent_messages()) {
+            auto s = msg.as_string();
+            for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end;
+                 it != end; ++it) {
+                auto id = (*it)[1].str();
+                if (acked_ids.insert(id).second) to_ack.push_back(id);
+            }
+        }
+        if (to_ack.empty()) break;
+        mock_ws->simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_ack(to_ack).to_json()));
+    }
+
+    auto final_progress = sync.get_progress();
+    EXPECT_EQ((int)acked_ids.size(), kEntries) << "not every entry was sent+ACKed";
+    EXPECT_EQ(final_progress.pending_upload, 0) << "pending must return to 0";
+    EXPECT_EQ(final_progress.acked, kEntries);
+    EXPECT_EQ(final_progress.total_upload, kEntries)
+        << "total must count actually-sent entries exactly (no backlog re-count)";
+    EXPECT_LE(max_pending_seen, 4);
+
+    sync.disconnect();
+    // A second pass finds nothing new to send.
+    auto sent_before = mock_ws->get_sent_messages().size();
+    sync.connect();
+    sync.sync_now();
+    // (Frames may include non-audit control messages; assert no audit re-send
+    // by checking no NEW globalIds appear.)
+    std::set<std::string> post_ids;
+    for (const auto& msg : mock_ws->get_sent_messages()) {
+        auto s = msg.as_string();
+        for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end;
+             it != end; ++it) {
+            post_ids.insert((*it)[1].str());
+        }
+    }
+    EXPECT_EQ(post_ids.size(), acked_ids.size())
+        << "reconnect re-sent already-ACKed entries";
+    (void)sent_before;
+    sync.disconnect();
 }

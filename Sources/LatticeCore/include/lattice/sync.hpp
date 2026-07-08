@@ -185,6 +185,11 @@ struct sync_config {
     double max_delay_seconds = 60.0;
     size_t chunk_size = 1000;  // Max events per message
 
+    /// A connection must stay open at least this long before a subsequent
+    /// drop resets the reconnect backoff. Guards against flapping endpoints
+    /// (open→error every cycle) re-arming ~1s reconnect storms.
+    int64_t stable_connection_ms = 60'000;
+
     /// Upload filter. nullopt = sync everything (default).
     /// Empty vector = sync nothing. Non-empty = whitelist.
     std::optional<std::vector<sync_filter_entry>> sync_filter;
@@ -305,6 +310,17 @@ protected:
     std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
     std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
     std::atomic<int> reconnect_attempts_{0};
+    // steady_clock ms of the last successful open. Backoff resets only after a
+    // connection proved STABLE (open ≥ config_.stable_connection_ms before
+    // dropping) — resetting on open re-armed ~1s reconnect storms against a
+    // flapping endpoint, and a schedule-time check re-arms during any outage
+    // longer than the stability window. The check therefore lives in
+    // on_websocket_close/error.
+    std::atomic<int64_t> last_open_time_ms_{0};
+    /// Reset reconnect_attempts_ iff a genuinely-open connection survived
+    /// ≥ config_.stable_connection_ms. Called from on_websocket_close/error
+    /// with was_open = is_connected_.exchange(false).
+    void maybe_reset_backoff_after_stable_connection(bool was_open);
     std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
 

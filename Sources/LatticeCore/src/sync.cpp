@@ -1657,10 +1657,17 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
     LOG_DEBUG("synchronizer", "FILTERED upload path — filter has %zu entries, %zu audit entries to classify",
               config_.sync_filter->size(), entries.size());
 
+    // The preloads below scan the entire _lattice_sync_set and run a full
+    // SELECT over every filtered table — worth it for bulk catch-up batches,
+    // pure overhead for the steady state (a paced tick carries a handful of
+    // entries; point lookups are indexed). Gate on batch size.
+    constexpr size_t kClassifyPreloadThreshold = 64;
+    const bool preload = entries.size() > kClassifyPreloadThreshold;
+
     // Pre-load sync set into memory — O(1) hash lookups instead of O(N) SQL queries.
     // Key is "table_name\0global_row_id" for compact hashing.
     std::unordered_set<std::string> sync_set_cache;
-    {
+    if (preload) {
         auto rows = db().db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
         sync_set_cache.reserve(rows.size());
         for (const auto& row : rows) {
@@ -1678,46 +1685,50 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
     // Pre-compute filter matches per table — one SQL query per filter entry
     // instead of one per audit entry. Key is "table_name\0global_row_id".
     std::unordered_set<std::string> filter_matches;
-    for (const auto& fe : *config_.sync_filter) {
-        LOG_DEBUG("synchronizer", "  filter entry: table=%s where=%s",
-                  fe.table_name.c_str(),
-                  fe.where_clause ? fe.where_clause->c_str() : "(all rows)");
+    if (preload) {
+        for (const auto& fe : *config_.sync_filter) {
+            LOG_DEBUG("synchronizer", "  filter entry: table=%s where=%s",
+                      fe.table_name.c_str(),
+                      fe.where_clause ? fe.where_clause->c_str() : "(all rows)");
 
-        std::string sql = "SELECT globalId FROM " + fe.table_name;
-        if (fe.where_clause) {
-            sql += " WHERE (" + *fe.where_clause + ")";
-        }
-        auto rows = db().db().query(sql);
-        for (const auto& row : rows) {
-            auto gid_it = row.find("globalId");
-            if (gid_it != row.end()) {
-                std::string key = fe.table_name + '\0'
-                                + std::get<std::string>(gid_it->second);
-                filter_matches.insert(std::move(key));
+            std::string sql = "SELECT globalId FROM " + fe.table_name;
+            if (fe.where_clause) {
+                sql += " WHERE (" + *fe.where_clause + ")";
+            }
+            auto rows = db().db().query(sql);
+            for (const auto& row : rows) {
+                auto gid_it = row.find("globalId");
+                if (gid_it != row.end()) {
+                    std::string key = fe.table_name + '\0'
+                                    + std::get<std::string>(gid_it->second);
+                    filter_matches.insert(std::move(key));
+                }
             }
         }
+        LOG_DEBUG("synchronizer", "Pre-computed filter matches: %zu rows", filter_matches.size());
     }
-    LOG_DEBUG("synchronizer", "Pre-computed filter matches: %zu rows", filter_matches.size());
 
-    // Lambda replacements for sync_set_contains and row_matches_filter
-    // that use the in-memory caches instead of SQL queries.
+    // Lambda seams: in-memory caches for bulk batches, indexed per-row SQL
+    // lookups for small (steady-state) batches.
     auto cached_sync_set_contains = [&](const std::string& table_name,
                                          const std::string& global_row_id) -> bool {
-        return sync_set_cache.count(table_name + '\0' + global_row_id) > 0;
+        if (preload) return sync_set_cache.count(table_name + '\0' + global_row_id) > 0;
+        return sync_set_contains(table_name, global_row_id);
     };
     auto cached_row_matches_filter = [&](const std::string& table_name,
                                           const std::string& global_row_id) -> bool {
-        return filter_matches.count(table_name + '\0' + global_row_id) > 0;
+        if (preload) return filter_matches.count(table_name + '\0' + global_row_id) > 0;
+        return row_matches_filter(table_name, global_row_id);
     };
-    // Keep sync_set_add/remove updating both the cache and the DB.
+    // Keep sync_set_add/remove updating both the cache (when active) and the DB.
     auto cached_sync_set_add = [&](const std::string& table_name,
                                     const std::string& global_row_id) {
-        sync_set_cache.insert(table_name + '\0' + global_row_id);
+        if (preload) sync_set_cache.insert(table_name + '\0' + global_row_id);
         sync_set_add(table_name, global_row_id);
     };
     auto cached_sync_set_remove = [&](const std::string& table_name,
                                        const std::string& global_row_id) {
-        sync_set_cache.erase(table_name + '\0' + global_row_id);
+        if (preload) sync_set_cache.erase(table_name + '\0' + global_row_id);
         sync_set_remove(table_name, global_row_id);
     };
 

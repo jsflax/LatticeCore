@@ -456,6 +456,11 @@ protected:
         std::vector<int64_t> to_mark_synced;
     };
     std::vector<audit_log_entry> query_pending_entries();
+    /// Set by query_pending_entries when the (floor-bounded) enumeration
+    /// returned a full window — more backlog is likely pending beyond the
+    /// LIMIT. Drives immediate catch-up continuation (scheduler-serialized;
+    /// only read/written from upload passes).
+    bool last_enumeration_hit_limit_ = false;
     classified_entries classify_entries(std::vector<audit_log_entry>& entries);
     void classify_delete(audit_log_entry& entry, classified_entries& result);
     void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);

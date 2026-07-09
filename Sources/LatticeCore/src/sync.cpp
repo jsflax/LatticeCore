@@ -644,7 +644,12 @@ void synchronizer_base::maybe_checkpoint() {
 }
 
 void synchronizer_base::start_pacer() {
-    if (config_.upload_coalesce_ms <= 0) return;
+    // The pacer owns trailing-edge coalescing AND the checkpoint heartbeat —
+    // it must run for checkpointing even when coalescing is disabled
+    // (upload requests then take the legacy direct path in request_upload,
+    // and a spurious pacer wake at most duplicates one exchange-guarded
+    // dispatch).
+    if (config_.upload_coalesce_ms <= 0 && config_.checkpoint_passive_interval_ms <= 0) return;
     pacer_thread_ = std::thread([this] {
         std::unique_lock<std::mutex> lock(pacer_mutex_);
         last_passive_ckpt_ = std::chrono::steady_clock::now();
@@ -1549,6 +1554,7 @@ std::vector<audit_log_entry> synchronizer_base::query_pending_entries() {
     }
     auto entries = query_audit_log_for_sync(
         db().db(), config_.sync_id, config_.sync_filter, floor, limit);
+    last_enumeration_hit_limit_ = (limit > 0 && entries.size() >= limit);
 
     // Filter out entries already in-flight (sent but not yet ACK'd), and
     // record every enumerated real audit id as OPEN — the floor may only
@@ -2080,14 +2086,27 @@ void synchronizer_base::upload_pending_changes() {
     // any idle-gated work. The invariant is now: pending == in-flight
     // (sent-but-unACKed) exactly; total counts only entries actually sent.
 
+    const size_t skipped = classified.to_mark_synced.size();
     mark_skipped_synced(classified.to_mark_synced);
     send_entries(classified.to_send);
+    const size_t sent = classified.to_send.size();  // resized to the window by send_entries
 
-    // No tail-call: requests that arrived during this pass were routed
-    // through request_upload(), which either queued its own scheduler pass
-    // (leading edge / legacy mode) or armed the pacer's trailing-edge tick.
-    // The old zero-delay tail-call was one of four sites that, combined,
-    // busy-spun the daemon.
+    // Catch-up continuation: a full enumeration window with real progress
+    // (something sent or skipped-resolved) means more backlog waits beyond
+    // the LIMIT — continue IMMEDIATELY. Paying the coalesce delay per window
+    // turned an N-window catch-up into N*coalesce_ms of added latency
+    // (observed: a 3s relay pipeline stretched past 15s). This cannot spin:
+    // each pass does bounded real work, the floor advances past skips, and
+    // a full send window with nothing sent (stalled server) makes progress
+    // false — the ACK / ack-timeout path owns continuation there.
+    //
+    // New-event bursts (observer requests) still coalesce via request_upload.
+    if (last_enumeration_hit_limit_ && (sent > 0 || skipped > 0)) {
+        scheduler_->invoke([this] {
+            if (is_destroyed_) return;
+            upload_pending_changes();
+        });
+    }
 }
 
 std::vector<std::string> synchronizer_base::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
@@ -2139,7 +2158,14 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
     // ACKs mean the server is alive and consuming — reset the resend backoff.
     ack_resend_failures_.store(0, std::memory_order_relaxed);
     if (should_upload) {
-        request_upload();
+        // The drained in-flight window is a continuation signal for KNOWN
+        // pending work — dispatch directly (the pass no-ops if nothing is
+        // pending). Coalescing here throttled ACK-driven window progression
+        // to one window per coalesce interval.
+        scheduler_->invoke([this] {
+            if (is_destroyed_) return;
+            upload_pending_changes();
+        });
     }
 }
 

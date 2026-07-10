@@ -665,7 +665,17 @@ void synchronizer_base::start_pacer() {
                 return pacer_stop_ || upload_requested_.load(std::memory_order_acquire);
             });
             if (pacer_stop_) return;
+            // DB work (checkpoints, upload ticks) must run with pacer_mutex_
+            // RELEASED: a writer mid-sqlite3_step holds the connection mutex
+            // while its change-hook observer calls request_upload(), which
+            // takes pacer_mutex_ — doing connection work under pacer_mutex_
+            // here is an ABBA deadlock (observed live as a hung
+            // PacerDrivenTruncateWhenIdle: main thread in __psynch_mutexwait
+            // inside the update hook, pacer in sqlite3LockAndPrepare).
+            lock.unlock();
             maybe_checkpoint();
+            lock.lock();
+            if (pacer_stop_) return;
             if (!upload_requested_.load(std::memory_order_acquire)) continue;
             // Trailing edge: wait out the remainder of the window opened by
             // the leading edge, then fire ONE coalesced tick for however many
@@ -678,10 +688,12 @@ void synchronizer_base::start_pacer() {
             if (upload_requested_.exchange(false, std::memory_order_acq_rel)) {
                 next_allowed_tick_ = std::chrono::steady_clock::now() +
                                      std::chrono::milliseconds(config_.upload_coalesce_ms);
+                lock.unlock();
                 scheduler_->invoke([this] {
                     if (is_destroyed_) return;
                     upload_pending_changes();
                 });
+                lock.lock();
             }
         }
     });

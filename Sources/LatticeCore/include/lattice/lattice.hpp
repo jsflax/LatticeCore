@@ -1487,6 +1487,15 @@ public:
             if (is_in_memory) continue;
             // Internal tables — AuditLog entries handled in pass 3 below
             if (internal_table_parents.count(table)) continue;
+            // Sync bookkeeping tables (_lattice_sync_state, _SyncControl,
+            // _lattice_replication_slots, …) are never audited — this pass's
+            // tail-scan lookup is definitionally futile for them and, before
+            // the covering index existed, full-scanned AuditLog per write
+            // (observed live: 1000 _lattice_sync_state UPSERTs per apply
+            // batch × 187k-row AuditLog ≈ minutes of CPU per batch, starving
+            // the IPC ACK path). Link tables were skipped above; any other
+            // underscore table is bookkeeping with no observable model.
+            if (!table.empty() && table[0] == '_') continue;
 
             LOG_DEBUG("flush_changes", "Querying AuditLog for table=%s rowId=%lld op=%s", table.c_str(), (long long)row_id, op.c_str());
 
@@ -4619,6 +4628,17 @@ private:
                 ON AuditLog(isSynchronized)
                 WHERE isSynchronized = 0
         )");
+
+        // Covering index for flush_changes' change→audit-entry lookups
+        // (pass 2: tableName+rowId+operation; pass 3 uses the tableName
+        // prefix). Without it each lookup is a full reverse scan — lethal
+        // on large AuditLogs during bulk applies. Existing DBs gain it via
+        // the kLatticeSchemaFormatEpoch bump (fingerprint slow path re-runs
+        // this guarded DDL).
+        db_->execute(R"(
+            CREATE INDEX IF NOT EXISTS idx_audit_log_change_lookup
+                ON AuditLog(tableName, rowId, operation)
+        )");
     }
 
     void ensure_sync_control_table() {
@@ -4754,7 +4774,12 @@ protected:
     /// ALTER in ensure_sync_control_table — without this bump the fast path
     /// skips the ALTER on every existing DB and the sync engine SELECTs a
     /// missing column on its hot path).
-    static constexpr int kLatticeSchemaFormatEpoch = 2;
+    ///
+    /// Epoch 3: AuditLog gained idx_audit_log_change_lookup (covering index
+    /// for flush_changes' change→audit lookups; guarded CREATE INDEX in
+    /// ensure_audit_log_table). Folded into the same unreleased train as
+    /// epoch 2 — no released binary ever wrote an epoch-2 marker.
+    static constexpr int kLatticeSchemaFormatEpoch = 3;
 
     static uint64_t fnv1a_hash(const std::string& s) {
         uint64_t h = 1469598103934665603ULL;

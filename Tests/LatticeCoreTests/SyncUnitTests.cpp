@@ -1520,3 +1520,40 @@ TEST(Sync, ExistingDbGainsUploadFloor) {
         EXPECT_EQ(std::get<int64_t>(rows[0].at("upload_floor")), 0);
     }
 }
+
+// ----------------------------------------------------------------------------
+// flush_changes change→audit lookup must be indexed (epoch 3)
+// ----------------------------------------------------------------------------
+// Without idx_audit_log_change_lookup, every pass-2 lookup in flush_changes
+// reverse-SCANs the whole AuditLog. Observed live: per-sync-mode applies
+// write one _lattice_sync_state row per entry, and each write's futile
+// lookup scanned a 187k-row AuditLog — minutes of CPU per 1000-entry batch,
+// starving the IPC ACK path into a permanent resend storm. (The bookkeeping
+// tables are additionally skipped in pass 2 now; this pins the index for
+// the model-table lookups that remain.)
+TEST(Sync, AuditChangeLookupIndexed) {
+    TempDB tmp{"idxcheck"};
+    lattice::lattice_db db(lattice::configuration(tmp.str()));
+
+    auto count = db.db().query(
+        "SELECT COUNT(*) AS c FROM sqlite_master "
+        "WHERE type='index' AND name='idx_audit_log_change_lookup'");
+    ASSERT_EQ(count.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(count[0].at("c")), 1);
+
+    auto plan = db.db().query(
+        "EXPLAIN QUERY PLAN SELECT id, globalId FROM AuditLog "
+        "WHERE tableName = 'X' AND rowId = 1 AND operation = 'INSERT' "
+        "ORDER BY id DESC LIMIT 1");
+    ASSERT_FALSE(plan.empty());
+    bool uses_index = false;
+    for (const auto& row : plan) {
+        auto it = row.find("detail");
+        if (it == row.end() || !std::holds_alternative<std::string>(it->second)) continue;
+        const auto& d = std::get<std::string>(it->second);
+        EXPECT_EQ(d.find("SCAN AuditLog"), std::string::npos)
+            << "pass-2 lookup shape still scans: " << d;
+        if (d.find("idx_audit_log_change_lookup") != std::string::npos) uses_index = true;
+    }
+    EXPECT_TRUE(uses_index) << "lookup does not use idx_audit_log_change_lookup";
+}

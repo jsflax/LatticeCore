@@ -62,6 +62,14 @@
   re-hammered with the same window at a fixed cadence.
 
 ### Fixed
+- **Apply-path scan storm**: per-sync-mode applies write one
+  `_lattice_sync_state` row per entry, and `flush_changes`' change→audit
+  lookup reverse-scanned the entire AuditLog for each (no covering index) —
+  1000-entry IPC batches against a 187k-row AuditLog burned minutes of CPU
+  per batch, starving ACKs into a permanent resend storm. Pass 2 now skips
+  never-audited bookkeeping tables, and AuditLog gains
+  `idx_audit_log_change_lookup` (schema format epoch 2 → 3, same unreleased
+  train).
 - **Pacer ABBA deadlock**: the pacer thread held its coordination mutex while
   performing DB work (WAL checkpoints, inline coalesced ticks under an
   immediate scheduler). A writer mid-`sqlite3_step` holds the connection mutex

@@ -1175,30 +1175,47 @@ TEST(Sync, PacerDrivenTruncateWhenIdle) {
     // ACK until ALL 100 entries are confirmed — the burst ships in a leading
     // tick + a trailing tick ~coalesce_ms later, so an early pending==0 (after
     // ACKing just the leading entry) does NOT mean the backlog is done.
+    //
+    // Model a REAL server: ACK every delivery, including at-least-once
+    // DUPLICATES. A trailing coalesced tick can enumerate entries just before
+    // the floor advance from a prior ACK commits and re-send them; if the
+    // duplicate is never re-ACKed it stays in_flight forever and pending
+    // never drains (observed on the slower Linux container, where the tick
+    // interleaves the ACK round-trip that macOS timing never splits).
     std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
     std::set<std::string> acked;
-    for (int round = 0; round < 60 && (int)acked.size() < 100; ++round) {
+    size_t seen_msgs = 0;
+    auto ack_new_messages = [&]() {
+        auto msgs = mock_ws->get_sent_messages();
         std::vector<std::string> to_ack;
-        for (const auto& msg : mock_ws->get_sent_messages()) {
-            auto s = msg.as_string();
+        for (size_t m = seen_msgs; m < msgs.size(); ++m) {
+            auto s = msgs[m].as_string();
             for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
                 auto id = (*it)[1].str();
-                if (acked.insert(id).second) to_ack.push_back(id);
+                acked.insert(id);
+                to_ack.push_back(id);  // duplicates included, like a real server
             }
         }
+        seen_msgs = msgs.size();
         if (!to_ack.empty()) {
             mock_ws->simulate_message(lattice::transport_message::from_string(
                 lattice::server_sent_event::make_ack(to_ack).to_json()));
-        } else {
+        }
+        return !to_ack.empty();
+    };
+    for (int round = 0; round < 60 && (int)acked.size() < 100; ++round) {
+        if (!ack_new_messages()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
     ASSERT_EQ((int)acked.size(), 100) << "not all burst entries were sent";
-    // Pending drains to 0 once the last ACK lands.
+    // Pending drains to 0 once the last ACK lands — keep ACKing late
+    // redeliveries while we wait, as a live server would.
     {
         const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (sync.get_progress().pending_upload != 0 &&
                std::chrono::steady_clock::now() < ack_deadline) {
+            ack_new_messages();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }

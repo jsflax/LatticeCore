@@ -939,11 +939,12 @@ TEST(Bridge, UpsertRebindsToExistingRowAndAppendIsIdempotent) {
     delete lattice_ref;
 }
 
-#endif // !__linux__
-
 // ============================================================================
 // Row cache — materialized reads (see dynamic_object.hpp contract)
 // ============================================================================
+// Stays inside the !__linux__ guard: these tests exercise the Swift bridge
+// (swift_lattice_ref/dynamic_object), which the test target only links on
+// Apple platforms — same constraint as everything above.
 
 namespace {
 lattice::property_descriptor nullable_text_prop(const std::string& name) {
@@ -1101,3 +1102,5 @@ TEST(Bridge, RowCacheNullRoundTrip) {
 
     delete ref;
 }
+
+#endif // !__linux__

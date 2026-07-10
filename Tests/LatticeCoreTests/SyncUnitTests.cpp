@@ -1557,3 +1557,35 @@ TEST(Sync, AuditChangeLookupIndexed) {
     }
     EXPECT_TRUE(uses_index) << "lookup does not use idx_audit_log_change_lookup";
 }
+
+// ----------------------------------------------------------------------------
+// Destroy-from-callback: no self-spin, no self-join
+// ----------------------------------------------------------------------------
+// An observer callback that releases the LAST reference to its lattice runs
+// ~lattice_db ON the notify thread while for_each_alive still holds the
+// guard's notify_refcount — the drain wait must exclude the current thread's
+// own holds or it waits for itself forever (observed live: 97%-CPU yield
+// spin, 184 CPU-minutes, intermittent full-suite hangs). The scheduler
+// shutdown reached from its own worker must detach, not self-join.
+TEST(Sync, DestroyFromObserverCallbackDoesNotHang) {
+    TempDB tmp{"cbdestroy"};
+    auto a = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    lattice::lattice_db b{lattice::configuration(tmp.str())};  // same path
+
+    std::atomic<bool> fired{false};
+    a->add_table_observer("AuditLog",
+        [&a, &fired](const std::vector<lattice::lattice_db::change_event>&) {
+            if (a) a.reset();  // destroy A from inside its own notification
+            fired.store(true, std::memory_order_release);
+        });
+
+    b.add(TestPerson{"boom", 1, std::nullopt});  // cross-instance notify → A
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!fired.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(fired.load()) << "observer never fired";
+    EXPECT_EQ(a, nullptr) << "callback did not destroy the instance";
+}

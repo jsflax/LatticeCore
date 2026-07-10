@@ -62,6 +62,11 @@
   re-hammered with the same window at a fixed cadence.
 
 ### Fixed
+- **Self-hang when an observer callback releases the last lattice
+  reference**: the destructor's in-flight-callback drain wait now excludes
+  the current thread's own holds (it spun on itself forever — the
+  long-standing intermittent test-suite hang), and a scheduler shutdown
+  reached from its own worker detaches instead of self-joining.
 - **Apply-path scan storm**: per-sync-mode applies write one
   `_lattice_sync_state` row per entry, and `flush_changes`' change→audit
   lookup reverse-scanned the entire AuditLog for each (no covering index) —

@@ -177,8 +177,17 @@ public:
             running_ = false;
         }
         cv_.notify_one();
+        // Self-join guard: shutdown() can be reached from a task running ON
+        // the worker (an observer callback releasing the last lattice
+        // reference → ~lattice_db → scheduler shutdown). join(self) throws
+        // resource_deadlock_would_occur; detach instead — running_ is false,
+        // so the loop exits after the current task.
         if (worker_.joinable()) {
-            worker_.join();
+            if (std::this_thread::get_id() == worker_.get_id()) {
+                worker_.detach();
+            } else {
+                worker_.join();
+            }
         }
     }
 

@@ -75,6 +75,25 @@ struct instance_guard {
     /// Number of in-flight notify_change() calls on this instance.
     /// The destructor spins until this reaches 0 before proceeding.
     std::atomic<int> notify_refcount{0};
+
+    /// Per-thread nesting depth of notify callbacks for THIS guard on the
+    /// calling thread. Lets close()/~lattice_db exclude the current thread's
+    /// own holds from the drain wait: when an observer callback releases the
+    /// LAST reference to the lattice, the destructor runs ON the callback
+    /// thread while notify_refcount still counts that very callback —
+    /// waiting for it is waiting for yourself (observed live as a 97%-CPU
+    /// yield spin in ~lattice_db during the test suite). A callback that
+    /// triggers destruction must not touch the lattice afterwards — which is
+    /// inherently true for deinit-triggered teardown.
+    static std::unordered_map<const instance_guard*, int>& tls_depths() {
+        thread_local std::unordered_map<const instance_guard*, int> depths;
+        return depths;
+    }
+    static int tls_depth(const instance_guard* g) {
+        auto& m = tls_depths();
+        auto it = m.find(g);
+        return it == m.end() ? 0 : it->second;
+    }
 };
 
 class instance_registry {
@@ -131,7 +150,14 @@ public:
                 e.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
                 continue;
             }
+            // Track this thread's hold so a callback that ends up running
+            // close()/~lattice_db (released the last reference) can exclude
+            // itself from the drain wait instead of self-spinning forever.
+            auto* g = e.guard.get();
+            ++instance_guard::tls_depths()[g];
             fn(e.ptr);
+            auto& depths = instance_guard::tls_depths();
+            if (--depths[g] == 0) depths.erase(g);
             e.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
         }
     }
@@ -6162,9 +6188,15 @@ inline void lattice_db::close() {
     closed_.store(true, std::memory_order_seq_cst);
     // 1. Mark as dying — prevents new notify_change() calls from starting.
     guard_->alive.store(false, std::memory_order_seq_cst);
-    // 2. Wait for any in-flight notify_change() calls to complete.
-    while (guard_->notify_refcount.load(std::memory_order_seq_cst) > 0) {
-        std::this_thread::yield();
+    // 2. Wait for any in-flight notify_change() calls on OTHER threads to
+    //    complete. Exclude this thread's own holds: when close() is reached
+    //    from inside an observer callback (the callback released the last
+    //    reference), waiting for our own refcount is waiting for ourselves.
+    {
+        const int own = instance_guard::tls_depth(guard_.get());
+        while (guard_->notify_refcount.load(std::memory_order_seq_cst) > own) {
+            std::this_thread::yield();
+        }
     }
     // 3. Stop all sync threads while all members are still alive.
     teardown_sync();
@@ -6196,16 +6228,21 @@ inline lattice_db::~lattice_db() {
     LOG_INFO("lattice_db", "~dtor: setting alive=false, refcount=%d",
              (int)guard_->notify_refcount.load(std::memory_order_seq_cst));
     guard_->alive.store(false, std::memory_order_seq_cst);
-    // 2. Wait for any in-flight notify_change() calls to complete.
+    // 2. Wait for in-flight notify_change() calls on OTHER threads. Exclude
+    //    this thread's own holds — a destructor reached from inside an
+    //    observer callback (callback dropped the last reference) would
+    //    otherwise wait for itself forever (observed live: 97%-CPU yield
+    //    spin, 184 CPU-minutes, during the Swift suite).
+    const int _own_holds = instance_guard::tls_depth(guard_.get());
     int _spin_iter = 0;
-    while (guard_->notify_refcount.load(std::memory_order_seq_cst) > 0) {
+    while (guard_->notify_refcount.load(std::memory_order_seq_cst) > _own_holds) {
         if (++_spin_iter % 1000000 == 0) {
-            LOG_INFO("lattice_db", "~dtor: SPINNING refcount=%d iter=%d",
-                     (int)guard_->notify_refcount.load(std::memory_order_seq_cst), _spin_iter);
+            LOG_INFO("lattice_db", "~dtor: SPINNING refcount=%d own=%d iter=%d",
+                     (int)guard_->notify_refcount.load(std::memory_order_seq_cst), _own_holds, _spin_iter);
         }
         std::this_thread::yield();
     }
-    LOG_INFO("lattice_db", "~dtor: refcount drained");
+    LOG_INFO("lattice_db", "~dtor: refcount drained (own holds: %d)", _own_holds);
     // 3. Stop all sync threads.
     teardown_sync();
     LOG_INFO("lattice_db", "~dtor: teardown_sync done");

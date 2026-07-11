@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-07-11
+
+### Added
+- **Sync tuning plumb-through (1.0 item I1)**: `configuration::sync_tuning` —
+  an all-optional overlay (chunk_size, reconnect/backoff knobs,
+  stable_connection_ms, upload_coalesce_ms, checkpoint intervals,
+  use_upload_floor) forwarded into every synchronizer the database creates
+  (WSS and IPC). Unset fields keep sync.hpp's defaults. Bridge:
+  `swift_configuration.set_sync_*` setters expose every knob to Swift.
+- **Named in-memory identity (1.0 item E1, core side)**:
+  `configuration::path_is_memory()` / `is_in_memory()` recognize named memory
+  URIs (`file:<name>?mode=memory&cache=shared`). Same-name handles share one
+  same-process database with exactly-once cross-instance observation via the
+  URI-keyed instance registry; distinct names are isolated. Read-only side
+  connections (`read_db_`, `xproc_read_db_`) stay null for all memory forms,
+  and no cross-process notifier is created for memory URIs (process-local).
+
 ## [0.10.5] - 2026-07-11
 
 ### Fixed

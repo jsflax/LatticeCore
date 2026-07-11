@@ -1103,7 +1103,6 @@ TEST(Bridge, RowCacheNullRoundTrip) {
     delete ref;
 }
 
-#endif // !__linux__
 
 // P0 review pins (Jul 11): tuning must differentiate the instance cache, and
 // nonsensical tuning values must be ignored at the bridge boundary.
@@ -1153,3 +1152,5 @@ TEST(BridgeTuning, CreateUncachedNeverAliasesParent) {
     EXPECT_NE(parent.get(), clone.get())
         << "query-clone must be a distinct instance even with an identical config";
 }
+
+#endif // !__linux__

@@ -784,84 +784,196 @@ static std::vector<std::string> get_column_names(database* db, const std::string
     return cols;
 }
 
+namespace {
+std::string attach_alias_for(const std::string& path) {
+    std::filesystem::path p = path;
+    return p.filename().replace_extension().string();
+}
+
+// Model tables only — excludes sqlite internals, _-prefixed virtual/shadow
+// tables, and Lattice bookkeeping. %s is the sqlite_master to scan.
+constexpr const char* kAttachTableFilter =
+    "SELECT name FROM %s WHERE type='table' "
+    "AND name NOT LIKE 'sqlite_%%' "
+    "AND name NOT LIKE '\\_%%' ESCAPE '\\' "
+    "AND name NOT IN ('AuditLog')";
+
+std::unordered_set<std::string> model_tables(lattice::database* db, const char* master) {
+    char sql[512];
+    snprintf(sql, sizeof(sql), kAttachTableFilter, master);
+    std::unordered_set<std::string> out;
+    for (const auto& row : db->query(sql)) {
+        auto it = row.find("name");
+        if (it != row.end() && std::holds_alternative<std::string>(it->second))
+            out.insert(std::get<std::string>(it->second));
+    }
+    return out;
+}
+} // namespace
+
 void lattice_db::attach(lattice_db &lattice) {
-    std::reference_wrapper<std::unique_ptr<database>> dbs[2] = {this->db_, this->read_db_};
-    for (auto& db : dbs) {
-        std::filesystem::path p = lattice.config_.path;
-        auto alias = p.filename().replace_extension();
+    // Serialize attach/detach: the already-attached consult below is
+    // check-then-act, and view regeneration must not interleave with a
+    // concurrent attach/detach on another thread.
+    std::lock_guard<std::mutex> attach_lock(attach_mutex_);
 
-        {
-            std::stringstream ss;
-            ss << "ATTACH DATABASE ";
-            ss << "'" << lattice.config_.path << "'";
-            ss << " AS \"" << alias.string() << "\"";
-            db.get()->execute(ss.str());
+    if (!lattice.db_) {
+        throw std::runtime_error("attach: the database being attached is closed");
+    }
+
+    const std::string alias = attach_alias_for(lattice.config_.path);
+
+    // Idempotence: same alias + same path is a no-op; same alias for a
+    // different path is a caller error.
+    for (const auto& [existing_alias, existing_path] : attached_dbs_) {
+        if (existing_alias == alias) {
+            if (existing_path == lattice.config_.path) return;
+            throw std::runtime_error(
+                "attach: alias '" + alias + "' is already attached to a different database (" +
+                existing_path + ")");
         }
+    }
 
-        // Collect main DB's model table names for overlap detection.
-        // Exclude all internal/auxiliary tables:
-        //   - _-prefixed: virtual tables (_Model_col_vec, _Model_col_fts, _Model_col_rtree)
-        //     and their shadow tables (_*_info, _*_chunks, _*_rowids, _*_content, etc.)
-        //   - AuditLog, _SyncControl: Lattice internal bookkeeping
-        //   - sqlite_*: SQLite internal
-        // knn_query/combinedNearestQuery handle cross-DB vec/fts search via attached_aliases_.
-        std::string table_filter =
-            "SELECT name FROM %s WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%%' "
-            "AND name NOT LIKE '\\_%%' ESCAPE '\\' "
-            "AND name NOT IN ('AuditLog')";
-
-        char main_sql[512];
-        snprintf(main_sql, sizeof(main_sql), table_filter.c_str(), "main.sqlite_master");
-        auto main_tables = db.get()->query(main_sql);
-        std::unordered_set<std::string> main_table_set;
-        for (const auto& row : main_tables) {
-            auto it = row.find("name");
-            if (it != row.end() && std::holds_alternative<std::string>(it->second))
-                main_table_set.insert(std::get<std::string>(it->second));
+    // Validate schema overlap BEFORE any side effect, reading the other
+    // lattice's schema through ITS OWN connection — a mismatch throws with
+    // this lattice untouched (no dangling ATTACH, no half-created views).
+    {
+        auto handles = view_handles();
+        if (handles.empty()) {
+            throw std::runtime_error("attach: this database is closed");
         }
-
-        char attached_sql[512];
-        snprintf(attached_sql, sizeof(attached_sql), table_filter.c_str(), "sqlite_master");
-        auto tables = lattice.db_->query(attached_sql);
-
-        for (const auto& table_row : tables) {
-            auto it = table_row.find("name");
-            if (it == table_row.end() || !std::holds_alternative<std::string>(it->second))
-                continue;
-
-            std::string table_name = std::get<std::string>(it->second);
-
-            if (main_table_set.count(table_name)) {
-                // Verify schemas match before creating UNION view
-                auto main_cols = get_column_names(db.get().get(), "main", table_name);
-                auto attached_cols = get_column_names(db.get().get(), "\"" + alias.string() + "\"", table_name);
-
-                if (main_cols != attached_cols) {
-                    LOG_ERROR("db", "Schema mismatch for table '%s' between main and attached DB '%s'",
-                              table_name.c_str(), alias.string().c_str());
-                    throw std::runtime_error(
-                        "Schema mismatch for table '" + table_name +
-                        "' between main database and attached database '" + alias.string() + "'");
-                }
-
-                // Same table exists in both with matching schema: create UNION ALL view
-                // Include _source column so hydrate can qualify table_name for lazy reads
-                std::string quoted_alias = "\"" + alias.string() + "\"";
-                db.get()->execute("CREATE TEMP VIEW IF NOT EXISTS " + table_name +
-                    " AS SELECT *, 'main' AS _source FROM main." + table_name +
-                    " UNION ALL SELECT *, '" + quoted_alias + "' AS _source FROM " + quoted_alias + "." + table_name);
-            } else {
-                // Table only in attached DB: simple passthrough view
-                db.get()->execute("CREATE TEMP VIEW IF NOT EXISTS " + table_name +
-                    " AS SELECT * FROM \"" + alias.string() + "\"." + table_name);
+        auto main_set = model_tables(handles.front(), "main.sqlite_master");
+        auto other_set = model_tables(lattice.db_.get(), "main.sqlite_master");
+        for (const auto& table_name : other_set) {
+            if (!main_set.count(table_name)) continue;
+            auto main_cols = get_column_names(handles.front(), "main", table_name);
+            auto other_cols = get_column_names(lattice.db_.get(), "main", table_name);
+            if (main_cols != other_cols) {
+                LOG_ERROR("db", "Schema mismatch for table '%s' between main and attached DB '%s'",
+                          table_name.c_str(), alias.c_str());
+                throw std::runtime_error(
+                    "Schema mismatch for table '" + table_name +
+                    "' between main database and attached database '" + alias + "'");
             }
         }
     }
 
-    // Store alias for cross-DB knn_query
-    std::filesystem::path p = lattice.config_.path;
-    attached_aliases_.push_back(p.filename().replace_extension().string());
+    // ATTACH on every view-bearing handle (null-tolerant — sync-enabled and
+    // in-memory lattices have no read_db_; the old code null-dereferenced).
+    // SQLite's own duplicate-alias error is treated as idempotent success:
+    // belt to the bookkeeping check's suspenders.
+    for (auto* handle : view_handles()) {
+        try {
+            handle->execute("ATTACH DATABASE '" + lattice.config_.path + "' AS \"" + alias + "\"");
+        } catch (const db_error& e) {
+            if (std::string(e.what()).find("already in use") == std::string::npos) throw;
+        }
+    }
+
+    attached_dbs_.emplace_back(alias, lattice.config_.path);
+    attached_aliases_.push_back(alias);
+    rebuild_attached_views();
+}
+
+void lattice_db::detach(lattice_db &lattice) {
+    detach_alias(attach_alias_for(lattice.config_.path));
+}
+
+void lattice_db::detach_alias(const std::string& alias) {
+    std::lock_guard<std::mutex> attach_lock(attach_mutex_);
+
+    auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
+        [&](const auto& entry) { return entry.first == alias; });
+    if (it == attached_dbs_.end()) return;  // idempotent no-op
+
+    // Views reference the alias — drop them all first (regeneration for the
+    // remaining aliases happens after the DETACH).
+    for (auto* handle : view_handles()) {
+        for (const auto& view : attached_view_names_) {
+            handle->execute("DROP VIEW IF EXISTS \"" + view + "\"");
+        }
+    }
+    attached_view_names_.clear();
+
+    // DETACH with a bounded retry: there is no prepared-statement cache —
+    // every query prepares/finalizes in-call — so the only blocker is an
+    // in-flight statement on another thread transiently locking the schema.
+    for (auto* handle : view_handles()) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            try {
+                handle->execute("DETACH DATABASE \"" + alias + "\"");
+                break;
+            } catch (const db_error& e) {
+                const std::string msg = e.what();
+                const bool transient = msg.find("locked") != std::string::npos ||
+                                       msg.find("busy") != std::string::npos;
+                if (!transient || std::chrono::steady_clock::now() >= deadline) throw;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    }
+
+    attached_dbs_.erase(it);
+    attached_aliases_.erase(
+        std::remove(attached_aliases_.begin(), attached_aliases_.end(), alias),
+        attached_aliases_.end());
+    rebuild_attached_views();
+}
+
+// Caller holds attach_mutex_. Drops every view attach created, then
+// regenerates from the CURRENT alias set — this makes multi-alias
+// attach/detach order-independent (the old CREATE ... IF NOT EXISTS meant a
+// second alias sharing a table name silently never joined the union view)
+// and restores main-table visibility after the last detach.
+void lattice_db::rebuild_attached_views() {
+    for (auto* handle : view_handles()) {
+        for (const auto& view : attached_view_names_) {
+            handle->execute("DROP VIEW IF EXISTS \"" + view + "\"");
+        }
+    }
+    attached_view_names_.clear();
+    if (attached_dbs_.empty()) return;
+
+    for (auto* handle : view_handles()) {
+        auto main_set = model_tables(handle, "main.sqlite_master");
+
+        // table → arms. An arm is (schema-qualifier, _source label).
+        std::map<std::string, std::vector<std::pair<std::string, std::string>>> arms;
+        for (const auto& [alias, _] : attached_dbs_) {
+            const std::string quoted = "\"" + alias + "\"";
+            char master[600];
+            snprintf(master, sizeof(master), "%s.sqlite_master", quoted.c_str());
+            for (const auto& table_name : model_tables(handle, master)) {
+                arms[table_name].emplace_back(quoted, quoted);
+            }
+        }
+
+        for (const auto& [table_name, alias_arms] : arms) {
+            const bool in_main = main_set.count(table_name) > 0;
+            std::string sql;
+            if (!in_main && alias_arms.size() == 1) {
+                // Attached-only table with a single source: plain passthrough
+                // (matches the historical view shape — no _source column).
+                sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name +
+                      " AS SELECT * FROM " + alias_arms.front().first + "." + table_name;
+            } else {
+                sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
+                bool first = true;
+                if (in_main) {
+                    sql += "SELECT *, 'main' AS _source FROM main." + table_name;
+                    first = false;
+                }
+                for (const auto& [qualifier, label] : alias_arms) {
+                    if (!first) sql += " UNION ALL ";
+                    sql += "SELECT *, '" + label + "' AS _source FROM " + qualifier + "." + table_name;
+                    first = false;
+                }
+            }
+            handle->execute(sql);
+            attached_view_names_.insert(table_name);
+        }
+    }
 }
 
 // ============================================================================

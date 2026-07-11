@@ -2594,8 +2594,24 @@ public:
         }
     }
 
+    /// Attach another lattice's database under an alias derived from its
+    /// filename, exposing overlapping tables as UNION views and
+    /// attached-only tables as passthrough views. Idempotent: attaching the
+    /// same database again is a no-op; the same alias for a DIFFERENT path
+    /// throws. Schema overlap is validated BEFORE any side effect — a
+    /// mismatch throws with no dangling ATTACH and no half-created views.
+    /// Serialized against detach() by an internal mutex.
     void attach(lattice_db& lattice);
-    
+
+    /// Remove an attached lattice: drops the views that referenced it,
+    /// DETACHes on every handle (bounded retry while an in-flight statement
+    /// on another thread briefly locks the schema), and regenerates the
+    /// remaining aliases' views — main-table visibility is restored once
+    /// the last alias is gone. Idempotent: detaching something not attached
+    /// is a no-op.
+    void detach(lattice_db& lattice);
+    void detach_alias(const std::string& alias);
+
     database& db() { return *db_; }
 
     /// Get the read-only database connection (falls back to write connection for in-memory DBs)
@@ -3866,6 +3882,27 @@ public:
 protected:
     // Attached database aliases (set by attach()) for cross-DB knn/fts queries
     std::vector<std::string> attached_aliases_;
+
+    // attach/detach bookkeeping — all guarded by attach_mutex_:
+    // (alias, path) pairs for idempotence checks, and the names of every
+    // TEMP view attach created so regeneration can drop exactly what it
+    // owns (view names are the bare table names; the set is identical on
+    // every view-bearing handle).
+    std::mutex attach_mutex_;
+    std::vector<std::pair<std::string, std::string>> attached_dbs_;
+    std::set<std::string> attached_view_names_;
+
+    /// The connections that carry attach views: db_ always (when open),
+    /// read_db_ only where it exists (sync-enabled and in-memory lattices
+    /// have no read connection — the old code null-dereferenced here).
+    std::vector<database*> view_handles() {
+        std::vector<database*> handles;
+        if (db_) handles.push_back(db_.get());
+        if (read_db_) handles.push_back(read_db_.get());
+        return handles;
+    }
+
+    void rebuild_attached_views();
 
 private:
     template<typename U> friend class query;

@@ -135,7 +135,9 @@ private:
 
 std::unique_ptr<cross_process_notifier> make_cross_process_notifier(const std::string& db_path) {
     // No cross-process notifications for in-memory databases
-    if (db_path.empty() || db_path == ":memory:") {
+    if (db_path.empty() || db_path == ":memory:" ||
+        db_path.find(":memory:") != std::string::npos ||
+        db_path.find("mode=memory") != std::string::npos) {  // named/shared-cache memory URIs are process-local
         return nullptr;
     }
     return std::make_unique<darwin_cross_process_notifier>(db_path);

@@ -35,7 +35,10 @@ instance_registry& instance_registry::instance() {
 }
 
 cross_process_notifier* instance_registry::get_or_create_notifier(const std::string& path) {
-    if (path.empty() || path == ":memory:") return nullptr;
+    // No cross-PROCESS notifier for any memory path (incl. named shared-cache
+    // URIs): memory DBs are process-local; same-process cross-instance
+    // delivery rides the instance registry (keyed on the canonical URI).
+    if (configuration::path_is_memory(path)) return nullptr;
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = shared_notifiers_.find(path);

@@ -520,10 +520,18 @@ struct configuration {
         return !ipc_targets.empty();
     }
 
-    /// Returns true if this is an in-memory database (either :memory: or shared cache URI)
-    bool is_in_memory() const {
-        return path == ":memory:" || path.empty() || path.find(":memory:") != std::string::npos;
+    /// True for any in-memory path form: plain ":memory:", the anonymous
+    /// shared-cache URI ("file::memory:?cache=shared"), or a NAMED memory URI
+    /// ("file:<name>?mode=memory&cache=shared" — the 1.0 `.memory(named:)`
+    /// storage form; same-name opens share one same-process database).
+    static bool path_is_memory(const std::string& p) {
+        return p.empty() || p == ":memory:" ||
+               p.find(":memory:") != std::string::npos ||
+               p.find("mode=memory") != std::string::npos;
     }
+
+    /// Returns true if this is an in-memory database (either :memory: or shared cache URI)
+    bool is_in_memory() const { return path_is_memory(path); }
 };
 
 // Backwards compatibility alias
@@ -744,7 +752,7 @@ public:
     explicit lattice_db(const std::string& path)
         : config_(path)
         , db_(std::make_unique<database>(path, database::open_mode::read_write))
-        , read_db_(path != ":memory:" ? std::make_unique<database>(path, database::open_mode::read_only) : nullptr)
+        , read_db_(!configuration::path_is_memory(path) ? std::make_unique<database>(path, database::open_mode::read_only) : nullptr)
         , scheduler_(std::make_shared<immediate_scheduler>()) {
         ensure_tables();
         setup_change_hook();
@@ -792,8 +800,8 @@ public:
               config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
               config.busy_timeout_ms))
         , read_db_(config.read_only ? nullptr :
-                   (config.path != ":memory:" && !config.is_sync_enabled() ? std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
-        , xproc_read_db_(config.path != ":memory:" && !config.read_only ?
+                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
+        , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
                          std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
         // Update config_.path to the resolved path so instance_registry keys match
@@ -2676,7 +2684,7 @@ public:
 
     /// Reopen the read-only connections after exclusive operations
     void reopen_read_db() {
-        if (config_.path != ":memory:" && !config_.read_only) {
+        if (!config_.is_in_memory() && !config_.read_only) {
             read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only,
                                                   config_.busy_timeout_ms);
             xproc_read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only,

@@ -1589,3 +1589,35 @@ TEST(Sync, DestroyFromObserverCallbackDoesNotHang) {
     EXPECT_TRUE(fired.load()) << "observer never fired";
     EXPECT_EQ(a, nullptr) << "callback did not destroy the instance";
 }
+
+// 1.0 item I1: configuration::sync_tuning overlays only its SET fields onto a
+// sync_config; unset fields keep sync.hpp's defaults (forward-only — the
+// tuning struct never re-states a default).
+TEST(SyncTuningTest, ApplyOverlaysOnlySetFields) {
+    lattice::sync_config defaults;  // capture library defaults for comparison
+    lattice::sync_config cfg;
+    lattice::configuration::sync_tuning tuning;
+
+    tuning.chunk_size = 1;
+    tuning.upload_coalesce_ms = 750;
+    tuning.use_upload_floor = false;
+    tuning.apply(cfg);
+
+    EXPECT_EQ(cfg.chunk_size, 1u);
+    EXPECT_EQ(cfg.upload_coalesce_ms, 750);
+    EXPECT_FALSE(cfg.use_upload_floor);
+    // Unset knobs must remain exactly the library defaults.
+    EXPECT_EQ(cfg.max_reconnect_attempts, defaults.max_reconnect_attempts);
+    EXPECT_EQ(cfg.base_delay_seconds, defaults.base_delay_seconds);
+    EXPECT_EQ(cfg.max_delay_seconds, defaults.max_delay_seconds);
+    EXPECT_EQ(cfg.stable_connection_ms, defaults.stable_connection_ms);
+    EXPECT_EQ(cfg.checkpoint_passive_interval_ms, defaults.checkpoint_passive_interval_ms);
+    EXPECT_EQ(cfg.checkpoint_truncate_interval_ms, defaults.checkpoint_truncate_interval_ms);
+
+    // Empty tuning is a strict no-op.
+    lattice::sync_config untouched;
+    lattice::configuration::sync_tuning{}.apply(untouched);
+    EXPECT_EQ(untouched.chunk_size, defaults.chunk_size);
+    EXPECT_EQ(untouched.upload_coalesce_ms, defaults.upload_coalesce_ms);
+    EXPECT_EQ(untouched.use_upload_floor, defaults.use_upload_floor);
+}

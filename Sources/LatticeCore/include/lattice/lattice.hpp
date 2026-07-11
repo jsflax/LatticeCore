@@ -449,6 +449,36 @@ struct configuration {
     /// a small value (e.g. 5000) so a stuck writer can't hang the UI thread.
     int busy_timeout_ms = kDefaultBusyTimeoutMs;
 
+    /// Sync tuning knobs, forwarded verbatim into every synchronizer this
+    /// database creates (WSS and IPC). Every field is optional: unset means
+    /// "keep sync_config's default" — this struct never re-states defaults,
+    /// so changing a default in sync.hpp changes it everywhere at once.
+    struct sync_tuning {
+        std::optional<size_t> chunk_size;
+        std::optional<int> max_reconnect_attempts;
+        std::optional<double> base_delay_seconds;
+        std::optional<double> max_delay_seconds;
+        std::optional<int64_t> stable_connection_ms;
+        std::optional<int> upload_coalesce_ms;
+        std::optional<int> checkpoint_passive_interval_ms;
+        std::optional<int> checkpoint_truncate_interval_ms;
+        std::optional<bool> use_upload_floor;
+
+        /// Overlay the set fields onto a sync_config.
+        void apply(sync_config& cfg) const {
+            if (chunk_size) cfg.chunk_size = *chunk_size;
+            if (max_reconnect_attempts) cfg.max_reconnect_attempts = *max_reconnect_attempts;
+            if (base_delay_seconds) cfg.base_delay_seconds = *base_delay_seconds;
+            if (max_delay_seconds) cfg.max_delay_seconds = *max_delay_seconds;
+            if (stable_connection_ms) cfg.stable_connection_ms = *stable_connection_ms;
+            if (upload_coalesce_ms) cfg.upload_coalesce_ms = *upload_coalesce_ms;
+            if (checkpoint_passive_interval_ms) cfg.checkpoint_passive_interval_ms = *checkpoint_passive_interval_ms;
+            if (checkpoint_truncate_interval_ms) cfg.checkpoint_truncate_interval_ms = *checkpoint_truncate_interval_ms;
+            if (use_upload_floor) cfg.use_upload_floor = *use_upload_floor;
+        }
+    };
+    sync_tuning tuning;
+
     // Default constructor - in-memory, no sync
     configuration() = default;
 

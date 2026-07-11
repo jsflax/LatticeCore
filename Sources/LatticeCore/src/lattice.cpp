@@ -596,6 +596,7 @@ void lattice_db::setup_sync_if_configured() {
     auto all_ids = collect_all_sync_ids(config_);
     sync_cfg.sync_id = "wss:" + config_.websocket_url;
     sync_cfg.all_active_sync_ids = all_ids;
+    config_.tuning.apply(sync_cfg);
     // Upload coalescing stays at the library default (0 = legacy immediate
     // dispatch): with the upload floor + classify gating, passes are cheap,
     // and enabling pacing here measurably collapsed relay-chain catch-up
@@ -728,6 +729,7 @@ void lattice_db::setup_ipc_if_configured() {
                 ipc_cfg.sync_id = sync_id;
                 ipc_cfg.all_active_sync_ids = all_ids;
                 ipc_cfg.sync_filter = target.sync_filter;
+                config_.tuning.apply(ipc_cfg);
                 // Coalescing off by default — see the WSS note above.
 
                 // Create dedicated lattice_db for this IPC synchronizer

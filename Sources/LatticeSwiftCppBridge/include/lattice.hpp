@@ -443,6 +443,19 @@ struct swift_configuration : public configuration {
         ipc_targets = std::vector<ipc_target>(targets.begin(), targets.end());
     }
 
+    // Sync tuning (1.0 item I1): forward-only overrides of sync_config
+    // defaults. Snake_case value-type setters (same shape as set_sync_filter)
+    // — unset knobs keep sync.hpp's defaults.
+    void set_sync_chunk_size(int64_t v) { tuning.chunk_size = static_cast<size_t>(v); }
+    void set_sync_max_reconnect_attempts(int32_t v) { tuning.max_reconnect_attempts = static_cast<int>(v); }
+    void set_sync_base_delay_seconds(double v) { tuning.base_delay_seconds = v; }
+    void set_sync_max_delay_seconds(double v) { tuning.max_delay_seconds = v; }
+    void set_sync_stable_connection_ms(int64_t v) { tuning.stable_connection_ms = v; }
+    void set_sync_upload_coalesce_ms(int32_t v) { tuning.upload_coalesce_ms = static_cast<int>(v); }
+    void set_sync_checkpoint_passive_interval_ms(int32_t v) { tuning.checkpoint_passive_interval_ms = static_cast<int>(v); }
+    void set_sync_checkpoint_truncate_interval_ms(int32_t v) { tuning.checkpoint_truncate_interval_ms = static_cast<int>(v); }
+    void set_sync_use_upload_floor(bool v) { tuning.use_upload_floor = v; }
+
 private:
     std::function<void(const std::string& table_name,
                        dynamic_object_ref* old_row,

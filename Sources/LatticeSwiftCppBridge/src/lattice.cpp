@@ -1658,8 +1658,39 @@ bool lattice::swift_lattice::remove(const dynamic_object_ref& obj) {
     return true;
 }
 
-void lattice::swift_lattice::attach(swift_lattice &lattice) {
-    lattice_db::attach(lattice);
+bool lattice::swift_lattice::attach(swift_lattice &lattice) {
+    // C++ exceptions must NOT propagate across the Swift/C++ boundary — that
+    // causes std::terminate() → SIGTRAP. Catch here, surface via accessor
+    // (same contract as receive_sync_data/last_receive_error).
+    last_attach_error_.reset();
+    try {
+        lattice_db::attach(lattice);
+        return true;
+    } catch (const std::exception& e) {
+        last_attach_error_ = std::string(e.what());
+        LOG_ERROR("attach", "Exception: %s", e.what());
+        return false;
+    } catch (...) {
+        last_attach_error_ = std::string("unknown C++ exception in attach");
+        LOG_ERROR("attach", "Unknown exception");
+        return false;
+    }
+}
+
+bool lattice::swift_lattice::detach(swift_lattice &lattice) {
+    last_attach_error_.reset();
+    try {
+        lattice_db::detach(lattice);
+        return true;
+    } catch (const std::exception& e) {
+        last_attach_error_ = std::string(e.what());
+        LOG_ERROR("detach", "Exception: %s", e.what());
+        return false;
+    } catch (...) {
+        last_attach_error_ = std::string("unknown C++ exception in detach");
+        LOG_ERROR("detach", "Unknown exception");
+        return false;
+    }
 }
 
 // enumerate_objects is now defined inline in lattice.hpp

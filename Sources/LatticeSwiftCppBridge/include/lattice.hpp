@@ -608,6 +608,7 @@ private:
     swift_configuration swift_config_;
     // Error from last receive_sync_data call (nullopt if none)
     OptionalString last_receive_error_;
+    OptionalString last_attach_error_;
     std::future<void> vec0_training_future_;
     // Background vec0 gap healing dispatched after open (off the open path).
     std::future<void> vec0_reconcile_future_;
@@ -1014,7 +1015,16 @@ public:
         commit();
     }
     
-    void attach(swift_lattice& lattice);
+    /// Attach another lattice. Returns false on failure (repeat attach of
+    /// the same db is SUCCESS — idempotent); the reason is available via
+    /// last_attach_error(). C++ exceptions never cross the Swift boundary.
+    bool attach(swift_lattice& lattice);
+
+    /// Remove an attached lattice (idempotent). Returns false on failure;
+    /// reason via last_attach_error().
+    bool detach(swift_lattice& lattice);
+
+    OptionalString last_attach_error() const { return last_attach_error_; }
 
     // ========================================================================
     // MARK: Observation API
@@ -2886,10 +2896,13 @@ public:
     // is a foreign-reference class (heap-only) so it must be passed by pointer; on
     // the value path it's a plain value passed by copy (shares impl_).
 #if LATTICE_HAS_FRT
-    void attach(swift_lattice_ref* other) const { impl().attach(*other->get()); }
+    bool attach(swift_lattice_ref* other) const { return impl().attach(*other->get()); }
+    bool detach(swift_lattice_ref* other) const { return impl().detach(*other->get()); }
 #else
-    void attach(swift_lattice_ref other) const { impl().attach(*other.get()); }
+    bool attach(swift_lattice_ref other) const { return impl().attach(*other.get()); }
+    bool detach(swift_lattice_ref other) const { return impl().detach(*other.get()); }
 #endif
+    OptionalString last_attach_error() const { return impl().last_attach_error(); }
 
     // Sync data ingestion
     std::vector<std::string> receive_sync_data(const ByteVector& data) const { return impl().receive_sync_data(data); }

@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-07-11
+
+### Fixed
+- **Apply-path scan storm**: `flush_changes` pass 2 no longer runs its
+  change→audit lookup for never-audited underscore bookkeeping tables
+  (`_lattice_sync_state` writes were full-scanning the AuditLog per applied
+  entry), and `AuditLog` gains a covering
+  `idx_audit_log_change_lookup(tableName, rowId, operation)` index (schema
+  format epoch 2 → 3, guarded auto-migration). Large IPC apply batches drop
+  from minutes to sub-second; a 53k-entry backlog drained in ~20 min live.
+- **Destroy-from-callback self-hang**: `instance_guard` tracks per-thread hold
+  depths so `~lattice_db`/`close()` invoked from an observer/scheduler callback
+  no longer waits on its own holds; `std_thread_scheduler` shutdown detaches
+  instead of self-joining when torn down from its own worker thread.
+
+### Added
+- **attach/detach rework (1.0 items ATT-1..ATT-3)**: `lattice_db::attach` is
+  now idempotent (repeat attach of the same (alias, path) is a no-op; duplicate
+  SQLite alias tolerated), serialized behind an attach mutex, validates the
+  peer's schema through its own live handle BEFORE attaching (mismatch throws
+  cleanly with no side effects), and is null-tolerant on sync-enabled lattices
+  (fixes a `read_db_` null-deref crash). New `detach(lattice_db&)` /
+  `detach_alias()` drop the attachment's union views, DETACH with bounded
+  retry on transient locks, and rebuild remaining views order-independently
+  via `rebuild_attached_views()`. Bridge: `swift_lattice::attach/detach`
+  return `bool` with `last_attach_error()` — C++ exceptions no longer cross
+  the Swift interop boundary (consumed by lattice's throwing ATT-4 surface).
+
 ## [0.10.4] - 2026-07-08
 
 ### Added

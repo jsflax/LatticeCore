@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.10.8] - 2026-07-11
+
+### Fixed
+- **Path-exact detach**: `lattice_db::detach(lattice&)` resolved the alias by
+  recomputing it from the filename stem with no path verification — detaching
+  a never-attached lattice whose stem matched an attached one silently
+  DETACHed the wrong database. Now resolves by exact path; unknown path is a
+  clean no-op.
+- **Uncached clone factory**: new `LatticeCache::create_uncached` /
+  `swift_lattice_ref.createUncached` for query-only clone connections — the
+  keyed cache deduped a clone whose stripped config matched its parent and
+  returned the PARENT instance, so the clone's ATTACH mutated the parent's
+  own connection.
+- ATTACH alias identifier double-quote escaped; `sync_tuning::apply()` drops
+  `chunk_size` 0 and nonpositive backoff delays; bridge delay setters require
+  `> 0`; `path_is_memory` only classifies `file:`-prefixed URIs (an on-disk
+  path merely containing `mode=memory` is a regular file).
+
 ## [0.10.7] - 2026-07-11
 
 ### Fixed

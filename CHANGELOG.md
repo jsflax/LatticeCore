@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-07-11
+
+### Fixed
+- **URI-capable connections everywhere**: `SQLITE_OPEN_URI` is set on every
+  connection (SQLite only URI-parses names starting with `file:`, so plain
+  paths are unaffected). Fixes attaching a named-memory lattice to a
+  file-backed lattice, which previously created and attached an empty
+  LITERAL file named `file:<name>?mode=memory&cache=shared`.
+- **attach SQL escaping**: the attached path and the union views'
+  `'<label>' AS _source` literal are single-quote escaped.
+- **Sync tuning validation**: `swift_configuration.set_sync_*` setters ignore
+  nonsensical values (`chunk_size <= 0` would permanently stall uploads;
+  negative delays/windows dropped).
+- **Instance-cache tuning fingerprint**: two opens of the same path with
+  different sync tuning no longer silently share the first opener's
+  synchronizer.
+- **`last_attach_error()` thread safety**: mutex-guarded.
+
 ## [0.10.6] - 2026-07-11
 
 ### Added

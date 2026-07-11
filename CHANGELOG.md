@@ -21,18 +21,9 @@
 
 ## [0.10.5] - 2026-07-11
 
-### Fixed
-- **Apply-path scan storm**: `flush_changes` pass 2 no longer runs its
-  change→audit lookup for never-audited underscore bookkeeping tables
-  (`_lattice_sync_state` writes were full-scanning the AuditLog per applied
-  entry), and `AuditLog` gains a covering
-  `idx_audit_log_change_lookup(tableName, rowId, operation)` index (schema
-  format epoch 2 → 3, guarded auto-migration). Large IPC apply batches drop
-  from minutes to sub-second; a 53k-entry backlog drained in ~20 min live.
-- **Destroy-from-callback self-hang**: `instance_guard` tracks per-thread hold
-  depths so `~lattice_db`/`close()` invoked from an observer/scheduler callback
-  no longer waits on its own holds; `std_thread_scheduler` shutdown detaches
-  instead of self-joining when torn down from its own worker thread.
+(Note: the apply-path scan-storm and destroy-from-callback fixes formerly
+listed here actually shipped in 0.10.4 — see that entry.)
+
 
 ### Added
 - **attach/detach rework (1.0 items ATT-1..ATT-3)**: `lattice_db::attach` is

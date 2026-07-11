@@ -37,11 +37,16 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
         // (>=3.22) reads a read-only WAL database even on read-only media by
         // falling back to a heap-memory wal-index, so this also covers bundled DBs.
         flags |= SQLITE_OPEN_READONLY;
-        if (path.compare(0, 5, "file:") == 0) flags |= SQLITE_OPEN_URI;
+        // URI handling is unconditional: SQLite only URI-parses names that
+        // START with "file:" even when the flag is set, so plain paths are
+        // unaffected — and ATTACH through this connection can then resolve
+        // named-memory URIs ("file:<name>?mode=memory&cache=shared") instead
+        // of creating a literal file of that name.
+        flags |= SQLITE_OPEN_URI;
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     } else {
         flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-        if (path.compare(0, 5, "file:") == 0) flags |= SQLITE_OPEN_URI;
+        flags |= SQLITE_OPEN_URI;  // see read-only branch note
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
     if (rc != SQLITE_OK) {

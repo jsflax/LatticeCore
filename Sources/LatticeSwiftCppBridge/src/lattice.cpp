@@ -1662,32 +1662,32 @@ bool lattice::swift_lattice::attach(swift_lattice &lattice) {
     // C++ exceptions must NOT propagate across the Swift/C++ boundary — that
     // causes std::terminate() → SIGTRAP. Catch here, surface via accessor
     // (same contract as receive_sync_data/last_receive_error).
-    last_attach_error_.reset();
+    { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_.reset(); }
     try {
         lattice_db::attach(lattice);
         return true;
     } catch (const std::exception& e) {
-        last_attach_error_ = std::string(e.what());
+        { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_ = std::string(e.what()); }
         LOG_ERROR("attach", "Exception: %s", e.what());
         return false;
     } catch (...) {
-        last_attach_error_ = std::string("unknown C++ exception in attach");
+        { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_ = std::string("unknown C++ exception in attach"); }
         LOG_ERROR("attach", "Unknown exception");
         return false;
     }
 }
 
 bool lattice::swift_lattice::detach(swift_lattice &lattice) {
-    last_attach_error_.reset();
+    { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_.reset(); }
     try {
         lattice_db::detach(lattice);
         return true;
     } catch (const std::exception& e) {
-        last_attach_error_ = std::string(e.what());
+        { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_ = std::string(e.what()); }
         LOG_ERROR("detach", "Exception: %s", e.what());
         return false;
     } catch (...) {
-        last_attach_error_ = std::string("unknown C++ exception in detach");
+        { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_ = std::string("unknown C++ exception in detach"); }
         LOG_ERROR("detach", "Unknown exception");
         return false;
     }

@@ -867,9 +867,17 @@ void lattice_db::attach(lattice_db &lattice) {
     // in-memory lattices have no read_db_; the old code null-dereferenced).
     // SQLite's own duplicate-alias error is treated as idempotent success:
     // belt to the bookkeeping check's suspenders.
+    // Escape single quotes in the path for the SQL literal (paths and named-
+    // memory names are caller-controlled strings).
+    std::string escaped_path;
+    escaped_path.reserve(lattice.config_.path.size());
+    for (char c : lattice.config_.path) {
+        escaped_path += c;
+        if (c == '\'') escaped_path += '\'';
+    }
     for (auto* handle : view_handles()) {
         try {
-            handle->execute("ATTACH DATABASE '" + lattice.config_.path + "' AS \"" + alias + "\"");
+            handle->execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + alias + "\"");
         } catch (const db_error& e) {
             if (std::string(e.what()).find("already in use") == std::string::npos) throw;
         }
@@ -971,7 +979,15 @@ void lattice_db::rebuild_attached_views() {
                 }
                 for (const auto& [qualifier, label] : alias_arms) {
                     if (!first) sql += " UNION ALL ";
-                    sql += "SELECT *, '" + label + "' AS _source FROM " + qualifier + "." + table_name;
+                    // The label is caller-controlled (derived from the attached
+                    // path) — escape single quotes for the SQL string literal.
+                    std::string escaped_label;
+                    escaped_label.reserve(label.size());
+                    for (char c : label) {
+                        escaped_label += c;
+                        if (c == '\'') escaped_label += '\'';
+                    }
+                    sql += "SELECT *, '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
                     first = false;
                 }
             }

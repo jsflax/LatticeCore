@@ -445,16 +445,23 @@ struct swift_configuration : public configuration {
 
     // Sync tuning (1.0 item I1): forward-only overrides of sync_config
     // defaults. Snake_case value-type setters (same shape as set_sync_filter)
-    // — unset knobs keep sync.hpp's defaults.
-    void set_sync_chunk_size(int64_t v) { tuning.chunk_size = static_cast<size_t>(v); }
-    void set_sync_max_reconnect_attempts(int32_t v) { tuning.max_reconnect_attempts = static_cast<int>(v); }
-    void set_sync_base_delay_seconds(double v) { tuning.base_delay_seconds = v; }
-    void set_sync_max_delay_seconds(double v) { tuning.max_delay_seconds = v; }
-    void set_sync_stable_connection_ms(int64_t v) { tuning.stable_connection_ms = v; }
-    void set_sync_upload_coalesce_ms(int32_t v) { tuning.upload_coalesce_ms = static_cast<int>(v); }
-    void set_sync_checkpoint_passive_interval_ms(int32_t v) { tuning.checkpoint_passive_interval_ms = static_cast<int>(v); }
-    void set_sync_checkpoint_truncate_interval_ms(int32_t v) { tuning.checkpoint_truncate_interval_ms = static_cast<int>(v); }
+    // — unset knobs keep sync.hpp's defaults. Nonsensical values are IGNORED
+    // at this boundary (the knob stays at its default) rather than being
+    // forwarded: chunk_size <= 0 would permanently stall uploads (and a
+    // negative value cast through size_t becomes a giant window); negative
+    // delays/windows have no meaning. 0 remains valid where it means
+    // "disabled" (reconnect attempts = unlimited, coalesce = legacy,
+    // checkpoint = off).
+    void set_sync_chunk_size(int64_t v) { if (v > 0) tuning.chunk_size = static_cast<size_t>(v); }
+    void set_sync_max_reconnect_attempts(int32_t v) { if (v >= 0) tuning.max_reconnect_attempts = static_cast<int>(v); }
+    void set_sync_base_delay_seconds(double v) { if (v >= 0) tuning.base_delay_seconds = v; }
+    void set_sync_max_delay_seconds(double v) { if (v >= 0) tuning.max_delay_seconds = v; }
+    void set_sync_stable_connection_ms(int64_t v) { if (v >= 0) tuning.stable_connection_ms = v; }
+    void set_sync_upload_coalesce_ms(int32_t v) { if (v >= 0) tuning.upload_coalesce_ms = static_cast<int>(v); }
+    void set_sync_checkpoint_passive_interval_ms(int32_t v) { if (v >= 0) tuning.checkpoint_passive_interval_ms = static_cast<int>(v); }
+    void set_sync_checkpoint_truncate_interval_ms(int32_t v) { if (v >= 0) tuning.checkpoint_truncate_interval_ms = static_cast<int>(v); }
     void set_sync_use_upload_floor(bool v) { tuning.use_upload_floor = v; }
+
 
 private:
     std::function<void(const std::string& table_name,
@@ -622,6 +629,7 @@ private:
     // Error from last receive_sync_data call (nullopt if none)
     OptionalString last_receive_error_;
     OptionalString last_attach_error_;
+    mutable std::mutex attach_error_mutex_;  // guards last_attach_error_ (attach/detach can race a reader)
     std::future<void> vec0_training_future_;
     // Background vec0 gap healing dispatched after open (off the open path).
     std::future<void> vec0_reconcile_future_;
@@ -1037,7 +1045,10 @@ public:
     /// reason via last_attach_error().
     bool detach(swift_lattice& lattice);
 
-    OptionalString last_attach_error() const { return last_attach_error_; }
+    OptionalString last_attach_error() const {
+        std::lock_guard<std::mutex> lock(attach_error_mutex_);
+        return last_attach_error_;
+    }
 
     // ========================================================================
     // MARK: Observation API
@@ -2310,7 +2321,25 @@ namespace detail {
     /// alias an existing instance WITH a live synchronizer — and vice versa —
     /// silently dropping the requested config and accumulating sync progress
     /// across logically separate sessions.
-    template <typename ConfigT>
+    /// Stable fingerprint of the sync-tuning overlay for the instance-cache key —
+/// two opens of the same path with DIFFERENT tuning must not share an
+/// instance (the first opener's synchronizer would silently win).
+inline std::string sync_tuning_fingerprint(const lattice::configuration& c) {
+    const auto& t = c.tuning;
+    std::string fp;
+    fp += t.chunk_size ? std::to_string(*t.chunk_size) : "-"; fp += "|";
+    fp += t.max_reconnect_attempts ? std::to_string(*t.max_reconnect_attempts) : "-"; fp += "|";
+    fp += t.base_delay_seconds ? std::to_string(*t.base_delay_seconds) : "-"; fp += "|";
+    fp += t.max_delay_seconds ? std::to_string(*t.max_delay_seconds) : "-"; fp += "|";
+    fp += t.stable_connection_ms ? std::to_string(*t.stable_connection_ms) : "-"; fp += "|";
+    fp += t.upload_coalesce_ms ? std::to_string(*t.upload_coalesce_ms) : "-"; fp += "|";
+    fp += t.checkpoint_passive_interval_ms ? std::to_string(*t.checkpoint_passive_interval_ms) : "-"; fp += "|";
+    fp += t.checkpoint_truncate_interval_ms ? std::to_string(*t.checkpoint_truncate_interval_ms) : "-"; fp += "|";
+    fp += t.use_upload_floor ? (*t.use_upload_floor ? "1" : "0") : "-";
+    return fp;
+}
+
+template <typename ConfigT>
     inline std::string ipc_targets_fingerprint(const ConfigT& config) {
         std::string fp;
         for (const auto& t : config.ipc_targets) {
@@ -2337,6 +2366,7 @@ namespace detail {
         std::string schema_hash;    // Hash of table names + property types
         int32_t schema_version;     // Target schema version (differentiates pre/post migration)
         std::string ipc_fingerprint; // Channels + socket paths + sync filter (see ipc_targets_fingerprint)
+        std::string tuning_fingerprint; // sync_tuning overlay (different tuning must not share an instance)
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if (path != other.path) return path < other.path;
@@ -2344,6 +2374,7 @@ namespace detail {
             if (schema_hash != other.schema_hash) return schema_hash < other.schema_hash;
             if (schema_version != other.schema_version) return schema_version < other.schema_version;
             if (ipc_fingerprint != other.ipc_fingerprint) return ipc_fingerprint < other.ipc_fingerprint;
+            if (tuning_fingerprint != other.tuning_fingerprint) return tuning_fingerprint < other.tuning_fingerprint;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -2358,6 +2389,7 @@ namespace detail {
             if (schema_hash != other.schema_hash) return false;
             if (schema_version != other.schema_version) return false;
             if (ipc_fingerprint != other.ipc_fingerprint) return false;
+            if (tuning_fingerprint != other.tuning_fingerprint) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -2411,7 +2443,7 @@ namespace detail {
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config)};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config)};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,

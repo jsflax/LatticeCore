@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include <lattice/sync.hpp>
+#include <fstream>
 
 // ============================================================================
 // attach/detach — ATT-1 (idempotence, mutex, null-tolerant handles) and
@@ -131,4 +132,38 @@ TEST(Attach, ConcurrentAttachRaceIsSafe) {
 
     EXPECT_EQ(failures.load(), 0) << "concurrent attach of the same db must be idempotent";
     EXPECT_EQ(person_count(a), 2);
+}
+
+// P0 fix (Jul 11 review): attaching a NAMED-MEMORY lattice to a FILE-backed
+// lattice must resolve the memory URI, not create a literal disk file named
+// "file:...". Requires SQLITE_OPEN_URI on the receiver's connections.
+TEST(Attach, FileLatticeAttachesNamedMemoryLattice) {
+    TempDB main_path{"attach_uri_recv"};
+    lattice::lattice_db main_db{lattice::configuration(main_path.str())};
+    lattice::lattice_db mem{lattice::configuration("file:attach_mem_src?mode=memory&cache=shared")};
+
+    mem.add(TestPerson{"memory-row", 42, std::nullopt});
+    main_db.add(TestPerson{"file-row", 1, std::nullopt});
+
+    main_db.attach(mem);
+    EXPECT_EQ(person_count(main_db), 2)
+        << "memory lattice's rows must be visible through the union view";
+
+    // And no junk literal file appeared in cwd.
+    EXPECT_NE(std::ifstream("file:attach_mem_src?mode=memory&cache=shared").good(), true);
+
+    main_db.detach(mem);
+    EXPECT_EQ(person_count(main_db), 1);
+}
+
+// Names/paths containing a single quote must not break the ATTACH statement.
+TEST(Attach, AttachPathWithSingleQuoteIsEscaped) {
+    TempDB main_path{"attach_quote_recv"};
+    lattice::lattice_db main_db{lattice::configuration(main_path.str())};
+    lattice::lattice_db mem{lattice::configuration("file:qu'ote?mode=memory&cache=shared")};
+    mem.add(TestPerson{"quoted", 7, std::nullopt});
+
+    EXPECT_NO_THROW(main_db.attach(mem));
+    EXPECT_EQ(person_count(main_db), 1);
+    main_db.detach(mem);
 }

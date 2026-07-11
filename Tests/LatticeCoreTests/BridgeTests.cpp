@@ -1104,3 +1104,52 @@ TEST(Bridge, RowCacheNullRoundTrip) {
 }
 
 #endif // !__linux__
+
+// P0 review pins (Jul 11): tuning must differentiate the instance cache, and
+// nonsensical tuning values must be ignored at the bridge boundary.
+TEST(BridgeTuning, DifferentTuningDoesNotShareInstance) {
+    auto path = std::filesystem::temp_directory_path() / "bridge_tuning_key.sqlite";
+    std::filesystem::remove(path);
+    lattice::swift_configuration a(path.string());
+    lattice::swift_configuration b(path.string());
+    b.set_sync_chunk_size(1);
+
+    auto ia = lattice::detail::LatticeCache::instance().get_or_create(a, lattice::SchemaVector{});
+    auto ib = lattice::detail::LatticeCache::instance().get_or_create(b, lattice::SchemaVector{});
+    EXPECT_NE(ia.get(), ib.get())
+        << "different sync tuning must not share a cached instance";
+    // Same tuning still dedups.
+    lattice::swift_configuration c(path.string());
+    c.set_sync_chunk_size(1);
+    auto ic = lattice::detail::LatticeCache::instance().get_or_create(c, lattice::SchemaVector{});
+    EXPECT_EQ(ib.get(), ic.get());
+}
+
+TEST(BridgeTuning, InvalidTuningValuesAreIgnored) {
+    lattice::swift_configuration cfg(":memory:");
+    cfg.set_sync_chunk_size(0);
+    cfg.set_sync_chunk_size(-5);
+    cfg.set_sync_base_delay_seconds(0);
+    cfg.set_sync_base_delay_seconds(-1);
+    cfg.set_sync_upload_coalesce_ms(-100);
+    EXPECT_FALSE(cfg.tuning.chunk_size.has_value());
+    EXPECT_FALSE(cfg.tuning.base_delay_seconds.has_value());
+    EXPECT_FALSE(cfg.tuning.upload_coalesce_ms.has_value());
+
+    // And the second boundary: apply() drops a zero smuggled into the struct.
+    cfg.tuning.chunk_size = 0;
+    lattice::sync_config sc;
+    auto default_chunk = sc.chunk_size;
+    cfg.tuning.apply(sc);
+    EXPECT_EQ(sc.chunk_size, default_chunk);
+}
+
+TEST(BridgeTuning, CreateUncachedNeverAliasesParent) {
+    auto path = std::filesystem::temp_directory_path() / "bridge_uncached.sqlite";
+    std::filesystem::remove(path);
+    lattice::swift_configuration cfg(path.string());
+    auto parent = lattice::detail::LatticeCache::instance().get_or_create(cfg, lattice::SchemaVector{});
+    auto clone = lattice::detail::LatticeCache::instance().create_uncached(cfg, lattice::SchemaVector{});
+    EXPECT_NE(parent.get(), clone.get())
+        << "query-clone must be a distinct instance even with an identical config";
+}

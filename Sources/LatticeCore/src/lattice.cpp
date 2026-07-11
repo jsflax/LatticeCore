@@ -877,7 +877,13 @@ void lattice_db::attach(lattice_db &lattice) {
     }
     for (auto* handle : view_handles()) {
         try {
-            handle->execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + alias + "\"");
+            std::string escaped_alias;
+            escaped_alias.reserve(alias.size());
+            for (char c : alias) {
+                escaped_alias += c;
+                if (c == '\"') escaped_alias += '\"';
+            }
+            handle->execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
         } catch (const db_error& e) {
             if (std::string(e.what()).find("already in use") == std::string::npos) throw;
         }
@@ -889,7 +895,19 @@ void lattice_db::attach(lattice_db &lattice) {
 }
 
 void lattice_db::detach(lattice_db &lattice) {
-    detach_alias(attach_alias_for(lattice.config_.path));
+    // Resolve by PATH, not by recomputed alias: alias derivation truncates at
+    // the filename stem, so two different paths (or dotted memory names) can
+    // share an alias — a never-attached path must be a clean no-op, never a
+    // detach of a same-stem victim.
+    std::string alias;
+    {
+        std::lock_guard<std::mutex> attach_lock(attach_mutex_);
+        auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
+            [&](const auto& entry) { return entry.second == lattice.config_.path; });
+        if (it == attached_dbs_.end()) return;  // not attached: idempotent no-op
+        alias = it->first;
+    }
+    detach_alias(alias);
 }
 
 void lattice_db::detach_alias(const std::string& alias) {

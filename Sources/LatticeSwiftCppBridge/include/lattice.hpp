@@ -454,8 +454,8 @@ struct swift_configuration : public configuration {
     // checkpoint = off).
     void set_sync_chunk_size(int64_t v) { if (v > 0) tuning.chunk_size = static_cast<size_t>(v); }
     void set_sync_max_reconnect_attempts(int32_t v) { if (v >= 0) tuning.max_reconnect_attempts = static_cast<int>(v); }
-    void set_sync_base_delay_seconds(double v) { if (v >= 0) tuning.base_delay_seconds = v; }
-    void set_sync_max_delay_seconds(double v) { if (v >= 0) tuning.max_delay_seconds = v; }
+    void set_sync_base_delay_seconds(double v) { if (v > 0) tuning.base_delay_seconds = v; }
+    void set_sync_max_delay_seconds(double v) { if (v > 0) tuning.max_delay_seconds = v; }
     void set_sync_stable_connection_ms(int64_t v) { if (v >= 0) tuning.stable_connection_ms = v; }
     void set_sync_upload_coalesce_ms(int32_t v) { if (v >= 0) tuning.upload_coalesce_ms = static_cast<int>(v); }
     void set_sync_checkpoint_passive_interval_ms(int32_t v) { if (v >= 0) tuning.checkpoint_passive_interval_ms = static_cast<int>(v); }
@@ -2550,6 +2550,18 @@ template <typename ConfigT>
             return nullptr;
         }
 
+        /// Construct a NEW instance regardless of any live key-cache entry,
+        /// registered in ptr_cache_ only (like dynamic opens). Used for
+        /// query-only clone connections (Swift attaching()): key-cache dedup
+        /// would return the clone's PARENT when their configs coincide, and
+        /// the subsequent ATTACH would mutate the parent's own connection.
+        std::shared_ptr<swift_lattice> create_uncached(const swift_configuration& config,
+                                                       const SchemaVector& schemas) {
+            auto inst = std::make_shared<swift_lattice>(config, schemas);
+            register_pointer(inst);
+            return inst;
+        }
+
         /// Register a bare-constructed instance (e.g. a dynamic/read-only open
         /// that bypasses get_or_create) into ptr_cache_ only, so its managed
         /// objects can resolve the owning lattice via get_by_pointer /
@@ -2736,6 +2748,18 @@ public:
         return _make(get_or_create_shared(new_config, schemas));
     }
     
+    /// Uncached construction for query-only clone connections (Swift's
+    /// attaching()). The keyed cache would dedup a clone whose config matches
+    /// its parent (same path/scheduler/schema/no-sync) and return the PARENT
+    /// instance — the subsequent ATTACH would then mutate the parent's own
+    /// connection. A clone must always be a distinct instance.
+    static LATTICE_SLREF_RET create_uncached(const swift_configuration& config,
+                                             const SchemaVector& schemas)
+    SWIFT_NAME(createUncached(swiftConfig:schemas:)) LATTICE_SLREF_UNRETAINED {
+        auto impl = detail::LatticeCache::instance().create_uncached(config, schemas);
+        return _make(impl);
+    }
+
     static LATTICE_SLREF_RET create(const swift_configuration& config,
                                      const SchemaVector& schemas)
     SWIFT_NAME(create(swiftConfig:schemas:)) LATTICE_SLREF_UNRETAINED {

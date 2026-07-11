@@ -464,12 +464,16 @@ struct configuration {
         std::optional<int> checkpoint_truncate_interval_ms;
         std::optional<bool> use_upload_floor;
 
-        /// Overlay the set fields onto a sync_config.
+        /// Overlay the set fields onto a sync_config. Values that would
+        /// break the synchronizer are ignored here too (defense at the second
+        /// boundary — the bridge setters already filter): chunk_size 0 would
+        /// permanently stall uploads; nonpositive backoff delays busy-spin
+        /// reconnects.
         void apply(sync_config& cfg) const {
-            if (chunk_size) cfg.chunk_size = *chunk_size;
+            if (chunk_size && *chunk_size > 0) cfg.chunk_size = *chunk_size;
             if (max_reconnect_attempts) cfg.max_reconnect_attempts = *max_reconnect_attempts;
-            if (base_delay_seconds) cfg.base_delay_seconds = *base_delay_seconds;
-            if (max_delay_seconds) cfg.max_delay_seconds = *max_delay_seconds;
+            if (base_delay_seconds && *base_delay_seconds > 0) cfg.base_delay_seconds = *base_delay_seconds;
+            if (max_delay_seconds && *max_delay_seconds > 0) cfg.max_delay_seconds = *max_delay_seconds;
             if (stable_connection_ms) cfg.stable_connection_ms = *stable_connection_ms;
             if (upload_coalesce_ms) cfg.upload_coalesce_ms = *upload_coalesce_ms;
             if (checkpoint_passive_interval_ms) cfg.checkpoint_passive_interval_ms = *checkpoint_passive_interval_ms;
@@ -525,9 +529,14 @@ struct configuration {
     /// ("file:<name>?mode=memory&cache=shared" — the 1.0 `.memory(named:)`
     /// storage form; same-name opens share one same-process database).
     static bool path_is_memory(const std::string& p) {
-        return p.empty() || p == ":memory:" ||
-               p.find(":memory:") != std::string::npos ||
-               p.find("mode=memory") != std::string::npos;
+        if (p.empty() || p == ":memory:") return true;
+        // URI forms are only URI-parsed by SQLite when they START with
+        // "file:" — an on-disk path merely CONTAINING ':memory:' or
+        // 'mode=memory' is a regular file and must not be classified memory.
+        if (p.compare(0, 5, "file:") != 0) return false;
+        if (p.find(":memory:") != std::string::npos) return true;
+        auto q = p.find('?');
+        return q != std::string::npos && p.find("mode=memory", q) != std::string::npos;
     }
 
     /// Returns true if this is an in-memory database (either :memory: or shared cache URI)

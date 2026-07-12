@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.10.10] - 2026-07-12
+
+### Added
+- Bridge forwards `rollback()` on `swift_lattice`/`swift_lattice_ref`
+  (core `lattice_db::rollback` already existed) — enables the Swift
+  `transaction { }` rollback-on-throw fix (1.0 item G8).
+
 ## [0.10.9] - 2026-07-12
 
 ### Fixed

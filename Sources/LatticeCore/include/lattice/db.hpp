@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <atomic>
+#include <functional>
 
 namespace lattice {
 
@@ -122,6 +123,22 @@ public:
     /// read paths, immune to parallel test suites in the same process.
     static uint64_t thread_statement_count();
 
+    /// Mark this connection dirty: buffered row changes await delivery once
+    /// the enclosing transaction settles. Relaxed store — callable from inside
+    /// sqlite3_update_hook (C frame: no locks, nothing that can throw).
+    void mark_txn_dirty() { txn_dirty_.store(true, std::memory_order_relaxed); }
+
+    /// Install the transaction-settled drain and rollback-discard callbacks
+    /// (docs/design-deferred-memory-delivery.md). `settled` runs after any
+    /// successful statement that leaves the connection in autocommit mode
+    /// with the dirty flag set — i.e. at the close of every top-level
+    /// transaction (including the explicit COMMIT, which funnels through
+    /// execute()), on the writing thread, outside all SQLite frames.
+    /// `rolled_back` is invoked from sqlite3_rollback_hook (C frame — it must
+    /// only clear state, never touch SQLite or throw) and defensively on
+    /// failed statements whose implicit transaction already rolled back.
+    void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back);
+
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }
 
@@ -139,7 +156,15 @@ private:
     // so this is a logical-close flag, not a lifetime guard.
     std::atomic<bool> closed_{false};
     int busy_timeout_ms_ = kDefaultBusyTimeoutMs;
+    // Deferred delivery (docs/design-deferred-memory-delivery.md): set by the
+    // update hook via mark_txn_dirty(); consumed by drain_if_settled() at the
+    // success tail of every statement wrapper; cleared by the rollback hook.
+    std::atomic<bool> txn_dirty_{false};
+    std::function<void()> on_txn_settled_;
+    std::function<void()> on_txn_rolled_back_;
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
+    void drain_if_settled();
+    void discard_if_rolled_back();
 };
 
 // RAII transaction guard

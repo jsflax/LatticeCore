@@ -128,6 +128,7 @@ database::~database() {
             sqlite3_update_hook(db_, nullptr, nullptr);
             sqlite3_wal_hook(db_, nullptr, nullptr);
             sqlite3_commit_hook(db_, nullptr, nullptr);
+            sqlite3_rollback_hook(db_, nullptr, nullptr);
             // Best-effort incremental stats refresh (bounded by analysis_limit).
             // Only re-analyzes tables this connection queried whose stats are
             // missing or stale. Never throw from a destructor.
@@ -154,6 +155,52 @@ void database::close() {
     // never deref a freed handle — it either sees closed_ and returns empty, or runs
     // a final query on the still-open connection.
     closed_.store(true, std::memory_order_release);
+}
+
+void database::set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back) {
+    on_txn_settled_ = std::move(settled);
+    on_txn_rolled_back_ = std::move(rolled_back);
+    // Rollback hook: fires inside SQLite's C frames, so the trampoline only
+    // clears a flag and (via rolled_back) a C++ vector — no SQLite calls,
+    // nothing that can throw. Applies to every storage kind: without it a
+    // rolled-back transaction's buffered rows linger and the NEXT flush
+    // delivers them as phantoms (latent file-DB bug, see the design doc).
+    sqlite3_rollback_hook(db_,
+        [](void* self_ptr) {
+            auto* self = static_cast<database*>(self_ptr);
+            self->txn_dirty_.store(false, std::memory_order_relaxed);
+            if (self->on_txn_rolled_back_) self->on_txn_rolled_back_();
+        },
+        this);
+}
+
+void database::drain_if_settled() {
+    // Post-statement drain point (docs/design-deferred-memory-delivery.md):
+    // after a successful statement, autocommit != 0 means the top-level
+    // transaction just closed (implicit, or the explicit COMMIT that funnels
+    // through execute()) and every lock is released — the exact post-commit
+    // point the WAL hook gives file DBs, but reached through plain C++
+    // frames, so observer exceptions propagate to the writer instead of
+    // unwinding through sqlite3_step. Clear the flag BEFORE draining so a
+    // callback's own writes re-arm it rather than re-entering.
+    if (on_txn_settled_ && txn_dirty_.load(std::memory_order_relaxed) &&
+        sqlite3_get_autocommit(db_) != 0) {
+        txn_dirty_.store(false, std::memory_order_relaxed);
+        on_txn_settled_();
+    }
+}
+
+void database::discard_if_rolled_back() {
+    // Failed statement with autocommit restored: the implicit transaction
+    // (if any) already rolled back. SQLite's rollback hook covers most of
+    // these paths; clear defensively so a hook-buffered row from the failed
+    // statement can't surface as a phantom in the next flush. Inside an
+    // explicit transaction (autocommit == 0) nothing is cleared — the
+    // transaction may still commit.
+    if (sqlite3_get_autocommit(db_) != 0) {
+        txn_dirty_.store(false, std::memory_order_relaxed);
+        if (on_txn_rolled_back_) on_txn_rolled_back_();
+    }
 }
 
 database::database(database&& other) noexcept
@@ -185,8 +232,10 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
             std::string error = errmsg ? errmsg : "Unknown error";
             sqlite3_free(errmsg);
             LOG_ERROR("db", "SQL execution failed: %s (SQL: %s)", error.c_str(), sql.c_str());
+            discard_if_rolled_back();
             throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
         }
+        drain_if_settled();
     } else {
         // Prepared statement path for parameterized queries
         sqlite3_stmt* stmt = nullptr;
@@ -218,8 +267,10 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
 
         if (rc != SQLITE_DONE) {
             LOG_ERROR("db", "Execution failed: %s (SQL: %s)", errmsg_str.c_str(), sql.c_str());
+            discard_if_rolled_back();
             throw db_error("Execution failed: " + errmsg_str);
         }
+        drain_if_settled();
     }
 }
 
@@ -456,8 +507,10 @@ primary_key_t database::insert(const std::string& table,
             auto err = std::string(sqlite3_errmsg(db_));
             LOG_ERROR("db", "Upsert failed (rc=%d, ext=%d, db=%p, path=%s): %s",
                       rc, extended_rc, (void*)db_, path_.c_str(), err.c_str());
+            discard_if_rolled_back();
             throw db_error("Insert failed: " + err);
         }
+        drain_if_settled();
         return affected_rowid;
     }
 
@@ -468,10 +521,15 @@ primary_key_t database::insert(const std::string& table,
         auto err = std::string(sqlite3_errmsg(db_));
         LOG_ERROR("db", "Insert failed (rc=%d, ext=%d, db=%p, path=%s): %s",
                   rc, extended_rc, (void*)db_, path_.c_str(), err.c_str());
+        discard_if_rolled_back();
         throw db_error("Insert failed: " + err);
     }
 
-    return sqlite3_last_insert_rowid(db_);
+    // Capture the rowid BEFORE draining: the drain runs observer callbacks,
+    // whose own writes would clobber last_insert_rowid on this connection.
+    auto rowid = sqlite3_last_insert_rowid(db_);
+    drain_if_settled();
+    return rowid;
 }
 
 void database::update(const std::string& table,
@@ -514,8 +572,10 @@ void database::update(const std::string& table,
     if (rc != SQLITE_DONE) {
         auto errmsg = sqlite3_errmsg(db_);
         LOG_ERROR("db", "Update failed: %s", errmsg);
+        discard_if_rolled_back();
         throw db_error("Update failed: " + std::string(errmsg));
     }
+    drain_if_settled();
 }
 
 void database::remove(const std::string& table, primary_key_t id) {
@@ -537,8 +597,10 @@ void database::remove(const std::string& table, primary_key_t id) {
 
     if (rc != SQLITE_DONE) {
         LOG_ERROR("db", "Delete failed: %s", sqlite3_errmsg(db_));
+        discard_if_rolled_back();
         throw db_error("Delete failed: " + std::string(sqlite3_errmsg(db_)));
     }
+    drain_if_settled();
 }
 
 std::vector<database::row_t> database::query(const std::string& sql,
@@ -577,9 +639,13 @@ std::vector<database::row_t> database::query(const std::string& sql,
     if (rc != SQLITE_DONE) {
         auto error = std::string(sqlite3_errmsg(db_));
         LOG_ERROR("db", "Query failed: %s", error.c_str());
+        discard_if_rolled_back();
         throw db_error("Query failed: " + error);
     }
 
+    // A plain SELECT can't close a transaction, but DML-via-RETURNING issued
+    // through query() can — one relaxed load of insurance (see design doc).
+    drain_if_settled();
     return results;
 }
 

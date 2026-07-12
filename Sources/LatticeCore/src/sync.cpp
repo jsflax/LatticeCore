@@ -2414,19 +2414,37 @@ static void notify_observers(lattice_db& db,
                              const std::vector<std::pair<int64_t, std::string>>& notify_list) {
     if (notify_list.empty()) return;
 
+    if (db.db().is_in_transaction()) {
+        // Caller holds the transaction (nested mark-synced, e.g. from
+        // receive_sync_data): delivering now would notify observers
+        // mid-transaction — on other handles that read is SQLITE_LOCKED
+        // territory. Ride the flush at the caller's commit instead: buffered
+        // AuditLog UPDATEs flow through flush_changes pass 1 verbatim and
+        // fan out post-commit (docs/design-deferred-memory-delivery.md).
+        for (const auto& [row_id, gid] : notify_list) {
+            db.append_to_change_buffer("AuditLog", "UPDATE", row_id, gid);
+        }
+        db.db().mark_txn_dirty();
+        return;
+    }
+
     std::vector<lattice_db::change_event> events;
     events.reserve(notify_list.size());
     for (const auto& [row_id, gid] : notify_list) {
         events.emplace_back("AuditLog", "UPDATE", row_id, gid, "");
     }
 
-    if (db.config().is_in_memory()) {
-        db.notify_changes_batched(events);
-    } else {
+    if (db.storage_shared_across_instances()) {
+        // Shared storage (file DB or shared-cache memory DB): every same-name
+        // handle can read the marked rows — fan out exactly like flush_changes.
         instance_registry::instance().for_each_alive(db.config().path,
             [&events](lattice_db* instance) {
                 instance->notify_changes_batched(events);
             });
+    } else {
+        // Isolated :memory: — registry keys collide (":memory:") but storage
+        // doesn't; fanning out would deliver phantom events.
+        db.notify_changes_batched(events);
     }
 }
 

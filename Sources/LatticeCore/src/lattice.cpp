@@ -90,49 +90,30 @@ void lattice_db::setup_change_hook() {
             }
 
             // For AuditLog changes:
-            // - In-memory DBs: notify directly (WAL hook won't fire)
-            // - Emscripten: notify directly (uses DELETE journal mode, no WAL)
+            // - In-memory DBs: buffer + mark dirty (WAL hook won't fire; the
+            //   post-statement drain flushes at transaction close)
+            // - Emscripten: same (uses DELETE journal mode, no WAL)
             // - File DBs: skip (let flush_changes handle it via WAL hook to avoid double notification)
             if (table == "AuditLog") {
 #ifdef __EMSCRIPTEN__
                 // Emscripten uses DELETE journal mode — WAL hook never fires,
-                // so always use the direct notification path.
-                constexpr bool use_direct_notify = true;
+                // so always use the deferred-drain path.
+                constexpr bool use_deferred_drain = true;
 #else
-                const bool use_direct_notify = self->config_.is_in_memory();
+                const bool use_deferred_drain = self->config_.is_in_memory();
 #endif
-                if (use_direct_notify) {
-                    // In-memory DBs: notify directly from update_hook.
-                    // flush_changes() can't handle this because it runs during the
-                    // model table's update_hook, BEFORE the AuditLog trigger fires.
+                if (use_deferred_drain) {
+                    // Deferred delivery (docs/design-deferred-memory-delivery.md):
+                    // buffer the AuditLog INSERT like any other row and let the
+                    // post-statement drain deliver it once the transaction
+                    // settles. globalId resolution moves to flush time — the
+                    // row is committed and readable there, which also removes
+                    // a same-connection SELECT from inside this hook.
                     if (operation == SQLITE_INSERT) {
-                        LOG_DEBUG("update_hook", "AuditLog change (in-memory), notifying directly");
-                        // Get globalId for the AuditLog entry
-                        std::string global_id;
-                        std::string sql = "SELECT globalId FROM AuditLog WHERE id = ?";
-                        auto rows = self->db_->query(sql, {static_cast<int64_t>(rowid)});
-                        if (!rows.empty()) {
-                            auto it = rows[0].find("globalId");
-                            if (it != rows[0].end() && std::holds_alternative<std::string>(it->second)) {
-                                global_id = std::get<std::string>(it->second);
-                            }
-                        }
-                        // For shared cache in-memory DBs, notify all instances
-                        // sharing the path (the sync db and main db share state).
-                        // For plain :memory:, just notify this instance.
-                        // Single-element batch — `notify_change` (singular) is
-                        // gone; per-row delivery is the degenerate case.
-                        std::vector<lattice_db::change_event> events;
-                        events.emplace_back("AuditLog", "INSERT",
-                                            static_cast<int64_t>(rowid), global_id, "");
-                        if (self->config_.path.find("cache=shared") != std::string::npos) {
-                            instance_registry::instance().for_each_alive(self->config_.path,
-                                [&events](lattice_db* inst) {
-                                    inst->notify_changes_batched(events);
-                                });
-                        } else {
-                            self->notify_changes_batched(events);
-                        }
+                        LOG_DEBUG("update_hook", "AuditLog change (in-memory), buffering for txn-settled drain");
+                        self->append_to_change_buffer("AuditLog", "INSERT",
+                                                      static_cast<int64_t>(rowid), "");
+                        self->db_->mark_txn_dirty();
                     }
                 } else {
                     LOG_DEBUG("update_hook", "AuditLog change (file DB), skipping - WAL hook will handle");
@@ -182,16 +163,19 @@ void lattice_db::setup_change_hook() {
                    table.c_str(), op.c_str(), (long long)rowid, global_id.c_str());
             self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id);
 
-            // For in-memory databases, flush immediately since WAL hook won't fire.
-            // Emscripten also needs immediate flush: it uses DELETE journal mode,
-            // not WAL, so the WAL hook never fires.
+            // For in-memory databases the WAL hook won't fire, so mark the
+            // connection dirty; the post-statement drain in db.cpp flushes at
+            // transaction close — never from inside this hook, which would
+            // deliver mid-transaction on SQLite's C frames
+            // (docs/design-deferred-memory-delivery.md). Emscripten is the
+            // same: DELETE journal mode, no WAL hook.
 #ifdef __EMSCRIPTEN__
-            LOG_DEBUG("update_hook", "Emscripten: immediate flush_changes()");
-            self->flush_changes();
+            LOG_DEBUG("update_hook", "Emscripten: marking txn dirty for post-statement drain");
+            self->db_->mark_txn_dirty();
 #else
             if (self->config_.is_in_memory()) {
-                LOG_DEBUG("update_hook", "In-memory DB, calling flush_changes()");
-                self->flush_changes();
+                LOG_DEBUG("update_hook", "In-memory DB, marking txn dirty for post-statement drain");
+                self->db_->mark_txn_dirty();
             } else {
                 LOG_DEBUG("update_hook", "File DB (path=%s), waiting for WAL hook", self->config_.path.c_str());
             }
@@ -209,6 +193,17 @@ void lattice_db::setup_change_hook() {
         },
         this
     );
+
+    // Transaction-settled drain + rollback discard
+    // (docs/design-deferred-memory-delivery.md). The settled hook drains the
+    // change buffer after any successful statement that leaves the connection
+    // in autocommit mode — the memory/Emscripten replacement for the WAL
+    // hook. Harmless for file DBs: only the memory path ever sets the dirty
+    // flag. The rollback hook applies to ALL storage kinds — a rolled-back
+    // transaction must discard its buffered rows, or the next flush delivers
+    // them as phantoms.
+    db_->set_txn_hooks([this] { flush_changes(); },
+                       [this] { discard_change_buffer(); });
 }
 void lattice_db::setup_cross_process_notifier() {
     // Use the shared per-path notifier from instance_registry.

@@ -153,12 +153,21 @@ public:
             // Track this thread's hold so a callback that ends up running
             // close()/~lattice_db (released the last reference) can exclude
             // itself from the drain wait instead of self-spinning forever.
+            // RAII: an observer exception now legally unwinds through here to
+            // the writer (docs/design-deferred-memory-delivery.md) — a leaked
+            // refcount would wedge the instance's destructor drain-wait.
             auto* g = e.guard.get();
+            struct hold_release {
+                instance_guard* g;
+                ~hold_release() {
+                    auto& depths = instance_guard::tls_depths();
+                    if (--depths[g] == 0) depths.erase(g);
+                    g->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
+                }
+            };
             ++instance_guard::tls_depths()[g];
+            hold_release release{g};
             fn(e.ptr);
-            auto& depths = instance_guard::tls_depths();
-            if (--depths[g] == 0) depths.erase(g);
-            e.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
         }
     }
 
@@ -1378,6 +1387,19 @@ public:
     bool is_synchronizer() const { return is_synchronizer_; }
     void set_is_synchronizer(bool value) { is_synchronizer_ = value; }
 
+    /// True when other same-process instances registered under this path can
+    /// read this instance's committed writes: file DBs and shared-cache memory
+    /// DBs share storage, so notifications must fan out via the instance
+    /// registry. Plain :memory: instances collide on the registry key
+    /// (":memory:") but have ISOLATED storage — fanning out to them would
+    /// deliver events about rows that don't exist in their database. Single
+    /// source of the fan-out policy (used by flush_changes and sync.cpp's
+    /// notify_observers).
+    bool storage_shared_across_instances() const {
+        return !config_.is_in_memory() ||
+               config_.path.find("cache=shared") != std::string::npos;
+    }
+
     /// Append a change to the buffer (called from update hook)
     void append_to_change_buffer(const std::string& table, const std::string& op,
                                   int64_t row_id, const std::string& global_id) {
@@ -1385,19 +1407,61 @@ public:
         change_buffer_.emplace_back(table, op, row_id, global_id);
     }
 
-    /// Flush buffered changes and notify observers (called from WAL hook)
-    /// Broadcasts to all instances sharing this database path
+    /// Discard buffered-but-undelivered changes (rollback path — wired as the
+    /// rolled-back txn hook in setup_change_hook). Wholesale clear is correct:
+    /// the buffer only ever holds the currently-open transaction's rows —
+    /// every commit flushes it via the WAL hook or the post-statement drain.
+    void discard_change_buffer() {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        change_buffer_.clear();
+    }
+
+    /// Flush buffered changes and notify observers. File DBs arrive here from
+    /// the WAL hook; memory/Emscripten DBs from the post-statement drain in
+    /// db.cpp (docs/design-deferred-memory-delivery.md). Broadcasts to all
+    /// instances sharing this database path.
+    ///
+    /// Bounded drain-until-empty: an observer callback that WRITES during
+    /// delivery buffers new entries while is_flushing_ suppresses its nested
+    /// flush — without the loop those entries would strand until the next
+    /// unrelated write. The cap guards against a callback that writes on
+    /// every fire; leftovers past the cap still deliver on the next write.
     void flush_changes() {
+        constexpr int kMaxDrainIterations = 64;
+        for (int i = 0; i < kMaxDrainIterations; ++i) {
+            if (!flush_changes_once()) return;
+        }
+        LOG_WARN("flush_changes", "change buffer still non-empty after %d drain iterations — "
+                 "an observer callback writes on every fire; remaining entries deliver on the next write",
+                 kMaxDrainIterations);
+    }
+
+    /// Single flush pass (implementation detail of flush_changes). Returns
+    /// false when there was nothing to deliver (empty buffer or re-entrant
+    /// call under is_flushing_); true after delivering one batch, so the
+    /// caller re-checks the buffer for observer-callback writes.
+    bool flush_changes_once() {
         LOG_DEBUG("flush_changes", "Called");
         std::vector<std::tuple<std::string, std::string, int64_t, std::string>> changes;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
-            if (change_buffer_.empty() || is_flushing_) return;
+            if (change_buffer_.empty() || is_flushing_) return false;
             is_flushing_ = true;
             changes = std::move(change_buffer_);
             change_buffer_.clear();
         }
+
+        // Exception-safe reset: observer exceptions propagate to the writer
+        // (plain C++ frames via the post-statement drain) and must not leave
+        // is_flushing_ set — that would silently disable delivery forever.
+        struct flushing_reset {
+            lattice_db* self;
+            ~flushing_reset() {
+                std::lock_guard<std::mutex> lock(self->change_buffer_mutex_);
+                self->is_flushing_ = false;
+            }
+        } reset_guard{this};
 
         // Read-and-clear the one-shot upsert flag set by add()/add_bulk on THIS thread
         // (flush_changes always runs on the writing thread). When set, populate
@@ -1409,14 +1473,47 @@ public:
 
         LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
+        // Backfill globalId for AuditLog INSERTs buffered by the update hook.
+        // The memory/Emscripten hook buffers them with an empty globalId — the
+        // row wasn't safely readable from inside the hook; here the transaction
+        // has settled and it is. One IN query covers the whole batch.
+        {
+            std::string audit_id_list;
+            for (const auto& [table, op, row_id, global_id] : changes) {
+                if (table == "AuditLog" && op == "INSERT" && global_id.empty()) {
+                    if (!audit_id_list.empty()) audit_id_list += ",";
+                    audit_id_list += std::to_string(row_id);
+                }
+            }
+            if (!audit_id_list.empty()) {
+                std::unordered_map<int64_t, std::string> gid_by_id;
+                auto rows = read_db().query(
+                    "SELECT id, globalId FROM AuditLog WHERE id IN (" + audit_id_list + ")");
+                for (const auto& row : rows) {
+                    auto id_it = row.find("id");
+                    auto gid_it = row.find("globalId");
+                    if (id_it != row.end() && gid_it != row.end() &&
+                        std::holds_alternative<int64_t>(id_it->second) &&
+                        std::holds_alternative<std::string>(gid_it->second)) {
+                        gid_by_id[std::get<int64_t>(id_it->second)] =
+                            std::get<std::string>(gid_it->second);
+                    }
+                }
+                for (auto& [table, op, row_id, global_id] : changes) {
+                    if (table == "AuditLog" && op == "INSERT" && global_id.empty()) {
+                        auto it = gid_by_id.find(row_id);
+                        if (it != gid_by_id.end()) global_id = it->second;
+                    }
+                }
+            }
+        }
+
         // Helper: iterate alive instances sharing this path, guarded by
         // refcount so the destructor waits for in-flight calls to complete.
         // Plain in-memory DBs each have isolated storage, so only notify this instance.
         // Shared cache in-memory DBs share storage, so use registry like file DBs.
-        bool is_file_db = !config_.is_in_memory() ||
-                          config_.path.find("cache=shared") != std::string::npos;
         auto for_each_alive = [&](auto&& fn) {
-            if (is_file_db) {
+            if (storage_shared_across_instances()) {
                 instance_registry::instance().for_each_alive(config_.path, fn);
             } else {
                 fn(this);
@@ -1547,8 +1644,9 @@ public:
         }
 
         // Pass 2: AuditLog INSERT events for each non-internal model change.
-        // For in-memory DBs, skip this — the update_hook notifies AuditLog observers
-        // directly because flush_changes() runs before the trigger fires.
+        // For in-memory DBs, skip this — the update hook buffers the AuditLog
+        // INSERT itself (delivered verbatim by pass 1 above), so deriving it
+        // again here would double-deliver.
         // For file-based DBs, flush_changes() runs at WAL commit (after triggers), so the entry exists.
         // Internal table AuditLog entries are skipped — handled in pass 3.
         bool is_in_memory = config_.is_in_memory();
@@ -1655,11 +1753,9 @@ public:
             shared_xproc_notifier_->post_notification();
         }
 
-        {
-            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
-            is_flushing_ = false;
-        }
+        // is_flushing_ cleared by reset_guard on scope exit (also on unwind).
         LOG_DEBUG("flush_changes", "Done");
+        return true;
     }
 
     // ========================================================================
@@ -1737,8 +1833,9 @@ public:
                                     std::string,   // global_row_id
                                     std::string>;  // changed_fields_names
 
-    // Register a table observer. The callback fires once per WAL flush
-    // (or per single-row update for in-memory DBs) with the batch of
+    // Register a table observer. The callback fires once per flush — the WAL
+    // hook for file DBs, the transaction-settled drain for memory/Emscripten
+    // DBs (docs/design-deferred-memory-delivery.md) — with the batch of
     // rows from that flush whose tableName matches `table_name`. A single
     // logical transaction is one fire; per-row delivery is just the
     // degenerate case (one-element batch).

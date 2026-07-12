@@ -1030,6 +1030,7 @@ public:
     }
     
     void commit() { lattice_db::commit(); }
+    void rollback() { lattice_db::rollback(); }
     void write(void (*fn)()) {
         begin_transaction();
         fn();
@@ -2896,6 +2897,7 @@ public:
     void optimize() const { impl().optimize(); }
     void begin_transaction() const { impl().begin_transaction(); }
     void commit() const { impl().commit(); }
+    void rollback() const { impl().rollback(); }
     void close() const { impl().close(); }
 
     // Sync status

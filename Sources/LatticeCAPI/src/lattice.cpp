@@ -1780,7 +1780,15 @@ extern "C" lattice_status_t lattice_db_attach(lattice_db_t* db, lattice_db_t* ot
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto* other_ref = reinterpret_cast<lattice_db_internal*>(other);
-        db_ref->get()->attach(*other_ref->get());
+        // Since ATT-3 the bridge attach reports failure via bool +
+        // last_attach_error() instead of throwing — discarding the bool made
+        // attach failures return LATTICE_OK with no error set (P0, see
+        // docs/capi-gap-audit.md B-1). The catch stays for older/other paths.
+        if (!db_ref->get()->attach(*other_ref->get())) {
+            auto reason = db_ref->get()->last_attach_error();
+            set_error(reason ? reason->c_str() : "attach failed");
+            return LATTICE_ERROR_DATABASE;
+        }
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());

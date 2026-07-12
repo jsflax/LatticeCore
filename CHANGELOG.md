@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.10.9] - 2026-07-12
+
+### Fixed
+- **Transaction-settled observer delivery for memory DBs**: in-memory (and
+  Emscripten) update hooks now only buffer; delivery drains after the
+  statement that closes the transaction — observers no longer run inside the
+  writer's open transaction (shared-cache readers can't hit SQLITE_LOCKED;
+  callback exceptions no longer unwind through SQLite's C hook frame).
+  Memory-DB observers now see ONE batch per logical transaction in commit
+  order, matching file DBs. A rollback hook discards buffered changes (fixes
+  a latent file-DB phantom-notification-on-rollback bug), and flush_changes
+  drains until empty (fixes stranded observer write-backs).
+- **Sync fan-out for named memory**: synced-status AuditLog updates now reach
+  all same-name shared-cache handles (new storage_shared_across_instances()
+  policy helper); isolated `:memory:` stays local-only.
+- **vec0 gap-reconcile reads `main.<table>`**: on an attached clone
+  connection the bare table name resolved to the TEMP union view, healing
+  the attached lattice's rows into main's vec index as permanent orphans
+  (scheduling-dependent; surfaced as a CI flake).
+
 ## [0.10.8] - 2026-07-11
 
 ### Fixed

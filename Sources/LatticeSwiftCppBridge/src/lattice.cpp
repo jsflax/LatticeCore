@@ -1500,8 +1500,15 @@ void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std:
     std::string vec_table = "_" + table + "_" + prop + "_vec";
     try {
         if (!db().table_exists(vec_table)) return;
+        // Qualify the model table with `main.`: this task runs async after
+        // open, and attach() may have installed a UNION ALL TEMP view that
+        // SHADOWS the bare table name on this connection. Counting the view
+        // (local + attached rows) against the local-only vec0 index would
+        // "heal" the attached rows into main's vec0 — permanent orphans.
+        // The vec0 index only indexes main's rows, so reconcile must only
+        // ever read main's model table.
         auto mc = db().query(
-            "SELECT COUNT(*) as cnt FROM " + table +
+            "SELECT COUNT(*) as cnt FROM main." + table +
             " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0");
         auto vc = db().query(
             "SELECT COUNT(*) as cnt FROM " + vec_table);
@@ -1516,7 +1523,7 @@ void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std:
         std::string rowids_table = vec_table + "_rowids";
         auto gaps = db().query(
             "SELECT m.globalId, m." + prop +
-            " FROM " + table + " m"
+            " FROM main." + table + " m"
             " LEFT JOIN " + rowids_table + " r ON r.id = m.globalId"
             " WHERE m." + prop + " IS NOT NULL"
             " AND length(m." + prop + ") > 0"

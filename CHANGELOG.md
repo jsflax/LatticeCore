@@ -3,6 +3,55 @@
 ## [Unreleased]
 
 ### Added
+- **Live Results item A, Commit 4** (lattice repo
+  `docs/design-results-item-A-SPEC.md`; bridge — consumed by the lattice
+  repo's Commit 5): generation + hook surface on
+  `swift_lattice`/`swift_lattice_ref`, exception containment.
+  - **Synchronous invalidation hook trampoline** (spec §2.3):
+    `add_invalidation_hook(context, c_fn, destroy)` /
+    `remove_invalidation_hook(token)` — established C-function-pointer +
+    context pattern; the callback receives the changed-table array + reason
+    (0 = commit, 1 = rollback, 2 = advance) INLINE on the writer's thread,
+    and the §2.3 restrictions (atomics only; no SQL; nothing that throws)
+    apply to the Swift body verbatim. Additive overload
+    `add_invalidation_hook_with_fields` also delivers per-table
+    `changed_fields` — non-empty only for UPDATE-only batches with known
+    fields (comma-joined deduped union); delivered now, consumed by the
+    v1.1 changedFields skip (Commit 8). Backed by new core
+    `add_invalidation_hook_detailed` (+ `invalidation_table_change`);
+    the Commit-3 basic hook API and payload are unchanged.
+  - **Read-generation pool forwarding** (spec §2.2/§3):
+    `acquire_read_generation` (0 = refused/no keeper),
+    `retain_read_generation`, `release_read_generation`,
+    `retire_all_read_generations` (§3.6 lifecycle),
+    `read_generations_outstanding` (+`local_`), `run_read_pool_maintenance`,
+    and the §1.7 tunables (`set_read_generation_ttl_ms`,
+    `set_read_generation_max_age_ms`,
+    `set_wal_keeper_eviction_threshold_bytes` + getter,
+    `wal_eviction_pending`). Every wrapper is catch-all — sentinels, never
+    a throw across interop.
+  - **Generation-scoped reads** routed through core `query_at_generation`
+    with the SAME SQL builders as the live paths (`build_query_rows_sql` /
+    `build_count_sql` extracted in core; bbox builder factored in the
+    bridge): `objects_at`, `count_at` (−1 sentinel),
+    `objects_within_bbox_at`. Failures (retired/unknown generation,
+    interrupted statement, throwing read) return empty/−1 plus the
+    per-thread `last_generation_read_stale()` flag (§2.5 tolerant ladder).
+  - **`query_ids_at(table, where, orderBy) → [int64]`** (spec §4.1
+    materialized-id capture for the memory family): capture transaction +
+    per-store write gate + bounded LOCKED sleep-backoff retry (~250 ms
+    budget), degrading to empty + stale. Id order ≡ row query order by
+    construction (same builder, `id` select list).
+  - **`data_version() → int64`** on the dedicated non-transaction
+    `xproc_read_db_` connection (−1 on failure) — the §4.4 cross-process
+    belt Commit 6 consumes; changes on foreign-connection commit only.
+  - Tests: 8 new (`BridgeGeneration.*`) — synchronous same-thread hook
+    delivery through the bridge, generation read round-trip + MVCC pin,
+    retired/unknown-generation sentinel path, memory-store acquire refusal,
+    id-vector order ≡ row order, fault injection (throwing read ⇒ empty +
+    stale, process alive), data_version foreign-commit-only, changed_fields
+    payload (INSERT ⇒ empty; UPDATE-only list append ⇒ property name).
+    Full suite 223/223 green.
 - **Live Results item A, Commit 3** (lattice repo
   `docs/design-results-item-A-SPEC.md`; core only — bridged in Commit 4):
   - **Synchronous invalidation hooks** (spec §2.3):

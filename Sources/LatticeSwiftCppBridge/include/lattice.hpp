@@ -5,8 +5,10 @@
 #include <LatticeCore.hpp>
 #include <bridging.hpp>
 #include <cassert>
+#include <chrono>
 #include <concepts>
 #include <future>
+#include <thread>
 #include <sqlite-vec.h>
 
 #include <dynamic_object.hpp>
@@ -724,22 +726,7 @@ public:
         OptionalString distinct_by = std::nullopt) {
 
         auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
-        std::vector<managed<swift_dynamic_object>> results;
-        results.reserve(rows.size());
-
-        // Get properties for this table
-        const SwiftSchema* props = get_properties_for_table(table_name);
-
-        for (const auto& row : rows) {
-            auto obj = hydrate<swift_dynamic_object>(row, table_name);
-            // Populate properties_ from stored schema
-            if (props) {
-                obj.properties_ = *props;
-                obj.source.properties = *props;
-            }
-            results.push_back(std::move(obj));
-        }
-        return results;
+        return hydrate_swift_rows(rows, table_name);
     }
 
     std::vector<managed<swift_dynamic_object>> union_objects(
@@ -1145,6 +1132,496 @@ public:
     }
 
     // ========================================================================
+    // MARK: Read generations + synchronous invalidation hooks
+    // Live Results item A, Commit 4 (lattice repo
+    // docs/design-results-item-A-SPEC.md §2.2/§2.3/§3/§4.1).
+    //
+    // Bridge-wide rules for THIS section:
+    //   - Every entry point is wrapped in a catch-all. A db_error (or any
+    //     exception) crossing the Swift interop boundary is std::terminate
+    //     (§1.2 rung 5), so failures surface as sentinels — empty result,
+    //     -1, 0, false — plus the per-thread stale flag below. No C++
+    //     exception can reach Swift through this surface.
+    //   - Generation-scoped reads route the SAME SQL builders the live read
+    //     paths use (lattice_db::build_query_rows_sql / build_count_sql /
+    //     build_bbox_rows_sql) through lattice_db::query_at_generation, so
+    //     the statement text is identical either way.
+    // ========================================================================
+
+private:
+    /// Per-thread stale marker for the tolerant ladder (§2.5): set when a
+    /// generation-scoped read (or a §4.1 id capture) could not be served —
+    /// retired/unknown generation, statement interrupted by a force-retire,
+    /// or a throwing core read — and the sentinel result must NOT be
+    /// interpreted as "genuinely empty". thread_local rather than a member:
+    /// generation reads run concurrently on reader threads, and a shared
+    /// member flag would cross-talk between them. Swift consumers check
+    /// last_generation_read_stale() immediately after the read, on the same
+    /// thread.
+    static bool& generation_read_stale_tl() {
+        static thread_local bool stale = false;
+        return stale;
+    }
+
+    /// Shared hydration for row-shaped query results (objects / objects_at /
+    /// bbox variants): hydrate + populate stored schema properties.
+    std::vector<managed<swift_dynamic_object>> hydrate_swift_rows(
+        const std::vector<std::unordered_map<std::string, column_value_t>>& rows,
+        const std::string& table_name) {
+        std::vector<managed<swift_dynamic_object>> results;
+        results.reserve(rows.size());
+        const SwiftSchema* props = get_properties_for_table(table_name);
+        for (const auto& row : rows) {
+            auto obj = hydrate<swift_dynamic_object>(row, table_name);
+            if (props) {
+                obj.properties_ = *props;
+                obj.source.properties = *props;
+            }
+            results.push_back(std::move(obj));
+        }
+        return results;
+    }
+
+    /// R*Tree bbox row-query SQL — factored from objects_within_bbox so the
+    /// generation-scoped variant routes the SAME builder (spec Commit 4).
+    /// `is_list` is resolved by the caller with one table_exists check on the
+    /// live connection: table SHAPE is DDL-stable across generations.
+    static std::string build_bbox_rows_sql(
+        const std::string& table_name,
+        const std::string& geo_column,
+        double min_lat, double max_lat,
+        double min_lon, double max_lon,
+        const OptionalString& where_clause,
+        const OptionalString& order_by,
+        OptionalInt64 limit,
+        OptionalInt64 offset,
+        const OptionalString& group_by,
+        bool is_list) {
+        std::string list_table = "_" + table_name + "_" + geo_column;
+        std::string list_rtree = list_table + "_rtree";
+        std::string single_rtree = "_" + table_name + "_" + geo_column + "_rtree";
+
+        std::string sql;
+        if (is_list) {
+            // Geo bounds list: join through list table's R*Tree
+            sql = "SELECT DISTINCT " + table_name + ".* FROM " + table_name +
+                  " JOIN " + list_table + " lt ON " + table_name + ".globalId = lt.parent_id" +
+                  " JOIN " + list_rtree + " r ON lt.id = r.id" +
+                  " WHERE r.minLat <= " + std::to_string(max_lat) +
+                  " AND r.maxLat >= " + std::to_string(min_lat) +
+                  " AND r.minLon <= " + std::to_string(max_lon) +
+                  " AND r.maxLon >= " + std::to_string(min_lon);
+        } else {
+            // Single geo_bounds: join main table's R*Tree directly
+            sql = "SELECT " + table_name + ".* FROM " + table_name +
+                  " JOIN " + single_rtree + " r ON " + table_name + ".id = r.id" +
+                  " WHERE r.minLat <= " + std::to_string(max_lat) +
+                  " AND r.maxLat >= " + std::to_string(min_lat) +
+                  " AND r.minLon <= " + std::to_string(max_lon) +
+                  " AND r.maxLon >= " + std::to_string(min_lon);
+        }
+
+        if (where_clause.has_value() && !where_clause.value().empty()) {
+            sql += " AND (" + where_clause.value() + ")";
+        }
+        if (group_by.has_value() && !group_by.value().empty()) {
+            sql += " GROUP BY " + group_by.value();
+        }
+        if (order_by.has_value() && !order_by.value().empty()) {
+            sql += " ORDER BY " + order_by.value();
+        }
+        if (limit.has_value()) {
+            sql += " LIMIT " + std::to_string(limit.value());
+        }
+        if (offset.has_value()) {
+            sql += " OFFSET " + std::to_string(offset.value());
+        }
+        return sql;
+    }
+
+public:
+    /// Whether the LAST generation-scoped read on THIS THREAD returned a
+    /// sentinel because it could not be served (retired generation, thrown
+    /// core read, exhausted §4.1 capture retry). Cleared at the start of
+    /// every generation-scoped entry point; check it on the same thread,
+    /// immediately after the read, before trusting an empty result.
+    static bool last_generation_read_stale()
+        SWIFT_NAME(lastGenerationReadStale()) {
+        return generation_read_stale_tl();
+    }
+
+    // ---- Synchronous invalidation hooks (§2.3) ----
+    //
+    // C function pointer trampoline (Swift-visible), same pattern as
+    // add_table_observer: void* context + C fn pointer + optional destroy.
+    //
+    // THE CALLBACK RUNS INLINE ON THE WRITER'S THREAD — for file DBs inside
+    // SQLite's post-commit C hook frame — once per settled top-level
+    // transaction, BEFORE the scheduler-dispatched observer fan-out, fanned
+    // to every alive same-path instance. The §2.3 restrictions apply to the
+    // Swift body verbatim: atomic epoch increments / dirty-flag stores ONLY.
+    // No SQL, no allocation-heavy work, nothing that can throw, and no lock
+    // that any thread ever holds across a SQL statement (leaf locks only).
+    //
+    // `reason` maps invalidation_reason: 0 = commit (payload = the batch's
+    // changed table names, EMPTY for bookkeeping-only commits), 1 = rollback
+    // (no change batch — re-capture at next access), 2 = advance (re-pin at
+    // next access; §3.3/§3.4). The pointer arrays are valid only for the
+    // duration of the callback.
+    uint64_t add_invalidation_hook(void* context,
+                                   void (*callback)(void* ctx,
+                                                    const char* const* changed_tables,
+                                                    size_t count,
+                                                    int reason),
+                                   void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        return lattice_db::add_invalidation_hook(
+            [shared_ctx, cb](const std::vector<std::string>& changed_tables,
+                             invalidation_reason reason) {
+                try {
+                    std::vector<const char*> tables;
+                    tables.reserve(changed_tables.size());
+                    for (const auto& t : changed_tables) tables.push_back(t.c_str());
+                    cb(shared_ctx.get(), tables.data(), tables.size(),
+                       static_cast<int>(reason));
+                } catch (...) {
+                    // §2.3: nothing may throw out of the hook frame — for
+                    // file DBs it is SQLite's C hook frame, and an unwind
+                    // through it is process death.
+                }
+            });
+    }
+
+    /// Additive overload (spec Commit 4): identical contract to
+    /// add_invalidation_hook, plus `changed_fields` — parallel to
+    /// `changed_tables`, per-table. changed_fields[i] is NON-EMPTY only when
+    /// every event for changed_tables[i] in the batch was an UPDATE with a
+    /// known changed-field list, and holds the comma-joined deduped union of
+    /// plain field names ("age,name"). EMPTY = must invalidate (INSERT or
+    /// DELETE present, fields unknown, rollback/advance). Delivered from
+    /// Commit 4; consumed by the v1.1 changedFields skip (Commit 8).
+    uint64_t add_invalidation_hook_with_fields(
+        void* context,
+        void (*callback)(void* ctx,
+                         const char* const* changed_tables,
+                         const char* const* changed_fields,
+                         size_t count,
+                         int reason),
+        void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+        auto cb = callback;
+        return lattice_db::add_invalidation_hook_detailed(
+            [shared_ctx, cb](const std::vector<invalidation_table_change>& changes,
+                             invalidation_reason reason) {
+                try {
+                    std::vector<const char*> tables;
+                    std::vector<const char*> fields;
+                    tables.reserve(changes.size());
+                    fields.reserve(changes.size());
+                    for (const auto& c : changes) {
+                        tables.push_back(c.table.c_str());
+                        fields.push_back(c.changed_fields.c_str());
+                    }
+                    cb(shared_ctx.get(), tables.data(), fields.data(),
+                       tables.size(), static_cast<int>(reason));
+                } catch (...) {
+                    // See the basic overload: never unwind the hook frame.
+                }
+            });
+    }
+
+    void remove_invalidation_hook(uint64_t token) {
+        lattice_db::remove_invalidation_hook(token);
+    }
+
+    // ---- Read-generation pool (§2.2/§3) ----
+    // Catch-all wrappers over the core pool. The core primitives already
+    // avoid throwing on their designed refusal paths (memory-family stores
+    // return 0, dead generations return nullopt); the wrappers guarantee it
+    // for everything else too.
+
+    /// Returns the new generation id, or 0 when this storage refuses keepers
+    /// (memory family, Emscripten, closed instance) or the store cannot be
+    /// pinned — treat 0 as "no keeper" and use the non-generation path.
+    uint64_t acquire_read_generation() {
+        try {
+            return lattice_db::acquire_read_generation();
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    /// Add a logical hold on a live generation. false = already retired or
+    /// retiring — re-resolve.
+    bool retain_read_generation(uint64_t generation_id) {
+        try {
+            return lattice_db::retain_read_generation(generation_id);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    /// Drop a hold; at refcount 0 the keeper COMMITs and its connection
+    /// returns to the idle pool. Releasing an already-retired id is a no-op.
+    void release_read_generation(uint64_t generation_id) {
+        try {
+            lattice_db::release_read_generation(generation_id);
+        } catch (...) {
+        }
+    }
+
+    /// Force-retire every live generation on this instance (§3.4 protocol).
+    /// Bridged for Lattice.retireAllGenerations() — the §3.6 iOS suspension
+    /// contract (retire on backgrounding so checkpoints land while
+    /// suspended).
+    void retire_all_read_generations() {
+        try {
+            lattice_db::retire_all_read_generations();
+        } catch (...) {
+        }
+    }
+
+    /// Live generations across EVERY alive same-path instance (§3.3
+    /// aggregation — the synchronizer owns its own instance, so any
+    /// single-instance count reads 0 from the wrong handle).
+    size_t read_generations_outstanding() {
+        try {
+            return lattice_db::read_generations_outstanding();
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    /// Live generations held by THIS instance only.
+    size_t local_read_generations_outstanding() {
+        try {
+            return lattice_db::local_read_generations_outstanding();
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    /// §3.2 maintenance tick: TTL retire, absolute age cap, pending
+    /// WAL-threshold evictions. The Swift coordinator's maintenance timer is
+    /// the actor of record for EVERY storage/config (a sync pacer is only
+    /// ever a second caller).
+    void run_read_pool_maintenance() {
+        try {
+            lattice_db::run_read_pool_maintenance();
+        } catch (...) {
+        }
+    }
+
+    // ---- Pool tunables (§1.7 ResultsTuning; forwarded per-Lattice from
+    //      Swift in Commit 5). Plain atomic stores — nothrow by
+    //      construction. ----
+    void set_read_generation_ttl_ms(int64_t ms) {
+        lattice_db::set_read_generation_ttl_ms(ms);
+    }
+    void set_read_generation_max_age_ms(int64_t ms) {
+        lattice_db::set_read_generation_max_age_ms(ms);
+    }
+    void set_wal_keeper_eviction_threshold_bytes(int64_t bytes) {
+        lattice_db::set_wal_keeper_eviction_threshold_bytes(bytes);
+    }
+    int64_t wal_keeper_eviction_threshold_bytes() const {
+        return lattice_db::wal_keeper_eviction_threshold_bytes();
+    }
+    /// Diagnostics/tests: an armed-but-unserviced WAL threshold eviction.
+    bool wal_eviction_pending() const {
+        return lattice_db::wal_eviction_pending();
+    }
+
+    // ---- Generation-scoped reads (§2.2: one MVCC snapshot per generation,
+    //      keeper-routed; §2.5 tolerant ladder on failure) ----
+
+    /// objects() executed at a held read generation. Same SQL builder as
+    /// objects(); rows come from the generation's keeper connection. Returns
+    /// EMPTY + stale flag (last_generation_read_stale()) when the generation
+    /// is no longer live or the read failed — an empty vector with the flag
+    /// clear is a genuine empty result.
+    std::vector<managed<swift_dynamic_object>> objects_at(
+        uint64_t generation_id,
+        const std::string& table_name,
+        OptionalString where_clause = std::nullopt,
+        OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt,
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt) {
+        generation_read_stale_tl() = false;
+        try {
+            auto rows = query_at_generation(
+                generation_id,
+                build_query_rows_sql(table_name, where_clause, order_by, limit,
+                                     offset, group_by, distinct_by));
+            if (!rows) {
+                generation_read_stale_tl() = true;
+                return {};
+            }
+            return hydrate_swift_rows(*rows, table_name);
+        } catch (...) {
+            generation_read_stale_tl() = true;
+            return {};
+        }
+    }
+
+    /// count() executed at a held read generation (same SQL builder,
+    /// keeper-routed). Returns -1 + stale flag when the generation is no
+    /// longer live or the read failed — callers re-resolve through the
+    /// tolerant ladder; 0 is a genuine zero.
+    int64_t count_at(uint64_t generation_id,
+                     const std::string& table_name,
+                     OptionalString where_clause = std::nullopt,
+                     OptionalString group_by = std::nullopt,
+                     OptionalString distinct_by = std::nullopt) {
+        generation_read_stale_tl() = false;
+        try {
+            auto rows = query_at_generation(
+                generation_id,
+                build_count_sql(table_name, where_clause, group_by, distinct_by));
+            if (!rows) {
+                generation_read_stale_tl() = true;
+                return -1;
+            }
+            if (!rows->empty()) {
+                auto it = (*rows)[0].find("cnt");
+                if (it != (*rows)[0].end() &&
+                    std::holds_alternative<int64_t>(it->second)) {
+                    return std::get<int64_t>(it->second);
+                }
+            }
+            return 0;
+        } catch (...) {
+            generation_read_stale_tl() = true;
+            return -1;
+        }
+    }
+
+    /// objects_within_bbox() executed at a held read generation (same SQL
+    /// builder, keeper-routed). EMPTY + stale flag on failure, as objects_at.
+    std::vector<managed<swift_dynamic_object>> objects_within_bbox_at(
+        uint64_t generation_id,
+        const std::string& table_name,
+        const std::string& geo_column,
+        double min_lat, double max_lat,
+        double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt,
+        OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt,
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt)
+        SWIFT_NAME(objectsWithinBBoxAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
+        generation_read_stale_tl() = false;
+        try {
+            bool is_list = db().table_exists("_" + table_name + "_" + geo_column);
+            auto rows = query_at_generation(
+                generation_id,
+                build_bbox_rows_sql(table_name, geo_column, min_lat, max_lat,
+                                    min_lon, max_lon, where_clause, order_by,
+                                    limit, offset, group_by, is_list));
+            if (!rows) {
+                generation_read_stale_tl() = true;
+                return {};
+            }
+            return hydrate_swift_rows(*rows, table_name);
+        } catch (...) {
+            generation_read_stale_tl() = true;
+            return {};
+        }
+    }
+
+    /// §4.1 materialized-id capture for the memory family (and any storage
+    /// without keepers): `SELECT id FROM T [WHERE …] [ORDER BY …]` — the
+    /// same builder as objects()/objects_at with an `id` select list, so the
+    /// id order is EXACTLY the row order the equivalent row query returns.
+    /// Runs inside a capture transaction (BEGIN waits out a concurrent
+    /// same-connection transaction) under the per-store write gate, with a
+    /// bounded LOCKED retry: SQLITE_LOCKED is immediate-fail on shared-cache
+    /// stores and sqlite3_unlock_notify is not compiled uniformly, so a
+    /// sleep-backoff loop is mandatory (§4.1 mechanism 3), degrading after a
+    /// ~250 ms budget to EMPTY + stale flag. Never throws into Swift.
+    std::vector<int64_t> query_ids_at(const std::string& table_name,
+                                      OptionalString where_clause = std::nullopt,
+                                      OptionalString order_by = std::nullopt) {
+        generation_read_stale_tl() = false;
+        const auto sql = build_query_rows_sql(table_name, where_clause, order_by,
+                                              std::nullopt, std::nullopt,
+                                              std::nullopt, std::nullopt, "id");
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::milliseconds(250);
+        int backoff_ms = 1;
+        for (;;) {
+            bool in_txn = false;
+            try {
+                lattice_db::begin_transaction();  // gate + BEGIN (retries in-txn races)
+                in_txn = true;
+                auto rows = db().query(sql);
+                lattice_db::commit();
+                in_txn = false;
+                std::vector<int64_t> ids;
+                ids.reserve(rows.size());
+                for (const auto& row : rows) {
+                    auto it = row.find("id");
+                    if (it != row.end() &&
+                        std::holds_alternative<int64_t>(it->second)) {
+                        ids.push_back(std::get<int64_t>(it->second));
+                    }
+                }
+                return ids;
+            } catch (const db_error& e) {
+                if (in_txn) {
+                    try { lattice_db::rollback(); } catch (...) {}
+                }
+                // Retry lock contention only ("database table is locked" /
+                // "database is locked"); anything else is not transient.
+                const bool locked =
+                    std::string(e.what()).find("locked") != std::string::npos;
+                if (!locked || clock::now() >= deadline) {
+                    generation_read_stale_tl() = true;
+                    return {};
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+                backoff_ms = std::min(backoff_ms * 2, 20);
+            } catch (...) {
+                if (in_txn) {
+                    try { lattice_db::rollback(); } catch (...) {}
+                }
+                generation_read_stale_tl() = true;
+                return {};
+            }
+        }
+    }
+
+    /// `PRAGMA data_version` on the dedicated non-transaction xproc read
+    /// connection (spec §4.4 belt; consumed by Commit 6). Changes exactly
+    /// when a DIFFERENT connection (including another process) commits to
+    /// the database — never for this connection's own reads. Returns -1 on
+    /// failure; never throws into Swift.
+    int64_t data_version() {
+        try {
+            auto rows = xproc_read_db().query("PRAGMA data_version", {});
+            if (!rows.empty()) {
+                auto it = rows[0].find("data_version");
+                if (it != rows[0].end() &&
+                    std::holds_alternative<int64_t>(it->second)) {
+                    return std::get<int64_t>(it->second);
+                }
+                // Column-name defensive fallback (pragma naming varies).
+                for (const auto& [key, value] : rows[0]) {
+                    if (std::holds_alternative<int64_t>(value)) {
+                        return std::get<int64_t>(value);
+                    }
+                }
+            }
+            return -1;
+        } catch (...) {
+            return -1;
+        }
+    }
+
+    // ========================================================================
     // MARK: Swift-compatible Vector Search API
     // ========================================================================
 
@@ -1219,74 +1696,15 @@ public:
         OptionalString group_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
 
-        // Build spatial query SQL using R*Tree
-        std::string list_table = "_" + table_name + "_" + geo_column;
-        std::string list_rtree = list_table + "_rtree";
-        std::string single_rtree = "_" + table_name + "_" + geo_column + "_rtree";
-
         // Check if this is a geo_bounds list (separate table) or single geo_bounds (inline columns)
-        bool is_list = db().table_exists(list_table);
+        bool is_list = db().table_exists("_" + table_name + "_" + geo_column);
 
-        std::string sql;
-        if (is_list) {
-            // Geo bounds list: join through list table's R*Tree
-            sql = "SELECT DISTINCT " + table_name + ".* FROM " + table_name +
-                  " JOIN " + list_table + " lt ON " + table_name + ".globalId = lt.parent_id" +
-                  " JOIN " + list_rtree + " r ON lt.id = r.id" +
-                  " WHERE r.minLat <= " + std::to_string(max_lat) +
-                  " AND r.maxLat >= " + std::to_string(min_lat) +
-                  " AND r.minLon <= " + std::to_string(max_lon) +
-                  " AND r.maxLon >= " + std::to_string(min_lon);
-        } else {
-            // Single geo_bounds: join main table's R*Tree directly
-            sql = "SELECT " + table_name + ".* FROM " + table_name +
-                  " JOIN " + single_rtree + " r ON " + table_name + ".id = r.id" +
-                  " WHERE r.minLat <= " + std::to_string(max_lat) +
-                  " AND r.maxLat >= " + std::to_string(min_lat) +
-                  " AND r.minLon <= " + std::to_string(max_lon) +
-                  " AND r.maxLon >= " + std::to_string(min_lon);
-        }
-
-        // Add additional where clause if provided
-        if (where_clause.has_value() && !where_clause.value().empty()) {
-            sql += " AND (" + where_clause.value() + ")";
-        }
-
-        // Add group by if provided
-        if (group_by.has_value() && !group_by.value().empty()) {
-            sql += " GROUP BY " + group_by.value();
-        }
-
-        // Add order by if provided
-        if (order_by.has_value() && !order_by.value().empty()) {
-            sql += " ORDER BY " + order_by.value();
-        }
-
-        // Add limit/offset if provided
-        if (limit.has_value()) {
-            sql += " LIMIT " + std::to_string(limit.value());
-        }
-        if (offset.has_value()) {
-            sql += " OFFSET " + std::to_string(offset.value());
-        }
-
-        // Execute query
-        auto rows = db().query(sql);
-        std::vector<managed<swift_dynamic_object>> results;
-        results.reserve(rows.size());
-
-        // Get properties for this table
-        const SwiftSchema* props = get_properties_for_table(table_name);
-
-        for (const auto& row : rows) {
-            auto obj = hydrate<swift_dynamic_object>(row, table_name);
-            if (props) {
-                obj.properties_ = *props;
-                obj.source.properties = *props;
-            }
-            results.push_back(std::move(obj));
-        }
-        return results;
+        // Build spatial query SQL using R*Tree — shared with the
+        // generation-scoped objects_within_bbox_at (Commit 4).
+        auto rows = db().query(build_bbox_rows_sql(
+            table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+            where_clause, order_by, limit, offset, group_by, is_list));
+        return hydrate_swift_rows(rows, table_name);
     }
 
     /// Count objects within a bounding box
@@ -3033,6 +3451,112 @@ public:
                            void (*callback)(void*),
                            void (*destroy)(void*) = nullptr) const {
         impl().set_on_xproc_idle(context, callback, destroy);
+    }
+
+    // ---- Read generations + synchronous invalidation hooks (item A
+    //      Commit 4). Const forwarders to the catch-all wrappers on
+    //      swift_lattice — every signature here is scalar/string-only, so a
+    //      SINGLE definition serves both the FRT and the value path (no
+    //      #if LATTICE_HAS_FRT split to fall out of sync — the ATT-3
+    //      forwarding lesson). See the swift_lattice section for contracts
+    //      (§2.3 callback restrictions, sentinel + stale-flag semantics). ----
+    uint64_t add_invalidation_hook(void* context,
+                                   void (*callback)(void* ctx,
+                                                    const char* const* changed_tables,
+                                                    size_t count,
+                                                    int reason),
+                                   void (*destroy)(void*) = nullptr) const {
+        return impl().add_invalidation_hook(context, callback, destroy);
+    }
+    uint64_t add_invalidation_hook_with_fields(
+        void* context,
+        void (*callback)(void* ctx,
+                         const char* const* changed_tables,
+                         const char* const* changed_fields,
+                         size_t count,
+                         int reason),
+        void (*destroy)(void*) = nullptr) const {
+        return impl().add_invalidation_hook_with_fields(context, callback, destroy);
+    }
+    void remove_invalidation_hook(uint64_t token) const {
+        impl().remove_invalidation_hook(token);
+    }
+
+    uint64_t acquire_read_generation() const { return impl().acquire_read_generation(); }
+    bool retain_read_generation(uint64_t generation_id) const {
+        return impl().retain_read_generation(generation_id);
+    }
+    void release_read_generation(uint64_t generation_id) const {
+        impl().release_read_generation(generation_id);
+    }
+    void retire_all_read_generations() const { impl().retire_all_read_generations(); }
+    size_t read_generations_outstanding() const { return impl().read_generations_outstanding(); }
+    size_t local_read_generations_outstanding() const {
+        return impl().local_read_generations_outstanding();
+    }
+    void run_read_pool_maintenance() const { impl().run_read_pool_maintenance(); }
+
+    void set_read_generation_ttl_ms(int64_t ms) const {
+        impl().set_read_generation_ttl_ms(ms);
+    }
+    void set_read_generation_max_age_ms(int64_t ms) const {
+        impl().set_read_generation_max_age_ms(ms);
+    }
+    void set_wal_keeper_eviction_threshold_bytes(int64_t bytes) const {
+        impl().set_wal_keeper_eviction_threshold_bytes(bytes);
+    }
+    int64_t wal_keeper_eviction_threshold_bytes() const {
+        return impl().wal_keeper_eviction_threshold_bytes();
+    }
+    bool wal_eviction_pending() const { return impl().wal_eviction_pending(); }
+
+    std::vector<managed<swift_dynamic_object>> objects_at(
+        uint64_t generation_id,
+        const std::string& table_name,
+        OptionalString where_clause = std::nullopt,
+        OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt,
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt,
+        OptionalString distinct_by = std::nullopt) const {
+        return impl().objects_at(generation_id, table_name, where_clause, order_by,
+                                 limit, offset, group_by, distinct_by);
+    }
+    int64_t count_at(uint64_t generation_id,
+                     const std::string& table_name,
+                     OptionalString where_clause = std::nullopt,
+                     OptionalString group_by = std::nullopt,
+                     OptionalString distinct_by = std::nullopt) const {
+        return impl().count_at(generation_id, table_name, where_clause, group_by, distinct_by);
+    }
+    std::vector<managed<swift_dynamic_object>> objects_within_bbox_at(
+        uint64_t generation_id,
+        const std::string& table_name,
+        const std::string& geo_column,
+        double min_lat, double max_lat,
+        double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt,
+        OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt,
+        OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt) const
+        SWIFT_NAME(objectsWithinBBoxAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
+        return impl().objects_within_bbox_at(generation_id, table_name, geo_column,
+                                             min_lat, max_lat, min_lon, max_lon,
+                                             where_clause, order_by, limit, offset, group_by);
+    }
+    std::vector<int64_t> query_ids_at(const std::string& table_name,
+                                      OptionalString where_clause = std::nullopt,
+                                      OptionalString order_by = std::nullopt) const {
+        return impl().query_ids_at(table_name, where_clause, order_by);
+    }
+    int64_t data_version() const { return impl().data_version(); }
+    /// Per-thread stale flag for the generation reads above — see
+    /// swift_lattice::last_generation_read_stale(). Instance-shaped for
+    /// call-site convenience; the flag itself is thread-local.
+    bool last_generation_read_stale() const
+        SWIFT_NAME(lastGenerationReadStale()) {
+        return swift_lattice::last_generation_read_stale();
     }
 
     // INTERNAL C++ lookup: the shared db wrapper for a raw lattice_db*

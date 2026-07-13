@@ -1779,17 +1779,45 @@ public:
         // commit through the synchronizer's dedicated handle (or any second
         // handle) bump the app coordinator's epoch before the write returns.
         {
-            std::vector<std::string> changed_tables;
-            changed_tables.reserve(events.size());
+            // Detailed payload (Commit 4 additive overload): per changed
+            // table, in commit order, deduped — plus the changed-fields
+            // union when (and only when) every event for the table was an
+            // UPDATE with a known changedFieldsNames list. Basic hooks see
+            // exactly the historical table-name vector via the registration
+            // adapter in add_invalidation_hook.
+            std::vector<invalidation_table_change> changed;
+            std::vector<char> update_only;                 // parallel to `changed`
+            std::vector<std::vector<std::string>> fields;  // parallel to `changed`
+            changed.reserve(events.size());
             for (const auto& ev : events) {
                 const auto& table = std::get<0>(ev);
-                if (std::find(changed_tables.begin(), changed_tables.end(), table) ==
-                    changed_tables.end()) {
-                    changed_tables.push_back(table);
+                const auto& op = std::get<1>(ev);
+                const auto& cfn = std::get<4>(ev);
+                size_t idx = 0;
+                for (; idx < changed.size(); ++idx) {
+                    if (changed[idx].table == table) break;
+                }
+                if (idx == changed.size()) {
+                    changed.push_back({table, std::string()});
+                    update_only.push_back(1);
+                    fields.emplace_back();
+                }
+                if (op != "UPDATE" || cfn.empty() ||
+                    !parse_changed_fields_names(cfn, fields[idx])) {
+                    update_only[idx] = 0;  // fields unknown or membership may change
                 }
             }
-            for_each_alive([&changed_tables](lattice_db* instance) {
-                instance->fire_invalidation_hooks_local(changed_tables,
+            for (size_t i = 0; i < changed.size(); ++i) {
+                if (!update_only[i]) continue;
+                std::string joined;
+                for (const auto& f : fields[i]) {
+                    if (!joined.empty()) joined += ',';
+                    joined += f;
+                }
+                changed[i].changed_fields = std::move(joined);
+            }
+            for_each_alive([&changed](lattice_db* instance) {
+                instance->fire_invalidation_hooks_local(changed,
                                                         invalidation_reason::commit);
             });
         }
@@ -2110,10 +2138,43 @@ public:
         std::function<void(const std::vector<std::string>& changed_tables,
                            invalidation_reason reason)>;
 
+    /// Per-table change detail for the additive Commit-4 hook overload
+    /// (results spec §2.3 v1.1 / Commit 8). `changed_fields` is NON-EMPTY
+    /// only when EVERY event for `table` in the settled batch was an UPDATE
+    /// with a known changed-field list — the only case in which the v1.1
+    /// disjointness skip may fire — and holds the comma-joined, deduped
+    /// union of plain field names (e.g. "age,name"). EMPTY means the
+    /// consumer MUST invalidate: INSERT/DELETE present (pre-change
+    /// membership is unknowable post-hoc), fields unknown (local setter
+    /// writes carry no changedFieldsNames), or a rollback/advance signal.
+    /// Delivered from Commit 4; unused until Commit 8 by design.
+    struct invalidation_table_change {
+        std::string table;
+        std::string changed_fields;
+    };
+
+    using invalidation_hook_detailed_fn =
+        std::function<void(const std::vector<invalidation_table_change>& changes,
+                           invalidation_reason reason)>;
+
     /// Register a synchronous invalidation hook. Returns a token for
     /// remove_invalidation_hook. See the section comment above for the
     /// (strict) callback contract.
     uint64_t add_invalidation_hook(invalidation_hook_fn hook) {
+        return add_invalidation_hook_detailed(
+            [hook = std::move(hook)](const std::vector<invalidation_table_change>& changes,
+                                     invalidation_reason reason) {
+                std::vector<std::string> tables;
+                tables.reserve(changes.size());
+                for (const auto& c : changes) tables.push_back(c.table);
+                hook(tables, reason);
+            });
+    }
+
+    /// Additive overload (results spec Commit 4): identical firing contract
+    /// to add_invalidation_hook, with the per-table changed-fields payload
+    /// (see invalidation_table_change). Shares the token space.
+    uint64_t add_invalidation_hook_detailed(invalidation_hook_detailed_fn hook) {
         std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
         auto token = next_invalidation_hook_token_++;
         invalidation_hooks_.emplace_back(token, std::move(hook));
@@ -2159,23 +2220,59 @@ public:
 private:
     void fire_invalidation_hooks_local(const std::vector<std::string>& changed_tables,
                                        invalidation_reason reason) {
+        // Table-names-only fire sites (rollback, advance, sync's mark-synced
+        // signal) carry no field detail: empty changed_fields = "must
+        // invalidate", per the invalidation_table_change contract.
+        std::vector<invalidation_table_change> changes;
+        changes.reserve(changed_tables.size());
+        for (const auto& t : changed_tables) changes.push_back({t, std::string()});
+        fire_invalidation_hooks_local(changes, reason);
+    }
+
+    void fire_invalidation_hooks_local(const std::vector<invalidation_table_change>& changes,
+                                       invalidation_reason reason) {
         // Copy under the (leaf) mutex, invoke outside it: a hook body may
         // legally call remove_invalidation_hook, and the lock must never be
         // observable as held across a callback.
-        std::vector<invalidation_hook_fn> hooks;
+        std::vector<invalidation_hook_detailed_fn> hooks;
         {
             std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
             if (invalidation_hooks_.empty()) return;
             hooks.reserve(invalidation_hooks_.size());
             for (const auto& [token, fn] : invalidation_hooks_) hooks.push_back(fn);
         }
-        for (const auto& fn : hooks) fn(changed_tables, reason);
+        for (const auto& fn : hooks) fn(changes, reason);
+    }
+
+    /// Parse a changedFieldsNames payload (JSON array of quoted names, e.g.
+    /// `["age","name"]`) into `out`, deduping. Returns false when the string
+    /// yields no names (unknown format) — callers must then treat the batch's
+    /// fields as unknown. Field names are plain identifiers; no escape
+    /// handling is needed, and anything unparseable degrades to "unknown"
+    /// (= must invalidate), never to a wrong skip.
+    static bool parse_changed_fields_names(const std::string& s,
+                                           std::vector<std::string>& out) {
+        bool any = false;
+        size_t pos = 0;
+        while ((pos = s.find('"', pos)) != std::string::npos) {
+            auto end = s.find('"', pos + 1);
+            if (end == std::string::npos) break;
+            std::string name = s.substr(pos + 1, end - pos - 1);
+            if (!name.empty()) {
+                any = true;
+                if (std::find(out.begin(), out.end(), name) == out.end()) {
+                    out.push_back(std::move(name));
+                }
+            }
+            pos = end + 1;
+        }
+        return any;
     }
 
     /// LEAF lock — held only for registration bookkeeping, never across SQL
     /// or a callback (see the §2.3 contract above).
     std::mutex invalidation_hooks_mutex_;
-    std::vector<std::pair<uint64_t, invalidation_hook_fn>> invalidation_hooks_;
+    std::vector<std::pair<uint64_t, invalidation_hook_detailed_fn>> invalidation_hooks_;
     uint64_t next_invalidation_hook_token_ = 1;
 
 public:
@@ -2820,10 +2917,15 @@ public:
     }
 
     // Count rows in a table (with optional WHERE clause)
-    size_t count(const std::string& table_name,
-                 std::optional<std::string> where_clause = std::nullopt,
-                 std::optional<std::string> group_by = std::nullopt,
-                 std::optional<std::string> distinct_by = std::nullopt) {
+    // SQL builder for count — extracted (results spec Commit 4) so the
+    // bridge's generation-scoped count_at routes the SAME statement text
+    // through query_at_generation. Pure string construction; the result
+    // always aliases the count column as `cnt`.
+    static std::string build_count_sql(
+        const std::string& table_name,
+        const std::optional<std::string>& where_clause = std::nullopt,
+        const std::optional<std::string>& group_by = std::nullopt,
+        const std::optional<std::string>& distinct_by = std::nullopt) {
         std::string sql;
 
         bool has_distinct = distinct_by.has_value() && !distinct_by->empty();
@@ -2852,8 +2954,14 @@ public:
                 sql += " WHERE " + *where_clause;
             }
         }
+        return sql;
+    }
 
-        auto rows = read_db().query(sql);
+    size_t count(const std::string& table_name,
+                 std::optional<std::string> where_clause = std::nullopt,
+                 std::optional<std::string> group_by = std::nullopt,
+                 std::optional<std::string> distinct_by = std::nullopt) {
+        auto rows = read_db().query(build_count_sql(table_name, where_clause, group_by, distinct_by));
         if (!rows.empty()) {
             auto it = rows[0].find("cnt");
             if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
@@ -3249,16 +3357,20 @@ public:
         }
     }
 
-    // Query objects from a table with optional filtering, sorting, and pagination
-    // Returns raw row data - caller is responsible for hydrating into managed objects
-    std::vector<std::unordered_map<std::string, column_value_t>> query_rows(
+    // SQL builder for query_rows — extracted (results spec Commit 4) so the
+    // bridge's generation-scoped reads (objects_at/query_ids_at) route the
+    // SAME statement text through query_at_generation instead of read_db().
+    // `select_list` is "*" for row queries and "id" for id-vector captures.
+    // Pure string construction: no connection, never throws (beyond OOM).
+    static std::string build_query_rows_sql(
         const std::string& table_name,
-        std::optional<std::string> where_clause = std::nullopt,
-        std::optional<std::string> order_by = std::nullopt,
+        const std::optional<std::string>& where_clause = std::nullopt,
+        const std::optional<std::string>& order_by = std::nullopt,
         std::optional<int64_t> limit = std::nullopt,
         std::optional<int64_t> offset = std::nullopt,
-        std::optional<std::string> group_by = std::nullopt,
-        std::optional<std::string> distinct_by = std::nullopt) {
+        const std::optional<std::string>& group_by = std::nullopt,
+        const std::optional<std::string>& distinct_by = std::nullopt,
+        const std::string& select_list = "*") {
 
         std::ostringstream sql;
 
@@ -3267,14 +3379,14 @@ public:
 
         if (has_distinct && has_group) {
             // Dedup via inner GROUP BY, then apply outer GROUP BY
-            sql << "SELECT * FROM (SELECT * FROM " << table_name;
+            sql << "SELECT " << select_list << " FROM (SELECT * FROM " << table_name;
             if (where_clause && !where_clause->empty()) {
                 sql << " WHERE " << *where_clause;
             }
             sql << " GROUP BY " << *distinct_by << ")";
             sql << " GROUP BY " << *group_by;
         } else {
-            sql << "SELECT * FROM " << table_name;
+            sql << "SELECT " << select_list << " FROM " << table_name;
             if (where_clause && !where_clause->empty()) {
                 sql << " WHERE " << *where_clause;
             }
@@ -3294,7 +3406,21 @@ public:
         if (offset) {
             sql << " OFFSET " << *offset;
         }
-        return read_db().query(sql.str());
+        return sql.str();
+    }
+
+    // Query objects from a table with optional filtering, sorting, and pagination
+    // Returns raw row data - caller is responsible for hydrating into managed objects
+    std::vector<std::unordered_map<std::string, column_value_t>> query_rows(
+        const std::string& table_name,
+        std::optional<std::string> where_clause = std::nullopt,
+        std::optional<std::string> order_by = std::nullopt,
+        std::optional<int64_t> limit = std::nullopt,
+        std::optional<int64_t> offset = std::nullopt,
+        std::optional<std::string> group_by = std::nullopt,
+        std::optional<std::string> distinct_by = std::nullopt) {
+        return read_db().query(build_query_rows_sql(
+            table_name, where_clause, order_by, limit, offset, group_by, distinct_by));
     }
 
     // Query objects from a table with optional filtering, sorting, and pagination

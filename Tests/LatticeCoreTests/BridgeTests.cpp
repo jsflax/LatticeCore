@@ -1153,4 +1153,370 @@ TEST(BridgeTuning, CreateUncachedNeverAliasesParent) {
         << "query-clone must be a distinct instance even with an identical config";
 }
 
+// ============================================================================
+// Read generations + synchronous invalidation hooks through the bridge —
+// Live Results item A, Commit 4 (lattice repo docs/design-results-item-A-SPEC.md).
+// Stays inside the !__linux__ guard: these exercise swift_lattice_ref, which
+// the test target only links on Apple platforms.
+// ============================================================================
+
+namespace {
+
+struct HookCapture {
+    std::mutex m;  // leaf lock — never held across SQL anywhere in the test
+    std::atomic<int> fires{0};
+    std::thread::id last_thread{};
+    std::vector<std::string> last_tables;
+    std::vector<int> reasons;
+};
+
+struct FieldsHookCapture {
+    std::mutex m;
+    std::vector<std::pair<std::string, std::string>> entries;  // (table, fields)
+};
+
+lattice::swift_schema_entry gen_person_schema(const std::string& table) {
+    return make_schema(table, {
+        {"name", text_prop("name")},
+        {"age", int_prop("age")},
+    });
+}
+
+void gen_insert_person(lattice::swift_lattice& db, const lattice::SchemaVector& schemas,
+                       const std::string& name, int64_t age) {
+    auto sdo = make_sdo(schemas[0].table_name, schemas[0].properties);
+    sdo.values["name"] = name;
+    sdo.values["age"] = age;
+    lattice::dynamic_object obj(sdo);
+    db.add(obj);
+}
+
+}  // namespace
+
+// The whole point of the new hook (§2.3): delivery is INLINE on the writer's
+// thread, before the write returns — no scheduler pump, no sleep, no Task hop
+// (the T2 failure mode of the observer trampoline, pinned at the bridge).
+TEST(BridgeGeneration, InvalidationHookFiresSynchronouslyThroughBridge) {
+    TempDB tmp{"gen_hook_sync"};
+    lattice::SchemaVector schemas = {gen_person_schema("GenHookPerson")};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+
+    HookCapture cap;
+    auto token = ref->add_invalidation_hook(
+        &cap,
+        [](void* ctx, const char* const* tables, size_t count, int reason) {
+            auto* c = static_cast<HookCapture*>(ctx);
+            std::lock_guard<std::mutex> lock(c->m);
+            c->last_thread = std::this_thread::get_id();
+            c->last_tables.clear();
+            for (size_t i = 0; i < count; ++i) c->last_tables.emplace_back(tables[i]);
+            c->reasons.push_back(reason);
+            c->fires.fetch_add(1, std::memory_order_release);
+        });
+
+    gen_insert_person(db, schemas, "Sync", 1);
+
+    // The write returned ⇒ the hook already fired, on THIS thread.
+    EXPECT_GE(cap.fires.load(std::memory_order_acquire), 1)
+        << "hook did not fire synchronously with the write";
+    {
+        std::lock_guard<std::mutex> lock(cap.m);
+        EXPECT_EQ(cap.last_thread, std::this_thread::get_id())
+            << "hook fired off the writer's thread";
+        EXPECT_NE(std::find(cap.last_tables.begin(), cap.last_tables.end(),
+                            std::string("GenHookPerson")),
+                  cap.last_tables.end())
+            << "changed-table payload missing the written table";
+        ASSERT_FALSE(cap.reasons.empty());
+        EXPECT_EQ(cap.reasons.front(), 0) << "expected invalidation_reason::commit";
+    }
+
+    // Removal is effective immediately: no further fires.
+    const int fires_before = cap.fires.load(std::memory_order_acquire);
+    ref->remove_invalidation_hook(token);
+    gen_insert_person(db, schemas, "After", 2);
+    EXPECT_EQ(cap.fires.load(std::memory_order_acquire), fires_before)
+        << "hook fired after remove_invalidation_hook";
+
+    delete ref;
+}
+
+// Generation read round-trip through the bridge: acquire → read (same SQL
+// builders, keeper-routed) → writer commits → the held generation still
+// serves its MVCC snapshot → release.
+TEST(BridgeGeneration, GenerationReadRoundTrip) {
+    TempDB tmp{"gen_round_trip"};
+    lattice::SchemaVector schemas = {gen_person_schema("GenTripPerson")};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    for (int64_t i = 1; i <= 3; ++i) gen_insert_person(db, schemas, "P", i);
+
+    auto gen = ref->acquire_read_generation();
+    ASSERT_NE(gen, 0u) << "file DB refused a keeper";
+    EXPECT_EQ(ref->read_generations_outstanding(), 1u);
+
+    auto rows = ref->objects_at(gen, "GenTripPerson", std::nullopt,
+                                std::string("age ASC"));
+    EXPECT_FALSE(ref->last_generation_read_stale());
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(int(rows[0].get_int("age")), 1);
+    EXPECT_EQ(int(rows[2].get_int("age")), 3);
+    EXPECT_EQ(ref->count_at(gen, "GenTripPerson"), 3);
+    EXPECT_FALSE(ref->last_generation_read_stale());
+
+    // Writer commits a 4th row: live reads see it, the held generation must not.
+    gen_insert_person(db, schemas, "P", 4);
+    EXPECT_EQ(ref->objects("GenTripPerson").size(), 4u);
+    EXPECT_EQ(ref->count_at(gen, "GenTripPerson"), 3) << "generation lost its MVCC pin";
+    EXPECT_EQ(ref->objects_at(gen, "GenTripPerson").size(), 3u);
+    EXPECT_FALSE(ref->last_generation_read_stale());
+
+    // retain adds a second hold: the first release keeps the keeper alive.
+    EXPECT_TRUE(ref->retain_read_generation(gen));
+    ref->release_read_generation(gen);
+    EXPECT_EQ(ref->count_at(gen, "GenTripPerson"), 3)
+        << "generation retired while a retain hold was live";
+    ref->release_read_generation(gen);
+    EXPECT_EQ(ref->read_generations_outstanding(), 0u);
+
+    delete ref;
+}
+
+// Catch-all/sentinel contract: reads on a retired or unknown generation return
+// the sentinel (empty / -1) plus the per-thread stale flag — never a throw
+// across the interop boundary.
+TEST(BridgeGeneration, RetiredGenerationReadReturnsSentinelNotThrow) {
+    TempDB tmp{"gen_retired"};
+    lattice::SchemaVector schemas = {gen_person_schema("GenRetiredPerson")};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    for (int64_t i = 1; i <= 2; ++i) gen_insert_person(db, schemas, "P", i);
+
+    auto gen = ref->acquire_read_generation();
+    ASSERT_NE(gen, 0u);
+    ref->retire_all_read_generations();  // §3.6 lifecycle path, bridged
+    EXPECT_EQ(ref->read_generations_outstanding(), 0u);
+
+    auto rows = ref->objects_at(gen, "GenRetiredPerson");
+    EXPECT_TRUE(rows.empty());
+    EXPECT_TRUE(ref->last_generation_read_stale())
+        << "empty-from-retired must be flagged stale (not a genuine empty)";
+    EXPECT_EQ(ref->count_at(gen, "GenRetiredPerson"), -1);
+    EXPECT_TRUE(ref->last_generation_read_stale());
+
+    EXPECT_FALSE(ref->retain_read_generation(gen)) << "retain on retired must refuse";
+    ref->release_read_generation(gen);  // releasing a retired id is a no-op
+
+    // Unknown id: same sentinel path.
+    EXPECT_EQ(ref->count_at(999999, "GenRetiredPerson"), -1);
+    EXPECT_TRUE(ref->last_generation_read_stale());
+
+    // A successful read on a fresh generation clears the per-thread flag.
+    auto gen2 = ref->acquire_read_generation();
+    ASSERT_NE(gen2, 0u);
+    EXPECT_EQ(ref->count_at(gen2, "GenRetiredPerson"), 2);
+    EXPECT_FALSE(ref->last_generation_read_stale());
+    ref->release_read_generation(gen2);
+
+    delete ref;
+}
+
+// Refusal path (§4.1): memory-family stores refuse keepers — acquire returns 0
+// through the bridge — while the §4.1 materialized-id capture (query_ids_at)
+// still serves them.
+TEST(BridgeGeneration, MemoryLatticeAcquireRefusedThroughBridge) {
+    lattice::SchemaVector schemas = {gen_person_schema("GenMemPerson")};
+    lattice::swift_configuration config;  // default = private :memory:
+    auto* ref = lattice::swift_lattice_ref::create(config, schemas);
+    auto& db = *ref->get();
+    for (int64_t i = 1; i <= 2; ++i) gen_insert_person(db, schemas, "M", i);
+
+    EXPECT_EQ(ref->acquire_read_generation(), 0u)
+        << "memory lattice must refuse read generations";
+    EXPECT_EQ(ref->read_generations_outstanding(), 0u);
+
+    // Feeding the 0 sentinel into a generation read is the tolerant-ladder
+    // path, not a throw.
+    EXPECT_EQ(ref->count_at(0, "GenMemPerson"), -1);
+    EXPECT_TRUE(ref->last_generation_read_stale());
+
+    // The §4.1 id capture (capture transaction + gate + LOCKED retry) works.
+    auto ids = ref->query_ids_at("GenMemPerson", std::nullopt, std::string("age ASC"));
+    EXPECT_FALSE(ref->last_generation_read_stale());
+    EXPECT_EQ(ids.size(), 2u);
+
+    delete ref;
+}
+
+// Spec Commit 4 test: id-vector order ≡ row query order (same SQL builder,
+// `id` select list), including under WHERE + ORDER BY.
+TEST(BridgeGeneration, IdVectorOrderMatchesRowQueryOrder) {
+    TempDB tmp{"gen_id_order"};
+    lattice::SchemaVector schemas = {gen_person_schema("GenOrderPerson")};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    for (int64_t age : {5, 1, 9, 3}) gen_insert_person(db, schemas, "O", age);
+
+    auto rows = ref->objects("GenOrderPerson", std::nullopt,
+                             std::string("age DESC, id ASC"));
+    auto ids = ref->query_ids_at("GenOrderPerson", std::nullopt,
+                                 std::string("age DESC, id ASC"));
+    ASSERT_EQ(rows.size(), 4u);
+    ASSERT_EQ(ids.size(), rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(ids[i], rows[i].get_int("id")) << "order diverged at index " << i;
+    }
+
+    auto rows2 = ref->objects("GenOrderPerson", std::string("age > 2"),
+                              std::string("age ASC"));
+    auto ids2 = ref->query_ids_at("GenOrderPerson", std::string("age > 2"),
+                                  std::string("age ASC"));
+    ASSERT_EQ(rows2.size(), 3u);
+    ASSERT_EQ(ids2.size(), rows2.size());
+    for (size_t i = 0; i < rows2.size(); ++i) {
+        EXPECT_EQ(ids2[i], rows2[i].get_int("id")) << "filtered order diverged at " << i;
+    }
+
+    delete ref;
+}
+
+// Spec Commit 4 fault injection: a throwing core read (bad WHERE on a LIVE
+// generation) surfaces as empty + stale, process alive — and the generation
+// itself remains serviceable afterwards.
+TEST(BridgeGeneration, ThrowingReadSurfacesAsEmptyPlusStale) {
+    TempDB tmp{"gen_fault"};
+    lattice::SchemaVector schemas = {gen_person_schema("GenFaultPerson")};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    for (int64_t i = 1; i <= 2; ++i) gen_insert_person(db, schemas, "F", i);
+
+    auto gen = ref->acquire_read_generation();
+    ASSERT_NE(gen, 0u);
+
+    auto rows = ref->objects_at(gen, "GenFaultPerson", std::string("no_such_column = 1"));
+    EXPECT_TRUE(rows.empty());
+    EXPECT_TRUE(ref->last_generation_read_stale());
+
+    EXPECT_EQ(ref->count_at(gen, "GenFaultPerson", std::string("no_such_column = 1")), -1);
+    EXPECT_TRUE(ref->last_generation_read_stale());
+
+    auto ids = ref->query_ids_at("GenFaultPerson", std::string("no_such_column = 1"));
+    EXPECT_TRUE(ids.empty());
+    EXPECT_TRUE(ref->last_generation_read_stale());
+
+    // Still alive: the fault did not kill the keeper or the process.
+    EXPECT_EQ(ref->count_at(gen, "GenFaultPerson"), 2);
+    EXPECT_FALSE(ref->last_generation_read_stale());
+    ref->release_read_generation(gen);
+
+    delete ref;
+}
+
+// Spec Commit 4 test: data_version changes on foreign-connection commit only —
+// it is read on the dedicated non-transaction xproc connection, so this
+// handle's own reads never move it, and any writer commit (a different
+// connection by construction) does.
+TEST(BridgeGeneration, DataVersionChangesOnForeignCommitOnly) {
+    TempDB tmp{"gen_data_version"};
+    lattice::SchemaVector schemas = {gen_person_schema("GenDvPerson")};
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+
+    const auto v1 = ref->data_version();
+    ASSERT_GT(v1, 0) << "data_version unavailable on a file DB";
+    EXPECT_EQ(ref->data_version(), v1) << "data_version moved with no commit";
+    (void)ref->objects("GenDvPerson");  // reads must not move it either
+    EXPECT_EQ(ref->data_version(), v1);
+
+    gen_insert_person(db, schemas, "DV", 1);  // write-connection commit
+    EXPECT_NE(ref->data_version(), v1)
+        << "foreign-connection commit did not move data_version";
+
+    delete ref;
+}
+
+// Commit 4 additive overload: changed_fields delivery. An INSERT batch
+// delivers EMPTY fields for its table (membership may change); a list append
+// flushes as an UPDATE-only parent batch carrying the list property name.
+TEST(BridgeGeneration, ChangedFieldsDeliveredThroughHookPayload) {
+    TempDB tmp{"gen_changed_fields"};
+    lattice::SchemaVector schemas = {
+        make_schema("CfOwner", {
+            {"name", text_prop("name")},
+            {"sigs", list_prop("sigs", "CfSig")},
+        }),
+        make_schema("CfSig", {
+            {"key", text_prop("key")},
+            {"val", int_prop("val")},
+        }),
+    };
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    db.db().execute("INSERT INTO CfOwner(globalId, name) VALUES('own-1', 'O')");
+
+    FieldsHookCapture cap;
+    auto token = ref->add_invalidation_hook_with_fields(
+        &cap,
+        [](void* ctx, const char* const* tables, const char* const* fields,
+           size_t count, int reason) {
+            if (reason != 0) return;  // commits only
+            auto* c = static_cast<FieldsHookCapture*>(ctx);
+            std::lock_guard<std::mutex> lock(c->m);
+            for (size_t i = 0; i < count; ++i) {
+                c->entries.emplace_back(tables[i], fields[i]);
+            }
+        });
+
+    // INSERT: fields for the inserted table must be EMPTY (must-invalidate).
+    auto sdo = make_sdo("CfSig", schemas[1].properties);
+    sdo.values["key"] = std::string("k1");
+    sdo.values["val"] = int64_t(1);
+    lattice::dynamic_object obj(sdo);
+    db.add(obj);
+    {
+        std::lock_guard<std::mutex> lock(cap.m);
+        bool saw_sig = false;
+        for (const auto& [table, fields] : cap.entries) {
+            if (table == "CfSig") {
+                saw_sig = true;
+                EXPECT_TRUE(fields.empty())
+                    << "INSERT batch delivered non-empty changed_fields: " << fields;
+            }
+        }
+        EXPECT_TRUE(saw_sig) << "hook never saw the CfSig insert";
+        cap.entries.clear();
+    }
+
+    // List append: flush translates the link-table write into a parent
+    // UPDATE whose changed_fields names the list property — an UPDATE-only
+    // batch for CfOwner, so the union ("sigs") is delivered.
+    auto owners = db.objects("CfOwner");
+    ASSERT_EQ(owners.size(), 1u);
+    auto field = owners[0].get_managed_field<std::vector<lattice::swift_dynamic_object*>>("sigs");
+    lattice::link_list list(field);
+    auto* obj_ref = lattice::dynamic_object_ref::wrap(obj);
+    list.push_back(*obj_ref);
+    delete obj_ref;
+    {
+        std::lock_guard<std::mutex> lock(cap.m);
+        bool delivered = false;
+        for (const auto& [table, fields] : cap.entries) {
+            if (table == "CfOwner" && fields == "sigs") delivered = true;
+        }
+        EXPECT_TRUE(delivered)
+            << "UPDATE-only parent batch did not deliver changed_fields 'sigs'";
+    }
+
+    ref->remove_invalidation_hook(token);
+    delete ref;
+}
+
 #endif // !__linux__

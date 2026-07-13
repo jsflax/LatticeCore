@@ -633,6 +633,18 @@ void synchronizer_base::maybe_checkpoint() {
             res = db().db().wal_checkpoint(false);
             LOG_DEBUG("synchronizer", "[%s] TRUNCATE checkpoint busy — PASSIVE fallback: log=%lld ckpt=%lld",
                       config_.sync_id.c_str(), (long long)res.log_frames, (long long)res.checkpointed);
+            // Results spec §3.3: the truncate was beaten by a held read
+            // snapshot (a keeper generation). Ask the coordinators to
+            // advance so facades re-pin at their next access and the NEXT
+            // cycle truncates behind them. Fanned per PATH through the
+            // instance registry — this synchronizer owns its OWN lattice_db
+            // instance (owned_db_), so a local-only signal would never
+            // reach the app handles that actually hold the keepers
+            // (adversarial-review finding #4). Note there is deliberately
+            // NO pre-gate on outstanding generations: TRUNCATE always
+            // attempts with its bounded budget and requests the advance
+            // only when actually beaten.
+            db().request_generation_advance();
         } else if (try_truncate) {
             LOG_INFO("synchronizer", "[%s] WAL TRUNCATE checkpoint: log=%lld ckpt=%lld",
                      config_.sync_id.c_str(), (long long)res.log_frames, (long long)res.checkpointed);
@@ -2434,6 +2446,17 @@ static void notify_observers(lattice_db& db,
         events.emplace_back("AuditLog", "UPDATE", row_id, gid, "");
     }
 
+    // Results spec §2.3: memory stores have no WAL hook, and the mark-synced
+    // UPDATE committed above never set the txn-dirty flag (the update hook
+    // ignores AuditLog UPDATEs), so the settled drain won't signal either —
+    // fire the synchronous invalidation hooks here so coordinators observe
+    // the commit (AuditLog-shaped results, e.g. sync-progress UIs, re-derive
+    // at the next access). File DBs already signalled from their WAL hook.
+    if (db.config().is_in_memory()) {
+        db.fire_invalidation_hooks({"AuditLog"},
+                                   lattice_db::invalidation_reason::commit);
+    }
+
     if (db.storage_shared_across_instances()) {
         // Shared storage (file DB or shared-cache memory DB): every same-name
         // handle can read the marked rows — fan out exactly like flush_changes.
@@ -2451,6 +2474,11 @@ static void notify_observers(lattice_db& db,
 void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& global_ids) {
     // Collect row IDs for observer notification after commit
     std::vector<std::pair<int64_t, std::string>> notify_list;
+
+    // Per-store write gate (results spec §4.1): on shared-cache stores this
+    // transaction must not interleave a sibling handle's generation capture
+    // (SQLITE_LOCKED both directions). No-op elsewhere.
+    lattice_db::store_write_gate_hold write_gate(db);
 
     // If we're already inside a transaction (e.g. called from receive_sync_data),
     // don't start a nested one — just do the work in the existing transaction.
@@ -2512,6 +2540,11 @@ void mark_audit_entries_synced_for(lattice_db& db,
     for (size_t i = 0; i < global_ids.size(); i += kChunkSize) {
         size_t end = std::min(i + kChunkSize, global_ids.size());
         int64_t chunk_max_entry_id = 0;
+
+        // Per-store write gate (results spec §4.1), held per chunk so
+        // sibling-handle captures can interleave between chunks — the same
+        // reason the transaction itself is chunked.
+        lattice_db::store_write_gate_hold write_gate(db);
 
         db.db().begin_transaction();
         try {
@@ -2790,6 +2823,14 @@ static std::vector<std::string> apply_remote_changes_impl(
 
     for (size_t chunk_start = 0; chunk_start < entries.size(); chunk_start += chunk_size) {
         size_t chunk_end = std::min(chunk_start + chunk_size, entries.size());
+
+        // Per-store write gate (results spec §4.1): a chunked sync apply on
+        // a shared-cache store is THE canonical writer that generation
+        // captures must never interleave (a capture's statement-scope table
+        // read locks fail the writer's in-transaction statements with
+        // SQLITE_LOCKED mid-chunk, and the capture fails immediately in the
+        // reverse direction). Held per chunk, matching the transaction.
+        lattice_db::store_write_gate_hold write_gate(db);
 
         try {
             db.db().begin_transaction();

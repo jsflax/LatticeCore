@@ -67,6 +67,22 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
 void lattice_db::setup_change_hook() {
     LOG_DEBUG("setup_change_hook", "Setting up hooks for path: %s", config_.path.c_str());
 
+    // Cache the page size for the WAL-threshold eviction check (results spec
+    // §3.4): the WAL hook receives the log's FRAME count and may not run SQL
+    // from its C frame, so bytes-per-frame must be known up front.
+    try {
+        auto rows = db_->query("PRAGMA page_size");
+        if (!rows.empty()) {
+            auto it = rows[0].find("page_size");
+            if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                auto ps = std::get<int64_t>(it->second);
+                if (ps > 0) wal_page_size_ = ps;
+            }
+        }
+    } catch (const db_error&) {
+        // keep the 4096 default
+    }
+
     // Update hook - buffers changes (called for each row change)
     sqlite3_update_hook(db_->handle(),
         [](void* user_data, int operation, const char* db_name, const char* table_name, sqlite3_int64 rowid) {
@@ -186,9 +202,34 @@ void lattice_db::setup_change_hook() {
 
     // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
     sqlite3_wal_hook(db_->handle(),
-        [](void* user_data, sqlite3*, const char*, int) -> int {
+        [](void* user_data, sqlite3*, const char*, int nframes) -> int {
             auto* self = static_cast<lattice_db*>(user_data);
-            self->flush_changes();
+
+            // WAL-threshold keeper eviction (results spec §3.4): nframes is
+            // the log's total frame count after this commit. Crossing the
+            // threshold sets the per-instance eviction flag — a single
+            // atomic store, legal in this C hook frame. Readers/maintenance
+            // aggregate the flag per path and open the coordinated reader
+            // gap (retire ALL same-path keepers, TRUNCATE-else-PASSIVE,
+            // re-pin) off this thread.
+            const int64_t threshold = self->wal_keeper_eviction_threshold_bytes_
+                                          .load(std::memory_order_relaxed);
+            if (threshold > 0 &&
+                static_cast<int64_t>(nframes) * self->wal_page_size_ > threshold) {
+                self->wal_eviction_pending_.store(true, std::memory_order_relaxed);
+            }
+
+            const bool delivered = self->flush_changes();
+            if (!delivered) {
+                // §2.3 epoch semantics: EVERY settled commit signals,
+                // observed tables or not — each commit grows the WAL that a
+                // keeper pins, including commits whose change buffer was
+                // empty (bookkeeping tables such as _lattice_sync_state,
+                // mark-synced AuditLog UPDATEs). The empty payload only
+                // means "no shape caches to drop"; the epoch bump — and the
+                // §3.4 advance the flag above requests — still delivers.
+                self->fire_invalidation_hooks({}, invalidation_reason::commit);
+            }
             return SQLITE_OK;
         },
         this
@@ -202,8 +243,21 @@ void lattice_db::setup_change_hook() {
     // flag. The rollback hook applies to ALL storage kinds — a rolled-back
     // transaction must discard its buffered rows, or the next flush delivers
     // them as phantoms.
-    db_->set_txn_hooks([this] { flush_changes(); },
-                       [this] { discard_change_buffer(); });
+    //
+    // The rollback path ALSO signals the invalidation hooks (results spec
+    // §2.3): a rolled-back transaction delivers no change batch by design,
+    // so without this signal a memory-family capture that raced the
+    // transaction could serve a poisoned id vector forever (§4.1) — the
+    // rollback bump guarantees the next access re-captures. Runs inside
+    // sqlite3_rollback_hook's C frame: hook bodies are atomics-only by
+    // contract, and every lock on this path (change_buffer_mutex_, the
+    // hook-list and registry mutexes) is a leaf lock never held across SQL.
+    db_->set_txn_hooks(
+        [this] { flush_changes(); },
+        [this] {
+            discard_change_buffer();
+            fire_invalidation_hooks({}, invalidation_reason::rollback);
+        });
 }
 void lattice_db::setup_cross_process_notifier() {
     // Use the shared per-path notifier from instance_registry.

@@ -2,6 +2,58 @@
 
 ## [Unreleased]
 
+### Added
+- **Live Results item A, Commit 3** (lattice repo
+  `docs/design-results-item-A-SPEC.md`; core only — bridged in Commit 4):
+  - **Synchronous invalidation hooks** (spec §2.3):
+    `lattice_db::add_invalidation_hook`/`remove_invalidation_hook` fire
+    inline on the writer's thread once per settled top-level transaction —
+    after the commit is durable, BEFORE the scheduler-dispatched
+    table-observer fan-out — fanned to every alive same-path instance via
+    the instance registry (sync-handle commits reach app-handle hooks
+    synchronously). Payload: changed table names + reason
+    (`commit`/`rollback`/`advance`). Rollbacks signal too (wired at the
+    `discard_change_buffer` rollback hook); empty-buffer commits
+    (bookkeeping-only transactions) signal with an empty payload — every
+    commit grows the WAL a keeper pins. Callback contract is normative:
+    atomics/leaf-locks only, no SQL, nothing that can throw.
+  - **Read-generation keeper pool** (spec §2.2/§2.5):
+    `acquire_read_generation`/`retain`/`release` pin a held read transaction
+    (`BEGIN` + pin SELECT) on a pooled dedicated read-only connection (cap
+    3, cache_size clamped to 2,000 pages); `query_at_generation` executes
+    reads at that MVCC snapshot and never throws (retired/interrupted reads
+    return nullopt → tolerant ladder). Memory-family stores (private
+    `:memory:`, named shared-cache) and Emscripten are refused keepers
+    (spec §4.1). Pool exhaustion force-retires the oldest generation.
+  - **WAL-retention policy** (spec §3): `run_read_pool_maintenance()` —
+    callable with no synchronizer — TTL-retires idle generations (30 s
+    default; "active reads" = in-flight statements), force-retires past an
+    absolute age cap, and executes pending threshold evictions. The WAL
+    hook's frame count arms a per-path eviction flag at
+    `wal_keeper_eviction_threshold_bytes` (16 MB default, tunable): ALL
+    same-path keepers force-retire (§3.4 protocol: retiring flag +
+    `sqlite3_interrupt` + bounded COMMIT retry) and one bounded
+    TRUNCATE-else-PASSIVE checkpoint runs in the reader gap.
+    `read_generations_outstanding()` aggregates per PATH across
+    `instance_registry::for_each_alive` (the synchronizer owns its own
+    `lattice_db` — consulting one instance would always read 0).
+  - **Pacer interplay** (spec §3.3): `maybe_checkpoint`'s TRUNCATE keeps its
+    attempt-with-budget + PASSIVE fallback (no outstanding-gate); when
+    beaten by a keeper it now issues `request_generation_advance()`,
+    delivered through the invalidation-hook path per path.
+  - **Per-store write gate** (spec §4.1): shared-cache memory stores publish
+    a per-path recursive gate (`instance_registry::write_gate`); lattice
+    write-transaction entry points (`begin_transaction`/`commit`/`rollback`,
+    `write`, `add`, `add_bulk`, `remove` cascade) and sync's chunked apply /
+    mark-synced paths hold it for the transaction, so generation captures
+    and cross-connection writes never overlap (no surfaced SQLITE_LOCKED in
+    either direction). File/isolated-`:memory:` stores: no-op.
+  - **Close ordering** (spec §4.6): `close()`/`~lattice_db` retire the pool
+    (COMMIT keeper txns, close pooled connections) before `db_`/`read_db_`
+    teardown; post-close generation reads return empty.
+  - `database::interrupt()` (sqlite3_interrupt wrapper) for the force-retire
+    protocol.
+
 ## [0.10.10] - 2026-07-12
 
 ### Added

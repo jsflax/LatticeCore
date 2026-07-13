@@ -91,6 +91,13 @@ public:
     /// Needed when another connection wrote and this connection's mmap'd WAL index is stale.
     void refresh_wal_snapshot();
 
+    /// Interrupt any in-flight statement on this connection
+    /// (sqlite3_interrupt). Safe to call from another thread. Used by the
+    /// read-generation force-retire protocol: SQLite refuses COMMIT while
+    /// statements are in progress, so a wedged in-flight read must be kicked
+    /// before the keeper transaction can close (results spec §3.4).
+    void interrupt();
+
     /// Result of a wal_checkpoint() call. rc is the PRAGMA's SQLite result
     /// code; busy is 1 when the checkpoint could not complete because a
     /// reader/writer held the WAL; log_frames/checkpointed mirror the PRAGMA

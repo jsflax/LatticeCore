@@ -655,6 +655,10 @@ void database::refresh_wal_snapshot() {
     sqlite3_exec(db_, "SELECT 1", nullptr, nullptr, nullptr);
 }
 
+void database::interrupt() {
+    if (db_) sqlite3_interrupt(db_);
+}
+
 database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_budget_ms) {
     checkpoint_result result;
 #ifdef __EMSCRIPTEN__

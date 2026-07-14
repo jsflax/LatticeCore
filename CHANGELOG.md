@@ -103,6 +103,51 @@
   - `database::interrupt()` (sqlite3_interrupt wrapper) for the force-retire
     protocol.
 
+### Fixed
+- **Item-A adversarial verification, CORE findings** (spec
+  `docs/design-results-item-A-SPEC.md` in the lattice repo):
+  - **Finding 1 (MAJOR — `query_at_generation` TOCTOU):** a reader that
+    passed the liveness check and bumped `in_flight` but was descheduled
+    before its statement started could be lapped by a force-retire
+    (pool-cap victim / max-age / retire-all / WAL eviction):
+    `sqlite3_interrupt` no-ops on a not-yet-started statement, the keeper
+    COMMITted, the connection was re-pooled, and a new acquire re-pinned
+    it — the delayed SELECT then ran at the WRONG snapshot with no error
+    and no stale sentinel. Two-sided fix: (a) `commit_and_pool` never pools
+    a connection whose generation still has `in_flight > 0` statements
+    (drops it — closing a connection is cheaper than a wrong-snapshot
+    read); (b) `query_at_generation` re-checks `retiring` after the
+    statement returns (`retiring` is set, release, under the pool lock
+    before every keeper COMMIT, so a wrong-snapshot read must observe it)
+    and yields nullopt → tolerant ladder. Pinned deterministically via a
+    new test seam (`test_hook_generation_query_gap_`) that widens the gap
+    between the in-flight bump and statement execution; new diagnostics
+    accessor `idle_read_pool_size()`.
+  - **Finding 2 (MAJOR — WAL eviction threshold never reached
+    synchronizer/IPC instances):** `wal_keeper_eviction_threshold_bytes_`
+    is read by each instance's OWN WAL hook, and the synchronizer owns its
+    OWN `lattice_db` per path — so sync-applied commits policed the default
+    forever. `set_wal_keeper_eviction_threshold_bytes` now fans out to
+    every alive same-path instance via `instance_registry::for_each_alive`
+    AND records a registry-level per-path value
+    (`instance_registry::set_wal_eviction_threshold_for_path` /
+    `wal_eviction_threshold_for_path`) that new instances adopt at open
+    (after registration). Isolated `:memory:` stores stay instance-local
+    (they share the literal registry key without sharing storage).
+  - **Finding 3 (MINOR — spec §3.2's second enforcement caller dropped):**
+    the sync pacer now runs read-pool maintenance each cycle at the
+    `maybe_checkpoint` cadence via new
+    `lattice_db::run_read_pool_maintenance_all_instances()`, aggregated
+    per path like the TRUNCATE gate — the keepers live on the app handles,
+    not the synchronizer's own instance.
+  - Tests: `ReadGeneration.ForceRetireRaceNeverServesWrongSnapshot`
+    (deterministic TOCTOU pin; verified to fail with either fix half
+    reverted), `ReadGeneration.QuiescentRetirePoolsConnection` (no pooling
+    regression), `ReadGeneration.WalEvictionThresholdPropagatesAcrossSamePathInstances`,
+    `ReadGeneration.WalEvictionThresholdIsolatedMemoryStaysLocal`,
+    `Sync.PacerRunsReadPoolMaintenancePerPath` (verified to fail without
+    the pacer call).
+
 ## [0.10.10] - 2026-07-12
 
 ### Added

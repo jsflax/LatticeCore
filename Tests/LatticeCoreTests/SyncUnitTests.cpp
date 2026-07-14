@@ -1248,6 +1248,57 @@ TEST(Sync, PacerDrivenTruncateWhenIdle) {
     sync.disconnect();
 }
 
+// Results spec §3.2 second enforcement caller (item-A adversarial finding 3):
+// the sync pacer runs read-pool maintenance at its maybe_checkpoint cadence,
+// aggregated per PATH — the keepers live on the APP handles, not on the
+// synchronizer's own lattice_db instance, so a local-only call would police
+// nothing. Pinned minimally: an idle keeper on a same-path app handle (tiny
+// TTL) must be TTL-retired by the pacer alone — no manual
+// run_read_pool_maintenance call anywhere.
+TEST(Sync, PacerRunsReadPoolMaintenancePerPath) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"pacermaint"};
+    // App-side handle: owns the keeper the pacer must police.
+    lattice::lattice_db app{lattice::configuration(tmp.str())};
+    app.add(TestPerson{"x", 1, std::nullopt});
+    app.set_read_generation_ttl_ms(50);
+
+    auto gen = app.acquire_read_generation();
+    ASSERT_NE(gen, 0u);
+    (void)app.query_at_generation(gen, "SELECT 1 AS one");
+    ASSERT_EQ(app.local_read_generations_outstanding(), 1u);
+
+    // Synchronizer topology: its OWN lattice_db on the same path; the pacer
+    // heartbeat doubles as the maintenance cadence. No connect() needed —
+    // the pacer starts with the synchronizer.
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "maint-sync";
+    cfg.all_active_sync_ids = {"maint-sync"};
+    cfg.upload_coalesce_ms = 50;
+    cfg.checkpoint_passive_interval_ms = 100;
+    lattice::synchronizer sync(
+        std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())), cfg);
+
+    // Within a few heartbeats the pacer's per-path maintenance must
+    // TTL-retire the APP instance's idle generation.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (app.local_read_generations_outstanding() != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(app.local_read_generations_outstanding(), 0u)
+        << "the pacer never ran per-path read-pool maintenance";
+    EXPECT_FALSE(app.query_at_generation(gen, "SELECT 1 AS one").has_value())
+        << "the TTL-retired generation must refuse reads";
+    app.release_read_generation(gen);  // late release: no-op
+
+    sync.disconnect();
+}
+
 // ----------------------------------------------------------------------------
 // Upload floor: incremental cursor — bounded scans, at-least-once preserved
 // ----------------------------------------------------------------------------

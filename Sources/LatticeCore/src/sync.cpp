@@ -686,6 +686,16 @@ void synchronizer_base::start_pacer() {
             // inside the update hook, pacer in sqlite3LockAndPrepare).
             lock.unlock();
             maybe_checkpoint();
+            // Results spec §3.2 second enforcement caller (item-A
+            // adversarial finding 3): read-pool maintenance at the
+            // maybe_checkpoint cadence, aggregated per PATH — the keepers
+            // live on the app handles, not this synchronizer's own
+            // lattice_db instance, so a local-only call would police
+            // nothing (same instance scoping as the §3.3 TRUNCATE gate).
+            // Runs with pacer_mutex_ RELEASED: maintenance COMMITs keeper
+            // transactions and may attempt a checkpoint — connection work
+            // under pacer_mutex_ is the ABBA hang documented above.
+            db().run_read_pool_maintenance_all_instances();
             lock.lock();
             if (pacer_stop_) return;
             if (!upload_requested_.load(std::memory_order_acquire)) continue;

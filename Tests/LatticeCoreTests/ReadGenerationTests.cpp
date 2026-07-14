@@ -1,6 +1,7 @@
 #include "TestHelpers.hpp"
 #include <lattice/sync.hpp>
 #include <filesystem>
+#include <future>
 #include <optional>
 
 // ============================================================================
@@ -458,6 +459,104 @@ TEST(ReadGeneration, ForceRetireInterruptsInFlightStatement) {
     db.release_read_generation(fresh);
 }
 
+// Item-A adversarial finding 1 (query_at_generation TOCTOU), pinned
+// deterministically via the test seam: a reader passes the liveness check
+// and bumps in_flight, then stalls BEFORE its statement starts. A concurrent
+// force-retire interrupts (a no-op — sqlite3_interrupt does not affect
+// statements that start after it returns), COMMITs, and — pre-fix — pooled
+// the connection, where the next acquire re-pinned it; the delayed SELECT
+// then ran at the WRONG snapshot with no error and no stale sentinel. The
+// fix is two-sided: (a) commit_and_pool refuses to pool while in_flight > 0
+// (drops the connection instead), and (b) query_at_generation re-checks
+// `retiring` after the statement returns — retiring is set before the
+// COMMIT under the pool lock, so any wrong-snapshot read must observe it
+// and yield nullopt (tolerant ladder).
+TEST(ReadGeneration, ForceRetireRaceNeverServesWrongSnapshot) {
+    TempDB tmp("gen_toctou");
+    lattice_db db{configuration(tmp.str())};
+    for (int i = 0; i < 5; ++i) db.add(TestPerson{"p" + std::to_string(i), i, std::nullopt});
+
+    auto gen = db.acquire_read_generation();
+    ASSERT_NE(gen, 0u);
+    EXPECT_EQ(count_people_at(db, gen), 5);
+
+    std::promise<void> reader_in_gap;
+    std::promise<void> resume_reader;
+    auto resume_future = resume_reader.get_future().share();
+    std::atomic<bool> gap_used{false};
+    // Fires exactly once (the delayed reader); later generation reads in
+    // this test pass straight through.
+    db.test_hook_generation_query_gap_ = [&] {
+        if (!gap_used.exchange(true)) {
+            reader_in_gap.set_value();
+            resume_future.wait();
+        }
+    };
+
+    std::optional<std::vector<lattice::database::row_t>> result;
+    std::thread reader([&] {
+        result = db.query_at_generation(gen, "SELECT COUNT(*) AS c FROM TestPerson");
+    });
+    // Reader has passed the liveness check and bumped in_flight; its
+    // statement has NOT started.
+    reader_in_gap.get_future().wait();
+
+    // Force-retire while the reader is stalled in the gap: the interrupt
+    // no-ops, the COMMIT succeeds immediately.
+    db.retire_all_read_generations();
+    EXPECT_EQ(db.local_read_generations_outstanding(), 0u);
+    // (a) the keeper must NOT be pooled with the reader still in flight — a
+    // re-acquire would otherwise re-pin it underneath the delayed statement.
+    EXPECT_EQ(db.idle_read_pool_size(), 0u)
+        << "connection with an in-flight reader must be dropped, not pooled";
+
+    // Advance head state so a wrong-snapshot read is detectable, and re-pin
+    // a successor generation (pre-fix, this adopted the reader's connection
+    // out of the pool and BEGAN a new transaction on it).
+    db.add(TestPerson{"late", 99, std::nullopt});
+    auto successor = db.acquire_read_generation();
+    ASSERT_NE(successor, 0u);
+
+    resume_reader.set_value();
+    reader.join();
+
+    // (b) the delayed read ran post-COMMIT — head state, not gen's snapshot.
+    // It must surface as nullopt (re-resolve via the tolerant ladder), never
+    // as wrong-snapshot rows attributed to the retired generation.
+    EXPECT_FALSE(result.has_value())
+        << "wrong-snapshot read leaked through a force-retire";
+
+    EXPECT_EQ(count_people_at(db, successor), 6)
+        << "the successor generation reads the post-commit state";
+    db.release_read_generation(successor);
+    db.test_hook_generation_query_gap_ = nullptr;
+}
+
+// The finding-1 fix must not regress steady-state pooling: a QUIESCENT
+// retire (no in-flight statements) still returns the keeper to the idle
+// pool, and the next acquisition reuses it — no open/close churn (§2.5).
+TEST(ReadGeneration, QuiescentRetirePoolsConnection) {
+    TempDB tmp("gen_pool_reuse");
+    lattice_db db{configuration(tmp.str())};
+    db.add(TestPerson{"x", 1, std::nullopt});
+
+    auto gen = db.acquire_read_generation();
+    ASSERT_NE(gen, 0u);
+    EXPECT_TRUE(db.query_at_generation(gen, "SELECT 1 AS one").has_value());
+    EXPECT_EQ(db.idle_read_pool_size(), 0u);
+
+    db.release_read_generation(gen);
+    EXPECT_EQ(db.idle_read_pool_size(), 1u)
+        << "a quiescent retire must pool the keeper connection";
+
+    auto next = db.acquire_read_generation();
+    ASSERT_NE(next, 0u);
+    EXPECT_EQ(db.idle_read_pool_size(), 0u)
+        << "the next acquisition must reuse the pooled connection";
+    EXPECT_TRUE(db.query_at_generation(next, "SELECT 1 AS one").has_value());
+    db.release_read_generation(next);
+}
+
 // §3.4 hard bound: under a synthetic write burst with a keeper treadmill
 // (always a live generation, re-pinned after every eviction — the regime
 // where the log can otherwise NEVER rewind), the WAL stays a sawtooth
@@ -540,6 +639,67 @@ TEST(ReadGeneration, CrossInstancePolicingAggregatesAndAdvances) {
     EXPECT_EQ(pacer_side.read_generations_outstanding(), 0u);
     res = pacer_side.db().wal_checkpoint(/*truncate=*/true, /*busy_budget_ms=*/250);
     EXPECT_EQ(res.busy, 0) << "TRUNCATE must succeed once the keeper released";
+}
+
+// Item-A adversarial finding 2: the WAL-threshold is consumed by each
+// instance's OWN WAL hook, and the commits that grow the WAL fastest arrive
+// through OTHER same-path instances (the synchronizer's dedicated
+// lattice_db applying sync chunks, IPC instances, second app handles) — so
+// the setter must fan out per path, and instances opened later must adopt
+// the per-path value. Pinned exactly as specified: set on instance A, write
+// through same-path instance B, B's wal_eviction_pending flips at A's
+// threshold.
+TEST(ReadGeneration, WalEvictionThresholdPropagatesAcrossSamePathInstances) {
+    TempDB tmp("gen_thresh_prop");
+    lattice_db a{configuration(tmp.str())};  // "app" handle: receives the setting
+    lattice_db b{configuration(tmp.str())};  // pre-existing sibling (sync topology)
+
+    const int64_t threshold = 64 * 1024;
+    a.set_wal_keeper_eviction_threshold_bytes(threshold);
+    EXPECT_EQ(b.wal_keeper_eviction_threshold_bytes(), threshold)
+        << "the setter must fan out to alive same-path instances";
+
+    lattice_db c{configuration(tmp.str())};  // opened AFTER the set
+    EXPECT_EQ(c.wal_keeper_eviction_threshold_bytes(), threshold)
+        << "instances opened later must adopt the per-path value";
+
+    // Keeper on A pins the log so it can only grow; commits through B must
+    // trip B's OWN WAL hook at A's threshold.
+    auto gen = a.acquire_read_generation();
+    ASSERT_NE(gen, 0u);
+    const std::string payload(4096, 'x');
+    for (int i = 0; i < 64 && !b.wal_eviction_pending(); ++i) {
+        b.add(TestPerson{payload, i, std::nullopt});
+    }
+    EXPECT_TRUE(b.wal_eviction_pending())
+        << "commits through a sibling instance must trip the propagated threshold";
+
+    // The pending eviction is serviced per path from any instance's
+    // maintenance: keepers retire, the gap truncates, ALL flags clear.
+    a.release_read_generation(gen);
+    a.run_read_pool_maintenance();
+    EXPECT_FALSE(b.wal_eviction_pending());
+    EXPECT_LE(wal_file_size(tmp), threshold)
+        << "the coordinated reader gap must rewind/truncate the log";
+}
+
+// Isolated `:memory:` instances share the literal ":memory:" registry key
+// WITHOUT sharing storage — per-path fan-out must not leak tunables between
+// them (they have no WAL either way; this guards the registry keying).
+TEST(ReadGeneration, WalEvictionThresholdIsolatedMemoryStaysLocal) {
+    lattice_db mem_a;
+    lattice_db mem_b;
+    const auto default_threshold = mem_b.wal_keeper_eviction_threshold_bytes();
+    ASSERT_NE(default_threshold, 123);
+
+    mem_a.set_wal_keeper_eviction_threshold_bytes(123);
+    EXPECT_EQ(mem_a.wal_keeper_eviction_threshold_bytes(), 123);
+    EXPECT_EQ(mem_b.wal_keeper_eviction_threshold_bytes(), default_threshold)
+        << "isolated :memory: instances must not leak tunables through the shared registry key";
+
+    lattice_db mem_c;
+    EXPECT_EQ(mem_c.wal_keeper_eviction_threshold_bytes(), default_threshold)
+        << "isolated :memory: instances must not adopt another store's tunables at open";
 }
 
 // Close ordering (§4.6): generations retire before connection teardown;

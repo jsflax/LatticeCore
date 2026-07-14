@@ -203,6 +203,27 @@ public:
         return gate;
     }
 
+    /// Per-path WAL keeper-eviction threshold (results spec §3.4; item-A
+    /// adversarial finding 2). The threshold is read by each instance's OWN
+    /// WAL hook — and the synchronizer/IPC agents own their OWN lattice_db
+    /// per path — so a per-instance setter alone would leave the instances
+    /// that apply sync chunks at the default forever.
+    /// lattice_db::set_wal_keeper_eviction_threshold_bytes fans out to every
+    /// alive same-path instance AND records the value here so instances
+    /// opened LATER adopt it at registration. Entries are never erased
+    /// (leaked with the singleton, like write_gates_): a reopened path keeps
+    /// the last-set policy until the owner sets it again.
+    void set_wal_eviction_threshold_for_path(const std::string& path, int64_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wal_eviction_thresholds_[path] = bytes;
+    }
+    std::optional<int64_t> wal_eviction_threshold_for_path(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = wal_eviction_thresholds_.find(path);
+        if (it == wal_eviction_thresholds_.end()) return std::nullopt;
+        return it->second;
+    }
+
 private:
     instance_registry() = default;
 
@@ -222,6 +243,8 @@ private:
     std::map<std::string, std::unique_ptr<cross_process_notifier>> shared_notifiers_;
     /// Per-path shared-cache write gates (see write_gate above).
     std::map<std::string, std::shared_ptr<std::recursive_timed_mutex>> write_gates_;
+    /// Per-path WAL eviction thresholds (see the accessors above).
+    std::map<std::string, int64_t> wal_eviction_thresholds_;
 };
 
 // ============================================================================
@@ -801,6 +824,7 @@ public:
         ensure_tables();
         setup_change_hook();
         instance_registry::instance().register_instance(config_.path, this, guard_);
+        adopt_path_wal_eviction_threshold();
         setup_cross_process_notifier();
     }
 
@@ -814,6 +838,7 @@ public:
         ensure_tables();
         setup_change_hook();
         instance_registry::instance().register_instance(config_.path, this, guard_);
+        adopt_path_wal_eviction_threshold();
         setup_cross_process_notifier();
     }
 
@@ -873,6 +898,7 @@ public:
         }
         LOG_DEBUG("lattice_db", "register_instance");
         instance_registry::instance().register_instance(config_.path, this, guard_);
+        adopt_path_wal_eviction_threshold();
         LOG_DEBUG("lattice_db", "setup_cross_process_notifier");
         setup_cross_process_notifier();
         LOG_DEBUG("lattice_db", "ctor done");
@@ -2402,7 +2428,7 @@ public:
                 if ((*it)->id == generation_id) {
                     if (--(*it)->refcount <= 0) {
                         to_retire = *it;
-                        to_retire->retiring.store(true, std::memory_order_relaxed);
+                        to_retire->retiring.store(true, std::memory_order_release);
                         live_generations_.erase(it);
                     }
                     break;
@@ -2416,9 +2442,10 @@ public:
     /// connection (one MVCC snapshot for the generation's lifetime).
     /// Returns nullopt when the generation is no longer live — retired,
     /// retiring (§3.4: liveness is re-validated under the pool lock before
-    /// EVERY statement), unknown, or the read lost the race with a
-    /// force-retire (interrupted mid-statement). Callers re-resolve and
-    /// serve through the tolerant ladder; no exception escapes.
+    /// EVERY statement AND re-checked after it returns), unknown, or the
+    /// read lost the race with a force-retire (interrupted mid-statement).
+    /// Callers re-resolve and serve through the tolerant ladder; no
+    /// exception escapes.
     /// Commit 4 builds the bridge's objects_at/count_at/query_ids_at on
     /// top of this primitive (same SQL builders, keeper-routed).
     std::optional<std::vector<database::row_t>> query_at_generation(
@@ -2447,8 +2474,22 @@ public:
                 gen->in_flight.fetch_sub(1, std::memory_order_acq_rel);
             }
         } release{gen.get()};
+        if (test_hook_generation_query_gap_) test_hook_generation_query_gap_();
         try {
-            return gen->conn->query(sql, params);
+            auto rows = gen->conn->query(sql, params);
+            // TOCTOU re-check (item-A adversarial finding 1): a force-retire
+            // that began AFTER the liveness check above sets `retiring`
+            // (release, under the pool lock) BEFORE its COMMIT. If this
+            // statement was delayed past that COMMIT — sqlite3_interrupt
+            // no-ops on a statement that has not started — it executed at
+            // the WRONG snapshot (post-COMMIT autocommit head state, or a
+            // successor generation's transaction) with no error. Any such
+            // read must observe the flag here and be discarded. The
+            // conservative cost — dropping a right-snapshot read that merely
+            // raced the flag mid-statement — is the §1.2 rung-1 carve-out:
+            // the caller re-resolves through the tolerant ladder.
+            if (gen->retiring.load(std::memory_order_acquire)) return std::nullopt;
+            return rows;
         } catch (const db_error&) {
             // Interrupted by a force-retire, or the store went away.
             return std::nullopt;
@@ -2504,7 +2545,7 @@ public:
                 const bool ttl_expired = ttl_ms > 0 && idle && idle_ms >= ttl_ms;
                 const bool over_age = max_age_ms > 0 && age_ms >= max_age_ms;
                 if (ttl_expired || over_age) {
-                    gen->retiring.store(true, std::memory_order_relaxed);
+                    gen->retiring.store(true, std::memory_order_release);
                     to_retire.push_back(gen);
                     it = live_generations_.erase(it);
                 } else {
@@ -2514,6 +2555,24 @@ public:
         }
         for (auto& gen : to_retire) commit_and_pool(gen, /*force=*/true);
         run_pending_wal_eviction_if_any();
+    }
+
+    /// Spec §3.2's SECOND enforcement caller (item-A adversarial finding 3):
+    /// run read-pool maintenance on EVERY alive same-path instance. The sync
+    /// pacer calls this at its maybe_checkpoint cadence — the keepers live
+    /// on the app handles, not on the synchronizer's own lattice_db, so a
+    /// local-only call would maintain nothing (the same per-path aggregation
+    /// the §3.3 TRUNCATE gate uses). The Swift coordinator's maintenance
+    /// timer remains the actor of record; this is belt coverage for sync
+    /// lattices. Runs SQL (keeper COMMITs, checkpoint attempts): never call
+    /// under a lock or from a hook frame.
+    void run_read_pool_maintenance_all_instances() {
+        if (storage_shared_across_instances()) {
+            instance_registry::instance().for_each_alive(config_.path,
+                [](lattice_db* inst) { inst->run_read_pool_maintenance(); });
+        } else {
+            run_read_pool_maintenance();
+        }
     }
 
     /// Force-retire every live generation on this instance (§3.4 protocol:
@@ -2527,7 +2586,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(read_pool_mutex_);
             for (auto& gen : live_generations_) {
-                gen->retiring.store(true, std::memory_order_relaxed);
+                gen->retiring.store(true, std::memory_order_release);
             }
             gens.swap(live_generations_);
         }
@@ -2553,8 +2612,27 @@ public:
     /// WAL size at which ALL keepers on ALL same-path instances are
     /// force-retired to open a reader gap so the log can rewind/truncate
     /// (spec §3.4 — the hard WAL bound). Default 16 MB; <= 0 disables.
+    ///
+    /// PER-PATH propagation (item-A adversarial finding 2): the threshold is
+    /// consumed by each instance's OWN WAL hook, and the writes that grow
+    /// the WAL fastest arrive through OTHER same-path instances — the
+    /// synchronizer's dedicated lattice_db applying sync chunks, IPC
+    /// instances, second app handles. Setting only this instance's atomic
+    /// would leave those hooks at the default forever. The setter therefore
+    /// fans out to every alive same-path instance and records the value at
+    /// the registry so instances opened later adopt it (mirrors the §3.3
+    /// per-path aggregation of read_generations_outstanding). Isolated
+    /// `:memory:` stores stay instance-local — they share the literal
+    /// ":memory:" registry key without sharing storage (and have no WAL).
     void set_wal_keeper_eviction_threshold_bytes(int64_t bytes) {
         wal_keeper_eviction_threshold_bytes_.store(bytes, std::memory_order_relaxed);
+        if (!storage_shared_across_instances()) return;
+        instance_registry::instance().set_wal_eviction_threshold_for_path(config_.path, bytes);
+        instance_registry::instance().for_each_alive(config_.path,
+            [bytes](lattice_db* inst) {
+                inst->wal_keeper_eviction_threshold_bytes_.store(bytes,
+                                                                 std::memory_order_relaxed);
+            });
     }
     int64_t wal_keeper_eviction_threshold_bytes() const {
         return wal_keeper_eviction_threshold_bytes_.load(std::memory_order_relaxed);
@@ -2565,6 +2643,19 @@ public:
     bool wal_eviction_pending() const {
         return wal_eviction_pending_.load(std::memory_order_relaxed);
     }
+
+    /// Diagnostics/tests: keeper connections parked in the idle pool.
+    size_t idle_read_pool_size() {
+        std::lock_guard<std::mutex> lock(read_pool_mutex_);
+        return idle_read_pool_.size();
+    }
+
+    /// TEST SEAM (item-A adversarial finding 1): when set, invoked in
+    /// query_at_generation between the in-flight bump and statement
+    /// execution — lets tests widen the force-retire TOCTOU window
+    /// deterministically. Assign only before spawning reader threads (the
+    /// member is read unsynchronized); never set in production.
+    std::function<void()> test_hook_generation_query_gap_;
 
     // ========================================================================
     // Per-store write gate — Live Results item A, spec §4.1 mechanism 2
@@ -2618,6 +2709,9 @@ private:
         std::shared_ptr<database> conn;   // keeper: holds the open read txn
         int refcount = 1;                 // guarded by read_pool_mutex_
         std::atomic<int> in_flight{0};    // statements executing right now
+        /// Set (release, under read_pool_mutex_) on EVERY retire path
+        /// before the keeper COMMIT; re-checked (acquire) after each
+        /// generation statement returns — the finding-1 TOCTOU belt.
         std::atomic<bool> retiring{false};
         std::chrono::steady_clock::time_point pinned_at{};
         std::atomic<int64_t> last_read_steady_ms{0};
@@ -2665,11 +2759,25 @@ private:
         }
         if (committed && !conn->is_closed()) {
             std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            // NEVER pool while the generation still has in-flight statements
+            // (item-A adversarial finding 1): a delayed reader — liveness
+            // checked and in_flight bumped, then descheduled before its
+            // statement started, so the force-retire's interrupt no-opped —
+            // could otherwise execute inside a SUCCESSOR generation's
+            // transaction after a re-acquire re-pins this connection: a
+            // wrong-snapshot read with no error and no stale sentinel.
+            // Dropping the connection is cheaper than a wrong-snapshot read.
+            // The 0-read is final: every retire path erased this generation
+            // from live_generations_ under the pool lock before reaching
+            // here, and in_flight only grows in query_at_generation's
+            // find-under-lock — so it can only fall from now on.
+            //
             // Duplicate guard: concurrent release/force-retire of the same
             // generation can both reach here (retire is idempotent); pooling
             // one connection twice would hand two future generations the
             // same handle.
-            if (idle_read_pool_.size() + live_generations_.size() < read_pool_capacity_ &&
+            if (gen->in_flight.load(std::memory_order_acquire) == 0 &&
+                idle_read_pool_.size() + live_generations_.size() < read_pool_capacity_ &&
                 std::find(idle_read_pool_.begin(), idle_read_pool_.end(), conn) ==
                     idle_read_pool_.end()) {
                 idle_read_pool_.push_back(conn);
@@ -2683,7 +2791,7 @@ private:
     void force_retire_generation(const std::shared_ptr<read_generation>& gen) {
         {
             std::lock_guard<std::mutex> lock(read_pool_mutex_);
-            gen->retiring.store(true, std::memory_order_relaxed);
+            gen->retiring.store(true, std::memory_order_release);
             live_generations_.erase(
                 std::remove(live_generations_.begin(), live_generations_.end(), gen),
                 live_generations_.end());
@@ -2728,6 +2836,20 @@ private:
         store_write_gate_ = (config_.is_in_memory() && storage_shared_across_instances())
             ? instance_registry::instance().write_gate(config_.path)
             : nullptr;
+    }
+
+    /// Adopt the registry's per-path WAL eviction threshold at open (item-A
+    /// adversarial finding 2): a synchronizer/IPC instance created AFTER the
+    /// app handle configured the store must not run its WAL hook at the
+    /// default. Called after register_instance — a concurrent setter then
+    /// either sees this instance in its fan-out or has already published the
+    /// registry value read here; either way the latest set wins.
+    void adopt_path_wal_eviction_threshold() {
+        if (!storage_shared_across_instances()) return;
+        if (auto bytes = instance_registry::instance()
+                             .wal_eviction_threshold_for_path(config_.path)) {
+            wal_keeper_eviction_threshold_bytes_.store(*bytes, std::memory_order_relaxed);
+        }
     }
 
     static std::unordered_map<const lattice_db*, int>& tls_store_gate_depths() {

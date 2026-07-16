@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.10.11] - 2026-07-16
+
+### Added
+- **Item-A core machinery (additive)**: synchronous invalidation hooks
+  (commit/rollback/advance, fired post-commit on the writer thread via the
+  transaction-settled drain), the read-generation keeper pool (held-read-txn
+  MVCC generations on pooled read-only connections; max 3, TTL + WAL-threshold
+  + lifecycle retirement, force-retire protocol), per-path WAL-threshold
+  propagation, pacer-driven read-pool maintenance, and the bridge surface for
+  all of it (generation-scoped reads, changed-fields hook variant, data_version,
+  exception containment throughout). Consumed by lattice 1.0's Results
+  redesign; no existing API changed.
+
+### Fixed
+- Generation-read TOCTOU: a read racing a force-retire could serve rows from
+  the WRONG snapshot with no error — reads now re-validate retirement after
+  the statement and retired keepers with in-flight reads are never re-pooled.
+
 ### Added
 - **Live Results item A, Commit 4** (lattice repo
   `docs/design-results-item-A-SPEC.md`; bridge — consumed by the lattice

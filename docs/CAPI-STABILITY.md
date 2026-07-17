@@ -62,12 +62,12 @@ bridge (`LatticeSwiftCppBridge`) and core (`LatticeCore`) headers is
   files must agree on it (see the epoch notes in the core header).
 - `lattice_capi_has_feature(name)` — capability probe; returns `false` for
   unknown names so bindings can probe features that do not exist yet.
-  - **True today:** `attach`, `cross_process_observation`, `fts`,
-    `geo_query`, `ipc`, `knn`, `migration`, `observation`, `rollback`,
-    `sync`, `sync_filter`, `transactions`.
-  - **Reserved (false until the feature lands):** `checkpoint`, `detach`,
-    `read_generations`, `row_cache`, `statement_counters`, `sync_progress`,
-    `sync_tuning`, `to_json`, `unified_open`.
+  - **True today:** `attach`, `checkpoint`, `cross_process_observation`,
+    `detach`, `fts`, `geo_query`, `ipc`, `knn`, `migration`, `observation`,
+    `rollback`, `row_cache`, `statement_counters`, `sync`, `sync_filter`,
+    `sync_progress`, `sync_tuning`, `transactions`.
+  - **Reserved (false until the feature lands):** `read_generations`,
+    `to_json`, `unified_open`.
   - A feature string is added in the same commit as its functions and is
     never removed once shipped.
 
@@ -103,6 +103,12 @@ The planned C-ABI CI leg additionally diffs this file against `nm` of the
 built **shared** library (the true export surface, which will matter once
 hidden visibility lands); until then the source-level test above is the
 gate.
+
+Behavioral coverage lives in `Tests/LatticeCAPITests` — a GoogleTest
+executable that LINKS the C surface and exercises it exactly as a
+Kotlin/Python binding would (`swift run LatticeCAPITests`; macOS-only under
+SwiftPM because the C API library's SwiftPM build is broken on Linux —
+`docs/capi-gap-audit.md` V1 — and built everywhere under CMake).
 
 ## Known frozen-in quirks (documented, not fixable in-place)
 

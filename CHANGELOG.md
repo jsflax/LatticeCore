@@ -3,6 +3,64 @@
 ## [Unreleased]
 
 ### Added
+- **C1 slice 2 — C-ABI sync surface + feature functions** (plan WS-C;
+  `docs/capi-gap-audit.md` A-8/9/10, A-15, A-22..A-30, A-32):
+  - **Sync options** (audit A-22): size-prefixed `lattice_sync_options_t`
+    (`struct_size` first member, impl reads `min(caller_size, sizeof)`)
+    carrying the 9 sync-tuning knobs + `sync_filter_json`;
+    `lattice_sync_options_init()` fills "keep the library default"
+    sentinels; `lattice_db_create_with_sync_options(...)` =
+    `lattice_db_create_with_sync` + trailing options pointer (the old
+    positional creator stays as-is per the additive policy). Knobs wire
+    through `configuration::sync_tuning` via the bridge setters, so
+    nonsensical values are ignored identically. `sync_id` field is
+    RESERVED (must be NULL — fails loudly, so a future override can't be
+    silently dropped by older libraries).
+  - **Sync progress + observers** (A-22..A-28): size-prefixed
+    `lattice_sync_progress_t` + `lattice_db_get_sync_progress` (zeroed on
+    a sync-less db); `lattice_db_observe_sync_progress` /
+    `lattice_db_observe_sync_state` / `lattice_db_observe_sync_error`
+    (context + fn-pointer + destroy pattern, token-returning,
+    multi-observer fan-out over the bridge's single callback slot, keyed
+    by the underlying instance so cached-instance-sharing handles don't
+    clobber each other) + `lattice_db_remove_sync_observer`;
+    `lattice_db_close` tears observers down and fires their destroys.
+  - **Attach completion** (A-29/30): `lattice_db_detach` (idempotent,
+    same bool + reason contract as attach) and
+    `lattice_db_last_attach_error` (thread-local copy of the core's
+    mutex-guarded accessor).
+  - **Feature functions**: row cache on objects
+    (`lattice_object_enable/disable/refresh_row_cache`,
+    `lattice_object_is_row_cache_enabled`; per-object receiver — A-8),
+    `lattice_object_increment_int` (SQL-side atomic increment — A-9),
+    `lattice_db_total_statement_count` / `lattice_db_thread_statement_count`
+    (A-10), `lattice_db_checkpoint(db, mode)` (0=passive, 1=truncate —
+    A-15), `lattice_db_read_upload_floor(db, sync_id)` (A-32; sync-id
+    derivation documented in the header).
+  - Feature strings flipped true: `checkpoint`, `detach`, `row_cache`,
+    `statement_counters`, `sync_progress`, `sync_tuning` (still reserved:
+    `read_generations`, `to_json`, `unified_open`). Symbols file
+    regenerated (99 → 117 exports).
+  - **Tests/LatticeCAPITests**: new gtest target that LINKS the C surface
+    (SwiftPM: macOS-only executable, so the Linux `swift run
+    LatticeCoreTests` closure never grows the C API library —
+    `docs/capi-gap-audit.md` V1; CMake: built everywhere). Behavioral
+    coverage for every slice-2 addition plus slice-1 pins: the
+    formerly-phantom cross-process observers fire for sibling-instance
+    writes, and `receive_sync_data` per-entry isolation.
+
+### Fixed
+- `apply_remote_changes` per-entry isolation now covers the WHOLE entry
+  apply, not just the instruction execute: an entry naming an unknown
+  table (schema drift) threw out of the pre-apply row lookup and aborted
+  the whole batch — and entries applied in earlier committed chunks were
+  never reported to the caller (the audit's B-2 "applied but unreported"
+  pathology recurring at chunk granularity). Failing entries are now
+  skipped (not acked; the sender re-sends) while the rest of the batch
+  applies. Surfaced by the new C-level
+  `CAPIReceiveSyncData.PerEntryErrorIsolation` test.
+
+### Added
 - **C1 slice 1 — C-ABI foundation** (plan WS-C; `docs/capi-gap-audit.md`):
   - Versioning/introspection on the C ABI: `lattice_capi_version()`,
     `lattice_capi_version_string()`, `lattice_schema_format_epoch()`,

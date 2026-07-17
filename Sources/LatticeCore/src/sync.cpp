@@ -2851,164 +2851,180 @@ static std::vector<std::string> apply_remote_changes_impl(
             for (size_t i = chunk_start; i < chunk_end; ++i) {
                 const auto& entry = entries[i];
 
-                // Re-check inside transaction (entry may have been inserted concurrently)
-                auto existing = db.db().query(
-                    "SELECT id FROM AuditLog WHERE globalId = ?",
-                    {entry.global_id}
-                );
-                if (!existing.empty()) {
-                    applied_ids.push_back(entry.global_id);
-                    continue;
-                }
-
-                // If it's a link table (starts with _), ensure it exists
-                if (!entry.table_name.empty() && entry.table_name[0] == '_') {
-                    bool is_virtual = std::find(entry.changed_fields_names.begin(),
-                                                entry.changed_fields_names.end(),
-                                                "rhs_type") != entry.changed_fields_names.end();
-                    if (is_virtual) {
-                        db.ensure_virtual_link_table(entry.table_name);
-                    } else {
-                        db.ensure_link_table(entry.table_name);
+                // Per-entry error isolation — the contract the C ABI and the
+                // bridge document: an entry that fails to apply for ANY reason
+                // (unknown table from schema drift, instruction generation,
+                // bookkeeping inserts) is skipped — NOT acked, so the sender
+                // re-sends it — and the remaining entries still apply.
+                // Previously only the instruction EXECUTE was isolated: an
+                // unknown-table entry threw out of the pre-apply row lookup and
+                // aborted the whole batch, and entries applied in earlier
+                // committed chunks were never reported (the B-2 pathology at
+                // chunk granularity).
+                try {
+                    // Re-check inside transaction (entry may have been inserted concurrently)
+                    auto existing = db.db().query(
+                        "SELECT id FROM AuditLog WHERE globalId = ?",
+                        {entry.global_id}
+                    );
+                    if (!existing.empty()) {
+                        applied_ids.push_back(entry.global_id);
+                        continue;
                     }
-                }
 
-                // Ensure vec0 tables exist for vector columns BEFORE the INSERT,
-                // so triggers can populate the shadow tables.
-                if (!entry.table_name.empty() && entry.table_name[0] != '_') {
-                    auto* model_schema = schema_registry::instance().get_schema(entry.table_name);
-                    if (model_schema) {
-                        for (const auto& prop : model_schema->properties) {
-                            if (prop.is_vector && prop.type == column_type::blob) {
-                                auto it = entry.changed_fields.find(prop.name);
-                                if (it != entry.changed_fields.end() &&
-                                    it->second.kind == any_property_kind::data_kind &&
-                                    std::holds_alternative<std::vector<uint8_t>>(it->second.value)) {
-                                    auto& vec_data = std::get<std::vector<uint8_t>>(it->second.value);
-                                    if (!vec_data.empty()) {
-                                        int dims = static_cast<int>(vec_data.size() / sizeof(float));
-                                        if (dims > 0) {
-                                            db.ensure_vec0_table(entry.table_name, prop.name, dims);
+                    // If it's a link table (starts with _), ensure it exists
+                    if (!entry.table_name.empty() && entry.table_name[0] == '_') {
+                        bool is_virtual = std::find(entry.changed_fields_names.begin(),
+                                                    entry.changed_fields_names.end(),
+                                                    "rhs_type") != entry.changed_fields_names.end();
+                        if (is_virtual) {
+                            db.ensure_virtual_link_table(entry.table_name);
+                        } else {
+                            db.ensure_link_table(entry.table_name);
+                        }
+                    }
+
+                    // Ensure vec0 tables exist for vector columns BEFORE the INSERT,
+                    // so triggers can populate the shadow tables.
+                    if (!entry.table_name.empty() && entry.table_name[0] != '_') {
+                        auto* model_schema = schema_registry::instance().get_schema(entry.table_name);
+                        if (model_schema) {
+                            for (const auto& prop : model_schema->properties) {
+                                if (prop.is_vector && prop.type == column_type::blob) {
+                                    auto it = entry.changed_fields.find(prop.name);
+                                    if (it != entry.changed_fields.end() &&
+                                        it->second.kind == any_property_kind::data_kind &&
+                                        std::holds_alternative<std::vector<uint8_t>>(it->second.value)) {
+                                        auto& vec_data = std::get<std::vector<uint8_t>>(it->second.value);
+                                        if (!vec_data.empty()) {
+                                            int dims = static_cast<int>(vec_data.size() / sizeof(float));
+                                            if (dims > 0) {
+                                                db.ensure_vec0_table(entry.table_name, prop.name, dims);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                // Generate and execute the SQL instruction
-                LOG_INFO("apply_remote", "entry[%zu]: table=%s op=%s globalRowId=%s changedFields=%zu changedFieldsNames=%zu",
-                         i, entry.table_name.c_str(), entry.operation.c_str(),
-                         entry.global_row_id.c_str(),
-                         entry.changed_fields.size(), entry.changed_fields_names.size());
-                for (const auto& [key, val] : entry.changed_fields) {
-                    LOG_INFO("apply_remote", "  field: %s kind=%d", key.c_str(), static_cast<int>(val.kind));
-                }
-                for (const auto& name : entry.changed_fields_names) {
-                    LOG_INFO("apply_remote", "  fieldName: %s", name.c_str());
-                }
-                auto schema = db.get_table_schema(entry.table_name);
-                auto [sql, params] = entry.generate_instruction(schema);
-                LOG_INFO("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
+                    // Generate and execute the SQL instruction
+                    LOG_INFO("apply_remote", "entry[%zu]: table=%s op=%s globalRowId=%s changedFields=%zu changedFieldsNames=%zu",
+                             i, entry.table_name.c_str(), entry.operation.c_str(),
+                             entry.global_row_id.c_str(),
+                             entry.changed_fields.size(), entry.changed_fields_names.size());
+                    for (const auto& [key, val] : entry.changed_fields) {
+                        LOG_INFO("apply_remote", "  field: %s kind=%d", key.c_str(), static_cast<int>(val.kind));
+                    }
+                    for (const auto& name : entry.changed_fields_names) {
+                        LOG_INFO("apply_remote", "  fieldName: %s", name.c_str());
+                    }
+                    auto schema = db.get_table_schema(entry.table_name);
+                    auto [sql, params] = entry.generate_instruction(schema);
+                    LOG_INFO("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
 
-                // Resolve the local rowId and operation for this object.
-                // flush_changes correlates model changes with AuditLog entries by
-                // (tableName, rowId, operation). After compaction, the sender's
-                // rowId and operation may differ from the receiver's:
-                //   - rowId diverges when INSERT...ON CONFLICT DO UPDATE bumps
-                //     the autoincrement counter
-                //   - operation diverges when sender says INSERT but receiver
-                //     already has the row (ON CONFLICT takes the UPDATE path)
-                int64_t local_row_id = entry.row_id;
-                std::string local_operation = entry.operation;
-                bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
+                    // Resolve the local rowId and operation for this object.
+                    // flush_changes correlates model changes with AuditLog entries by
+                    // (tableName, rowId, operation). After compaction, the sender's
+                    // rowId and operation may differ from the receiver's:
+                    //   - rowId diverges when INSERT...ON CONFLICT DO UPDATE bumps
+                    //     the autoincrement counter
+                    //   - operation diverges when sender says INSERT but receiver
+                    //     already has the row (ON CONFLICT takes the UPDATE path)
+                    int64_t local_row_id = entry.row_id;
+                    std::string local_operation = entry.operation;
+                    bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
 
-                bool row_existed = false;
-                if (is_model_table && !entry.global_row_id.empty()) {
-                    auto pre_rows = db.db().query(
-                        "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
-                        {entry.global_row_id}
-                    );
-                    if (!pre_rows.empty()) {
-                        row_existed = true;
-                        auto it = pre_rows[0].find("id");
-                        if (it != pre_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                            local_row_id = std::get<int64_t>(it->second);
-                        }
-                        if (entry.operation == "INSERT") {
-                            local_operation = "UPDATE";
+                    bool row_existed = false;
+                    if (is_model_table && !entry.global_row_id.empty()) {
+                        auto pre_rows = db.db().query(
+                            "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                            {entry.global_row_id}
+                        );
+                        if (!pre_rows.empty()) {
+                            row_existed = true;
+                            auto it = pre_rows[0].find("id");
+                            if (it != pre_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                                local_row_id = std::get<int64_t>(it->second);
+                            }
+                            if (entry.operation == "INSERT") {
+                                local_operation = "UPDATE";
+                            }
                         }
                     }
-                }
 
-                bool sql_succeeded = true;
-                if (!sql.empty()) {
-                    try {
-                        db.db().execute(sql, params);
-                    } catch (const std::exception& e) {
-                        LOG_ERROR("apply_remote", "Failed: %s (SQL: %s)", e.what(), sql.c_str());
-                        sql_succeeded = false;
+                    bool sql_succeeded = true;
+                    if (!sql.empty()) {
+                        try {
+                            db.db().execute(sql, params);
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("apply_remote", "Failed: %s (SQL: %s)", e.what(), sql.c_str());
+                            sql_succeeded = false;
+                        }
                     }
-                }
 
-                if (!sql_succeeded) {
+                    if (!sql_succeeded) {
+                        continue;
+                    }
+
+                    // For genuine INSERTs (row didn't exist), get the new local rowId
+                    if (is_model_table && !row_existed && entry.operation != "DELETE" && !entry.global_row_id.empty()) {
+                        auto post_rows = db.db().query(
+                            "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                            {entry.global_row_id}
+                        );
+                        if (!post_rows.empty()) {
+                            auto it = post_rows[0].find("id");
+                            if (it != post_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                                local_row_id = std::get<int64_t>(it->second);
+                            }
+                        }
+                    }
+
+                    // Record the audit entry as from remote.
+                    // Global mode: isSynchronized=1 (fully synced).
+                    // Per-sync mode: isSynchronized=0 (other sync_ids still need to relay it).
+                    int is_synchronized = receiving_sync_id ? 0 : 1;
+                    std::string insert_sql = R"(
+                        INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
+                            changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    )";
+                    db.db().execute(insert_sql, {
+                        entry.global_id,
+                        entry.table_name,
+                        local_operation,
+                        local_row_id,
+                        entry.global_row_id,
+                        entry.changed_fields_to_json(),
+                        entry.changed_fields_names_to_json(),
+                        entry.timestamp,
+                        static_cast<int64_t>(is_synchronized)
+                    });
+
+                    // Per-sync mode: mark this entry as synced for the receiving sync_id (loop prevention).
+                    if (receiving_sync_id) {
+                        auto audit_rows = db.db().query(
+                            "SELECT id FROM AuditLog WHERE globalId = ?", {entry.global_id});
+                        if (!audit_rows.empty()) {
+                            auto id_it = audit_rows[0].find("id");
+                            if (id_it != audit_rows[0].end() && std::holds_alternative<int64_t>(id_it->second)) {
+                                int64_t audit_id = std::get<int64_t>(id_it->second);
+                                db.db().execute(R"(
+                                    INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized)
+                                    VALUES (?, ?, 1)
+                                    ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1
+                                )", {audit_id, *receiving_sync_id});
+                            }
+                        }
+                    }
+
+                    applied_ids.push_back(entry.global_id);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("apply_remote", "entry[%zu] skipped (table=%s, op=%s): %s",
+                              i, entry.table_name.c_str(), entry.operation.c_str(), e.what());
                     continue;
                 }
-
-                // For genuine INSERTs (row didn't exist), get the new local rowId
-                if (is_model_table && !row_existed && entry.operation != "DELETE" && !entry.global_row_id.empty()) {
-                    auto post_rows = db.db().query(
-                        "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
-                        {entry.global_row_id}
-                    );
-                    if (!post_rows.empty()) {
-                        auto it = post_rows[0].find("id");
-                        if (it != post_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                            local_row_id = std::get<int64_t>(it->second);
-                        }
-                    }
-                }
-
-                // Record the audit entry as from remote.
-                // Global mode: isSynchronized=1 (fully synced).
-                // Per-sync mode: isSynchronized=0 (other sync_ids still need to relay it).
-                int is_synchronized = receiving_sync_id ? 0 : 1;
-                std::string insert_sql = R"(
-                    INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
-                        changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                )";
-                db.db().execute(insert_sql, {
-                    entry.global_id,
-                    entry.table_name,
-                    local_operation,
-                    local_row_id,
-                    entry.global_row_id,
-                    entry.changed_fields_to_json(),
-                    entry.changed_fields_names_to_json(),
-                    entry.timestamp,
-                    static_cast<int64_t>(is_synchronized)
-                });
-
-                // Per-sync mode: mark this entry as synced for the receiving sync_id (loop prevention).
-                if (receiving_sync_id) {
-                    auto audit_rows = db.db().query(
-                        "SELECT id FROM AuditLog WHERE globalId = ?", {entry.global_id});
-                    if (!audit_rows.empty()) {
-                        auto id_it = audit_rows[0].find("id");
-                        if (id_it != audit_rows[0].end() && std::holds_alternative<int64_t>(id_it->second)) {
-                            int64_t audit_id = std::get<int64_t>(id_it->second);
-                            db.db().execute(R"(
-                                INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized)
-                                VALUES (?, ?, 1)
-                                ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1
-                            )", {audit_id, *receiving_sync_id});
-                        }
-                    }
-                }
-
-                applied_ids.push_back(entry.global_id);
             }
 
             // Re-enable sync triggers (restore the pre-existing flag value)

@@ -184,3 +184,14 @@ set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 
 include(GoogleTest)
 gtest_discover_tests(LatticeCoreTests)
+
+# =============================================================================
+# LatticeCAPITests - behavioral tests against the C ABI (links the C surface)
+# =============================================================================
+add_executable(LatticeCAPITests
+    Tests/LatticeCAPITests/CAPIBehaviorTests.cpp
+)
+target_link_libraries(LatticeCAPITests PRIVATE LatticeCAPI gtest_main)
+target_include_directories(LatticeCAPITests PRIVATE
+    Sources/LatticeCAPI/include)
+gtest_discover_tests(LatticeCAPITests)

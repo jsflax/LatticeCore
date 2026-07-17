@@ -54,13 +54,12 @@ int32_t lattice_schema_format_epoch(void);
 // do not exist yet.
 //
 // Feature strings that return true today:
-//   "attach", "cross_process_observation", "fts", "geo_query", "ipc", "knn",
-//   "migration", "observation", "rollback", "sync", "sync_filter",
-//   "transactions"
+//   "attach", "checkpoint", "cross_process_observation", "detach", "fts",
+//   "geo_query", "ipc", "knn", "migration", "observation", "rollback",
+//   "row_cache", "statement_counters", "sync", "sync_filter",
+//   "sync_progress", "sync_tuning", "transactions"
 // Reserved strings that will return true when the feature lands (planned):
-//   "checkpoint", "detach", "read_generations", "row_cache",
-//   "statement_counters", "sync_progress", "sync_tuning", "to_json",
-//   "unified_open"
+//   "read_generations", "to_json", "unified_open"
 bool lattice_capi_has_feature(const char* feature);
 
 // =============================================================================
@@ -761,6 +760,231 @@ uint64_t lattice_db_observe_cross_process(
 // Remove a cross-process observer previously registered with
 // lattice_db_observe_cross_process (no-op for unknown tokens).
 void lattice_db_remove_cross_process_observer(lattice_db_t* db, uint64_t token);
+
+// =============================================================================
+// Sync Options (size-prefixed struct; docs/CAPI-STABILITY.md rule 3)
+// =============================================================================
+
+// Sync-tuning + sync-configuration options for
+// lattice_db_create_with_sync_options.
+//
+// SIZE-PREFIXED: struct_size is the first member and MUST be initialized —
+// always via lattice_sync_options_init(), which also fills every knob with
+// its "keep the library default" sentinel:
+//
+//   lattice_sync_options_t opts;
+//   lattice_sync_options_init(&opts);
+//   opts.chunk_size = 512;                 // override only what you need
+//
+// The implementation reads min(struct_size, sizeof(lattice_sync_options_t))
+// bytes, so binaries compiled against an older (shorter) version of this
+// struct keep working as fields are appended at the tail.
+//
+// VALIDATION mirrors the Swift bridge setters: nonsensical values are
+// IGNORED (the knob keeps the library default) rather than failing the open
+// — chunk_size <= 0, delays <= 0, negative windows/intervals. 0 stays valid
+// where it means "disabled": max_reconnect_attempts 0 = retry forever,
+// upload_coalesce_ms 0 = legacy immediate dispatch, checkpoint interval
+// 0 = that checkpoint cadence off.
+typedef struct {
+    size_t struct_size;                      // set by lattice_sync_options_init()
+
+    // Sync-tuning knobs (sentinel = keep the library default).
+    int64_t chunk_size;                      // audit entries per upload chunk; applies when > 0 (sentinel 0)
+    int32_t max_reconnect_attempts;          // applies when >= 0 (0 = retry forever); sentinel -1
+    double  base_delay_seconds;              // reconnect backoff base; applies when > 0 (sentinel 0)
+    double  max_delay_seconds;               // reconnect backoff cap; applies when > 0 (sentinel 0)
+    int64_t stable_connection_ms;            // stable-connection window before backoff reset; applies when >= 0; sentinel -1
+    int32_t upload_coalesce_ms;              // applies when >= 0 (0 = immediate dispatch); sentinel -1
+    int32_t checkpoint_passive_interval_ms;  // applies when >= 0 (0 = off); sentinel -1
+    int32_t checkpoint_truncate_interval_ms; // applies when >= 0 (0 = off); sentinel -1
+    int32_t use_upload_floor;                // tri-state: 1 = on, 0 = off, -1 = keep default
+
+    // Upload sync filter, same JSON contract as lattice_db_set_sync_filter:
+    // array of {"table": "...", "predicate": "..."} objects ("where_clause"
+    // accepted as legacy alias). NULL = sync everything. NOTE: an empty
+    // array means sync NOTHING (explicit empty whitelist).
+    const char* sync_filter_json;
+
+    // RESERVED for the unified-open work: must be NULL. Sync ids are
+    // currently always derived by the library ("wss:<wss_endpoint>",
+    // "ipc:<channel>" — see lattice_db_read_upload_floor); a non-NULL value
+    // fails the open with LATTICE_ERROR_INVALID_ARGUMENT so that a future
+    // override cannot be silently ignored by older libraries.
+    const char* sync_id;
+} lattice_sync_options_t;
+
+// Fill defaults: struct_size = sizeof(lattice_sync_options_t), every knob at
+// its "keep the library default" sentinel, pointers NULL. No-op on NULL.
+void lattice_sync_options_init(lattice_sync_options_t* options);
+
+// Create a database with schemas, scheduler, sync endpoint AND sync options.
+// Identical to lattice_db_create_with_sync (which stays as-is per the
+// additive policy) plus a trailing options struct. options may be NULL
+// (all defaults — then this behaves exactly like create_with_sync).
+// Pass NULL for wss_endpoint to disable WSS sync (tuning still applies to
+// any IPC synchronizers created through other configuration).
+// Returns NULL on failure; see lattice_last_error().
+lattice_db_t* lattice_db_create_with_sync_options(
+    const char* path,
+    const lattice_schema_t* schemas,
+    size_t schema_count,
+    lattice_scheduler_t* scheduler,
+    const char* wss_endpoint,
+    const char* authorization_token,
+    const lattice_sync_options_t* options
+);
+
+// =============================================================================
+// Sync Progress & Sync Observers
+// =============================================================================
+
+// Snapshot of sync progress, aggregated over ALL synchronizers attached to
+// the database's path (WSS + IPC; the synchronizer may live on a sibling
+// instance).
+//
+// SIZE-PREFIXED OUT-STRUCT: set struct_size to
+// sizeof(lattice_sync_progress_t) before calling; the implementation writes
+// min(struct_size, its own sizeof) bytes and sets struct_size to the number
+// of bytes written.
+typedef struct {
+    size_t struct_size;
+    int64_t pending_upload;  // entries awaiting upload in the current batch
+    int64_t total_upload;    // total-upload snapshot at start of the batch
+    int64_t acked;           // entries acknowledged by the peer
+    int64_t received;        // cumulative downloaded entries applied
+} lattice_sync_progress_t;
+
+// Read current sync progress. A database with no sync configured returns
+// LATTICE_OK with all counters zero.
+lattice_status_t lattice_db_get_sync_progress(lattice_db_t* db,
+                                              lattice_sync_progress_t* progress);
+
+// Sync observer callbacks. All fire on the synchronizer's own thread — do
+// not block; marshal to your own thread/queue. The progress pointer is only
+// valid for the duration of the callback (copy it out).
+typedef void (*lattice_sync_progress_fn)(void* context,
+                                         const lattice_sync_progress_t* progress);
+typedef void (*lattice_sync_state_fn)(void* context, bool connected);
+typedef void (*lattice_sync_error_fn)(void* context, const char* message);
+
+// Register sync observers (established context + fn-pointer + destroy
+// pattern). Returns an observer token (0 on failure). Multiple observers may
+// be registered per database; tokens are shared across the three kinds and
+// are removed with lattice_db_remove_sync_observer. destroy(context) is
+// called when the observer is removed or the database is closed (it is NOT
+// called if the last handle is released without lattice_db_close — remove
+// observers or close the database before the final release).
+//
+// NOTE: sync callbacks are a single slot per underlying database instance;
+// the C observers multiplex over that slot. Registering C observers replaces
+// any callback installed directly on the same instance through another
+// binding layer.
+uint64_t lattice_db_observe_sync_progress(
+    lattice_db_t* db,
+    void* context,
+    lattice_sync_progress_fn callback,
+    void (*destroy)(void*)
+);
+
+// connected=true when the sync transport connects, false when it drops.
+uint64_t lattice_db_observe_sync_state(
+    lattice_db_t* db,
+    void* context,
+    lattice_sync_state_fn callback,
+    void (*destroy)(void*)
+);
+
+// message is NUL-terminated and only valid for the duration of the callback.
+uint64_t lattice_db_observe_sync_error(
+    lattice_db_t* db,
+    void* context,
+    lattice_sync_error_fn callback,
+    void (*destroy)(void*)
+);
+
+// Remove a sync observer registered by any of the three functions above
+// (no-op for unknown tokens). Calls the observer's destroy(context).
+void lattice_db_remove_sync_observer(lattice_db_t* db, uint64_t token);
+
+// =============================================================================
+// Database Detachment & Attach Errors
+// =============================================================================
+
+// Detach a previously attached database (inverse of lattice_db_attach).
+// Idempotent: detaching a database that is not attached succeeds. Returns
+// LATTICE_ERROR_DATABASE on failure with the reason in lattice_last_error()
+// (also readable via lattice_db_last_attach_error).
+lattice_status_t lattice_db_detach(lattice_db_t* db, lattice_db_t* other);
+
+// Reason for the most recent FAILED attach/detach on this database (a copy
+// of the core's mutex-guarded accessor). Returns NULL when the most recent
+// attach/detach succeeded (success clears it) or none has been attempted.
+// The returned buffer is thread-local — copy it before the next C-API call
+// on the same thread.
+const char* lattice_db_last_attach_error(lattice_db_t* db);
+
+// =============================================================================
+// Row Cache & Atomic Field Increment (per-object)
+// =============================================================================
+
+// Row cache: one-statement materialization of a MANAGED object's full row —
+// field reads hit the snapshot instead of issuing one SELECT per column.
+// The snapshot is as-of hydration/refresh; concurrent writers are invisible
+// until lattice_object_refresh_row_cache. Writes through this object are
+// write-through (read-your-writes holds). Any cache miss or type mismatch
+// falls through to the live read — slower, never wrong. Enabling on an
+// UNMANAGED object is a no-op (unmanaged objects are already value
+// snapshots; is_row_cache_enabled stays false).
+lattice_status_t lattice_object_enable_row_cache(lattice_object_t* obj);
+lattice_status_t lattice_object_disable_row_cache(lattice_object_t* obj);
+// Re-fetch the full row in one statement (the staleness escape hatch).
+lattice_status_t lattice_object_refresh_row_cache(lattice_object_t* obj);
+bool lattice_object_is_row_cache_enabled(lattice_object_t* obj);
+
+// SQL-side atomic increment of an integer field: `SET field = field + delta`
+// under the write lock — no read-modify-write race between concurrent
+// writers. On an unmanaged object the in-memory value is incremented
+// instead. `field` must be a schema column name, not user input (same
+// interpolation convention as the query layer's filter clauses).
+lattice_status_t lattice_object_increment_int(lattice_object_t* obj,
+                                              const char* field,
+                                              int64_t delta);
+
+// =============================================================================
+// Statement Counters
+// =============================================================================
+
+// Process-global count of SQL statements issued through the database layer's
+// public funnels, across ALL connections and databases. For statement-budget
+// regression tests in bindings.
+uint64_t lattice_db_total_statement_count(void);
+
+// Thread-local twin — exact budgets on single-threaded read paths.
+uint64_t lattice_db_thread_statement_count(void);
+
+// =============================================================================
+// WAL Checkpoint
+// =============================================================================
+
+// Checkpoint the WAL file. mode: 0 = PASSIVE (checkpoint what can be done
+// without blocking readers/writers), 1 = TRUNCATE (checkpoint everything and
+// truncate the WAL; silently partial under concurrent readers — the outcome
+// is logged). Any other mode returns LATTICE_ERROR_INVALID_ARGUMENT.
+lattice_status_t lattice_db_checkpoint(lattice_db_t* db, int32_t mode);
+
+// =============================================================================
+// Sync Upload Floor (conformance/debug hook)
+// =============================================================================
+
+// Read the per-slot upload floor for a sync id from
+// _lattice_replication_slots — the scan bound with the invariant that no
+// entry pending for this sync_id has id <= floor. Sync ids are derived by
+// the library: "wss:<wss_endpoint>" for the WSS synchronizer,
+// "ipc:<channel>" for IPC synchronizers. Returns 0 when the slot does not
+// exist (no floor advanced yet), -1 on invalid arguments or database error
+// (see lattice_last_error()).
+int64_t lattice_db_read_upload_floor(lattice_db_t* db, const char* sync_id);
 
 #ifdef __cplusplus
 }

@@ -5,9 +5,11 @@
 #include <lattice/sync.hpp>
 #include <lattice/network.hpp>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <cstring>
@@ -39,6 +41,10 @@ struct lattice_results_internal {
     std::atomic<int> ref_count{1};
 };
 
+// Defined with the sync-observer registry near the end of this file; called
+// from lattice_db_close so observers' destroy callbacks fire on close.
+static void capi_teardown_sync_observers(lattice::swift_lattice* impl) noexcept;
+
 // =============================================================================
 // Error Handling
 // =============================================================================
@@ -69,7 +75,9 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
     // lattice.h and docs/CAPI-STABILITY.md.
     static const char* const kFeatures[] = {
         "attach",
+        "checkpoint",
         "cross_process_observation",
+        "detach",
         "fts",
         "geo_query",
         "ipc",
@@ -77,8 +85,12 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
         "migration",
         "observation",
         "rollback",
+        "row_cache",
+        "statement_counters",
         "sync",
         "sync_filter",
+        "sync_progress",
+        "sync_tuning",
         "transactions",
     };
     for (const char* const f : kFeatures) {
@@ -147,6 +159,11 @@ extern "C" bool lattice_db_is_sync_connected(lattice_db_t* db) {
 extern "C" void lattice_db_close(lattice_db_t* db) {
     if (!db) return;
     auto* ref = reinterpret_cast<lattice_db_internal*>(db);
+    // Tear down C sync observers first so their destroy callbacks fire and
+    // no callback lands mid-close (documented in lattice.h).
+    try {
+        capi_teardown_sync_observers(ref->get());
+    } catch (...) {}
     try {
         ref->get()->close();
     } catch (...) {}
@@ -2008,6 +2025,32 @@ extern "C" lattice_db_t* lattice_db_create_with_ipc(
 // Sync Filter
 // =============================================================================
 
+// Shared by lattice_db_set_sync_filter and
+// lattice_db_create_with_sync_options (lattice_sync_options_t.sync_filter_json).
+// Throws on malformed JSON.
+static std::vector<lattice::sync_filter_entry> parse_sync_filter_json(const char* filter_json) {
+    auto json = nlohmann::json::parse(filter_json);
+    if (!json.is_array()) {
+        throw std::runtime_error(
+            "sync filter JSON must be an array of {\"table\", \"predicate\"} objects");
+    }
+    std::vector<lattice::sync_filter_entry> filters;
+    for (const auto& entry : json) {
+        lattice::sync_filter_entry f;
+        f.table_name = entry.value("table", "");
+        // The header documents {"table", "predicate"}; the impl
+        // historically parsed only the core field name "where_clause",
+        // silently dropping documented-form predicates (the table then
+        // synced ALL rows - docs/capi-gap-audit.md B-3). Accept both,
+        // preferring the documented key.
+        std::string where = entry.value("predicate", "");
+        if (where.empty()) where = entry.value("where_clause", "");
+        if (!where.empty()) f.where_clause = where;
+        filters.push_back(std::move(f));
+    }
+    return filters;
+}
+
 extern "C" lattice_status_t lattice_db_set_sync_filter(lattice_db_t* db, const char* filter_json) {
     if (!db || !filter_json) {
         set_error("Invalid arguments");
@@ -2016,24 +2059,7 @@ extern "C" lattice_status_t lattice_db_set_sync_filter(lattice_db_t* db, const c
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         auto* impl = db_ref->get();
-
-        auto json = nlohmann::json::parse(filter_json);
-        std::vector<lattice::sync_filter_entry> filters;
-        for (const auto& entry : json) {
-            lattice::sync_filter_entry f;
-            f.table_name = entry.value("table", "");
-            // The header documents {"table", "predicate"}; the impl
-            // historically parsed only the core field name "where_clause",
-            // silently dropping documented-form predicates (the table then
-            // synced ALL rows - docs/capi-gap-audit.md B-3). Accept both,
-            // preferring the documented key.
-            std::string where = entry.value("predicate", "");
-            if (where.empty()) where = entry.value("where_clause", "");
-            if (!where.empty()) f.where_clause = where;
-            filters.push_back(std::move(f));
-        }
-
-        impl->update_sync_filter(filters);
+        impl->update_sync_filter(parse_sync_filter_json(filter_json));
         return LATTICE_OK;
     } catch (const std::exception& e) {
         set_error(e.what());
@@ -2126,4 +2152,595 @@ extern "C" void lattice_db_remove_cross_process_observer(lattice_db_t* db, uint6
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
         db_ref->get()->remove_table_observer(table, token);
     } catch (...) {}
+}
+
+// =============================================================================
+// Sync Options (C1 slice 2)
+// =============================================================================
+
+extern "C" void lattice_sync_options_init(lattice_sync_options_t* options) {
+    if (!options) return;
+    std::memset(options, 0, sizeof(*options));
+    options->struct_size = sizeof(lattice_sync_options_t);
+    // "Keep the library default" sentinels — values the bridge setters ignore.
+    options->chunk_size = 0;
+    options->max_reconnect_attempts = -1;
+    options->base_delay_seconds = 0.0;
+    options->max_delay_seconds = 0.0;
+    options->stable_connection_ms = -1;
+    options->upload_coalesce_ms = -1;
+    options->checkpoint_passive_interval_ms = -1;
+    options->checkpoint_truncate_interval_ms = -1;
+    options->use_upload_floor = -1;
+    options->sync_filter_json = nullptr;
+    options->sync_id = nullptr;
+}
+
+extern "C" lattice_db_t* lattice_db_create_with_sync_options(
+    const char* path,
+    const lattice_schema_t* schemas,
+    size_t schema_count,
+    lattice_scheduler_t* scheduler,
+    const char* wss_endpoint,
+    const char* authorization_token,
+    const lattice_sync_options_t* options
+) {
+    try {
+        // Size-prefixed copy: read min(caller_size, sizeof) bytes onto a
+        // defaults-initialized local, so callers built against an older
+        // (shorter) struct keep working as fields are appended
+        // (docs/CAPI-STABILITY.md rule 3).
+        lattice_sync_options_t opts;
+        lattice_sync_options_init(&opts);
+        if (options) {
+            if (options->struct_size == 0) {
+                set_error("lattice_sync_options_t.struct_size is 0 - "
+                          "initialize the struct with lattice_sync_options_init()");
+                return nullptr;
+            }
+            std::memcpy(&opts, options,
+                        std::min(options->struct_size, sizeof(lattice_sync_options_t)));
+        }
+        if (opts.sync_id) {
+            set_error("lattice_sync_options_t.sync_id is reserved and must be NULL "
+                      "(sync ids are derived by the library; see lattice.h)");
+            return nullptr;
+        }
+
+        std::string db_path = path ? std::string(path) : ":memory:";
+        auto schema_vec = convert_schemas(schemas, schema_count);
+        std::string ws_url = wss_endpoint ? std::string(wss_endpoint) : "";
+        std::string auth_token = authorization_token ? std::string(authorization_token) : "";
+
+        lattice::swift_configuration config(db_path, ws_url, auth_token);
+
+        if (scheduler) {
+            auto* sched = reinterpret_cast<lattice_scheduler_internal*>(scheduler);
+            config.sched = std::shared_ptr<lattice::scheduler>(sched, [](lattice::scheduler*) {});
+        }
+
+        // Wire the knobs through configuration::sync_tuning via the bridge
+        // setters, so the validation semantics are literally the bridge's:
+        // nonsensical values are ignored and the knob keeps sync.hpp's
+        // default (0 stays meaningful where it means "disabled").
+        config.set_sync_chunk_size(opts.chunk_size);
+        config.set_sync_max_reconnect_attempts(opts.max_reconnect_attempts);
+        config.set_sync_base_delay_seconds(opts.base_delay_seconds);
+        config.set_sync_max_delay_seconds(opts.max_delay_seconds);
+        config.set_sync_stable_connection_ms(opts.stable_connection_ms);
+        config.set_sync_upload_coalesce_ms(opts.upload_coalesce_ms);
+        config.set_sync_checkpoint_passive_interval_ms(opts.checkpoint_passive_interval_ms);
+        config.set_sync_checkpoint_truncate_interval_ms(opts.checkpoint_truncate_interval_ms);
+        if (opts.use_upload_floor >= 0) {
+            config.set_sync_use_upload_floor(opts.use_upload_floor != 0);
+        }
+
+        if (opts.sync_filter_json) {
+            // Same JSON contract as lattice_db_set_sync_filter. NOTE: an
+            // empty array is an explicit empty whitelist (sync nothing).
+            config.sync_filter = parse_sync_filter_json(opts.sync_filter_json);
+        }
+
+        auto* ref = lattice::swift_lattice_ref::create(config, schema_vec);
+        ref->retain();
+        return reinterpret_cast<lattice_db_t*>(ref);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
+}
+
+// =============================================================================
+// Sync Progress & Sync Observers (C1 slice 2)
+// =============================================================================
+
+extern "C" lattice_status_t lattice_db_get_sync_progress(lattice_db_t* db,
+                                                         lattice_sync_progress_t* progress) {
+    if (!db || !progress) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    if (progress->struct_size == 0) {
+        set_error("lattice_sync_progress_t.struct_size is 0 - "
+                  "set it to sizeof(lattice_sync_progress_t) before calling");
+        return LATTICE_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto p = db_ref->get()->get_sync_progress();
+
+        lattice_sync_progress_t full;
+        std::memset(&full, 0, sizeof(full));
+        size_t written = std::min(progress->struct_size, sizeof(full));
+        full.struct_size = written;
+        full.pending_upload = p.pending_upload;
+        full.total_upload = p.total_upload;
+        full.acked = p.acked;
+        full.received = p.received;
+        std::memcpy(progress, &full, written);
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+// Multi-observer fan-out over the bridge's single sync-callback slot per
+// kind. Registries are keyed by the underlying swift_lattice instance (NOT
+// the C handle) so multiple handles sharing a cached instance share one
+// registry and one installed trampoline — installing per-handle would
+// silently clobber the other handle's observers at the bridge slot.
+//
+// Locking: entries_mutex (recursive) guards the token map and is held during
+// dispatch, so removing an observer from another thread blocks until an
+// in-flight callback completes — after lattice_db_remove_sync_observer
+// returns, the context is never touched again and destroy(context) is safe.
+// Removing from within the callback (same thread) re-enters via the
+// recursive mutex; dispatch re-looks each token up so erased entries are
+// skipped. install_mutex serializes install/uninstall of the bridge slots.
+namespace {
+
+struct capi_sync_observer_registry {
+    enum class kind : int { progress = 0, state = 1, error = 2 };
+    struct entry {
+        kind k;
+        void* context;
+        void* fn;
+        void (*destroy)(void*);
+    };
+
+    std::recursive_mutex entries_mutex;
+    std::mutex install_mutex;
+    uint64_t next_token = 1;
+    std::map<uint64_t, entry> entries;
+
+    size_t count_of(kind k) {
+        size_t n = 0;
+        for (const auto& [tok, e] : entries) {
+            if (e.k == k) n++;
+        }
+        return n;
+    }
+};
+
+std::mutex g_sync_registry_map_mutex;
+// Keyed by swift_lattice*. An entry lives while it has observers (or until
+// close); it is erased when its last observer is removed, which also bounds
+// the stale-pointer window to caller-leaked observers (documented in
+// lattice.h: remove observers or close before the final release).
+std::map<const void*, std::shared_ptr<capi_sync_observer_registry>> g_sync_registries;
+
+std::shared_ptr<capi_sync_observer_registry> sync_registry_for(
+    lattice::swift_lattice* impl, bool create_if_missing) {
+    std::lock_guard<std::mutex> lock(g_sync_registry_map_mutex);
+    auto it = g_sync_registries.find(impl);
+    if (it != g_sync_registries.end()) return it->second;
+    if (!create_if_missing) return nullptr;
+    auto reg = std::make_shared<capi_sync_observer_registry>();
+    g_sync_registries.emplace(impl, reg);
+    return reg;
+}
+
+void drop_sync_registry_if_empty(lattice::swift_lattice* impl,
+                                 const std::shared_ptr<capi_sync_observer_registry>& reg) {
+    std::lock_guard<std::mutex> map_lock(g_sync_registry_map_mutex);
+    std::lock_guard<std::recursive_mutex> lock(reg->entries_mutex);
+    if (reg->entries.empty()) {
+        auto it = g_sync_registries.find(impl);
+        if (it != g_sync_registries.end() && it->second == reg) {
+            g_sync_registries.erase(it);
+        }
+    }
+}
+
+// Context handed to the bridge trampolines. Holds the registry weakly: if
+// the registry is torn down (close) while the bridge still owns the
+// trampoline, dispatch becomes a no-op instead of dangling.
+struct sync_trampoline_ctx {
+    std::weak_ptr<capi_sync_observer_registry> registry;
+};
+
+template <typename Invoke>
+void dispatch_sync_observers(void* raw_ctx,
+                             capi_sync_observer_registry::kind k,
+                             Invoke&& invoke) {
+    auto* t = static_cast<sync_trampoline_ctx*>(raw_ctx);
+    if (!t) return;
+    auto reg = t->registry.lock();
+    if (!reg) return;
+    std::lock_guard<std::recursive_mutex> lock(reg->entries_mutex);
+    std::vector<uint64_t> tokens;
+    tokens.reserve(reg->entries.size());
+    for (const auto& [tok, e] : reg->entries) {
+        if (e.k == k) tokens.push_back(tok);
+    }
+    for (uint64_t tok : tokens) {
+        auto it = reg->entries.find(tok);
+        if (it == reg->entries.end() || it->second.k != k) continue;  // removed mid-dispatch
+        invoke(it->second);
+    }
+}
+
+using sync_kind = capi_sync_observer_registry::kind;
+
+// Install the bridge trampoline for `k` on `impl` (call with install_mutex held).
+void install_sync_trampoline(lattice::swift_lattice* impl,
+                             const std::shared_ptr<capi_sync_observer_registry>& reg,
+                             sync_kind k) {
+    switch (k) {
+        case sync_kind::progress:
+            impl->set_on_sync_progress(
+                new sync_trampoline_ctx{reg},
+                [](void* ctx, int64_t pending_upload, int64_t total_upload,
+                   int64_t acked, int64_t received) {
+                    lattice_sync_progress_t p;
+                    std::memset(&p, 0, sizeof(p));
+                    p.struct_size = sizeof(p);
+                    p.pending_upload = pending_upload;
+                    p.total_upload = total_upload;
+                    p.acked = acked;
+                    p.received = received;
+                    dispatch_sync_observers(ctx, sync_kind::progress,
+                        [&](const capi_sync_observer_registry::entry& e) {
+                            reinterpret_cast<lattice_sync_progress_fn>(e.fn)(e.context, &p);
+                        });
+                },
+                [](void* ctx) { delete static_cast<sync_trampoline_ctx*>(ctx); });
+            break;
+        case sync_kind::state:
+            impl->set_on_sync_state_change(
+                new sync_trampoline_ctx{reg},
+                [](void* ctx, bool connected) {
+                    dispatch_sync_observers(ctx, sync_kind::state,
+                        [&](const capi_sync_observer_registry::entry& e) {
+                            reinterpret_cast<lattice_sync_state_fn>(e.fn)(e.context, connected);
+                        });
+                },
+                [](void* ctx) { delete static_cast<sync_trampoline_ctx*>(ctx); });
+            break;
+        case sync_kind::error:
+            impl->set_on_sync_error(
+                new sync_trampoline_ctx{reg},
+                [](void* ctx, const char* error, int64_t /*len*/) {
+                    dispatch_sync_observers(ctx, sync_kind::error,
+                        [&](const capi_sync_observer_registry::entry& e) {
+                            reinterpret_cast<lattice_sync_error_fn>(e.fn)(
+                                e.context, error ? error : "");
+                        });
+                },
+                [](void* ctx) { delete static_cast<sync_trampoline_ctx*>(ctx); });
+            break;
+    }
+}
+
+// Clear the bridge slot for `k` on `impl` (call with install_mutex held).
+// The bridge's null-callback path releases the old trampoline context.
+void clear_sync_trampoline(lattice::swift_lattice* impl, sync_kind k) {
+    switch (k) {
+        case sync_kind::progress:
+            impl->set_on_sync_progress(nullptr, nullptr, nullptr);
+            break;
+        case sync_kind::state:
+            impl->set_on_sync_state_change(nullptr, nullptr, nullptr);
+            break;
+        case sync_kind::error:
+            impl->set_on_sync_error(nullptr, nullptr, nullptr);
+            break;
+    }
+}
+
+uint64_t observe_sync_common(lattice_db_t* db, sync_kind k, void* context,
+                             void* fn, void (*destroy)(void*)) {
+    if (!db || !fn) return 0;
+    try {
+        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        auto reg = sync_registry_for(impl, /*create_if_missing=*/true);
+
+        std::lock_guard<std::mutex> install_lock(reg->install_mutex);
+        bool first_of_kind;
+        uint64_t token;
+        {
+            std::lock_guard<std::recursive_mutex> lock(reg->entries_mutex);
+            first_of_kind = reg->count_of(k) == 0;
+            token = reg->next_token++;
+            reg->entries[token] = capi_sync_observer_registry::entry{k, context, fn, destroy};
+        }
+        if (first_of_kind) {
+            install_sync_trampoline(impl, reg, k);
+        }
+        return token;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+}  // namespace
+
+static void capi_teardown_sync_observers(lattice::swift_lattice* impl) noexcept {
+    std::shared_ptr<capi_sync_observer_registry> reg;
+    {
+        std::lock_guard<std::mutex> lock(g_sync_registry_map_mutex);
+        auto it = g_sync_registries.find(impl);
+        if (it == g_sync_registries.end()) return;
+        reg = it->second;
+        g_sync_registries.erase(it);
+    }
+    std::vector<capi_sync_observer_registry::entry> taken;
+    {
+        std::lock_guard<std::mutex> install_lock(reg->install_mutex);
+        {
+            std::lock_guard<std::recursive_mutex> lock(reg->entries_mutex);
+            taken.reserve(reg->entries.size());
+            for (const auto& [tok, e] : reg->entries) taken.push_back(e);
+            reg->entries.clear();
+        }
+        try {
+            clear_sync_trampoline(impl, sync_kind::progress);
+            clear_sync_trampoline(impl, sync_kind::state);
+            clear_sync_trampoline(impl, sync_kind::error);
+        } catch (...) {}
+    }
+    for (const auto& e : taken) {
+        if (e.destroy && e.context) {
+            try { e.destroy(e.context); } catch (...) {}
+        }
+    }
+}
+
+extern "C" uint64_t lattice_db_observe_sync_progress(
+    lattice_db_t* db,
+    void* context,
+    lattice_sync_progress_fn callback,
+    void (*destroy)(void*)
+) {
+    return observe_sync_common(db, sync_kind::progress, context,
+                               reinterpret_cast<void*>(callback), destroy);
+}
+
+extern "C" uint64_t lattice_db_observe_sync_state(
+    lattice_db_t* db,
+    void* context,
+    lattice_sync_state_fn callback,
+    void (*destroy)(void*)
+) {
+    return observe_sync_common(db, sync_kind::state, context,
+                               reinterpret_cast<void*>(callback), destroy);
+}
+
+extern "C" uint64_t lattice_db_observe_sync_error(
+    lattice_db_t* db,
+    void* context,
+    lattice_sync_error_fn callback,
+    void (*destroy)(void*)
+) {
+    return observe_sync_common(db, sync_kind::error, context,
+                               reinterpret_cast<void*>(callback), destroy);
+}
+
+extern "C" void lattice_db_remove_sync_observer(lattice_db_t* db, uint64_t token) {
+    if (!db || token == 0) return;
+    try {
+        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        auto reg = sync_registry_for(impl, /*create_if_missing=*/false);
+        if (!reg) return;
+
+        capi_sync_observer_registry::entry taken{};
+        bool found = false;
+        bool kind_now_empty = false;
+        {
+            std::lock_guard<std::mutex> install_lock(reg->install_mutex);
+            {
+                std::lock_guard<std::recursive_mutex> lock(reg->entries_mutex);
+                auto it = reg->entries.find(token);
+                if (it == reg->entries.end()) return;  // unknown token: no-op
+                taken = it->second;
+                found = true;
+                reg->entries.erase(it);
+                kind_now_empty = reg->count_of(taken.k) == 0;
+            }
+            if (kind_now_empty) {
+                clear_sync_trampoline(impl, taken.k);
+            }
+        }
+        if (found && taken.destroy && taken.context) {
+            taken.destroy(taken.context);
+        }
+        drop_sync_registry_if_empty(impl, reg);
+    } catch (...) {}
+}
+
+// =============================================================================
+// Database Detachment & Attach Errors (C1 slice 2; audit A-29/A-30)
+// =============================================================================
+
+extern "C" lattice_status_t lattice_db_detach(lattice_db_t* db, lattice_db_t* other) {
+    if (!db || !other) {
+        set_error("Invalid arguments to lattice_db_detach");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto* other_ref = reinterpret_cast<lattice_db_internal*>(other);
+        // Same contract as attach since ATT-3: bool return + reason in
+        // last_attach_error(); idempotent (detaching a non-attached db is
+        // success), never throws across the boundary.
+        if (!db_ref->get()->detach(*other_ref->get())) {
+            auto reason = db_ref->get()->last_attach_error();
+            set_error(reason ? reason->c_str() : "detach failed");
+            return LATTICE_ERROR_DATABASE;
+        }
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" const char* lattice_db_last_attach_error(lattice_db_t* db) {
+    if (!db) return nullptr;
+    try {
+        auto err = reinterpret_cast<lattice_db_internal*>(db)->get()->last_attach_error();
+        if (!err) return nullptr;
+        g_returned_string = *err;  // thread-safe copy (core accessor is mutex-guarded)
+        return g_returned_string.c_str();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// =============================================================================
+// Row Cache & Atomic Field Increment (C1 slice 2; audit A-8/A-9)
+// =============================================================================
+
+extern "C" lattice_status_t lattice_object_enable_row_cache(lattice_object_t* obj) {
+    if (!obj) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        reinterpret_cast<lattice_object_internal*>(obj)->enable_row_cache();
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" lattice_status_t lattice_object_disable_row_cache(lattice_object_t* obj) {
+    if (!obj) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        reinterpret_cast<lattice_object_internal*>(obj)->disable_row_cache();
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" lattice_status_t lattice_object_refresh_row_cache(lattice_object_t* obj) {
+    if (!obj) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        reinterpret_cast<lattice_object_internal*>(obj)->refresh_row_cache();
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" bool lattice_object_is_row_cache_enabled(lattice_object_t* obj) {
+    if (!obj) return false;
+    try {
+        return reinterpret_cast<lattice_object_internal*>(obj)->is_row_cache_enabled();
+    } catch (...) {
+        return false;
+    }
+}
+
+extern "C" lattice_status_t lattice_object_increment_int(lattice_object_t* obj,
+                                                         const char* field,
+                                                         int64_t delta) {
+    if (!obj || !field) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    try {
+        reinterpret_cast<lattice_object_internal*>(obj)->increment_int_field(field, delta);
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+// =============================================================================
+// Statement Counters (C1 slice 2; audit A-10)
+// =============================================================================
+
+extern "C" uint64_t lattice_db_total_statement_count(void) {
+    return lattice::swift_lattice::total_sql_statement_count();
+}
+
+extern "C" uint64_t lattice_db_thread_statement_count(void) {
+    return lattice::swift_lattice::thread_sql_statement_count();
+}
+
+// =============================================================================
+// WAL Checkpoint (C1 slice 2; audit A-15)
+// =============================================================================
+
+extern "C" lattice_status_t lattice_db_checkpoint(lattice_db_t* db, int32_t mode) {
+    if (!db) {
+        set_error("null argument");
+        return LATTICE_ERROR_NULL_POINTER;
+    }
+    if (mode != 0 && mode != 1) {
+        set_error("invalid checkpoint mode (0 = passive, 1 = truncate)");
+        return LATTICE_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        if (mode == 1) {
+            // TRUNCATE via the bridge member — logged outcome (partial
+            // checkpoints under concurrent readers are how multi-GB WAL
+            // files accumulate silently).
+            impl->checkpoint();
+        } else {
+            // PASSIVE: checkpoint what can be done without blocking
+            // readers/writers. PRAGMA for the same reason the bridge uses it
+            // (sqlite3ext.h macro shadowing on Linux TUs).
+            impl->db().query("PRAGMA wal_checkpoint(PASSIVE)", {});
+        }
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+// =============================================================================
+// Sync Upload Floor (C1 slice 2; audit A-32)
+// =============================================================================
+
+extern "C" int64_t lattice_db_read_upload_floor(lattice_db_t* db, const char* sync_id) {
+    if (!db || !sync_id) {
+        set_error("null argument");
+        return -1;
+    }
+    try {
+        auto* impl = reinterpret_cast<lattice_db_internal*>(db)->get();
+        return lattice::read_upload_floor(impl->db(), std::string(sync_id));
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    }
 }

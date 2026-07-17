@@ -2,6 +2,39 @@
 
 import PackageDescription
 
+// The behavioral C-ABI test target links the LatticeCAPI library, whose
+// SwiftPM build is broken on Linux (missing bridge modulemap — see
+// docs/capi-gap-audit.md V1). Gate it to macOS manifests so the Linux
+// `swift run LatticeCoreTests` closure never grows the CAPI library;
+// on Linux the same tests build via CMake (CMakeLists.txt).
+#if os(macOS)
+let capiTestProducts: [Product] = [
+    .executable(
+        name: "LatticeCAPITests",
+        targets: ["LatticeCAPITests"]
+    ),
+]
+let capiTestTargets: [Target] = [
+    .executableTarget(
+        name: "LatticeCAPITests",
+        dependencies: ["LatticeCAPI", "GoogleTest"],
+        path: "Tests/LatticeCAPITests",
+        cxxSettings: [
+            .headerSearchPath("../../Sources/LatticeCAPI/include"),
+            .headerSearchPath("../../Sources/GoogleTest/include"),
+            .unsafeFlags(["-std=c++20"]),
+            .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
+        ],
+        linkerSettings: [
+            .linkedLibrary("sqlite3")
+        ]
+    ),
+]
+#else
+let capiTestProducts: [Product] = []
+let capiTestTargets: [Target] = []
+#endif
+
 let package = Package(
     name: "LatticeCore",
     platforms: [
@@ -29,7 +62,7 @@ let package = Package(
             name: "LatticeCoreTests",
             targets: ["LatticeCoreTests"]
         ),
-    ],
+    ] + capiTestProducts,
     targets: [
         .target(
             name: "SqliteVec",
@@ -158,6 +191,6 @@ let package = Package(
         //             dependencies: ["LatticeSwiftCppBridge"],
         //             cxxSettings: [],
         //             swiftSettings: [.interoperabilityMode(.Cxx)])
-    ],
+    ] + capiTestTargets,
     cxxLanguageStandard: .cxx20
 )

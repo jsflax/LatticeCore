@@ -1322,23 +1322,25 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
     return entry;
 }
 
-// Sync set CRUD
+// Sync set CRUD — all scoped to this synchronizer's sync_id. Membership is
+// per-channel state: two filtered synchronizers on one database must never
+// see (or clobber) each other's rows.
 void synchronizer_base::sync_set_add(const std::string& table_name, const std::string& global_row_id) {
     db().db().execute(
-        "INSERT OR IGNORE INTO _lattice_sync_set (table_name, global_row_id) VALUES (?, ?)",
-        {table_name, global_row_id});
+        "INSERT OR IGNORE INTO _lattice_sync_set (sync_id, table_name, global_row_id) VALUES (?, ?, ?)",
+        {config_.sync_id, table_name, global_row_id});
 }
 
 void synchronizer_base::sync_set_remove(const std::string& table_name, const std::string& global_row_id) {
     db().db().execute(
-        "DELETE FROM _lattice_sync_set WHERE table_name = ? AND global_row_id = ?",
-        {table_name, global_row_id});
+        "DELETE FROM _lattice_sync_set WHERE sync_id = ? AND table_name = ? AND global_row_id = ?",
+        {config_.sync_id, table_name, global_row_id});
 }
 
 bool synchronizer_base::sync_set_contains(const std::string& table_name, const std::string& global_row_id) {
     auto rows = db().db().query(
-        "SELECT 1 FROM _lattice_sync_set WHERE table_name = ? AND global_row_id = ? LIMIT 1",
-        {table_name, global_row_id});
+        "SELECT 1 FROM _lattice_sync_set WHERE sync_id = ? AND table_name = ? AND global_row_id = ? LIMIT 1",
+        {config_.sync_id, table_name, global_row_id});
     return !rows.empty();
 }
 
@@ -1377,8 +1379,9 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
 void synchronizer_base::clear_sync_filter() {
     scheduler_->invoke([this] {
         config_.sync_filter = std::nullopt;
-        // Clear the sync set — without a filter, everything syncs via normal path
-        db().db().execute("DELETE FROM _lattice_sync_set");
+        // Clear THIS channel's sync set — without a filter, everything syncs
+        // via the normal path. Other channels' membership is untouched.
+        db().db().execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {config_.sync_id});
     });
 }
 
@@ -1412,9 +1415,11 @@ void synchronizer_base::reconcile_sync_filter() {
             }
         }
     }
-    auto sync_set_rows = db().db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
-    LOG_INFO("synchronizer", "reconcile Phase 1: %zu sync_set rows, %zu current matches",
-             sync_set_rows.size(), current_matches.size());
+    auto sync_set_rows = db().db().query(
+        "SELECT table_name, global_row_id FROM _lattice_sync_set WHERE sync_id = ?",
+        {config_.sync_id});
+    LOG_INFO("synchronizer", "reconcile Phase 1 (%s): %zu sync_set rows, %zu current matches",
+             config_.sync_id.c_str(), sync_set_rows.size(), current_matches.size());
     for (const auto& row : sync_set_rows) {
         auto tn_it = row.find("table_name");
         auto gid_it = row.find("global_row_id");
@@ -1480,7 +1485,8 @@ void synchronizer_base::reconcile_sync_filter() {
             // through the normal upload pipeline.
             std::string sql = "SELECT id, globalId, " + select_cols.str() +
                               " FROM " + fe.table_name +
-                              " WHERE globalId NOT IN (SELECT global_row_id FROM _lattice_sync_set WHERE table_name = ?)"
+                              " WHERE globalId NOT IN (SELECT global_row_id FROM _lattice_sync_set"
+                              "                        WHERE table_name = ? AND sync_id = ?)"
                               " AND globalId NOT IN ("
                               "   SELECT a.globalRowId FROM AuditLog a"
                               "   WHERE a.tableName = ?"
@@ -1491,7 +1497,7 @@ void synchronizer_base::reconcile_sync_filter() {
                               "       WHERE ss.audit_entry_id = a.id"
                               "         AND ss.sync_id = ?"
                               "         AND ss.is_synchronized = 1))";
-            std::vector<column_value_t> params = {fe.table_name, fe.table_name, config_.sync_id};
+            std::vector<column_value_t> params = {fe.table_name, config_.sync_id, fe.table_name, config_.sync_id};
             if (fe.where_clause) {
                 sql += " AND (" + *fe.where_clause + ")";
             }
@@ -1704,11 +1710,13 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
     constexpr size_t kClassifyPreloadThreshold = 64;
     const bool preload = entries.size() > kClassifyPreloadThreshold;
 
-    // Pre-load sync set into memory — O(1) hash lookups instead of O(N) SQL queries.
-    // Key is "table_name\0global_row_id" for compact hashing.
+    // Pre-load THIS channel's sync set into memory — O(1) hash lookups instead
+    // of O(N) SQL queries. Key is "table_name\0global_row_id" for compact hashing.
     std::unordered_set<std::string> sync_set_cache;
     if (preload) {
-        auto rows = db().db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
+        auto rows = db().db().query(
+            "SELECT table_name, global_row_id FROM _lattice_sync_set WHERE sync_id = ?",
+            {config_.sync_id});
         sync_set_cache.reserve(rows.size());
         for (const auto& row : rows) {
             auto tn_it = row.find("table_name");
@@ -2657,6 +2665,15 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
     // in on_websocket_open, so sync_set is already up-to-date by the time we query.
     std::string filter_clause;
     if (sync_filter && !sync_filter->empty()) {
+        // sync_id is embedded in the string-built clause (it repeats per
+        // filter entry, so a positional bind would be fragile against the
+        // params the caller appends). Escape single quotes — sync_ids carry
+        // URLs ("wss:...") and channel names, never trusted input, but
+        // correctness costs nothing.
+        std::string escaped_sync_id = sync_id;
+        for (size_t pos = 0; (pos = escaped_sync_id.find('\'', pos)) != std::string::npos; pos += 2) {
+            escaped_sync_id.replace(pos, 1, "''");
+        }
         filter_clause = " AND (";
         for (size_t i = 0; i < sync_filter->size(); ++i) {
             if (i > 0) filter_clause += " OR ";
@@ -2667,7 +2684,8 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
                 filter_clause += "(a.tableName = '" + entry.table_name + "' AND ("
                        "a.operation = 'DELETE'"
                        " OR EXISTS (SELECT 1 FROM _lattice_sync_set"
-                       " WHERE table_name = a.tableName AND global_row_id = a.globalRowId)"
+                       " WHERE sync_id = '" + escaped_sync_id + "'"
+                       " AND table_name = a.tableName AND global_row_id = a.globalRowId)"
                        " OR EXISTS (SELECT 1 FROM " + entry.table_name +
                        " WHERE globalId = a.globalRowId AND (" + *entry.where_clause + "))"
                        "))";

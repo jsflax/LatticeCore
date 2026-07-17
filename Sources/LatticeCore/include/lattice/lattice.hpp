@@ -3255,34 +3255,15 @@ public:
     /// subset. Local data is untouched; upload volume stays proportional to
     /// the filter, never the whole AuditLog.
     ///
-    /// LIMITATION: _lattice_sync_set has no sync_id column, so its wipe is
-    /// global. It is therefore SKIPPED whenever more than one replication
-    /// slot exists on this database (a hub with IPC + WSS, or multiple
-    /// channels) — wiping it there would corrupt the other synchronizers'
-    /// filtered-set membership and re-send/loop their data. The cost of
-    /// skipping: Phase 1 (removals) of the next reconcile sees stale set
-    /// rows and may emit redundant removals to the fresh peer, which are
-    /// harmless (the peer is empty). Single-sync databases (the Engram
-    /// daemon topology) keep the full re-arm.
+    /// The sync-set wipe is scoped to this sync_id (per-sync_id shape) — it
+    /// cannot corrupt other synchronizers' filtered-set membership, so the
+    /// full re-arm is safe on any topology, including multi-channel hubs.
     void reset_sync_state(const std::string& sync_id) {
         db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
-        auto slot_rows = db_->query("SELECT COUNT(*) AS n FROM _lattice_replication_slots");
-        int64_t slot_count = 0;
-        if (!slot_rows.empty()) {
-            auto it = slot_rows[0].find("n");
-            if (it != slot_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                slot_count = std::get<int64_t>(it->second);
-            }
-        }
-        if (slot_count <= 1) {
-            db_->execute("DELETE FROM _lattice_sync_set");
-        } else {
-            LOG_INFO("lattice_db", "reset_sync_state(%s): %lld replication slots — keeping global _lattice_sync_set",
-                     sync_id.c_str(), (long long)slot_count);
-        }
+        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
         db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0 WHERE sync_id = ?", {sync_id});
-        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_set wiped: %s)",
-                 sync_id.c_str(), slot_count <= 1 ? "yes" : "no");
+        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_state, sync_set, slot cursors)",
+                 sync_id.c_str());
     }
 
     /// Slot-aware compaction: deletes only AuditLog entries that ALL
@@ -5913,12 +5894,19 @@ private:
         )");
         db_->execute("INSERT OR IGNORE INTO _SyncControl(id, disabled) VALUES(1, 0)");
 
-        // Create _lattice_sync_set table for tracking filtered sync membership
+        // Create _lattice_sync_set table for tracking filtered sync membership,
+        // scoped PER SYNCHRONIZER (sync_id). Two channels with different
+        // filters on one database must not share membership state: with the
+        // old shared shape, channel A's classify saw channel B's rows in the
+        // set and synthesized real DELETEs for them (`!matches && in_set`),
+        // and reconcile Phase 1 emitted filter-removal DELETEs for the other
+        // channel's rows — cross-channel mirror wipes.
         db_->execute(R"(
             CREATE TABLE IF NOT EXISTS _lattice_sync_set (
+                sync_id TEXT NOT NULL,
                 table_name TEXT NOT NULL,
                 global_row_id TEXT NOT NULL,
-                PRIMARY KEY (table_name, global_row_id)
+                PRIMARY KEY (sync_id, table_name, global_row_id)
             )
         )");
 
@@ -5966,6 +5954,74 @@ private:
         } catch (const std::exception&) {
             // Column already exists.
         }
+
+        // Runs AFTER the slots table exists — the rebuild's attribution rule
+        // reads it. Reaching this on existing DBs requires the
+        // kLatticeSchemaFormatEpoch bump (same contract as the ALTER above).
+        migrate_sync_set_to_per_sync_id();
+    }
+
+    /// One-time rebuild of _lattice_sync_set from the pre-per-sync_id shape
+    /// (PK (table_name, global_row_id), no sync_id column).
+    ///
+    /// Attribution rule: when exactly ONE replication slot exists, all
+    /// existing membership rows belong to it (the filtered-hub topology that
+    /// produced them — a single filtered IPC synchronizer; unfiltered
+    /// synchronizers never touch the set). With zero or multiple slots the
+    /// rows are dropped: multi-slot databases hold no filtered synchronizers
+    /// today, so their sets are empty/unused, and reconcile Phase 2
+    /// re-synthesizes membership idempotently if that assumption is ever
+    /// wrong (bandwidth-only cost, surfaced by the Phase-2 synthesis-count
+    /// soak metric).
+    void migrate_sync_set_to_per_sync_id() {
+        auto cols = db_->query("PRAGMA table_info(_lattice_sync_set)");
+        if (cols.empty()) return;  // no table (fresh DB creates the new shape above)
+        for (const auto& c : cols) {
+            auto it = c.find("name");
+            if (it != c.end() && std::holds_alternative<std::string>(it->second)
+                && std::get<std::string>(it->second) == "sync_id") {
+                return;  // already the per-sync_id shape
+            }
+        }
+
+        std::string attributed_sync_id;
+        auto slots = db_->query("SELECT sync_id FROM _lattice_replication_slots");
+        if (slots.size() == 1) {
+            auto it = slots[0].find("sync_id");
+            if (it != slots[0].end() && std::holds_alternative<std::string>(it->second)) {
+                attributed_sync_id = std::get<std::string>(it->second);
+            }
+        }
+
+        const bool was_in_txn = db_->is_in_transaction();
+        if (!was_in_txn) db_->begin_transaction();
+        try {
+            db_->execute("ALTER TABLE _lattice_sync_set RENAME TO _lattice_sync_set_v1");
+            db_->execute(R"(
+                CREATE TABLE _lattice_sync_set (
+                    sync_id TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    global_row_id TEXT NOT NULL,
+                    PRIMARY KEY (sync_id, table_name, global_row_id)
+                )
+            )");
+            if (!attributed_sync_id.empty()) {
+                db_->execute(
+                    "INSERT INTO _lattice_sync_set (sync_id, table_name, global_row_id) "
+                    "SELECT ?, table_name, global_row_id FROM _lattice_sync_set_v1",
+                    {attributed_sync_id});
+            }
+            db_->execute("DROP TABLE _lattice_sync_set_v1");
+            if (!was_in_txn) db_->commit();
+        } catch (...) {
+            if (!was_in_txn && db_->is_in_transaction()) {
+                try { db_->rollback(); } catch (...) {}
+            }
+            throw;
+        }
+        LOG_INFO("lattice_db", "migrated _lattice_sync_set to per-sync_id shape (%s)",
+                 attributed_sync_id.empty() ? "dropped rows: no single-slot attribution"
+                                            : ("attributed to " + attributed_sync_id).c_str());
     }
 
     /// Register per-connection SQL functions. This is connection state, not a
@@ -6052,8 +6108,16 @@ protected:
     /// canonicalization changes the swift fingerprint for affected DBs
     /// anyway; the bump makes the revalidation guarantee uniform across
     /// both fingerprint families.) All new DDL is guarded/absent-object —
-    /// auto-migration-safe on revalidation.
-    static constexpr int kLatticeSchemaFormatEpoch = 4;
+    /// auto-migration-safe on revalidation. RELEASED in 1.0.1 — this number
+    /// is burned; anything later takes the next one.
+    ///
+    /// Epoch 5: _lattice_sync_set rebuilt to the per-sync_id shape
+    /// (migrate_sync_set_to_per_sync_id in ensure_sync_control_table —
+    /// without this bump the fast path skips the rebuild on every existing
+    /// DB and the sync engine binds a sync_id column that doesn't exist).
+    /// Renumbered from 4 during the rebase onto 1.0.1: this branch and the
+    /// released unique-index pass both originally claimed 4.
+    static constexpr int kLatticeSchemaFormatEpoch = 5;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as

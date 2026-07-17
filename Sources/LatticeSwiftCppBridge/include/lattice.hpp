@@ -900,6 +900,10 @@ public:
     bool is_sync_agent() const { return lattice_db::is_sync_agent(); }
 
     /// Count AuditLog entries pending sync whose rows are in the sync set.
+    /// Deliberately UNSCOPED across sync_ids (per-sync_id set shape): this
+    /// powers the whole-database "pending upload" progress counter, so an
+    /// entry counts if ANY channel considers its row shared. EXISTS keeps
+    /// the count per-entry — a row in N channels' sets never double-counts.
     int64_t pending_sync_entry_count() {
         auto rows = xproc_read_db().query(
             "SELECT COUNT(*) FROM AuditLog a"

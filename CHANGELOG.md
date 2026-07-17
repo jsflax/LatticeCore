@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Changed
+- **`_lattice_sync_set` is per-synchronizer (A1, Engram Groups increment 0)**:
+  PK widened from `(table_name, global_row_id)` to
+  `(sync_id, table_name, global_row_id)`; all membership reads/writes
+  (`sync_set_add/remove/contains`, `clear_sync_filter`, both
+  `reconcile_sync_filter` phases, `classify_entries` preload, the
+  pending-query sync-set EXISTS) scope to the owning synchronizer's
+  `sync_id`. Two filtered channels on one database no longer share (or
+  clobber) membership state — the shared shape made channel A synthesize
+  cross-channel DELETEs for channel B's rows (`!matches && in_set`, and
+  reconcile Phase-1 removals over the global set), the mechanism class
+  behind the Mar 2026 filter-narrowing data loss. `reset_sync_state` now
+  wipes only the named channel's set (the multi-slot skip hack is gone).
+  Existing databases rebuild on open via `migrate_sync_set_to_per_sync_id`
+  (schema-format epoch 4 → 5): one registered replication slot → rows
+  attributed to it; otherwise rows drop and reconcile Phase 2
+  re-synthesizes membership idempotently. New `MultiChannelSyncSet` gtest
+  suite (5 tests) pins isolation, scoped reconcile, both migration paths,
+  and scoped reset.
+
 ## [1.0.1] - 2026-07-25
 
 ### Fixed

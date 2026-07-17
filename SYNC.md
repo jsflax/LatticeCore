@@ -109,15 +109,26 @@ CREATE INDEX IF NOT EXISTS idx_sync_state_pending
 
 ### _lattice_sync_set
 
-Tracks which rows are in scope for a sync filter. Used to detect rows entering/leaving the filter.
+Tracks which rows are in scope for a sync filter, **per synchronizer**. Used to
+detect rows entering/leaving the filter. Membership is channel-local state: two
+filtered synchronizers on one database (a multi-channel hub) keep fully
+independent sets — a shared set would make channel A's classify treat channel
+B's rows as "left my filter" and synthesize cross-channel DELETEs.
 
 ```sql
 CREATE TABLE IF NOT EXISTS _lattice_sync_set (
+    sync_id       TEXT NOT NULL,
     table_name    TEXT NOT NULL,
     global_row_id TEXT NOT NULL,
-    PRIMARY KEY (table_name, global_row_id)
+    PRIMARY KEY (sync_id, table_name, global_row_id)
 )
 ```
+
+Databases created before the per-sync_id shape are rebuilt on open
+(`migrate_sync_set_to_per_sync_id`, gated by the schema-format epoch): with
+exactly one registered replication slot, existing rows are attributed to it
+(the filtered-hub topology that produced them); otherwise rows are dropped and
+reconcile Phase 2 re-synthesizes membership idempotently.
 
 ### _lattice_replication_slots
 
@@ -474,13 +485,13 @@ This prevents unbounded growth of the sync state table while maintaining the per
 
 ### Sync Set
 
-`_lattice_sync_set` tracks which `(table_name, global_row_id)` pairs are currently in sync scope. This enables detecting when rows enter or leave the filter.
+`_lattice_sync_set` tracks which `(sync_id, table_name, global_row_id)` triples are currently in sync scope — one membership set per synchronizer. This enables detecting when rows enter or leave that channel's filter without ever touching another channel's state.
 
 ### reconcile_sync_filter()
 
-Called on connect and on runtime filter update via `update_sync_filter()`. Two phases:
+Called on connect and on runtime filter update via `update_sync_filter()`. Both phases operate only on this synchronizer's (`sync_id`-scoped) membership rows. Two phases:
 
-**Phase 1 -- Removals**: Query current matching rows per filter entry. Any `_lattice_sync_set` entry NOT in current matches gets a synthetic DELETE in AuditLog, and is removed from the sync set.
+**Phase 1 -- Removals**: Query current matching rows per filter entry. Any of THIS channel's `_lattice_sync_set` entries NOT in current matches gets a synthetic DELETE in AuditLog, and is removed from the sync set.
 
 **Phase 2 -- Additions**: Per filter entry, batch-fetch matching rows NOT in sync set. Synthesize INSERT audit entries with full row data. Add to sync set.
 

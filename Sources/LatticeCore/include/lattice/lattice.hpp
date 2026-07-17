@@ -568,6 +568,12 @@ struct configuration {
         /// Required for cross-platform IPC (e.g. macOS host ↔ iOS simulator) where
         /// HOME differs between processes.
         std::optional<std::string> socket_path;
+        /// A4 — see sync_config::narrowing_emits_removals. true (default):
+        /// narrowing the filter clears the paired spoke's mirror via marked
+        /// filter-removal DELETEs (personal-sync semantics). false:
+        /// narrowing is bookkeeping-only and the spoke keeps its mirror
+        /// (group-channel semantics: "stop new sharing", never un-share).
+        bool narrowing_emits_removals = true;
     };
     std::vector<ipc_target> ipc_targets;
 
@@ -1902,11 +1908,28 @@ public:
     /// Manually trigger sync (uploads pending changes)
     void sync_now();
 
-    /// Update the sync filter at runtime, triggering reconciliation
+    /// Update the sync filter at runtime, triggering reconciliation.
+    /// FAN-OUT: applies ONE filter to the WSS synchronizer AND every IPC
+    /// synchronizer. Correct only for single-channel databases — on a
+    /// multi-channel hub (N filtered IPC targets) use the per-channel
+    /// overload; fanning one filter across channels with different scopes
+    /// reconciles every channel against the wrong filter.
     void update_sync_filter(std::vector<sync_filter_entry> filter);
 
-    /// Clear the sync filter, reverting to syncing everything
+    /// Update ONE channel's sync filter at runtime, triggering that
+    /// channel's reconciliation only. `channel` matches an ipc_target's
+    /// channel name; the empty string targets the WSS synchronizer. Also
+    /// writes the filter into config_.ipc_targets so a lazily-created
+    /// synchronizer (accept callback not yet fired) picks it up.
+    void update_sync_filter(const std::string& channel, std::vector<sync_filter_entry> filter);
+
+    /// Clear the sync filter, reverting to syncing everything.
+    /// FAN-OUT across all synchronizers — same caveat as the fan-out
+    /// update_sync_filter; use the per-channel overload on hubs.
     void clear_sync_filter();
+
+    /// Clear ONE channel's sync filter ("" = WSS).
+    void clear_sync_filter(const std::string& channel);
 
     /// Connect to sync server (called automatically if configured)
     void connect_sync();
@@ -3266,6 +3289,22 @@ public:
                  sync_id.c_str());
     }
 
+    /// A6 — permanently retire a sync channel: delete its `_lattice_sync_state`
+    /// rows, its `_lattice_sync_set` membership, AND its replication slot.
+    /// Call when a channel is gone for good (e.g. the daemon dropped a group
+    /// membership), NOT for a reconnecting channel (use reset_sync_state).
+    /// Leftover state from a dead channel is actively harmful: its stale slot
+    /// pins safe compaction forever, and (pre-scoping) its confirmed
+    /// sync_state rows inflated the eager-collapse count — an entry could
+    /// collapse to isSynchronized=1 before a still-live channel relayed it.
+    void remove_sync_channel_state(const std::string& sync_id) {
+        db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
+        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
+        db_->execute("DELETE FROM _lattice_replication_slots WHERE sync_id = ?", {sync_id});
+        LOG_INFO("lattice_db", "remove_sync_channel_state(%s): channel retired (state, set, slot removed)",
+                 sync_id.c_str());
+    }
+
     /// Slot-aware compaction: deletes only AuditLog entries that ALL
     /// registered synchronizers have confirmed receiving.
     /// Safe to call during active sync — no re-sync storm.
@@ -3337,7 +3376,14 @@ public:
     /// entries for objects that are missing from the audit log.
     /// Useful for initial migration when enabling sync on existing data.
     /// @return Number of INSERT entries created
-    int64_t generate_history(int64_t batch_size = 20000) {
+    /// @param mark_synthesized When true (A5), the generated INSERT snapshots
+    /// carry synthesized=1: receivers apply them insert-if-absent rather than
+    /// as unconditional upserts, so regeneration from possibly-stale LOCAL
+    /// state (a client's nuclear compact) can never revert a peer's newer
+    /// edits or resurrect tombstones. Pass false only when this database is
+    /// the CANONICAL copy (e.g. server-side history compaction) and receivers
+    /// SHOULD be refreshed to exactly this state.
+    int64_t generate_history(int64_t batch_size = 20000, bool mark_synthesized = true) {
         if (batch_size <= 0) batch_size = 20000;
 
         // Transient index on (tableName, globalRowId) for the NOT EXISTS check
@@ -3417,11 +3463,11 @@ public:
                 // naturally excludes rows already audited in earlier batches.
                 std::ostringstream sql;
                 sql << "INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, "
-                    << "changedFields, changedFieldsNames, isSynchronized, timestamp) "
+                    << "changedFields, changedFieldsNames, isSynchronized, timestamp, synthesized) "
                     << "SELECT '" << table_name << "', 'INSERT', id, globalId, "
                     << "json_object(" << json_cols.str() << "), "
                     << "json_array(" << json_names.str() << "), "
-                    << "0, unixepoch('subsec') "
+                    << "0, unixepoch('subsec'), " << (mark_synthesized ? 1 : 0) << " "
                     << "FROM " << table_name << " t "
                     << "WHERE NOT EXISTS ("
                     << "  SELECT 1 FROM AuditLog a "
@@ -5859,10 +5905,20 @@ private:
                 changedFieldsNames TEXT,
                 isFromRemote INTEGER DEFAULT 0,
                 isSynchronized INTEGER DEFAULT 0,
-                timestamp REAL DEFAULT (unixepoch('subsec'))
+                timestamp REAL DEFAULT (unixepoch('subsec')),
+                synthesized INTEGER DEFAULT 0
             )
         )";
         db_->execute(sql);
+
+        // A5 provenance column for pre-existing databases. Guarded ALTER —
+        // reaching it on the open fast path requires the
+        // kLatticeSchemaFormatEpoch bump (epoch 5).
+        try {
+            db_->execute("ALTER TABLE AuditLog ADD COLUMN synthesized INTEGER DEFAULT 0");
+        } catch (const std::exception&) {
+            // Column already exists.
+        }
 
         // Partial index for sync queries — only indexes unsynchronized entries,
         // which are the ones query_audit_log_for_sync needs to scan.
@@ -6117,7 +6173,13 @@ protected:
     /// DB and the sync engine binds a sync_id column that doesn't exist).
     /// Renumbered from 4 during the rebase onto 1.0.1: this branch and the
     /// released unique-index pass both originally claimed 4.
-    static constexpr int kLatticeSchemaFormatEpoch = 5;
+    ///
+    /// Epoch 6: AuditLog gained the `synthesized` provenance column (A5
+    /// insert-if-absent semantics for locally-synthesized full-row
+    /// snapshots; guarded ALTER in ensure_audit_log_table). Epoch 5 ships
+    /// alone as Engram Groups increment 0; this train is increment 1.
+    /// Renumbered from 5 by the same rebase.
+    static constexpr int kLatticeSchemaFormatEpoch = 6;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as
@@ -7624,6 +7686,33 @@ inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter
     }
 }
 
+inline void lattice_db::update_sync_filter(const std::string& channel,
+                                           std::vector<sync_filter_entry> filter) {
+    if (channel.empty()) {
+        LOG_INFO("lattice_db", "update_sync_filter(wss): %zu entries (db=%s)",
+                 filter.size(), config_.path.c_str());
+        config_.sync_filter = filter;
+        if (synchronizer_) {
+            synchronizer_->update_sync_filter(std::move(filter));
+        }
+        return;
+    }
+    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
+        if (config_.ipc_targets[i].channel != channel) continue;
+        LOG_INFO("lattice_db", "update_sync_filter(%s): %zu entries (db=%s)",
+                 channel.c_str(), filter.size(), config_.path.c_str());
+        // Config write first — lazily-created synchronizers (accept callback
+        // hasn't fired yet) read their filter from the config entry.
+        config_.ipc_targets[i].sync_filter = filter;
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->update_sync_filter(std::move(filter));
+        }
+        return;
+    }
+    LOG_ERROR("lattice_db", "update_sync_filter: unknown channel '%s' (db=%s)",
+              channel.c_str(), config_.path.c_str());
+}
+
 inline void lattice_db::clear_sync_filter() {
     if (synchronizer_) {
         synchronizer_->clear_sync_filter();
@@ -7633,6 +7722,24 @@ inline void lattice_db::clear_sync_filter() {
             ipc.sync->clear_sync_filter();
         }
     }
+}
+
+inline void lattice_db::clear_sync_filter(const std::string& channel) {
+    if (channel.empty()) {
+        config_.sync_filter = std::nullopt;
+        if (synchronizer_) synchronizer_->clear_sync_filter();
+        return;
+    }
+    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
+        if (config_.ipc_targets[i].channel != channel) continue;
+        config_.ipc_targets[i].sync_filter = std::nullopt;
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->clear_sync_filter();
+        }
+        return;
+    }
+    LOG_ERROR("lattice_db", "clear_sync_filter: unknown channel '%s' (db=%s)",
+              channel.c_str(), config_.path.c_str());
 }
 
 inline void lattice_db::trigger_sync_upload() {

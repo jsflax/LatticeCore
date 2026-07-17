@@ -918,7 +918,18 @@ public:
     }
 
     void update_sync_filter(const SyncFilterVector& filter);
+    /// Per-channel variant: `channel` matches an ipc_target's channel name;
+    /// the empty string targets the WSS synchronizer. Required on
+    /// multi-channel hubs — the fan-out variant reconciles every channel
+    /// against one filter.
+    void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter);
     void clear_sync_filter();
+    void clear_sync_filter_for_channel(const std::string& channel);
+    /// A6 — permanently retire a dead sync channel (state + set + slot).
+    /// For channels that will reconnect, use reset via the daemon instead.
+    void remove_sync_channel_state(const std::string& sync_id) {
+        lattice_db::remove_sync_channel_state(sync_id);
+    }
 
     /// Register a callback for cross-process idle hints (no new AuditLog entries).
     /// Fires directly on the xproc background thread, NOT through the scheduler.
@@ -3426,6 +3437,12 @@ public:
 
     // Sync filter
     void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }
+    void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter) const {
+        impl().update_sync_filter_for_channel(channel, filter);
+    }
+    void clear_sync_filter_for_channel(const std::string& channel) const {
+        impl().clear_sync_filter_for_channel(channel);
+    }
 
     // Observers
     void remove_table_observer(const std::string& table_name, uint64_t observer_id) const {

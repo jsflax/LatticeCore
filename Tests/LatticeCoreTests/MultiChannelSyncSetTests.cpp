@@ -215,6 +215,86 @@ TEST(MultiChannelSyncSet, MigrationMultiSlotDrops) {
 }
 
 // ----------------------------------------------------------------------------
+// A6: the eager-collapse count must ignore sync_state rows from channels
+// with no live replication slot — stale confirmations from a removed
+// channel must not collapse an entry before a live channel relays it.
+// ----------------------------------------------------------------------------
+TEST(MultiChannelSyncSet, CollapseCountIgnoresDeadChannels) {
+    TempDB tmp{"mcss_collapse"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    db.add(TestPerson{"Relay", 20, std::nullopt});
+
+    auto audit = db.db().query(
+        "SELECT globalId FROM AuditLog WHERE operation = 'INSERT' LIMIT 1");
+    ASSERT_EQ(audit.size(), 1u);
+    const std::string entry_gid = std::get<std::string>(audit[0].at("globalId"));
+    auto id_rows = db.db().query(
+        "SELECT id FROM AuditLog WHERE globalId = ?", {entry_gid});
+    const int64_t entry_id = std::get<int64_t>(id_rows[0].at("id"));
+
+    // Two LIVE channels (slots registered): "live-a" (about to confirm) and
+    // "live-b" (has NOT relayed yet). Plus a stale confirmation from a DEAD
+    // channel "dead-z" with no slot.
+    db.db().execute(
+        "INSERT OR IGNORE INTO _lattice_replication_slots (sync_id) VALUES ('live-a'), ('live-b')");
+    db.db().execute(
+        "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized)"
+        " VALUES (?, 'dead-z', 1)", {entry_id});
+
+    lattice::mark_audit_entries_synced_for(db, {entry_gid}, "live-a",
+                                           {"live-a", "live-b"});
+
+    EXPECT_EQ(count_rows(db,
+        "SELECT isSynchronized FROM AuditLog WHERE id = " + std::to_string(entry_id)), 0)
+        << "dead-z's stale confirmation must not collapse the entry — "
+           "live-b has not relayed it (silent relay loss)";
+    EXPECT_EQ(count_rows(db,
+        "SELECT COUNT(*) FROM _lattice_sync_state WHERE audit_entry_id = "
+        + std::to_string(entry_id)), 2)
+        << "sync_state rows (dead-z's stale + live-a's fresh; live-b's absence"
+           " = pending) must survive until every LIVE channel confirms";
+
+    // When live-b also confirms, the entry collapses despite dead-z.
+    lattice::mark_audit_entries_synced_for(db, {entry_gid}, "live-b",
+                                           {"live-a", "live-b"});
+    EXPECT_EQ(count_rows(db,
+        "SELECT isSynchronized FROM AuditLog WHERE id = " + std::to_string(entry_id)), 1);
+}
+
+// ----------------------------------------------------------------------------
+// A6: remove_sync_channel_state retires a channel completely (state, set,
+// slot) and leaves other channels untouched.
+// ----------------------------------------------------------------------------
+TEST(MultiChannelSyncSet, RemoveSyncChannelState) {
+    TempDB tmp{"mcss_retire"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    db.db().execute(
+        "INSERT INTO _lattice_sync_set (sync_id, table_name, global_row_id)"
+        " VALUES ('gone', 'T', 'g1'), ('stays', 'T', 'g1')");
+    db.db().execute(
+        "INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized)"
+        " VALUES (1, 'gone', 1), (1, 'stays', 0)");
+    db.db().execute(
+        "INSERT OR IGNORE INTO _lattice_replication_slots (sync_id) VALUES ('gone'), ('stays')");
+
+    db.remove_sync_channel_state("gone");
+
+    EXPECT_EQ(count_rows(db,
+        "SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id = 'gone'"), 0);
+    EXPECT_EQ(count_rows(db,
+        "SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id = 'gone'"), 0);
+    EXPECT_EQ(count_rows(db,
+        "SELECT COUNT(*) FROM _lattice_replication_slots WHERE sync_id = 'gone'"), 0)
+        << "the dead slot must go too — it pins safe compaction forever";
+    EXPECT_EQ(count_rows(db,
+        "SELECT COUNT(*) FROM _lattice_sync_set WHERE sync_id = 'stays'"), 1);
+    EXPECT_EQ(count_rows(db,
+        "SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id = 'stays'"), 1);
+    EXPECT_EQ(count_rows(db,
+        "SELECT COUNT(*) FROM _lattice_replication_slots WHERE sync_id = 'stays'"), 1);
+}
+
+// ----------------------------------------------------------------------------
 // reset_sync_state wipes only the named channel's membership.
 // ----------------------------------------------------------------------------
 TEST(MultiChannelSyncSet, ResetSyncStateScoped) {

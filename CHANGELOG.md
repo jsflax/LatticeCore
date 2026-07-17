@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Added
+- **Stage A sync hardening for multi-channel hubs (A2–A6, Engram Groups increment 1)**:
+  - **A2 — per-channel filter control**: `lattice_db::update_sync_filter(channel, filter)` /
+    `clear_sync_filter(channel)` ("" = WSS) target ONE synchronizer; the
+    fan-out overloads remain but are documented single-channel-only. Bridge:
+    `update_sync_filter_for_channel` / `clear_sync_filter_for_channel`.
+    `ipc_target.narrowing_emits_removals` plumbs through to the synchronizer.
+  - **A3 — schema-skew tolerance**: apply drops unknown columns (loudly) and
+    applies the remainder; unknown-table entries skip-and-ack; an
+    unknown-only UPDATE acks as a no-op. Ends the silent unacked-resend
+    wedge class; the receiver's AuditLog bookkeeping keeps the ORIGINAL
+    payload so onward relay is lossless.
+  - **A4 — narrowing never deletes beyond bookkeeping**: marked
+    filter-removal DELETEs applied over any per-sync channel are recorded
+    fully-synchronized (they clear the local mirror and stop dead — an
+    unfiltered uplink can no longer forward them to a shared server DB);
+    `sync_config.narrowing_emits_removals=false` makes narrowing
+    bookkeeping-only (group-channel semantics: spokes stay full mirrors).
+  - **A5 — synthesized snapshots are insert-if-absent**: new
+    `audit_log_entry.synthesized` provenance flag (AuditLog column, epoch 5;
+    optional wire key, ignored by old peers) set by reconcile Phase-2
+    additions, classify's UPDATE→INSERT conversion, and nuclear-compact
+    regeneration (`generate_history(mark_synthesized:)`). Apply skips the
+    SQL when the row already exists — stale local snapshots can no longer
+    revert newer peer edits or resurrect tombstones.
+  - **A6 — channel teardown hygiene**: eager-collapse counts only sync_ids
+    with LIVE replication slots (a dead channel's stale confirmations could
+    collapse an entry before a live channel relayed it — silent relay
+    loss); new `remove_sync_channel_state(sync_id)` retires a channel
+    (state + set + slot) so it can't pin compaction.
+  - Tests: `SkewToleranceTests` (3), `FilterRemovalGateTests` (3),
+    `SynthesisNoClobberTests` (4), + 2 A6 cases in `MultiChannelSyncSet`.
+    Full suite 249/249.
+
 ### Changed
 - **`_lattice_sync_set` is per-synchronizer (A1, Engram Groups increment 0)**:
   PK widened from `(table_name, global_row_id)` to

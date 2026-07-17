@@ -1868,6 +1868,16 @@ int lattice::migration_get_current_version() {
     return g_migration_current_version;
 }
 
+void lattice::swift_lattice::update_sync_filter_for_channel(const std::string& channel,
+                                                            const SyncFilterVector& filter) {
+    lattice_db::update_sync_filter(channel,
+                                   std::vector<sync_filter_entry>(filter.begin(), filter.end()));
+}
+
+void lattice::swift_lattice::clear_sync_filter_for_channel(const std::string& channel) {
+    lattice_db::clear_sync_filter(channel);
+}
+
 void lattice::swift_lattice::update_sync_filter(const SyncFilterVector& filter) {
     lattice_db::update_sync_filter(std::vector<sync_filter_entry>(filter.begin(), filter.end()));
 }

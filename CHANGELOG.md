@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.1]
+
+The C ABI freeze (plan WS-C C1 exit; docs/CAPI-STABILITY.md becomes binding:
+additive-only from here).
+
+### Changed
+- **Default-hidden visibility + `LATTICE_EXPORT`** (stability rule 8): the
+  shared library now exports exactly the 118 declared `lattice_*` functions;
+  the static libs it absorbs (LatticeCore, LatticeSwiftCppBridge) build
+  hidden too, so their C++ symbols no longer re-export through the `.so`.
+- `LATTICE_CAPI_VERSION*` macros bumped to 1.0.0 (`lattice_capi_version()`
+  returns 1000000). The rc identity is the git tag; the version string keeps
+  its documented MAJOR.MINOR.PATCH shape.
+
 ### Added
 - **C1 slice 3 — Linux SwiftPM fix, C-ABI CI leg, to_json, unified-open
   decision** (plan WS-C; `docs/capi-gap-audit.md` V1, A-11, A-33):

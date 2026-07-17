@@ -133,6 +133,22 @@ set_target_properties(LatticeCAPI PROPERTIES
     SOVERSION 0
 )
 
+# Default-hidden visibility (docs/CAPI-STABILITY.md rule 8): only the
+# LATTICE_EXPORT-annotated C surface leaves the shared library. Applied to the
+# static libs it absorbs too — their default-visibility symbols would
+# otherwise re-export through the .so.
+set(_lattice_hidden_targets LatticeCore LatticeSwiftCppBridge LatticeCAPI SqliteVec)
+if(TARGET sqlite3_bundled)
+    list(APPEND _lattice_hidden_targets sqlite3_bundled)
+endif()
+foreach(tgt ${_lattice_hidden_targets})
+    set_target_properties(${tgt} PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+endforeach()
+
 # On macOS, set install name for proper dylib loading
 if(APPLE)
     set_target_properties(LatticeCAPI PROPERTIES

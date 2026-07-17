@@ -44,10 +44,11 @@ bridge (`LatticeSwiftCppBridge`) and core (`LatticeCore`) headers is
    macOS/Windows and the ABI must behave identically on all three platforms.
    Versioning is carried by `lattice_capi_version()` and the additive-only
    rule instead.
-8. **Visibility (adopted at freeze).** The shared library will build with
+8. **Visibility (adopted at freeze).** The shared library builds with
    default-hidden visibility plus an explicit `LATTICE_EXPORT` on every
-   public function, so the export list is exactly the declared surface. Not
-   yet applied — rides the rc freeze commit together with the C-ABI CI leg.
+   public function, so the export list is exactly the declared surface.
+   Applied at the 1.0.0-rc.1 freeze commit (CMake visibility presets on
+   LatticeCAPI and the static libs it absorbs).
 
 ## Versioning & introspection
 

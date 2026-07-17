@@ -5670,11 +5670,35 @@ private:
     }
 
     void ensure_audit_triggers(const model_schema& schema) {
-        // Quick check: if the insert trigger exists, all three do.
+        // Presence + INTEGRITY check. A real audit trigger always gates on
+        // sync_disabled(); if the insert trigger is missing OR its body lacks
+        // that gate — e.g. a hand-installed `WHEN (0)` stub squatting the
+        // name so a naive existence check passes forever — drop and recreate
+        // all three. This exact tampering silently killed all Memory sync on
+        // a production hub for six days (Jul 2026): every write after the
+        // stub produced no audit entry while every counter looked healthy.
+        // Tampering bumps the SQLite schema cookie, which invalidates the
+        // fingerprint marker and forces the slow path, so this check is
+        // guaranteed to run on the next open. (The old "if the insert
+        // trigger exists, all three do" assumption was also false in that
+        // incident — the UPDATE trigger had been dropped outright.)
         auto rows = db_->query(
-            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='Audit"
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='Audit"
             + schema.table_name + "Insert' LIMIT 1");
-        if (rows.empty()) {
+        bool healthy = false;
+        if (!rows.empty()) {
+            auto it = rows[0].find("sql");
+            healthy = it != rows[0].end() &&
+                      std::holds_alternative<std::string>(it->second) &&
+                      std::get<std::string>(it->second).find("sync_disabled") != std::string::npos;
+            if (!healthy) {
+                LOG_ERROR("lattice_db",
+                          "audit trigger 'Audit%sInsert' exists WITHOUT a sync_disabled() "
+                          "gate (hand-tampered stub?) — recreating all audit triggers",
+                          schema.table_name.c_str());
+            }
+        }
+        if (!healthy) {
             recreate_model_table_triggers(schema);
         }
     }

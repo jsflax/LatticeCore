@@ -295,6 +295,40 @@ TEST(MultiChannelSyncSet, RemoveSyncChannelState) {
 }
 
 // ----------------------------------------------------------------------------
+// Audit-trigger self-heal: a hand-installed `WHEN (0)` stub squatting an
+// audit trigger's name (the Jul 2026 six-day silent Memory-sync outage) is
+// detected and replaced with the real trigger on the next ensure pass.
+// ----------------------------------------------------------------------------
+TEST(MultiChannelSyncSet, AuditTriggerSelfHeal) {
+    TempDB tmp{"trigger_heal"};
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        db.add(TestPerson{"Before", 1, std::nullopt});
+        // Tamper exactly like the production incident: neutered stubs that
+        // name-squat so CREATE IF NOT EXISTS can't restore the real ones.
+        db.db().execute("DROP TRIGGER AuditTestPersonInsert");
+        db.db().execute(
+            "CREATE TRIGGER AuditTestPersonInsert AFTER INSERT ON TestPerson"
+            " WHEN (0) BEGIN SELECT 1; END");
+        db.db().execute("DROP TRIGGER IF EXISTS AuditLog_Update_TestPerson");
+    }
+    // Tampering bumped the schema cookie → reopen takes the slow ensure path.
+    lattice::lattice_db healed{lattice::configuration(tmp.str())};
+    auto sql_rows = healed.db().query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='AuditTestPersonInsert'");
+    ASSERT_EQ(sql_rows.size(), 1u);
+    EXPECT_NE(std::get<std::string>(sql_rows[0].at("sql")).find("sync_disabled"),
+              std::string::npos) << "the stub must be replaced by the real trigger";
+
+    healed.add(TestPerson{"After", 2, std::nullopt});
+    auto audited = healed.db().query(
+        "SELECT COUNT(*) AS n FROM AuditLog WHERE tableName='TestPerson'"
+        " AND operation='INSERT'");
+    EXPECT_GE(std::get<int64_t>(audited[0].at("n")), 1)
+        << "writes after the heal must audit again";
+}
+
+// ----------------------------------------------------------------------------
 // reset_sync_state wipes only the named channel's membership.
 // ----------------------------------------------------------------------------
 TEST(MultiChannelSyncSet, ResetSyncStateScoped) {

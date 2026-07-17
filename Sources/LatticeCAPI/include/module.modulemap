@@ -1,0 +1,7 @@
+// Textual on purpose (docs/capi-gap-audit.md V1, same rationale as the
+// bridge/LatticeCore/SqliteVec maps): consumers (LatticeCAPITests) compile
+// lattice.h textually; nothing imports LatticeCAPI as a clang/Swift module.
+module LatticeCAPI {
+    textual header "lattice.h"
+    export *
+}

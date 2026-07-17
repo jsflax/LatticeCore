@@ -65,11 +65,30 @@ bridge (`LatticeSwiftCppBridge`) and core (`LatticeCore`) headers is
   - **True today:** `attach`, `checkpoint`, `cross_process_observation`,
     `detach`, `fts`, `geo_query`, `ipc`, `knn`, `migration`, `observation`,
     `rollback`, `row_cache`, `statement_counters`, `sync`, `sync_filter`,
-    `sync_progress`, `sync_tuning`, `transactions`.
+    `sync_progress`, `sync_tuning`, `to_json`, `transactions`.
   - **Reserved (false until the feature lands):** `read_generations`,
-    `to_json`, `unified_open`.
+    `unified_open` (deliberately deferred to 1.1 — the unified
+    `lattice_db_open` failed its rc−2wk migration-ABI design gate and took
+    the plan's sanctioned additive-post-1.0 fallback; decision + full
+    design in `docs/design-unified-open.md`).
   - A feature string is added in the same commit as its functions and is
     never removed once shipped.
+
+## `lattice_object_to_json` output contract
+
+The JSON shape emitted by `lattice_object_to_json(obj, max_depth)` is part
+of the ABI contract (bindings build their Detached snapshot types on it)
+and is **pinned to Swift's `DynamicObject.jsonObject(maxDepth:)`** — the
+walker is implemented once in the bridge (`dynamic_object::to_json`) and
+shared by Swift and the C surface. Summary (full text in `lattice.h`):
+`globalId`/`id` when present; primitives by declared column type (INTEGER →
+number, REAL → number, BLOB → **base64** string, TEXT → inlined as JSON when
+it starts with `[`/`{` and parses, else the raw string); vector columns
+omitted; geo_bounds as `{"lat","lon"}` or `{"minLat",…}`; links recursed to
+`max_depth` with `{"globalId"}` stubs at the boundary and on cycle
+revisits; lists as arrays, or `{"count"}`/`{"geoBoundsCount"}` summaries;
+unions as `{"unionRef"}`. Key order within objects is unspecified. Shape
+changes are ABI changes: additive only, behind a new feature string.
 
 ## Surface enforcement
 
@@ -99,16 +118,17 @@ nm -gU .build/arm64-apple-macosx/debug/LatticeCAPI.build/src/lattice.cpp.o \
 # (Linux/CMake shared lib: nm -gD --defined-only libLatticeCAPI.so | awk '$2=="T" && $3 ~ /^lattice_/ {print $3}' | LC_ALL=C sort -u)
 ```
 
-The planned C-ABI CI leg additionally diffs this file against `nm` of the
-built **shared** library (the true export surface, which will matter once
-hidden visibility lands); until then the source-level test above is the
-gate.
+The C-ABI CI leg (`.github/workflows/capi.yml`, Linux + macOS) additionally
+diffs this file against `nm` of the CMake-built **shared** library — the
+true export surface, which the source-level test above cannot see and which
+will matter once hidden visibility lands.
 
 Behavioral coverage lives in `Tests/LatticeCAPITests` — a GoogleTest
 executable that LINKS the C surface and exercises it exactly as a
-Kotlin/Python binding would (`swift run LatticeCAPITests`; macOS-only under
-SwiftPM because the C API library's SwiftPM build is broken on Linux —
-`docs/capi-gap-audit.md` V1 — and built everywhere under CMake).
+Kotlin/Python binding would. Built and run on every platform under BOTH
+build systems since C1 slice 3 fixed the Linux SwiftPM modulemap gap
+(`docs/capi-gap-audit.md` V1): `swift run LatticeCAPITests`, and the CMake
+build against the shared library in the CI leg.
 
 ## Known frozen-in quirks (documented, not fixable in-place)
 

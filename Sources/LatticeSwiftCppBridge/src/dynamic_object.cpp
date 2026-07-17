@@ -3,6 +3,9 @@
 #include <list.hpp>
 #include <geo_bounds.hpp>
 #include <lattice.hpp>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <set>
 
 // std::format / std::vformat parse the format string at runtime, so libc++
 // unconditionally instantiates the floating-point formatter, which depends on
@@ -503,4 +506,215 @@ void lattice::dynamic_object::refresh_row_cache() {
         if (key == "id") continue;
         managed_.source.values[key] = value;
     }
+}
+
+// ============================================================================
+// MARK: - Object-graph → JSON (dynamic_object::to_json)
+//
+// Backs the C ABI's lattice_object_to_json (and Swift-reachable
+// toJson(maxDepth:)). The output contract is PINNED to Swift's
+// DynamicObject.jsonObject(maxDepth:includeVectors:false) — lattice repo,
+// Sources/Lattice/Dynamic/DynamicObject+JSON.swift — so a sibling SDK's
+// Detached is a one-liner over the same shape:
+//
+// - "globalId" and "id" are emitted when present.
+// - primitives by declared column type: integer → JSON number (bools are
+//   0/1), real → JSON number, blob → base64 string, text → if the string's
+//   first character is '[' or '{' AND it parses as JSON it is INLINED as
+//   that value, else the raw string. NULL/absent values omit the key.
+// - vector columns are OMITTED (Swift's includeVectors default).
+// - geo_bounds values: {"lat","lon"} for a point (min == max), else
+//   {"minLat","maxLat","minLon","maxLon"}; absent → key omitted.
+// - to-one links (link/virtual_link): unmanaged/absent target → key
+//   omitted; depth > 0 and target not already visited → recursed with
+//   depth-1; otherwise a {"globalId": gid} stub (key omitted entirely when
+//   the target has no globalId to stub with).
+// - to-many lists (list/virtual_list): geo-bounds lists collapse to
+//   {"geoBoundsCount": n}; depth > 0 → array of recursed elements
+//   (already-visited elements collapse to {"globalId": gid} stubs);
+//   depth <= 0 → {"count": n}.
+// - unions: {"unionRef": "<union row globalId>"} when set.
+// - cycle guard: a visited set keyed "<table>:<globalId>", inserted when an
+//   object with a globalId is serialized and NEVER removed — matching
+//   Swift, a DAG diamond collapses its second occurrence to a stub.
+// - key ORDER inside objects is unspecified (nlohmann sorts, Swift
+//   dictionaries hash); consumers must parse, not string-compare.
+// ============================================================================
+
+namespace {
+
+std::string lattice_json_base64(const std::vector<uint8_t>& data) {
+    static constexpr char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 3 <= data.size(); i += 3) {
+        const uint32_t n = (uint32_t(data[i]) << 16) |
+                           (uint32_t(data[i + 1]) << 8) | data[i + 2];
+        out += tbl[(n >> 18) & 63];
+        out += tbl[(n >> 12) & 63];
+        out += tbl[(n >> 6) & 63];
+        out += tbl[n & 63];
+    }
+    const size_t rem = data.size() - i;
+    if (rem == 1) {
+        const uint32_t n = uint32_t(data[i]) << 16;
+        out += tbl[(n >> 18) & 63];
+        out += tbl[(n >> 12) & 63];
+        out += "==";
+    } else if (rem == 2) {
+        const uint32_t n = (uint32_t(data[i]) << 16) | (uint32_t(data[i + 1]) << 8);
+        out += tbl[(n >> 18) & 63];
+        out += tbl[(n >> 12) & 63];
+        out += tbl[(n >> 6) & 63];
+        out += '=';
+    }
+    return out;
+}
+
+// Swift's inlineText: embedded JSON arrays/objects inline; anything else is
+// the raw string (no whitespace trimming — first character only, as Swift).
+nlohmann::json lattice_json_text_value(const std::string& text) {
+    if (!text.empty() && (text.front() == '[' || text.front() == '{')) {
+        auto parsed = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+        if (!parsed.is_discarded()) return parsed;
+    }
+    return text;
+}
+
+}  // namespace
+
+lattice::link_list lattice::dynamic_object::list_backing(const std::string& name) const {
+    if (this->lattice) {
+        // The same binding get_link_list performs, minus the ref wrapper (the
+        // walker needs raw shared_ptr element access on both ref paths).
+        managed<std::vector<swift_dynamic_object*>> m;
+        const property_descriptor& property = managed_.properties_.at(name);
+        model_base* base = const_cast<model_base*>(static_cast<const model_base*>(&managed_));
+        m.bind_to_parent(base, property);
+        return link_list(m);
+    }
+    // Unmanaged: a list that was never staged reads as empty (the raw
+    // accessor would throw std::out_of_range on the absent key).
+    if (unmanaged_.list_values.count(name)) {
+        if (auto sp = unmanaged_.get_link_list(name)) return *sp;
+    }
+    return link_list{};
+}
+
+void lattice::dynamic_object::json_walk(const dynamic_object& obj, int64_t depth,
+                                        std::set<std::string>& visited,
+                                        void* out_json) {
+    auto& out = *static_cast<nlohmann::json*>(out_json);
+    out = nlohmann::json::object();
+
+    const bool is_managed = obj.lattice != nullptr;
+    const std::string table = obj.get_table_name();
+
+    std::optional<std::string> global_id;
+    if (obj.has_value("globalId")) global_id = obj.get_string("globalId");
+    if (global_id) out["globalId"] = *global_id;
+    if (obj.has_value("id")) out["id"] = obj.get_int("id");
+    // Cycle guard keyed by identity (only objects with a globalId are
+    // guarded — same as Swift; maxDepth is the backstop for the rest).
+    if (global_id) visited.insert(table + ":" + *global_id);
+
+    const auto& props = is_managed ? obj.managed_.properties_ : obj.unmanaged_.properties;
+    for (const auto& [name, prop] : props) {
+        switch (prop.kind) {
+        case property_kind::primitive: {
+            if (prop.is_vector) break;  // omitted (includeVectors=false)
+            if (prop.is_geo_bounds) {
+                if (obj.has_geo_bounds(name)) {
+                    const geo_bounds gb = obj.get_geo_bounds(name);
+                    nlohmann::json g = nlohmann::json::object();
+                    if (gb.is_point()) {
+                        g["lat"] = gb.min_lat;
+                        g["lon"] = gb.min_lon;
+                    } else {
+                        g["minLat"] = gb.min_lat;
+                        g["maxLat"] = gb.max_lat;
+                        g["minLon"] = gb.min_lon;
+                        g["maxLon"] = gb.max_lon;
+                    }
+                    out[name] = std::move(g);
+                }
+                break;
+            }
+            if (!obj.has_value(name)) break;
+            switch (prop.type) {
+            case column_type::integer: out[name] = obj.get_int(name); break;
+            case column_type::real:    out[name] = obj.get_double(name); break;
+            case column_type::blob:    out[name] = lattice_json_base64(obj.get_data(name)); break;
+            case column_type::text:    out[name] = lattice_json_text_value(obj.get_string(name)); break;
+            }
+            break;
+        }
+        case property_kind::link:
+        case property_kind::virtual_link: {
+            const dynamic_object child = obj.get_object(name);
+            if (!child.lattice) break;  // no linked row → key omitted
+            std::optional<std::string> child_gid;
+            if (child.has_value("globalId")) child_gid = child.get_string("globalId");
+            const bool already_visited =
+                child_gid && visited.count(child.get_table_name() + ":" + *child_gid) > 0;
+            if (depth > 0 && !already_visited) {
+                nlohmann::json sub;
+                json_walk(child, depth - 1, visited, &sub);
+                out[name] = std::move(sub);
+            } else if (child_gid) {
+                out[name] = nlohmann::json{{"globalId", *child_gid}};
+            }
+            break;
+        }
+        case property_kind::list:
+        case property_kind::virtual_list: {
+            const link_list list = obj.list_backing(name);
+            if (prop.is_geo_bounds) {
+                // Geo-bounds list lives in a sidecar table; expose its count
+                // through the same list access Swift uses.
+                out[name] = nlohmann::json{{"geoBoundsCount", list.size()}};
+                break;
+            }
+            if (depth > 0) {
+                nlohmann::json arr = nlohmann::json::array();
+                const size_t n = list.size();
+                for (size_t i = 0; i < n; i++) {
+                    const std::shared_ptr<dynamic_object> el = list[i].object;
+                    if (!el) continue;
+                    std::optional<std::string> el_gid;
+                    if (el->has_value("globalId")) el_gid = el->get_string("globalId");
+                    if (el_gid && visited.count(el->get_table_name() + ":" + *el_gid) > 0) {
+                        arr.push_back(nlohmann::json{{"globalId", *el_gid}});
+                    } else {
+                        nlohmann::json sub;
+                        json_walk(*el, depth - 1, visited, &sub);
+                        arr.push_back(std::move(sub));
+                    }
+                }
+                out[name] = std::move(arr);
+            } else {
+                out[name] = nlohmann::json{{"count", list.size()}};
+            }
+            break;
+        }
+        case property_kind::union_type: {
+            // Stored as the union row's globalId in the parent column; the
+            // raw reference is surfaced (rich case decoding is a follow-up,
+            // matching Swift).
+            if (obj.has_value(name)) {
+                out[name] = nlohmann::json{{"unionRef", obj.get_string(name)}};
+            }
+            break;
+        }
+        }
+    }
+}
+
+std::string lattice::dynamic_object::to_json(int64_t max_depth) const {
+    nlohmann::json out;
+    std::set<std::string> visited;
+    json_walk(*this, max_depth, visited, &out);
+    return out.dump();
 }

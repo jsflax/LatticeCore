@@ -1,0 +1,100 @@
+# C-ABI leg (plan WS-C C1; docs/CAPI-STABILITY.md "Surface enforcement").
+#
+# Guards the frozen C surface on both platforms:
+#   1. `swift build` of ALL targets — pins the Linux modulemap fix
+#      (docs/capi-gap-audit.md V1): the LatticeCAPI SwiftPM build used to be
+#      broken on Linux and no CI leg ever compiled it.
+#   2. CMake build of the SHARED LatticeCAPI library — the true export
+#      surface Kotlin/Python bindings load.
+#   3. `nm` of the shared library diffed against the checked-in
+#      Sources/LatticeCAPI/lattice_capi.symbols (the freeze gate; the
+#      source-level CAPISurfaceTests can't see linker-level drift).
+#   4. LatticeCAPITests (GoogleTest, links the C surface exactly as a
+#      binding would) against the CMake-built shared library.
+#   5. lattice.h compiled as pure C11 (stability rule 6).
+#
+# Kept as its own workflow (not a job in linux.yml/macos.yml): those legs
+# gate the core test suite; this one gates the ABI and needs CMake + nm
+# plumbing the others don't.
+name: C ABI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  capi-linux:
+    runs-on: ubuntu-latest
+    # 6.3-noble is the toolchain the V1 modulemap fix was verified against
+    # (its stricter explicit-module handling is what surfaced the bug).
+    container: swift:6.3-noble
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y libsqlite3-dev cmake
+
+      - name: swift build (ALL targets — audit V1 pin)
+        run: swift build
+
+      - name: swift run LatticeCAPITests (SwiftPM leg)
+        run: swift run LatticeCAPITests
+
+      - name: CMake build (shared LatticeCAPI + C-ABI tests)
+        # clang explicitly: match the Swift toolchain (the container's default
+        # cc is gcc, which rejects sqlite-vec's NEON kernels on aarch64).
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build --target LatticeCAPI LatticeCAPITests -j "$(nproc)"
+
+      - name: Symbols freeze gate (nm vs lattice_capi.symbols)
+        run: |
+          nm -gD --defined-only build/libLatticeCAPI.so \
+            | awk '$2=="T" && $3 ~ /^lattice_/ {print $3}' \
+            | LC_ALL=C sort -u > /tmp/exported.symbols
+          grep -v '^#' Sources/LatticeCAPI/lattice_capi.symbols \
+            | grep -v '^[[:space:]]*$' | LC_ALL=C sort -u > /tmp/declared.symbols
+          diff -u /tmp/declared.symbols /tmp/exported.symbols
+
+      - name: Run LatticeCAPITests (against the shared library)
+        run: ./build/LatticeCAPITests
+
+      - name: lattice.h compiles as pure C11
+        run: |
+          clang -std=c11 -fsyntax-only -I Sources/LatticeCAPI/include \
+            -I Tests/LatticeCAPIHeaderCheck/include \
+            Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
+
+  capi-macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: swift run LatticeCAPITests (SwiftPM leg)
+        run: swift run LatticeCAPITests
+
+      - name: CMake build (shared LatticeCAPI + C-ABI tests)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target LatticeCAPI LatticeCAPITests -j "$(sysctl -n hw.ncpu)"
+
+      - name: Symbols freeze gate (nm vs lattice_capi.symbols)
+        run: |
+          nm -gU build/libLatticeCAPI.dylib \
+            | awk '$2=="T" && $3 ~ /^_lattice_/ {sub(/^_/,"",$3); print $3}' \
+            | LC_ALL=C sort -u > /tmp/exported.symbols
+          grep -v '^#' Sources/LatticeCAPI/lattice_capi.symbols \
+            | grep -v '^[[:space:]]*$' | LC_ALL=C sort -u > /tmp/declared.symbols
+          diff -u /tmp/declared.symbols /tmp/exported.symbols
+
+      - name: Run LatticeCAPITests (against the shared library)
+        run: ./build/LatticeCAPITests
+
+      - name: lattice.h compiles as pure C11
+        run: |
+          clang -std=c11 -fsyntax-only -I Sources/LatticeCAPI/include \
+            -I Tests/LatticeCAPIHeaderCheck/include \
+            Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c

@@ -8,15 +8,20 @@
 // observers actually fire across instances; receive_sync_data applies with
 // per-entry error isolation).
 //
-// This file includes ONLY lattice.h — everything observable must be
-// observable through the C ABI, exactly as a Kotlin/Python binding would
-// see it. (SwiftPM: macOS-only executable target `LatticeCAPITests`;
-// CMake: built everywhere — see docs/capi-gap-audit.md V1 for why the
-// SwiftPM Linux closure must not grow the C API library.)
+// This file includes ONLY lattice.h from the product — everything
+// observable must be observable through the C ABI, exactly as a
+// Kotlin/Python binding would see it. (nlohmann/json.hpp is included as a
+// TEST-SIDE verifier only, to parse lattice_object_to_json output — JSON
+// object key order is unspecified, so string comparison would overpin.)
+// (SwiftPM: macOS-only executable target `LatticeCAPITests`; CMake: built
+// everywhere — see docs/capi-gap-audit.md V1 for why the SwiftPM Linux
+// closure must not grow the C API library.)
 
 #include <gtest/gtest.h>
 
 #include "lattice.h"
+
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -137,11 +142,12 @@ void inline_invoke(void* /*context*/, void (*callback)(void*), void* callback_co
 
 TEST(CAPIFeatures, Slice2FeatureStringsAreTrue) {
     for (const char* f : {"checkpoint", "detach", "row_cache", "statement_counters",
-                          "sync_progress", "sync_tuning"}) {
+                          "sync_progress", "sync_tuning", "to_json"}) {
         EXPECT_TRUE(lattice_capi_has_feature(f)) << f;
     }
-    // Still reserved.
-    for (const char* f : {"read_generations", "to_json", "unified_open"}) {
+    // Still reserved. unified_open deliberately stays false at 1.0 — the
+    // drop-gate decision is documented in docs/design-unified-open.md.
+    for (const char* f : {"read_generations", "unified_open"}) {
         EXPECT_FALSE(lattice_capi_has_feature(f)) << f;
     }
     EXPECT_FALSE(lattice_capi_has_feature("no_such_feature"));
@@ -805,4 +811,261 @@ TEST(CAPIReceiveSyncData, PerEntryErrorIsolation) {
     lattice_db_close(dst);
     lattice_db_release(src);
     lattice_db_release(dst);
+}
+
+// ============================================================================
+// lattice_object_to_json (C1 slice 3) — contract pinned to Swift's
+// DynamicObject.jsonObject(maxDepth:) shape (see lattice.h for the full
+// contract). Output is PARSED, never string-compared: key order within JSON
+// objects is explicitly unspecified.
+// ============================================================================
+
+namespace {
+
+// Author {name, bio, note TEXT; score REAL; photo BLOB; pet -> Pet;
+// friends -> [Author]} / Pet {name TEXT; owner -> Author}.
+struct GraphSchema {
+    lattice_property_t author_props[7];
+    lattice_property_t pet_props[2];
+    lattice_schema_t schemas[2];
+
+    GraphSchema() {
+        std::memset(author_props, 0, sizeof(author_props));
+        std::memset(pet_props, 0, sizeof(pet_props));
+        auto text = [](lattice_property_t& p, const char* name) {
+            p.name = name;
+            p.type = LATTICE_TYPE_TEXT;
+            p.kind = LATTICE_KIND_PRIMITIVE;
+            p.nullable = true;
+        };
+        text(author_props[0], "name");
+        text(author_props[1], "bio");
+        text(author_props[2], "note");
+        author_props[3].name = "score";
+        author_props[3].type = LATTICE_TYPE_REAL;
+        author_props[3].kind = LATTICE_KIND_PRIMITIVE;
+        author_props[3].nullable = true;
+        author_props[4].name = "photo";
+        author_props[4].type = LATTICE_TYPE_BLOB;
+        author_props[4].kind = LATTICE_KIND_PRIMITIVE;
+        author_props[4].nullable = true;
+        author_props[5].name = "pet";
+        author_props[5].type = LATTICE_TYPE_TEXT;
+        author_props[5].kind = LATTICE_KIND_LINK;
+        author_props[5].target_table = "Pet";
+        author_props[5].nullable = true;
+        author_props[6].name = "friends";
+        author_props[6].type = LATTICE_TYPE_TEXT;
+        author_props[6].kind = LATTICE_KIND_LINK_LIST;
+        author_props[6].target_table = "Author";
+        author_props[6].nullable = true;
+
+        text(pet_props[0], "name");
+        pet_props[1].name = "owner";
+        pet_props[1].type = LATTICE_TYPE_TEXT;
+        pet_props[1].kind = LATTICE_KIND_LINK;
+        pet_props[1].target_table = "Author";
+        pet_props[1].nullable = true;
+
+        std::memset(schemas, 0, sizeof(schemas));
+        schemas[0].table_name = "Author";
+        schemas[0].properties = author_props;
+        schemas[0].property_count = 7;
+        schemas[1].table_name = "Pet";
+        schemas[1].properties = pet_props;
+        schemas[1].property_count = 2;
+    }
+};
+
+// to_json + parse, freeing the C string.
+nlohmann::json parsed_json(lattice_object_t* obj, int32_t max_depth) {
+    char* json = lattice_object_to_json(obj, max_depth);
+    EXPECT_NE(json, nullptr) << (lattice_last_error() ? lattice_last_error() : "");
+    if (!json) return nlohmann::json::value_t::discarded;
+    auto parsed = nlohmann::json::parse(json, nullptr, /*allow_exceptions=*/false);
+    EXPECT_FALSE(parsed.is_discarded()) << json;
+    lattice_string_free(json);
+    return parsed;
+}
+
+std::string global_id_of(lattice_object_t* obj) {
+    const char* gid = lattice_object_get_global_id(obj);
+    return gid ? gid : "";
+}
+
+}  // namespace
+
+TEST(CAPIToJson, ScalarTypesBlobBase64AndEmbeddedJson) {
+    TempPath path("capi_tojson_scalars");
+    GraphSchema gs;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), gs.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    lattice_object_t* a = lattice_db_create_object(db, "Author");
+    ASSERT_NE(a, nullptr) << lattice_last_error();
+    lattice_object_set_string(a, "name", "Ada");
+    lattice_object_set_string(a, "bio", "[1,2,3]");        // embedded JSON -> inlined
+    lattice_object_set_string(a, "note", "{not json");     // '{' but unparseable -> raw
+    lattice_object_set_double(a, "score", 2.5);
+    const uint8_t photo[] = {0x00, 0x01, 0xFF};
+    lattice_object_set_blob(a, "photo", photo, sizeof(photo));
+    ASSERT_NE(lattice_db_add(db, a), nullptr) << lattice_last_error();
+    lattice_object_release(a);  // drop the add's extra retain
+
+    nlohmann::json j = parsed_json(a, 0);
+    EXPECT_EQ(j["name"], "Ada");
+    EXPECT_EQ(j["bio"], nlohmann::json::parse("[1,2,3]"));  // inlined, not a string
+    EXPECT_EQ(j["note"], "{not json");                       // raw string preserved
+    EXPECT_EQ(j["score"], 2.5);
+    EXPECT_EQ(j["photo"], "AAH/");                           // base64, matching Swift
+    EXPECT_TRUE(j.contains("globalId"));
+    EXPECT_EQ(j["globalId"], global_id_of(a));
+    EXPECT_TRUE(j.contains("id"));
+    EXPECT_EQ(j["id"], lattice_object_get_id(a));
+    // Unset link/columns: keys omitted, not null.
+    EXPECT_FALSE(j.contains("pet"));
+
+    lattice_object_release(a);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+TEST(CAPIToJson, LinkDepthAndStubs) {
+    TempPath path("capi_tojson_links");
+    GraphSchema gs;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), gs.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    lattice_object_t* author = lattice_db_create_object(db, "Author");
+    lattice_object_set_string(author, "name", "Mary");
+    ASSERT_NE(lattice_db_add(db, author), nullptr) << lattice_last_error();
+    lattice_object_release(author);
+
+    lattice_object_t* pet = lattice_db_create_object(db, "Pet");
+    lattice_object_set_string(pet, "name", "Rex");
+    ASSERT_NE(lattice_db_add(db, pet), nullptr) << lattice_last_error();
+    lattice_object_release(pet);
+
+    lattice_object_set_object(author, "pet", pet);
+    const std::string pet_gid = global_id_of(pet);
+    const std::string author_gid = global_id_of(author);
+    ASSERT_FALSE(pet_gid.empty());
+    ASSERT_FALSE(author_gid.empty());
+
+    // Depth 0: the link collapses to a {"globalId"} stub.
+    nlohmann::json j0 = parsed_json(author, 0);
+    ASSERT_TRUE(j0.contains("pet"));
+    EXPECT_EQ(j0["pet"], nlohmann::json({{"globalId", pet_gid}}));
+
+    // Depth 1: the link expands one hop.
+    nlohmann::json j1 = parsed_json(author, 1);
+    ASSERT_TRUE(j1.contains("pet"));
+    EXPECT_EQ(j1["pet"]["name"], "Rex");
+    EXPECT_EQ(j1["pet"]["globalId"], pet_gid);
+
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+TEST(CAPIToJson, CycleCollapsesToStubAndTerminates) {
+    TempPath path("capi_tojson_cycle");
+    GraphSchema gs;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), gs.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    lattice_object_t* author = lattice_db_create_object(db, "Author");
+    lattice_object_set_string(author, "name", "Ouro");
+    ASSERT_NE(lattice_db_add(db, author), nullptr) << lattice_last_error();
+    lattice_object_release(author);
+    lattice_object_t* pet = lattice_db_create_object(db, "Pet");
+    lattice_object_set_string(pet, "name", "Boros");
+    ASSERT_NE(lattice_db_add(db, pet), nullptr) << lattice_last_error();
+    lattice_object_release(pet);
+
+    // Author -> Pet -> Author cycle.
+    lattice_object_set_object(author, "pet", pet);
+    lattice_object_set_object(pet, "owner", author);
+
+    // Generous depth: must terminate, with the back-link collapsing to the
+    // visited author's stub (cycle guard), not recursing.
+    nlohmann::json j = parsed_json(author, 16);
+    ASSERT_TRUE(j.contains("pet"));
+    EXPECT_EQ(j["pet"]["name"], "Boros");
+    ASSERT_TRUE(j["pet"].contains("owner"));
+    EXPECT_EQ(j["pet"]["owner"],
+              nlohmann::json({{"globalId", global_id_of(author)}}));
+
+    lattice_object_release(author);
+    lattice_object_release(pet);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+TEST(CAPIToJson, ListsExpandAtDepthAndSummarizeAtBoundary) {
+    TempPath path("capi_tojson_lists");
+    GraphSchema gs;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), gs.schemas, 2);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    lattice_object_t* a = lattice_db_create_object(db, "Author");
+    lattice_object_set_string(a, "name", "Hub");
+    ASSERT_NE(lattice_db_add(db, a), nullptr) << lattice_last_error();
+    lattice_object_release(a);
+
+    lattice_link_list_t* friends = lattice_object_get_link_list(a, "friends");
+    ASSERT_NE(friends, nullptr) << lattice_last_error();
+    for (const char* name : {"F1", "F2"}) {
+        lattice_object_t* f = lattice_db_create_object(db, "Author");
+        lattice_object_set_string(f, "name", name);
+        ASSERT_NE(lattice_db_add(db, f), nullptr) << lattice_last_error();
+        lattice_object_release(f);
+        lattice_link_list_push_back(friends, f);
+        lattice_object_release(f);
+    }
+    ASSERT_EQ(lattice_link_list_size(friends), 2u);
+
+    // Depth 0: the list is a {"count"} summary.
+    nlohmann::json j0 = parsed_json(a, 0);
+    ASSERT_TRUE(j0.contains("friends"));
+    EXPECT_EQ(j0["friends"], nlohmann::json({{"count", 2}}));
+
+    // Depth 1: elements expand; THEIR lists summarize at the boundary.
+    nlohmann::json j1 = parsed_json(a, 1);
+    ASSERT_TRUE(j1["friends"].is_array());
+    ASSERT_EQ(j1["friends"].size(), 2u);
+    std::set<std::string> names;
+    for (const auto& el : j1["friends"]) {
+        ASSERT_TRUE(el.contains("name"));
+        names.insert(el["name"].get<std::string>());
+        ASSERT_TRUE(el.contains("friends"));
+        EXPECT_EQ(el["friends"], nlohmann::json({{"count", 0}}));
+    }
+    EXPECT_EQ(names, (std::set<std::string>{"F1", "F2"}));
+
+    lattice_link_list_release(friends);
+    lattice_object_release(a);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+TEST(CAPIToJson, UnmanagedObjectAndErrorContract) {
+    GraphSchema gs;
+    lattice_object_t* obj = lattice_object_create_with_schema(
+        "Author", gs.author_props, gs.schemas[0].property_count);
+    ASSERT_NE(obj, nullptr) << lattice_last_error();
+    lattice_object_set_string(obj, "name", "Loose");
+    lattice_object_set_double(obj, "score", 1.0);
+
+    // Unmanaged objects serialize their staged scalars; no identity keys.
+    nlohmann::json j = parsed_json(obj, 1);
+    EXPECT_EQ(j["name"], "Loose");
+    EXPECT_EQ(j["score"], 1.0);
+    EXPECT_FALSE(j.contains("globalId"));
+    EXPECT_FALSE(j.contains("id"));
+    lattice_object_release(obj);
+
+    EXPECT_EQ(lattice_object_to_json(nullptr, 5), nullptr);
+    ASSERT_NE(lattice_last_error(), nullptr);
 }

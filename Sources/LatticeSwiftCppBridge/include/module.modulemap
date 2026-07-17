@@ -1,0 +1,28 @@
+// Handwritten module map (docs/capi-gap-audit.md V1).
+//
+// Every header a C++ target can #include is TEXTUAL, mirroring the maps in
+// LatticeCore/SqliteVec/GoogleTest: SwiftPM passes this file to dependent
+// C-family compiles via -fmodule-map-file even though it never builds clang
+// modules for them, so a non-textual header claim makes clang demand a module
+// nobody provides ("module 'LatticeSwiftCppBridge' is needed but has not been
+// provided") and breaks `swift build` of LatticeCAPI on Linux.
+//
+// Unlike those leaf maps, this module IS imported by Swift (`import
+// LatticeSwiftCppBridge` in the Lattice package, C++ interop), and an
+// all-textual module is EMPTY to Swift. swift_module_umbrella.hpp exists
+// solely to anchor the module for ClangImporter: it is the one real header,
+// it textually inlines all the others, and no C++ TU includes it.
+module LatticeSwiftCppBridge {
+    header "swift_module_umbrella.hpp"
+    textual header "LatticeBridge.hpp"
+    textual header "bridging.hpp"
+    textual header "dynamic_object.hpp"
+    textual header "error.hpp"
+    textual header "geo_bounds.hpp"
+    textual header "lattice.hpp"
+    textual header "list.hpp"
+    textual header "managed_object.hpp"
+    textual header "unmanaged_object.hpp"
+    textual header "util.hpp"
+    export *
+}

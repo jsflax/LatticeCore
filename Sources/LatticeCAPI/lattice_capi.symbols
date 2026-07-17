@@ -99,6 +99,7 @@ lattice_object_set_int
 lattice_object_set_null
 lattice_object_set_object
 lattice_object_set_string
+lattice_object_to_json
 lattice_results_count
 lattice_results_free
 lattice_results_get

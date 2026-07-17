@@ -91,6 +91,7 @@ extern "C" bool lattice_capi_has_feature(const char* feature) {
         "sync_filter",
         "sync_progress",
         "sync_tuning",
+        "to_json",
         "transactions",
     };
     for (const char* const f : kFeatures) {
@@ -2742,5 +2743,34 @@ extern "C" int64_t lattice_db_read_upload_floor(lattice_db_t* db, const char* sy
     } catch (const std::exception& e) {
         set_error(e.what());
         return -1;
+    }
+}
+
+// =============================================================================
+// Object-graph -> JSON (C1 slice 3; audit A-11)
+// =============================================================================
+
+extern "C" char* lattice_object_to_json(lattice_object_t* obj, int32_t max_depth) {
+    if (!obj) {
+        set_error("null argument");
+        return nullptr;
+    }
+    try {
+        auto* ref = reinterpret_cast<lattice_object_internal*>(obj);
+        // Contract pinned to Swift's DynamicObject.jsonObject — implemented
+        // once in the bridge (dynamic_object::to_json) so every consumer
+        // (Swift, C, Kotlin/Python via this ABI) shares the walker.
+        const std::string json = ref->to_json(max_depth);
+        char* ret = static_cast<char*>(malloc(json.size() + 1));
+        if (ret) {
+            std::memcpy(ret, json.c_str(), json.size() + 1);
+        }
+        return ret;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("unknown error in lattice_object_to_json");
+        return nullptr;
     }
 }

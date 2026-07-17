@@ -48,8 +48,12 @@ target_compile_definitions(SqliteVec PRIVATE
     SQLITE_VEC_STATIC
     SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
 )
-# Enable NEON on ARM (macOS/iOS)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+# Enable NEON on ARM — Clang only: sqlite-vec's NEON kernels rely on Clang's
+# lax int8x16_t/uint8x16_t conversions and do not compile under GCC's strict
+# intrinsic signatures (seen on aarch64 Linux). The SwiftPM build always uses
+# Clang; keep the CMake path aligned rather than forking behavior.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"
+   AND CMAKE_C_COMPILER_ID MATCHES "Clang")
     target_compile_definitions(SqliteVec PRIVATE SQLITE_VEC_ENABLE_NEON)
 endif()
 target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
@@ -71,6 +75,11 @@ add_library(LatticeCore STATIC
 target_include_directories(LatticeCore PUBLIC
     Sources/LatticeCore/include
 )
+# Parity with Package.swift's LatticeCore cxxSettings: without SQLITE_CORE,
+# sqlite-vec.h (included by db.cpp) switches to sqlite3ext.h extension mode
+# and every sqlite3_* call expands to the undefined sqlite3_api thunk table
+# (bites on Linux, where libsqlite3-dev ships sqlite3ext.h).
+target_compile_definitions(LatticeCore PRIVATE SQLITE_CORE)
 target_link_libraries(LatticeCore PUBLIC
     SqliteVec
     SQLite::SQLite3
@@ -193,5 +202,8 @@ add_executable(LatticeCAPITests
 )
 target_link_libraries(LatticeCAPITests PRIVATE LatticeCAPI gtest_main)
 target_include_directories(LatticeCAPITests PRIVATE
-    Sources/LatticeCAPI/include)
+    Sources/LatticeCAPI/include
+    # Test-side JSON verifier only (nlohmann) — to_json output is parsed,
+    # never string-compared (key order is unspecified).
+    Sources/LatticeCore/include)
 gtest_discover_tests(LatticeCAPITests)

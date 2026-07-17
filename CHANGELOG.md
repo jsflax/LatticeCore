@@ -3,6 +3,60 @@
 ## [Unreleased]
 
 ### Added
+- **C1 slice 3 — Linux SwiftPM fix, C-ABI CI leg, to_json, unified-open
+  decision** (plan WS-C; `docs/capi-gap-audit.md` V1, A-11, A-33):
+  - **Linux `swift build` of ALL targets fixed** (audit V1): handwritten
+    `module.modulemap`s for `LatticeSwiftCppBridge` and
+    `LatticeCAPIHeaderCheck` (the pattern LatticeCore/SqliteVec/GoogleTest
+    already used). The bridge map needed a twist the audit's fix shape
+    missed: an all-textual map fixes Linux but empties the module for the
+    Lattice Swift package's `import LatticeSwiftCppBridge` (C++ interop).
+    New `swift_module_umbrella.hpp` is the module's single real header —
+    Swift's ClangImporter builds the module from it (all bridge headers
+    textually inlined, same alphabetical order the synthesized umbrella
+    used); every other header is `textual`, and no C++ TU may ever include
+    the anchor. Verified: `swift build` green in swift:6.3-noble (all
+    targets) AND the Lattice Swift package builds against the fixed tree.
+  - **`lattice_object_to_json(obj, max_depth)`** (audit A-11, sized M):
+    object-graph → JSON walker implemented ONCE in the bridge
+    (`dynamic_object::to_json`, Swift-reachable as `toJson(maxDepth:)`)
+    and wrapped by the C ABI. Output contract PINNED to Swift's
+    `DynamicObject.jsonObject(maxDepth:)` shape — `globalId`/`id`,
+    primitives by declared column type (blobs base64, embedded JSON text
+    inlined), vectors omitted, geo `{lat,lon}`/`{minLat…}`, links recursed
+    to depth with `{"globalId"}` stubs at boundary/cycle revisits, lists as
+    arrays or `{"count"}`/`{"geoBoundsCount"}` summaries, unions
+    `{"unionRef"}`, `table:globalId` cycle guard. Feature string `to_json`
+    flipped true; contract documented in `lattice.h` +
+    `docs/CAPI-STABILITY.md`. 5 new LatticeCAPITests (28 total): scalar
+    types/base64/embedded-JSON, link depth + stubs, cycle termination,
+    list expand/summarize, unmanaged + error contract.
+  - **C-ABI CI leg** (`.github/workflows/capi.yml`, Linux + macOS): builds
+    the SHARED LatticeCAPI via CMake, diffs `nm` exports against
+    `lattice_capi.symbols` (the freeze gate, now enforced at the linker
+    level), runs LatticeCAPITests against the shared library, compiles
+    `lattice.h` as pure C11, and pins the V1 fix with a full Linux
+    `swift build`. Kept as its own workflow: the linux/macos legs gate the
+    core suite; this one gates the ABI.
+  - **CMake-on-Linux portability** (surfaced by the new CI leg; the CMake
+    path had only ever been exercised on Android/macOS): `LatticeCore` now
+    defines `SQLITE_CORE` (parity with Package.swift — without it,
+    sqlite-vec.h flips into sqlite3ext.h extension mode on Linux and every
+    sqlite3_* call expands to the undefined `sqlite3_api` thunk table), and
+    the SqliteVec NEON kernels are gated to Clang (GCC's strict intrinsic
+    signatures reject them on aarch64).
+  - **Unified `lattice_db_open`: DEFERRED TO 1.1** (drop-gate applied
+    honestly — `docs/design-unified-open.md`): the migration value-union
+    ABI cannot be pinned while G3's `(rowId, [String: ColumnValue])` shape
+    is unlanded in the Swift repo (its `enumerateObjects` is still a stub),
+    write-path ownership is undecided, and the bridge's single
+    row-migration slot lacks version dispatch. The plan prices the
+    fallback as free (additive post-1.0). `unified_open` stays
+    reserved-false; the design doc carries the full proposed
+    `lattice_open_options_t`/`lattice_migration_step_t` shape and the 1.1
+    checklist. Symbols file: 117 → 118 exports
+    (`lattice_object_to_json`).
+
 - **C1 slice 2 — C-ABI sync surface + feature functions** (plan WS-C;
   `docs/capi-gap-audit.md` A-8/9/10, A-15, A-22..A-30, A-32):
   - **Sync options** (audit A-22): size-prefixed `lattice_sync_options_t`

@@ -7,6 +7,7 @@
 #include <string>
 #include <atomic>
 #include <memory>
+#include <set>
 #include <unmanaged_object.hpp>
 #include <managed_object.hpp>
 #include <LatticeCore.hpp>
@@ -370,7 +371,17 @@ public:
     }
 
     void manage(managed<swift_dynamic_object> o);
-    
+
+    /// Object-graph → JSON string. The output contract is PINNED to Swift's
+    /// `DynamicObject.jsonObject(maxDepth:)` (lattice repo,
+    /// Sources/Lattice/Dynamic/DynamicObject+JSON.swift) so a sibling SDK's
+    /// Detached is a one-liner over the same shape — see the full contract
+    /// comment above json_walk in dynamic_object.cpp and the C ABI docs for
+    /// lattice_object_to_json.
+    /// `max_depth` = link hops to follow; <= 0 collapses to-one links to
+    /// {"globalId"} stubs and to-many lists to {"count"} summaries.
+    std::string to_json(int64_t max_depth) const SWIFT_NAME(toJson(maxDepth:));
+
     std::string debug_description() const;
     
     std::shared_ptr<dynamic_object> make_shared() const { return std::make_shared<dynamic_object>(*this); }
@@ -384,6 +395,14 @@ public:
     }
 
 private:
+    // to_json internals (dynamic_object.cpp). out_json is a nlohmann::json*
+    // passed as void* to keep the JSON dependency out of this header;
+    // list_backing reproduces get_link_list without the ref wrapper (the
+    // walker needs raw element access on both the FRT and value paths).
+    static void json_walk(const dynamic_object& obj, int64_t depth,
+                          std::set<std::string>& visited, void* out_json);
+    link_list list_backing(const std::string& name) const;
+
     union {
         swift_dynamic_object unmanaged_;
         managed<swift_dynamic_object> managed_;
@@ -604,6 +623,11 @@ public:
 
     std::string get_table_name() const SWIFT_NAME(getTableName()) {
         return impl_->get_table_name();
+    }
+
+    /// Object-graph → JSON — see dynamic_object::to_json for the pinned contract.
+    std::string to_json(int64_t max_depth) const SWIFT_NAME(toJson(maxDepth:)) {
+        return impl_->to_json(max_depth);
     }
 
     std::string debug_description() const {

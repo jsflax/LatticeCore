@@ -2,12 +2,12 @@
 
 import PackageDescription
 
-// The behavioral C-ABI test target links the LatticeCAPI library, whose
-// SwiftPM build is broken on Linux (missing bridge modulemap — see
-// docs/capi-gap-audit.md V1). Gate it to macOS manifests so the Linux
-// `swift run LatticeCoreTests` closure never grows the CAPI library;
-// on Linux the same tests build via CMake (CMakeLists.txt).
-#if os(macOS)
+// The behavioral C-ABI test target links the LatticeCAPI library. Built on
+// every platform since C1 slice 3 fixed the Linux SwiftPM modulemap gap
+// (docs/capi-gap-audit.md V1 — bridge + LatticeCAPIHeaderCheck maps); it is
+// a separate product, so the Linux `swift run LatticeCoreTests` closure
+// still never grows the CAPI library. Also built via CMake against the
+// SHARED library (the true export surface) in the capi.yml CI leg.
 let capiTestProducts: [Product] = [
     .executable(
         name: "LatticeCAPITests",
@@ -22,6 +22,9 @@ let capiTestTargets: [Target] = [
         cxxSettings: [
             .headerSearchPath("../../Sources/LatticeCAPI/include"),
             .headerSearchPath("../../Sources/GoogleTest/include"),
+            // Test-side JSON verifier only (nlohmann): to_json output has
+            // unspecified key order, so tests parse instead of string-compare.
+            .headerSearchPath("../../Sources/LatticeCore/include"),
             .unsafeFlags(["-std=c++20"]),
             .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
         ],
@@ -30,10 +33,6 @@ let capiTestTargets: [Target] = [
         ]
     ),
 ]
-#else
-let capiTestProducts: [Product] = []
-let capiTestTargets: [Target] = []
-#endif
 
 let package = Package(
     name: "LatticeCore",

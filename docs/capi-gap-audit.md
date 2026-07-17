@@ -163,6 +163,18 @@ policy.
 
 ### V1. Linux `swift build` of LatticeCAPI — modulemap gap
 
+**RESOLVED (C1 slice 3).** Fixed with handwritten `module.modulemap`s for
+`LatticeSwiftCppBridge`, `LatticeCAPI`, and `Tests/LatticeCAPIHeaderCheck`
+— fix shape (1) below, with one correction the audit missed: an
+all-textual bridge map empties the module for the Lattice Swift package's
+`import LatticeSwiftCppBridge`, so the bridge map anchors the module on a
+Swift-only real header (`swift_module_umbrella.hpp`, never included by
+C++) with every other header `textual`. Verified in swift:6.3-noble:
+`swift build` (all targets, including the now-ungated LatticeCAPITests)
+and `swift run LatticeCAPITests` both green; the Lattice Swift package
+still builds on macOS. Enforced by `.github/workflows/capi.yml`.
+Original finding follows.
+
 **Still broken as of `f5f7cd7` (static verification; no Linux toolchain/daemon available
 on this machine to re-run the build).** Evidence:
 

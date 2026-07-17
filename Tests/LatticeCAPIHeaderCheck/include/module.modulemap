@@ -1,0 +1,4 @@
+module LatticeCAPIHeaderCheck {
+    textual header "capi_header_check.h"
+    export *
+}

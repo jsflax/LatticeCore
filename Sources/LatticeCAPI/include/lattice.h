@@ -57,9 +57,10 @@ int32_t lattice_schema_format_epoch(void);
 //   "attach", "checkpoint", "cross_process_observation", "detach", "fts",
 //   "geo_query", "ipc", "knn", "migration", "observation", "rollback",
 //   "row_cache", "statement_counters", "sync", "sync_filter",
-//   "sync_progress", "sync_tuning", "transactions"
+//   "sync_progress", "sync_tuning", "to_json", "transactions"
 // Reserved strings that will return true when the feature lands (planned):
-//   "read_generations", "to_json", "unified_open"
+//   "read_generations", "unified_open" (deferred to 1.1 —
+//   docs/design-unified-open.md)
 bool lattice_capi_has_feature(const char* feature);
 
 // =============================================================================
@@ -985,6 +986,37 @@ lattice_status_t lattice_db_checkpoint(lattice_db_t* db, int32_t mode);
 // exist (no floor advanced yet), -1 on invalid arguments or database error
 // (see lattice_last_error()).
 int64_t lattice_db_read_upload_floor(lattice_db_t* db, const char* sync_id);
+
+// =============================================================================
+// Object-graph -> JSON (Detached snapshot backing)
+// =============================================================================
+
+// Serialize an object's data view - and its link graph, followed to
+// max_depth hops - to a JSON string. This is the primitive a binding's
+// Detached/detached(maxDepth) is built on.
+//
+// The output contract is PINNED to Swift's
+// DynamicObject.jsonObject(maxDepth:) so all SDKs produce the same shape:
+// - "globalId" / "id" keys when present.
+// - primitives by declared column type: INTEGER -> number (bools are 0/1),
+//   REAL -> number, BLOB -> base64 string, TEXT -> inlined as JSON when the
+//   string's first character is '[' or '{' and it parses, else the raw
+//   string. NULL/absent values omit the key. Vector columns are OMITTED.
+// - geo_bounds: {"lat","lon"} for a point, else
+//   {"minLat","maxLat","minLon","maxLon"}.
+// - to-one links: recursed while max_depth > 0; at the boundary (or on a
+//   revisit of an already-serialized object) they collapse to a
+//   {"globalId": "..."} stub; absent links omit the key.
+// - to-many lists: arrays of recursed elements while max_depth > 0, else a
+//   {"count": n} summary; geo-bounds lists are {"geoBoundsCount": n}.
+// - unions: {"unionRef": "<union row globalId>"}.
+// - cycle-safe: revisited objects (keyed table:globalId) become stubs.
+// - key ORDER within objects is unspecified; parse, don't string-compare.
+//
+// max_depth <= 0 serializes scalars only (links/lists collapse as above).
+// Returns a malloc'd NUL-terminated string - free with lattice_string_free.
+// Returns NULL on error (see lattice_last_error()).
+char* lattice_object_to_json(lattice_object_t* obj, int32_t max_depth);
 
 #ifdef __cplusplus
 }

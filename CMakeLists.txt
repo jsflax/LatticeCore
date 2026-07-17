@@ -170,9 +170,17 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
+    Tests/LatticeCoreTests/CAPISurfaceTests.cpp
+    Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 )
 target_link_libraries(LatticeCoreTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
-target_include_directories(LatticeCoreTests PRIVATE Tests/LatticeCoreTests)
+target_include_directories(LatticeCoreTests PRIVATE
+    Tests/LatticeCoreTests
+    Tests/LatticeCAPIHeaderCheck/include
+    Sources/LatticeCAPI/include)
+# The header-compile pin must be built as pure C11 (docs/CAPI-STABILITY.md).
+set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
+    PROPERTIES COMPILE_OPTIONS "-std=c11")
 
 include(GoogleTest)
 gtest_discover_tests(LatticeCoreTests)

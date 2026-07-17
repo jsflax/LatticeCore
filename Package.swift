@@ -120,9 +120,24 @@ let package = Package(
                 .unsafeFlags(["-std=c++20"]),
             ]
         ),
+        // Compiles the public C ABI header (lattice.h) as pure C11
+        // (docs/CAPI-STABILITY.md). Lives in its own C-only target because
+        // SwiftPM applies a C++ target's -std=c++20 unsafeFlags to C sources
+        // too. Only needs the header — the C API *library* is deliberately
+        // NOT in the test closure (its SwiftPM build is broken on Linux; see
+        // docs/capi-gap-audit.md V1).
+        .target(
+            name: "LatticeCAPIHeaderCheck",
+            path: "Tests/LatticeCAPIHeaderCheck",
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("../../Sources/LatticeCAPI/include"),
+                .unsafeFlags(["-std=c11"]),
+            ]
+        ),
         .executableTarget(
             name: "LatticeCoreTests",
-            dependencies: ["LatticeCore", "LatticeSwiftCppBridge", "GoogleTest"],
+            dependencies: ["LatticeCore", "LatticeSwiftCppBridge", "GoogleTest", "LatticeCAPIHeaderCheck"],
             path: "Tests/LatticeCoreTests",
             exclude: ["vendor", "LatticeCoreTests_legacy.cpp.bak", "IPCTests.hpp", "SyncIntegrationTests.hpp"],
             cxxSettings: [

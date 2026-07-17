@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### Added
+- **C1 slice 1 — C-ABI foundation** (plan WS-C; `docs/capi-gap-audit.md`):
+  - Versioning/introspection on the C ABI: `lattice_capi_version()`,
+    `lattice_capi_version_string()`, `lattice_schema_format_epoch()`,
+    `lattice_capi_has_feature(name)` (+ `LATTICE_CAPI_VERSION*` header
+    macros). Feature strings cover what exists today; reserved strings are
+    documented and return false until they land.
+  - Implemented the two **phantom symbols** (audit B-9):
+    `lattice_db_observe_cross_process` /
+    `lattice_db_remove_cross_process_observer` — declared in the frozen
+    header since 2026-03-27 but never defined. Registered over the core
+    cross-process notifier's shared batched change-dispatch path.
+  - **ABI freeze enforcement**: checked-in canonical export list
+    `Sources/LatticeCAPI/lattice_capi.symbols` + `CAPISurfaceTests`
+    (declared⊆implemented, implemented⊆declared, symbols-file exact match)
+    + `capi_header_compiles.c` compiled as pure C11 in the suite (new
+    C-only target `LatticeCAPIHeaderCheck`). Would have caught B-9 the day
+    it happened.
+  - ABI policy: `docs/CAPI-STABILITY.md` (additive-only post-1.0, enums
+    grow at tail, `struct_size` on new pointer-structs, deprecated wrappers
+    survive 1.x, thread-local `lattice_last_error`, symbols-file gate).
+  - Core: public `lattice_db::schema_format_epoch()` accessor for the
+    protected epoch constant.
+
+### Fixed
+- `lattice_db_receive_sync_data` (audit B-2, P1): replaced a divergent
+  all-or-nothing reimplementation with the same core path the Swift bridge
+  uses (`swift_lattice::receive_sync_data` → `apply_remote_changes`):
+  per-entry error isolation, returns ONLY successfully-applied ids; total
+  failure returns NULL with `lattice_last_error()` set.
+- `lattice_db_set_sync_filter` (audit B-3, P1): the impl parsed only the
+  core key `"where_clause"` while the header documented `"predicate"` — a
+  documented-form filter silently synced ALL rows. Both keys are now
+  accepted (documented; `"predicate"` preferred).
+- `lattice_db_create_with_migration` (audit B-8, P1): the JSON row
+  round-trip silently dropped BLOB columns. Migrating a table with BLOB
+  columns (declared, or encountered in old rows) is now an explicit
+  documented error instead of silent data loss; full BLOB-capable migration
+  rides the unified-open ABI work.
+
 ## [0.10.11] - 2026-07-16
 
 ### Added

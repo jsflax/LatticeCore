@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <mutex>
+#include <stdexcept>
 #include <cstring>
 #include <cstdlib>
 
@@ -43,6 +45,46 @@ struct lattice_results_internal {
 
 extern "C" const char* lattice_last_error(void) {
     return g_last_error.empty() ? nullptr : g_last_error.c_str();
+}
+
+// =============================================================================
+// Versioning & Introspection
+// =============================================================================
+
+extern "C" uint32_t lattice_capi_version(void) {
+    return LATTICE_CAPI_VERSION;
+}
+
+extern "C" const char* lattice_capi_version_string(void) {
+    return LATTICE_CAPI_VERSION_STRING;
+}
+
+extern "C" int32_t lattice_schema_format_epoch(void) {
+    return lattice::lattice_db::schema_format_epoch();
+}
+
+extern "C" bool lattice_capi_has_feature(const char* feature) {
+    if (!feature) return false;
+    // Keep sorted; the reserved (currently-false) strings are documented in
+    // lattice.h and docs/CAPI-STABILITY.md.
+    static const char* const kFeatures[] = {
+        "attach",
+        "cross_process_observation",
+        "fts",
+        "geo_query",
+        "ipc",
+        "knn",
+        "migration",
+        "observation",
+        "rollback",
+        "sync",
+        "sync_filter",
+        "transactions",
+    };
+    for (const char* const f : kFeatures) {
+        if (std::strcmp(feature, f) == 0) return true;
+    }
+    return false;
 }
 
 // =============================================================================
@@ -981,39 +1023,27 @@ extern "C" char* lattice_db_receive_sync_data(
     try {
         auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
 
-        // Parse the JSON data as ServerSentEvent
+        // Validate the payload up front so a malformed message keeps the
+        // documented NULL-on-error contract (the bridge call below maps a
+        // parse failure to an empty result without setting an error).
         std::string json_str(reinterpret_cast<const char*>(data), data_size);
-        auto event = lattice::server_sent_event::from_json(json_str);
-
-        if (!event) {
+        if (!lattice::server_sent_event::from_json(json_str)) {
             set_error("Failed to parse sync data");
             return nullptr;
         }
 
-        std::vector<std::string> applied_ids;
+        // Route through the same core path the Swift bridge uses
+        // (swift_lattice::receive_sync_data -> lattice::apply_remote_changes):
+        // per-entry error isolation, returns only the successfully-applied
+        // ids. Replaces a divergent all-or-nothing reimplementation that
+        // left already-executed entries unreported when a later entry threw
+        // (docs/capi-gap-audit.md B-2).
+        std::vector<uint8_t> bytes(data, data + data_size);
+        auto applied_ids = db_ref->get()->receive_sync_data(bytes);
 
-        if (event->event_type == lattice::server_sent_event::type::audit_log) {
-            // Apply each audit log entry
-            for (const auto& entry : event->audit_logs) {
-                // Get schema for table
-                const auto* props = db_ref->get()->get_properties_for_table(entry.table_name);
-                std::unordered_map<std::string, lattice::column_type> schema;
-                if (props) {
-                    for (const auto& [name, desc] : *props) {
-                        schema[name] = desc.type;
-                    }
-                }
-
-                // Generate and execute SQL
-                auto [sql, params] = entry.generate_instruction(schema);
-                db_ref->get()->db().execute(sql, params);
-
-                applied_ids.push_back(entry.global_id);
-            }
-        } else if (event->event_type == lattice::server_sent_event::type::ack) {
-            // Mark entries as synchronized
-            lattice::mark_audit_entries_synced(*db_ref->get(), event->acked_ids);
-            applied_ids = event->acked_ids;
+        if (auto err = db_ref->get()->last_receive_error()) {
+            set_error(*err);
+            return nullptr;
         }
 
         // Return JSON array of applied IDs
@@ -1823,6 +1853,28 @@ extern "C" lattice_db_t* lattice_db_create_with_migration(
         }
 
         if (migration_fn && migration_table) {
+            // B-8 (docs/capi-gap-audit.md): the JSON row round-trip below
+            // cannot represent BLOB values - std::vector<uint8_t> variants
+            // were silently skipped when serializing old_row and blob values
+            // cannot be expressed in new_values_json, so a C-driven migration
+            // of a blob-bearing table lost data silently. Refuse loudly
+            // instead. (Vector columns are BLOB-typed and are refused too.)
+            // Full BLOB-capable migration rides the unified-open ABI work.
+            for (const auto& entry : schema_vec) {
+                if (entry.table_name != migration_table) continue;
+                for (const auto& [prop_name, desc] : entry.properties) {
+                    if (desc.kind == lattice::property_kind::primitive &&
+                        desc.type == lattice::column_type::blob) {
+                        set_error(std::string("lattice_db_create_with_migration: table '") +
+                                  migration_table + "' has BLOB column '" + prop_name +
+                                  "' - the C migration callback's JSON row format cannot "
+                                  "represent BLOB values, and migrating this table would "
+                                  "silently drop them. BLOB-table row migration via the C "
+                                  "ABI is unsupported (see lattice.h).");
+                        return nullptr;
+                    }
+                }
+            }
             std::string table_name = migration_table;
             config.migration_block = [migration_context, migration_fn, table_name](
                 lattice::migration_context& ctx) {
@@ -1839,6 +1891,16 @@ extern "C" lattice_db_t* lattice_db_create_with_migration(
                             old_json[k] = std::get<double>(v);
                         } else if (std::holds_alternative<std::string>(v)) {
                             old_json[k] = std::get<std::string>(v);
+                        } else if (std::holds_alternative<std::vector<uint8_t>>(v)) {
+                            // B-8: a BLOB value from the OLD on-disk schema
+                            // (column absent from the new schema, so the
+                            // up-front check could not see it). Silently
+                            // dropping it loses data - fail the open instead.
+                            throw std::runtime_error(
+                                "lattice_db_create_with_migration: row in table '" +
+                                table_name + "' carries BLOB column '" + k +
+                                "' - the C migration callback's JSON row format cannot "
+                                "represent BLOB values (see lattice.h)");
                         }
                     }
 
@@ -1960,7 +2022,13 @@ extern "C" lattice_status_t lattice_db_set_sync_filter(lattice_db_t* db, const c
         for (const auto& entry : json) {
             lattice::sync_filter_entry f;
             f.table_name = entry.value("table", "");
-            std::string where = entry.value("where_clause", "");
+            // The header documents {"table", "predicate"}; the impl
+            // historically parsed only the core field name "where_clause",
+            // silently dropping documented-form predicates (the table then
+            // synced ALL rows - docs/capi-gap-audit.md B-3). Accept both,
+            // preferring the documented key.
+            std::string where = entry.value("predicate", "");
+            if (where.empty()) where = entry.value("where_clause", "");
             if (!where.empty()) f.where_clause = where;
             filters.push_back(std::move(f));
         }
@@ -1986,4 +2054,76 @@ extern "C" lattice_status_t lattice_db_clear_sync_filter(lattice_db_t* db) {
         set_error(e.what());
         return LATTICE_ERROR_DATABASE;
     }
+}
+
+// =============================================================================
+// Cross-Process Observation
+// =============================================================================
+//
+// These two functions were declared in lattice.h since 2026-03-27 but never
+// implemented (docs/capi-gap-audit.md B-9 - "phantom symbols"). Cross-process
+// changes are delivered by the core cross-process notifier: writes committed
+// by other processes are detected by tailing AuditLog
+// (lattice_db::handle_cross_process_notification) and dispatched through
+// notify_changes_batched() - the SAME batched table-observer pipeline local
+// flushes use. So a cross-process observer is a table observer registered on
+// that shared dispatch path; it also fires for this handle's own writes
+// (documented in lattice.h).
+//
+// lattice_db_remove_cross_process_observer() takes only {db, token} while the
+// core unregister needs the table name, so keep a token->table registry keyed
+// by {db handle, token} (tokens are only unique per db instance). Entries for
+// observers never removed before the db is released are retired lazily when
+// the same {db, token} key is reused; the strings involved are tiny.
+
+namespace {
+std::mutex g_xproc_observer_mutex;
+std::map<std::pair<void*, uint64_t>, std::string> g_xproc_observer_tables;
+}
+
+extern "C" uint64_t lattice_db_observe_cross_process(
+    lattice_db_t* db,
+    const char* table_name,
+    void* context,
+    lattice_table_observer_fn callback
+) {
+    if (!db || !table_name || !callback) return 0;
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        auto cb = callback;
+        auto ctx = context;
+        uint64_t token = static_cast<lattice::lattice_db*>(db_ref->get())->add_table_observer(
+            std::string(table_name),
+            [cb, ctx](const std::vector<lattice::lattice_db::change_event>& events) {
+                for (const auto& ev : events) {
+                    const auto& op = std::get<1>(ev);
+                    int64_t row_id = std::get<2>(ev);
+                    const auto& global_id = std::get<3>(ev);
+                    cb(ctx, op.c_str(), row_id, global_id.c_str());
+                }
+            });
+        if (token != 0) {
+            std::lock_guard<std::mutex> lock(g_xproc_observer_mutex);
+            g_xproc_observer_tables[{db, token}] = table_name;
+        }
+        return token;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" void lattice_db_remove_cross_process_observer(lattice_db_t* db, uint64_t token) {
+    if (!db || token == 0) return;
+    std::string table;
+    {
+        std::lock_guard<std::mutex> lock(g_xproc_observer_mutex);
+        auto it = g_xproc_observer_tables.find({db, token});
+        if (it == g_xproc_observer_tables.end()) return;  // unknown token: no-op
+        table = it->second;
+        g_xproc_observer_tables.erase(it);
+    }
+    try {
+        auto* db_ref = reinterpret_cast<lattice_db_internal*>(db);
+        db_ref->get()->remove_table_observer(table, token);
+    } catch (...) {}
 }

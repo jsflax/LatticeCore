@@ -5939,6 +5939,13 @@ protected:
     /// epoch 2 — no released binary ever wrote an epoch-2 marker.
     static constexpr int kLatticeSchemaFormatEpoch = 3;
 
+public:
+    /// Public accessor for the schema-format epoch (exposed on the C ABI as
+    /// lattice_schema_format_epoch()). The constant itself stays protected
+    /// with the rest of the fingerprint machinery above.
+    static constexpr int schema_format_epoch() noexcept { return kLatticeSchemaFormatEpoch; }
+
+protected:
     static uint64_t fnv1a_hash(const std::string& s) {
         uint64_t h = 1469598103934665603ULL;
         for (unsigned char c : s) {

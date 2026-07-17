@@ -19,6 +19,51 @@ typedef struct lattice_results lattice_results_t;
 typedef struct lattice_link_list lattice_link_list_t;
 
 // =============================================================================
+// Versioning & Introspection
+// =============================================================================
+
+// The C ABI version tracks the LatticeCore release train (see CHANGELOG.md).
+// The surface becomes additive-only at 1.0 (see docs/CAPI-STABILITY.md).
+#define LATTICE_CAPI_VERSION_MAJOR 0
+#define LATTICE_CAPI_VERSION_MINOR 10
+#define LATTICE_CAPI_VERSION_PATCH 11
+
+// Single-integer encoding: MAJOR*1000000 + MINOR*1000 + PATCH (sqlite-style).
+#define LATTICE_CAPI_VERSION \
+    (LATTICE_CAPI_VERSION_MAJOR * 1000000 + \
+     LATTICE_CAPI_VERSION_MINOR * 1000 + \
+     LATTICE_CAPI_VERSION_PATCH)
+
+#define LATTICE_CAPI_VERSION_STRING "0.10.11"
+
+// Runtime version of the linked library (compare against LATTICE_CAPI_VERSION
+// to detect header/library skew).
+uint32_t lattice_capi_version(void);
+
+// Runtime version string of the linked library ("MAJOR.MINOR.PATCH", static
+// storage - do NOT free).
+const char* lattice_capi_version_string(void);
+
+// The on-disk schema-format epoch this library writes/expects
+// (lattice_db::kLatticeSchemaFormatEpoch). Bumped when internal DDL templates
+// change; consumers sharing database files must agree on the epoch.
+int32_t lattice_schema_format_epoch(void);
+
+// Query whether a named feature is available in this build of the C ABI.
+// Returns false for unknown/NULL names, so callers can probe features that
+// do not exist yet.
+//
+// Feature strings that return true today:
+//   "attach", "cross_process_observation", "fts", "geo_query", "ipc", "knn",
+//   "migration", "observation", "rollback", "sync", "sync_filter",
+//   "transactions"
+// Reserved strings that will return true when the feature lands (planned):
+//   "checkpoint", "detach", "read_generations", "row_cache",
+//   "statement_counters", "sync_progress", "sync_tuning", "to_json",
+//   "unified_open"
+bool lattice_capi_has_feature(const char* feature);
+
+// =============================================================================
 // Logging
 // =============================================================================
 
@@ -368,8 +413,14 @@ typedef struct lattice_audit_log_entry lattice_audit_log_entry_t;
 typedef struct lattice_audit_log_vector lattice_audit_log_vector_t;
 
 // Receive sync data from server (JSON-encoded ServerSentEvent)
-// Returns array of global IDs that were applied (JSON array string, caller must free)
-// Returns NULL on error
+// Applies entries with per-entry error isolation (same core path the Swift
+// bridge uses): an entry that fails to apply is skipped and the remaining
+// entries are still applied.
+// Returns the array of global IDs that were SUCCESSFULLY applied (JSON array
+// string, caller must free with lattice_string_free) - entries missing from
+// the returned array were not applied and must not be acked.
+// Returns NULL on total failure (malformed payload, database-level error);
+// see lattice_last_error() for details.
 char* lattice_db_receive_sync_data(
     lattice_db_t* db,
     const uint8_t* data,
@@ -624,6 +675,15 @@ typedef void (*lattice_migration_row_fn)(
 );
 
 // Create a database with schema version and migration support
+//
+// LIMITATION - BLOB columns: the JSON row round-trip used by
+// lattice_migration_row_fn cannot represent BLOB values (including vector
+// columns, which are stored as BLOBs). Requesting a row migration
+// (migration_fn + migration_table) for a table that contains BLOB columns
+// FAILS EXPLICITLY: this function returns NULL and lattice_last_error()
+// describes the offending column. Previously such migrations silently
+// dropped the BLOB data. BLOB-capable row migration arrives with the
+// unified-open migration ABI (see docs/CAPI-STABILITY.md).
 lattice_db_t* lattice_db_create_with_migration(
     const char* path,
     const lattice_schema_t* schemas,
@@ -665,7 +725,11 @@ lattice_db_t* lattice_db_create_with_ipc(
 // =============================================================================
 
 // Set sync filter for upload (per-table predicates)
-// filter_json: JSON array of {"table": "...", "predicate": "..."} objects
+// filter_json: JSON array of {"table": "...", "predicate": "..."} objects.
+// "predicate" is a SQL WHERE-clause fragment; omit it (or pass "") to sync
+// ALL rows of the table. The key "where_clause" is accepted as a legacy
+// alias for "predicate" (older callers targeted the core field name; both
+// keys are parsed, "predicate" wins when both are present and non-empty).
 lattice_status_t lattice_db_set_sync_filter(lattice_db_t* db, const char* filter_json);
 
 // Clear sync filter (upload everything)
@@ -675,7 +739,18 @@ lattice_status_t lattice_db_clear_sync_filter(lattice_db_t* db);
 // Cross-Process Observation
 // =============================================================================
 
-// Register a cross-process observer (fires when another process modifies the DB)
+// Register a cross-process observer (fires when another process modifies the DB).
+//
+// Delivery rides the core cross-process notifier: writes committed by OTHER
+// processes are detected by tailing the audit log and dispatched through the
+// same batched change pipeline as local flushes. Consequently the callback
+// also fires for writes made through THIS handle - callers needing
+// other-process-only events should filter out their own writes (e.g. by
+// global_id). Callbacks are dispatched via the database's scheduler, once per
+// changed row.
+//
+// Returns an observer token (0 on failure). Remove with
+// lattice_db_remove_cross_process_observer.
 uint64_t lattice_db_observe_cross_process(
     lattice_db_t* db,
     const char* table_name,
@@ -683,7 +758,8 @@ uint64_t lattice_db_observe_cross_process(
     lattice_table_observer_fn callback
 );
 
-// Remove a cross-process observer
+// Remove a cross-process observer previously registered with
+// lattice_db_observe_cross_process (no-op for unknown tokens).
 void lattice_db_remove_cross_process_observer(lattice_db_t* db, uint64_t token);
 
 #ifdef __cplusplus

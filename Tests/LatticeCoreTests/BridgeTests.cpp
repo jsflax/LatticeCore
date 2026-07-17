@@ -985,30 +985,32 @@ TEST(Bridge, RowCacheMaterializedReads) {
     // SQL for any number of property reads.
     lattice::dynamic_object cached(results[0]);
     cached.enable_row_cache();
-    const auto base = lattice::database::total_statement_count();
+    // Thread-local counter throughout: pacer/maintenance threads issue SQL on
+    // their own schedule, so zero-delta asserts on the GLOBAL counter flake.
+    const auto base = lattice::database::thread_statement_count();
     for (int i = 0; i < 5; ++i) {
         EXPECT_EQ(cached.get_string("name"), "Alice");
         EXPECT_EQ(cached.get_int("age"), 30);
     }
-    EXPECT_EQ(lattice::database::total_statement_count() - base, 0u)
+    EXPECT_EQ(lattice::database::thread_statement_count() - base, 0u)
         << "materialized reads issued SQL";
 
     // The live path (default) pays one statement per read — the recall
     // N-statements pathology this exists to kill. Documents the contrast.
     lattice::dynamic_object live(results[0]);
-    const auto live_base = lattice::database::total_statement_count();
+    const auto live_base = lattice::database::thread_statement_count();
     for (int i = 0; i < 5; ++i) {
         (void)live.get_string("name");
         (void)live.get_int("age");
     }
-    EXPECT_GE(lattice::database::total_statement_count() - live_base, 10u)
+    EXPECT_GE(lattice::database::thread_statement_count() - live_base, 10u)
         << "expected the live path to issue one statement per read";
 
     // Write-through: DB row updates AND the cached read sees the new value.
     cached.set_int("age", 31);
-    const auto after_write = lattice::database::total_statement_count();
+    const auto after_write = lattice::database::thread_statement_count();
     EXPECT_EQ(cached.get_int("age"), 31);
-    EXPECT_EQ(lattice::database::total_statement_count() - after_write, 0u)
+    EXPECT_EQ(lattice::database::thread_statement_count() - after_write, 0u)
         << "read-your-writes should be served from the cache";
     auto verify = db.objects("RcPerson");
     EXPECT_EQ(verify[0].get_int("age"), 31) << "write-through missed the DB";
@@ -1084,9 +1086,9 @@ TEST(Bridge, RowCacheNullRoundTrip) {
     lattice::dynamic_object cached(results[0]);
     cached.enable_row_cache();
 
-    const auto base = lattice::database::total_statement_count();
+    const auto base = lattice::database::thread_statement_count();
     EXPECT_TRUE(cached.has_value("email"));
-    EXPECT_EQ(lattice::database::total_statement_count() - base, 0u);
+    EXPECT_EQ(lattice::database::thread_statement_count() - base, 0u);
 
     // set_nil must write through: a cached read after setNil returning the
     // stale value would be silent wrong-value corruption for optionals.
@@ -1095,10 +1097,10 @@ TEST(Bridge, RowCacheNullRoundTrip) {
         << "cache returned stale non-nil after setNil";
     // And back:
     cached.set_field<std::string>("email", "x@y.z");
-    const auto reread = lattice::database::total_statement_count();
+    const auto reread = lattice::database::thread_statement_count();
     EXPECT_TRUE(cached.has_value("email"));
     EXPECT_EQ(cached.get_string("email"), "x@y.z");
-    EXPECT_EQ(lattice::database::total_statement_count() - reread, 0u);
+    EXPECT_EQ(lattice::database::thread_statement_count() - reread, 0u);
 
     delete ref;
 }

@@ -1657,4 +1657,77 @@ TEST(BridgeGeneration, ChangedFieldsDeliveredThroughHookPayload) {
     delete ref;
 }
 
+// ============================================================================
+// Unique-index name parity — bridge constraint pass vs C-ABI is_unique shape
+// ============================================================================
+
+TEST(Bridge, UniqueIndexNameParityAcrossSwiftAndCapiSchemaShapes) {
+    TempDB tmp{"bridge_unique_parity"};
+
+    // Swift-shaped schema: uniqueness arrives ONLY as a constraint (what the
+    // @Unique macro emits). Phase 8 must name the index unique_<table>_0.
+    {
+        lattice::swift_schema_entry entry = make_schema("ParityDoc", {
+            {"code", text_prop("code")},
+            {"label", text_prop("label")},
+        });
+        entry.constraints.push_back(lattice::swift_constraint({"code"}, /*upsert=*/false));
+        lattice::SchemaVector schemas = {entry};
+
+        auto* ref = lattice::swift_lattice_ref::create(
+            lattice::swift_configuration(tmp.str()), schemas);
+        auto& db = *ref->get();
+
+        auto rows = db.db().query(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='ParityDoc' AND name LIKE 'unique_%'");
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(rows[0].at("name")), "unique_ParityDoc_0");
+        delete ref;
+    }
+
+    // C-ABI-shaped schema for the SAME logical model: per-property is_unique
+    // plus the single-column constraint the C ABI's convert_schemas derives
+    // from it. Reopening the Swift-created file must find the index already
+    // present — same name, so NO second unique index appears.
+    {
+        auto code = text_prop("code");
+        code.is_unique = true;
+        lattice::swift_schema_entry entry = make_schema("ParityDoc", {
+            {"code", code},
+            {"label", text_prop("label")},
+        });
+        entry.constraints.push_back(lattice::swift_constraint({"code"}, /*upsert=*/false));
+        lattice::SchemaVector schemas = {entry};
+
+        auto* ref = lattice::swift_lattice_ref::create(
+            lattice::swift_configuration(tmp.str()), schemas);
+        auto& db = *ref->get();
+
+        auto rows = db.db().query(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='ParityDoc' AND name LIKE 'unique_%'");
+        ASSERT_EQ(rows.size(), 1u) << "reopen double-indexed the unique column";
+        EXPECT_EQ(std::get<std::string>(rows[0].at("name")), "unique_ParityDoc_0");
+
+        // Enforcement through the bridge write path: same code twice → reject.
+        {
+            auto sdo = make_sdo("ParityDoc", schemas[0].properties);
+            sdo.values["code"] = std::string("C-1");
+            sdo.values["label"] = std::string("first");
+            lattice::dynamic_object obj(sdo);
+            db.add(obj);
+        }
+        auto sdo2 = make_sdo("ParityDoc", schemas[0].properties);
+        sdo2.values["code"] = std::string("C-1");
+        sdo2.values["label"] = std::string("second");
+        lattice::dynamic_object obj2(sdo2);
+        EXPECT_THROW(db.add(obj2), lattice::db_error);
+
+        auto count = db.db().query("SELECT COUNT(*) AS c FROM ParityDoc");
+        EXPECT_EQ(std::get<int64_t>(count[0].at("c")), 1);
+        delete ref;
+    }
+}
+
 #endif // !__linux__

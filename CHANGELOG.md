@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Cross-SDK conformance: per-property `is_unique` now produces DDL on the
+  C-ABI/core paths.** `lattice_property_t.is_unique` survived into the
+  descriptors and the schema fingerprint but generated no `CREATE UNIQUE
+  INDEX` anywhere — only the Swift bridge's constraint-driven pass ("Phase 8")
+  emitted unique indexes, so C-ABI-created databases (Python/Kotlin/JS) never
+  enforced uniqueness that Swift-created ones did, including on the same file.
+  The C ABI now canonicalizes `is_unique` into single-column constraints (in
+  property declaration order) so Phase 8 emits them, and the core registry
+  ensure path gained an equivalent `ensure_unique_property_indexes` pass.
+  Index naming is identical across all paths (`unique_<table>_<ordinal>`), so
+  mixed-SDK reopens find the index already present instead of double-indexing.
+  `kLatticeSchemaFormatEpoch` bumped to 4 (guarded, auto-migration-safe DDL;
+  existing fingerprinted databases revalidate once and gain the indexes).
+- **Cross-SDK conformance: C-ABI reads inside an open transaction see the
+  transaction's uncommitted writes.** `lattice_db_count`/`lattice_db_query`
+  always executed on the dedicated read-only connection, which under WAL
+  cannot see an open transaction on the write connection
+  (`lattice_db_begin_transaction`). `read_db()` now routes reads through the
+  write connection while it has an open transaction (live autocommit state —
+  self-correcting on COMMIT/ROLLBACK); outside a transaction, read routing is
+  unchanged.
+- **Cross-SDK conformance: dynamic add with a geo-bounds property no longer
+  fails with "table has no column named `<name>`".**
+  `lattice_object_create_with_schema` rebuilt property descriptors by hand and
+  dropped every index/constraint/geo/vector flag, so an `is_geo_bounds`
+  property was treated as a plain column and the INSERT targeted the raw
+  property name instead of the four expanded
+  `<name>_minLat/_maxLat/_minLon/_maxLon` columns. It now shares the C ABI's
+  full descriptor conversion, and `swift_dynamic_object` seeds non-nullable
+  geo defaults into the expanded columns rather than the raw name.
+
 ## [1.0.0-rc.1]
 
 The C ABI freeze (plan WS-C C1 exit; docs/CAPI-STABILITY.md becomes binding:

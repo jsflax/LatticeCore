@@ -464,3 +464,112 @@ TEST(Schema, MachineryShadowColumnIsNotARemoval) {
             << "shadow data lost — table was rebuilt";
     }
 }
+
+// ----------------------------------------------------------------------------
+// Per-property UNIQUE indexes on the core table-DDL path
+//
+// `property_descriptor::is_unique` is how uniqueness arrives from the C ABI
+// (and any core-registry user); it must produce the SAME schema objects the
+// Swift bridge's constraint-driven pass ("Phase 8") creates — index name
+// `unique_<table>_<ordinal>` — so a database created by one path and reopened
+// by the other never grows a second unique index on the same column.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+struct CoreUniqueGadgetTag {};
+
+lattice::model_schema core_unique_gadget_schema() {
+    lattice::model_schema schema;
+    schema.table_name = "CoreUniqueGadget";
+
+    lattice::property_descriptor serial;
+    serial.name = "serial";
+    serial.type = lattice::column_type::text;
+    serial.kind = lattice::property_kind::primitive;
+    serial.nullable = true;
+    serial.is_unique = true;
+
+    lattice::property_descriptor label;
+    label.name = "label";
+    label.type = lattice::column_type::text;
+    label.kind = lattice::property_kind::primitive;
+    label.nullable = true;
+
+    schema.properties = {serial, label};
+    return schema;
+}
+
+// Registration is global (the table is created by every subsequent open in
+// this process) — the DDL is tiny and fully guarded, so other tests are
+// unaffected.
+void register_core_unique_gadget() {
+    lattice::schema_registry::instance().register_model(
+        typeid(CoreUniqueGadgetTag), core_unique_gadget_schema());
+}
+
+}  // namespace
+
+TEST(Schema, CorePathCreatesUniquePropertyIndexWithBridgeNaming) {
+    register_core_unique_gadget();
+
+    TempDB tmp{"coreunique"};
+    lattice::lattice_db db(tmp.str());
+
+    // Exactly one unique index, named as the bridge's Phase 8 would name the
+    // equivalent single-column constraint.
+    auto rows = db.db().query(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='index' AND tbl_name='CoreUniqueGadget' AND name LIKE 'unique_%'");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(rows[0].at("name")), "unique_CoreUniqueGadget_0");
+
+    // Enforcement: duplicate value for the unique column must be rejected.
+    db.db().execute(
+        "INSERT INTO CoreUniqueGadget(globalId, serial, label) VALUES('g-1', 'S1', 'a')");
+    EXPECT_THROW(
+        db.db().execute(
+            "INSERT INTO CoreUniqueGadget(globalId, serial, label) VALUES('g-2', 'S1', 'b')"),
+        lattice::db_error);
+    // Distinct values still insert.
+    db.db().execute(
+        "INSERT INTO CoreUniqueGadget(globalId, serial, label) VALUES('g-3', 'S2', 'c')");
+    auto count = db.db().query("SELECT COUNT(*) AS c FROM CoreUniqueGadget");
+    EXPECT_EQ(std::get<int64_t>(count[0].at("c")), 2);
+}
+
+TEST(Schema, CoreUniquePassDeduplicatesPreexistingRowsKeepingNewest) {
+    register_core_unique_gadget();
+
+    TempDB tmp{"coreuniquededup"};
+    {
+        // Table pre-exists with duplicate data (rows inserted before the
+        // constraint could be enforced) — mirrors the bridge pass's recovery:
+        // deduplicate keeping the newest row per unique value, then index.
+        lattice::database old_db(tmp.str());
+        old_db.execute(R"(
+            CREATE TABLE CoreUniqueGadget (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                globalId TEXT UNIQUE,
+                serial TEXT,
+                label TEXT
+            )
+        )");
+        old_db.execute(
+            "INSERT INTO CoreUniqueGadget (globalId, serial, label) VALUES ('a', 'DUP', 'old')");
+        old_db.execute(
+            "INSERT INTO CoreUniqueGadget (globalId, serial, label) VALUES ('b', 'DUP', 'new')");
+    }
+
+    lattice::lattice_db db(tmp.str());
+
+    auto rows = db.db().query("SELECT label FROM CoreUniqueGadget WHERE serial = 'DUP'");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(rows[0].at("label")), "new")
+        << "dedup must keep the newest row per unique value";
+
+    auto idx = db.db().query(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='index' AND name='unique_CoreUniqueGadget_0'");
+    EXPECT_EQ(idx.size(), 1u);
+}

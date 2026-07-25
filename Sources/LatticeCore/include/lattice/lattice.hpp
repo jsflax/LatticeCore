@@ -3709,8 +3709,27 @@ public:
 
     database& db() { return *db_; }
 
-    /// Get the read-only database connection (falls back to write connection for in-memory DBs)
-    database& read_db() { return read_db_ ? *read_db_ : *db_; }
+    /// Get the connection for reads (falls back to the write connection for
+    /// in-memory DBs).
+    ///
+    /// While the write connection has an OPEN transaction, reads route
+    /// through the write connection instead of the dedicated read-only one:
+    /// under WAL a separate reader sees only committed state, so a count()/
+    /// query_rows()/find() issued inside an explicit transaction (C-ABI
+    /// lattice_db_begin_transaction, bridge/core begin_transaction, or an
+    /// internal write block) would silently miss that transaction's
+    /// uncommitted writes. The Swift bridge's generation-scoped readers
+    /// already read via the write connection; this closes the same gap for
+    /// the core/C-ABI read paths. `is_in_transaction()` is SQLite's live
+    /// autocommit state, so the routing self-corrects on COMMIT/ROLLBACK no
+    /// matter which code path executed it. Both connections are opened
+    /// SQLITE_OPEN_FULLMUTEX, so a cross-thread read that lands on the write
+    /// connection serializes safely; outside a transaction behavior is
+    /// unchanged (concurrent reads stay off the writer).
+    database& read_db() {
+        if (read_db_ && db_->is_in_transaction()) return *db_;
+        return read_db_ ? *read_db_ : *db_;
+    }
 
     /// Get the xproc-dedicated read connection (falls back to read_db for in-memory/read-only)
     database& xproc_read_db() { return xproc_read_db_ ? *xproc_read_db_ : read_db(); }
@@ -5247,6 +5266,14 @@ private:
 
         ensure_link_tables();
 
+        // Phase 6: per-property UNIQUE constraint indexes (guarded DDL,
+        // naming mirrors the bridge's Phase 8 — see the method comment).
+        // Runs for new AND existing tables so an is_unique added to an
+        // existing schema gains its index on the next slow-path open.
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            ensure_unique_property_indexes(*schema);
+        }
+
         store_fingerprint_marker(fp_key);
         txn.commit();
     }
@@ -5387,6 +5414,61 @@ private:
         }
         return "TEXT";
     }
+
+public:
+    /// Per-property UNIQUE constraint indexes for the core table-DDL path.
+    ///
+    /// `property_descriptor::is_unique` survives into the schema fingerprint
+    /// but historically produced no DDL on this path — the CREATE UNIQUE INDEX
+    /// pass existed only in the Swift bridge's constraint-driven "Phase 8"
+    /// (ensure_swift_tables). Databases created through the core registry (or
+    /// through the C ABI before its is_unique→constraint canonicalization)
+    /// therefore never enforced uniqueness that Swift-created databases did.
+    ///
+    /// Naming MIRRORS the bridge's Phase 8 exactly: `unique_<table>_<i>`,
+    /// where i is the ordinal of the constraint for this table — here, the
+    /// ordinal of the is_unique property in schema declaration order, which is
+    /// the position the equivalent single-column constraint occupies in the
+    /// bridge's constraints vector for the same logical schema. Identical
+    /// names mean a database created by one path and reopened by the other
+    /// sees the index already present (IF NOT EXISTS) instead of growing a
+    /// second, differently-named unique index on the same column.
+    ///
+    /// Only primitive, non-geo properties are emitted (they are real columns
+    /// on the table). Link-kind uniques require the bridge's shadow-column
+    /// machinery; their ordinal is still consumed so names stay aligned.
+    ///
+    /// If duplicate data predates the constraint, deduplicate first (keep the
+    /// newest row per unique value) — same recovery the bridge pass performs.
+    void ensure_unique_property_indexes(const model_schema& schema) {
+        size_t ordinal = 0;
+        for (const auto& prop : schema.properties) {
+            if (!prop.is_unique) continue;
+            const size_t i = ordinal++;
+            if (prop.kind != property_kind::primitive || prop.is_geo_bounds) {
+                continue;  // no single base-table column to index; ordinal reserved
+            }
+            const std::string idx_name =
+                "unique_" + schema.table_name + "_" + std::to_string(i);
+            const std::string sql =
+                "CREATE UNIQUE INDEX IF NOT EXISTS " + idx_name +
+                " ON " + schema.table_name + "(" + prop.name + ")";
+            try {
+                db_->execute(sql);
+            } catch (...) {
+                // Duplicate data exists — deduplicate (keep newest row per value).
+                LOG_WARN("lattice_db", "Deduplicating %s for unique constraint on (%s)",
+                         schema.table_name.c_str(), prop.name.c_str());
+                db_->execute(
+                    "DELETE FROM " + schema.table_name + " WHERE id NOT IN ("
+                    "SELECT MAX(id) FROM " + schema.table_name +
+                    " GROUP BY " + prop.name + ")");
+                db_->execute(sql);
+            }
+        }
+    }
+
+private:
 
     void migrate_model_table(const model_schema& schema) {
         LOG_INFO("migrate", "migrate_model_table: %s", schema.table_name.c_str());
@@ -5937,7 +6019,19 @@ protected:
     /// for flush_changes' change→audit lookups; guarded CREATE INDEX in
     /// ensure_audit_log_table). Folded into the same unreleased train as
     /// epoch 2 — no released binary ever wrote an epoch-2 marker.
-    static constexpr int kLatticeSchemaFormatEpoch = 3;
+    ///
+    /// Epoch 4: the core ensure path gained the per-property unique-index
+    /// pass (ensure_unique_property_indexes: guarded CREATE UNIQUE INDEX
+    /// `unique_<table>_<i>`, mirroring the bridge's Phase 8 naming).
+    /// `is_unique` was ALREADY serialized in stored fingerprints while
+    /// emitting no DDL, so an existing fingerprinted database whose schema
+    /// carries the flag would fast-path past the new pass forever without
+    /// this bump. (On the bridge path the C ABI's is_unique→constraint
+    /// canonicalization changes the swift fingerprint for affected DBs
+    /// anyway; the bump makes the revalidation guarantee uniform across
+    /// both fingerprint families.) All new DDL is guarded/absent-object —
+    /// auto-migration-safe on revalidation.
+    static constexpr int kLatticeSchemaFormatEpoch = 4;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as

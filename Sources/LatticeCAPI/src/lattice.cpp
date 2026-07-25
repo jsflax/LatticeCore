@@ -174,6 +174,30 @@ extern "C" void lattice_db_close(lattice_db_t* db) {
 // Helper: Convert C schemas to C++ SchemaVector
 // =============================================================================
 
+// Convert one C property descriptor to the C++ descriptor, copying EVERY
+// DDL-driving attribute. Shared by convert_schemas and
+// lattice_object_create_with_schema — the latter used to rebuild descriptors
+// by hand and silently dropped the index/constraint/geo/vector flags, so a
+// dynamic object created with an is_geo_bounds property lost the flag and the
+// add path built its INSERT against the raw property name instead of the four
+// expanded `<name>_minLat/_maxLat/_minLon/_maxLon` columns.
+static lattice::property_descriptor convert_property(const lattice_property_t& p) {
+    lattice::property_descriptor desc;
+    desc.name = p.name;
+    desc.type = static_cast<lattice::column_type>(p.type);
+    desc.kind = static_cast<lattice::property_kind>(p.kind);
+    desc.nullable = p.nullable;
+    if (p.target_table) desc.target_table = p.target_table;
+    if (p.link_table) desc.link_table = p.link_table;
+    desc.is_indexed = p.is_indexed;
+    desc.is_unique = p.is_unique;
+    desc.is_full_text = p.is_full_text;
+    desc.is_vector = p.is_vector;
+    desc.is_geo_bounds = p.is_geo_bounds;
+    if (p.column_name) desc.column_name = p.column_name;
+    return desc;
+}
+
 static lattice::SchemaVector convert_schemas(const lattice_schema_t* schemas, size_t schema_count) {
     lattice::SchemaVector schema_vec;
     if (!schemas || schema_count == 0) return schema_vec;
@@ -187,25 +211,27 @@ static lattice::SchemaVector convert_schemas(const lattice_schema_t* schemas, si
         for (size_t j = 0; j < s.property_count; j++) {
             const lattice_property_t& p = s.properties[j];
             if (!p.name) continue;
-
-            lattice::property_descriptor desc;
-            desc.name = p.name;
-            desc.type = static_cast<lattice::column_type>(p.type);
-            desc.kind = static_cast<lattice::property_kind>(p.kind);
-            desc.nullable = p.nullable;
-            if (p.target_table) desc.target_table = p.target_table;
-            if (p.link_table) desc.link_table = p.link_table;
-            desc.is_indexed = p.is_indexed;
-            desc.is_unique = p.is_unique;
-            desc.is_full_text = p.is_full_text;
-            desc.is_vector = p.is_vector;
-            desc.is_geo_bounds = p.is_geo_bounds;
-            if (p.column_name) desc.column_name = p.column_name;
-
-            props[p.name] = desc;
+            props[p.name] = convert_property(p);
         }
 
-        schema_vec.emplace_back(s.table_name, props);
+        // Canonicalize per-property `is_unique` flags into single-column
+        // constraints, in PROPERTY ARRAY ORDER (the C array is the calling
+        // SDK's declaration order). The bridge's unique-index pass ("Phase 8")
+        // is constraint-driven and names its indexes `unique_<table>_<i>` by
+        // constraint ordinal; Swift's `@Unique` macro likewise emits
+        // constraints in declaration order. Deriving here gives C-ABI-created
+        // databases the SAME schema objects (same index names) a Swift-created
+        // database has for the same logical schema — without it, per-property
+        // uniqueness declared over the C ABI produced no DDL at all.
+        lattice::ConstraintVector constraints;
+        for (size_t j = 0; j < s.property_count; j++) {
+            const lattice_property_t& p = s.properties[j];
+            if (!p.name || !p.is_unique) continue;
+            constraints.push_back(
+                lattice::swift_constraint({std::string(p.name)}, /*upsert=*/false));
+        }
+
+        schema_vec.emplace_back(s.table_name, props, constraints);
     }
     return schema_vec;
 }
@@ -382,22 +408,17 @@ extern "C" lattice_object_t* lattice_object_create_with_schema(
     try {
         std::string table_str(table_name);
 
-        // Convert C properties to C++ property map
+        // Convert C properties to C++ property map. Uses the same conversion
+        // as lattice_db_create_with_schemas — descriptors must carry the full
+        // flag set (is_geo_bounds in particular: without it the add path
+        // treats the property as a plain column and the INSERT targets the
+        // raw name instead of the four expanded geo columns).
         std::unordered_map<std::string, lattice::property_descriptor> props;
         if (properties && property_count > 0) {
             for (size_t i = 0; i < property_count; i++) {
                 const lattice_property_t& p = properties[i];
                 if (!p.name) continue;
-
-                lattice::property_descriptor desc;
-                desc.name = p.name;
-                desc.type = static_cast<lattice::column_type>(p.type);
-                desc.kind = static_cast<lattice::property_kind>(p.kind);
-                desc.nullable = p.nullable;
-                if (p.target_table) desc.target_table = p.target_table;
-                if (p.link_table) desc.link_table = p.link_table;
-
-                props[p.name] = desc;
+                props[p.name] = convert_property(p);
             }
         }
 

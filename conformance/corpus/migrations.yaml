@@ -1,0 +1,353 @@
+{
+  "format_version": 1,
+  "suite": "migrations",
+  "scenarios": [
+    {
+      "name": "column-add-defaults",
+      "description": "Reopening at a higher schema version auto-adds columns; pre-existing rows read zero values for non-optional adds and null for optional adds.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfWidget": {
+            "properties": {
+              "label": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfWidget",
+          "values": {
+            "label": "w1"
+          }
+        },
+        {
+          "op": "close"
+        },
+        {
+          "op": "reopen",
+          "schema": {
+            "version": 2,
+            "tables": {
+              "CfWidget": {
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "count": {
+                    "type": "int"
+                  },
+                  "note": {
+                    "type": "string",
+                    "optional": true
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfWidget",
+            "columns": [
+              "label",
+              "count",
+              "note"
+            ],
+            "equals": [
+              [
+                "w1",
+                0,
+                null
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "row-transform-parse-int",
+      "description": "A row transform converts a string column's values into the retyped int column.",
+      "capabilities": [
+        "migration-row-transform"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfMigPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfMigPerson",
+          "values": {
+            "name": "alice",
+            "age": "30"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfMigPerson",
+          "values": {
+            "name": "bob",
+            "age": "7"
+          }
+        },
+        {
+          "op": "close"
+        },
+        {
+          "op": "reopen",
+          "schema": {
+            "version": 2,
+            "tables": {
+              "CfMigPerson": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "age": {
+                    "type": "int"
+                  }
+                }
+              }
+            }
+          },
+          "migration": {
+            "transforms": {
+              "CfMigPerson": [
+                {
+                  "set": "age",
+                  "parse_int_from": "age"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfMigPerson",
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name",
+              "age"
+            ],
+            "equals": [
+              [
+                "alice",
+                30
+              ],
+              [
+                "bob",
+                7
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "blob-preserved-through-column-add",
+      "description": "A pure column-add migration preserves bytes columns byte-identical.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfBlobDoc": {
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "payload": {
+                "type": "bytes"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfBlobDoc",
+          "values": {
+            "label": "x",
+            "payload": {
+              "$hex": "cafef00d"
+            }
+          }
+        },
+        {
+          "op": "close"
+        },
+        {
+          "op": "reopen",
+          "schema": {
+            "version": 2,
+            "tables": {
+              "CfBlobDoc": {
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "payload": {
+                    "type": "bytes"
+                  },
+                  "stars": {
+                    "type": "int"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfBlobDoc",
+            "columns": [
+              "label",
+              "payload",
+              "stars"
+            ],
+            "equals": [
+              [
+                "x",
+                {
+                  "$hex": "cafef00d"
+                },
+                0
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "blob-explicit-failure-contract",
+      "description": "A row transform on a table with bytes columns must never silently lose blob data: either the migration is refused (migration_blob_unsupported) or the transform applies with blobs preserved byte-identical.",
+      "capabilities": [
+        "migration-row-transform"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfBlobDoc": {
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "payload": {
+                "type": "bytes"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfBlobDoc",
+          "values": {
+            "label": "x",
+            "payload": {
+              "$hex": "cafef00d"
+            }
+          }
+        },
+        {
+          "op": "close"
+        },
+        {
+          "op": "reopen",
+          "schema": {
+            "version": 2,
+            "tables": {
+              "CfBlobDoc": {
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "payload": {
+                    "type": "bytes"
+                  },
+                  "tag": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "save_outcome": "outcome",
+          "migration": {
+            "transforms": {
+              "CfBlobDoc": [
+                {
+                  "set": "tag",
+                  "const": "tagged"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "expect": [
+        {
+          "one_of": [
+            [
+              {
+                "var": "outcome",
+                "equals": "migration_blob_unsupported"
+              }
+            ],
+            [
+              {
+                "var": "outcome",
+                "equals": "ok"
+              },
+              {
+                "rows": {
+                  "table": "CfBlobDoc",
+                  "columns": [
+                    "label",
+                    "payload",
+                    "tag"
+                  ],
+                  "equals": [
+                    [
+                      "x",
+                      {
+                        "$hex": "cafef00d"
+                      },
+                      "tagged"
+                    ]
+                  ]
+                }
+              }
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}

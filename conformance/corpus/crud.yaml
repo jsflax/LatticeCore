@@ -1,0 +1,216 @@
+{
+  "format_version": 1,
+  "suite": "crud",
+  "scenarios": [
+    {
+      "name": "insert-read-scalars",
+      "description": "Every primitive column type round-trips through insert and a live snapshot; an unset optional reads null.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": { "type": "string" },
+              "age": { "type": "int" },
+              "score": { "type": "double" },
+              "active": { "type": "bool" },
+              "nickname": { "type": "string", "optional": true },
+              "city": { "type": "string" }
+            }
+          }
+        }
+      },
+      "ops": [
+        { "op": "insert", "table": "CfPerson", "as": "p1",
+          "values": { "name": "alice", "age": 30, "score": 9.5, "active": true, "city": "lisbon" } }
+      ],
+      "expect": [
+        { "count": { "table": "CfPerson", "equals": 1 } },
+        { "rows": { "table": "CfPerson",
+                    "columns": ["name", "age", "score", "active", "nickname", "city"],
+                    "equals": [["alice", 30, 9.5, true, null, "lisbon"]] } }
+      ]
+    },
+    {
+      "name": "insert-bytes-roundtrip",
+      "description": "A bytes column stores and reads back byte-identical.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfBlobDoc": {
+            "properties": {
+              "label": { "type": "string" },
+              "payload": { "type": "bytes" }
+            }
+          }
+        }
+      },
+      "ops": [
+        { "op": "insert", "table": "CfBlobDoc", "as": "d1",
+          "values": { "label": "raw", "payload": { "$hex": "00ff10a5" } } }
+      ],
+      "expect": [
+        { "rows": { "table": "CfBlobDoc",
+                    "columns": ["label", "payload"],
+                    "equals": [["raw", { "$hex": "00ff10a5" }]] } }
+      ]
+    },
+    {
+      "name": "find-by-id",
+      "description": "Primary-key lookup returns the exact row that was inserted.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": { "type": "string" },
+              "age": { "type": "int" },
+              "score": { "type": "double" },
+              "active": { "type": "bool" },
+              "nickname": { "type": "string", "optional": true },
+              "city": { "type": "string" }
+            }
+          }
+        }
+      },
+      "ops": [
+        { "op": "insert", "table": "CfPerson", "as": "p1",
+          "values": { "name": "alice", "age": 30, "score": 9.5, "active": true, "city": "lisbon" } },
+        { "op": "insert", "table": "CfPerson", "as": "p2",
+          "values": { "name": "bob", "age": 25, "score": 7.25, "active": false, "city": "porto" } },
+        { "op": "get", "table": "CfPerson", "id": { "$id_of": "p2" }, "as": "found", "save_found": "was_found" },
+        { "op": "read", "ref": "found", "fields": ["name", "age"], "save": "found_fields" }
+      ],
+      "expect": [
+        { "var": "was_found", "equals": true },
+        { "var": "found_fields", "equals": ["bob", 25] }
+      ]
+    },
+    {
+      "name": "live-update",
+      "description": "A property write through a managed handle persists immediately and is visible through a second, independently fetched handle.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": { "type": "string" },
+              "age": { "type": "int" },
+              "score": { "type": "double" },
+              "active": { "type": "bool" },
+              "nickname": { "type": "string", "optional": true },
+              "city": { "type": "string" }
+            }
+          }
+        }
+      },
+      "ops": [
+        { "op": "insert", "table": "CfPerson", "as": "p1",
+          "values": { "name": "alice", "age": 30, "score": 9.5, "active": true, "city": "lisbon" } },
+        { "op": "update", "ref": "p1", "values": { "age": 35, "nickname": "al" } },
+        { "op": "get", "table": "CfPerson", "id": { "$id_of": "p1" }, "as": "fresh" },
+        { "op": "read", "ref": "fresh", "fields": ["age", "nickname"], "save": "fresh_fields" }
+      ],
+      "expect": [
+        { "var": "fresh_fields", "equals": [35, "al"] },
+        { "count": { "table": "CfPerson", "where": { "field": "age", "op": "eq", "value": 35 }, "equals": 1 } }
+      ]
+    },
+    {
+      "name": "delete-object",
+      "description": "Deleting one object removes exactly that row; a subsequent primary-key lookup finds nothing.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": { "type": "string" },
+              "age": { "type": "int" },
+              "score": { "type": "double" },
+              "active": { "type": "bool" },
+              "nickname": { "type": "string", "optional": true },
+              "city": { "type": "string" }
+            }
+          }
+        }
+      },
+      "ops": [
+        { "op": "insert", "table": "CfPerson", "as": "p1", "save_id": "p1_id",
+          "values": { "name": "alice", "age": 30, "score": 9.5, "active": true, "city": "lisbon" } },
+        { "op": "insert", "table": "CfPerson", "as": "p2",
+          "values": { "name": "bob", "age": 25, "score": 7.25, "active": false, "city": "porto" } },
+        { "op": "delete", "ref": "p1" },
+        { "op": "get", "table": "CfPerson", "id": { "$saved_id": "p1_id" }, "save_found": "still_there" }
+      ],
+      "expect": [
+        { "count": { "table": "CfPerson", "equals": 1 } },
+        { "var": "still_there", "equals": false },
+        { "rows": { "table": "CfPerson", "columns": ["name"], "equals": [["bob"]] } }
+      ]
+    },
+    {
+      "name": "delete-where-predicate",
+      "description": "Predicate bulk delete removes exactly the matching rows.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": { "type": "string" },
+              "age": { "type": "int" },
+              "score": { "type": "double" },
+              "active": { "type": "bool" },
+              "nickname": { "type": "string", "optional": true },
+              "city": { "type": "string" }
+            }
+          }
+        }
+      },
+      "ops": [
+        { "op": "insert", "table": "CfPerson",
+          "values": { "name": "alice", "age": 10, "score": 1.0, "active": true, "city": "lisbon" } },
+        { "op": "insert", "table": "CfPerson",
+          "values": { "name": "bob", "age": 20, "score": 2.0, "active": true, "city": "porto" } },
+        { "op": "insert", "table": "CfPerson",
+          "values": { "name": "carol", "age": 30, "score": 3.0, "active": true, "city": "faro" } },
+        { "op": "delete_where", "table": "CfPerson", "where": { "field": "age", "op": "ge", "value": 20 } }
+      ],
+      "expect": [
+        { "count": { "table": "CfPerson", "equals": 1 } },
+        { "rows": { "table": "CfPerson", "columns": ["name", "age"], "equals": [["alice", 10]] } }
+      ]
+    },
+    {
+      "name": "delete-all",
+      "description": "delete_where without a predicate empties the table.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": { "type": "string" },
+              "age": { "type": "int" },
+              "score": { "type": "double" },
+              "active": { "type": "bool" },
+              "nickname": { "type": "string", "optional": true },
+              "city": { "type": "string" }
+            }
+          }
+        }
+      },
+      "ops": [
+        { "op": "insert", "table": "CfPerson",
+          "values": { "name": "alice", "age": 30, "score": 9.5, "active": true, "city": "lisbon" } },
+        { "op": "insert", "table": "CfPerson",
+          "values": { "name": "bob", "age": 25, "score": 7.25, "active": false, "city": "porto" } },
+        { "op": "insert", "table": "CfPerson",
+          "values": { "name": "carol", "age": 41, "score": 8.5, "active": true, "city": "faro" } },
+        { "op": "delete_where", "table": "CfPerson" }
+      ],
+      "expect": [
+        { "count": { "table": "CfPerson", "equals": 0 } },
+        { "rows": { "table": "CfPerson", "columns": ["name"], "equals": [] } }
+      ]
+    }
+  ]
+}

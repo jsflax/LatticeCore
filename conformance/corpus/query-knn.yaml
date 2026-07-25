@@ -1,0 +1,477 @@
+{
+  "format_version": 1,
+  "suite": "query-knn",
+  "scenarios": [
+    {
+      "name": "l2-order-and-distances",
+      "description": "L2 nearest returns ascending Euclidean distance; integer coordinates give exact perfect-square distances.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfDoc": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "embedding": {
+                "type": "vector",
+                "dims": 4
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "a",
+            "kind": "x",
+            "embedding": [
+              1,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "b",
+            "kind": "y",
+            "embedding": [
+              0,
+              2,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "c",
+            "kind": "x",
+            "embedding": [
+              3,
+              4,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "d",
+            "kind": "y",
+            "embedding": [
+              10,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "knn",
+          "table": "CfDoc",
+          "column": "embedding",
+          "query": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "k": 4,
+          "metric": "l2",
+          "columns": [
+            "title"
+          ],
+          "save": "order",
+          "save_distances": "dists"
+        }
+      ],
+      "expect": [
+        {
+          "var": "order",
+          "equals": [
+            [
+              "a"
+            ],
+            [
+              "b"
+            ],
+            [
+              "c"
+            ],
+            [
+              "d"
+            ]
+          ]
+        },
+        {
+          "var": "dists",
+          "equals": [
+            1.0,
+            2.0,
+            5.0,
+            10.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "l2-top-k",
+      "description": "k limits the result to the k nearest.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfDoc": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "embedding": {
+                "type": "vector",
+                "dims": 4
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "a",
+            "kind": "x",
+            "embedding": [
+              1,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "b",
+            "kind": "y",
+            "embedding": [
+              0,
+              2,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "c",
+            "kind": "x",
+            "embedding": [
+              3,
+              4,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "d",
+            "kind": "y",
+            "embedding": [
+              10,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "knn",
+          "table": "CfDoc",
+          "column": "embedding",
+          "query": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "k": 2,
+          "metric": "l2",
+          "columns": [
+            "title"
+          ],
+          "save": "order"
+        }
+      ],
+      "expect": [
+        {
+          "var": "order",
+          "equals": [
+            [
+              "a"
+            ],
+            [
+              "b"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cosine-order",
+      "description": "Cosine distance orders by angle; distance values are not asserted (not binary-exact in general).",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfDoc": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "embedding": {
+                "type": "vector",
+                "dims": 4
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "p",
+            "kind": "x",
+            "embedding": [
+              2,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "q",
+            "kind": "x",
+            "embedding": [
+              1,
+              1,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "r",
+            "kind": "x",
+            "embedding": [
+              0,
+              3,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "s",
+            "kind": "x",
+            "embedding": [
+              -1,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "knn",
+          "table": "CfDoc",
+          "column": "embedding",
+          "query": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "k": 4,
+          "metric": "cosine",
+          "columns": [
+            "title"
+          ],
+          "save": "order"
+        }
+      ],
+      "expect": [
+        {
+          "var": "order",
+          "equals": [
+            [
+              "p"
+            ],
+            [
+              "q"
+            ],
+            [
+              "r"
+            ],
+            [
+              "s"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "knn-with-where-prefilter",
+      "description": "A where predicate restricts the candidate set before the nearest search.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfDoc": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "embedding": {
+                "type": "vector",
+                "dims": 4
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "a",
+            "kind": "x",
+            "embedding": [
+              1,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "b",
+            "kind": "y",
+            "embedding": [
+              0,
+              2,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "c",
+            "kind": "x",
+            "embedding": [
+              3,
+              4,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfDoc",
+          "values": {
+            "title": "d",
+            "kind": "y",
+            "embedding": [
+              10,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "op": "knn",
+          "table": "CfDoc",
+          "column": "embedding",
+          "query": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "k": 4,
+          "metric": "l2",
+          "where": {
+            "field": "kind",
+            "op": "eq",
+            "value": "x"
+          },
+          "columns": [
+            "title"
+          ],
+          "save": "order"
+        }
+      ],
+      "expect": [
+        {
+          "var": "order",
+          "equals": [
+            [
+              "a"
+            ],
+            [
+              "c"
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}

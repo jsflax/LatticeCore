@@ -1,0 +1,205 @@
+{
+  "format_version": 1,
+  "suite": "errors",
+  "scenarios": [
+    {
+      "name": "re-add-managed-object",
+      "description": "Re-adding an already-persisted object fails with already_managed and writes nothing.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          },
+          "as": "a"
+        },
+        {
+          "op": "add_existing",
+          "ref": "a",
+          "expect_error": "already_managed"
+        }
+      ],
+      "expect": [
+        {
+          "count": {
+            "table": "CfPerson",
+            "equals": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "unique-violation-add-failed",
+      "description": "Inserting a duplicate into a unique column fails with add_failed, writes nothing, and leaves the database usable.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfCard": {
+            "properties": {
+              "code": {
+                "type": "string",
+                "unique": true
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfCard",
+          "values": {
+            "code": "x",
+            "note": "first"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfCard",
+          "values": {
+            "code": "x",
+            "note": "dup"
+          },
+          "expect_error": "add_failed"
+        },
+        {
+          "op": "insert",
+          "table": "CfCard",
+          "values": {
+            "code": "y",
+            "note": "second"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "count": {
+            "table": "CfCard",
+            "equals": 2
+          }
+        },
+        {
+          "rows": {
+            "table": "CfCard",
+            "sort": {
+              "by": "code",
+              "order": "asc"
+            },
+            "columns": [
+              "code",
+              "note"
+            ],
+            "equals": [
+              [
+                "x",
+                "first"
+              ],
+              [
+                "y",
+                "second"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "delete-where-no-match-is-not-an-error",
+      "description": "A bulk delete matching zero rows succeeds and changes nothing.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "delete_where",
+          "table": "CfPerson",
+          "where": {
+            "field": "age",
+            "op": "eq",
+            "value": 99
+          }
+        }
+      ],
+      "expect": [
+        {
+          "count": {
+            "table": "CfPerson",
+            "equals": 1
+          }
+        }
+      ]
+    }
+  ]
+}

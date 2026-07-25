@@ -1,0 +1,428 @@
+{
+  "format_version": 1,
+  "suite": "rowcache-increment",
+  "scenarios": [
+    {
+      "name": "materialized-stale-until-refresh",
+      "description": "A materialized handle serves the captured snapshot: a concurrent writer's update is invisible until refresh.",
+      "capabilities": [
+        "row-cache"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfCounter": {
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "hits": {
+                "type": "int"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfCounter",
+          "values": {
+            "label": "main",
+            "hits": 7
+          },
+          "as": "writer"
+        },
+        {
+          "op": "get",
+          "table": "CfCounter",
+          "id": {
+            "$id_of": "writer"
+          },
+          "as": "reader"
+        },
+        {
+          "op": "materialize",
+          "ref": "reader"
+        },
+        {
+          "op": "read",
+          "ref": "reader",
+          "fields": [
+            "hits"
+          ],
+          "save": "before"
+        },
+        {
+          "op": "update",
+          "ref": "writer",
+          "values": {
+            "hits": 20
+          }
+        },
+        {
+          "op": "read",
+          "ref": "reader",
+          "fields": [
+            "hits"
+          ],
+          "save": "stale"
+        },
+        {
+          "op": "refresh",
+          "ref": "reader"
+        },
+        {
+          "op": "read",
+          "ref": "reader",
+          "fields": [
+            "hits"
+          ],
+          "save": "after"
+        }
+      ],
+      "expect": [
+        {
+          "var": "before",
+          "equals": [
+            7
+          ]
+        },
+        {
+          "var": "stale",
+          "equals": [
+            7
+          ]
+        },
+        {
+          "var": "after",
+          "equals": [
+            20
+          ]
+        }
+      ]
+    },
+    {
+      "name": "materialized-write-through",
+      "description": "Writes through a materialized handle persist immediately and update its own snapshot (read-your-writes).",
+      "capabilities": [
+        "row-cache"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfCounter": {
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "hits": {
+                "type": "int"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfCounter",
+          "values": {
+            "label": "main",
+            "hits": 7
+          },
+          "as": "h"
+        },
+        {
+          "op": "materialize",
+          "ref": "h"
+        },
+        {
+          "op": "update",
+          "ref": "h",
+          "values": {
+            "hits": 9
+          }
+        },
+        {
+          "op": "read",
+          "ref": "h",
+          "fields": [
+            "hits"
+          ],
+          "save": "own"
+        }
+      ],
+      "expect": [
+        {
+          "var": "own",
+          "equals": [
+            9
+          ]
+        },
+        {
+          "count": {
+            "table": "CfCounter",
+            "where": {
+              "field": "hits",
+              "op": "eq",
+              "value": 9
+            },
+            "equals": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "dematerialize-returns-to-live",
+      "description": "After dematerialize, reads are live again and see the concurrent writer.",
+      "capabilities": [
+        "row-cache"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfCounter": {
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "hits": {
+                "type": "int"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfCounter",
+          "values": {
+            "label": "main",
+            "hits": 7
+          },
+          "as": "writer"
+        },
+        {
+          "op": "get",
+          "table": "CfCounter",
+          "id": {
+            "$id_of": "writer"
+          },
+          "as": "reader"
+        },
+        {
+          "op": "materialize",
+          "ref": "reader"
+        },
+        {
+          "op": "update",
+          "ref": "writer",
+          "values": {
+            "hits": 20
+          }
+        },
+        {
+          "op": "read",
+          "ref": "reader",
+          "fields": [
+            "hits"
+          ],
+          "save": "stale"
+        },
+        {
+          "op": "dematerialize",
+          "ref": "reader"
+        },
+        {
+          "op": "read",
+          "ref": "reader",
+          "fields": [
+            "hits"
+          ],
+          "save": "live"
+        }
+      ],
+      "expect": [
+        {
+          "var": "stale",
+          "equals": [
+            7
+          ]
+        },
+        {
+          "var": "live",
+          "equals": [
+            20
+          ]
+        }
+      ]
+    },
+    {
+      "name": "increment-atomic",
+      "description": "increment applies SQL-side deltas that are immediately visible through the handle and a fresh lookup.",
+      "capabilities": [
+        "increment"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfCounter": {
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "hits": {
+                "type": "int"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfCounter",
+          "values": {
+            "label": "main",
+            "hits": 7
+          },
+          "as": "h"
+        },
+        {
+          "op": "increment",
+          "ref": "h",
+          "field": "hits",
+          "by": 1
+        },
+        {
+          "op": "read",
+          "ref": "h",
+          "fields": [
+            "hits"
+          ],
+          "save": "after_one"
+        },
+        {
+          "op": "increment",
+          "ref": "h",
+          "field": "hits",
+          "by": 5
+        },
+        {
+          "op": "get",
+          "table": "CfCounter",
+          "id": {
+            "$id_of": "h"
+          },
+          "as": "fresh"
+        },
+        {
+          "op": "read",
+          "ref": "fresh",
+          "fields": [
+            "hits"
+          ],
+          "save": "after_five"
+        }
+      ],
+      "expect": [
+        {
+          "var": "after_one",
+          "equals": [
+            8
+          ]
+        },
+        {
+          "var": "after_five",
+          "equals": [
+            13
+          ]
+        },
+        {
+          "count": {
+            "table": "CfCounter",
+            "where": {
+              "field": "hits",
+              "op": "eq",
+              "value": 13
+            },
+            "equals": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "increment-keeps-materialized-coherent",
+      "description": "increment through a materialized handle updates the snapshot too: the cached read never goes stale.",
+      "capabilities": [
+        "row-cache",
+        "increment"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfCounter": {
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "hits": {
+                "type": "int"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfCounter",
+          "values": {
+            "label": "main",
+            "hits": 7
+          },
+          "as": "h"
+        },
+        {
+          "op": "materialize",
+          "ref": "h"
+        },
+        {
+          "op": "increment",
+          "ref": "h",
+          "field": "hits",
+          "by": 3
+        },
+        {
+          "op": "read",
+          "ref": "h",
+          "fields": [
+            "hits"
+          ],
+          "save": "cached"
+        }
+      ],
+      "expect": [
+        {
+          "var": "cached",
+          "equals": [
+            10
+          ]
+        },
+        {
+          "count": {
+            "table": "CfCounter",
+            "where": {
+              "field": "hits",
+              "op": "eq",
+              "value": 10
+            },
+            "equals": 1
+          }
+        }
+      ]
+    }
+  ]
+}

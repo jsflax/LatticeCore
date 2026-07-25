@@ -1,0 +1,380 @@
+{
+  "format_version": 1,
+  "suite": "virtuals",
+  "scenarios": [
+    {
+      "name": "virtual-link-set-and-read",
+      "description": "A polymorphic to-one link stores a concrete type and reads its shared field.",
+      "capabilities": [
+        "virtual"
+      ],
+      "schema": {
+        "version": 1,
+        "protocols": {
+          "CfNoteworthy": {
+            "shared": {
+              "label": "string"
+            }
+          }
+        },
+        "tables": {
+          "CfNoteA": {
+            "conforms": [
+              "CfNoteworthy"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "extra_a": {
+                "type": "int"
+              }
+            }
+          },
+          "CfNoteB": {
+            "conforms": [
+              "CfNoteworthy"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "extra_b": {
+                "type": "string"
+              }
+            }
+          },
+          "CfBinder": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "main": {
+                "type": "virtual_link",
+                "protocol": "CfNoteworthy"
+              },
+              "notes": {
+                "type": "virtual_list",
+                "protocol": "CfNoteworthy"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfNoteA",
+          "as": "a1",
+          "values": {
+            "label": "alpha",
+            "extra_a": 7
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfBinder",
+          "as": "binder",
+          "values": {
+            "title": "b1"
+          }
+        },
+        {
+          "op": "update",
+          "ref": "binder",
+          "values": {
+            "main": {
+              "$ref": "a1"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "ref": "binder",
+          "fields": [
+            "main.label"
+          ],
+          "save": "linked"
+        }
+      ],
+      "expect": [
+        {
+          "var": "linked",
+          "equals": [
+            "alpha"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "virtual-link-reassign-across-types",
+      "description": "Reassigning a virtual link to a different conforming type dispatches to the new concrete row.",
+      "capabilities": [
+        "virtual"
+      ],
+      "schema": {
+        "version": 1,
+        "protocols": {
+          "CfNoteworthy": {
+            "shared": {
+              "label": "string"
+            }
+          }
+        },
+        "tables": {
+          "CfNoteA": {
+            "conforms": [
+              "CfNoteworthy"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "extra_a": {
+                "type": "int"
+              }
+            }
+          },
+          "CfNoteB": {
+            "conforms": [
+              "CfNoteworthy"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "extra_b": {
+                "type": "string"
+              }
+            }
+          },
+          "CfBinder": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "main": {
+                "type": "virtual_link",
+                "protocol": "CfNoteworthy"
+              },
+              "notes": {
+                "type": "virtual_list",
+                "protocol": "CfNoteworthy"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfNoteA",
+          "as": "a1",
+          "values": {
+            "label": "alpha",
+            "extra_a": 7
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfNoteB",
+          "as": "b1",
+          "values": {
+            "label": "beta",
+            "extra_b": "z"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfBinder",
+          "as": "binder",
+          "values": {
+            "title": "b1"
+          }
+        },
+        {
+          "op": "update",
+          "ref": "binder",
+          "values": {
+            "main": {
+              "$ref": "a1"
+            }
+          }
+        },
+        {
+          "op": "update",
+          "ref": "binder",
+          "values": {
+            "main": {
+              "$ref": "b1"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "ref": "binder",
+          "fields": [
+            "main.label"
+          ],
+          "save": "linked"
+        }
+      ],
+      "expect": [
+        {
+          "var": "linked",
+          "equals": [
+            "beta"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "virtual-list-heterogeneous-order",
+      "description": "A polymorphic list holds mixed concrete types in insertion order.",
+      "capabilities": [
+        "virtual"
+      ],
+      "schema": {
+        "version": 1,
+        "protocols": {
+          "CfNoteworthy": {
+            "shared": {
+              "label": "string"
+            }
+          }
+        },
+        "tables": {
+          "CfNoteA": {
+            "conforms": [
+              "CfNoteworthy"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "extra_a": {
+                "type": "int"
+              }
+            }
+          },
+          "CfNoteB": {
+            "conforms": [
+              "CfNoteworthy"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "extra_b": {
+                "type": "string"
+              }
+            }
+          },
+          "CfBinder": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "main": {
+                "type": "virtual_link",
+                "protocol": "CfNoteworthy"
+              },
+              "notes": {
+                "type": "virtual_list",
+                "protocol": "CfNoteworthy"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfNoteA",
+          "as": "a1",
+          "values": {
+            "label": "alpha",
+            "extra_a": 7
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfNoteB",
+          "as": "b1",
+          "values": {
+            "label": "beta",
+            "extra_b": "z"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfNoteA",
+          "as": "a2",
+          "values": {
+            "label": "gamma",
+            "extra_a": 9
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfBinder",
+          "as": "binder",
+          "values": {
+            "title": "b1"
+          }
+        },
+        {
+          "op": "list_append",
+          "ref": "binder",
+          "property": "notes",
+          "item": {
+            "$ref": "a1"
+          }
+        },
+        {
+          "op": "list_append",
+          "ref": "binder",
+          "property": "notes",
+          "item": {
+            "$ref": "b1"
+          }
+        },
+        {
+          "op": "list_append",
+          "ref": "binder",
+          "property": "notes",
+          "item": {
+            "$ref": "a2"
+          }
+        },
+        {
+          "op": "list_size",
+          "ref": "binder",
+          "property": "notes",
+          "save": "n"
+        },
+        {
+          "op": "list_read",
+          "ref": "binder",
+          "property": "notes",
+          "field": "label",
+          "save": "labels"
+        }
+      ],
+      "expect": [
+        {
+          "var": "n",
+          "equals": 3
+        },
+        {
+          "var": "labels",
+          "equals": [
+            "alpha",
+            "beta",
+            "gamma"
+          ]
+        }
+      ]
+    }
+  ]
+}

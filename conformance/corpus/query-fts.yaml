@@ -1,0 +1,480 @@
+{
+  "format_version": 1,
+  "suite": "query-fts",
+  "scenarios": [
+    {
+      "name": "single-term",
+      "description": "A single FTS5 term matches every row containing it.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfArticle": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string",
+                "full_text": true
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "alpha",
+            "content": "machine learning improves search quality"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "beta",
+            "content": "cooking pasta with fresh tomato sauce"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "gamma",
+            "content": "deep learning networks for machine translation"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "delta",
+            "content": "database indexing and search performance"
+          }
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "machine",
+          "columns": [
+            "title"
+          ],
+          "save": "hits"
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [
+            [
+              "alpha"
+            ],
+            [
+              "gamma"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    },
+    {
+      "name": "implicit-and",
+      "description": "Two bare terms are ANDed (FTS5 default).",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfArticle": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string",
+                "full_text": true
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "alpha",
+            "content": "machine learning improves search quality"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "beta",
+            "content": "cooking pasta with fresh tomato sauce"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "gamma",
+            "content": "deep learning networks for machine translation"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "delta",
+            "content": "database indexing and search performance"
+          }
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "machine search",
+          "columns": [
+            "title"
+          ],
+          "save": "hits"
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [
+            [
+              "alpha"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    },
+    {
+      "name": "explicit-or",
+      "description": "FTS5 OR matches rows containing either term.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfArticle": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string",
+                "full_text": true
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "alpha",
+            "content": "machine learning improves search quality"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "beta",
+            "content": "cooking pasta with fresh tomato sauce"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "gamma",
+            "content": "deep learning networks for machine translation"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "delta",
+            "content": "database indexing and search performance"
+          }
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "pasta OR indexing",
+          "columns": [
+            "title"
+          ],
+          "save": "hits"
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [
+            [
+              "beta"
+            ],
+            [
+              "delta"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    },
+    {
+      "name": "phrase",
+      "description": "A quoted phrase matches only adjacent terms in order.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfArticle": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string",
+                "full_text": true
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "alpha",
+            "content": "machine learning improves search quality"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "beta",
+            "content": "cooking pasta with fresh tomato sauce"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "gamma",
+            "content": "deep learning networks for machine translation"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "delta",
+            "content": "database indexing and search performance"
+          }
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "\"machine learning\"",
+          "columns": [
+            "title"
+          ],
+          "save": "hits"
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [
+            [
+              "alpha"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    },
+    {
+      "name": "prefix",
+      "description": "A trailing * matches by token prefix.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfArticle": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string",
+                "full_text": true
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "alpha",
+            "content": "machine learning improves search quality"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "beta",
+            "content": "cooking pasta with fresh tomato sauce"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "gamma",
+            "content": "deep learning networks for machine translation"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "values": {
+            "title": "delta",
+            "content": "database indexing and search performance"
+          }
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "index*",
+          "columns": [
+            "title"
+          ],
+          "save": "hits"
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [
+            [
+              "delta"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    },
+    {
+      "name": "match-update-visibility",
+      "description": "The FTS index follows row updates: the old text stops matching, the new text matches.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfArticle": {
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string",
+                "full_text": true
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfArticle",
+          "as": "a1",
+          "values": {
+            "title": "alpha",
+            "content": "original text about databases"
+          }
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "databases",
+          "columns": [
+            "title"
+          ],
+          "save": "before"
+        },
+        {
+          "op": "update",
+          "ref": "a1",
+          "values": {
+            "content": "revised text about compilers"
+          }
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "databases",
+          "columns": [
+            "title"
+          ],
+          "save": "after_old"
+        },
+        {
+          "op": "fts",
+          "table": "CfArticle",
+          "column": "content",
+          "match": "compilers",
+          "columns": [
+            "title"
+          ],
+          "save": "after_new"
+        }
+      ],
+      "expect": [
+        {
+          "var": "before",
+          "equals": [
+            [
+              "alpha"
+            ]
+          ],
+          "unordered": true
+        },
+        {
+          "var": "after_old",
+          "equals": [],
+          "unordered": true
+        },
+        {
+          "var": "after_new",
+          "equals": [
+            [
+              "alpha"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    }
+  ]
+}

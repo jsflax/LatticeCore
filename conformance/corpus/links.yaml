@@ -1,0 +1,576 @@
+{
+  "format_version": 1,
+  "suite": "links",
+  "scenarios": [
+    {
+      "name": "link-set-and-traverse",
+      "description": "Setting a to-one link persists it; a dotted read traverses to the target's field.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPet": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          },
+          "CfOwner": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "pet": {
+                "type": "link",
+                "target": "CfPet"
+              },
+              "pets": {
+                "type": "list",
+                "target": "CfPet"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "rex",
+            "kind": "dog"
+          },
+          "as": "rex"
+        },
+        {
+          "op": "insert",
+          "table": "CfOwner",
+          "values": {
+            "name": "alice"
+          },
+          "as": "alice"
+        },
+        {
+          "op": "update",
+          "ref": "alice",
+          "values": {
+            "pet": {
+              "$ref": "rex"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "ref": "alice",
+          "fields": [
+            "pet.name",
+            "pet.kind"
+          ],
+          "save": "linked"
+        }
+      ],
+      "expect": [
+        {
+          "var": "linked",
+          "equals": [
+            "rex",
+            "dog"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "link-default-null",
+      "description": "An unset link reads null through a dotted path.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPet": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          },
+          "CfOwner": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "pet": {
+                "type": "link",
+                "target": "CfPet"
+              },
+              "pets": {
+                "type": "list",
+                "target": "CfPet"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfOwner",
+          "values": {
+            "name": "bob"
+          },
+          "as": "bob"
+        },
+        {
+          "op": "read",
+          "ref": "bob",
+          "fields": [
+            "pet.name"
+          ],
+          "save": "linked"
+        }
+      ],
+      "expect": [
+        {
+          "var": "linked",
+          "equals": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "name": "link-reassign",
+      "description": "Reassigning a link points at the new target.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPet": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          },
+          "CfOwner": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "pet": {
+                "type": "link",
+                "target": "CfPet"
+              },
+              "pets": {
+                "type": "list",
+                "target": "CfPet"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "rex",
+            "kind": "dog"
+          },
+          "as": "rex"
+        },
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "whiskers",
+            "kind": "cat"
+          },
+          "as": "whiskers"
+        },
+        {
+          "op": "insert",
+          "table": "CfOwner",
+          "values": {
+            "name": "alice"
+          },
+          "as": "alice"
+        },
+        {
+          "op": "update",
+          "ref": "alice",
+          "values": {
+            "pet": {
+              "$ref": "rex"
+            }
+          }
+        },
+        {
+          "op": "update",
+          "ref": "alice",
+          "values": {
+            "pet": {
+              "$ref": "whiskers"
+            }
+          }
+        },
+        {
+          "op": "read",
+          "ref": "alice",
+          "fields": [
+            "pet.name"
+          ],
+          "save": "linked"
+        }
+      ],
+      "expect": [
+        {
+          "var": "linked",
+          "equals": [
+            "whiskers"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "link-clear",
+      "description": "Assigning null clears the link.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPet": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          },
+          "CfOwner": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "pet": {
+                "type": "link",
+                "target": "CfPet"
+              },
+              "pets": {
+                "type": "list",
+                "target": "CfPet"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "rex",
+            "kind": "dog"
+          },
+          "as": "rex"
+        },
+        {
+          "op": "insert",
+          "table": "CfOwner",
+          "values": {
+            "name": "alice"
+          },
+          "as": "alice"
+        },
+        {
+          "op": "update",
+          "ref": "alice",
+          "values": {
+            "pet": {
+              "$ref": "rex"
+            }
+          }
+        },
+        {
+          "op": "update",
+          "ref": "alice",
+          "values": {
+            "pet": null
+          }
+        },
+        {
+          "op": "read",
+          "ref": "alice",
+          "fields": [
+            "pet.name"
+          ],
+          "save": "linked"
+        }
+      ],
+      "expect": [
+        {
+          "var": "linked",
+          "equals": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "name": "list-append-preserves-order",
+      "description": "List append preserves insertion order; size and ordered element reads agree.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPet": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          },
+          "CfOwner": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "pet": {
+                "type": "link",
+                "target": "CfPet"
+              },
+              "pets": {
+                "type": "list",
+                "target": "CfPet"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "rex",
+            "kind": "dog"
+          },
+          "as": "rex"
+        },
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "whiskers",
+            "kind": "cat"
+          },
+          "as": "whiskers"
+        },
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "buddy",
+            "kind": "dog"
+          },
+          "as": "buddy"
+        },
+        {
+          "op": "insert",
+          "table": "CfOwner",
+          "values": {
+            "name": "alice"
+          },
+          "as": "alice"
+        },
+        {
+          "op": "list_append",
+          "ref": "alice",
+          "property": "pets",
+          "item": {
+            "$ref": "rex"
+          }
+        },
+        {
+          "op": "list_append",
+          "ref": "alice",
+          "property": "pets",
+          "item": {
+            "$ref": "whiskers"
+          }
+        },
+        {
+          "op": "list_append",
+          "ref": "alice",
+          "property": "pets",
+          "item": {
+            "$ref": "buddy"
+          }
+        },
+        {
+          "op": "list_size",
+          "ref": "alice",
+          "property": "pets",
+          "save": "n"
+        },
+        {
+          "op": "list_read",
+          "ref": "alice",
+          "property": "pets",
+          "field": "name",
+          "save": "members"
+        }
+      ],
+      "expect": [
+        {
+          "var": "n",
+          "equals": 3
+        },
+        {
+          "var": "members",
+          "equals": [
+            "rex",
+            "whiskers",
+            "buddy"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "list-remove-at",
+      "description": "Positional removal keeps the remaining order.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPet": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            }
+          },
+          "CfOwner": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "pet": {
+                "type": "link",
+                "target": "CfPet"
+              },
+              "pets": {
+                "type": "list",
+                "target": "CfPet"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "rex",
+            "kind": "dog"
+          },
+          "as": "rex"
+        },
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "whiskers",
+            "kind": "cat"
+          },
+          "as": "whiskers"
+        },
+        {
+          "op": "insert",
+          "table": "CfPet",
+          "values": {
+            "name": "buddy",
+            "kind": "dog"
+          },
+          "as": "buddy"
+        },
+        {
+          "op": "insert",
+          "table": "CfOwner",
+          "values": {
+            "name": "alice"
+          },
+          "as": "alice"
+        },
+        {
+          "op": "list_append",
+          "ref": "alice",
+          "property": "pets",
+          "item": {
+            "$ref": "rex"
+          }
+        },
+        {
+          "op": "list_append",
+          "ref": "alice",
+          "property": "pets",
+          "item": {
+            "$ref": "whiskers"
+          }
+        },
+        {
+          "op": "list_append",
+          "ref": "alice",
+          "property": "pets",
+          "item": {
+            "$ref": "buddy"
+          }
+        },
+        {
+          "op": "list_remove_at",
+          "ref": "alice",
+          "property": "pets",
+          "index": 1
+        },
+        {
+          "op": "list_size",
+          "ref": "alice",
+          "property": "pets",
+          "save": "n"
+        },
+        {
+          "op": "list_read",
+          "ref": "alice",
+          "property": "pets",
+          "field": "name",
+          "save": "members"
+        }
+      ],
+      "expect": [
+        {
+          "var": "n",
+          "equals": 2
+        },
+        {
+          "var": "members",
+          "equals": [
+            "rex",
+            "buddy"
+          ]
+        }
+      ]
+    }
+  ]
+}

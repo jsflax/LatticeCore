@@ -1,0 +1,650 @@
+{
+  "format_version": 1,
+  "suite": "query-shape",
+  "scenarios": [
+    {
+      "name": "sort-asc",
+      "description": "Ascending sort on an int column (distinct values).",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "sort": {
+              "by": "age",
+              "order": "asc"
+            },
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "alice"
+              ],
+              [
+                "erin"
+              ],
+              [
+                "carol"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "sort-desc",
+      "description": "Descending sort on a double column (distinct values).",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "sort": {
+              "by": "score",
+              "order": "desc"
+            },
+            "equals": [
+              [
+                "erin"
+              ],
+              [
+                "alice"
+              ],
+              [
+                "carol"
+              ],
+              [
+                "bob"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "limit",
+      "description": "LIMIT truncates the sorted result.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "sort": {
+              "by": "age",
+              "order": "asc"
+            },
+            "limit": 2,
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "alice"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "offset-pagination",
+      "description": "LIMIT+OFFSET pages through a sorted result without gaps or repeats.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "sort": {
+              "by": "age",
+              "order": "asc"
+            },
+            "limit": 2,
+            "offset": 0,
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "alice"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "sort": {
+              "by": "age",
+              "order": "asc"
+            },
+            "limit": 2,
+            "offset": 2,
+            "equals": [
+              [
+                "erin"
+              ],
+              [
+                "carol"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "distinct-by",
+      "description": "distinct_by returns one row per distinct value; only the distinct column is asserted.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "city"
+            ],
+            "distinct_by": "city",
+            "equals": [
+              [
+                "lisbon"
+              ],
+              [
+                "porto"
+              ]
+            ],
+            "unordered": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "where-plus-shape",
+      "description": "Filter, sort, and limit compose.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "active",
+              "op": "eq",
+              "value": true
+            },
+            "sort": {
+              "by": "age",
+              "order": "desc"
+            },
+            "limit": 2,
+            "columns": [
+              "name",
+              "age"
+            ],
+            "equals": [
+              [
+                "carol",
+                41
+              ],
+              [
+                "erin",
+                35
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,307 @@
+{
+  "format_version": 1,
+  "suite": "query-geo",
+  "scenarios": [
+    {
+      "name": "within-bounds-membership",
+      "description": "Bounding-box query returns exactly the points inside the box.",
+      "capabilities": [
+        "geo"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPlace": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "location": {
+                "type": "geo"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "a",
+            "kind": "cafe",
+            "location": {
+              "lat": 10.0,
+              "lon": 20.0
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "b",
+            "kind": "museum",
+            "location": {
+              "lat": 10.5,
+              "lon": 20.5
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "c",
+            "kind": "cafe",
+            "location": {
+              "lat": 40.0,
+              "lon": -5.0
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "d",
+            "kind": "cafe",
+            "location": {
+              "lat": -10.0,
+              "lon": 20.0
+            }
+          }
+        },
+        {
+          "op": "geo_within",
+          "table": "CfPlace",
+          "column": "location",
+          "min_lat": 9.0,
+          "max_lat": 11.0,
+          "min_lon": 19.0,
+          "max_lon": 21.0,
+          "columns": [
+            "name"
+          ],
+          "save": "hits"
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [
+            [
+              "a"
+            ],
+            [
+              "b"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    },
+    {
+      "name": "within-bounds-plus-where",
+      "description": "A scalar predicate composes with the spatial filter.",
+      "capabilities": [
+        "geo"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPlace": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "location": {
+                "type": "geo"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "a",
+            "kind": "cafe",
+            "location": {
+              "lat": 10.0,
+              "lon": 20.0
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "b",
+            "kind": "museum",
+            "location": {
+              "lat": 10.5,
+              "lon": 20.5
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "c",
+            "kind": "cafe",
+            "location": {
+              "lat": 40.0,
+              "lon": -5.0
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "d",
+            "kind": "cafe",
+            "location": {
+              "lat": -10.0,
+              "lon": 20.0
+            }
+          }
+        },
+        {
+          "op": "geo_within",
+          "table": "CfPlace",
+          "column": "location",
+          "min_lat": 9.0,
+          "max_lat": 11.0,
+          "min_lon": 19.0,
+          "max_lon": 21.0,
+          "columns": [
+            "name"
+          ],
+          "save": "hits",
+          "where": {
+            "field": "kind",
+            "op": "eq",
+            "value": "cafe"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [
+            [
+              "a"
+            ]
+          ],
+          "unordered": true
+        }
+      ]
+    },
+    {
+      "name": "within-bounds-empty",
+      "description": "A box containing no points returns an empty result.",
+      "capabilities": [
+        "geo"
+      ],
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPlace": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "location": {
+                "type": "geo"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "a",
+            "kind": "cafe",
+            "location": {
+              "lat": 10.0,
+              "lon": 20.0
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "b",
+            "kind": "museum",
+            "location": {
+              "lat": 10.5,
+              "lon": 20.5
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "c",
+            "kind": "cafe",
+            "location": {
+              "lat": 40.0,
+              "lon": -5.0
+            }
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPlace",
+          "values": {
+            "name": "d",
+            "kind": "cafe",
+            "location": {
+              "lat": -10.0,
+              "lon": 20.0
+            }
+          }
+        },
+        {
+          "op": "geo_within",
+          "table": "CfPlace",
+          "column": "location",
+          "min_lat": 80.0,
+          "max_lat": 81.0,
+          "min_lon": 100.0,
+          "max_lon": 101.0,
+          "columns": [
+            "name"
+          ],
+          "save": "hits"
+        }
+      ],
+      "expect": [
+        {
+          "var": "hits",
+          "equals": [],
+          "unordered": true
+        }
+      ]
+    }
+  ]
+}

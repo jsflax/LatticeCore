@@ -1,0 +1,1553 @@
+{
+  "format_version": 1,
+  "suite": "query-filter",
+  "scenarios": [
+    {
+      "name": "eq-string",
+      "description": "String equality predicate selects exactly the matching rows.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "city",
+              "op": "eq",
+              "value": "lisbon"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "ne-int",
+      "description": "Integer inequality predicate.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "age",
+              "op": "ne",
+              "value": 25
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "carol"
+              ],
+              [
+                "dave"
+              ],
+              [
+                "erin"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "ordered-comparisons-int",
+      "description": "ge is inclusive, gt exclusive, lt/le mirror them.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "age",
+              "op": "ge",
+              "value": 30
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "carol"
+              ],
+              [
+                "erin"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "age",
+              "op": "gt",
+              "value": 30
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "carol"
+              ],
+              [
+                "erin"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "age",
+              "op": "lt",
+              "value": 25
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "dave"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "age",
+              "op": "le",
+              "value": 25
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "double-comparisons",
+      "description": "Comparisons on a double column with binary-exact literals.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "score",
+              "op": "lt",
+              "value": 8.5
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "score",
+              "op": "le",
+              "value": 8.5
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "carol"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "score",
+              "op": "gt",
+              "value": 9.5
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "erin"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "bool-eq",
+      "description": "Boolean equality predicate.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "active",
+              "op": "eq",
+              "value": true
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "carol"
+              ],
+              [
+                "erin"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "active",
+              "op": "eq",
+              "value": false
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "and-or-not",
+      "description": "Conjunction, disjunction, and negation compose.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "all": [
+                {
+                  "field": "city",
+                  "op": "eq",
+                  "value": "porto"
+                },
+                {
+                  "field": "age",
+                  "op": "ge",
+                  "value": 30
+                }
+              ]
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "erin"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "any": [
+                {
+                  "field": "city",
+                  "op": "eq",
+                  "value": "faro"
+                },
+                {
+                  "field": "age",
+                  "op": "eq",
+                  "value": 25
+                }
+              ]
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "carol"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "not": {
+                "any": [
+                  {
+                    "field": "city",
+                    "op": "eq",
+                    "value": "faro"
+                  },
+                  {
+                    "field": "age",
+                    "op": "eq",
+                    "value": 25
+                  }
+                ]
+              }
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "dave"
+              ],
+              [
+                "erin"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "string-affixes",
+      "description": "contains / starts_with / ends_with on a text column (lower-case data, case-sensitivity unpinned).",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "name",
+              "op": "contains",
+              "value": "ar"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "carol"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "name",
+              "op": "starts_with",
+              "value": "d"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "dave"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "name",
+              "op": "ends_with",
+              "value": "e"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "like-pattern",
+      "description": "SQL LIKE with % wildcards.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "name",
+              "op": "like",
+              "value": "%a%"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "carol"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "name",
+              "op": "like",
+              "value": "b%"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "in-and-between",
+      "description": "Set membership and inclusive range.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "age",
+              "op": "in",
+              "value": [
+                25,
+                41
+              ]
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "carol"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "age",
+              "op": "between",
+              "value": {
+                "low": 25,
+                "high": 35
+              }
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "bob"
+              ],
+              [
+                "erin"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "null-checks",
+      "description": "is_null / is_not_null on an optional column.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon",
+            "nickname": "al"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "bob",
+            "age": 25,
+            "score": 7.25,
+            "active": false,
+            "city": "porto"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "carol",
+            "age": 41,
+            "score": 8.5,
+            "active": true,
+            "city": "faro"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "dave",
+            "age": 24,
+            "score": 6.0,
+            "active": false,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "erin",
+            "age": 35,
+            "score": 9.75,
+            "active": true,
+            "city": "porto",
+            "nickname": "e"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "nickname",
+              "op": "is_null"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ],
+              [
+                "carol"
+              ],
+              [
+                "dave"
+              ]
+            ]
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "where": {
+              "field": "nickname",
+              "op": "is_not_null"
+            },
+            "sort": {
+              "by": "name",
+              "order": "asc"
+            },
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ],
+              [
+                "erin"
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

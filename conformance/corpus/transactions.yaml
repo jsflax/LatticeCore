@@ -1,0 +1,417 @@
+{
+  "format_version": 1,
+  "suite": "transactions",
+  "scenarios": [
+    {
+      "name": "commit-visibility",
+      "description": "Writes inside a committed transaction are visible after it.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "transaction",
+          "ops": [
+            {
+              "op": "insert",
+              "table": "CfPerson",
+              "values": {
+                "name": "alice",
+                "age": 30,
+                "score": 9.5,
+                "active": true,
+                "city": "lisbon"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "count": {
+            "table": "CfPerson",
+            "equals": 1
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "rollback-discards-writes",
+      "description": "An aborted transaction leaves no trace of its writes.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfPerson",
+          "values": {
+            "name": "alice",
+            "age": 30,
+            "score": 9.5,
+            "active": true,
+            "city": "lisbon"
+          }
+        },
+        {
+          "op": "transaction",
+          "ops": [
+            {
+              "op": "insert",
+              "table": "CfPerson",
+              "values": {
+                "name": "bob",
+                "age": 25,
+                "score": 7.25,
+                "active": false,
+                "city": "porto"
+              }
+            },
+            {
+              "op": "abort"
+            }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "count": {
+            "table": "CfPerson",
+            "equals": 1
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "alice"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "usable-after-rollback",
+      "description": "After a rollback the connection immediately supports a fresh committing transaction.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "transaction",
+          "ops": [
+            {
+              "op": "insert",
+              "table": "CfPerson",
+              "values": {
+                "name": "alice",
+                "age": 30,
+                "score": 9.5,
+                "active": true,
+                "city": "lisbon"
+              }
+            },
+            {
+              "op": "abort"
+            }
+          ]
+        },
+        {
+          "op": "transaction",
+          "ops": [
+            {
+              "op": "insert",
+              "table": "CfPerson",
+              "values": {
+                "name": "bob",
+                "age": 25,
+                "score": 7.25,
+                "active": false,
+                "city": "porto"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "count": {
+            "table": "CfPerson",
+            "equals": 1
+          }
+        },
+        {
+          "rows": {
+            "table": "CfPerson",
+            "columns": [
+              "name"
+            ],
+            "equals": [
+              [
+                "bob"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "own-writes-visible-inside",
+      "description": "A transaction reads its own uncommitted writes.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "transaction",
+          "ops": [
+            {
+              "op": "insert",
+              "table": "CfPerson",
+              "values": {
+                "name": "alice",
+                "age": 30,
+                "score": 9.5,
+                "active": true,
+                "city": "lisbon"
+              }
+            },
+            {
+              "op": "count",
+              "table": "CfPerson",
+              "save": "inside"
+            }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "var": "inside",
+          "equals": 1
+        },
+        {
+          "count": {
+            "table": "CfPerson",
+            "equals": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "error-inside-rolls-back",
+      "description": "An unexpected error inside the block rolls the whole transaction back and surfaces as the transaction's error.",
+      "schema": {
+        "version": 1,
+        "tables": {
+          "CfPerson": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "age": {
+                "type": "int"
+              },
+              "score": {
+                "type": "double"
+              },
+              "active": {
+                "type": "bool"
+              },
+              "nickname": {
+                "type": "string",
+                "optional": true
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          },
+          "CfCard": {
+            "properties": {
+              "code": {
+                "type": "string",
+                "unique": true
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "ops": [
+        {
+          "op": "insert",
+          "table": "CfCard",
+          "values": {
+            "code": "x",
+            "note": "first"
+          }
+        },
+        {
+          "op": "transaction",
+          "expect_error": "add_failed",
+          "ops": [
+            {
+              "op": "insert",
+              "table": "CfCard",
+              "values": {
+                "code": "y",
+                "note": "doomed"
+              }
+            },
+            {
+              "op": "insert",
+              "table": "CfCard",
+              "values": {
+                "code": "x",
+                "note": "dup"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "count": {
+            "table": "CfCard",
+            "equals": 1
+          }
+        },
+        {
+          "rows": {
+            "table": "CfCard",
+            "columns": [
+              "code",
+              "note"
+            ],
+            "equals": [
+              [
+                "x",
+                "first"
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

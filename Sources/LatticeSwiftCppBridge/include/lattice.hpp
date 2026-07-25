@@ -2157,8 +2157,13 @@ public:
             // metric is not L2, we re-score using the actual distance function.
             // WHERE filters are applied as post-filtering on candidates.
             // Oversample by 2x when filtering to compensate for post-filter loss.
-            int fetch_k = where_conditions.empty() ? vc.k : vc.k * 2;
+            // When re-scoring with a non-L2 metric, additionally oversample 4x:
+            // MATCH selects candidates by L2 distance, and the true top-k under
+            // the requested metric need not lie within the L2 top-k. The CTE
+            // then orders by the re-scored distance and truncates back to k.
             bool needs_rescore = (distance_func != "vec_distance_L2");
+            int fetch_k = where_conditions.empty() ? vc.k : vc.k * 2;
+            if (needs_rescore) fetch_k *= 4;
             // MATCH CTE: each schema's vec table is queried with MATCH, then
             // JOINed to THAT SCHEMA's model table (not the UNION ALL view) to
             // resolve gid → id and carry the distance through.
@@ -2178,8 +2183,11 @@ public:
                     sql << " AND " << cond;
                 }
             }
-            sql << ") ORDER BY distance ASC"
-                << "), ";
+            sql << ") ORDER BY distance ASC";
+            // Truncate the oversampled, re-scored candidate set back to the
+            // requested k so the constraint keeps its top-k semantics.
+            if (needs_rescore) sql << " LIMIT " << vc.k;
+            sql << "), ";
         }
 
         // ====================================================================
@@ -2350,6 +2358,7 @@ public:
             sql << " GROUP BY " << group_by.value();
         }
 
+        bool emitted_order_by = false;
         if (sort.type != sort_descriptor::Type::none && !sort.column.empty()) {
             std::string order_col;
             switch (sort.type) {
@@ -2361,8 +2370,22 @@ public:
                     order_col = table_name + "." + sort.column; break;
                 default: break;
             }
-            if (!order_col.empty())
+            if (!order_col.empty()) {
                 sql << " ORDER BY " << order_col << (sort.ascending ? " ASC" : " DESC");
+                emitted_order_by = true;
+            }
+        }
+        // SQL does not guarantee that a subquery's ORDER BY survives to the
+        // outer SELECT, so the vec CTE's ordering by (possibly re-scored)
+        // distance is lost here — without an explicit sort, rows would come
+        // back in vec0's L2 MATCH candidate order, which is wrong for any
+        // non-L2 metric. Default to ordering by vector distance ascending.
+        if (!emitted_order_by && !vectors.empty()) {
+            sql << " ORDER BY ";
+            for (size_t i = 0; i < vectors.size(); ++i) {
+                if (i > 0) sql << ", ";
+                sql << "_dist_" << vectors[i].column << " ASC";
+            }
         }
 
         sql << " LIMIT " << limit;

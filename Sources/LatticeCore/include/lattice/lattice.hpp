@@ -3654,6 +3654,10 @@ public:
             release_store_write_gate();
             throw;
         }
+        // Record the owning thread: read_db()'s in-transaction routing must
+        // apply ONLY to this thread — other threads' reads keep reader
+        // isolation and never observe the open transaction.
+        txn_owner_thread_.store(std::this_thread::get_id(), std::memory_order_release);
     }
     void commit() {
         try {
@@ -3662,18 +3666,26 @@ public:
             // COMMIT can fail with the transaction still open (BUSY) — keep
             // the gate; the caller retries or rolls back. If the txn is
             // already gone (auto-rollback), release now.
-            if (!db_->is_in_transaction()) release_store_write_gate();
+            if (!db_->is_in_transaction()) {
+                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
+                release_store_write_gate();
+            }
             throw;
         }
+        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
         release_store_write_gate();
     }
     void rollback() {
         try {
             db_->rollback();
         } catch (...) {
-            if (!db_->is_in_transaction()) release_store_write_gate();
+            if (!db_->is_in_transaction()) {
+                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
+                release_store_write_gate();
+            }
             throw;
         }
+        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
         release_store_write_gate();
     }
 
@@ -3727,7 +3739,15 @@ public:
     /// connection serializes safely; outside a transaction behavior is
     /// unchanged (concurrent reads stay off the writer).
     database& read_db() {
-        if (read_db_ && db_->is_in_transaction()) return *db_;
+        // Thread-scoped: only the transaction-owning thread reads through
+        // the write connection (read-your-writes); every other thread keeps
+        // the dedicated reader and sees only committed state. A raw BEGIN
+        // that bypassed begin_transaction() records no owner, so routing
+        // simply doesn't engage (the safe, pre-1.0 behavior).
+        if (read_db_ && db_->is_in_transaction() &&
+            txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+            return *db_;
+        }
         return read_db_ ? *read_db_ : *db_;
     }
 
@@ -5026,7 +5046,9 @@ private:
 
     configuration config_;
     std::unique_ptr<database> db_;       // Write connection
-    std::unique_ptr<database> read_db_;  // Read-only connection for concurrent reads
+    std::unique_ptr<database> read_db_;
+    // Thread that opened the current explicit transaction (see read_db()).
+    std::atomic<std::thread::id> txn_owner_thread_{};  // Read-only connection for concurrent reads
     std::unique_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler
                                                // (avoids SQLite lock contention with read_db_
                                                // when observer callbacks query on MainActor)

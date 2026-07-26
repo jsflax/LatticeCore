@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-25
+
+### Fixed
+- **In-transaction read routing is now thread-scoped.** 1.0.0's fix for
+  C-ABI reads missing an open transaction's uncommitted writes routed ALL
+  reads through the write connection while a transaction was open — so a
+  concurrent reader on another thread could observe uncommitted state,
+  breaking reader isolation (caught by the Swift suite's
+  `fileStore_otherThreadReads_neverSeeTheOpenTransaction` pin on the first
+  run against the released core). `read_db()` now routes through the write
+  connection only for the thread that opened the transaction; every other
+  thread keeps the dedicated reader and sees committed state only.
+
 ## [1.0.0] - 2026-07-25
 
 LatticeCore 1.0.0. The C ABI is frozen and additive-only from this release

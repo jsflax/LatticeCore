@@ -1230,6 +1230,49 @@ TEST(CAPITransactionVisibility, ReadsInsideOpenTransactionSeeUncommittedWrites) 
     lattice_db_release(db);
 }
 
+// The in-transaction read routing is THREAD-SCOPED: only the thread that
+// opened the transaction reads through the write connection. Every other
+// thread keeps the dedicated reader and must see ONLY committed state —
+// leaking uncommitted rows to concurrent readers would break reader
+// isolation (caught by the Swift suite against 1.0.0, fixed in 1.0.1).
+TEST(CAPITransactionVisibility, OtherThreadsNeverSeeTheOpenTransaction) {
+    TempPath path("capi_txn_thread_scope");
+    PersonSchema ps;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), &ps.schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    lattice_object_t* base = add_person(db, "committed", 1);
+    ASSERT_NE(base, nullptr);
+    lattice_object_release(base);
+
+    ASSERT_EQ(lattice_db_begin_transaction(db), LATTICE_OK) << lattice_last_error();
+    lattice_object_t* staged = lattice_db_create_object(db, "Person");
+    ASSERT_NE(staged, nullptr);
+    lattice_object_set_string(staged, "name", "uncommitted");
+    lattice_object_set_int(staged, "age", 99);
+    lattice_object_t* managed = lattice_db_add(db, staged);
+    ASSERT_NE(managed, nullptr) << lattice_last_error();
+    lattice_object_release(managed);
+
+    // Owning thread: read-your-writes.
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 2u);
+
+    // Foreign thread: committed state only.
+    uint64_t other_count = 0, other_filtered = ~0ull;
+    std::thread([&] {
+        other_count = lattice_db_count(db, "Person", nullptr);
+        other_filtered = lattice_db_count(db, "Person", "age = 99");
+    }).join();
+    EXPECT_EQ(other_count, 1u)
+        << "a foreign thread observed another thread's open transaction";
+    EXPECT_EQ(other_filtered, 0u);
+
+    ASSERT_EQ(lattice_db_rollback(db), LATTICE_OK) << lattice_last_error();
+    lattice_object_release(staged);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
 // Commit is the positive control: the same routing must not break the
 // ordinary committed-visibility contract.
 TEST(CAPITransactionVisibility, CommitKeepsTransactionWrites) {

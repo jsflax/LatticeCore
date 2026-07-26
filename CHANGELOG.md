@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-25
+
+LatticeCore 1.0.0. The C ABI is frozen and additive-only from this release
+(docs/CAPI-STABILITY.md): exactly the 118 exported `lattice_*` functions in
+`lattice_capi.symbols`, enforced by an `nm` diff in CI on macOS and Linux.
+The on-disk schema-format epoch is 4.
+
+Consolidates 1.0.0-rc.1 (the freeze) plus the post-rc conformance-driven
+fixes below. Changes relative to 0.10.11:
+
 ### Fixed
 - **Cross-SDK conformance: per-property `is_unique` now produces DDL on the
   C-ABI/core paths.** `lattice_property_t.is_unique` survived into the
@@ -34,7 +44,8 @@
   full descriptor conversion, and `swift_dynamic_object` seeds non-nullable
   geo defaults into the expanded columns rather than the raw name.
 
-## [1.0.0-rc.1]
+### From 1.0.0-rc.1
+
 
 The C ABI freeze (plan WS-C C1 exit; docs/CAPI-STABILITY.md becomes binding:
 additive-only from here).

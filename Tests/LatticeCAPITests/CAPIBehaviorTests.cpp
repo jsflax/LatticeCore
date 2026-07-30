@@ -782,10 +782,18 @@ TEST(CAPIReceiveSyncData, PerEntryErrorIsolation) {
 
     // Tamper the FIRST entry to target a table the receiver doesn't have —
     // that entry must fail to apply while the second still lands.
+    //
+    // The name is deliberately underscore-prefixed (an INTERNAL table). A3's
+    // schema-skew tolerance gates on `is_model_table` (first char != '_'), so
+    // an unknown MODEL table is now a defined, acked no-op — that contract is
+    // pinned separately by SkewTolerance.UnknownTableSkippedAndAcked. An
+    // unknown internal table bypasses both skew gates and still hard-fails,
+    // which is the failure mode this test needs to keep pinning per-entry
+    // isolation. Do not "simplify" this back to a bare table name.
     const std::string needle = "\"tableName\":\"Person\"";
     auto pos = entries_json.find(needle);
     ASSERT_NE(pos, std::string::npos) << entries_json;
-    entries_json.replace(pos, needle.size(), "\"tableName\":\"NoSuchTable\"");
+    entries_json.replace(pos, needle.size(), "\"tableName\":\"_NoSuchTable\"");
     ASSERT_NE(entries_json.find("\"tableName\":\"Person\""), std::string::npos)
         << "expected a second, untampered entry";
 

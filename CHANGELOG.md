@@ -1,6 +1,13 @@
 # Changelog
 
-## [Unreleased]
+## [1.1.0] - 2026-08-04
+
+Stage A sync hardening: multi-channel hubs (one database feeding several
+independently-filtered synchronizers) are now correct. Public API is
+purely additive; the schema-format epoch moves 3 → 6, which migrates
+forward automatically but is NOT downgrade-safe (an older binary's
+two-column insert into the rebuilt `_lattice_sync_set` hits
+`sync_id NOT NULL`).
 
 ### Added
 - **Stage A sync hardening for multi-channel hubs (A2–A6, Engram Groups increment 1)**:

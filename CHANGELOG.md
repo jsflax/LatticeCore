@@ -2,7 +2,117 @@
 
 ## [Unreleased]
 
-## [1.0.0-rc.1]
+### Added
+- **Stage A sync hardening for multi-channel hubs (A2–A6, Engram Groups increment 1)**:
+  - **A2 — per-channel filter control**: `lattice_db::update_sync_filter(channel, filter)` /
+    `clear_sync_filter(channel)` ("" = WSS) target ONE synchronizer; the
+    fan-out overloads remain but are documented single-channel-only. Bridge:
+    `update_sync_filter_for_channel` / `clear_sync_filter_for_channel`.
+    `ipc_target.narrowing_emits_removals` plumbs through to the synchronizer.
+  - **A3 — schema-skew tolerance**: apply drops unknown columns (loudly) and
+    applies the remainder; unknown-table entries skip-and-ack; an
+    unknown-only UPDATE acks as a no-op. Ends the silent unacked-resend
+    wedge class; the receiver's AuditLog bookkeeping keeps the ORIGINAL
+    payload so onward relay is lossless.
+  - **A4 — narrowing never deletes beyond bookkeeping**: marked
+    filter-removal DELETEs applied over any per-sync channel are recorded
+    fully-synchronized (they clear the local mirror and stop dead — an
+    unfiltered uplink can no longer forward them to a shared server DB);
+    `sync_config.narrowing_emits_removals=false` makes narrowing
+    bookkeeping-only (group-channel semantics: spokes stay full mirrors).
+  - **A5 — synthesized snapshots are insert-if-absent**: new
+    `audit_log_entry.synthesized` provenance flag (AuditLog column, epoch 5;
+    optional wire key, ignored by old peers) set by reconcile Phase-2
+    additions, classify's UPDATE→INSERT conversion, and nuclear-compact
+    regeneration (`generate_history(mark_synthesized:)`). Apply skips the
+    SQL when the row already exists — stale local snapshots can no longer
+    revert newer peer edits or resurrect tombstones.
+  - **A6 — channel teardown hygiene**: eager-collapse counts only sync_ids
+    with LIVE replication slots (a dead channel's stale confirmations could
+    collapse an entry before a live channel relayed it — silent relay
+    loss); new `remove_sync_channel_state(sync_id)` retires a channel
+    (state + set + slot) so it can't pin compaction.
+  - Tests: `SkewToleranceTests` (3), `FilterRemovalGateTests` (3),
+    `SynthesisNoClobberTests` (4), + 2 A6 cases in `MultiChannelSyncSet`.
+    Full suite 249/249.
+
+### Changed
+- **`_lattice_sync_set` is per-synchronizer (A1, Engram Groups increment 0)**:
+  PK widened from `(table_name, global_row_id)` to
+  `(sync_id, table_name, global_row_id)`; all membership reads/writes
+  (`sync_set_add/remove/contains`, `clear_sync_filter`, both
+  `reconcile_sync_filter` phases, `classify_entries` preload, the
+  pending-query sync-set EXISTS) scope to the owning synchronizer's
+  `sync_id`. Two filtered channels on one database no longer share (or
+  clobber) membership state — the shared shape made channel A synthesize
+  cross-channel DELETEs for channel B's rows (`!matches && in_set`, and
+  reconcile Phase-1 removals over the global set), the mechanism class
+  behind the Mar 2026 filter-narrowing data loss. `reset_sync_state` now
+  wipes only the named channel's set (the multi-slot skip hack is gone).
+  Existing databases rebuild on open via `migrate_sync_set_to_per_sync_id`
+  (schema-format epoch 4 → 5): one registered replication slot → rows
+  attributed to it; otherwise rows drop and reconcile Phase 2
+  re-synthesizes membership idempotently. New `MultiChannelSyncSet` gtest
+  suite (5 tests) pins isolation, scoped reconcile, both migration paths,
+  and scoped reset.
+
+## [1.0.1] - 2026-07-25
+
+### Fixed
+- **In-transaction read routing is now thread-scoped.** 1.0.0's fix for
+  C-ABI reads missing an open transaction's uncommitted writes routed ALL
+  reads through the write connection while a transaction was open — so a
+  concurrent reader on another thread could observe uncommitted state,
+  breaking reader isolation (caught by the Swift suite's
+  `fileStore_otherThreadReads_neverSeeTheOpenTransaction` pin on the first
+  run against the released core). `read_db()` now routes through the write
+  connection only for the thread that opened the transaction; every other
+  thread keeps the dedicated reader and sees committed state only.
+
+## [1.0.0] - 2026-07-25
+
+LatticeCore 1.0.0. The C ABI is frozen and additive-only from this release
+(docs/CAPI-STABILITY.md): exactly the 118 exported `lattice_*` functions in
+`lattice_capi.symbols`, enforced by an `nm` diff in CI on macOS and Linux.
+The on-disk schema-format epoch is 4.
+
+Consolidates 1.0.0-rc.1 (the freeze) plus the post-rc conformance-driven
+fixes below. Changes relative to 0.10.11:
+
+### Fixed
+- **Cross-SDK conformance: per-property `is_unique` now produces DDL on the
+  C-ABI/core paths.** `lattice_property_t.is_unique` survived into the
+  descriptors and the schema fingerprint but generated no `CREATE UNIQUE
+  INDEX` anywhere — only the Swift bridge's constraint-driven pass ("Phase 8")
+  emitted unique indexes, so C-ABI-created databases (Python/Kotlin/JS) never
+  enforced uniqueness that Swift-created ones did, including on the same file.
+  The C ABI now canonicalizes `is_unique` into single-column constraints (in
+  property declaration order) so Phase 8 emits them, and the core registry
+  ensure path gained an equivalent `ensure_unique_property_indexes` pass.
+  Index naming is identical across all paths (`unique_<table>_<ordinal>`), so
+  mixed-SDK reopens find the index already present instead of double-indexing.
+  `kLatticeSchemaFormatEpoch` bumped to 4 (guarded, auto-migration-safe DDL;
+  existing fingerprinted databases revalidate once and gain the indexes).
+- **Cross-SDK conformance: C-ABI reads inside an open transaction see the
+  transaction's uncommitted writes.** `lattice_db_count`/`lattice_db_query`
+  always executed on the dedicated read-only connection, which under WAL
+  cannot see an open transaction on the write connection
+  (`lattice_db_begin_transaction`). `read_db()` now routes reads through the
+  write connection while it has an open transaction (live autocommit state —
+  self-correcting on COMMIT/ROLLBACK); outside a transaction, read routing is
+  unchanged.
+- **Cross-SDK conformance: dynamic add with a geo-bounds property no longer
+  fails with "table has no column named `<name>`".**
+  `lattice_object_create_with_schema` rebuilt property descriptors by hand and
+  dropped every index/constraint/geo/vector flag, so an `is_geo_bounds`
+  property was treated as a plain column and the INSERT targeted the raw
+  property name instead of the four expanded
+  `<name>_minLat/_maxLat/_minLon/_maxLon` columns. It now shares the C ABI's
+  full descriptor conversion, and `swift_dynamic_object` seeds non-nullable
+  geo defaults into the expanded columns rather than the raw name.
+
+### From 1.0.0-rc.1
+
 
 The C ABI freeze (plan WS-C C1 exit; docs/CAPI-STABILITY.md becomes binding:
 additive-only from here).

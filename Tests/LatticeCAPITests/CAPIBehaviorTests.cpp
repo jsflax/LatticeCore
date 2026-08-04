@@ -782,10 +782,18 @@ TEST(CAPIReceiveSyncData, PerEntryErrorIsolation) {
 
     // Tamper the FIRST entry to target a table the receiver doesn't have —
     // that entry must fail to apply while the second still lands.
+    //
+    // The name is deliberately underscore-prefixed (an INTERNAL table). A3's
+    // schema-skew tolerance gates on `is_model_table` (first char != '_'), so
+    // an unknown MODEL table is now a defined, acked no-op — that contract is
+    // pinned separately by SkewTolerance.UnknownTableSkippedAndAcked. An
+    // unknown internal table bypasses both skew gates and still hard-fails,
+    // which is the failure mode this test needs to keep pinning per-entry
+    // isolation. Do not "simplify" this back to a bare table name.
     const std::string needle = "\"tableName\":\"Person\"";
     auto pos = entries_json.find(needle);
     ASSERT_NE(pos, std::string::npos) << entries_json;
-    entries_json.replace(pos, needle.size(), "\"tableName\":\"NoSuchTable\"");
+    entries_json.replace(pos, needle.size(), "\"tableName\":\"_NoSuchTable\"");
     ASSERT_NE(entries_json.find("\"tableName\":\"Person\""), std::string::npos)
         << "expected a second, untampered entry";
 
@@ -1068,4 +1076,308 @@ TEST(CAPIToJson, UnmanagedObjectAndErrorContract) {
 
     EXPECT_EQ(lattice_object_to_json(nullptr, 5), nullptr);
     ASSERT_NE(lattice_last_error(), nullptr);
+}
+
+// ============================================================================
+// Per-property unique constraints (conformance: cross-SDK divergence fix)
+// ============================================================================
+
+// A property flagged `is_unique` over the C ABI must produce the SAME schema
+// object the Swift bridge's constraint pass creates for `@Unique` on the same
+// field — a unique index named `unique_<table>_<ordinal>`, ordinals assigned
+// in property declaration order. Identical names are load-bearing: a database
+// created by Swift and reopened through the C ABI (or vice versa) must see
+// the index already present instead of growing a second one.
+TEST(CAPIUniqueConstraint, IsUniqueCreatesBridgeNamedIndexAndEnforces) {
+    TempPath path("capi_unique");
+
+    lattice_property_t props[3];
+    std::memset(props, 0, sizeof(props));
+    props[0].name = "email";
+    props[0].type = LATTICE_TYPE_TEXT;
+    props[0].kind = LATTICE_KIND_PRIMITIVE;
+    props[0].nullable = true;
+    props[0].is_unique = true;
+    props[1].name = "age";
+    props[1].type = LATTICE_TYPE_INTEGER;
+    props[1].kind = LATTICE_KIND_PRIMITIVE;
+    props[1].nullable = true;
+    props[2].name = "code";
+    props[2].type = LATTICE_TYPE_TEXT;
+    props[2].kind = LATTICE_KIND_PRIMITIVE;
+    props[2].nullable = true;
+    props[2].is_unique = true;
+
+    lattice_schema_t schema;
+    std::memset(&schema, 0, sizeof(schema));
+    schema.table_name = "UniquePerson";
+    schema.properties = props;
+    schema.property_count = 3;
+
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), &schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    // Index names: ordinal 0 = email (first unique property), 1 = code.
+    EXPECT_EQ(lattice_db_count(db, "sqlite_master",
+                  "type = 'index' AND tbl_name = 'UniquePerson' AND "
+                  "name = 'unique_UniquePerson_0'"),
+              1u);
+    EXPECT_EQ(lattice_db_count(db, "sqlite_master",
+                  "type = 'index' AND tbl_name = 'UniquePerson' AND "
+                  "name = 'unique_UniquePerson_1'"),
+              1u);
+    // ... and nothing else — exactly the two.
+    EXPECT_EQ(lattice_db_count(db, "sqlite_master",
+                  "type = 'index' AND tbl_name = 'UniquePerson' AND "
+                  "name LIKE 'unique_%'"),
+              2u);
+
+    // Enforcement: duplicate email is rejected.
+    lattice_object_t* first = lattice_db_create_object(db, "UniquePerson");
+    ASSERT_NE(first, nullptr) << lattice_last_error();
+    lattice_object_set_string(first, "email", "a@example.com");
+    lattice_object_set_string(first, "code", "c-1");
+    lattice_object_t* first_managed = lattice_db_add(db, first);
+    ASSERT_NE(first_managed, nullptr) << lattice_last_error();
+    lattice_object_release(first_managed);
+
+    lattice_object_t* dup = lattice_db_create_object(db, "UniquePerson");
+    ASSERT_NE(dup, nullptr) << lattice_last_error();
+    lattice_object_set_string(dup, "email", "a@example.com");
+    lattice_object_set_string(dup, "code", "c-2");
+    lattice_object_t* dup_managed = lattice_db_add(db, dup);
+    EXPECT_EQ(dup_managed, nullptr) << "duplicate unique value must be rejected";
+    ASSERT_NE(lattice_last_error(), nullptr);
+    EXPECT_EQ(lattice_db_count(db, "UniquePerson", nullptr), 1u);
+    lattice_object_release(dup);
+
+    // Distinct values still insert.
+    lattice_object_t* other = lattice_db_create_object(db, "UniquePerson");
+    ASSERT_NE(other, nullptr) << lattice_last_error();
+    lattice_object_set_string(other, "email", "b@example.com");
+    lattice_object_set_string(other, "code", "c-2");
+    lattice_object_t* other_managed = lattice_db_add(db, other);
+    ASSERT_NE(other_managed, nullptr) << lattice_last_error();
+    lattice_object_release(other_managed);
+    EXPECT_EQ(lattice_db_count(db, "UniquePerson", nullptr), 2u);
+
+    lattice_object_release(first);
+    lattice_object_release(other);
+    lattice_db_close(db);
+    lattice_db_release(db);
+
+    // Reopen: the pass is idempotent — still exactly two unique indexes.
+    lattice_db_t* db2 = lattice_db_create_with_schemas(path.str().c_str(), &schema, 1);
+    ASSERT_NE(db2, nullptr) << lattice_last_error();
+    EXPECT_EQ(lattice_db_count(db2, "sqlite_master",
+                  "type = 'index' AND tbl_name = 'UniquePerson' AND "
+                  "name LIKE 'unique_%'"),
+              2u);
+    lattice_db_close(db2);
+    lattice_db_release(db2);
+}
+
+// ============================================================================
+// Transaction read visibility (conformance: cross-SDK divergence fix)
+// ============================================================================
+
+// Under WAL the dedicated read-only connection cannot see another
+// connection's open transaction. lattice_db_count/lattice_db_query issued
+// between lattice_db_begin_transaction and commit/rollback must therefore
+// route through the write connection — uncommitted writes are visible inside
+// the transaction and gone after rollback.
+TEST(CAPITransactionVisibility, ReadsInsideOpenTransactionSeeUncommittedWrites) {
+    TempPath path("capi_txn_vis");
+    PersonSchema ps;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), &ps.schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    // Committed baseline.
+    lattice_object_t* base = add_person(db, "committed", 1);
+    ASSERT_NE(base, nullptr);
+    lattice_object_release(base);
+    ASSERT_EQ(lattice_db_count(db, "Person", nullptr), 1u);
+
+    ASSERT_EQ(lattice_db_begin_transaction(db), LATTICE_OK) << lattice_last_error();
+
+    lattice_object_t* staged = lattice_db_create_object(db, "Person");
+    ASSERT_NE(staged, nullptr) << lattice_last_error();
+    lattice_object_set_string(staged, "name", "uncommitted");
+    lattice_object_set_int(staged, "age", 99);
+    lattice_object_t* managed = lattice_db_add(db, staged);
+    ASSERT_NE(managed, nullptr) << lattice_last_error();
+    lattice_object_release(managed);
+
+    // Visible to count and query on the same handle while the txn is open.
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 2u)
+        << "count missed uncommitted writes inside an open transaction";
+    EXPECT_EQ(lattice_db_count(db, "Person", "age = 99"), 1u);
+
+    lattice_results_t* res = lattice_db_query(db, "Person", "age = 99", nullptr, 0, 0);
+    ASSERT_NE(res, nullptr) << lattice_last_error();
+    ASSERT_EQ(lattice_results_count(res), 1u)
+        << "query missed uncommitted writes inside an open transaction";
+    lattice_object_t* row = lattice_results_get(res, 0);
+    ASSERT_NE(row, nullptr);
+    EXPECT_STREQ(lattice_object_get_string(row, "name"), "uncommitted");
+    lattice_object_release(row);
+    lattice_results_free(res);
+
+    ASSERT_EQ(lattice_db_rollback(db), LATTICE_OK) << lattice_last_error();
+
+    // After rollback the staged row is gone from both read routes.
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 1u);
+    EXPECT_EQ(lattice_db_count(db, "Person", "age = 99"), 0u);
+    lattice_results_t* res2 = lattice_db_query(db, "Person", "age = 99", nullptr, 0, 0);
+    ASSERT_NE(res2, nullptr) << lattice_last_error();
+    EXPECT_EQ(lattice_results_count(res2), 0u);
+    lattice_results_free(res2);
+
+    lattice_object_release(staged);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+// The in-transaction read routing is THREAD-SCOPED: only the thread that
+// opened the transaction reads through the write connection. Every other
+// thread keeps the dedicated reader and must see ONLY committed state —
+// leaking uncommitted rows to concurrent readers would break reader
+// isolation (caught by the Swift suite against 1.0.0, fixed in 1.0.1).
+TEST(CAPITransactionVisibility, OtherThreadsNeverSeeTheOpenTransaction) {
+    TempPath path("capi_txn_thread_scope");
+    PersonSchema ps;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), &ps.schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    lattice_object_t* base = add_person(db, "committed", 1);
+    ASSERT_NE(base, nullptr);
+    lattice_object_release(base);
+
+    ASSERT_EQ(lattice_db_begin_transaction(db), LATTICE_OK) << lattice_last_error();
+    lattice_object_t* staged = lattice_db_create_object(db, "Person");
+    ASSERT_NE(staged, nullptr);
+    lattice_object_set_string(staged, "name", "uncommitted");
+    lattice_object_set_int(staged, "age", 99);
+    lattice_object_t* managed = lattice_db_add(db, staged);
+    ASSERT_NE(managed, nullptr) << lattice_last_error();
+    lattice_object_release(managed);
+
+    // Owning thread: read-your-writes.
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 2u);
+
+    // Foreign thread: committed state only.
+    uint64_t other_count = 0, other_filtered = ~0ull;
+    std::thread([&] {
+        other_count = lattice_db_count(db, "Person", nullptr);
+        other_filtered = lattice_db_count(db, "Person", "age = 99");
+    }).join();
+    EXPECT_EQ(other_count, 1u)
+        << "a foreign thread observed another thread's open transaction";
+    EXPECT_EQ(other_filtered, 0u);
+
+    ASSERT_EQ(lattice_db_rollback(db), LATTICE_OK) << lattice_last_error();
+    lattice_object_release(staged);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+// Commit is the positive control: the same routing must not break the
+// ordinary committed-visibility contract.
+TEST(CAPITransactionVisibility, CommitKeepsTransactionWrites) {
+    TempPath path("capi_txn_commit");
+    PersonSchema ps;
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), &ps.schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    ASSERT_EQ(lattice_db_begin_transaction(db), LATTICE_OK) << lattice_last_error();
+    lattice_object_t* p = add_person(db, "kept", 7);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 1u);
+    ASSERT_EQ(lattice_db_commit(db), LATTICE_OK) << lattice_last_error();
+
+    EXPECT_EQ(lattice_db_count(db, "Person", nullptr), 1u);
+    EXPECT_EQ(lattice_db_count(db, "Person", "age = 7"), 1u);
+    lattice_object_release(p);
+    lattice_db_close(db);
+    lattice_db_release(db);
+}
+
+// ============================================================================
+// Geo-bounds on the dynamic add path (conformance: cross-SDK divergence fix)
+// ============================================================================
+
+// An `is_geo_bounds` property is stored as four expanded REAL columns
+// (`<name>_minLat/_maxLat/_minLon/_maxLon`). Objects created through
+// lattice_object_create_with_schema used to lose the flag, so the add path
+// built its INSERT against the raw property name and SQLite rejected it with
+// "table has no column named <name>". The add must succeed and the four
+// columns must round-trip.
+TEST(CAPIGeoBounds, DynamicAddExpandsGeoBoundsColumns) {
+    TempPath path("capi_geo_add");
+
+    lattice_property_t props[2];
+    std::memset(props, 0, sizeof(props));
+    props[0].name = "name";
+    props[0].type = LATTICE_TYPE_TEXT;
+    props[0].kind = LATTICE_KIND_PRIMITIVE;
+    props[0].nullable = true;
+    props[1].name = "bounds";
+    props[1].type = LATTICE_TYPE_REAL;
+    props[1].kind = LATTICE_KIND_PRIMITIVE;
+    props[1].nullable = false;
+    props[1].is_geo_bounds = true;
+
+    lattice_schema_t schema;
+    std::memset(&schema, 0, sizeof(schema));
+    schema.table_name = "GeoPlace";
+    schema.properties = props;
+    schema.property_count = 2;
+
+    lattice_db_t* db = lattice_db_create_with_schemas(path.str().c_str(), &schema, 1);
+    ASSERT_NE(db, nullptr) << lattice_last_error();
+
+    // The table has the four expanded columns and NOT the raw property.
+    EXPECT_EQ(lattice_db_count(db, "pragma_table_info('GeoPlace')",
+                               "name = 'bounds_minLat'"), 1u);
+    EXPECT_EQ(lattice_db_count(db, "pragma_table_info('GeoPlace')",
+                               "name = 'bounds_maxLat'"), 1u);
+    EXPECT_EQ(lattice_db_count(db, "pragma_table_info('GeoPlace')",
+                               "name = 'bounds_minLon'"), 1u);
+    EXPECT_EQ(lattice_db_count(db, "pragma_table_info('GeoPlace')",
+                               "name = 'bounds_maxLon'"), 1u);
+    EXPECT_EQ(lattice_db_count(db, "pragma_table_info('GeoPlace')",
+                               "name = 'bounds'"), 0u);
+
+    // Standalone with-schema creation — the path bindings use and the one
+    // that used to drop the geo flag.
+    lattice_object_t* obj = lattice_object_create_with_schema("GeoPlace", props, 2);
+    ASSERT_NE(obj, nullptr) << lattice_last_error();
+    lattice_object_set_string(obj, "name", "sf");
+    lattice_object_set_double(obj, "bounds_minLat", 37.70);
+    lattice_object_set_double(obj, "bounds_maxLat", 37.83);
+    lattice_object_set_double(obj, "bounds_minLon", -122.52);
+    lattice_object_set_double(obj, "bounds_maxLon", -122.35);
+
+    lattice_object_t* managed = lattice_db_add(db, obj);
+    ASSERT_NE(managed, nullptr)
+        << "dynamic add with geo bounds failed: " << lattice_last_error();
+    lattice_object_release(managed);
+
+    // Round-trip the four columns through a fresh query.
+    lattice_results_t* res = lattice_db_query(db, "GeoPlace", nullptr, nullptr, 0, 0);
+    ASSERT_NE(res, nullptr) << lattice_last_error();
+    ASSERT_EQ(lattice_results_count(res), 1u);
+    lattice_object_t* row = lattice_results_get(res, 0);
+    ASSERT_NE(row, nullptr);
+    EXPECT_STREQ(lattice_object_get_string(row, "name"), "sf");
+    EXPECT_DOUBLE_EQ(lattice_object_get_double(row, "bounds_minLat"), 37.70);
+    EXPECT_DOUBLE_EQ(lattice_object_get_double(row, "bounds_maxLat"), 37.83);
+    EXPECT_DOUBLE_EQ(lattice_object_get_double(row, "bounds_minLon"), -122.52);
+    EXPECT_DOUBLE_EQ(lattice_object_get_double(row, "bounds_maxLon"), -122.35);
+    lattice_object_release(row);
+    lattice_results_free(res);
+
+    lattice_object_release(obj);
+    lattice_db_close(db);
+    lattice_db_release(db);
 }

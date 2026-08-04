@@ -370,6 +370,10 @@ std::string audit_log_entry::to_json() const {
     j["timestamp"] = timestamp;
     j["isFromRemote"] = is_from_remote;
     j["isSynchronized"] = is_synchronized;
+    if (synthesized) {
+        // Optional key — only on the wire when set. Old receivers ignore it.
+        j["synthesized"] = true;
+    }
 
     return j.dump();
 }
@@ -430,6 +434,9 @@ std::optional<audit_log_entry> audit_log_entry::from_json(const std::string& jso
         }
         if (j.contains("isSynchronized") && j["isSynchronized"].is_boolean()) {
             entry.is_synchronized = j["isSynchronized"].get<bool>();
+        }
+        if (j.contains("synthesized") && j["synthesized"].is_boolean()) {
+            entry.synthesized = j["synthesized"].get<bool>();
         }
 
         return entry;
@@ -1280,6 +1287,10 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
     entry.global_id = db().generate_global_id();
     entry.table_name = table_name;
     entry.operation = "INSERT";
+    // A5: this is a full-row snapshot of LOCAL state (classify's
+    // UPDATE→INSERT conversion for rows entering the filter) — receivers
+    // apply it insert-if-absent, never clobbering a newer remote copy.
+    entry.synthesized = true;
 
     // Get rowId
     auto id_it = row.find("id");
@@ -1322,23 +1333,25 @@ std::optional<audit_log_entry> synchronizer_base::build_insert_entry_from_curren
     return entry;
 }
 
-// Sync set CRUD
+// Sync set CRUD — all scoped to this synchronizer's sync_id. Membership is
+// per-channel state: two filtered synchronizers on one database must never
+// see (or clobber) each other's rows.
 void synchronizer_base::sync_set_add(const std::string& table_name, const std::string& global_row_id) {
     db().db().execute(
-        "INSERT OR IGNORE INTO _lattice_sync_set (table_name, global_row_id) VALUES (?, ?)",
-        {table_name, global_row_id});
+        "INSERT OR IGNORE INTO _lattice_sync_set (sync_id, table_name, global_row_id) VALUES (?, ?, ?)",
+        {config_.sync_id, table_name, global_row_id});
 }
 
 void synchronizer_base::sync_set_remove(const std::string& table_name, const std::string& global_row_id) {
     db().db().execute(
-        "DELETE FROM _lattice_sync_set WHERE table_name = ? AND global_row_id = ?",
-        {table_name, global_row_id});
+        "DELETE FROM _lattice_sync_set WHERE sync_id = ? AND table_name = ? AND global_row_id = ?",
+        {config_.sync_id, table_name, global_row_id});
 }
 
 bool synchronizer_base::sync_set_contains(const std::string& table_name, const std::string& global_row_id) {
     auto rows = db().db().query(
-        "SELECT 1 FROM _lattice_sync_set WHERE table_name = ? AND global_row_id = ? LIMIT 1",
-        {table_name, global_row_id});
+        "SELECT 1 FROM _lattice_sync_set WHERE sync_id = ? AND table_name = ? AND global_row_id = ? LIMIT 1",
+        {config_.sync_id, table_name, global_row_id});
     return !rows.empty();
 }
 
@@ -1377,8 +1390,9 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
 void synchronizer_base::clear_sync_filter() {
     scheduler_->invoke([this] {
         config_.sync_filter = std::nullopt;
-        // Clear the sync set — without a filter, everything syncs via normal path
-        db().db().execute("DELETE FROM _lattice_sync_set");
+        // Clear THIS channel's sync set — without a filter, everything syncs
+        // via the normal path. Other channels' membership is untouched.
+        db().db().execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {config_.sync_id});
     });
 }
 
@@ -1412,9 +1426,11 @@ void synchronizer_base::reconcile_sync_filter() {
             }
         }
     }
-    auto sync_set_rows = db().db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
-    LOG_INFO("synchronizer", "reconcile Phase 1: %zu sync_set rows, %zu current matches",
-             sync_set_rows.size(), current_matches.size());
+    auto sync_set_rows = db().db().query(
+        "SELECT table_name, global_row_id FROM _lattice_sync_set WHERE sync_id = ?",
+        {config_.sync_id});
+    LOG_INFO("synchronizer", "reconcile Phase 1 (%s): %zu sync_set rows, %zu current matches",
+             config_.sync_id.c_str(), sync_set_rows.size(), current_matches.size());
     for (const auto& row : sync_set_rows) {
         auto tn_it = row.find("table_name");
         auto gid_it = row.find("global_row_id");
@@ -1424,17 +1440,27 @@ void synchronizer_base::reconcile_sync_filter() {
         std::string gid = std::get<std::string>(gid_it->second);
 
         if (current_matches.count(tn + '\0' + gid) == 0) {
-            // Marked as a filter removal: this DELETE means "stop syncing this
-            // row here", not "the user deleted it". It propagates at most one
-            // IPC hop (local -> the device's own synced DB) and never crosses
-            // a WSS hop — unshare must not become a fleet-wide delete on the
-            // user's other devices (see classify_entries / apply gates).
-            db().db().execute(
-                "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
-                "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
-                "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
-                {db().generate_global_id(), tn, gid});
-            has_changes = true;
+            if (config_.narrowing_emits_removals) {
+                // Marked as a filter removal: this DELETE means "stop syncing this
+                // row here", not "the user deleted it". It propagates at most one
+                // IPC hop (local -> the device's own synced DB) and never crosses
+                // a WSS hop — unshare must not become a fleet-wide delete on the
+                // user's other devices (see classify_entries / apply gates).
+                db().db().execute(
+                    "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
+                    "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
+                    "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
+                    {db().generate_global_id(), tn, gid});
+                has_changes = true;
+            } else {
+                // A4 — bookkeeping-only narrowing (group-channel semantics):
+                // the row leaves THIS channel's sync set so nothing further
+                // relays, but no DELETE is synthesized — the paired spoke
+                // keeps its mirror ("stop NEW sharing", never un-share).
+                // Direct set removal here because no DELETE entry will flow
+                // through classify to do it.
+                sync_set_remove(tn, gid);
+            }
         }
     }
 
@@ -1480,7 +1506,8 @@ void synchronizer_base::reconcile_sync_filter() {
             // through the normal upload pipeline.
             std::string sql = "SELECT id, globalId, " + select_cols.str() +
                               " FROM " + fe.table_name +
-                              " WHERE globalId NOT IN (SELECT global_row_id FROM _lattice_sync_set WHERE table_name = ?)"
+                              " WHERE globalId NOT IN (SELECT global_row_id FROM _lattice_sync_set"
+                              "                        WHERE table_name = ? AND sync_id = ?)"
                               " AND globalId NOT IN ("
                               "   SELECT a.globalRowId FROM AuditLog a"
                               "   WHERE a.tableName = ?"
@@ -1491,7 +1518,7 @@ void synchronizer_base::reconcile_sync_filter() {
                               "       WHERE ss.audit_entry_id = a.id"
                               "         AND ss.sync_id = ?"
                               "         AND ss.is_synchronized = 1))";
-            std::vector<column_value_t> params = {fe.table_name, fe.table_name, config_.sync_id};
+            std::vector<column_value_t> params = {fe.table_name, config_.sync_id, fe.table_name, config_.sync_id};
             if (fe.where_clause) {
                 sql += " AND (" + *fe.where_clause + ")";
             }
@@ -1540,10 +1567,13 @@ void synchronizer_base::reconcile_sync_filter() {
                         entry.changed_fields_names.push_back(col_name);
                     }
 
+                    // A5: Phase-2 additions are full-row snapshots of LOCAL
+                    // state — synthesized=1 so receivers apply insert-if-absent
+                    // (never clobbering a newer remote copy).
                     db().db().execute(
                         "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
-                        "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
-                        "VALUES (?, ?, 'INSERT', ?, ?, ?, ?, 0, 0)",
+                        "changedFields, changedFieldsNames, isFromRemote, isSynchronized, synthesized) "
+                        "VALUES (?, ?, 'INSERT', ?, ?, ?, ?, 0, 0, 1)",
                         {entry.global_id, entry.table_name,
                          entry.row_id, entry.global_row_id,
                          entry.changed_fields_to_json(),
@@ -1704,11 +1734,13 @@ synchronizer_base::classified_entries synchronizer_base::classify_entries(std::v
     constexpr size_t kClassifyPreloadThreshold = 64;
     const bool preload = entries.size() > kClassifyPreloadThreshold;
 
-    // Pre-load sync set into memory — O(1) hash lookups instead of O(N) SQL queries.
-    // Key is "table_name\0global_row_id" for compact hashing.
+    // Pre-load THIS channel's sync set into memory — O(1) hash lookups instead
+    // of O(N) SQL queries. Key is "table_name\0global_row_id" for compact hashing.
     std::unordered_set<std::string> sync_set_cache;
     if (preload) {
-        auto rows = db().db().query("SELECT table_name, global_row_id FROM _lattice_sync_set");
+        auto rows = db().db().query(
+            "SELECT table_name, global_row_id FROM _lattice_sync_set WHERE sync_id = ?",
+            {config_.sync_id});
         sync_set_cache.reserve(rows.size());
         for (const auto& row : rows) {
             auto tn_it = row.find("table_name");
@@ -1898,9 +1930,16 @@ void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_
 
                 // Eager cleanup: if all active sync_ids have synced this entry,
                 // collapse to isSynchronized=1 on AuditLog and remove sync_state rows.
+                // A6: count only sync_ids with a LIVE replication slot — the
+                // threshold is derived from live slots, so a stale confirmed
+                // row from a REMOVED channel would otherwise inflate the count
+                // and collapse the entry before a still-active channel relayed
+                // it (silent relay loss).
                 auto count_rows = db().db().query(
-                    "SELECT COUNT(*) as cnt FROM _lattice_sync_state "
-                    "WHERE audit_entry_id = ? AND is_synchronized = 1",
+                    "SELECT COUNT(*) as cnt FROM _lattice_sync_state ss "
+                    "WHERE ss.audit_entry_id = ? AND ss.is_synchronized = 1 "
+                    "AND EXISTS (SELECT 1 FROM _lattice_replication_slots rs "
+                    "            WHERE rs.sync_id = ss.sync_id)",
                     {entry_id});
 
                 int64_t synced_count = 0;
@@ -2419,6 +2458,7 @@ std::vector<audit_log_entry> query_audit_log(database& db,
         entry.timestamp = get_str("timestamp");
         entry.is_from_remote = get_int("isFromRemote") != 0;
         entry.is_synchronized = get_int("isSynchronized") != 0;
+        entry.synthesized = get_int("synthesized") != 0;
 
         entries.push_back(entry);
     }
@@ -2582,10 +2622,15 @@ void mark_audit_entries_synced_for(lattice_db& db,
                     ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1
                 )", {entry_id, sync_id});
 
-                // Eager cleanup: check if ALL active sync_ids have synced this entry
+                // Eager cleanup: check if ALL active sync_ids have synced this entry.
+                // A6: count only sync_ids with a LIVE replication slot (see
+                // mark_skipped_synced) — stale rows from removed channels must
+                // not collapse entries before live channels relay them.
                 auto count_rows = db.db().query(
-                    "SELECT COUNT(*) as cnt FROM _lattice_sync_state "
-                    "WHERE audit_entry_id = ? AND is_synchronized = 1",
+                    "SELECT COUNT(*) as cnt FROM _lattice_sync_state ss "
+                    "WHERE ss.audit_entry_id = ? AND ss.is_synchronized = 1 "
+                    "AND EXISTS (SELECT 1 FROM _lattice_replication_slots rs "
+                    "            WHERE rs.sync_id = ss.sync_id)",
                     {entry_id});
 
                 int64_t synced_count = 0;
@@ -2657,6 +2702,15 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
     // in on_websocket_open, so sync_set is already up-to-date by the time we query.
     std::string filter_clause;
     if (sync_filter && !sync_filter->empty()) {
+        // sync_id is embedded in the string-built clause (it repeats per
+        // filter entry, so a positional bind would be fragile against the
+        // params the caller appends). Escape single quotes — sync_ids carry
+        // URLs ("wss:...") and channel names, never trusted input, but
+        // correctness costs nothing.
+        std::string escaped_sync_id = sync_id;
+        for (size_t pos = 0; (pos = escaped_sync_id.find('\'', pos)) != std::string::npos; pos += 2) {
+            escaped_sync_id.replace(pos, 1, "''");
+        }
         filter_clause = " AND (";
         for (size_t i = 0; i < sync_filter->size(); ++i) {
             if (i > 0) filter_clause += " OR ";
@@ -2667,7 +2721,8 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
                 filter_clause += "(a.tableName = '" + entry.table_name + "' AND ("
                        "a.operation = 'DELETE'"
                        " OR EXISTS (SELECT 1 FROM _lattice_sync_set"
-                       " WHERE table_name = a.tableName AND global_row_id = a.globalRowId)"
+                       " WHERE sync_id = '" + escaped_sync_id + "'"
+                       " AND table_name = a.tableName AND global_row_id = a.globalRowId)"
                        " OR EXISTS (SELECT 1 FROM " + entry.table_name +
                        " WHERE globalId = a.globalRowId AND (" + *entry.where_clause + "))"
                        "))";
@@ -2746,6 +2801,7 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
         entry.timestamp = get_str("timestamp");
         entry.is_from_remote = get_int("isFromRemote") != 0;
         entry.is_synchronized = get_int("isSynchronized") != 0;
+        entry.synthesized = get_int("synthesized") != 0;
 
         entries.push_back(entry);
     }
@@ -2920,7 +2976,59 @@ static std::vector<std::string> apply_remote_changes_impl(
                         LOG_INFO("apply_remote", "  fieldName: %s", name.c_str());
                     }
                     auto schema = db.get_table_schema(entry.table_name);
-                    auto [sql, params] = entry.generate_instruction(schema);
+                    bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
+
+                    // A3 — schema-skew tolerance. A NEWER peer's entries may
+                    // reference a table or columns this build doesn't have.
+                    // The old behavior generated SQL naming them; the execute
+                    // failed; the entry was skipped WITHOUT ack — the sender
+                    // re-sent the same page forever (a silent sync wedge) and
+                    // the receiver lost the entire row, not just the new column.
+                    //
+                    // Unknown TABLE: this build can never apply the entry —
+                    // skip it and ACK (loudly). The row appears after upgrade
+                    // via catch-up/reconcile; the schema handshake surfaces
+                    // the drift as a visible warning instead of a wedge.
+                    if (is_model_table && schema.empty()) {
+                        LOG_ERROR("apply_remote",
+                                  "unknown table '%s' (schema drift — newer peer); "
+                                  "acking entry %s as inapplicable no-op",
+                                  entry.table_name.c_str(), entry.global_id.c_str());
+                        applied_ids.push_back(entry.global_id);
+                        continue;
+                    }
+
+                    // Unknown COLUMNS: drop them (loudly) and apply the rest.
+                    // An UPDATE whose fields are ALL unknown becomes an acked
+                    // no-op — the accepted skew semantic (e.g. a v2 client
+                    // never sees v3 tombstone fields until it upgrades).
+                    audit_log_entry skew_filtered;
+                    const audit_log_entry* apply_entry = &entry;
+                    if (is_model_table &&
+                        (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
+                        bool has_unknown = false;
+                        for (const auto& name : entry.changed_fields_names) {
+                            if (schema.find(name) == schema.end()) { has_unknown = true; break; }
+                        }
+                        if (has_unknown) {
+                            skew_filtered = entry;
+                            auto& names = skew_filtered.changed_fields_names;
+                            for (auto it = names.begin(); it != names.end();) {
+                                if (schema.find(*it) == schema.end()) {
+                                    LOG_WARN("apply_remote",
+                                             "dropping unknown column '%s.%s' (schema drift — newer peer)",
+                                             entry.table_name.c_str(), it->c_str());
+                                    skew_filtered.changed_fields.erase(*it);
+                                    it = names.erase(it);
+                                } else {
+                                    ++it;
+                                }
+                            }
+                            apply_entry = &skew_filtered;
+                        }
+                    }
+
+                    auto [sql, params] = apply_entry->generate_instruction(schema);
                     LOG_INFO("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
 
                     // Resolve the local rowId and operation for this object.
@@ -2933,7 +3041,6 @@ static std::vector<std::string> apply_remote_changes_impl(
                     //     already has the row (ON CONFLICT takes the UPDATE path)
                     int64_t local_row_id = entry.row_id;
                     std::string local_operation = entry.operation;
-                    bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
 
                     bool row_existed = false;
                     if (is_model_table && !entry.global_row_id.empty()) {
@@ -2953,8 +3060,18 @@ static std::vector<std::string> apply_remote_changes_impl(
                         }
                     }
 
+                    // A5 — synthesized full-row snapshots are insert-if-absent:
+                    // the sender built them from ITS local state, which may be
+                    // stale relative to this copy (re-expose/re-join/nuclear-
+                    // compact). If the row already exists here, skip the SQL —
+                    // an unconditional upsert would revert newer edits and
+                    // resurrect tombstones. Bookkeeping + ack still run.
                     bool sql_succeeded = true;
-                    if (!sql.empty()) {
+                    if (entry.synthesized && row_existed) {
+                        LOG_DEBUG("apply_remote",
+                                  "synthesized INSERT for existing row %s.%s — insert-if-absent skip",
+                                  entry.table_name.c_str(), entry.global_row_id.c_str());
+                    } else if (!sql.empty()) {
                         try {
                             db.db().execute(sql, params);
                         } catch (const std::exception& e) {
@@ -2984,11 +3101,23 @@ static std::vector<std::string> apply_remote_changes_impl(
                     // Record the audit entry as from remote.
                     // Global mode: isSynchronized=1 (fully synced).
                     // Per-sync mode: isSynchronized=0 (other sync_ids still need to relay it).
-                    int is_synchronized = receiving_sync_id ? 0 : 1;
+                    //
+                    // A4 — marked filter-removal DELETEs never relay further:
+                    // recorded fully-synchronized so no other synchronizer on
+                    // this database ever enumerates them as pending. They
+                    // clear this mirror (one IPC hop) and stop dead — with
+                    // per-sync bookkeeping alone, an unfiltered uplink (the
+                    // spoke's WSS) would enumerate the entry as pending and
+                    // upload the DELETE to the shared server DB.
+                    bool is_filter_removal = entry.operation == "DELETE" &&
+                        std::find(entry.changed_fields_names.begin(),
+                                  entry.changed_fields_names.end(),
+                                  "__lattice_filter_removal") != entry.changed_fields_names.end();
+                    int is_synchronized = (receiving_sync_id && !is_filter_removal) ? 0 : 1;
                     std::string insert_sql = R"(
                         INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
-                            changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                            changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized, synthesized)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     )";
                     db.db().execute(insert_sql, {
                         entry.global_id,
@@ -2999,7 +3128,8 @@ static std::vector<std::string> apply_remote_changes_impl(
                         entry.changed_fields_to_json(),
                         entry.changed_fields_names_to_json(),
                         entry.timestamp,
-                        static_cast<int64_t>(is_synchronized)
+                        static_cast<int64_t>(is_synchronized),
+                        static_cast<int64_t>(entry.synthesized ? 1 : 0)
                     });
 
                     // Per-sync mode: mark this entry as synced for the receiving sync_id (loop prevention).

@@ -900,6 +900,10 @@ public:
     bool is_sync_agent() const { return lattice_db::is_sync_agent(); }
 
     /// Count AuditLog entries pending sync whose rows are in the sync set.
+    /// Deliberately UNSCOPED across sync_ids (per-sync_id set shape): this
+    /// powers the whole-database "pending upload" progress counter, so an
+    /// entry counts if ANY channel considers its row shared. EXISTS keeps
+    /// the count per-entry — a row in N channels' sets never double-counts.
     int64_t pending_sync_entry_count() {
         auto rows = xproc_read_db().query(
             "SELECT COUNT(*) FROM AuditLog a"
@@ -914,7 +918,18 @@ public:
     }
 
     void update_sync_filter(const SyncFilterVector& filter);
+    /// Per-channel variant: `channel` matches an ipc_target's channel name;
+    /// the empty string targets the WSS synchronizer. Required on
+    /// multi-channel hubs — the fan-out variant reconciles every channel
+    /// against one filter.
+    void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter);
     void clear_sync_filter();
+    void clear_sync_filter_for_channel(const std::string& channel);
+    /// A6 — permanently retire a dead sync channel (state + set + slot).
+    /// For channels that will reconnect, use reset via the daemon instead.
+    void remove_sync_channel_state(const std::string& sync_id) {
+        lattice_db::remove_sync_channel_state(sync_id);
+    }
 
     /// Register a callback for cross-process idle hints (no new AuditLog entries).
     /// Fires directly on the xproc background thread, NOT through the scheduler.
@@ -2157,8 +2172,13 @@ public:
             // metric is not L2, we re-score using the actual distance function.
             // WHERE filters are applied as post-filtering on candidates.
             // Oversample by 2x when filtering to compensate for post-filter loss.
-            int fetch_k = where_conditions.empty() ? vc.k : vc.k * 2;
+            // When re-scoring with a non-L2 metric, additionally oversample 4x:
+            // MATCH selects candidates by L2 distance, and the true top-k under
+            // the requested metric need not lie within the L2 top-k. The CTE
+            // then orders by the re-scored distance and truncates back to k.
             bool needs_rescore = (distance_func != "vec_distance_L2");
+            int fetch_k = where_conditions.empty() ? vc.k : vc.k * 2;
+            if (needs_rescore) fetch_k *= 4;
             // MATCH CTE: each schema's vec table is queried with MATCH, then
             // JOINed to THAT SCHEMA's model table (not the UNION ALL view) to
             // resolve gid → id and carry the distance through.
@@ -2178,8 +2198,11 @@ public:
                     sql << " AND " << cond;
                 }
             }
-            sql << ") ORDER BY distance ASC"
-                << "), ";
+            sql << ") ORDER BY distance ASC";
+            // Truncate the oversampled, re-scored candidate set back to the
+            // requested k so the constraint keeps its top-k semantics.
+            if (needs_rescore) sql << " LIMIT " << vc.k;
+            sql << "), ";
         }
 
         // ====================================================================
@@ -2350,6 +2373,7 @@ public:
             sql << " GROUP BY " << group_by.value();
         }
 
+        bool emitted_order_by = false;
         if (sort.type != sort_descriptor::Type::none && !sort.column.empty()) {
             std::string order_col;
             switch (sort.type) {
@@ -2361,8 +2385,22 @@ public:
                     order_col = table_name + "." + sort.column; break;
                 default: break;
             }
-            if (!order_col.empty())
+            if (!order_col.empty()) {
                 sql << " ORDER BY " << order_col << (sort.ascending ? " ASC" : " DESC");
+                emitted_order_by = true;
+            }
+        }
+        // SQL does not guarantee that a subquery's ORDER BY survives to the
+        // outer SELECT, so the vec CTE's ordering by (possibly re-scored)
+        // distance is lost here — without an explicit sort, rows would come
+        // back in vec0's L2 MATCH candidate order, which is wrong for any
+        // non-L2 metric. Default to ordering by vector distance ascending.
+        if (!emitted_order_by && !vectors.empty()) {
+            sql << " ORDER BY ";
+            for (size_t i = 0; i < vectors.size(); ++i) {
+                if (i > 0) sql << ", ";
+                sql << "_dist_" << vectors[i].column << " ASC";
+            }
         }
 
         sql << " LIMIT " << limit;
@@ -3399,6 +3437,15 @@ public:
 
     // Sync filter
     void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }
+    void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter) const {
+        impl().update_sync_filter_for_channel(channel, filter);
+    }
+    void clear_sync_filter_for_channel(const std::string& channel) const {
+        impl().clear_sync_filter_for_channel(channel);
+    }
+    void remove_sync_channel_state(const std::string& sync_id) const {
+        impl().remove_sync_channel_state(sync_id);
+    }
 
     // Observers
     void remove_table_observer(const std::string& table_name, uint64_t observer_id) const {

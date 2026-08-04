@@ -568,6 +568,12 @@ struct configuration {
         /// Required for cross-platform IPC (e.g. macOS host ↔ iOS simulator) where
         /// HOME differs between processes.
         std::optional<std::string> socket_path;
+        /// A4 — see sync_config::narrowing_emits_removals. true (default):
+        /// narrowing the filter clears the paired spoke's mirror via marked
+        /// filter-removal DELETEs (personal-sync semantics). false:
+        /// narrowing is bookkeeping-only and the spoke keeps its mirror
+        /// (group-channel semantics: "stop new sharing", never un-share).
+        bool narrowing_emits_removals = true;
     };
     std::vector<ipc_target> ipc_targets;
 
@@ -1902,11 +1908,28 @@ public:
     /// Manually trigger sync (uploads pending changes)
     void sync_now();
 
-    /// Update the sync filter at runtime, triggering reconciliation
+    /// Update the sync filter at runtime, triggering reconciliation.
+    /// FAN-OUT: applies ONE filter to the WSS synchronizer AND every IPC
+    /// synchronizer. Correct only for single-channel databases — on a
+    /// multi-channel hub (N filtered IPC targets) use the per-channel
+    /// overload; fanning one filter across channels with different scopes
+    /// reconciles every channel against the wrong filter.
     void update_sync_filter(std::vector<sync_filter_entry> filter);
 
-    /// Clear the sync filter, reverting to syncing everything
+    /// Update ONE channel's sync filter at runtime, triggering that
+    /// channel's reconciliation only. `channel` matches an ipc_target's
+    /// channel name; the empty string targets the WSS synchronizer. Also
+    /// writes the filter into config_.ipc_targets so a lazily-created
+    /// synchronizer (accept callback not yet fired) picks it up.
+    void update_sync_filter(const std::string& channel, std::vector<sync_filter_entry> filter);
+
+    /// Clear the sync filter, reverting to syncing everything.
+    /// FAN-OUT across all synchronizers — same caveat as the fan-out
+    /// update_sync_filter; use the per-channel overload on hubs.
     void clear_sync_filter();
+
+    /// Clear ONE channel's sync filter ("" = WSS).
+    void clear_sync_filter(const std::string& channel);
 
     /// Connect to sync server (called automatically if configured)
     void connect_sync();
@@ -3255,34 +3278,31 @@ public:
     /// subset. Local data is untouched; upload volume stays proportional to
     /// the filter, never the whole AuditLog.
     ///
-    /// LIMITATION: _lattice_sync_set has no sync_id column, so its wipe is
-    /// global. It is therefore SKIPPED whenever more than one replication
-    /// slot exists on this database (a hub with IPC + WSS, or multiple
-    /// channels) — wiping it there would corrupt the other synchronizers'
-    /// filtered-set membership and re-send/loop their data. The cost of
-    /// skipping: Phase 1 (removals) of the next reconcile sees stale set
-    /// rows and may emit redundant removals to the fresh peer, which are
-    /// harmless (the peer is empty). Single-sync databases (the Engram
-    /// daemon topology) keep the full re-arm.
+    /// The sync-set wipe is scoped to this sync_id (per-sync_id shape) — it
+    /// cannot corrupt other synchronizers' filtered-set membership, so the
+    /// full re-arm is safe on any topology, including multi-channel hubs.
     void reset_sync_state(const std::string& sync_id) {
         db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
-        auto slot_rows = db_->query("SELECT COUNT(*) AS n FROM _lattice_replication_slots");
-        int64_t slot_count = 0;
-        if (!slot_rows.empty()) {
-            auto it = slot_rows[0].find("n");
-            if (it != slot_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                slot_count = std::get<int64_t>(it->second);
-            }
-        }
-        if (slot_count <= 1) {
-            db_->execute("DELETE FROM _lattice_sync_set");
-        } else {
-            LOG_INFO("lattice_db", "reset_sync_state(%s): %lld replication slots — keeping global _lattice_sync_set",
-                     sync_id.c_str(), (long long)slot_count);
-        }
+        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
         db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0 WHERE sync_id = ?", {sync_id});
-        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_set wiped: %s)",
-                 sync_id.c_str(), slot_count <= 1 ? "yes" : "no");
+        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_state, sync_set, slot cursors)",
+                 sync_id.c_str());
+    }
+
+    /// A6 — permanently retire a sync channel: delete its `_lattice_sync_state`
+    /// rows, its `_lattice_sync_set` membership, AND its replication slot.
+    /// Call when a channel is gone for good (e.g. the daemon dropped a group
+    /// membership), NOT for a reconnecting channel (use reset_sync_state).
+    /// Leftover state from a dead channel is actively harmful: its stale slot
+    /// pins safe compaction forever, and (pre-scoping) its confirmed
+    /// sync_state rows inflated the eager-collapse count — an entry could
+    /// collapse to isSynchronized=1 before a still-live channel relayed it.
+    void remove_sync_channel_state(const std::string& sync_id) {
+        db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
+        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
+        db_->execute("DELETE FROM _lattice_replication_slots WHERE sync_id = ?", {sync_id});
+        LOG_INFO("lattice_db", "remove_sync_channel_state(%s): channel retired (state, set, slot removed)",
+                 sync_id.c_str());
     }
 
     /// Slot-aware compaction: deletes only AuditLog entries that ALL
@@ -3356,7 +3376,14 @@ public:
     /// entries for objects that are missing from the audit log.
     /// Useful for initial migration when enabling sync on existing data.
     /// @return Number of INSERT entries created
-    int64_t generate_history(int64_t batch_size = 20000) {
+    /// @param mark_synthesized When true (A5), the generated INSERT snapshots
+    /// carry synthesized=1: receivers apply them insert-if-absent rather than
+    /// as unconditional upserts, so regeneration from possibly-stale LOCAL
+    /// state (a client's nuclear compact) can never revert a peer's newer
+    /// edits or resurrect tombstones. Pass false only when this database is
+    /// the CANONICAL copy (e.g. server-side history compaction) and receivers
+    /// SHOULD be refreshed to exactly this state.
+    int64_t generate_history(int64_t batch_size = 20000, bool mark_synthesized = true) {
         if (batch_size <= 0) batch_size = 20000;
 
         // Transient index on (tableName, globalRowId) for the NOT EXISTS check
@@ -3436,11 +3463,11 @@ public:
                 // naturally excludes rows already audited in earlier batches.
                 std::ostringstream sql;
                 sql << "INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, "
-                    << "changedFields, changedFieldsNames, isSynchronized, timestamp) "
+                    << "changedFields, changedFieldsNames, isSynchronized, timestamp, synthesized) "
                     << "SELECT '" << table_name << "', 'INSERT', id, globalId, "
                     << "json_object(" << json_cols.str() << "), "
                     << "json_array(" << json_names.str() << "), "
-                    << "0, unixepoch('subsec') "
+                    << "0, unixepoch('subsec'), " << (mark_synthesized ? 1 : 0) << " "
                     << "FROM " << table_name << " t "
                     << "WHERE NOT EXISTS ("
                     << "  SELECT 1 FROM AuditLog a "
@@ -3654,6 +3681,10 @@ public:
             release_store_write_gate();
             throw;
         }
+        // Record the owning thread: read_db()'s in-transaction routing must
+        // apply ONLY to this thread — other threads' reads keep reader
+        // isolation and never observe the open transaction.
+        txn_owner_thread_.store(std::this_thread::get_id(), std::memory_order_release);
     }
     void commit() {
         try {
@@ -3662,18 +3693,26 @@ public:
             // COMMIT can fail with the transaction still open (BUSY) — keep
             // the gate; the caller retries or rolls back. If the txn is
             // already gone (auto-rollback), release now.
-            if (!db_->is_in_transaction()) release_store_write_gate();
+            if (!db_->is_in_transaction()) {
+                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
+                release_store_write_gate();
+            }
             throw;
         }
+        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
         release_store_write_gate();
     }
     void rollback() {
         try {
             db_->rollback();
         } catch (...) {
-            if (!db_->is_in_transaction()) release_store_write_gate();
+            if (!db_->is_in_transaction()) {
+                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
+                release_store_write_gate();
+            }
             throw;
         }
+        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
         release_store_write_gate();
     }
 
@@ -3709,8 +3748,35 @@ public:
 
     database& db() { return *db_; }
 
-    /// Get the read-only database connection (falls back to write connection for in-memory DBs)
-    database& read_db() { return read_db_ ? *read_db_ : *db_; }
+    /// Get the connection for reads (falls back to the write connection for
+    /// in-memory DBs).
+    ///
+    /// While the write connection has an OPEN transaction, reads route
+    /// through the write connection instead of the dedicated read-only one:
+    /// under WAL a separate reader sees only committed state, so a count()/
+    /// query_rows()/find() issued inside an explicit transaction (C-ABI
+    /// lattice_db_begin_transaction, bridge/core begin_transaction, or an
+    /// internal write block) would silently miss that transaction's
+    /// uncommitted writes. The Swift bridge's generation-scoped readers
+    /// already read via the write connection; this closes the same gap for
+    /// the core/C-ABI read paths. `is_in_transaction()` is SQLite's live
+    /// autocommit state, so the routing self-corrects on COMMIT/ROLLBACK no
+    /// matter which code path executed it. Both connections are opened
+    /// SQLITE_OPEN_FULLMUTEX, so a cross-thread read that lands on the write
+    /// connection serializes safely; outside a transaction behavior is
+    /// unchanged (concurrent reads stay off the writer).
+    database& read_db() {
+        // Thread-scoped: only the transaction-owning thread reads through
+        // the write connection (read-your-writes); every other thread keeps
+        // the dedicated reader and sees only committed state. A raw BEGIN
+        // that bypassed begin_transaction() records no owner, so routing
+        // simply doesn't engage (the safe, pre-1.0 behavior).
+        if (read_db_ && db_->is_in_transaction() &&
+            txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+            return *db_;
+        }
+        return read_db_ ? *read_db_ : *db_;
+    }
 
     /// Get the xproc-dedicated read connection (falls back to read_db for in-memory/read-only)
     database& xproc_read_db() { return xproc_read_db_ ? *xproc_read_db_ : read_db(); }
@@ -5007,7 +5073,9 @@ private:
 
     configuration config_;
     std::unique_ptr<database> db_;       // Write connection
-    std::unique_ptr<database> read_db_;  // Read-only connection for concurrent reads
+    std::unique_ptr<database> read_db_;
+    // Thread that opened the current explicit transaction (see read_db()).
+    std::atomic<std::thread::id> txn_owner_thread_{};  // Read-only connection for concurrent reads
     std::unique_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler
                                                // (avoids SQLite lock contention with read_db_
                                                // when observer callbacks query on MainActor)
@@ -5247,6 +5315,14 @@ private:
 
         ensure_link_tables();
 
+        // Phase 6: per-property UNIQUE constraint indexes (guarded DDL,
+        // naming mirrors the bridge's Phase 8 — see the method comment).
+        // Runs for new AND existing tables so an is_unique added to an
+        // existing schema gains its index on the next slow-path open.
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            ensure_unique_property_indexes(*schema);
+        }
+
         store_fingerprint_marker(fp_key);
         txn.commit();
     }
@@ -5387,6 +5463,61 @@ private:
         }
         return "TEXT";
     }
+
+public:
+    /// Per-property UNIQUE constraint indexes for the core table-DDL path.
+    ///
+    /// `property_descriptor::is_unique` survives into the schema fingerprint
+    /// but historically produced no DDL on this path — the CREATE UNIQUE INDEX
+    /// pass existed only in the Swift bridge's constraint-driven "Phase 8"
+    /// (ensure_swift_tables). Databases created through the core registry (or
+    /// through the C ABI before its is_unique→constraint canonicalization)
+    /// therefore never enforced uniqueness that Swift-created databases did.
+    ///
+    /// Naming MIRRORS the bridge's Phase 8 exactly: `unique_<table>_<i>`,
+    /// where i is the ordinal of the constraint for this table — here, the
+    /// ordinal of the is_unique property in schema declaration order, which is
+    /// the position the equivalent single-column constraint occupies in the
+    /// bridge's constraints vector for the same logical schema. Identical
+    /// names mean a database created by one path and reopened by the other
+    /// sees the index already present (IF NOT EXISTS) instead of growing a
+    /// second, differently-named unique index on the same column.
+    ///
+    /// Only primitive, non-geo properties are emitted (they are real columns
+    /// on the table). Link-kind uniques require the bridge's shadow-column
+    /// machinery; their ordinal is still consumed so names stay aligned.
+    ///
+    /// If duplicate data predates the constraint, deduplicate first (keep the
+    /// newest row per unique value) — same recovery the bridge pass performs.
+    void ensure_unique_property_indexes(const model_schema& schema) {
+        size_t ordinal = 0;
+        for (const auto& prop : schema.properties) {
+            if (!prop.is_unique) continue;
+            const size_t i = ordinal++;
+            if (prop.kind != property_kind::primitive || prop.is_geo_bounds) {
+                continue;  // no single base-table column to index; ordinal reserved
+            }
+            const std::string idx_name =
+                "unique_" + schema.table_name + "_" + std::to_string(i);
+            const std::string sql =
+                "CREATE UNIQUE INDEX IF NOT EXISTS " + idx_name +
+                " ON " + schema.table_name + "(" + prop.name + ")";
+            try {
+                db_->execute(sql);
+            } catch (...) {
+                // Duplicate data exists — deduplicate (keep newest row per value).
+                LOG_WARN("lattice_db", "Deduplicating %s for unique constraint on (%s)",
+                         schema.table_name.c_str(), prop.name.c_str());
+                db_->execute(
+                    "DELETE FROM " + schema.table_name + " WHERE id NOT IN ("
+                    "SELECT MAX(id) FROM " + schema.table_name +
+                    " GROUP BY " + prop.name + ")");
+                db_->execute(sql);
+            }
+        }
+    }
+
+private:
 
     void migrate_model_table(const model_schema& schema) {
         LOG_INFO("migrate", "migrate_model_table: %s", schema.table_name.c_str());
@@ -5539,11 +5670,35 @@ private:
     }
 
     void ensure_audit_triggers(const model_schema& schema) {
-        // Quick check: if the insert trigger exists, all three do.
+        // Presence + INTEGRITY check. A real audit trigger always gates on
+        // sync_disabled(); if the insert trigger is missing OR its body lacks
+        // that gate — e.g. a hand-installed `WHEN (0)` stub squatting the
+        // name so a naive existence check passes forever — drop and recreate
+        // all three. This exact tampering silently killed all Memory sync on
+        // a production hub for six days (Jul 2026): every write after the
+        // stub produced no audit entry while every counter looked healthy.
+        // Tampering bumps the SQLite schema cookie, which invalidates the
+        // fingerprint marker and forces the slow path, so this check is
+        // guaranteed to run on the next open. (The old "if the insert
+        // trigger exists, all three do" assumption was also false in that
+        // incident — the UPDATE trigger had been dropped outright.)
         auto rows = db_->query(
-            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='Audit"
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='Audit"
             + schema.table_name + "Insert' LIMIT 1");
-        if (rows.empty()) {
+        bool healthy = false;
+        if (!rows.empty()) {
+            auto it = rows[0].find("sql");
+            healthy = it != rows[0].end() &&
+                      std::holds_alternative<std::string>(it->second) &&
+                      std::get<std::string>(it->second).find("sync_disabled") != std::string::npos;
+            if (!healthy) {
+                LOG_ERROR("lattice_db",
+                          "audit trigger 'Audit%sInsert' exists WITHOUT a sync_disabled() "
+                          "gate (hand-tampered stub?) — recreating all audit triggers",
+                          schema.table_name.c_str());
+            }
+        }
+        if (!healthy) {
             recreate_model_table_triggers(schema);
         }
     }
@@ -5774,10 +5929,20 @@ private:
                 changedFieldsNames TEXT,
                 isFromRemote INTEGER DEFAULT 0,
                 isSynchronized INTEGER DEFAULT 0,
-                timestamp REAL DEFAULT (unixepoch('subsec'))
+                timestamp REAL DEFAULT (unixepoch('subsec')),
+                synthesized INTEGER DEFAULT 0
             )
         )";
         db_->execute(sql);
+
+        // A5 provenance column for pre-existing databases. Guarded ALTER —
+        // reaching it on the open fast path requires the
+        // kLatticeSchemaFormatEpoch bump (epoch 5).
+        try {
+            db_->execute("ALTER TABLE AuditLog ADD COLUMN synthesized INTEGER DEFAULT 0");
+        } catch (const std::exception&) {
+            // Column already exists.
+        }
 
         // Partial index for sync queries — only indexes unsynchronized entries,
         // which are the ones query_audit_log_for_sync needs to scan.
@@ -5809,12 +5974,19 @@ private:
         )");
         db_->execute("INSERT OR IGNORE INTO _SyncControl(id, disabled) VALUES(1, 0)");
 
-        // Create _lattice_sync_set table for tracking filtered sync membership
+        // Create _lattice_sync_set table for tracking filtered sync membership,
+        // scoped PER SYNCHRONIZER (sync_id). Two channels with different
+        // filters on one database must not share membership state: with the
+        // old shared shape, channel A's classify saw channel B's rows in the
+        // set and synthesized real DELETEs for them (`!matches && in_set`),
+        // and reconcile Phase 1 emitted filter-removal DELETEs for the other
+        // channel's rows — cross-channel mirror wipes.
         db_->execute(R"(
             CREATE TABLE IF NOT EXISTS _lattice_sync_set (
+                sync_id TEXT NOT NULL,
                 table_name TEXT NOT NULL,
                 global_row_id TEXT NOT NULL,
-                PRIMARY KEY (table_name, global_row_id)
+                PRIMARY KEY (sync_id, table_name, global_row_id)
             )
         )");
 
@@ -5862,6 +6034,74 @@ private:
         } catch (const std::exception&) {
             // Column already exists.
         }
+
+        // Runs AFTER the slots table exists — the rebuild's attribution rule
+        // reads it. Reaching this on existing DBs requires the
+        // kLatticeSchemaFormatEpoch bump (same contract as the ALTER above).
+        migrate_sync_set_to_per_sync_id();
+    }
+
+    /// One-time rebuild of _lattice_sync_set from the pre-per-sync_id shape
+    /// (PK (table_name, global_row_id), no sync_id column).
+    ///
+    /// Attribution rule: when exactly ONE replication slot exists, all
+    /// existing membership rows belong to it (the filtered-hub topology that
+    /// produced them — a single filtered IPC synchronizer; unfiltered
+    /// synchronizers never touch the set). With zero or multiple slots the
+    /// rows are dropped: multi-slot databases hold no filtered synchronizers
+    /// today, so their sets are empty/unused, and reconcile Phase 2
+    /// re-synthesizes membership idempotently if that assumption is ever
+    /// wrong (bandwidth-only cost, surfaced by the Phase-2 synthesis-count
+    /// soak metric).
+    void migrate_sync_set_to_per_sync_id() {
+        auto cols = db_->query("PRAGMA table_info(_lattice_sync_set)");
+        if (cols.empty()) return;  // no table (fresh DB creates the new shape above)
+        for (const auto& c : cols) {
+            auto it = c.find("name");
+            if (it != c.end() && std::holds_alternative<std::string>(it->second)
+                && std::get<std::string>(it->second) == "sync_id") {
+                return;  // already the per-sync_id shape
+            }
+        }
+
+        std::string attributed_sync_id;
+        auto slots = db_->query("SELECT sync_id FROM _lattice_replication_slots");
+        if (slots.size() == 1) {
+            auto it = slots[0].find("sync_id");
+            if (it != slots[0].end() && std::holds_alternative<std::string>(it->second)) {
+                attributed_sync_id = std::get<std::string>(it->second);
+            }
+        }
+
+        const bool was_in_txn = db_->is_in_transaction();
+        if (!was_in_txn) db_->begin_transaction();
+        try {
+            db_->execute("ALTER TABLE _lattice_sync_set RENAME TO _lattice_sync_set_v1");
+            db_->execute(R"(
+                CREATE TABLE _lattice_sync_set (
+                    sync_id TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    global_row_id TEXT NOT NULL,
+                    PRIMARY KEY (sync_id, table_name, global_row_id)
+                )
+            )");
+            if (!attributed_sync_id.empty()) {
+                db_->execute(
+                    "INSERT INTO _lattice_sync_set (sync_id, table_name, global_row_id) "
+                    "SELECT ?, table_name, global_row_id FROM _lattice_sync_set_v1",
+                    {attributed_sync_id});
+            }
+            db_->execute("DROP TABLE _lattice_sync_set_v1");
+            if (!was_in_txn) db_->commit();
+        } catch (...) {
+            if (!was_in_txn && db_->is_in_transaction()) {
+                try { db_->rollback(); } catch (...) {}
+            }
+            throw;
+        }
+        LOG_INFO("lattice_db", "migrated _lattice_sync_set to per-sync_id shape (%s)",
+                 attributed_sync_id.empty() ? "dropped rows: no single-slot attribution"
+                                            : ("attributed to " + attributed_sync_id).c_str());
     }
 
     /// Register per-connection SQL functions. This is connection state, not a
@@ -5937,7 +6177,33 @@ protected:
     /// for flush_changes' change→audit lookups; guarded CREATE INDEX in
     /// ensure_audit_log_table). Folded into the same unreleased train as
     /// epoch 2 — no released binary ever wrote an epoch-2 marker.
-    static constexpr int kLatticeSchemaFormatEpoch = 3;
+    ///
+    /// Epoch 4: the core ensure path gained the per-property unique-index
+    /// pass (ensure_unique_property_indexes: guarded CREATE UNIQUE INDEX
+    /// `unique_<table>_<i>`, mirroring the bridge's Phase 8 naming).
+    /// `is_unique` was ALREADY serialized in stored fingerprints while
+    /// emitting no DDL, so an existing fingerprinted database whose schema
+    /// carries the flag would fast-path past the new pass forever without
+    /// this bump. (On the bridge path the C ABI's is_unique→constraint
+    /// canonicalization changes the swift fingerprint for affected DBs
+    /// anyway; the bump makes the revalidation guarantee uniform across
+    /// both fingerprint families.) All new DDL is guarded/absent-object —
+    /// auto-migration-safe on revalidation. RELEASED in 1.0.1 — this number
+    /// is burned; anything later takes the next one.
+    ///
+    /// Epoch 5: _lattice_sync_set rebuilt to the per-sync_id shape
+    /// (migrate_sync_set_to_per_sync_id in ensure_sync_control_table —
+    /// without this bump the fast path skips the rebuild on every existing
+    /// DB and the sync engine binds a sync_id column that doesn't exist).
+    /// Renumbered from 4 during the rebase onto 1.0.1: this branch and the
+    /// released unique-index pass both originally claimed 4.
+    ///
+    /// Epoch 6: AuditLog gained the `synthesized` provenance column (A5
+    /// insert-if-absent semantics for locally-synthesized full-row
+    /// snapshots; guarded ALTER in ensure_audit_log_table). Epoch 5 ships
+    /// alone as Engram Groups increment 0; this train is increment 1.
+    /// Renumbered from 5 by the same rebase.
+    static constexpr int kLatticeSchemaFormatEpoch = 6;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as
@@ -7444,6 +7710,33 @@ inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter
     }
 }
 
+inline void lattice_db::update_sync_filter(const std::string& channel,
+                                           std::vector<sync_filter_entry> filter) {
+    if (channel.empty()) {
+        LOG_INFO("lattice_db", "update_sync_filter(wss): %zu entries (db=%s)",
+                 filter.size(), config_.path.c_str());
+        config_.sync_filter = filter;
+        if (synchronizer_) {
+            synchronizer_->update_sync_filter(std::move(filter));
+        }
+        return;
+    }
+    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
+        if (config_.ipc_targets[i].channel != channel) continue;
+        LOG_INFO("lattice_db", "update_sync_filter(%s): %zu entries (db=%s)",
+                 channel.c_str(), filter.size(), config_.path.c_str());
+        // Config write first — lazily-created synchronizers (accept callback
+        // hasn't fired yet) read their filter from the config entry.
+        config_.ipc_targets[i].sync_filter = filter;
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->update_sync_filter(std::move(filter));
+        }
+        return;
+    }
+    LOG_ERROR("lattice_db", "update_sync_filter: unknown channel '%s' (db=%s)",
+              channel.c_str(), config_.path.c_str());
+}
+
 inline void lattice_db::clear_sync_filter() {
     if (synchronizer_) {
         synchronizer_->clear_sync_filter();
@@ -7453,6 +7746,24 @@ inline void lattice_db::clear_sync_filter() {
             ipc.sync->clear_sync_filter();
         }
     }
+}
+
+inline void lattice_db::clear_sync_filter(const std::string& channel) {
+    if (channel.empty()) {
+        config_.sync_filter = std::nullopt;
+        if (synchronizer_) synchronizer_->clear_sync_filter();
+        return;
+    }
+    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
+        if (config_.ipc_targets[i].channel != channel) continue;
+        config_.ipc_targets[i].sync_filter = std::nullopt;
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->clear_sync_filter();
+        }
+        return;
+    }
+    LOG_ERROR("lattice_db", "clear_sync_filter: unknown channel '%s' (db=%s)",
+              channel.c_str(), config_.path.c_str());
 }
 
 inline void lattice_db::trigger_sync_upload() {

@@ -105,6 +105,18 @@ struct audit_log_entry {
     bool is_from_remote = false;
     bool is_synchronized = false;
 
+    /// A5 — provenance marker for full-row snapshot entries synthesized from
+    /// LOCAL state (reconcile Phase-2 additions, classify's UPDATE→INSERT
+    /// conversion, nuclear-compact history regeneration) rather than captured
+    /// from a live write. Synthesized rows may be STALE relative to a peer
+    /// that has newer edits; apply treats a synthesized INSERT for an
+    /// already-existing row as insert-if-absent (skip, ack) instead of the
+    /// unconditional every-column upsert — re-expose/re-join/nuclear-compact
+    /// must never resurrect a peer's tombstones or revert newer edits.
+    /// Serialized as an optional "synthesized" JSON key; old receivers
+    /// ignore it (legacy upsert behavior — acceptable, they predate groups).
+    bool synthesized = false;
+
     // Generate SQL instruction from this audit entry
     // Returns {sql, params} for executing the change
     // schema maps column_name -> column_type for decoding hex-encoded BLOBs
@@ -236,6 +248,20 @@ struct sync_config {
     /// Used for eager cleanup: when all sync_ids have synced an entry,
     /// _lattice_sync_state rows are deleted and isSynchronized=1 is set.
     std::vector<std::string> all_active_sync_ids;
+
+    /// A4 — whether narrowing this channel's filter synthesizes marked
+    /// filter-removal DELETEs for rows that left the filter (reconcile
+    /// Phase 1). true (default): current behavior — the paired spoke's
+    /// mirror is cleared (personal-sync semantics: un-synced projects leave
+    /// the synced DB). false: narrowing is BOOKKEEPING-ONLY — rows leave
+    /// this channel's sync set but no DELETE is emitted; the paired spoke
+    /// remains a full mirror (group-channel semantics: un-exposing stops
+    /// NEW sharing, never removes already-shared rows — a mirror-clear
+    /// would let later peer edits apply against deleted rows as acked
+    /// no-ops and permanently diverge). Row-level filter unmatch in
+    /// classify (e.g. a row edit that stops matching) is NOT affected —
+    /// that DELETE is the deliberate retract path.
+    bool narrowing_emits_removals = true;
 };
 
 // ============================================================================

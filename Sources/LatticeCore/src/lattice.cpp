@@ -781,6 +781,7 @@ void lattice_db::setup_ipc_if_configured() {
                 ipc_cfg.sync_id = sync_id;
                 ipc_cfg.all_active_sync_ids = all_ids;
                 ipc_cfg.sync_filter = target.sync_filter;
+                ipc_cfg.narrowing_emits_removals = target.narrowing_emits_removals;
                 config_.tuning.apply(ipc_cfg);
                 // Coalescing off by default — see the WSS note above.
 

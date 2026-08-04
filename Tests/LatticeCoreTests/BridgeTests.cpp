@@ -280,6 +280,142 @@ TEST(Bridge, BlobVec0NearestNeighbors) {
 }
 
 // ============================================================================
+// combined_nearest_query — metric-correct ordering (the path Swift queries use)
+// ============================================================================
+//
+// vec0 MATCH retrieves candidates by L2 distance; non-L2 metrics are re-scored
+// in SQL. Regression tests for two bugs found by the conformance corpus:
+//   1. The re-scored ORDER BY lived only in a subquery — SQL drops a
+//      subquery's ordering, so rows came back in vec0's L2 candidate order.
+//   2. The candidate fetch was truncated to k BEFORE re-scoring, so the true
+//      top-k under the requested metric could be missing rows entirely.
+//
+// Fixture: query [1,0,0,0] over
+//   p=[ 2,0,0,0]  cosine 0.0      L1 1  L2 1.0
+//   q=[ 1,1,0,0]  cosine 0.29289  L1 1  L2 1.0
+//   r=[ 0,3,0,0]  cosine 1.0      L1 4  L2 3.162
+//   s=[-1,0,0,0]  cosine 2.0      L1 2  L2 2.0
+// Correct cosine order: [p,q,r,s]. L2 candidate order: {p,q} tie, then s, then r.
+
+static lattice::SchemaVector metric_vec_schemas() {
+    return {
+        make_schema("MetricVec", {
+            {"label", text_prop("label")},
+            {"embedding", blob_prop("embedding")},
+        })
+    };
+}
+
+static void seed_metric_vec_docs(lattice::swift_lattice& db,
+                                 const lattice::SchemaVector& schemas) {
+    auto insert_doc = [&](const std::string& label, const std::vector<float>& vec) {
+        auto sdo = make_sdo("MetricVec", schemas[0].properties);
+        sdo.values["label"] = label;
+        sdo.values["embedding"] = pack_floats(vec);
+        { lattice::dynamic_object obj(sdo); db.add(obj); }
+        auto rows = db.db().query(
+            "SELECT globalId FROM MetricVec WHERE label = ?", {label});
+        ASSERT_EQ(rows.size(), 1u) << "insert failed for " << label;
+        auto gid = std::get<std::string>(rows[0].at("globalId"));
+        db.upsert_vec0("MetricVec", "embedding", gid, pack_floats(vec));
+    };
+    insert_doc("p", {2.0f, 0.0f, 0.0f, 0.0f});
+    insert_doc("q", {1.0f, 1.0f, 0.0f, 0.0f});
+    insert_doc("r", {0.0f, 3.0f, 0.0f, 0.0f});
+    insert_doc("s", {-1.0f, 0.0f, 0.0f, 0.0f});
+}
+
+TEST(Bridge, CombinedNearestCosineOrdersByRescoredDistance) {
+    TempDB tmp{"bridge_cnq_cosine"};
+    auto schemas = metric_vec_schemas();
+    lattice::swift_configuration config(tmp.str());
+    auto* lattice_ref = lattice::swift_lattice_ref::create(config, schemas);
+    auto& db = *lattice_ref->get();
+    seed_metric_vec_docs(db, schemas);
+
+    auto qvec = pack_floats({1.0f, 0.0f, 0.0f, 0.0f});
+    lattice::VectorConstraintVector vecs = {
+        lattice::vector_constraint("embedding", qvec, /*k=*/4, /*metric=*/1)  // cosine
+    };
+    // No explicit sort: the result order itself must be the cosine order.
+    auto results = db.combined_nearest_query(
+        "MetricVec", {}, vecs, {}, {}, std::nullopt,
+        lattice::sort_descriptor{}, /*limit=*/10);
+
+    ASSERT_EQ(results.size(), 4u);
+    EXPECT_EQ(results[0].object.get_string("label"), "p");
+    EXPECT_EQ(results[1].object.get_string("label"), "q");
+    EXPECT_EQ(results[2].object.get_string("label"), "r");
+    EXPECT_EQ(results[3].object.get_string("label"), "s");
+
+    ASSERT_EQ(results[0].distances.size(), 1u);
+    EXPECT_NEAR(results[0].distances[0].distance, 0.0, 0.001);
+    EXPECT_NEAR(results[1].distances[0].distance, 0.29289, 0.001);
+    EXPECT_NEAR(results[2].distances[0].distance, 1.0, 0.001);
+    EXPECT_NEAR(results[3].distances[0].distance, 2.0, 0.001);
+}
+
+TEST(Bridge, CombinedNearestCosineTopKSurvivesRescore) {
+    // k=3: the L2 top-3 is {p, q, s} (L2 1, 1, 2 — r is 3.162 away), but the
+    // cosine top-3 is {p, q, r}. Truncating to k before re-scoring silently
+    // drops r; the oversampled fetch + order-then-limit must keep it.
+    TempDB tmp{"bridge_cnq_topk"};
+    auto schemas = metric_vec_schemas();
+    lattice::swift_configuration config(tmp.str());
+    auto* lattice_ref = lattice::swift_lattice_ref::create(config, schemas);
+    auto& db = *lattice_ref->get();
+    seed_metric_vec_docs(db, schemas);
+
+    auto qvec = pack_floats({1.0f, 0.0f, 0.0f, 0.0f});
+    lattice::VectorConstraintVector vecs = {
+        lattice::vector_constraint("embedding", qvec, /*k=*/3, /*metric=*/1)  // cosine
+    };
+    auto results = db.combined_nearest_query(
+        "MetricVec", {}, vecs, {}, {}, std::nullopt,
+        lattice::sort_descriptor{}, /*limit=*/10);
+
+    ASSERT_EQ(results.size(), 3u);
+    EXPECT_EQ(results[0].object.get_string("label"), "p");
+    EXPECT_EQ(results[1].object.get_string("label"), "q");
+    EXPECT_EQ(results[2].object.get_string("label"), "r")
+        << "true cosine top-3 must include r, not the L2 candidate s";
+}
+
+TEST(Bridge, CombinedNearestL1OrdersByRescoredDistance) {
+    // L1 (metric=2) is the other re-scored metric. L1 distances: p=1, q=1,
+    // s=2, r=4. p and q tie, so pin the tail order and monotone distances.
+    TempDB tmp{"bridge_cnq_l1"};
+    auto schemas = metric_vec_schemas();
+    lattice::swift_configuration config(tmp.str());
+    auto* lattice_ref = lattice::swift_lattice_ref::create(config, schemas);
+    auto& db = *lattice_ref->get();
+    seed_metric_vec_docs(db, schemas);
+
+    auto qvec = pack_floats({1.0f, 0.0f, 0.0f, 0.0f});
+    lattice::VectorConstraintVector vecs = {
+        lattice::vector_constraint("embedding", qvec, /*k=*/4, /*metric=*/2)  // L1
+    };
+    auto results = db.combined_nearest_query(
+        "MetricVec", {}, vecs, {}, {}, std::nullopt,
+        lattice::sort_descriptor{}, /*limit=*/10);
+
+    ASSERT_EQ(results.size(), 4u);
+    // First two are {p, q} in either order (both L1 distance 1).
+    std::string first = results[0].object.get_string("label");
+    std::string second = results[1].object.get_string("label");
+    EXPECT_TRUE((first == "p" && second == "q") || (first == "q" && second == "p"))
+        << "got [" << first << ", " << second << "]";
+    EXPECT_EQ(results[2].object.get_string("label"), "s");
+    EXPECT_EQ(results[3].object.get_string("label"), "r");
+    for (size_t i = 0; i + 1 < results.size(); ++i) {
+        ASSERT_EQ(results[i].distances.size(), 1u);
+        EXPECT_LE(results[i].distances[0].distance,
+                  results[i + 1].distances[0].distance)
+            << "distances must be non-decreasing at index " << i;
+    }
+}
+
+// ============================================================================
 // receive_sync_data — the complete sync ingest path through the bridge
 // ============================================================================
 
@@ -1519,6 +1655,79 @@ TEST(BridgeGeneration, ChangedFieldsDeliveredThroughHookPayload) {
 
     ref->remove_invalidation_hook(token);
     delete ref;
+}
+
+// ============================================================================
+// Unique-index name parity — bridge constraint pass vs C-ABI is_unique shape
+// ============================================================================
+
+TEST(Bridge, UniqueIndexNameParityAcrossSwiftAndCapiSchemaShapes) {
+    TempDB tmp{"bridge_unique_parity"};
+
+    // Swift-shaped schema: uniqueness arrives ONLY as a constraint (what the
+    // @Unique macro emits). Phase 8 must name the index unique_<table>_0.
+    {
+        lattice::swift_schema_entry entry = make_schema("ParityDoc", {
+            {"code", text_prop("code")},
+            {"label", text_prop("label")},
+        });
+        entry.constraints.push_back(lattice::swift_constraint({"code"}, /*upsert=*/false));
+        lattice::SchemaVector schemas = {entry};
+
+        auto* ref = lattice::swift_lattice_ref::create(
+            lattice::swift_configuration(tmp.str()), schemas);
+        auto& db = *ref->get();
+
+        auto rows = db.db().query(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='ParityDoc' AND name LIKE 'unique_%'");
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::get<std::string>(rows[0].at("name")), "unique_ParityDoc_0");
+        delete ref;
+    }
+
+    // C-ABI-shaped schema for the SAME logical model: per-property is_unique
+    // plus the single-column constraint the C ABI's convert_schemas derives
+    // from it. Reopening the Swift-created file must find the index already
+    // present — same name, so NO second unique index appears.
+    {
+        auto code = text_prop("code");
+        code.is_unique = true;
+        lattice::swift_schema_entry entry = make_schema("ParityDoc", {
+            {"code", code},
+            {"label", text_prop("label")},
+        });
+        entry.constraints.push_back(lattice::swift_constraint({"code"}, /*upsert=*/false));
+        lattice::SchemaVector schemas = {entry};
+
+        auto* ref = lattice::swift_lattice_ref::create(
+            lattice::swift_configuration(tmp.str()), schemas);
+        auto& db = *ref->get();
+
+        auto rows = db.db().query(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='ParityDoc' AND name LIKE 'unique_%'");
+        ASSERT_EQ(rows.size(), 1u) << "reopen double-indexed the unique column";
+        EXPECT_EQ(std::get<std::string>(rows[0].at("name")), "unique_ParityDoc_0");
+
+        // Enforcement through the bridge write path: same code twice → reject.
+        {
+            auto sdo = make_sdo("ParityDoc", schemas[0].properties);
+            sdo.values["code"] = std::string("C-1");
+            sdo.values["label"] = std::string("first");
+            lattice::dynamic_object obj(sdo);
+            db.add(obj);
+        }
+        auto sdo2 = make_sdo("ParityDoc", schemas[0].properties);
+        sdo2.values["code"] = std::string("C-1");
+        sdo2.values["label"] = std::string("second");
+        lattice::dynamic_object obj2(sdo2);
+        EXPECT_THROW(db.add(obj2), lattice::db_error);
+
+        auto count = db.db().query("SELECT COUNT(*) AS c FROM ParityDoc");
+        EXPECT_EQ(std::get<int64_t>(count[0].at("c")), 1);
+        delete ref;
+    }
 }
 
 #endif // !__linux__

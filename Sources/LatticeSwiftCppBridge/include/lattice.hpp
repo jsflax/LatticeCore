@@ -3446,6 +3446,13 @@ public:
     void remove_sync_channel_state(const std::string& sync_id) const {
         impl().remove_sync_channel_state(sync_id);
     }
+    /// Hard-delete rows with the no-relay marker (admin tombstone purge) —
+    /// see lattice_db::delete_rows_no_relay for why a normal delete is
+    /// catastrophic on a shared group DB.
+    int64_t delete_rows_no_relay(const std::string& table,
+                                 const std::vector<std::string>& global_row_ids) const {
+        return impl().delete_rows_no_relay(table, global_row_ids);
+    }
 
     // Observers
     void remove_table_observer(const std::string& table_name, uint64_t observer_id) const {

@@ -3240,6 +3240,60 @@ public:
         return 0;
     }
 
+    /// Hard-delete rows WITHOUT relaying the deletes: each row's DELETE
+    /// audit entry carries the `__lattice_filter_removal` marker, which WSS
+    /// receivers skip-and-ack (they never apply it) and IPC receivers record
+    /// fully-synchronized (A4). The rows vanish HERE; every peer keeps its
+    /// own copy untouched.
+    ///
+    /// This is the one sanctioned emitter of group-wide hard deletes — the
+    /// server-side tombstone purge. A NORMAL delete would be catastrophic
+    /// there: members' spokes would apply it, and because the purged rows
+    /// sit in each member's spoke→hub sync set, the DELETE would classify
+    /// onward into their personal hubs and fan out to every one of their
+    /// devices.
+    ///
+    /// The row deletions run with sync disabled (so the audit triggers stay
+    /// silent) and the marked entries are written by hand, all in one
+    /// transaction — a normal trigger-written DELETE entry appearing next
+    /// to the marked one would resurrect exactly the relay this exists to
+    /// suppress.
+    /// @return rows actually deleted
+    int64_t delete_rows_no_relay(const std::string& table,
+                                 const std::vector<std::string>& global_row_ids) {
+        if (global_row_ids.empty()) return 0;
+        const int64_t prev_disabled = read_sync_disabled_flag();
+        int64_t deleted = 0;
+        db_->begin_transaction();
+        try {
+            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+            for (const auto& gid : global_row_ids) {
+                db_->execute("DELETE FROM \"" + table + "\" WHERE globalId = ? COLLATE NOCASE",
+                             {gid});
+                if (sqlite3_changes(db_->handle()) == 0) continue;
+                deleted++;
+                // Shape mirrors reconcile's narrowing synthesis (sync.cpp):
+                // the ONLY producer of marked deletes until now, and the
+                // shape every apply gate matches on.
+                db_->execute(
+                    "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
+                    "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
+                    "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
+                    {generate_global_id(), table, gid});
+            }
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+            db_->commit();
+        } catch (...) {
+            db_->rollback();
+            // The flag write above rolled back with everything else, but
+            // restore defensively in case the txn died after a partial step.
+            try { db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1",
+                               {prev_disabled}); } catch (...) {}
+            throw;
+        }
+        return deleted;
+    }
+
     /// Nuclear compaction: deletes ALL history, regenerates INSERT snapshots,
     /// and resets all replication slot cursors to 0.
     /// Active synchronizers will re-sync all data.

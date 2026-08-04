@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.2.0] - 2026-08-04
+
+### Added
+- **`lattice_db::delete_rows_no_relay(table, global_row_ids)`** (bridged on
+  `swift_lattice_ref`): hard-delete rows and log each as a DELETE audit
+  entry carrying the `__lattice_filter_removal` marker — the shape WSS
+  receivers skip-and-ack (defense-in-depth gate shipped in 1.1.0/A4) and
+  IPC receivers record fully-synchronized. The rows vanish locally; every
+  peer keeps its own copy. Row deletion runs with sync disabled so the
+  audit triggers stay silent (a trigger-written unmarked DELETE alongside
+  the marked one would relay fleet-wide), the marked entries are written by
+  hand, and everything commits in one transaction with the pre-existing
+  `_SyncControl.disabled` value restored.
+
+  This is the sanctioned emitter of group-wide hard deletes for Engram's
+  admin tombstone purge; a normal delete on a shared group DB classifies
+  through members' spoke→hub sync sets and cascades into their personal
+  hubs. No schema change; purely additive → MINOR.
+
 ## [1.1.0] - 2026-08-04
 
 Stage A sync hardening: multi-channel hubs (one database feeding several

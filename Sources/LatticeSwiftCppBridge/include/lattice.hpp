@@ -3443,6 +3443,9 @@ public:
     void clear_sync_filter_for_channel(const std::string& channel) const {
         impl().clear_sync_filter_for_channel(channel);
     }
+    void remove_sync_channel_state(const std::string& sync_id) const {
+        impl().remove_sync_channel_state(sync_id);
+    }
 
     // Observers
     void remove_table_observer(const std::string& table_name, uint64_t observer_id) const {

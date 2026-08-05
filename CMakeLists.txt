@@ -195,6 +195,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
+    Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/CAPISurfaceTests.cpp
     Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 )

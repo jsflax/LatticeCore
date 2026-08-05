@@ -2086,12 +2086,17 @@ public:
 
             std::string rtree_table = "_" + table_name + "_" + bc.column + "_rtree";
 
+            // Candidate currency is globalId (see the cross-arm note in
+            // Step 4): join the main-arm model table to translate rtree
+            // rowids. rtree sidecars are main-only today; main. keeps the
+            // join off the TEMP union view.
             sql << cte_name << " AS ("
-                << "SELECT id FROM " << rtree_table
-                << " WHERE minLat <= " << std::to_string(bc.max_lat)
-                << " AND maxLat >= " << std::to_string(bc.min_lat)
-                << " AND minLon <= " << std::to_string(bc.max_lon)
-                << " AND maxLon >= " << std::to_string(bc.min_lon)
+                << "SELECT m.globalId AS gid FROM " << rtree_table << " r"
+                << " JOIN main." << table_name << " m ON m.id = r.id"
+                << " WHERE r.minLat <= " << std::to_string(bc.max_lat)
+                << " AND r.maxLat >= " << std::to_string(bc.min_lat)
+                << " AND r.minLon <= " << std::to_string(bc.max_lon)
+                << " AND r.maxLon >= " << std::to_string(bc.min_lon)
                 << "), ";
         }
 
@@ -2128,8 +2133,9 @@ public:
                 "))";
 
             sql << cte_name << " AS ("
-                << "SELECT r.id, " << haversine << " AS distance"
+                << "SELECT m.globalId AS gid, " << haversine << " AS distance"
                 << " FROM " << rtree_table << " r"
+                << " JOIN main." << table_name << " m ON m.id = r.id"
                 << " WHERE r.minLat <= " << std::to_string(max_lat)
                 << " AND r.maxLat >= " << std::to_string(min_lat)
                 << " AND r.minLon <= " << std::to_string(max_lon)
@@ -2146,7 +2152,7 @@ public:
             sql << candidates_cte << " AS (";
             for (size_t i = 0; i < cte_names.size(); ++i) {
                 if (i > 0) sql << " INTERSECT ";
-                sql << "SELECT id FROM " << cte_names[i];
+                sql << "SELECT gid FROM " << cte_names[i];
             }
             sql << "), ";
         }
@@ -2206,7 +2212,7 @@ public:
             // Build WHERE conditions
             std::vector<std::string> where_conditions;
             if (!cte_names.empty()) {
-                where_conditions.push_back("m.id IN (SELECT id FROM " + candidates_cte + ")");
+                where_conditions.push_back("m.globalId IN (SELECT gid FROM " + candidates_cte + ")");
             }
             if (where_clause.has_value() && !where_clause.value().empty()) {
                 where_conditions.push_back("(" + where_clause.value() + ")");
@@ -2235,10 +2241,13 @@ public:
             // MATCH CTE: each schema's vec table is queried with MATCH, then
             // JOINed to THAT SCHEMA's model table (not the UNION ALL view) to
             // resolve gid → id and carry the distance through.
-            sql << cte_name << " AS (SELECT * FROM (";
+            // One candidate row per DISTINCT memory: the same globalId can
+            // appear in several arms (hub + spoke replicas) — group to the
+            // best distance so the outer joins can't multiply result rows.
+            sql << cte_name << " AS (SELECT gid, MIN(distance) AS distance FROM (";
             for (size_t si = 0; si < vec_schemas.size(); ++si) {
                 if (si > 0) sql << " UNION ALL ";
-                sql << "SELECT m.id AS id, "
+                sql << "SELECT m.globalId AS gid, "
                     << (needs_rescore
                         ? distance_func + "(v.embedding, " + query_blob + ")"
                         : "v.distance")
@@ -2251,7 +2260,7 @@ public:
                     sql << " AND " << cond;
                 }
             }
-            sql << ") ORDER BY distance ASC";
+            sql << ") GROUP BY gid ORDER BY distance ASC";
             // Truncate the oversampled, re-scored candidate set back to the
             // requested k so the constraint keeps its top-k semantics.
             if (needs_rescore) sql << " LIMIT " << vc.k;
@@ -2292,27 +2301,32 @@ public:
                 pos += 2;
             }
 
-            // Build WHERE suffix for pre-filtering
+            // Pre-filters expressed against the JOINED model row (m) so they
+            // are arm-correct: fts.rowid is only meaningful within its own
+            // arm, so each arm's FTS hits are translated to globalId by
+            // joining THAT arm's model table before any cross-arm set logic.
             std::string fts_where_suffix;
             if (!cte_names.empty()) {
-                fts_where_suffix += " AND fts.rowid IN (SELECT id FROM " + candidates_cte + ")";
+                fts_where_suffix += " AND m.globalId IN (SELECT gid FROM " + candidates_cte + ")";
             }
             if (where_clause.has_value() && !where_clause.value().empty()) {
-                fts_where_suffix += " AND fts.rowid IN (SELECT id FROM " + table_name
-                    + " WHERE " + where_clause.value() + ")";
+                fts_where_suffix += " AND (" + where_clause.value() + ")";
             }
 
-            // Build CTE: UNION ALL across all schemas' FTS tables, then ORDER + LIMIT
-            sql << cte_name << " AS (SELECT * FROM (";
+            // Build CTE: UNION ALL across all schemas' FTS tables, collapsed
+            // to one row per memory (best rank), then ORDER + LIMIT.
+            sql << cte_name << " AS (SELECT gid, MIN(distance) AS distance FROM (";
             for (size_t si = 0; si < fts_schemas.size(); ++si) {
                 if (si > 0) sql << " UNION ALL ";
                 std::string qualified_fts = fts_schemas[si] + "." + fts_table;
-                sql << "SELECT fts.rowid AS id, fts.rank AS distance"
+                sql << "SELECT m.globalId AS gid, fts.rank AS distance"
                     << " FROM " << qualified_fts << " fts"
+                    << " JOIN " << fts_schemas[si] << "." << table_name
+                    << " m ON m.id = fts.rowid"
                     << " WHERE " << fts_table << " MATCH '" << escaped_text << "'"
                     << fts_where_suffix;
             }
-            sql << ") ORDER BY distance LIMIT " << tc.limit
+            sql << ") GROUP BY gid ORDER BY distance LIMIT " << tc.limit
                 << "), ";
         }
 
@@ -2331,18 +2345,18 @@ public:
             // Intersect all vector and FTS candidates
             for (size_t i = 0; i < all_candidate_ctes.size(); ++i) {
                 if (i > 0) sql << " INTERSECT ";
-                sql << "SELECT id FROM " << all_candidate_ctes[i];
+                sql << "SELECT gid FROM " << all_candidate_ctes[i];
             }
             // Also intersect with spatial candidates if present
             if (!cte_names.empty()) {
-                sql << " INTERSECT SELECT id FROM " << candidates_cte;
+                sql << " INTERSECT SELECT gid FROM " << candidates_cte;
             }
         } else if (!cte_names.empty()) {
             // No vector/FTS constraints, just use spatial candidates
-            sql << "SELECT id FROM " << candidates_cte;
+            sql << "SELECT gid FROM " << candidates_cte;
         } else {
-            // No constraints at all - select all IDs
-            sql << "SELECT id FROM " << table_name;
+            // No constraints at all - select all rows (globalId currency)
+            sql << "SELECT globalId AS gid FROM " << table_name;
         }
         sql << ") ";
 
@@ -2408,17 +2422,17 @@ public:
             sql << ", f" << i << ".distance AS _dist_" << texts[i].column;
 
         sql << " FROM " << table_name
-            << " JOIN final_candidates fc ON " << table_name << ".id = fc.id";
+            << " JOIN final_candidates fc ON " << table_name << ".globalId = fc.gid";
 
         for (size_t i = 0; i < ctes.geo_ctes.size(); ++i)
             sql << " LEFT JOIN " << ctes.geo_ctes[i] << " g" << i
-                << " ON " << table_name << ".id = g" << i << ".id";
+                << " ON " << table_name << ".globalId = g" << i << ".gid";
         for (size_t i = 0; i < ctes.vec_ctes.size(); ++i)
             sql << " LEFT JOIN " << ctes.vec_ctes[i] << " v" << i
-                << " ON " << table_name << ".id = v" << i << ".id";
+                << " ON " << table_name << ".globalId = v" << i << ".gid";
         for (size_t i = 0; i < ctes.fts_ctes.size(); ++i)
             sql << " LEFT JOIN " << ctes.fts_ctes[i] << " f" << i
-                << " ON " << table_name << ".id = f" << i << ".id";
+                << " ON " << table_name << ".globalId = f" << i << ".gid";
 
         if (where_clause.has_value() && !where_clause.value().empty())
             sql << " WHERE " << where_clause.value();
@@ -2569,7 +2583,7 @@ public:
         sql << ctes.sql;
         sql << "SELECT " << table_name << ".id"
             << " FROM " << table_name
-            << " JOIN final_candidates fc ON " << table_name << ".id = fc.id";
+            << " JOIN final_candidates fc ON " << table_name << ".globalId = fc.gid";
 
         if (where_clause.has_value() && !where_clause.value().empty())
             sql << " WHERE " << where_clause.value();

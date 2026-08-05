@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.10.12] - 2026-08-05
+
+### Fixed
+- **Universal (arm64 + x86_64) builds**: `SQLITE_VEC_ENABLE_NEON` is defined
+  per-platform (SwiftPM can't condition a define on CPU arch), so the x86_64
+  slice of any universal build — e.g. an Xcode Release/Archive of a consuming
+  app, which compiles SPM package deps universal regardless of destination —
+  died at the `arm_neon.h` include with "module '_Builtin_intrinsics.arm.neon'
+  requires feature 'neon'". sqlite-vec.c now drops SIMD defines that don't
+  match the slice being compiled (NEON off non-aarch64, AVX off non-x86) and
+  falls through to the portable scalar paths. arm64 codegen is unchanged.
+
 ## [0.10.11] - 2026-07-16
 
 ### Added

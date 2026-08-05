@@ -625,11 +625,28 @@ std::vector<database::row_t> database::query(const std::string& sql,
     std::vector<row_t> results;
     int col_count = sqlite3_column_count(stmt);
 
+    // Capture column names ONCE, before stepping. sqlite3_column_name
+    // materializes the name lazily on first access and returns NULL if that
+    // allocation fails — under system memory pressure (Apple's purgeable
+    // page cache purging mid-scan) this is a real, observed failure, and
+    // constructing the row-map key from NULL is a segfault. Names are stable
+    // for the life of the statement, so per-row capture was also wasted work.
+    std::vector<std::string> col_names;
+    col_names.reserve(static_cast<size_t>(col_count));
+    for (int i = 0; i < col_count; ++i) {
+        const char* name = sqlite3_column_name(stmt, i);
+        if (!name) {
+            sqlite3_finalize(stmt);
+            LOG_ERROR("db", "column_name OOM in %s", sql.c_str());
+            throw db_error("Query failed: out of memory reading column name");
+        }
+        col_names.emplace_back(name);
+    }
+
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         row_t row;
         for (int i = 0; i < col_count; ++i) {
-            const char* name = sqlite3_column_name(stmt, i);
-            row[name] = extract_column(stmt, i);
+            row[col_names[static_cast<size_t>(i)]] = extract_column(stmt, i);
         }
         results.push_back(std::move(row));
     }

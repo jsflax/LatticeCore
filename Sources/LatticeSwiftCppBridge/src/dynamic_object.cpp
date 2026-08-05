@@ -498,9 +498,23 @@ void lattice::dynamic_object::refresh_row_cache() {
     // table_name_ may be schema-qualified for attached/UNION objects
     // ("alias".Table) — valid SQL, use as-is. One SELECT * replaces the
     // per-column reads the live path would otherwise issue.
-    auto rows = db->query(
-        "SELECT * FROM " + managed_.table_name_ + " WHERE id = ?",
-        {managed_.id_});
+    //
+    // The cache is strictly an optimization: if the query fails (e.g.
+    // transient OOM while the purgeable page cache is being purged under
+    // system memory pressure), degrade to the per-field read path instead
+    // of letting the exception escape through the Swift bridge, which has
+    // no handler on this path and would terminate the process.
+    std::vector<lattice::database::row_t> rows;
+    try {
+        rows = db->query(
+            "SELECT * FROM " + managed_.table_name_ + " WHERE id = ?",
+            {managed_.id_});
+    } catch (const std::exception& e) {
+        fprintf(stderr,
+                "lattice: row cache refresh failed (%s) — per-field reads\n",
+                e.what());
+        return;
+    }
     if (rows.empty()) return;
     for (auto& [key, value] : rows[0]) {
         if (key == "id") continue;

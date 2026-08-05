@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.1] - 2026-08-05
+
+### Changed
+- **Parse-once wire codec**: `server_sent_event::from_json` hands each
+  auditLog array element to the entry parser as the ALREADY-PARSED object;
+  it used to `dump()` each sub-object and re-parse it, so every entry on
+  the wire was parsed twice (changedFields a third time). Symmetrically,
+  `server_sent_event::to_json` embeds `entry_to_json_obj(...)` directly
+  instead of `json::parse(entry.to_json())`. Wire format is byte-identical;
+  this is pure per-entry overhead removal on the exact path catch-up
+  hammers — the browser client (2,155 MB measured catch-up payload) is the
+  main beneficiary, but every relay hop shares the codec.
+
 ## [1.2.0] - 2026-08-04
 
 ### Added

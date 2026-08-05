@@ -348,7 +348,29 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
     return {"", {}};
 }
 
+// Build the json OBJECT once — to_json() dumps it, and callers embedding
+// entries into a larger payload (server_sent_event::to_json) use it
+// directly instead of dump-then-reparse per entry.
+static json entry_to_json_obj(const audit_log_entry& e);
+static std::optional<audit_log_entry> entry_from_parsed(const json& j);
+
 std::string audit_log_entry::to_json() const {
+    return entry_to_json_obj(*this).dump();
+}
+
+static json entry_to_json_obj(const audit_log_entry& entry) {
+    const auto& id = entry.id;
+    const auto& global_id = entry.global_id;
+    const auto& table_name = entry.table_name;
+    const auto& operation = entry.operation;
+    const auto& row_id = entry.row_id;
+    const auto& global_row_id = entry.global_row_id;
+    const auto& changed_fields = entry.changed_fields;
+    const auto& changed_fields_names = entry.changed_fields_names;
+    const auto& timestamp = entry.timestamp;
+    const auto& is_from_remote = entry.is_from_remote;
+    const auto& is_synchronized = entry.is_synchronized;
+    const auto& synthesized = entry.synthesized;
     json j;
     j["id"] = id;
     j["globalId"] = global_id;
@@ -375,12 +397,23 @@ std::string audit_log_entry::to_json() const {
         j["synthesized"] = true;
     }
 
-    return j.dump();
+    return j;
 }
 
 std::optional<audit_log_entry> audit_log_entry::from_json(const std::string& json_str) {
     try {
-        json j = json::parse(json_str);
+        return entry_from_parsed(json::parse(json_str));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+// The parse-once body: server_sent_event::from_json hands each auditLog
+// array element here DIRECTLY. It used to entry_json.dump() and re-parse —
+// every entry on the wire was parsed twice (and its changedFields a third
+// time), which is pure overhead on the exact path catch-up hammers.
+static std::optional<audit_log_entry> entry_from_parsed(const json& j) {
+    try {
         audit_log_entry entry;
 
         if (j.contains("id") && j["id"].is_number()) {
@@ -409,7 +442,7 @@ std::optional<audit_log_entry> audit_log_entry::from_json(const std::string& jso
                     entry.changed_fields[key] = json_to_any_property(value);
                 }
             } else if (j["changedFields"].is_string()) {
-                entry.changed_fields = parse_changed_fields(j["changedFields"].get<std::string>());
+                entry.changed_fields = audit_log_entry::parse_changed_fields(j["changedFields"].get<std::string>());
             }
         }
 
@@ -422,7 +455,7 @@ std::optional<audit_log_entry> audit_log_entry::from_json(const std::string& jso
                     }
                 }
             } else if (j["changedFieldsNames"].is_string()) {
-                entry.changed_fields_names = parse_changed_fields_names(j["changedFieldsNames"].get<std::string>());
+                entry.changed_fields_names = audit_log_entry::parse_changed_fields_names(j["changedFieldsNames"].get<std::string>());
             }
         }
 
@@ -456,8 +489,9 @@ std::string server_sent_event::to_json() const {
         j["kind"] = "auditLog";
         json audit_array = json::array();
         for (const auto& entry : audit_logs) {
-            // Parse the entry's JSON to include as nested object
-            audit_array.push_back(json::parse(entry.to_json()));
+            // Build the object directly — dump-then-reparse doubled the
+            // serialization cost of every relayed entry.
+            audit_array.push_back(entry_to_json_obj(entry));
         }
         j["auditLog"] = audit_array;
     } else if (event_type == type::replay_request) {
@@ -480,7 +514,9 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
             event.event_type = type::audit_log;
 
             for (const auto& entry_json : j["auditLog"]) {
-                auto entry = audit_log_entry::from_json(entry_json.dump());
+                // Parse once: the sub-object is already parsed — dumping it
+                // back to a string re-parsed every entry a second time.
+                auto entry = entry_from_parsed(entry_json);
                 if (entry) {
                     event.audit_logs.push_back(*entry);
                 }

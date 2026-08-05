@@ -73,6 +73,18 @@ typedef size_t usize;
 #define SQLITE_VEC_ENABLE_RESCORE 1
 #endif
 
+// SIMD defines come from the build system per-PLATFORM (SwiftPM can't condition a define on
+// CPU arch), but universal builds compile this file once per SLICE — an x86_64 slice with
+// SQLITE_VEC_ENABLE_NEON dies at the arm_neon.h include ("_Builtin_intrinsics.arm.neon
+// requires feature 'neon'"). Drop a define that doesn't match the slice being compiled and
+// fall through to the portable scalar paths instead.
+#if defined(SQLITE_VEC_ENABLE_NEON) && !defined(__aarch64__)
+#undef SQLITE_VEC_ENABLE_NEON
+#endif
+#if defined(SQLITE_VEC_ENABLE_AVX) && !(defined(__x86_64__) || defined(__i386__))
+#undef SQLITE_VEC_ENABLE_AVX
+#endif
+
 enum VectorElementType {
   // clang-format off
   SQLITE_VEC_ELEMENT_TYPE_FLOAT32 = 223 + 0,

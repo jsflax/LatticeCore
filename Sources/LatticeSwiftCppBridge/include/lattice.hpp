@@ -3362,11 +3362,14 @@ public:
 #endif
     bool remove(const dynamic_object_ref& obj) const { return impl().remove(obj); }
 
+    // Single-object lookups query the row — sealed like the bulk reads
+    // (Swift cannot catch C++ exceptions): nullopt + last_bridge_error()
+    // on failure.
     std::optional<managed<swift_dynamic_object>> object(int64_t primary_key, const std::string& table_name) const {
-        return impl().object(primary_key, table_name);
+        return sealed([&] { return impl().object(primary_key, table_name); });
     }
     std::optional<managed<swift_dynamic_object>> object_by_global_id(const std::string& global_id, const std::string& table_name) const {
-        return impl().object_by_global_id(global_id, table_name);
+        return sealed([&] { return impl().object_by_global_id(global_id, table_name); });
     }
     std::vector<managed<swift_dynamic_object>> objects(
         const std::string& table_name,
@@ -3404,26 +3407,43 @@ public:
         return impl().count(table_name, where_clause, group_by, distinct_by);
     }
     bool delete_where(const std::string& table_name, std::optional<std::string> where_clause) const {
-        return impl().delete_where(table_name, where_clause);
+        return sealed([&] { return impl().delete_where(table_name, where_clause); });
     }
 
-    // Maintenance
-    void train_untrained_vec0_tables() const SWIFT_NAME(trainUntrainedVec0Tables()) { impl().train_untrained_vec0_tables(); }
-    void wait_for_vec0_training() const SWIFT_NAME(waitForVec0Training()) { impl().wait_for_vec0_training(); }
+    // Maintenance — Swift-reachable via the MCP vacuum/compact tools; the
+    // same pressure events that fail queries fail these. Sealed: 0/no-op +
+    // last_bridge_error() on failure.
+    void train_untrained_vec0_tables() const SWIFT_NAME(trainUntrainedVec0Tables()) {
+        sealed([&] { impl().train_untrained_vec0_tables(); });
+    }
+    void wait_for_vec0_training() const SWIFT_NAME(waitForVec0Training()) {
+        sealed([&] { impl().wait_for_vec0_training(); });
+    }
     int64_t vacuum_vec0(const std::string& table, const std::string& column) const {
-        return impl().vacuum_vec0(table, column);
+        return sealed([&] { return impl().vacuum_vec0(table, column); });
     }
-    void vacuum() const { impl().vacuum(); }
+    void vacuum() const { sealed([&] { impl().vacuum(); }); }
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
-        return impl().safe_compact_audit_log(stale_threshold_seconds);
+        return sealed([&] { return impl().safe_compact_audit_log(stale_threshold_seconds); });
     }
-    int64_t force_compact_audit_log() const { return impl().force_compact_audit_log(); }
+    int64_t force_compact_audit_log() const {
+        return sealed([&] { return impl().force_compact_audit_log(); });
+    }
     void backdate_replication_slots(int64_t seconds) const { impl().backdate_replication_slots(seconds); }
     void checkpoint() const { impl().checkpoint(); }
     void optimize() const { impl().optimize(); }
-    void begin_transaction() const { impl().begin_transaction(); }
-    void commit() const { impl().commit(); }
-    void rollback() const { impl().rollback(); }
+
+    // Transactions — begin_transaction throws db_error when the busy
+    // timeout lapses or an allocation fails under memory pressure; that
+    // escaped into Swift and killed the Engram MCP server twice on
+    // 2026-08-05 (recall's access-stat bump runs in a transaction).
+    // Sealed: the failure lands in last_bridge_error(); a failed BEGIN
+    // means subsequent writes autocommit individually (atomicity degrades,
+    // process survives), and the paired commit/rollback no-op-fails into
+    // the same slot instead of trapping.
+    void begin_transaction() const { sealed([&] { impl().begin_transaction(); }); }
+    void commit() const { sealed([&] { impl().commit(); }); }
+    void rollback() const { sealed([&] { impl().rollback(); }); }
     void close() const { impl().close(); }
 
     // Sync status

@@ -11,6 +11,7 @@
 #include <unmanaged_object.hpp>
 #include <managed_object.hpp>
 #include <LatticeCore.hpp>
+#include <error.hpp>
 
 
 namespace lattice {
@@ -499,61 +500,79 @@ public:
     bool release() { return --ref_count_ == 0; }
 #endif
 
-    // Delegate common operations to impl_
+    // Delegate common operations to impl_.
+    //
+    // Every method here is Swift-facing, and field access is NOT memory-only:
+    // an uncached read lazily queries the row (managed::detach) and a write
+    // executes an UPDATE — either can throw db_error (e.g. transient
+    // SQLITE_NOMEM while macOS purges the purgeable page cache), and a C++
+    // exception crossing into Swift is std::terminate → SIGTRAP (observed
+    // live in Engram.app, Aug 2026). sealed() catches, stashes the message
+    // in last_bridge_error() for Swift to bubble, and returns a default.
+    // NOT sealed (default-value semantics don't fit their return types;
+    // revisit if they ever appear in a crash): get_object, get_union/
+    // set_union, get_link_list, get_geo_bounds_list.
     bool has_value(const std::string& name) const SWIFT_NAME(hasValue(named:)) {
-        return impl_->has_value(name);
+        return sealed([&] { return impl_->has_value(name); });
     }
 
     int64_t get_int(const std::string& name) const SWIFT_NAME(getInt(named:)) {
-        return impl_->get_int(name);
+        return sealed([&] { return impl_->get_int(name); });
     }
 
     std::string get_string(const std::string& name) const SWIFT_NAME(getString(named:)) {
-        return impl_->get_string(name);
+        return sealed([&] { return impl_->get_string(name); });
     }
 
     bool get_bool(const std::string& name) const SWIFT_NAME(getBool(named:)) {
-        return impl_->get_bool(name);
+        return sealed([&] { return impl_->get_bool(name); });
     }
 
     std::vector<uint8_t> get_data(const std::string& name) const SWIFT_NAME(getData(named:)) {
-        return impl_->get_data(name);
+        return sealed([&] { return impl_->get_data(name); });
     }
 
     double get_double(const std::string& name) const SWIFT_NAME(getDouble(named:)) {
-        return impl_->get_double(name);
+        return sealed([&] { return impl_->get_double(name); });
     }
 
     float get_float(const std::string& name) const SWIFT_NAME(getFloat(named:)) {
-        return impl_->get_float(name);
+        return sealed([&] { return impl_->get_float(name); });
     }
 
     void set_int(const std::string& name, int64_t value) const SWIFT_NAME(setInt(named:_:)) {
-        impl_->set_int(name, value);
+        sealed([&] { impl_->set_int(name, value); });
     }
 
     void set_string(const std::string& name, const std::string& value) const SWIFT_NAME(setString(named:_:)) {
-        impl_->set_string(name, value);
+        sealed([&] { impl_->set_string(name, value); });
     }
 
     void set_bool(const std::string& name, bool value) const SWIFT_NAME(setBool(named:_:)) {
-        impl_->set_bool(name, value);
+        sealed([&] { impl_->set_bool(name, value); });
     }
 
     void set_data(const std::string& name, const std::vector<uint8_t>& value) const SWIFT_NAME(setData(named:_:)) {
-        impl_->set_data(name, value);
+        sealed([&] { impl_->set_data(name, value); });
     }
 
     void set_double(const std::string& name, double value) const SWIFT_NAME(setDouble(named:_:)) {
-        impl_->set_double(name, value);
+        sealed([&] { impl_->set_double(name, value); });
     }
 
     void set_float(const std::string& name, float value) const SWIFT_NAME(setFloat(named:_:)) {
-        impl_->set_float(name, value);
+        sealed([&] { impl_->set_float(name, value); });
     }
 
     void set_nil(const std::string& name) const SWIFT_NAME(setNil(named:)) {
-        impl_->set_nil(name);
+        sealed([&] { impl_->set_nil(name); });
+    }
+
+    /// The sealed contract's error slot (see error.hpp): "" if the last
+    /// sealed bridge call on THIS THREAD succeeded, else its failure
+    /// message. Check immediately after a suspicious defaulted result.
+    std::string last_query_error_message() const SWIFT_NAME(lastQueryErrorMessage()) {
+        return last_bridge_error();
     }
 
     // Materialized reads (row cache) — see dynamic_object's contract.

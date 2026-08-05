@@ -726,10 +726,12 @@ public:
         OptionalString distinct_by = std::nullopt) {
         // Never throws into Swift (interop cannot catch C++ exceptions) —
         // empty on failure, e.g. transient SQLITE_NOMEM under memory pressure.
+        last_bridge_error().clear();
         try {
         auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
         return hydrate_swift_rows(rows, table_name);
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "objects(%s) failed: %s", table_name.c_str(), e.what());
             return {};
         }
@@ -744,6 +746,7 @@ public:
         // Never throws into Swift — empty on failure. A row missing '_type'
         // is a malformed union query; skip the row (it used to throw, which
         // terminated the process at the interop boundary).
+        last_bridge_error().clear();
         try {
         auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset);
         std::vector<managed<swift_dynamic_object>> results;
@@ -768,6 +771,7 @@ public:
         }
         return results;
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "union_objects failed: %s", e.what());
             return {};
         }
@@ -778,21 +782,24 @@ public:
                  OptionalString where_clause,
                  OptionalString group_by,
                  OptionalString distinct_by) {
+        last_bridge_error().clear();
         try { return lattice_db::count(table_name, where_clause, group_by, distinct_by); }
-        catch (const std::exception& e) { LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
+        catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
                  OptionalString group_by) {
+        last_bridge_error().clear();
         try { return lattice_db::count(table_name, where_clause, group_by); }
-        catch (const std::exception& e) { LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
+        catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name,
                  OptionalString where_clause) {
+        last_bridge_error().clear();
         try { return lattice_db::count(table_name, where_clause, std::nullopt); }
-        catch (const std::exception& e) { LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
+        catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name) {
@@ -1729,6 +1736,7 @@ public:
         // Swift-facing read API: never throws into Swift (interop cannot
         // catch C++ exceptions — an escape is a process trap). Empty on
         // failure, e.g. transient SQLITE_NOMEM under page-cache purge.
+        last_bridge_error().clear();
         try {
         // Check if this is a geo_bounds list (separate table) or single geo_bounds (inline columns)
         bool is_list = db().table_exists("_" + table_name + "_" + geo_column);
@@ -1740,6 +1748,7 @@ public:
             where_clause, order_by, limit, offset, group_by, is_list));
         return hydrate_swift_rows(rows, table_name);
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "objects_within_bbox failed: %s", e.what());
             return {};
         }
@@ -1754,6 +1763,7 @@ public:
         OptionalString where_clause = std::nullopt)
         SWIFT_NAME(countWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
         // Never throws into Swift — 0 on failure.
+        last_bridge_error().clear();
         try {
         std::string list_table = "_" + table_name + "_" + geo_column;
         std::string list_rtree = list_table + "_rtree";
@@ -1794,6 +1804,7 @@ public:
         }
         return 0;
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "count_within_bbox failed: %s", e.what());
             return 0;
         }
@@ -1813,6 +1824,7 @@ public:
         OptionalString where_clause = std::nullopt)
         SWIFT_NAME(geoNearest(table:geoColumn:lat:lon:radius:limit:sortByDistance:where:)) {
         // Never throws into Swift — empty on failure.
+        last_bridge_error().clear();
         try {
         // Convert radius to bounding box
         constexpr double METERS_PER_DEGREE = 111000.0;
@@ -1897,6 +1909,7 @@ public:
         }
         return results;
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "geo_nearest failed: %s", e.what());
             return {};
         }
@@ -1927,6 +1940,7 @@ public:
         OptionalString where_clause = std::nullopt)
         SWIFT_NAME(combinedQuery(table:vectorColumn:queryVector:k:metric:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
         // Never throws into Swift — empty on failure.
+        last_bridge_error().clear();
         try {
         // Determine distance function based on metric
         std::string distance_func;
@@ -2000,6 +2014,7 @@ public:
         }
         return results;
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "combined_query failed: %s", e.what());
             return {};
         }
@@ -2351,6 +2366,7 @@ public:
         // that is std::terminate() → SIGTRAP (observed live: db_error under
         // system memory pressure escaped here and killed the app). Empty on
         // failure; callers already treat empty as "no results".
+        last_bridge_error().clear();
         try {
         auto ctes_opt = build_combined_nearest_ctes_(table_name, bounds, vectors, geos, texts, where_clause);
         if (!ctes_opt) return CombinedQueryResultVector{};
@@ -2499,6 +2515,7 @@ public:
 
         return results;
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "combined_nearest_query failed: %s", e.what());
             return CombinedQueryResultVector{};
         }
@@ -2519,6 +2536,7 @@ public:
         OptionalString distinct_by = std::nullopt)
         SWIFT_NAME(combinedNearestQueryCount(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
         // Never throws into Swift — 0 on failure.
+        last_bridge_error().clear();
         try {
         auto ctes_opt = build_combined_nearest_ctes_(table_name, bounds, vectors, geos, texts, where_clause);
         if (!ctes_opt) return 0;
@@ -2578,6 +2596,7 @@ public:
         }
         return 0;
         } catch (const std::exception& e) {
+            last_bridge_error() = e.what();
             LOG_ERROR("query", "combined_nearest_query_count failed: %s", e.what());
             return 0;
         }
@@ -3485,6 +3504,16 @@ public:
     // Sync data ingestion
     std::vector<std::string> receive_sync_data(const ByteVector& data) const { return impl().receive_sync_data(data); }
     OptionalString last_receive_error() const { return impl().last_receive_error(); }
+
+    /// The sealed query surface's error slot (see error.hpp): nullopt if
+    /// the last sealed call on THIS THREAD succeeded, else its failure
+    /// message. Same-thread, immediately-after-the-call semantics — the
+    /// query analog of last_receive_error(), thread-local because queries
+    /// run concurrently across galaxy/recall threads.
+    OptionalString last_query_error() const {
+        if (last_bridge_error().empty()) return std::nullopt;
+        return last_bridge_error();
+    }
 
     // Sync filter
     void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }

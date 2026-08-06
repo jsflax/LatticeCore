@@ -1039,10 +1039,36 @@ void lattice_db::rebuild_attached_views() {
                 sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name +
                       " AS SELECT * FROM " + alias_arms.front().first + "." + table_name;
             } else {
+                // UNION ALL matches columns BY POSITION, and each database's
+                // physical column order is whatever its create-time schema
+                // iteration produced (an unordered map — effectively random
+                // per file). `SELECT *` arms therefore SCRAMBLE values across
+                // same-named columns whenever two files disagree — observed
+                // live: a WHERE over the view read an attached row's
+                // modifiedAt as deletedAt and filtered every spoke row out
+                // of recall. Project every arm's columns explicitly, in one
+                // canonical order, so the view maps by NAME. A column
+                // missing from some arm then fails view creation loudly
+                // instead of scrambling silently.
+                const std::string first_schema =
+                    in_main ? "main" : alias_arms.front().first;
+                auto ordered_cols = [&]() {
+                    auto rows = handle->query(
+                        "PRAGMA " + first_schema + ".table_info(" + table_name + ")");
+                    std::string cols;
+                    for (const auto& row : rows) {
+                        auto it = row.find("name");
+                        if (it == row.end() ||
+                            !std::holds_alternative<std::string>(it->second)) continue;
+                        if (!cols.empty()) cols += ", ";
+                        cols += "\"" + std::get<std::string>(it->second) + "\"";
+                    }
+                    return cols;
+                }();
                 sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
                 bool first = true;
                 if (in_main) {
-                    sql += "SELECT *, 'main' AS _source FROM main." + table_name;
+                    sql += "SELECT " + ordered_cols + ", 'main' AS _source FROM main." + table_name;
                     first = false;
                 }
                 for (const auto& [qualifier, label] : alias_arms) {
@@ -1055,7 +1081,7 @@ void lattice_db::rebuild_attached_views() {
                         escaped_label += c;
                         if (c == '\'') escaped_label += '\'';
                     }
-                    sql += "SELECT *, '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
+                    sql += "SELECT " + ordered_cols + ", '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
                     first = false;
                 }
             }

@@ -2250,20 +2250,35 @@ public:
             // One candidate row per DISTINCT memory: the same globalId can
             // appear in several arms (hub + spoke replicas) — group to the
             // best distance so the outer joins can't multiply result rows.
+            //
+            // The KNN MATCH lives ALONE in an inner subquery whose LIMIT
+            // blocks flattening. With MATCH+k in the same SELECT as the
+            // model-table join and pre-filters, the planner is free to make
+            // the model table the outer loop (it will, when an arm's table
+            // is small) — and vec0's KNN driven as the inner side of a join
+            // returns garbage or nothing. Observed live: attached spokes
+            // vanished from filtered recalls while an unfiltered query
+            // returned them (plus duplicate rows with borrowed distances).
             sql << cte_name << " AS (SELECT gid, MIN(distance) AS distance FROM (";
             for (size_t si = 0; si < vec_schemas.size(); ++si) {
                 if (si > 0) sql << " UNION ALL ";
                 sql << "SELECT m.globalId AS gid, "
                     << (needs_rescore
-                        ? distance_func + "(v.embedding, " + query_blob + ")"
-                        : "v.distance")
+                        ? distance_func + "(k.embedding, " + query_blob + ")"
+                        : "k.distance")
                     << " AS distance"
-                    << " FROM " << vec_schemas[si] << "." << vec_table << " v"
+                    << " FROM (SELECT global_id, embedding, distance"
+                    << " FROM " << vec_schemas[si] << "." << vec_table
+                    << " WHERE embedding MATCH " << query_blob
+                    << " ORDER BY distance LIMIT " << fetch_k << ") k"
                     << " JOIN " << vec_schemas[si] << "." << table_name
-                    << " m ON m.globalId = v.global_id"
-                    << " WHERE v.embedding MATCH " << query_blob << " AND v.k = " << fetch_k;
-                for (const auto& cond : where_conditions) {
-                    sql << " AND " << cond;
+                    << " m ON m.globalId = k.global_id";
+                if (!where_conditions.empty()) {
+                    sql << " WHERE ";
+                    for (size_t wi = 0; wi < where_conditions.size(); ++wi) {
+                        if (wi > 0) sql << " AND ";
+                        sql << where_conditions[wi];
+                    }
                 }
             }
             sql << ") GROUP BY gid ORDER BY distance ASC";
@@ -2491,6 +2506,9 @@ public:
         }
 
         LOG_DEBUG("combinedNearestQuery", "Final SQL length: %zu", final_sql.size());
+        if (std::getenv("LATTICE_DUMP_SQL")) {
+            fprintf(stderr, "[LATTICE_DUMP_SQL]\n%s\n[/LATTICE_DUMP_SQL]\n", final_sql.c_str());
+        }
         auto rows = db().query(final_sql);
         LOG_DEBUG("combinedNearestQuery", "Query returned %zu rows", rows.size());
         CombinedQueryResultVector results;

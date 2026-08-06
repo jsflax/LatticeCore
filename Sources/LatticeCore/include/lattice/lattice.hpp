@@ -4780,14 +4780,20 @@ public:
                         const std::string& column_name) {
         std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
         try {
-            // Infer dimensions from existing vec0 info or first non-empty embedding
+            // Infer dimensions from existing vec0 info or first non-empty
+            // embedding. The info table is absent when the index was never
+            // created (rows applied by sync bypass the lazy create path) —
+            // that case MUST fall through to the sample probe so this
+            // function can build the index from scratch, not just rebuild it.
             int dimensions = 0;
-            auto info_rows = db_->query(
-                "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
-            if (!info_rows.empty()) {
-                auto it = info_rows[0].find("value");
-                if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    dimensions = static_cast<int>(std::get<int64_t>(it->second));
+            if (db_->table_exists(vec_table + "_info")) {
+                auto info_rows = db_->query(
+                    "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
+                if (!info_rows.empty()) {
+                    auto it = info_rows[0].find("value");
+                    if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                        dimensions = static_cast<int>(std::get<int64_t>(it->second));
+                    }
                 }
             }
             if (dimensions == 0) {

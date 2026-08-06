@@ -645,7 +645,6 @@ private:
     void populate_swift_in_memory_state(const SchemaVector& schemas);
     /// Heal vec0 rows missed by other connections' triggers, asynchronously.
     void dispatch_vec0_reconcile(const SchemaVector& schemas);
-    void reconcile_vec0_gaps_for(const std::string& table, const std::string& prop);
     void persist_union_values(swift_dynamic_object& unmanaged_obj,
                               const std::string& table_name, int64_t parent_id);
     // For an `allowsUpsert` constraint that includes a to-one link column, write
@@ -889,6 +888,13 @@ public:
     int64_t vacuum_vec0(const std::string& table, const std::string& column) {
         return lattice_db::vacuum_vec0(table, column);
     }
+
+    /// Heal vec0 for one table+column: CREATES the index (dims sampled from
+    /// data) when it is missing entirely — the sync-only-DB lifecycle — and
+    /// backfills rows missed by other connections' triggers. Idempotent.
+    /// Dispatched in the background on every open; public so maintenance
+    /// paths and tests can invoke the heal deterministically.
+    void reconcile_vec0_gaps_for(const std::string& table, const std::string& prop);
 
     /// Train all untrained IVF vec0 tables on the main write connection.
     void train_untrained_vec0_tables()

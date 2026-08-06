@@ -1499,7 +1499,25 @@ void swift_lattice::dispatch_vec0_reconcile(const SchemaVector& schemas) {
 void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std::string& prop) {
     std::string vec_table = "_" + table + "_" + prop + "_vec";
     try {
-        if (!db().table_exists(vec_table)) return;
+        if (!db().table_exists(vec_table)) {
+            // Missing table + present vector data is the sync-only lifecycle:
+            // the DB was CREATED empty (open's Phase 6b had no rows to infer
+            // dims from), then hydrated by sync-apply — which never creates
+            // vec0 or its triggers. Every later open takes the fast path, so
+            // bailing here would leave the DB semantically unsearchable
+            // forever. Create the index (dims from a sample row); the gap
+            // fill below then backfills every row.
+            auto sample = db().query(
+                "SELECT length(" + prop + ") as len FROM main." + table +
+                " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0 LIMIT 1");
+            if (sample.empty()) return;
+            auto len_it = sample[0].find("len");
+            if (len_it == sample[0].end() ||
+                !std::holds_alternative<int64_t>(len_it->second)) return;
+            int dims = static_cast<int>(std::get<int64_t>(len_it->second) / sizeof(float));
+            if (dims <= 0) return;
+            ensure_vec0_table(table, prop, dims);
+        }
         // Qualify the model table with `main.`: this task runs async after
         // open, and attach() may have installed a UNION ALL TEMP view that
         // SHADOWS the bare table name on this connection. Counting the view

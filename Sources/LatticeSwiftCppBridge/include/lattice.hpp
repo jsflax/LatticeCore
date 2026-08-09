@@ -3498,6 +3498,10 @@ public:
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
         return sealed([&] { return impl().safe_compact_audit_log(stale_threshold_seconds); });
     }
+    int64_t normalize_audit_timestamps() const
+        SWIFT_NAME(normalizeAuditTimestamps()) {
+        return sealed([&] { return impl().normalize_audit_timestamps(); });
+    }
     int64_t force_compact_audit_log() const {
         return sealed([&] { return impl().force_compact_audit_log(); });
     }

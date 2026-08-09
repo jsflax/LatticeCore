@@ -3294,6 +3294,20 @@ public:
         return deleted;
     }
 
+    /// Repair audit rows whose timestamp landed in the REAL column as TEXT.
+    /// The pre-fix apply path bound the wire's ISO-8601 string directly, so
+    /// those rows fell out of every date-based query and every age-based
+    /// maintenance sweep (2.0M rows on a production hub). unixepoch()
+    /// parses the ISO forms; unparseable values are left alone rather than
+    /// zeroed. Idempotent — typed-REAL rows are not matched.
+    /// @return rows normalized
+    int64_t normalize_audit_timestamps() {
+        db_->execute(
+            "UPDATE AuditLog SET timestamp = unixepoch(timestamp) "
+            "WHERE typeof(timestamp) = 'text' AND unixepoch(timestamp) IS NOT NULL");
+        return static_cast<int64_t>(sqlite3_changes(db_->handle()));
+    }
+
     /// Nuclear compaction: deletes ALL history, regenerates INSERT snapshots,
     /// and resets all replication slot cursors to 0.
     /// Active synchronizers will re-sync all data.

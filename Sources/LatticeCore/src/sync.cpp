@@ -2144,8 +2144,21 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
         const int failures = self->ack_resend_failures_.load(std::memory_order_relaxed);
         const auto timeout = std::min<std::chrono::steady_clock::duration>(
             kAckTimeoutBase * (int64_t(1) << std::min(failures, 5)), kAckTimeoutMax);
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
+        // ACK-PROGRESS deadline, not a fixed send-time deadline: the peer
+        // acks a frame only after synchronously APPLYING it (11-20s+ per
+        // 1000-entry frame observed), so a fixed deadline re-sent every
+        // window before its acks could land — ~16-26x upload amplification
+        // in production. Matching acks extend the deadline; a window being
+        // actively consumed is never re-sent, a silent peer still times out
+        // after `timeout` of NO progress.
+        const auto start = std::chrono::steady_clock::now();
+        auto deadline_from = [&](int64_t last_ack_ns) {
+            auto last = std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(last_ack_ns));
+            return std::max(start, last) + timeout;
+        };
+        while (std::chrono::steady_clock::now() <
+               deadline_from(self->last_matching_ack_ns_.load(std::memory_order_relaxed))) {
             {
                 std::lock_guard<std::mutex> g(guard->m);
                 if (!guard->alive) return;
@@ -2183,8 +2196,44 @@ void synchronizer_base::upload_pending_changes() {
         LOG_DEBUG("synchronizer", "upload_pending_changes: not connected, skipping");
         return;
     }
+    // Horizon BEFORE the scan: if the pass then enumerates nothing, no
+    // entry <= horizon is pending for this channel (writes that land after
+    // the horizon read are past it and unaffected).
+    int64_t scan_horizon = 0;
+    if (config_.use_upload_floor) {
+        auto h = db().db().query("SELECT COALESCE(MAX(id), 0) AS m FROM AuditLog", {});
+        if (!h.empty() && std::holds_alternative<int64_t>(h[0].at("m"))) {
+            scan_horizon = std::get<int64_t>(h[0].at("m"));
+        }
+    }
     auto entries = query_pending_entries();
-    if (entries.empty()) return;
+    if (entries.empty()) {
+        // A channel whose filter matches nothing NEVER enumerates a row, so
+        // its floor never advances and its slot pins compaction at 0 forever
+        // (production: two filtered-to-nothing group slots vetoed collapse
+        // of 4.67M rows). An empty pass with nothing open/in-flight proves
+        // everything <= horizon is resolved for this channel — advance the
+        // floor so compaction can pass it. Safe on filter WIDENING: newly
+        // matching rows are re-delivered via reconcile Phase-2 full-row
+        // snapshots, never by audit replay.
+        if (config_.use_upload_floor && scan_horizon > 0) {
+            bool nothing_open;
+            {
+                std::lock_guard<std::mutex> lock(in_flight_mutex_);
+                nothing_open = open_audit_ids_.empty() && in_flight_ids_.empty();
+            }
+            if (nothing_open) {
+                db().db().execute(R"(
+                    INSERT INTO _lattice_replication_slots (sync_id, upload_floor, last_active_at)
+                    VALUES (?, ?, datetime('now'))
+                    ON CONFLICT(sync_id) DO UPDATE SET
+                        upload_floor = MAX(upload_floor, excluded.upload_floor),
+                        last_active_at = excluded.last_active_at
+                )", {config_.sync_id, scan_horizon});
+            }
+        }
+        return;
+    }
     auto classified = classify_entries(entries);
 
     // Progress accounting happens in send_entries AFTER windowing: counting
@@ -2237,6 +2286,7 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
     // map still has them: mark_audit_entries_synced_for's transactions have
     // already committed above, so advancing the floor past them is safe.
     std::vector<int64_t> resolved_audit_ids;
+    size_t matched = 0;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (const auto& id : global_ids) {
@@ -2244,10 +2294,17 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
             if (it != in_flight_ids_.end()) {
                 if (it->second > 0) resolved_audit_ids.push_back(it->second);
                 in_flight_ids_.erase(it);
+                ++matched;
             }
         }
         progress_pending_upload_.store(
             static_cast<int64_t>(in_flight_ids_.size()), std::memory_order_relaxed);
+    }
+    if (matched > 0) {
+        last_matching_ack_ns_.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
     }
     if (config_.use_upload_floor) {
         resolve_audit_ids(resolved_audit_ids);
@@ -2264,8 +2321,14 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         should_upload = in_flight_ids_.empty();
     }
-    // ACKs mean the server is alive and consuming — reset the resend backoff.
-    ack_resend_failures_.store(0, std::memory_order_relaxed);
+    // Backoff resets ONLY on acks that matched in-flight entries. During
+    // the Aug 2026 incident the channel carried ~2,400 unmatched acked-ids
+    // per second (server re-acks + the other device's traffic), each batch
+    // resetting the backoff to base — the resend loop never slowed down.
+    // Unmatched acks are not progress on OUR window.
+    if (matched > 0) {
+        ack_resend_failures_.store(0, std::memory_order_relaxed);
+    }
     if (should_upload) {
         // The drained in-flight window is a continuation signal for KNOWN
         // pending work — dispatch directly (the pass no-ops if nothing is
@@ -2357,7 +2420,8 @@ synchronizer_base::sync_progress synchronizer_base::get_progress() const {
         progress_pending_upload_.load(std::memory_order_relaxed),
         progress_total_upload_.load(std::memory_order_relaxed),
         progress_acked_.load(std::memory_order_relaxed),
-        progress_received_.load(std::memory_order_relaxed)
+        progress_received_.load(std::memory_order_relaxed),
+        config_.sync_id
     };
 }
 
@@ -2900,6 +2964,32 @@ void advance_upload_floor(database& db, const std::string& sync_id, int64_t floo
     )", {floor, sync_id});
 }
 
+// Wire timestamps arrive as strings (ISO-8601 from older peers, or a
+// numeric epoch rendered as text), but AuditLog.timestamp is REAL
+// (unixepoch('subsec') on locally-minted rows). Binding the string put
+// TEXT into the REAL column — 2.0M production rows invisible to every
+// piece of date math (age-based compaction, timeline queries). Convert;
+// unparseable input degrades to "now" (a bounded lie beats a typed one).
+static double wire_timestamp_to_epoch(const std::string& ts) {
+    if (ts.empty()) return static_cast<double>(::time(nullptr));
+    // Numeric-as-text (current peers): parse directly.
+    {
+        char* end = nullptr;
+        double v = std::strtod(ts.c_str(), &end);
+        if (end && *end == '\0' && v > 0) return v;
+    }
+    // ISO-8601 "YYYY-MM-DDTHH:MM:SS[.sss]Z" (older peers).
+    std::tm tm{};
+    if (::strptime(ts.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) != nullptr) {
+        double frac = 0.0;
+        if (auto dot = ts.find('.'); dot != std::string::npos) {
+            frac = std::strtod(ts.c_str() + dot, nullptr);
+        }
+        return static_cast<double>(::timegm(&tm)) + frac;
+    }
+    return static_cast<double>(::time(nullptr));
+}
+
 // Unified implementation for applying remote changes.
 // receiving_sync_id = nullopt → global mode (server path): isSynchronized=1, no _lattice_sync_state row.
 // receiving_sync_id = value   → per-sync mode (relay path): isSynchronized=0, insert _lattice_sync_state row.
@@ -3163,7 +3253,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                         entry.global_row_id,
                         entry.changed_fields_to_json(),
                         entry.changed_fields_names_to_json(),
-                        entry.timestamp,
+                        wire_timestamp_to_epoch(entry.timestamp),
                         static_cast<int64_t>(is_synchronized),
                         static_cast<int64_t>(entry.synthesized ? 1 : 0)
                     });

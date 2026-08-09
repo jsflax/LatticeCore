@@ -3373,9 +3373,17 @@ public:
                 {stale_threshold_seconds});
         }
 
-        // 2. Query MIN(confirmed_audit_id) and slot count
+        // 2. Deletion bound: MIN(upload_floor) over live slots — the floor is
+        // the CONTIGUOUS resolved frontier ("no entry pending for this
+        // sync_id has id <= upload_floor", advanced only as ids resolve by
+        // ack or skip). confirmed_audit_id must NOT participate: it is a
+        // HOLEY high-watermark (advance takes each ACKed chunk's max, and a
+        // partial apply acks only the applied subset — confirmed jumps past
+        // unacked lower ids; observed live: 1,087 entries pending BELOW a
+        // channel's confirmed). Compacting to it deletes un-uploaded history
+        // unrecoverably; compacting to the floor is exactly safe.
         auto rows = db_->query(
-            "SELECT COUNT(*) as cnt, MIN(confirmed_audit_id) as safe_id "
+            "SELECT COUNT(*) as cnt, MIN(upload_floor) as safe_id "
             "FROM _lattice_replication_slots");
 
         if (rows.empty()) return -1;
@@ -3399,17 +3407,23 @@ public:
         }
         if (safe_id <= 0) return 0;
 
-        // 4. Delete confirmed entries
+        // 4. Delete floor-covered entries — in ONE transaction. The bare
+        // autocommit sequence could commit a mixed state on mid-pass crash
+        // (flag flipped but rows half-deleted, or AuditLog pruned with its
+        // sync-state rows orphaned); a transaction makes crash = clean
+        // rollback, including the _SyncControl flag flip.
         const int64_t prev_disabled = read_sync_disabled_flag();
-        db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
         int64_t deleted = 0;
+        db_->begin_transaction();
         try {
+            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
             db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
             deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
             db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
             db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+            db_->commit();
         } catch (...) {
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+            try { db_->rollback(); } catch (...) {}
             throw;
         }
 
@@ -5887,7 +5901,24 @@ private:
         }
         std::string copy_sql = "INSERT INTO " + table + " (" + dest_str + ") SELECT " + src_str + " FROM " + tmp;
         LOG_INFO("migrate", "rebuild_table: copying data: %s", copy_sql.c_str());
-        db_->execute(copy_sql);
+        // The copy is a schema-SHAPE operation, not user writes — it must
+        // not mint audit entries. The new table's audit triggers are already
+        // live here, and an unbracketed copy re-audits the ENTIRE table as
+        // fresh INSERTs (full payloads: ~218K rows per migration on a
+        // production hub, ~2.2M in one dev-loop day — the Aug 2026
+        // audit-explosion incident's largest local generator). Same
+        // _SyncControl bracket as generate_history/delete_rows_no_relay.
+        {
+            const int64_t prev_disabled = read_sync_disabled_flag();
+            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+            try {
+                db_->execute(copy_sql);
+                db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+            } catch (...) {
+                db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+                throw;
+            }
+        }
 
         // Verify row count after copy
         auto count_rows = db_->query("SELECT COUNT(*) as cnt FROM " + table);

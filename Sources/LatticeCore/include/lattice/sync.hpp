@@ -283,6 +283,11 @@ public:
         int64_t total_upload = 0;    // snapshot at start of batch
         int64_t acked = 0;
         int64_t received = 0;        // cumulative downloads
+        /// Which channel this update belongs to. Multiple synchronizers on
+        /// one database multiplex through one handler — without the label,
+        /// interleaved counters from different channels are undiagnosable
+        /// (the Aug 2026 incident's log was exactly this).
+        std::string sync_id;
     };
 
     using on_progress_handler = std::function<void(const sync_progress&)>;
@@ -389,9 +394,21 @@ protected:
 
     /// Consecutive ack-timeout failures (no ACK before the resend deadline).
     /// Grows the resend deadline (10s, 20s, 40s… capped) so a stalled server
-    /// is not re-hammered with the same window at a fixed cadence. Reset on
-    /// any ACK.
+    /// is not re-hammered with the same window at a fixed cadence. Reset
+    /// ONLY by an ACK that matched in-flight entries — unmatched ack floods
+    /// (re-acks of history, another device's traffic on the channel) kept
+    /// resetting this during the Aug 2026 incident, pinning the resend loop
+    /// hot at its base cadence indefinitely.
     std::atomic<int> ack_resend_failures_{0};
+
+    /// steady_clock nanos of the last ACK that resolved in-flight entries.
+    /// The resend watchdog treats this as PROGRESS and extends its deadline:
+    /// first-delivery acks return only after the peer synchronously applies
+    /// a full frame (11-20s+ per 1000 entries observed), so a fixed
+    /// send-time deadline re-sent every window before its acks could land —
+    /// ~16-26x upload amplification in production. A window being actively
+    /// consumed is never re-sent; a truly silent peer still times out.
+    std::atomic<int64_t> last_matching_ack_ns_{0};
 
 #ifndef __EMSCRIPTEN__
     // Pacer thread: owns trailing-edge coalescing and periodic WAL

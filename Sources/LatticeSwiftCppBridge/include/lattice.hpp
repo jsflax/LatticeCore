@@ -977,13 +977,17 @@ public:
         });
     }
 
-    // Sync progress — callback (fires on synchronizer's std_thread_scheduler thread)
+    // Sync progress — callback (fires on synchronizer's std_thread_scheduler thread).
+    // sync_id labels WHICH channel the update belongs to: multiple
+    // synchronizers on one database multiplex through this one callback, and
+    // unlabeled interleaved counters are undiagnosable (Aug 2026 incident).
     void set_on_sync_progress(void* context,
                                void (*callback)(void* ctx,
                                                 int64_t pending_upload,
                                                 int64_t total_upload,
                                                 int64_t acked,
-                                                int64_t received),
+                                                int64_t received,
+                                                const char* sync_id),
                                void (*destroy)(void*) = nullptr) {
         LOG_INFO("swift_lattice", "set_on_sync_progress: callback=%s (db=%s)",
                  callback ? "SET" : "CLEAR", config().path.c_str());
@@ -996,7 +1000,8 @@ public:
         auto cb = callback;
         lattice_db::set_on_sync_progress(
             [shared_ctx, cb](const synchronizer::sync_progress& p) {
-                cb(shared_ctx.get(), p.pending_upload, p.total_upload, p.acked, p.received);
+                cb(shared_ctx.get(), p.pending_upload, p.total_upload, p.acked, p.received,
+                   p.sync_id.c_str());
             });
     }
     
@@ -3625,7 +3630,8 @@ public:
                                                int64_t pending_upload,
                                                int64_t total_upload,
                                                int64_t acked,
-                                               int64_t received),
+                                               int64_t received,
+                                               const char* sync_id),
                               void (*destroy)(void*) = nullptr) const {
         impl().set_on_sync_progress(context, callback, destroy);
     }

@@ -873,6 +873,35 @@ public:
         }
     }
 
+    /// Bounded WAL checkpoint — the sync-pacer recipe (sync.cpp
+    /// maybe_checkpoint) exposed as a callable: TRUNCATE with a small busy
+    /// budget so a held reader snapshot makes it FAIL FAST instead of
+    /// stalling every writer for the connection's full 30s busy timeout;
+    /// on busy, fall back to PASSIVE (backfills as far as readers allow,
+    /// blocks no one) and ask same-path keepers to advance their read
+    /// generations so the NEXT truncate can land behind them. Returns the
+    /// number of frames checkpointed (-1 when nothing could run).
+    ///
+    /// This is what maintenance paths (embedding-migration sweeps, repair)
+    /// must call between write batches: the unbounded checkpoint() above is
+    /// for teardown; calling it mid-workload trades read starvation for
+    /// write starvation (Aug 2026 incident review).
+    int64_t checkpoint_bounded(int64_t busy_budget_ms = 250) {
+        auto res = db().wal_checkpoint(/*truncate=*/true,
+                                       static_cast<int>(busy_budget_ms));
+        if (res.busy != 0) {
+            auto passive = db().wal_checkpoint(/*truncate=*/false,
+                                               static_cast<int>(busy_budget_ms));
+            lattice_db::request_generation_advance();
+            LOG_INFO("swift_lattice",
+                     "checkpoint_bounded: truncate busy — passive fallback "
+                     "(frames=%lld checkpointed=%lld), generation advance requested",
+                     (long long)passive.log_frames, (long long)passive.checkpointed);
+            return passive.checkpointed;
+        }
+        return res.checkpointed;
+    }
+
     /// Incremental statistics refresh ("PRAGMA optimize", bounded by
     /// analysis_limit). Cheap; safe to run from maintenance paths. Long-lived
     /// processes should call this periodically — the automatic close-time
@@ -3474,6 +3503,10 @@ public:
     }
     void backdate_replication_slots(int64_t seconds) const { impl().backdate_replication_slots(seconds); }
     void checkpoint() const { impl().checkpoint(); }
+    int64_t checkpoint_bounded(int64_t busy_budget_ms = 250) const
+        SWIFT_NAME(checkpointBounded(busyBudgetMs:)) {
+        return sealed([&] { return impl().checkpoint_bounded(busy_budget_ms); });
+    }
     void optimize() const { impl().optimize(); }
 
     // Transactions — begin_transaction throws db_error when the busy

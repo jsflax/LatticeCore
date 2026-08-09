@@ -287,3 +287,50 @@ TEST(AuditHygiene, SafeCompactUsesFloorNotHoleyConfirmed) {
     EXPECT_EQ(std::get<int64_t>(compacted[0].at("c")), 0)
         << "floor-covered entries must compact";
 }
+
+// ---------------------------------------------------------------------------
+// Compaction preserves the WSS download-resume cursor.
+// ---------------------------------------------------------------------------
+TEST(AuditHygiene, SafeCompactPreservesDownloadCursorRow) {
+    TempDB tmp{"compact_cursor"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+
+    // Local writes, then a "downloaded" row (the newest isFromRemote row is
+    // the ?last-event-id resume cursor), then more local writes.
+    for (int i = 0; i < 3; ++i) {
+        db.add(TestPerson{std::string("D") + std::to_string(i), 20 + i, std::nullopt});
+    }
+    db.db().execute(
+        "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
+        " changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized) "
+        "VALUES ('cursor-row-gid', 'TestPerson', 'INSERT', 99, 'cursor-person', "
+        " '{}', '[]', unixepoch('subsec'), 1, 0)");
+    for (int i = 3; i < 6; ++i) {
+        db.add(TestPerson{std::string("D") + std::to_string(i), 20 + i, std::nullopt});
+    }
+    const int64_t maxid = max_audit_id(db.db());
+
+    // A slot whose floor covers EVERYTHING — without cursor preservation,
+    // compaction would delete the isFromRemote row and the next WSS connect
+    // (which resumes from the newest isFromRemote globalId) would
+    // re-download the peer's entire history.
+    db.db().execute(
+        "INSERT INTO _lattice_replication_slots "
+        "(sync_id, confirmed_audit_id, upload_floor, last_active_at) "
+        "VALUES ('full-chan', ?, ?, datetime('now'))",
+        {maxid, maxid});
+
+    db.safe_compact_audit_log();
+
+    auto cursor = db.db().query(
+        "SELECT globalId FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1", {});
+    ASSERT_FALSE(cursor.empty())
+        << "compaction deleted the download-resume cursor row";
+    EXPECT_EQ(std::get<std::string>(cursor[0].at("globalId")), "cursor-row-gid");
+
+    // Everything else below the floor is gone.
+    auto rest = db.db().query(
+        "SELECT COUNT(*) AS c FROM AuditLog WHERE isFromRemote = 0", {});
+    ASSERT_FALSE(rest.empty());
+    EXPECT_EQ(std::get<int64_t>(rest[0].at("c")), 0);
+}

@@ -3417,7 +3417,15 @@ public:
         db_->begin_transaction();
         try {
             db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-            db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
+            // Preserve the newest isFromRemote row: it IS the WSS download
+            // resume cursor (get_last_received_event_id reads it to build
+            // ?last-event-id on connect). Deleting it resets the cursor and
+            // the next connect re-downloads the peer's entire history.
+            db_->execute(
+                "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
+                "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
+                "  ORDER BY id DESC LIMIT 1)",
+                {safe_id});
             deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
             db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
             db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});

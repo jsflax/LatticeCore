@@ -1413,6 +1413,39 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
             return;
         }
         config_.sync_filter = std::move(filter);
+        // REWIND the scan floor to the oldest entry this channel has not
+        // durably resolved. The floor is a scan bound
+        // (query_audit_log_for_sync skips id <= floor), and the empty-pass
+        // advance below can push it PAST entries that were skipped only
+        // because the old filter excluded them. Widening the filter is
+        // exactly the case that must see those entries again — reconcile's
+        // Phase-2 dedup deliberately does NOT re-synthesize rows whose
+        // INSERT entries are still pending, so without this rewind they are
+        // unreachable forever (observed: exposing a project to a group
+        // relayed nothing, because the group channel's empty passes had
+        // already advanced its floor past the row).
+        //
+        // Derived from _lattice_sync_state, not from in-memory bookkeeping,
+        // so it is correct across daemon restarts too.
+        if (config_.use_upload_floor) {
+            auto rows = db().db().query(
+                "SELECT MIN(a.id) AS min_pending FROM AuditLog a "
+                "LEFT JOIN _lattice_sync_state s "
+                "  ON s.audit_entry_id = a.id AND s.sync_id = ? "
+                "WHERE s.audit_entry_id IS NULL", {config_.sync_id});
+            if (!rows.empty()) {
+                auto it = rows[0].find("min_pending");
+                if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                    const int64_t rewind_to = std::get<int64_t>(it->second) - 1;
+                    db().db().execute(
+                        "UPDATE _lattice_replication_slots SET upload_floor = ? "
+                        "WHERE sync_id = ? AND upload_floor > ?",
+                        {rewind_to, config_.sync_id, rewind_to});
+                }
+            }
+            std::lock_guard<std::mutex> lock(in_flight_mutex_);
+            last_enumerated_id_ = 0;  // re-enumerate from the rewound floor
+        }
         reconcile_sync_filter();
         // A filter change can make ALREADY-PENDING entries newly eligible
         // (reconcile's Phase-2 dedup intentionally does not re-synthesize rows

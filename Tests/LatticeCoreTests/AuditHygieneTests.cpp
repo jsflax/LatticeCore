@@ -243,6 +243,54 @@ TEST(AuditHygiene, EmptyPassAdvancesUploadFloor) {
 }
 
 // ---------------------------------------------------------------------------
+// Widening a filter must re-expose entries the empty-pass advance skipped.
+//
+// The floor is a SCAN BOUND, so advancing it past rows that were excluded
+// only by the filter makes them unreachable — and reconcile's Phase-2 dedup
+// deliberately does not re-synthesize rows whose INSERT entries are still
+// pending. Without the rewind, exposing a project to a group relays nothing
+// (caught by Engram's unexposedGroupGetsNothingRatherThanEverything, which
+// exists precisely because an empty spoke is indistinguishable from a relay
+// that never started).
+// ---------------------------------------------------------------------------
+TEST(AuditHygiene, WideningFilterReExposesSkippedEntries) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"filter_widen"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    lattice::lattice_db reader(lattice::configuration(tmp.str()));
+
+    db->add(TestPerson{"WidenPerson", 33, std::nullopt});
+
+    lattice::sync_config config;
+    config.websocket_url = "ws://localhost:8080/sync";
+    config.sync_id = "widen-chan";
+    config.all_active_sync_ids = {"widen-chan"};
+    config.sync_filter = {{lattice::sync_filter_entry{"TestPerson", "1 = 0"}}};
+
+    lattice::synchronizer sync(std::move(db), config);
+    sync.connect();
+    sync.sync_now();  // empty pass -> floor advances past the row
+
+    ASSERT_GT(lattice::read_upload_floor(reader.db(), "widen-chan"), 0)
+        << "fixture requires the empty-pass advance to have run";
+
+    // Widen: the row now matches. It must become enumerable again.
+    sync.update_sync_filter({lattice::sync_filter_entry{"TestPerson", std::nullopt}});
+    for (int i = 0; i < 100; ++i) {
+        if (!lattice::query_audit_log_for_sync(reader.db(), "widen-chan").empty()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    auto pending = lattice::query_audit_log_for_sync(reader.db(), "widen-chan");
+    EXPECT_FALSE(pending.empty())
+        << "widening the filter left previously-skipped entries below the floor "
+           "— they can never be sent";
+
+    sync.disconnect();
+}
+
+// ---------------------------------------------------------------------------
 // Increment 2b — compaction keys on the contiguous upload_floor, never the
 // holey confirmed_audit_id.
 // ---------------------------------------------------------------------------

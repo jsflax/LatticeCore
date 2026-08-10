@@ -2413,8 +2413,14 @@ void install_sync_trampoline(lattice::swift_lattice* impl,
         case sync_kind::progress:
             impl->set_on_sync_progress(
                 new sync_trampoline_ctx{reg},
+                // sync_id (added with the bridge's labeled progress, 1.3.x)
+                // is deliberately dropped at this boundary: the C ABI's
+                // size-prefixed lattice_sync_progress_t doesn't carry it
+                // yet, and a snapshot struct holding a borrowed const char*
+                // would be a lifetime trap. Extend the C struct (append-only,
+                // struct_size-gated) if a C consumer ever wants the label.
                 [](void* ctx, int64_t pending_upload, int64_t total_upload,
-                   int64_t acked, int64_t received) {
+                   int64_t acked, int64_t received, const char* /*sync_id*/) {
                     lattice_sync_progress_t p;
                     std::memset(&p, 0, sizeof(p));
                     p.struct_size = sizeof(p);

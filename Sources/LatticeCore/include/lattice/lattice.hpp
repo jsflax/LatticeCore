@@ -2280,12 +2280,6 @@ private:
 
     void fire_invalidation_hooks_local(const std::vector<invalidation_table_change>& changes,
                                        invalidation_reason reason) {
-        // C0b row-hydration cache: any settled commit / rollback / advance on
-        // this path may have changed row data under live objects — move the
-        // data generation so the next managed<T> read re-hydrates. Single
-        // atomic bump (hook-frame legal, §2.3); the cache itself is cleared
-        // lazily on the next access, never from this frame.
-        row_cache_epoch_.fetch_add(1, std::memory_order_acq_rel);
         // Copy under the (leaf) mutex, invoke outside it: a hook body may
         // legally call remove_invalidation_hook, and the lock must never be
         // observable as held across a callback.
@@ -2686,121 +2680,6 @@ public:
     /// member is read unsynchronized); never set in production.
     std::function<void()> test_hook_generation_query_gap_;
 
-    // ========================================================================
-    // Row-hydration cache — C0b (crash forensics: Engram SIGBUS 2026-08-10)
-    // ========================================================================
-    //
-    // managed<T>::detach() historically ran one `SELECT <col> … WHERE id = ?`
-    // per PROPERTY READ on a live object — one sqlite3 prepare each. Observer
-    // callbacks reading a handful of properties per changed row during sync
-    // bursts multiplied that into tens of thousands of prepares (the crash's
-    // innermost frames: managed<string>::detach ← dynamic_object::get_field).
-    // The first live property read on a (table, row) now hydrates the FULL
-    // row in ONE statement (same shape as find<T>/hydrate<T>); subsequent
-    // reads within the same data generation are served from the cache with
-    // zero statements.
-    //
-    // Freshness contract (parity with the per-column read, which re-queried
-    // every time): the whole cache is valid for exactly one generation token
-    //   (invalidation epoch, connection total_changes, connection identity).
-    // The epoch bumps inline on the writer's thread for every settled commit
-    // or rollback on ANY alive same-path instance (the §2.3 invalidation
-    // fan-out — which is what makes cross-handle read-your-writes hold) and
-    // on every cross-process change notification (handle_cross_process_
-    // notification, BEFORE its observers dispatch). total_changes covers this
-    // connection's own writes INSIDE an open transaction, where no settle
-    // signal has fired yet. Any token movement invalidates lazily on next
-    // access — hook frames only ever pay the existing atomic bump.
-    //
-    // Rows of attached lattices (schema-qualified table names) bypass the
-    // cache: their writes commit through the attached path's own instances,
-    // whose invalidation fan-out never reaches this instance's epoch.
-
-    /// Cache-backed column read for managed_base::cached_column. On a miss it
-    /// hydrates the full row through `conn` (the same connection the live
-    /// per-column read uses, so in-transaction visibility is identical).
-    /// Returns `bypass` when the cache cannot answer — callers then run the
-    /// historical per-column SELECT, which also reproduces error surfacing
-    /// (unknown columns) exactly.
-    row_cache_lookup lookup_row_cached(database* conn, const std::string& table,
-                                       primary_key_t id, const std::string& column,
-                                       column_value_t& out) {
-        if (conn == nullptr || conn->is_closed()) return row_cache_lookup::bypass;
-        if (table.find('.') != std::string::npos) return row_cache_lookup::bypass;
-        const uint64_t epoch = row_cache_epoch_.load(std::memory_order_acquire);
-        const int64_t changes = conn->total_changes();
-        std::string key = table;
-        key.push_back('\x1f');  // unit separator — never part of a table name
-        key += std::to_string(id);
-        {
-            std::lock_guard<std::mutex> lock(row_cache_mutex_);  // LEAF: never held across SQL
-            if (row_cache_epoch_seen_ == epoch && row_cache_changes_seen_ == changes &&
-                row_cache_conn_seen_ == conn) {
-                auto it = row_cache_.find(key);
-                if (it != row_cache_.end()) {
-                    return row_cache_serve(it->second, column, out);
-                }
-            }
-        }
-        // Miss → hydrate the full row in ONE statement, outside the leaf lock.
-        std::vector<database::row_t> rows;
-        try {
-            rows = conn->query("SELECT * FROM " + table + " WHERE id = ?", {id});
-        } catch (const db_error&) {
-            return row_cache_lookup::bypass;  // live path reruns and surfaces the error
-        }
-        row_cache_row entry;
-        entry.missing = rows.empty();
-        if (!entry.missing) entry.row = std::move(rows[0]);
-        // Publish only if the generation did not move while the statement ran
-        // — never stamp possibly-pre-write data as current. (A skipped
-        // publish costs one extra hydration on the next read; a wrong publish
-        // would serve stale values.)
-        if (row_cache_epoch_.load(std::memory_order_acquire) == epoch &&
-            conn->total_changes() == changes) {
-            std::lock_guard<std::mutex> lock(row_cache_mutex_);
-            if (row_cache_epoch_seen_ != epoch || row_cache_changes_seen_ != changes ||
-                row_cache_conn_seen_ != conn) {
-                row_cache_.clear();  // stale generation's rows are all dead
-                row_cache_epoch_seen_ = epoch;
-                row_cache_changes_seen_ = changes;
-                row_cache_conn_seen_ = conn;
-            }
-            if (row_cache_.size() >= kRowCacheMaxEntries) row_cache_.clear();
-            row_cache_[key] = entry;
-        }
-        return row_cache_serve(entry, column, out);
-    }
-
-private:
-    struct row_cache_row {
-        bool missing = false;      // hydration found no row (deleted/absent id)
-        database::row_t row;
-    };
-
-    static row_cache_lookup row_cache_serve(const row_cache_row& e,
-                                            const std::string& column,
-                                            column_value_t& out) {
-        if (e.missing) return row_cache_lookup::row_missing;
-        auto it = e.row.find(column);
-        if (it == e.row.end()) return row_cache_lookup::absent;
-        out = it->second;
-        return row_cache_lookup::found;
-    }
-
-    /// LEAF lock — bookkeeping only, never held across a SQL statement.
-    std::mutex row_cache_mutex_;
-    std::unordered_map<std::string, row_cache_row> row_cache_;   // key: table \x1f id
-    uint64_t row_cache_epoch_seen_ = 0;      // guarded by row_cache_mutex_
-    int64_t row_cache_changes_seen_ = -1;    // guarded by row_cache_mutex_ (-1 = never built)
-    database* row_cache_conn_seen_ = nullptr;  // guarded by row_cache_mutex_
-    static constexpr size_t kRowCacheMaxEntries = 512;  // bulk-evict bound (blob rows can be large)
-    /// Data generation. Bumped (single atomic — hook-frame legal) by
-    /// fire_invalidation_hooks_local (every settled commit / rollback /
-    /// advance, fanned per path) and by handle_cross_process_notification.
-    std::atomic<uint64_t> row_cache_epoch_{0};
-
-public:
     // ========================================================================
     // Per-store write gate — Live Results item A, spec §4.1 mechanism 2
     // ========================================================================
@@ -8181,15 +8060,6 @@ inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler h
                 }
             }
         });
-}
-
-// C0b row-hydration cache plumbing — declared in managed.hpp, defined here
-// where lattice_db is complete. All bound managed<T> lazy reads funnel
-// through this before falling back to their historical per-column SELECT.
-inline row_cache_lookup managed_base::cached_column(const std::string& col,
-                                                    column_value_t& out) const {
-    if (lattice == nullptr) return row_cache_lookup::bypass;
-    return lattice->lookup_row_cached(db, table_name, row_id, col, out);
 }
 
 // Implementation of managed<std::vector<uint8_t>> methods that need lattice_db

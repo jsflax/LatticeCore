@@ -22,10 +22,6 @@ uint64_t database::thread_statement_count() {
     return t_statement_count;
 }
 
-int64_t database::total_changes() const {
-    return db_ ? sqlite3_total_changes64(db_) : 0;
-}
-
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {

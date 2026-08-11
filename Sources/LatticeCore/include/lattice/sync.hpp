@@ -199,6 +199,13 @@ struct sync_config {
     double max_delay_seconds = 60.0;
     size_t chunk_size = 1000;  // Max events per message
 
+    /// Base ACK-progress deadline for the resend watchdog (doubles with
+    /// consecutive failures, capped at 5 min). The default reproduces the
+    /// former hard-coded 10s exactly; tests and benches shrink it so
+    /// deadline-release scenarios run in milliseconds instead of tens of
+    /// seconds.
+    int ack_timeout_base_ms = 10'000;
+
     /// A connection must stay open at least this long before a subsequent
     /// drop resets the reconnect backoff. Guards against flapping endpoints
     /// (open→error every cycle) re-arming ~1s reconnect storms.

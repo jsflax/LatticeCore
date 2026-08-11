@@ -2172,7 +2172,8 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
         // never ACKs) must not be re-hammered with the same window every 10s
         // while each resend pass re-queries the audit log. 10s, 20s, 40s...
         // capped at 5 min; reset to 10s by any ACK (mark_as_synced).
-        constexpr auto kAckTimeoutBase = std::chrono::seconds(10);
+        const auto kAckTimeoutBase =
+            std::chrono::milliseconds(self->config_.ack_timeout_base_ms);
         constexpr auto kAckTimeoutMax = std::chrono::minutes(5);
         const int failures = self->ack_resend_failures_.load(std::memory_order_relaxed);
         const auto timeout = std::min<std::chrono::steady_clock::duration>(

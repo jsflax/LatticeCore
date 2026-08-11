@@ -275,6 +275,10 @@ using CombinedQueryResultVector = std::vector<combined_query_result>;
 using SyncFilterVector = std::vector<sync_filter_entry>;
 using IPCTargetVector = std::vector<configuration::ipc_target>;
 
+/// Ordered bindings for a parameterized predicate: `params[i]` binds the i-th
+/// `?` in the WHERE fragment. Named so Swift can construct one directly.
+using ColumnValueVector = std::vector<column_value_t>;
+
 // ============================================================================
 // column_value_t helper functions for Swift interop
 // These provide clean Swift APIs for working with variant values
@@ -298,6 +302,18 @@ inline column_value_t column_value_from_string(const std::string& v) {
 /// Create column_value_t from blob
 inline column_value_t column_value_from_blob(const std::vector<uint8_t>& v) {
     return v;
+}
+
+/// Create a NULL column_value_t (the nullptr_t alternative). Swift cannot
+/// spell `column_value_t(nullptr)` through interop, so it needs a factory.
+inline column_value_t column_value_null() {
+    return nullptr;
+}
+
+/// Append to a ColumnValueVector. `push_back` on a std::vector of a variant is
+/// not reliably importable into Swift; this free function is.
+inline void push_column_value(ColumnValueVector* vec, const column_value_t& v) {
+    vec->push_back(v);
 }
 
 /// Check if column_value_t is null (nullptr_t)
@@ -714,7 +730,10 @@ public:
         return result;
     }
 
-    /// Get all objects from a table, optionally filtered and sorted
+    /// Get all objects from a table, optionally filtered and sorted.
+    /// `params` binds the `?` placeholders in `where_clause`; it is TRAILING
+    /// and DEFAULTED so every positional caller (notably LatticeJS's 7-argument
+    /// wasm binding) keeps compiling unchanged.
     std::vector<managed<swift_dynamic_object>> objects(
         const std::string& table_name,
         OptionalString where_clause = std::nullopt,
@@ -722,12 +741,13 @@ public:
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt,
-        OptionalString distinct_by = std::nullopt) {
+        OptionalString distinct_by = std::nullopt,
+        const ColumnValueVector& params = {}) {
         // Never throws into Swift (interop cannot catch C++ exceptions) —
         // empty on failure, e.g. transient SQLITE_NOMEM under memory pressure.
         last_bridge_error().clear();
         try {
-        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
+        auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
         return hydrate_swift_rows(rows, table_name);
         } catch (const std::exception& e) {
             last_bridge_error() = e.what();
@@ -741,13 +761,14 @@ public:
         OptionalString where_clause = std::nullopt,
         OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt,
-        OptionalInt64 offset = std::nullopt) {
+        OptionalInt64 offset = std::nullopt,
+        const ColumnValueVector& params = {}) {
         // Never throws into Swift — empty on failure. A row missing '_type'
         // is a malformed union query; skip the row (it used to throw, which
         // terminated the process at the interop boundary).
         last_bridge_error().clear();
         try {
-        auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset);
+        auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset, params);
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
 
@@ -780,9 +801,10 @@ public:
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
                  OptionalString group_by,
-                 OptionalString distinct_by) {
+                 OptionalString distinct_by,
+                 const ColumnValueVector& params = {}) {
         last_bridge_error().clear();
-        try { return lattice_db::count(table_name, where_clause, group_by, distinct_by); }
+        try { return lattice_db::count(table_name, where_clause, group_by, distinct_by, params); }
         catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
@@ -805,8 +827,9 @@ public:
         return lattice_db::count(table_name, std::nullopt, std::nullopt);
     }
 
-    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause) {
-        return lattice_db::delete_where(table_name, where_clause);
+    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause,
+                      const ColumnValueVector& params = {}) {
+        return lattice_db::delete_where(table_name, where_clause, params);
     }
 
     bool delete_where(const std::string& table_name) {
@@ -1527,13 +1550,15 @@ public:
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt,
-        OptionalString distinct_by = std::nullopt) {
+        OptionalString distinct_by = std::nullopt,
+        const ColumnValueVector& params = {}) {
         generation_read_stale_tl() = false;
         try {
             auto rows = query_at_generation(
                 generation_id,
                 build_query_rows_sql(table_name, where_clause, order_by, limit,
-                                     offset, group_by, distinct_by));
+                                     offset, group_by, distinct_by),
+                params);
             if (!rows) {
                 generation_read_stale_tl() = true;
                 return {};
@@ -1553,12 +1578,14 @@ public:
                      const std::string& table_name,
                      OptionalString where_clause = std::nullopt,
                      OptionalString group_by = std::nullopt,
-                     OptionalString distinct_by = std::nullopt) {
+                     OptionalString distinct_by = std::nullopt,
+                     const ColumnValueVector& params = {}) {
         generation_read_stale_tl() = false;
         try {
             auto rows = query_at_generation(
                 generation_id,
-                build_count_sql(table_name, where_clause, group_by, distinct_by));
+                build_count_sql(table_name, where_clause, group_by, distinct_by),
+                params);
             if (!rows) {
                 generation_read_stale_tl() = true;
                 return -1;
@@ -1622,7 +1649,8 @@ public:
     /// ~250 ms budget to EMPTY + stale flag. Never throws into Swift.
     std::vector<int64_t> query_ids_at(const std::string& table_name,
                                       OptionalString where_clause = std::nullopt,
-                                      OptionalString order_by = std::nullopt) {
+                                      OptionalString order_by = std::nullopt,
+                                      const ColumnValueVector& params = {}) {
         generation_read_stale_tl() = false;
         const auto sql = build_query_rows_sql(table_name, where_clause, order_by,
                                               std::nullopt, std::nullopt,
@@ -1635,7 +1663,7 @@ public:
             try {
                 lattice_db::begin_transaction();  // gate + BEGIN (retries in-txn races)
                 in_txn = true;
-                auto rows = db().query(sql);
+                auto rows = db().query(sql, params);
                 lattice_db::commit();
                 in_txn = false;
                 std::vector<int64_t> ids;
@@ -3454,8 +3482,9 @@ public:
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt,
-        OptionalString distinct_by = std::nullopt) const {
-        return impl().objects(table_name, where_clause, order_by, limit, offset, group_by, distinct_by);
+        OptionalString distinct_by = std::nullopt,
+        const ColumnValueVector& params = {}) const {
+        return impl().objects(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
     }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema
@@ -3473,17 +3502,20 @@ public:
         OptionalString where_clause = std::nullopt,
         OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt,
-        OptionalInt64 offset = std::nullopt) const {
-        return impl().union_objects(table_names, where_clause, order_by, limit, offset);
+        OptionalInt64 offset = std::nullopt,
+        const ColumnValueVector& params = {}) const {
+        return impl().union_objects(table_names, where_clause, order_by, limit, offset, params);
     }
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
                  OptionalString group_by,
-                 OptionalString distinct_by) const {
-        return impl().count(table_name, where_clause, group_by, distinct_by);
+                 OptionalString distinct_by,
+                 const ColumnValueVector& params = {}) const {
+        return impl().count(table_name, where_clause, group_by, distinct_by, params);
     }
-    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause) const {
-        return sealed([&] { return impl().delete_where(table_name, where_clause); });
+    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause,
+                      const ColumnValueVector& params = {}) const {
+        return sealed([&] { return impl().delete_where(table_name, where_clause, params); });
     }
 
     // Maintenance — Swift-reachable via the MCP vacuum/compact tools; the
@@ -3757,16 +3789,18 @@ public:
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt,
-        OptionalString distinct_by = std::nullopt) const {
+        OptionalString distinct_by = std::nullopt,
+        const ColumnValueVector& params = {}) const {
         return impl().objects_at(generation_id, table_name, where_clause, order_by,
-                                 limit, offset, group_by, distinct_by);
+                                 limit, offset, group_by, distinct_by, params);
     }
     int64_t count_at(uint64_t generation_id,
                      const std::string& table_name,
                      OptionalString where_clause = std::nullopt,
                      OptionalString group_by = std::nullopt,
-                     OptionalString distinct_by = std::nullopt) const {
-        return impl().count_at(generation_id, table_name, where_clause, group_by, distinct_by);
+                     OptionalString distinct_by = std::nullopt,
+                     const ColumnValueVector& params = {}) const {
+        return impl().count_at(generation_id, table_name, where_clause, group_by, distinct_by, params);
     }
     std::vector<managed<swift_dynamic_object>> objects_within_bbox_at(
         uint64_t generation_id,
@@ -3786,8 +3820,9 @@ public:
     }
     std::vector<int64_t> query_ids_at(const std::string& table_name,
                                       OptionalString where_clause = std::nullopt,
-                                      OptionalString order_by = std::nullopt) const {
-        return impl().query_ids_at(table_name, where_clause, order_by);
+                                      OptionalString order_by = std::nullopt,
+                                      const ColumnValueVector& params = {}) const {
+        return impl().query_ids_at(table_name, where_clause, order_by, params);
     }
     int64_t data_version() const { return impl().data_version(); }
     /// Per-thread stale flag for the generation reads above — see

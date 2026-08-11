@@ -3226,8 +3226,9 @@ public:
     size_t count(const std::string& table_name,
                  std::optional<std::string> where_clause = std::nullopt,
                  std::optional<std::string> group_by = std::nullopt,
-                 std::optional<std::string> distinct_by = std::nullopt) {
-        auto rows = read_db().query(build_count_sql(table_name, where_clause, group_by, distinct_by));
+                 std::optional<std::string> distinct_by = std::nullopt,
+                 const std::vector<column_value_t>& params = {}) {
+        auto rows = read_db().query(build_count_sql(table_name, where_clause, group_by, distinct_by), params);
         if (!rows.empty()) {
             auto it = rows[0].find("cnt");
             if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
@@ -3249,7 +3250,14 @@ public:
     }
 
     // Delete rows from a table (with optional WHERE clause)
-    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt) {
+    /// `params` bind the `?` placeholders in `where_clause`. NOTE the
+    /// where clause is re-issued in EVERY cascade statement below (the parent
+    /// SELECT is inlined as a subquery rather than materialized), so each of
+    /// those statements must be handed the same bindings — a parameterized
+    /// predicate whose bindings were passed only to the final DELETE would
+    /// cascade against the wrong row set.
+    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt,
+                      const std::vector<column_value_t>& params = {}) {
         try {
             const bool skip_cascade = is_non_cascading_table(table_name);
 
@@ -3263,7 +3271,7 @@ public:
                 if (where_clause.has_value()) {
                     select_sql += " WHERE " + *where_clause;
                 }
-                auto gid_rows = db_->query(select_sql);
+                auto gid_rows = db_->query(select_sql, params);
 
                 for (const auto& gid_row : gid_rows) {
                     auto gid_it = gid_row.find("globalId");
@@ -3288,7 +3296,7 @@ public:
                             if (db_->table_exists(link_table)) {
                                 db_->execute(
                                     "DELETE FROM " + link_table +
-                                    " WHERE rhs IN (" + parent_sub + ")");
+                                    " WHERE rhs IN (" + parent_sub + ")", params);
                             }
                         }
                     }
@@ -3296,15 +3304,22 @@ public:
                         if (db_->table_exists(link_table)) {
                             db_->execute(
                                 "DELETE FROM " + link_table +
-                                " WHERE rhs IN (" + parent_sub + ")");
+                                " WHERE rhs IN (" + parent_sub + ")", params);
                         }
                     }
                     for (const auto& link_table : virtual_link_tables_) {
                         if (db_->table_exists(link_table)) {
+                            // `rhs_type = ?` precedes the subquery in the
+                            // statement text, so its binding must precede the
+                            // predicate's.
+                            std::vector<column_value_t> virtual_params;
+                            virtual_params.reserve(params.size() + 1);
+                            virtual_params.push_back(table_name);
+                            virtual_params.insert(virtual_params.end(), params.begin(), params.end());
                             db_->execute(
                                 "DELETE FROM " + link_table +
                                 " WHERE rhs_type = ? AND rhs IN (" + parent_sub + ")",
-                                {table_name});
+                                virtual_params);
                         }
                     }
                     auto list_it = list_tables_by_parent_.find(table_name);
@@ -3313,7 +3328,7 @@ public:
                             if (db_->table_exists(list_table)) {
                                 db_->execute(
                                     "DELETE FROM " + list_table +
-                                    " WHERE parent_id IN (" + parent_sub + ")");
+                                    " WHERE parent_id IN (" + parent_sub + ")", params);
                             }
                         }
                     }
@@ -3324,7 +3339,7 @@ public:
             if (where_clause.has_value()) {
                 sql += " WHERE " + *where_clause;
             }
-            db_->execute(sql);
+            db_->execute(sql, params);
 
             if (!skip_cascade) {
                 // Defensive vec0 cleanup: the DELETE trigger should have removed
@@ -3815,6 +3830,9 @@ public:
 
     // Query objects from a table with optional filtering, sorting, and pagination
     // Returns raw row data - caller is responsible for hydrating into managed objects
+    /// `params` bind the `?` placeholders in `where_clause`, positionally.
+    /// Empty (the default) is the all-literal predicate every pre-existing
+    /// caller passes, so their statement text and behavior are unchanged.
     std::vector<std::unordered_map<std::string, column_value_t>> query_rows(
         const std::string& table_name,
         std::optional<std::string> where_clause = std::nullopt,
@@ -3822,9 +3840,10 @@ public:
         std::optional<int64_t> limit = std::nullopt,
         std::optional<int64_t> offset = std::nullopt,
         std::optional<std::string> group_by = std::nullopt,
-        std::optional<std::string> distinct_by = std::nullopt) {
+        std::optional<std::string> distinct_by = std::nullopt,
+        const std::vector<column_value_t>& params = {}) {
         return read_db().query(build_query_rows_sql(
-            table_name, where_clause, order_by, limit, offset, group_by, distinct_by));
+            table_name, where_clause, order_by, limit, offset, group_by, distinct_by), params);
     }
 
     // Query objects from a table with optional filtering, sorting, and pagination
@@ -3834,7 +3853,8 @@ public:
         std::optional<std::string> where_clause = std::nullopt,
         std::optional<std::string> order_by = std::nullopt,
         std::optional<int64_t> limit = std::nullopt,
-        std::optional<int64_t> offset = std::nullopt) {
+        std::optional<int64_t> offset = std::nullopt,
+        const std::vector<column_value_t>& params = {}) {
 
         if (table_names.empty()) {
             return {};
@@ -3920,9 +3940,21 @@ public:
         if (offset) {
             sql << " OFFSET " << *offset;
         }
-        return read_db().query(sql.str());
+        // The predicate is emitted ONCE PER UNIONED TABLE above, so its
+        // bindings repeat once per table, in the same order. Passing `params`
+        // unreplicated would bind only the first arm and leave the rest
+        // unbound (SQLite treats unbound parameters as NULL — every later arm
+        // would silently return no rows).
+        std::vector<column_value_t> repeated;
+        if (!params.empty()) {
+            repeated.reserve(params.size() * table_names.size());
+            for (size_t i = 0; i < table_names.size(); i++) {
+                repeated.insert(repeated.end(), params.begin(), params.end());
+            }
+        }
+        return read_db().query(sql.str(), repeated);
     }
-    
+
     // Transaction support. On shared-cache stores the per-store write gate
     // (results spec §4.1) is held for the duration of the transaction, so
     // generation captures on sibling handles never interleave a

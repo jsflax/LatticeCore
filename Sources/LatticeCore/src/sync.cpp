@@ -2078,6 +2078,54 @@ void synchronizer_base::resolve_audit_ids(const std::vector<int64_t>& audit_ids)
     }
 }
 
+void synchronizer_base::reconcile_open_with_db() {
+    if (!config_.use_upload_floor) return;
+    // Walk only the RESOLVED PREFIX: stop at the first genuinely-open id (the
+    // floor is correctly pinned there). Part A keeps this prefix short in
+    // steady state; after a late-ack burst it is bounded by one send window.
+    bool erased_missing = false;
+    while (true) {
+        int64_t min_open = 0;
+        {
+            std::lock_guard<std::mutex> lock(in_flight_mutex_);
+            if (open_audit_ids_.empty()) break;
+            min_open = *open_audit_ids_.begin();
+        }
+        auto rows = db().db().query(R"(
+            SELECT
+              (SELECT COUNT(*) FROM AuditLog WHERE id = ?1) AS row_present,
+              COALESCE((SELECT isSynchronized FROM AuditLog WHERE id = ?1), 0) AS row_synced,
+              COALESCE((SELECT is_synchronized FROM _lattice_sync_state
+                        WHERE audit_entry_id = ?1 AND sync_id = ?2), 0) AS chan_synced
+        )", {min_open, config_.sync_id});
+        if (rows.empty()) break;
+        const auto get_i64 = [&](const char* key) -> int64_t {
+            auto it = rows[0].find(key);
+            return (it != rows[0].end() && std::holds_alternative<int64_t>(it->second))
+                ? std::get<int64_t>(it->second) : 0;
+        };
+        const bool missing = get_i64("row_present") == 0;
+        const bool resolved = missing || get_i64("row_synced") == 1 || get_i64("chan_synced") == 1;
+        if (!resolved) break;
+        if (missing) erased_missing = true;
+        resolve_audit_ids({min_open});
+    }
+    // Out-of-band wipe guard: force_compact_audit_log resets the AUTOINCREMENT
+    // sequence, so a stale high last_enumerated_id_ could otherwise advance the
+    // floor ABOVE regenerated history — silently skipping it. When the sweep
+    // erased MISSING rows, clamp the floor back to current MAX(AuditLog.id).
+    if (erased_missing) {
+        db().db().execute(R"(
+            UPDATE _lattice_replication_slots
+            SET upload_floor = MIN(upload_floor,
+                                   (SELECT COALESCE(MAX(id), 0) FROM AuditLog))
+            WHERE sync_id = ?
+        )", {config_.sync_id});
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        last_enumerated_id_ = 0;
+    }
+}
+
 void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     if (entries.empty()) return;
 
@@ -2178,30 +2226,34 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
         const int failures = self->ack_resend_failures_.load(std::memory_order_relaxed);
         const auto timeout = std::min<std::chrono::steady_clock::duration>(
             kAckTimeoutBase * (int64_t(1) << std::min(failures, 5)), kAckTimeoutMax);
-        // ACK-PROGRESS deadline, not a fixed send-time deadline: the peer
-        // acks a frame only after synchronously APPLYING it (11-20s+ per
-        // 1000-entry frame observed), so a fixed deadline re-sent every
-        // window before its acks could land — ~16-26x upload amplification
-        // in production. Matching acks extend the deadline; a window being
-        // actively consumed is never re-sent, a silent peer still times out
-        // after `timeout` of NO progress.
-        const auto start = std::chrono::steady_clock::now();
-        auto deadline_from = [&](int64_t last_ack_ns) {
-            auto last = std::chrono::steady_clock::time_point(
-                std::chrono::nanoseconds(last_ack_ns));
-            return std::max(start, last) + timeout;
-        };
-        while (std::chrono::steady_clock::now() <
-               deadline_from(self->last_matching_ack_ns_.load(std::memory_order_relaxed))) {
+        // ACK-PROGRESS deadline, WINDOW-LOCAL: the peer acks a frame only
+        // after synchronously APPLYING it (11-20s+ per 1000-entry frame
+        // observed), so a fixed send-time deadline re-sent every window
+        // before its acks could land — ~16-26x upload amplification in
+        // production. Progress is measured on THIS window's own sent_ids
+        // (their in-flight count decreasing), not on any global ack signal:
+        // a channel-wide timestamp let unrelated acks (progressive per-chunk
+        // acks, other windows) extend the deadline of a window the peer had
+        // actually skipped, leaving its entries in-flight — excluded from
+        // enumeration and pinning the upload floor — for an entire drain.
+        // A window being actively consumed is never re-sent; a window with
+        // no progress for `timeout` is released and re-sent.
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        size_t last_remaining = sent_ids.size();
+        while (std::chrono::steady_clock::now() < deadline) {
             {
                 std::lock_guard<std::mutex> g(guard->m);
                 if (!guard->alive) return;
                 std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
-                bool any = false;
+                size_t remaining = 0;
                 for (const auto& id : sent_ids) {
-                    if (self->in_flight_ids_.count(id)) { any = true; break; }
+                    if (self->in_flight_ids_.count(id)) ++remaining;
                 }
-                if (!any) return;  // everything ACKed
+                if (remaining == 0) return;  // everything ACKed
+                if (remaining < last_remaining) {
+                    last_remaining = remaining;
+                    deadline = std::chrono::steady_clock::now() + timeout;
+                }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -2230,6 +2282,9 @@ void synchronizer_base::upload_pending_changes() {
         LOG_DEBUG("synchronizer", "upload_pending_changes: not connected, skipping");
         return;
     }
+    // DB-truth belt for the floor (runs before the horizon read so a swept
+    // prefix can advance the floor this same pass).
+    reconcile_open_with_db();
     // Horizon BEFORE the scan: if the pass then enumerates nothing, no
     // entry <= horizon is pending for this channel (writes that land after
     // the horizon read are past it and unaffected).
@@ -2320,7 +2375,9 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
     // map still has them: mark_audit_entries_synced_for's transactions have
     // already committed above, so advancing the floor past them is safe.
     std::vector<int64_t> resolved_audit_ids;
+    std::vector<std::string> unmatched;
     size_t matched = 0;
+    bool any_open = false;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         for (const auto& id : global_ids) {
@@ -2329,11 +2386,53 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
                 if (it->second > 0) resolved_audit_ids.push_back(it->second);
                 in_flight_ids_.erase(it);
                 ++matched;
+            } else {
+                unmatched.push_back(id);
             }
         }
+        any_open = !open_audit_ids_.empty();
         progress_pending_upload_.store(
             static_cast<int64_t>(in_flight_ids_.size()), std::memory_order_relaxed);
     }
+
+    // LATE ACKS (Aug 2026 floor-pin incident): an entry released by the ack
+    // deadline — or sent during a previous process tenure — still gets its ack
+    // delivered here. The DB row was marked synchronized above, but without an
+    // in_flight mapping the audit id never left open_audit_ids_: the floor
+    // pinned below DB-synchronized rows for the life of the connection
+    // (production: 245K such rows above a frozen floor), enumeration skips
+    // synchronized rows so nothing ever re-opened them, and every compaction
+    // was vetoed. Resolve late acks by looking their audit ids up directly.
+    // Gated on the open set being non-empty — in steady state it is empty and
+    // this costs nothing; unmatched acks are otherwise common (server re-acks,
+    // other devices' traffic) and must stay cheap.
+    if (config_.use_upload_floor && any_open && !unmatched.empty()) {
+        constexpr size_t kLookupChunk = 500;
+        for (size_t start = 0; start < unmatched.size(); start += kLookupChunk) {
+            const size_t end = std::min(start + kLookupChunk, unmatched.size());
+            std::string placeholders;
+            std::vector<column_value_t> params;
+            params.reserve(end - start);
+            for (size_t i = start; i < end; ++i) {
+                placeholders += (i == start ? "?" : ",?");
+                params.push_back(unmatched[i]);
+            }
+            auto rows = db().db().query(
+                "SELECT id FROM AuditLog WHERE globalId IN (" + placeholders + ")",
+                params);
+            std::lock_guard<std::mutex> lock(in_flight_mutex_);
+            for (const auto& row : rows) {
+                auto it = row.find("id");
+                if (it == row.end() || !std::holds_alternative<int64_t>(it->second)) continue;
+                const int64_t audit_id = std::get<int64_t>(it->second);
+                if (open_audit_ids_.count(audit_id)) {
+                    resolved_audit_ids.push_back(audit_id);
+                    ++matched;  // a late ack IS progress on our window
+                }
+            }
+        }
+    }
+
     if (matched > 0) {
         last_matching_ack_ns_.store(
             std::chrono::duration_cast<std::chrono::nanoseconds>(

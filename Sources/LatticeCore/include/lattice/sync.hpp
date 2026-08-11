@@ -468,6 +468,16 @@ protected:
     /// committed. Takes in_flight_mutex_ internally.
     void resolve_audit_ids(const std::vector<int64_t>& audit_ids);
 
+    /// Sweep the resolved prefix of open_audit_ids_ against DATABASE truth:
+    /// min(open) is erased while the database says it can never be pending —
+    /// synchronized for this channel, globally synchronized (cross-channel
+    /// collapse deletes the per-channel rows), or the AuditLog row no longer
+    /// exists. Self-heals every state where a row was marked/removed without
+    /// the in-memory resolution running (late acks, prior-tenure acks,
+    /// out-of-band history wipes) — each of which otherwise pins the upload
+    /// floor for the life of the connection and vetoes all compaction.
+    void reconcile_open_with_db();
+
     on_sync_complete_handler on_sync_complete_;
     on_error_handler on_error_;
     on_state_change_handler on_state_change_;

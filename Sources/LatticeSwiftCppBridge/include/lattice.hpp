@@ -2701,9 +2701,13 @@ public:
                 // Apply remote changes — returns only successfully applied IDs
                 result = ::lattice::apply_remote_changes(*this, event->audit_logs);
             } else if (event->event_type == server_sent_event::type::ack) {
-                // Mark entries as synchronized (includes observer notification)
+                // Mark entries as synchronized (includes observer notification).
+                // Return NOTHING: the caller acks whatever we return, and
+                // echoing acked_ids here made every relay re-ack each client
+                // download-ack — an infinite ping-pong of empty bookkeeping
+                // (B3.8). An ack frame applies no entries, so there is
+                // nothing to acknowledge.
                 ::lattice::mark_audit_entries_synced(*this, event->acked_ids);
-                result = event->acked_ids;
             }
 
             return result;

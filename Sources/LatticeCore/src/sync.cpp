@@ -2830,6 +2830,12 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
     }
 
     try {
+        // Chunked commits (only when we own the transaction): a 1000-id ack
+        // used to run 2000+ statements in ONE transaction — on the relay that
+        // transaction executes on the socket's event loop and starves every
+        // other connection sharing it (B3.7).
+        constexpr size_t kAckChunk = 100;
+        size_t since_commit = 0;
         for (const auto& gid : global_ids) {
             // Check current state — skip if already synced (avoids spurious
             // observer notifications when ACKs are forwarded by the server)
@@ -2852,6 +2858,11 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
             auto it = rows[0].find("id");
             if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
                 notify_list.emplace_back(std::get<int64_t>(it->second), gid);
+            }
+            if (own_transaction && ++since_commit >= kAckChunk) {
+                db.db().commit();
+                db.db().begin_transaction();
+                since_commit = 0;
             }
         }
 
@@ -3280,6 +3291,12 @@ static std::vector<std::string> apply_remote_changes_impl(
     std::optional<std::string> cursor_candidate;
     bool cursor_halted = false;
 
+    // B3.4 per-delivery memos: table ensures and schema lookups are per-TABLE
+    // facts hoisted out of the per-entry loop.
+    std::unordered_set<std::string> tables_ensured;
+    std::unordered_set<std::string> vec0_ensured;
+    std::unordered_map<std::string, std::unordered_map<std::string, column_type>> schema_cache;
+
     for (size_t chunk_start = 0; chunk_start < entries.size(); chunk_start += chunk_size) {
         size_t chunk_end = std::min(chunk_start + chunk_size, entries.size());
         const size_t applied_before_chunk = applied_ids.size();
@@ -3327,20 +3344,27 @@ static std::vector<std::string> apply_remote_changes_impl(
                         continue;
                     }
 
-                    // If it's a link table (starts with _), ensure it exists
+                    // If it's a link table (starts with _), ensure it exists —
+                    // once per (table, kind) per delivery (B3.4: these are
+                    // per-TABLE facts; running them per ENTRY cost ~3,000
+                    // statements per 1000-entry frame, including two
+                    // sqlite_master scans and a PRAGMA table_info each).
                     if (!entry.table_name.empty() && entry.table_name[0] == '_') {
                         bool is_virtual = std::find(entry.changed_fields_names.begin(),
                                                     entry.changed_fields_names.end(),
                                                     "rhs_type") != entry.changed_fields_names.end();
-                        if (is_virtual) {
-                            db.ensure_virtual_link_table(entry.table_name);
-                        } else {
-                            db.ensure_link_table(entry.table_name);
+                        if (tables_ensured.insert(entry.table_name + (is_virtual ? "|v" : "|l")).second) {
+                            if (is_virtual) {
+                                db.ensure_virtual_link_table(entry.table_name);
+                            } else {
+                                db.ensure_link_table(entry.table_name);
+                            }
                         }
                     }
 
                     // Ensure vec0 tables exist for vector columns BEFORE the INSERT,
-                    // so triggers can populate the shadow tables.
+                    // so triggers can populate the shadow tables — once per
+                    // (table, prop) per delivery.
                     if (!entry.table_name.empty() && entry.table_name[0] != '_') {
                         auto* model_schema = schema_registry::instance().get_schema(entry.table_name);
                         if (model_schema) {
@@ -3353,7 +3377,8 @@ static std::vector<std::string> apply_remote_changes_impl(
                                         auto& vec_data = std::get<std::vector<uint8_t>>(it->second.value);
                                         if (!vec_data.empty()) {
                                             int dims = static_cast<int>(vec_data.size() / sizeof(float));
-                                            if (dims > 0) {
+                                            if (dims > 0 &&
+                                                vec0_ensured.insert(entry.table_name + "|" + prop.name).second) {
                                                 db.ensure_vec0_table(entry.table_name, prop.name, dims);
                                             }
                                         }
@@ -3364,17 +3389,26 @@ static std::vector<std::string> apply_remote_changes_impl(
                     }
 
                     // Generate and execute the SQL instruction
-                    LOG_INFO("apply_remote", "entry[%zu]: table=%s op=%s globalRowId=%s changedFields=%zu changedFieldsNames=%zu",
+                    LOG_DEBUG("apply_remote", "entry[%zu]: table=%s op=%s globalRowId=%s changedFields=%zu changedFieldsNames=%zu",
                              i, entry.table_name.c_str(), entry.operation.c_str(),
                              entry.global_row_id.c_str(),
                              entry.changed_fields.size(), entry.changed_fields_names.size());
                     for (const auto& [key, val] : entry.changed_fields) {
-                        LOG_INFO("apply_remote", "  field: %s kind=%d", key.c_str(), static_cast<int>(val.kind));
+                        LOG_DEBUG("apply_remote", "  field: %s kind=%d", key.c_str(), static_cast<int>(val.kind));
                     }
                     for (const auto& name : entry.changed_fields_names) {
-                        LOG_INFO("apply_remote", "  fieldName: %s", name.c_str());
+                        LOG_DEBUG("apply_remote", "  fieldName: %s", name.c_str());
                     }
-                    auto schema = db.get_table_schema(entry.table_name);
+                    // Schema memo (B3.4): PRAGMA table_info once per table per
+                    // delivery, not per entry. Safe because the ensure_* calls
+                    // above run before the first fetch for a table, and tables
+                    // only ever gain existence within a delivery.
+                    auto schema_it = schema_cache.find(entry.table_name);
+                    if (schema_it == schema_cache.end()) {
+                        schema_it = schema_cache.emplace(
+                            entry.table_name, db.get_table_schema(entry.table_name)).first;
+                    }
+                    const auto& schema = schema_it->second;
                     bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
 
                     // A3 — schema-skew tolerance. A NEWER peer's entries may
@@ -3428,7 +3462,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                     }
 
                     auto [sql, params] = apply_entry->generate_instruction(schema);
-                    LOG_INFO("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
+                    LOG_DEBUG("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
 
                     // Resolve the local rowId and operation for this object.
                     // flush_changes correlates model changes with AuditLog entries by

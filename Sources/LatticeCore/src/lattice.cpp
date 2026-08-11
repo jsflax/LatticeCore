@@ -346,6 +346,19 @@ void lattice_db::handle_cross_process_notification() {
 
         LOG_DEBUG("xproc", "Found %zu new AuditLog entries from other process", rows.size());
 
+        // C0b row-hydration cache: these entries survived the cursor filter,
+        // so another PROCESS committed them — no in-process WAL hook fired,
+        // and the synchronous invalidation fan-out never saw the change.
+        // Advance the data generation BEFORE the observer dispatch below so
+        // observer callbacks' property reads re-hydrate fresh rows instead of
+        // serving the pre-notification cache. Deliberately NOT at function
+        // entry: every local commit's own notification echoes back here
+        // asynchronously (filtered above by the cursor), and bumping on the
+        // echo would invalidate the cache milliseconds after every local
+        // write — re-introducing per-burst statements the cache exists to
+        // remove.
+        row_cache_epoch_.fetch_add(1, std::memory_order_acq_rel);
+
         // Only notify THIS instance's observers. Each instance sharing the
         // same database path has its own cross-process notifier, so each
         // independently receives the event and processes it. Notifying all

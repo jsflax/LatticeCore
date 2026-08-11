@@ -1131,16 +1131,19 @@ TEST(Bridge, RowCacheMaterializedReads) {
     EXPECT_EQ(lattice::database::thread_statement_count() - base, 0u)
         << "materialized reads issued SQL";
 
-    // The live path (default) pays one statement per read — the recall
-    // N-statements pathology this exists to kill. Documents the contrast.
+    // The live path (default) historically paid one statement per read — the
+    // recall N-statements pathology. Since C0b it pays ONE full-row hydration
+    // for the first read and serves the rest from lattice_db's
+    // generation-keyed row cache (still FRESH: it re-hydrates when the data
+    // generation moves, unlike the explicit snapshot above).
     lattice::dynamic_object live(results[0]);
     const auto live_base = lattice::database::thread_statement_count();
     for (int i = 0; i < 5; ++i) {
         (void)live.get_string("name");
         (void)live.get_int("age");
     }
-    EXPECT_GE(lattice::database::thread_statement_count() - live_base, 10u)
-        << "expected the live path to issue one statement per read";
+    EXPECT_EQ(lattice::database::thread_statement_count() - live_base, 1u)
+        << "expected one hydration statement for the whole live-read burst";
 
     // Write-through: DB row updates AND the cached read sees the new value.
     cached.set_int("age", 31);

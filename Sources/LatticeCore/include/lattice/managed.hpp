@@ -86,6 +86,20 @@ class model_base;
 template<typename T, typename = void>
 struct managed;
 
+/// Outcome of a row-hydration-cache column lookup (C0b). The cache lives on
+/// lattice_db (see lattice_db::lookup_row_cached in lattice.hpp): the FIRST
+/// live property read on a (table, row) hydrates the full row in ONE
+/// statement; later reads in the same data generation are served with zero
+/// statements. detach() consults it first and falls back to the historical
+/// per-column SELECT on `bypass`/`absent` so error surfacing (unknown
+/// columns) and unbound behavior are bit-for-bit unchanged.
+enum class row_cache_lookup : uint8_t {
+    bypass,       ///< cache unavailable (no lattice, attached-schema table, closed conn, hydration error) — run the live per-column read
+    row_missing,  ///< hydration ran; the row does not exist (same as an empty live result)
+    absent,       ///< row hydrated but has no such column — the live path decides (and surfaces unknown-column errors identically)
+    found,        ///< value produced; may hold nullptr_t (SQL NULL)
+};
+
 // ============================================================================
 // managed_base - Base for property wrappers (holds DB binding info)
 // ============================================================================
@@ -111,6 +125,11 @@ struct managed_base {
 
     // Called by LATTICE_BIND_PROP macro - implementation below after model_base
     void bind_to_parent(model_base* parent, const char* prop_name);
+
+    /// C0b row-hydration cache: serve this property's CURRENT value from the
+    /// lattice's one-statement-per-(row, generation) full-row hydration.
+    /// Defined in lattice.hpp (needs the complete lattice_db).
+    row_cache_lookup cached_column(const std::string& col, column_value_t& out) const;
 };
 
 // ============================================================================
@@ -308,6 +327,18 @@ struct CONFORMS_TO_MANAGED managed<int64_t> : managed_base {
 
     [[nodiscard]] int64_t detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<int64_t>(cv)) {
+                    return std::get<int64_t>(cv);
+                }
+                return unmanaged_value;  // NULL or stored-type mismatch — as before
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -347,6 +378,18 @@ struct CONFORMS_TO_MANAGED managed<int> : managed_base {
 
     [[nodiscard]] int detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<int64_t>(cv)) {
+                    return static_cast<int>(std::get<int64_t>(cv));
+                }
+                return unmanaged_value;
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -384,6 +427,18 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
 
     [[nodiscard]] double detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<double>(cv)) {
+                    return std::get<double>(cv);
+                }
+                return unmanaged_value;
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -421,6 +476,18 @@ struct CONFORMS_TO_MANAGED managed<float> : managed_base {
 
     [[nodiscard]] float detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<double>(cv)) {
+                    return static_cast<float>(std::get<double>(cv));
+                }
+                return unmanaged_value;
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -458,6 +525,18 @@ struct CONFORMS_TO_MANAGED managed<bool> : managed_base {
 
     [[nodiscard]] bool detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<int64_t>(cv)) {
+                    return std::get<int64_t>(cv) != 0;
+                }
+                return unmanaged_value;
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -515,6 +594,18 @@ struct CONFORMS_TO_MANAGED managed<std::string> : managed_base {
     
     [[nodiscard]] std::string detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<std::string>(cv)) {
+                    return std::get<std::string>(cv);
+                }
+                return unmanaged_value;
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -550,6 +641,18 @@ struct CONFORMS_TO_MANAGED managed<timestamp_t> : managed_base {
 
     [[nodiscard]] timestamp_t detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<double>(cv)) {
+                    return detail::from_column_value<timestamp_t>(cv);
+                }
+                return unmanaged_value;
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -589,6 +692,18 @@ struct CONFORMS_TO_MANAGED managed<uuid_t> : managed_base {
 
     [[nodiscard]] uuid_t detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (!std::holds_alternative<std::nullptr_t>(cv)) {
+                    return detail::from_column_value<uuid_t>(cv);
+                }
+                return unmanaged_value;
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -669,6 +784,21 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
 
     [[nodiscard]] geo_bounds detach() const {
         if (is_bound()) {
+            // Row-hydration cache first: the 4 component columns live on the
+            // parent row, so one hydration serves all of them.
+            column_value_t v0, v1, v2, v3;
+            auto r0 = cached_column(col_min_lat(), v0);
+            if (r0 == row_cache_lookup::row_missing) return unmanaged_value;
+            if (r0 == row_cache_lookup::found &&
+                cached_column(col_max_lat(), v1) == row_cache_lookup::found &&
+                cached_column(col_min_lon(), v2) == row_cache_lookup::found &&
+                cached_column(col_max_lon(), v3) == row_cache_lookup::found) {
+                auto as_double = [](const column_value_t& v) -> double {
+                    if (std::holds_alternative<double>(v)) return std::get<double>(v);
+                    return 0.0;
+                };
+                return geo_bounds(as_double(v0), as_double(v1), as_double(v2), as_double(v3));
+            }
             auto rows = db->query(
                 "SELECT " + col_min_lat() + ", " + col_max_lat() + ", " +
                 col_min_lon() + ", " + col_max_lon() +
@@ -796,6 +926,25 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
 
     [[nodiscard]] std::optional<geo_bounds> detach() const {
         if (is_bound()) {
+            // Row-hydration cache first (same NULL convention as the live
+            // path: NULL min-lat column means the whole bounds is nullopt).
+            column_value_t v0, v1, v2, v3;
+            auto r0 = cached_column(col_min_lat(), v0);
+            if (r0 == row_cache_lookup::row_missing) return unmanaged_value;
+            if (r0 == row_cache_lookup::found) {
+                if (std::holds_alternative<std::nullptr_t>(v0)) {
+                    return std::nullopt;
+                }
+                if (cached_column(col_max_lat(), v1) == row_cache_lookup::found &&
+                    cached_column(col_min_lon(), v2) == row_cache_lookup::found &&
+                    cached_column(col_max_lon(), v3) == row_cache_lookup::found) {
+                    auto as_double = [](const column_value_t& v) -> double {
+                        if (std::holds_alternative<double>(v)) return std::get<double>(v);
+                        return 0.0;
+                    };
+                    return geo_bounds(as_double(v0), as_double(v1), as_double(v2), as_double(v3));
+                }
+            }
             auto rows = db->query(
                 "SELECT " + col_min_lat() + ", " + col_max_lat() + ", " +
                 col_min_lon() + ", " + col_max_lon() +
@@ -1292,6 +1441,24 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
     
     [[nodiscard]] std::optional<T> detach() const {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return unmanaged_value;
+            case row_cache_lookup::found:
+                if (std::holds_alternative<std::nullptr_t>(cv)) {
+                    return std::nullopt;
+                }
+                if constexpr (is_vector<T>::value) {
+                    managed<T> m;
+                    m.assign(this->db, lattice, table_name, column_name, row_id);
+                    return m;
+                } else {
+                    return detail::from_column_value<T>(cv);
+                }
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query(
                 "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                 {row_id});
@@ -1318,6 +1485,15 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
 
     bool has_value() const SWIFT_NAME(hasValue()) {
         if (is_bound()) {
+            column_value_t cv;
+            switch (cached_column(column_name, cv)) {
+            case row_cache_lookup::row_missing:
+                return false;  // same as the live path's empty result
+            case row_cache_lookup::found:
+                return !std::holds_alternative<std::nullptr_t>(cv);
+            default:
+                break;  // bypass/absent → live per-column read
+            }
             auto rows = db->query("SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
                                   {row_id});
             if (!rows.empty()) {
@@ -1330,7 +1506,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
                 }
             }
         }
-        
+
         return false;
     }
     
@@ -1389,6 +1565,29 @@ struct CONFORMS_TO_MANAGED managed<std::vector<T>, std::enable_if_t<is_primitive
     std::vector<T> detach() const {
         if (!is_bound()) return unmanaged_value;
 
+        auto decode = [this](const column_value_t& v) -> std::vector<T> {
+            if (auto* json_str = std::get_if<std::string>(&v)) {
+                if (json_str->empty()) return {};
+                try {
+                    auto j = nlohmann::json::parse(*json_str);
+                    return j.template get<std::vector<T>>();
+                } catch (...) {
+                    return unmanaged_value;
+                }
+            }
+            return unmanaged_value;
+        };
+
+        column_value_t cv;
+        switch (cached_column(column_name, cv)) {
+        case row_cache_lookup::row_missing:
+            return unmanaged_value;
+        case row_cache_lookup::found:
+            return decode(cv);
+        default:
+            break;  // bypass/absent → live per-column read
+        }
+
         std::string sql = "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?";
         auto rows = db->query(sql, {row_id});
         if (rows.empty()) return unmanaged_value;
@@ -1396,16 +1595,7 @@ struct CONFORMS_TO_MANAGED managed<std::vector<T>, std::enable_if_t<is_primitive
         auto it = rows[0].find(column_name);
         if (it == rows[0].end()) return unmanaged_value;
 
-        if (auto* json_str = std::get_if<std::string>(&it->second)) {
-            if (json_str->empty()) return {};
-            try {
-                auto j = nlohmann::json::parse(*json_str);
-                return j.template get<std::vector<T>>();
-            } catch (...) {
-                return unmanaged_value;
-            }
-        }
-        return unmanaged_value;
+        return decode(it->second);
     }
 
     // Write to database (JSON encode)
@@ -1462,6 +1652,19 @@ struct CONFORMS_TO_MANAGED managed<std::vector<uint8_t>> : managed_base {
     // Read from database (BLOB)
     std::vector<uint8_t> detach() const {
         if (!is_bound()) return unmanaged_value;
+
+        column_value_t cv;
+        switch (cached_column(column_name, cv)) {
+        case row_cache_lookup::row_missing:
+            return unmanaged_value;
+        case row_cache_lookup::found:
+            if (auto* cached_blob = std::get_if<std::vector<uint8_t>>(&cv)) {
+                return *cached_blob;
+            }
+            return unmanaged_value;
+        default:
+            break;  // bypass/absent → live per-column read
+        }
 
         std::string sql = "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?";
         auto rows = db->query(sql, {row_id});

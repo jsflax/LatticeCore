@@ -107,6 +107,13 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     // per call, each scanning a WAL bloated by the sync daemon — 228s
     // observed). Materialized mode serves gets from the hydrated snapshot.
     //
+    // Since C0b the LIVE path is no longer one-statement-per-read either:
+    // managed<T>::detach() serves from lattice_db's generation-keyed
+    // row-hydration cache (one SELECT * per (row, data generation); see
+    // lattice_db::lookup_row_cached). The materialized mode here remains the
+    // explicit-SNAPSHOT API — pinned values until refreshRowCache() — whereas
+    // the live path stays fresh, re-hydrating whenever the generation moves.
+    //
     // Contract:
     // - Opt-in; default read path is bit-for-bit untouched.
     // - A materialized object is a read SNAPSHOT as of hydration/refresh;

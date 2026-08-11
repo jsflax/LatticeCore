@@ -22,6 +22,10 @@ uint64_t database::thread_statement_count() {
     return t_statement_count;
 }
 
+int64_t database::total_changes() const {
+    return db_ ? sqlite3_total_changes64(db_) : 0;
+}
+
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
@@ -108,6 +112,17 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
         // to do this as a side effect.)
         sqlite3_exec(db_, "SELECT count(*) FROM sqlite_master", nullptr, nullptr, nullptr);
     }
+
+    // Apple's libsqlite3 compiles SQLITE_ENABLE_STMT_SCANSTATUS and ships the
+    // runtime toggle ON, which makes every WhereBegin opcode run the
+    // sqlite3WhereAddExplainText/sqlite3_str_appendf explain-text pass — the
+    // exact top frames of the Aug 2026 Engram SIGBUS — and measurably fattens
+    // every prepare. We never read scanstatus, so turn it off per connection.
+    // Stock amalgamations without the feature don't define the constant (and
+    // the call would be a no-op there anyway).
+#ifdef SQLITE_DBCONFIG_STMT_SCANSTATUS
+    sqlite3_db_config(db_, SQLITE_DBCONFIG_STMT_SCANSTATUS, 0, nullptr);
+#endif
 
     // Initialize sqlite-vec extension for vector search
     int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);

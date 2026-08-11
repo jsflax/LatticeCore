@@ -137,6 +137,13 @@ public:
     /// read paths, immune to parallel test suites in the same process.
     static uint64_t thread_statement_count();
 
+    /// Rows changed by ALL INSERT/UPDATE/DELETEs on this connection since it
+    /// opened (sqlite3_total_changes64). Moves immediately — inside open
+    /// transactions too — with zero SQL. Freshness token for the lattice
+    /// row-hydration cache: it covers this connection's own writes in the
+    /// window before any commit/rollback signal has fired.
+    int64_t total_changes() const;
+
     /// Mark this connection dirty: buffered row changes await delivery once
     /// the enclosing transaction settles. Relaxed store — callable from inside
     /// sqlite3_update_hook (C frame: no locks, nothing that can throw).

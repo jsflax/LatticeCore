@@ -3427,21 +3427,65 @@ public:
         // sync-state rows orphaned); a transaction makes crash = clean
         // rollback, including the _SyncControl flag flip.
         const int64_t prev_disabled = read_sync_disabled_flag();
+
+        // The newest isFromRemote row is the LEGACY download-resume cursor.
+        // Since the cursor moved into _lattice_replication_slots
+        // (last_received_event_id, written per applied chunk and eagerly
+        // seeded), the row only needs preserving while some slot still has a
+        // NULL cursor — i.e. a channel that has neither seeded nor received
+        // since the upgrade. Once every slot carries a cursor, compaction may
+        // reclaim the row.
+        bool preserve_cursor_row = true;
+        {
+            bool has_cursor_col = false;
+            for (const auto& row : db_->query(
+                     "PRAGMA table_info(_lattice_replication_slots)", {})) {
+                auto it = row.find("name");
+                if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+                    std::get<std::string>(it->second) == "last_received_event_id") {
+                    has_cursor_col = true;
+                    break;
+                }
+            }
+            if (has_cursor_col) {
+                auto nulls = db_->query(
+                    "SELECT COUNT(*) AS c FROM _lattice_replication_slots "
+                    "WHERE last_received_event_id IS NULL");
+                if (!nulls.empty() &&
+                    std::holds_alternative<int64_t>(nulls[0].at("c")) &&
+                    std::get<int64_t>(nulls[0].at("c")) == 0) {
+                    preserve_cursor_row = false;
+                }
+            }
+        }
+
         int64_t deleted = 0;
+        // Receipts may not exist yet on a database that has never applied
+        // remote entries — the prune below must not abort the transaction.
+        db_->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
+                     "  globalId TEXT PRIMARY KEY)", {});
         db_->begin_transaction();
         try {
             db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-            // Preserve the newest isFromRemote row: it IS the WSS download
-            // resume cursor (get_last_received_event_id reads it to build
-            // ?last-event-id on connect). Deleting it resets the cursor and
-            // the next connect re-downloads the peer's entire history.
-            db_->execute(
-                "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
-                "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
-                "  ORDER BY id DESC LIMIT 1)",
-                {safe_id});
+            if (preserve_cursor_row) {
+                db_->execute(
+                    "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
+                    "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
+                    "  ORDER BY id DESC LIMIT 1)",
+                    {safe_id});
+            } else {
+                db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
+            }
             deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
             db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
+            // Bound the no-op receipts table (insertion-ordered rowid horizon;
+            // a receipt only matters while some sender could still re-deliver
+            // its entry, which the resend machinery bounds to far less).
+            db_->execute(R"(
+                DELETE FROM _lattice_applied_receipts WHERE rowid <=
+                    (SELECT COALESCE(MAX(rowid), 0) FROM _lattice_applied_receipts)
+                    - 500000
+            )", {});
             db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
             db_->commit();
         } catch (...) {

@@ -382,3 +382,127 @@ TEST(AuditHygiene, SafeCompactPreservesDownloadCursorRow) {
     ASSERT_FALSE(rest.empty());
     EXPECT_EQ(std::get<int64_t>(rest[0].at("c")), 0);
 }
+
+// ===========================================================================
+// B2 pinning — no-op suppression scope, receipts, cursor, catch-up fallback.
+// ===========================================================================
+
+// Absent-row UPDATE keeps minting in per-sync mode: absence can be a
+// filter-removal value-hole with the row live downstream (hub) — today's
+// phantom relay row is what carries the edit onward. Suppressing it would
+// permanently diverge hub vs server (red-team blocker #1 against naive B2).
+TEST(AuditHygiene, AbsentRowUpdateStillMintsRelayRow) {
+    TempDB tmp{"b2_valuehole"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+
+    lattice::audit_log_entry up;
+    up.global_id = "vh-audit-1";
+    up.table_name = "TestPerson";
+    up.operation = "UPDATE";
+    up.global_row_id = "vh-person-absent";
+    up.changed_fields = {{"name", lattice::any_property(std::string("Ghost"))}};
+    up.changed_fields_names = {"name"};
+    up.timestamp = "2026-08-10T12:00:00Z";
+
+    auto acked = lattice::apply_remote_changes_for(db, {up}, "chan-a");
+    ASSERT_EQ(acked.size(), 1u) << "absent-row UPDATE must still be acked";
+
+    auto minted = db.db().query(
+        "SELECT COUNT(*) AS c FROM AuditLog WHERE globalId = 'vh-audit-1'", {});
+    EXPECT_EQ(std::get<int64_t>(minted[0].at("c")), 1)
+        << "absent-row UPDATE must mint the phantom relay row (value-hole)";
+}
+
+// A suppressed entry re-delivered AFTER an intervening local edit must be
+// dedup'd via its RECEIPT — not re-applied over the newer local value
+// (red-team: suppression deletes the AuditLog row the dedup keyed on).
+TEST(AuditHygiene, SuppressedEntryRedeliveryDoesNotRevertLocalEdit) {
+    TempDB tmp{"b2_receipt"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+
+    db.add(TestPerson{"ReceiptP", 40, std::nullopt});
+    auto row = db.db().query("SELECT globalId FROM TestPerson LIMIT 1", {});
+    const auto row_gid = std::get<std::string>(row[0].at("globalId"));
+
+    // Remote UPDATE carrying the CURRENT value — a genuine no-op: suppressed.
+    lattice::audit_log_entry noop;
+    noop.global_id = "rcpt-audit-1";
+    noop.table_name = "TestPerson";
+    noop.operation = "UPDATE";
+    noop.global_row_id = row_gid;
+    noop.changed_fields = {{"name", lattice::any_property(std::string("ReceiptP"))}};
+    noop.changed_fields_names = {"name"};
+    noop.timestamp = "2026-08-10T12:00:00Z";
+
+    auto acked1 = lattice::apply_remote_changes_for(db, {noop}, "chan-a");
+    ASSERT_EQ(acked1.size(), 1u);
+    auto minted = db.db().query(
+        "SELECT COUNT(*) AS c FROM AuditLog WHERE globalId = 'rcpt-audit-1'", {});
+    ASSERT_EQ(std::get<int64_t>(minted[0].at("c")), 0) << "no-op must be suppressed";
+
+    // Intervening LOCAL edit.
+    db.db().execute("UPDATE TestPerson SET name = 'EditedLocally' WHERE globalId = ?",
+                    {row_gid});
+
+    // The SAME entry re-delivered (at-least-once transport) must hit the
+    // receipt and be acked WITHOUT re-applying the stale value.
+    auto acked2 = lattice::apply_remote_changes_for(db, {noop}, "chan-a");
+    ASSERT_EQ(acked2.size(), 1u) << "re-delivery must still be acked";
+    auto name = db.db().query(
+        "SELECT name FROM TestPerson WHERE globalId = ?", {row_gid});
+    EXPECT_EQ(std::get<std::string>(name[0].at("name")), "EditedLocally")
+        << "receipt-less re-delivery re-applied a stale value over a local edit";
+}
+
+// A fully-suppressed (zero-mint) delivery must still advance the download
+// cursor, or reconnect re-downloads the whole no-op tail forever.
+TEST(AuditHygiene, NoopOnlyChunkAdvancesDownloadCursor) {
+    TempDB tmp{"b2_cursor"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    lattice::ensure_cursor_column(db.db());
+    lattice::register_replication_slot(db.db(), "chan-a");
+
+    db.add(TestPerson{"CursorP", 41, std::nullopt});
+    auto row = db.db().query("SELECT globalId FROM TestPerson LIMIT 1", {});
+    const auto row_gid = std::get<std::string>(row[0].at("globalId"));
+
+    lattice::audit_log_entry noop;
+    noop.global_id = "cur-audit-1";
+    noop.table_name = "TestPerson";
+    noop.operation = "UPDATE";
+    noop.global_row_id = row_gid;
+    noop.changed_fields = {{"name", lattice::any_property(std::string("CursorP"))}};
+    noop.changed_fields_names = {"name"};
+    noop.timestamp = "2026-08-10T12:00:00Z";
+
+    auto acked = lattice::apply_remote_changes_for(db, {noop}, "chan-a");
+    ASSERT_EQ(acked.size(), 1u);
+
+    auto cursor = db.db().query(
+        "SELECT last_received_event_id AS c FROM _lattice_replication_slots "
+        "WHERE sync_id = 'chan-a'", {});
+    ASSERT_FALSE(cursor.empty());
+    EXPECT_TRUE(std::holds_alternative<std::string>(cursor[0].at("c")) &&
+                std::get<std::string>(cursor[0].at("c")) == "cur-audit-1")
+        << "zero-mint chunk left the download cursor behind";
+}
+
+// Catch-up with an UNKNOWN checkpoint must serve full history, not silence:
+// "id > (SELECT id ... )" over a compacted-away globalId matched nothing and
+// the client diverged forever (red-team blocker; required for B6 server
+// compaction independently of B2).
+TEST(AuditHygiene, UnknownCheckpointServesFullHistory) {
+    TempDB tmp{"b2_checkpoint"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+
+    db.add(TestPerson{"Ck1", 30, std::nullopt});
+    db.add(TestPerson{"Ck2", 31, std::nullopt});
+
+    auto known = lattice::events_after(db.db(), std::nullopt);
+    ASSERT_GE(known.size(), 2u);
+
+    auto after_unknown = lattice::events_after(
+        db.db(), std::optional<std::string>("gone-with-the-compaction"));
+    EXPECT_EQ(after_unknown.size(), known.size())
+        << "unknown checkpoint must fall back to full history, not empty";
+}

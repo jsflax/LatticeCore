@@ -220,6 +220,11 @@ database& database::operator=(database&& other) noexcept {
     return *this;
 }
 
+int64_t database::changes() const {
+    if (closed_.load(std::memory_order_acquire) || !db_) return 0;
+    return sqlite3_changes64(db_);
+}
+
 void database::execute(const std::string& sql, const std::vector<column_value_t>& params) {
     if (closed_.load(std::memory_order_acquire)) return;
     g_statement_count.fetch_add(1, std::memory_order_relaxed);

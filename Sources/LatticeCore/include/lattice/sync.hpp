@@ -638,6 +638,12 @@ std::vector<std::string> apply_remote_changes_for(lattice_db& db,
 /// Register (or touch) a replication slot for the given sync_id.
 void register_replication_slot(database& db, const std::string& sync_id);
 
+/// Guarded migration: adds _lattice_replication_slots.last_received_event_id
+/// (the externalized download-resume cursor) and eagerly seeds it from the
+/// legacy newest-isFromRemote AuditLog row. Idempotent and cheap; called from
+/// every cursor read/write entry point.
+void ensure_cursor_column(database& db);
+
 /// Advance a replication slot's confirmed cursor (monotonically forward only).
 void advance_replication_slot(database& db, const std::string& sync_id, int64_t confirmed_audit_id);
 

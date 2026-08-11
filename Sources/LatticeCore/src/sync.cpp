@@ -293,7 +293,22 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
 
         std::string sql = "INSERT INTO " + table_name + "(" + col_names + ") VALUES (" + placeholders + ")";
         if (!update_set.empty()) {
-            sql += " ON CONFLICT(globalId) DO UPDATE SET " + update_set;
+            // Value-guarded upsert: the DO UPDATE arm fires only when some
+            // incoming value actually differs (IS NOT is NULL-safe; excluded.*
+            // already carries the decoded value, so blob columns compare
+            // BLOB-vs-BLOB with no re-binding). A value-identical redundant
+            // delivery then reports changes()==0 and the apply path can
+            // suppress its relay mint — the Aug 2026 flood minted 2.3M audit
+            // rows from exactly these no-op re-applies. Row-level triggers
+            // (FTS5/vec0 shadows) also skip, which is consistent: identical
+            // values mean the shadows are already correct.
+            std::string change_pred;
+            for (size_t i = 1; i < cols.size(); ++i) {
+                if (i > 1) change_pred += " OR ";
+                change_pred += cols[i] + " IS NOT excluded." + cols[i];
+            }
+            sql += " ON CONFLICT(globalId) DO UPDATE SET " + update_set +
+                   " WHERE " + change_pred;
         }
 
         // Add globalRowId as first param
@@ -324,9 +339,23 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
             set_clause += ", " + changed_fields_names[i] + " = " + placeholder(changed_fields_names[i]);
         }
 
-        std::string sql = "UPDATE " + table_name + " SET " + set_clause + " WHERE globalId = ?";
+        // Value-guarded update: only fire when some value actually differs,
+        // so changes()==0 identifies a genuine no-op. The guard re-binds the
+        // same values through placeholder() — a blob column whose wire value
+        // is a hex string must compare via unhex(?) (BLOB-vs-BLOB); a bare ?
+        // would compare BLOB IS NOT TEXT-hex, always true, and every
+        // embedding-bearing UPDATE would look like a change forever.
+        std::string change_pred;
+        for (size_t i = 0; i < changed_fields_names.size(); ++i) {
+            if (i > 0) change_pred += " OR ";
+            change_pred += changed_fields_names[i] + " IS NOT " +
+                           placeholder(changed_fields_names[i]);
+        }
+        std::string sql = "UPDATE " + table_name + " SET " + set_clause +
+                          " WHERE globalId = ? AND (" + change_pred + ")";
 
-        // Extract values from changed_fields map
+        // Params in SQL order: SET values, globalId, then the guard's
+        // re-bound copies of the same values.
         for (const auto& col : changed_fields_names) {
             auto it = changed_fields.find(col);
             if (it != changed_fields.end()) {
@@ -336,6 +365,14 @@ std::pair<std::string, std::vector<column_value_t>> audit_log_entry::generate_in
             }
         }
         params.push_back(global_row_id);
+        for (const auto& col : changed_fields_names) {
+            auto it = changed_fields.find(col);
+            if (it != changed_fields.end()) {
+                params.push_back(it->second.to_column_value());
+            } else {
+                params.push_back(nullptr);
+            }
+        }
 
         return {sql, params};
 
@@ -2532,13 +2569,34 @@ void synchronizer_base::schedule_reconnect() {
 }
 
 std::optional<std::string> synchronizer_base::get_last_received_event_id() {
+    // Slot cursor first (written per applied chunk; survives no-op-suppressed
+    // deliveries and compaction). NULL slot → legacy newest-isFromRemote scan,
+    // self-seeding the slot so the fallback is only ever taken once per
+    // channel and repairs can eventually drop their cursor-row preservation.
+    ensure_cursor_column(db().db());
+    auto slot = db().db().query(
+        "SELECT last_received_event_id FROM _lattice_replication_slots "
+        "WHERE sync_id = ? AND last_received_event_id IS NOT NULL",
+        {config_.sync_id});
+    if (!slot.empty()) {
+        auto it = slot[0].find("last_received_event_id");
+        if (it != slot[0].end() && std::holds_alternative<std::string>(it->second)) {
+            return std::get<std::string>(it->second);
+        }
+    }
     auto rows = db().db().query(
         "SELECT globalId FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1"
     );
     if (!rows.empty()) {
         auto it = rows[0].find("globalId");
         if (it != rows[0].end() && std::holds_alternative<std::string>(it->second)) {
-            return std::get<std::string>(it->second);
+            const auto& gid = std::get<std::string>(it->second);
+            db().db().execute(R"(
+                UPDATE _lattice_replication_slots
+                SET last_received_event_id = ?
+                WHERE sync_id = ? AND last_received_event_id IS NULL
+            )", {gid, config_.sync_id});
+            return gid;
         }
     }
     return std::nullopt;
@@ -3044,6 +3102,20 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
 
 std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id) {
     if (checkpoint_global_id) {
+        // Resolve the checkpoint EXPLICITLY. The filter's correlated subquery
+        // ("id > (SELECT id ... WHERE globalId = ?)") yields NULL for an
+        // unknown globalId and "id > NULL" matches nothing — a client whose
+        // checkpoint was compacted away on this side would receive an EMPTY
+        // catch-up forever (silent, permanent divergence). Unknown checkpoint
+        // ⇒ serve full history; the receiver's globalId dedup + value-guarded
+        // no-op applies make the replay safe and cheap.
+        auto rows = db.query("SELECT id FROM AuditLog WHERE globalId = ?",
+                             {*checkpoint_global_id});
+        if (rows.empty()) {
+            LOG_WARN("sync", "events_after: unknown checkpoint '%s' — serving full history",
+                     checkpoint_global_id->c_str());
+            return query_audit_log(db, false, std::nullopt);
+        }
         return query_audit_log(db, false, checkpoint_global_id);
     } else {
         return query_audit_log(db, false, std::nullopt);
@@ -3054,7 +3126,40 @@ std::vector<audit_log_entry> events_after(database& db, const std::optional<std:
 // Replication slot management
 // =========================================================================
 
+// Externalized download-resume cursor (guarded ALTER + EAGER seed). The
+// cursor used to be derived from the newest isFromRemote AuditLog row — which
+// forced every compaction/repair to preserve that row and stalled whenever
+// no-op suppression stopped minting. Called from every cursor read/write
+// entry point: connect-time reads can run before slot registration, so no
+// single site owns the migration. No explicit transaction: the caller may
+// already hold one, ALTER is atomic on its own, and a crash between ALTER
+// and seed just means the NULL-cursor legacy fallback self-seeds later.
+void ensure_cursor_column(database& db) {
+    for (const auto& row : db.query("PRAGMA table_info(_lattice_replication_slots)", {})) {
+        auto it = row.find("name");
+        if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+            std::get<std::string>(it->second) == "last_received_event_id") {
+            return;
+        }
+    }
+    try {
+        db.execute("ALTER TABLE _lattice_replication_slots "
+                   "ADD COLUMN last_received_event_id TEXT", {});
+        db.execute(R"(
+            UPDATE _lattice_replication_slots
+            SET last_received_event_id =
+                (SELECT globalId FROM AuditLog
+                 WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1)
+            WHERE last_received_event_id IS NULL
+        )", {});
+    } catch (const std::exception& e) {
+        // Racing ALTERs from two connections: one wins, the loser lands here.
+        LOG_DEBUG("sync", "ensure_cursor_column: %s", e.what());
+    }
+}
+
 void register_replication_slot(database& db, const std::string& sync_id) {
+    ensure_cursor_column(db);
     db.execute(R"(
         INSERT INTO _lattice_replication_slots (sync_id, last_active_at)
         VALUES (?, datetime('now'))
@@ -3146,8 +3251,38 @@ static std::vector<std::string> apply_remote_changes_impl(
     // than hardcoding 0 — deliberately disabled auditing must stay disabled.
     const int64_t prev_disabled = db.read_sync_disabled_flag();
 
+    // Durable idempotency receipts for suppressed no-op applies: suppression
+    // (below) mints no AuditLog row, which is what the globalId dedup keys
+    // on — without a receipt, a suppressed entry re-delivered AFTER an
+    // intervening local edit would re-apply stale values and relay the
+    // reversion fleet-wide. Receipts are globalId-only (~tens of bytes vs a
+    // full audit row) and pruned by bounded rowid horizon in compaction.
+    db.db().execute(
+        "CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
+        "  globalId TEXT PRIMARY KEY)", {});
+
+    // Download-resume cursor (externalized): advanced per chunk to the last
+    // CONTIGUOUSLY-acked entry of the delivery. Only meaningful in per-sync
+    // mode (clients resuming a download stream); the column is added by
+    // register_replication_slot, so probe rather than assume.
+    bool cursor_column_ok = false;
+    if (receiving_sync_id) {
+        auto cols = db.db().query("PRAGMA table_info(_lattice_replication_slots)", {});
+        for (const auto& row : cols) {
+            auto it = row.find("name");
+            if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+                std::get<std::string>(it->second) == "last_received_event_id") {
+                cursor_column_ok = true;
+                break;
+            }
+        }
+    }
+    std::optional<std::string> cursor_candidate;
+    bool cursor_halted = false;
+
     for (size_t chunk_start = 0; chunk_start < entries.size(); chunk_start += chunk_size) {
         size_t chunk_end = std::min(chunk_start + chunk_size, entries.size());
+        const size_t applied_before_chunk = applied_ids.size();
 
         // Per-store write gate (results spec §4.1): a chunked sync apply on
         // a shared-cache store is THE canonical writer that generation
@@ -3177,9 +3312,14 @@ static std::vector<std::string> apply_remote_changes_impl(
                 // committed chunks were never reported (the B-2 pathology at
                 // chunk granularity).
                 try {
-                    // Re-check inside transaction (entry may have been inserted concurrently)
+                    // Re-check inside transaction (entry may have been inserted
+                    // concurrently). A hit in EITHER AuditLog or the receipts
+                    // table means already-applied: ack and move on.
                     auto existing = db.db().query(
-                        "SELECT id FROM AuditLog WHERE globalId = ?",
+                        "SELECT 1 FROM AuditLog WHERE globalId = ?1 "
+                        "UNION ALL "
+                        "SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?1 "
+                        "LIMIT 1",
                         {entry.global_id}
                     );
                     if (!existing.empty()) {
@@ -3326,6 +3466,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                     // an unconditional upsert would revert newer edits and
                     // resurrect tombstones. Bookkeeping + ack still run.
                     bool sql_succeeded = true;
+                    bool sql_executed = false;
                     if (entry.synthesized && row_existed) {
                         LOG_DEBUG("apply_remote",
                                   "synthesized INSERT for existing row %s.%s — insert-if-absent skip",
@@ -3333,6 +3474,7 @@ static std::vector<std::string> apply_remote_changes_impl(
                     } else if (!sql.empty()) {
                         try {
                             db.db().execute(sql, params);
+                            sql_executed = true;
                         } catch (const std::exception& e) {
                             LOG_ERROR("apply_remote", "Failed: %s (SQL: %s)", e.what(), sql.c_str());
                             sql_succeeded = false;
@@ -3340,6 +3482,33 @@ static std::vector<std::string> apply_remote_changes_impl(
                     }
 
                     if (!sql_succeeded) {
+                        continue;
+                    }
+
+                    // NO-OP SUPPRESSION (per-sync/client mode only). With the
+                    // value-guarded instructions, changes()==0 on an EXISTING
+                    // row means every incoming value equals the stored value —
+                    // there is nothing to relay, so minting a full audit row
+                    // per redundant delivery (2.3M rows in 4h during the Aug
+                    // 2026 flood) is pure damage. Scope guards, each one
+                    // red-team-mandated:
+                    //   - per-sync mode only: the server's global-mode path
+                    //     must keep minting for every acked entry (fan-out +
+                    //     last-event-id resume depend on ack'd globalIds being
+                    //     checkpoint-resolvable server-side);
+                    //   - row_existed: an ABSENT row can be a filter-removal
+                    //     value-hole with the row live downstream — today's
+                    //     phantom mint is what relays the edit onward;
+                    //   - sql_executed: the A5 synthesized-skip branch never
+                    //     ran SQL, so changes() would be stale garbage there.
+                    // A durable receipt replaces the audit row for dedup, and
+                    // the entry is still ACKED (the sender must retire it).
+                    if (receiving_sync_id && is_model_table && row_existed &&
+                        sql_executed && db.db().changes() == 0) {
+                        db.db().execute(
+                            "INSERT OR IGNORE INTO _lattice_applied_receipts (globalId) VALUES (?)",
+                            {entry.global_id});
+                        applied_ids.push_back(entry.global_id);
                         continue;
                     }
 
@@ -3413,6 +3582,34 @@ static std::vector<std::string> apply_remote_changes_impl(
                     LOG_ERROR("apply_remote", "entry[%zu] skipped (table=%s, op=%s): %s",
                               i, entry.table_name.c_str(), entry.operation.c_str(), e.what());
                     continue;
+                }
+            }
+
+            // Advance the download-resume cursor to the last CONTIGUOUSLY
+            // acked entry of this delivery, inside the same transaction as
+            // the applies it covers. Contiguous-prefix semantics: a failed
+            // (un-acked) entry halts the cursor so the server re-delivers
+            // from it on the next reconnect; suppressed no-ops DO advance it
+            // (they are acked and receipt-backed), which is what keeps a
+            // fully-suppressed chunk from stalling resume.
+            if (receiving_sync_id && cursor_column_ok && !cursor_halted) {
+                std::unordered_set<std::string> chunk_acked;
+                for (size_t k = applied_before_chunk; k < applied_ids.size(); ++k) {
+                    chunk_acked.insert(applied_ids[k]);
+                }
+                for (size_t k = chunk_start; k < chunk_end; ++k) {
+                    if (!chunk_acked.count(entries[k].global_id)) {
+                        cursor_halted = true;
+                        break;
+                    }
+                    cursor_candidate = entries[k].global_id;
+                }
+                if (cursor_candidate) {
+                    db.db().execute(R"(
+                        UPDATE _lattice_replication_slots
+                        SET last_received_event_id = ?, last_active_at = datetime('now')
+                        WHERE sync_id = ?
+                    )", {*cursor_candidate, *receiving_sync_id});
                 }
             }
 

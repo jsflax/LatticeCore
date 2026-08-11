@@ -87,6 +87,13 @@ public:
     void execute(const std::string& sql,
                  const std::vector<column_value_t>& params = {});
 
+    /// Rows changed by the most recent INSERT/UPDATE/DELETE on this
+    /// connection (sqlite3_changes64). With value-guarded writes (a DO
+    /// UPDATE arm or UPDATE gated on actual value inequality) 0 means the
+    /// statement was a genuine no-op — the sync apply path uses this to
+    /// suppress relay minting for value-identical redundant deliveries.
+    int64_t changes() const;
+
     /// Advance this connection's WAL read snapshot to see the latest committed data.
     /// Needed when another connection wrote and this connection's mmap'd WAL index is stale.
     void refresh_wal_snapshot();

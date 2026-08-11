@@ -264,7 +264,10 @@ TEST(Sync, GenerateInstructionUpdate) {
     auto [sql, params] = entry.generate_instruction();
     EXPECT_NE(sql.find("UPDATE TestPerson SET"), std::string::npos);
     EXPECT_NE(sql.find("WHERE globalId = ?"), std::string::npos);
-    EXPECT_EQ(params.size(), 2u);  // name, globalId
+    // Value-guarded update (B2): the WHERE re-binds each changed value via
+    // "col IS NOT ?" so changes()==0 identifies a genuine no-op.
+    EXPECT_NE(sql.find("name IS NOT ?"), std::string::npos);
+    EXPECT_EQ(params.size(), 3u);  // name, globalId, guard re-bind of name
 }
 
 TEST(Sync, GenerateInstructionDelete) {

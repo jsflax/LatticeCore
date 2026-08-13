@@ -8,6 +8,10 @@
 
 namespace lattice {
 
+namespace test_hooks {
+std::function<void(size_t chunk_start)> apply_chunk_begin;
+}  // namespace test_hooks
+
 using json = nlohmann::json;
 
 static std::atomic<int64_t> g_sync_instance_count{0};
@@ -593,10 +597,11 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched) {
     config_ = config;
+    log_label_cache_ = config_.log_label;
     scheduler_ = sched;
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
     LOG_INFO("synchronizer", "[%s] CREATED (WSS, this=%p, db=%s, alive=%lld)",
-             config_.sync_id.c_str(), (void*)this, db().config().path.c_str(), (long long)n);
+             log_id(), (void*)this, db().config().path.c_str(), (long long)n);
     auto factory = get_network_factory();
     ws_client_ = factory->create_sync_transport();
     setup_transport_handlers();
@@ -609,11 +614,12 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
                                    std::unique_ptr<sync_transport> transport) {
     config_ = config;
+    log_label_cache_ = config_.log_label;
     scheduler_ = sched;
     ws_client_ = std::move(transport);
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
     LOG_INFO("synchronizer", "[%s] CREATED (IPC, this=%p, db=%s, alive=%lld)",
-             config_.sync_id.c_str(), (void*)this, db().config().path.c_str(), (long long)n);
+             log_id(), (void*)this, db().config().path.c_str(), (long long)n);
     setup_transport_handlers();
     setup_observer();
 #ifndef __EMSCRIPTEN__
@@ -693,7 +699,7 @@ void synchronizer_base::maybe_checkpoint() {
             std::chrono::milliseconds(config_.checkpoint_passive_interval_ms);
 
     LOG_DEBUG("synchronizer", "[%s] maybe_checkpoint: pending=%lld truncate_due=%d idle=%d passive_due=%d",
-              config_.sync_id.c_str(),
+              log_id(),
               (long long)progress_pending_upload_.load(std::memory_order_relaxed),
               truncate_due ? 1 : 0, idle ? 1 : 0, passive_due ? 1 : 0);
     if (!(passive_due || (truncate_due && idle))) return;
@@ -712,7 +718,7 @@ void synchronizer_base::maybe_checkpoint() {
             // so backfill progress always happens; truncate retries next due.
             res = db().db().wal_checkpoint(false);
             LOG_DEBUG("synchronizer", "[%s] TRUNCATE checkpoint busy — PASSIVE fallback: log=%lld ckpt=%lld",
-                      config_.sync_id.c_str(), (long long)res.log_frames, (long long)res.checkpointed);
+                      log_id(), (long long)res.log_frames, (long long)res.checkpointed);
             // Results spec §3.3: the truncate was beaten by a held read
             // snapshot (a keeper generation). Ask the coordinators to
             // advance so facades re-pin at their next access and the NEXT
@@ -727,10 +733,10 @@ void synchronizer_base::maybe_checkpoint() {
             db().request_generation_advance();
         } else if (try_truncate) {
             LOG_INFO("synchronizer", "[%s] WAL TRUNCATE checkpoint: log=%lld ckpt=%lld",
-                     config_.sync_id.c_str(), (long long)res.log_frames, (long long)res.checkpointed);
+                     log_id(), (long long)res.log_frames, (long long)res.checkpointed);
         } else {
             LOG_DEBUG("synchronizer", "[%s] WAL PASSIVE checkpoint: busy=%d log=%lld ckpt=%lld",
-                      config_.sync_id.c_str(), res.busy, (long long)res.log_frames, (long long)res.checkpointed);
+                      log_id(), res.busy, (long long)res.log_frames, (long long)res.checkpointed);
         }
     });
 }
@@ -849,7 +855,7 @@ void synchronizer_base::setup_observer() {
             }
             if (any_unsynced_insert) {
                 LOG_DEBUG("synchronizer", "Requesting upload for entries pending on sync_id=%s",
-                          config_.sync_id.c_str());
+                          log_id());
                 request_upload();
             }
         });
@@ -857,7 +863,7 @@ void synchronizer_base::setup_observer() {
 
 synchronizer_base::~synchronizer_base() {
     LOG_INFO("synchronizer", "[%s] ~synchronizer START (this=%p, db=%s)",
-             config_.sync_id.c_str(), (void*)this,
+             log_id(), (void*)this,
              db().config().path.c_str());
     // Mark as destroyed so scheduled lambdas bail out.
     is_destroyed_ = true;
@@ -886,16 +892,16 @@ synchronizer_base::~synchronizer_base() {
     // Skip if we're on the scheduler thread (destructor called from within
     // a callback) — the work will finish as part of the current call stack.
     if (scheduler_ && !scheduler_->is_on_thread()) {
-        LOG_INFO("synchronizer", "[%s] ~synchronizer: draining scheduler...", config_.sync_id.c_str());
+        LOG_INFO("synchronizer", "[%s] ~synchronizer: draining scheduler...", log_id());
         scheduler_->shutdown();
     }
     auto n = g_sync_instance_count.fetch_sub(1, std::memory_order_relaxed) - 1;
-    LOG_INFO("synchronizer", "[%s] ~synchronizer END (this=%p, alive=%lld)", config_.sync_id.c_str(), (void*)this, (long long)n);
+    LOG_INFO("synchronizer", "[%s] ~synchronizer END (this=%p, alive=%lld)", log_id(), (void*)this, (long long)n);
 }
 
 void synchronizer_base::connect() {
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
-             config_.sync_id.c_str(), (void*)this, db().config().path.c_str());
+             log_id(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
         // IPC or injected transport — connect without URL/headers.
         // Dialer-side IPC clients auto-reconnect with backoff (they redial
@@ -906,7 +912,7 @@ void synchronizer_base::connect() {
         // "client retries via endpoint" path never existed.)
         should_reconnect_ = ws_client_->supports_reconnect();
         LOG_INFO("synchronizer", "[%s] IPC connect: supports_reconnect=%d",
-                 config_.sync_id.c_str(), should_reconnect_ ? 1 : 0);
+                 log_id(), should_reconnect_ ? 1 : 0);
         ws_client_->connect("", {});
         return;
     }
@@ -935,7 +941,7 @@ void synchronizer_base::connect() {
 
 void synchronizer_base::disconnect() {
     LOG_INFO("synchronizer", "[%s] disconnect() (this=%p, is_connected=%d, db=%s)",
-             config_.sync_id.c_str(), (void*)this, is_connected_ ? 1 : 0,
+             log_id(), (void*)this, is_connected_ ? 1 : 0,
              db().config().path.c_str());
     should_reconnect_ = false;  // Prevent auto-reconnect
     is_connected_ = false;
@@ -997,13 +1003,13 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     LOG_INFO("synchronizer", "[%s] drain: deadline reached with pending=%lld — disconnecting anyway",
-             config_.sync_id.c_str(),
+             log_id(),
              (long long)progress_pending_upload_.load(std::memory_order_relaxed));
 }
 
 void synchronizer_base::on_websocket_open() {
     LOG_INFO("synchronizer", "[%s] on_websocket_open (this=%p, db=%s)",
-             config_.sync_id.c_str(), (void*)this, db().config().path.c_str());
+             log_id(), (void*)this, db().config().path.c_str());
     is_connected_ = true;
     // Do NOT reset reconnect_attempts_ here: a flapping endpoint fires
     // open→error every cycle, and resetting on open pinned the backoff at
@@ -1044,7 +1050,7 @@ void synchronizer_base::on_websocket_open() {
         // peer's _lattice_sync_set still marks every row as already-synced.
         if (config_.sync_id.rfind("ipc:", 0) == 0 && !get_last_received_event_id()) {
             LOG_INFO("synchronizer", "[%s] fresh peer (no applied remote entries) — sending replay request",
-                     config_.sync_id.c_str());
+                     log_id());
             auto req = server_sent_event::make_replay_request().to_json();
             ws_client_->send(transport_message::from_binary({req.begin(), req.end()}));
         }
@@ -1079,7 +1085,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
         }
 
         LOG_INFO("synchronizer", "[%s] on_transport_message: type=%s entries=%zu (this=%p, db=%s)",
-                 config_.sync_id.c_str(),
+                 log_id(),
                  event->event_type == server_sent_event::type::audit_log ? "audit_log"
                      : event->event_type == server_sent_event::type::replay_request ? "replay_request" : "ack",
                  event->event_type == server_sent_event::type::audit_log
@@ -1108,7 +1114,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     });
                 if (it != entries.end()) {
                     LOG_INFO("synchronizer", "[%s] skipping %zu filter-removal DELETE(s) from WSS peer",
-                             config_.sync_id.c_str(), skipped_filter_removals.size());
+                             log_id(), skipped_filter_removals.size());
                     entries.erase(it, entries.end());
                 }
             }
@@ -1117,18 +1123,18 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                                 skipped_filter_removals = std::move(skipped_filter_removals)] {
                 if (is_destroyed_) {
                     LOG_INFO("synchronizer", "[%s] scheduler lambda: is_destroyed_, skipping apply of %zu entries",
-                             config_.sync_id.c_str(), entry_count);
+                             log_id(), entry_count);
                     return;
                 }
                 LOG_INFO("synchronizer", "[%s] scheduler lambda: applying %zu entries (db=%s)",
-                         config_.sync_id.c_str(), entries.size(), db().config().path.c_str());
+                         log_id(), entries.size(), db().config().path.c_str());
                 auto applied_ids = apply_remote_changes(entries);
                 // Ack skipped filter-removals as if applied (see above).
                 applied_ids.insert(applied_ids.end(),
                                    skipped_filter_removals.begin(),
                                    skipped_filter_removals.end());
                 LOG_INFO("synchronizer", "[%s] apply_remote_changes returned %zu/%zu (db=%s)",
-                         config_.sync_id.c_str(), applied_ids.size(), entries.size(),
+                         log_id(), applied_ids.size(), entries.size(),
                          db().config().path.c_str());
 
                 // Send acknowledgment only for successfully applied entries
@@ -1136,7 +1142,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     auto ack = server_sent_event::make_ack(applied_ids);
                     auto json_ack = ack.to_json();
                     LOG_INFO("synchronizer", "[%s] sending ACK for %zu entries (transport_state=%d, db=%s)",
-                             config_.sync_id.c_str(), applied_ids.size(),
+                             log_id(), applied_ids.size(),
                              static_cast<int>(ws_client_->state()),
                              db().config().path.c_str());
                     ws_client_->send(transport_message::from_binary({json_ack.begin(), json_ack.end()}));
@@ -1172,11 +1178,11 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 if (is_destroyed_) return;
                 if (!config_.sync_filter) {
                     LOG_INFO("synchronizer", "[%s] replay request ignored (no sync filter on this side)",
-                             config_.sync_id.c_str());
+                             log_id());
                     return;
                 }
                 LOG_INFO("synchronizer", "[%s] replay request from fresh peer — re-arming filtered snapshot",
-                         config_.sync_id.c_str());
+                         log_id());
                 db().reset_sync_state(config_.sync_id);
                 // reset_sync_state zeroed the persisted upload_floor and made
                 // previously-resolved entries pending again — the in-memory
@@ -1205,7 +1211,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 
 void synchronizer_base::on_websocket_error(const std::string& error) {
     LOG_ERROR("synchronizer", "[%s] WebSocket error: %s (this=%p, db=%s)",
-              config_.sync_id.c_str(), error.c_str(), (void*)this, db().config().path.c_str());
+              log_id(), error.c_str(), (void*)this, db().config().path.c_str());
 
     // The transport is dead: mark disconnected BEFORE scheduling the
     // reconnect. A transport error without a close event (connection reset
@@ -1229,7 +1235,7 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         if (!in_flight_ids_.empty()) {
             LOG_INFO("synchronizer", "[%s] Clearing %zu in-flight entries after error",
-                     config_.sync_id.c_str(), in_flight_ids_.size());
+                     log_id(), in_flight_ids_.size());
             in_flight_ids_.clear();
         }
         progress_pending_upload_.store(0, std::memory_order_relaxed);
@@ -1246,7 +1252,7 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
 
 void synchronizer_base::on_websocket_close(int code, const std::string& reason) {
     LOG_INFO("synchronizer", "[%s] WebSocket closed (code=%d, reason=%s, this=%p, db=%s)",
-             config_.sync_id.c_str(), code, reason.c_str(), (void*)this, db().config().path.c_str());
+             log_id(), code, reason.c_str(), (void*)this, db().config().path.c_str());
     const bool was_open = is_connected_.exchange(false);
     maybe_reset_backoff_after_stable_connection(was_open);
 
@@ -1256,7 +1262,7 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         if (!in_flight_ids_.empty()) {
             LOG_INFO("synchronizer", "[%s] Clearing %zu in-flight entries after close",
-                     config_.sync_id.c_str(), in_flight_ids_.size());
+                     log_id(), in_flight_ids_.size());
             in_flight_ids_.clear();
         }
         progress_pending_upload_.store(0, std::memory_order_relaxed);
@@ -1536,7 +1542,7 @@ void synchronizer_base::reconcile_sync_filter() {
         "SELECT table_name, global_row_id FROM _lattice_sync_set WHERE sync_id = ?",
         {config_.sync_id});
     LOG_INFO("synchronizer", "reconcile Phase 1 (%s): %zu sync_set rows, %zu current matches",
-             config_.sync_id.c_str(), sync_set_rows.size(), current_matches.size());
+             log_id(), sync_set_rows.size(), current_matches.size());
     for (const auto& row : sync_set_rows) {
         auto tn_it = row.find("table_name");
         auto gid_it = row.find("global_row_id");
@@ -2105,7 +2111,7 @@ void synchronizer_base::resolve_audit_ids(const std::vector<int64_t>& audit_ids)
                 stall_since_ = now;
             } else if (now - stall_since_ >= std::chrono::minutes(5)) {
                 LOG_WARN("synchronizer", "[%s] upload floor stalled below audit id %lld for >5min — an entry is repeatedly failing to resolve",
-                         config_.sync_id.c_str(), (long long)min_open);
+                         log_id(), (long long)min_open);
                 stall_since_ = now;  // rate-limit the warning
             }
         }
@@ -2201,7 +2207,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     }
     if (window_end == 0) {
         LOG_DEBUG("synchronizer", "[%s] send window full (%zu in flight) — %zu entries stay pending",
-                  config_.sync_id.c_str(), window_cap, entries.size());
+                  log_id(), window_cap, entries.size());
         entries.clear();
         return;
     }
@@ -2210,7 +2216,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     fire_progress();
     if (window_end < entries.size()) {
         LOG_INFO("synchronizer", "[%s] send window: %zu of %zu entries (rest pend on ACKs)",
-                 config_.sync_id.c_str(), window_end, entries.size());
+                 log_id(), window_end, entries.size());
     }
 
     for (size_t i = 0; i < window_end; i += config_.chunk_size) {
@@ -2306,7 +2312,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
         if (released > 0) {
             const int f = self->ack_resend_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
             LOG_WARN("synchronizer", "[%s] %zu entries unACKed after timeout — resending (consecutive failures: %d)",
-                     self->config_.sync_id.c_str(), released, f);
+                     self->log_id(), released, f);
             self->request_upload();
         }
     }).detach();
@@ -2402,7 +2408,7 @@ std::vector<std::string> synchronizer_base::apply_remote_changes(const std::vect
 
 void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_ids) {
     LOG_INFO("synchronizer", "[%s] mark_as_synced: %zu entries ACK'd (progress_acked was %lld)",
-             config_.sync_id.c_str(), global_ids.size(),
+             log_id(), global_ids.size(),
              (long long)progress_acked_.load(std::memory_order_relaxed));
     mark_audit_entries_synced_for(db(), global_ids, config_.sync_id, config_.all_active_sync_ids);
 
@@ -2520,7 +2526,7 @@ void synchronizer_base::maybe_reset_backoff_after_stable_connection(bool was_ope
         const int prior = reconnect_attempts_.exchange(0);
         if (prior > 0) {
             LOG_INFO("synchronizer", "[%s] connection was stable %llds — backoff reset (attempts were %d)",
-                     config_.sync_id.c_str(), (long long)((now_ms - open_ms) / 1000), prior);
+                     log_id(), (long long)((now_ms - open_ms) / 1000), prior);
         }
     }
 }
@@ -2530,7 +2536,7 @@ void synchronizer_base::schedule_reconnect() {
         || reconnect_attempts_ < config_.max_reconnect_attempts;
     if (!(should_reconnect_ && !is_connected_ && within_limit)) {
         LOG_INFO("synchronizer", "[%s] schedule_reconnect: NOT reconnecting (should=%d connected=%d within_limit=%d)",
-                 config_.sync_id.c_str(), should_reconnect_ ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
+                 log_id(), should_reconnect_ ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
     }
     if (should_reconnect_ && !is_connected_ && within_limit) {
 #ifdef __EMSCRIPTEN__
@@ -2540,7 +2546,7 @@ void synchronizer_base::schedule_reconnect() {
         // completing. Browser clients reconnect at the app layer (tab
         // visibility / reload) instead.
         LOG_INFO("synchronizer", "[%s] schedule_reconnect: skipped on Emscripten (app-level reconnect)",
-                 config_.sync_id.c_str());
+                 log_id());
         return;
 #endif
         double delay = std::min(
@@ -2548,7 +2554,7 @@ void synchronizer_base::schedule_reconnect() {
             config_.max_delay_seconds);
         ++reconnect_attempts_;
         LOG_INFO("synchronizer", "[%s] Scheduling reconnect attempt %d in %.1fs",
-                 config_.sync_id.c_str(), reconnect_attempts_.load(), delay);
+                 log_id(), reconnect_attempts_.load(), delay);
 
         // Schedule reconnection with an interruptible sleep.
         // Short-sleep loop checks is_destroyed_ so that scheduler_->shutdown()
@@ -2618,7 +2624,7 @@ synchronizer_base::sync_progress synchronizer_base::get_progress() const {
 
 void synchronizer_base::set_on_progress(on_progress_handler handler) {
     LOG_INFO("synchronizer", "[%s] set_on_progress: handler=%s (this=%p, db=%s)",
-             config_.sync_id.c_str(),
+             log_id(),
              handler ? "SET" : "CLEARED",
              (void*)this, db().config().path.c_str());
     std::lock_guard<std::mutex> lock(progress_handler_mutex_);
@@ -2633,7 +2639,7 @@ void synchronizer_base::fire_progress() {
     }
     auto p = get_progress();
     LOG_INFO("synchronizer", "[%s] fire_progress: pending=%lld total=%lld acked=%lld received=%lld handler=%s (this=%p)",
-             config_.sync_id.c_str(),
+             log_id(),
              (long long)p.pending_upload, (long long)p.total_upload,
              (long long)p.acked, (long long)p.received,
              handler ? "SET" : "NULL",
@@ -3297,9 +3303,15 @@ static std::vector<std::string> apply_remote_changes_impl(
     std::unordered_set<std::string> vec0_ensured;
     std::unordered_map<std::string, std::unordered_map<std::string, column_type>> schema_cache;
 
-    for (size_t chunk_start = 0; chunk_start < entries.size(); chunk_start += chunk_size) {
+    bool chunk_retried = false;
+    for (size_t chunk_start = 0; chunk_start < entries.size(); ) {
         size_t chunk_end = std::min(chunk_start + chunk_size, entries.size());
         const size_t applied_before_chunk = applied_ids.size();
+        // Snapshots for the failure path: a rolled-back chunk must not leak
+        // its cursor progress (advancing the resume cursor past an entry
+        // that never committed would create a permanent download hole).
+        const auto cursor_candidate_before_chunk = cursor_candidate;
+        const bool cursor_halted_before_chunk = cursor_halted;
 
         // Per-store write gate (results spec §4.1): a chunked sync apply on
         // a shared-cache store is THE canonical writer that generation
@@ -3310,6 +3322,7 @@ static std::vector<std::string> apply_remote_changes_impl(
         lattice_db::store_write_gate_hold write_gate(db);
 
         try {
+            if (test_hooks::apply_chunk_begin) test_hooks::apply_chunk_begin(chunk_start);
             db.db().begin_transaction();
 
             // Disable sync triggers for this chunk
@@ -3651,11 +3664,54 @@ static std::vector<std::string> apply_remote_changes_impl(
             db.db().execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
 
             db.db().commit();
+        } catch (const std::exception& e) {
+            // A CHUNK-level failure (BEGIN lock timeout, COMMIT busy, the
+            // trigger-gate UPDATEs) rolls back this chunk only. It must
+            // NEVER throw out of the apply: entries committed by EARLIER
+            // chunks are durably applied, and losing the applied_ids vector
+            // to an unwind acks them to nobody — the sender then re-sends
+            // the whole window forever (the Aug 13 IPC livelock: spoke→hub
+            // frozen at progress_acked=215008, four windows cycling at
+            // their 300s backoff caps while committed work went unacked).
+            // Policy: retry the chunk once, then stop the DELIVERY and
+            // return what committed; the sender re-sends only the rest.
+            try { db.db().rollback(); } catch (...) {}
+            applied_ids.resize(applied_before_chunk);
+            cursor_candidate = cursor_candidate_before_chunk;
+            cursor_halted = cursor_halted_before_chunk;
+            // The per-delivery memos may record DDL that the rollback undid.
+            tables_ensured.clear();
+            vec0_ensured.clear();
+            schema_cache.clear();
+            if (!chunk_retried) {
+                chunk_retried = true;
+                LOG_WARN("apply_remote", "chunk [%zu,%zu) failed (%s) — retrying once",
+                         chunk_start, chunk_end, e.what());
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            LOG_WARN("apply_remote",
+                     "chunk [%zu,%zu) failed twice (%s) — stopping this delivery; "
+                     "%zu already-committed entries will be acked, the sender re-sends the rest",
+                     chunk_start, chunk_end, e.what(), applied_ids.size());
+            break;
         } catch (...) {
-            db.db().rollback();
-            db.applying_remote_changes_.store(false, std::memory_order_release);
-            throw;
+            // Non-std throw: same containment policy, no retry (unknown cause).
+            try { db.db().rollback(); } catch (...) {}
+            applied_ids.resize(applied_before_chunk);
+            cursor_candidate = cursor_candidate_before_chunk;
+            cursor_halted = cursor_halted_before_chunk;
+            tables_ensured.clear();
+            vec0_ensured.clear();
+            schema_cache.clear();
+            LOG_WARN("apply_remote",
+                     "chunk [%zu,%zu) failed (non-std exception) — stopping this delivery; "
+                     "%zu already-committed entries will be acked",
+                     chunk_start, chunk_end, applied_ids.size());
+            break;
         }
+        chunk_start = chunk_end;
+        chunk_retried = false;
     }
 
     db.applying_remote_changes_.store(false, std::memory_order_release);

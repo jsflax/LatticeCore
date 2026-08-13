@@ -775,3 +775,111 @@ TEST_F(IVFTest, MatchQueryWithFilter) {
             << "Filtered result should match: " << title;
     }
 }
+
+// ============================================================================
+// H3 (Aug 13 2026) — vec0 reconcile must be idempotent and atomic.
+//
+// Every process that receives an xproc change notification reconciles the
+// same rows. The old blind DELETE+INSERT (two autocommit write transactions)
+// interleaved ACROSS processes — P1.DELETE, P2.DELETE, P1.INSERT,
+// P2.INSERT→UNIQUE — into 28,308 "UNIQUE constraint failed on
+// _Memory_embedding_vec" errors hammering the hub's write lock, which
+// starved the IPC apply path into a livelock (spoke→hub acks frozen).
+// ============================================================================
+
+// Reconciling a row the index already holds with identical bytes must be a
+// READ, not a rewrite: the writer's triggers already indexed it. Pinned via
+// PRAGMA data_version on an observer connection — it moves iff some other
+// connection commits a write.
+TEST_F(Vec0Test, ReconcileOfCurrentRowIsReadOnly) {
+    TempDB rtmp{"vec0_readonly_reconcile"};
+    lattice::lattice_db db_a(lattice::configuration(rtmp.str()));
+    createVectorTable(db_a);
+    insertDoc(db_a, "ro1", "ReadOnly1", {1.0f, 0.0f, 0.0f});  // trigger indexes it
+
+    lattice::lattice_db db_b(lattice::configuration(rtmp.str()));
+
+    lattice::database obs(rtmp.str());
+    auto data_version = [&obs]() {
+        return std::get<int64_t>(obs.query("PRAGMA data_version")[0].at("data_version"));
+    };
+    const auto before = data_version();
+
+    db_b.reconcile_vec0("VectorDoc", "ro1");
+
+    EXPECT_EQ(data_version(), before)
+        << "reconcile of an already-correct index row wrote to the database "
+           "(the blind-rewrite storm of the Aug 13 incident)";
+
+    // The row must remain correct and queryable from the reconciling side.
+    auto qvec = pack_floats({1.0f, 0.0f, 0.0f});
+    auto results = db_b.knn_query("VectorDoc", "embedding", qvec, 1,
+                                  lattice::lattice_db::distance_metric::l2);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results[0].global_id, "ro1");
+    EXPECT_NEAR(results[0].distance, 0.0, 0.001);
+}
+
+// A CHANGED embedding must still be refreshed (idempotence must not decay
+// into never-writing), and the write must survive concurrent reconcilers.
+TEST_F(Vec0Test, ReconcileOfChangedRowRefreshesTheIndex) {
+    TempDB ctmp{"vec0_changed_reconcile"};
+    lattice::lattice_db db_a(lattice::configuration(ctmp.str()));
+    createVectorTable(db_a);
+    insertDoc(db_a, "ch1", "Changed1", {1.0f, 0.0f, 0.0f});
+
+    lattice::lattice_db db_b(lattice::configuration(ctmp.str()));
+
+    // Simulate a trigger-missed index row: stale bytes planted directly.
+    db_b.upsert_vec0("VectorDoc", "embedding", "ch1",
+                     pack_floats({9.0f, 9.0f, 9.0f}));
+
+    // Reconcile against the model's truth must repair it.
+    db_b.reconcile_vec0("VectorDoc", "ch1");
+
+    auto qvec = pack_floats({1.0f, 0.0f, 0.0f});
+    auto results = db_b.knn_query("VectorDoc", "embedding", qvec, 1,
+                                  lattice::lattice_db::distance_metric::l2);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results[0].global_id, "ch1");
+    EXPECT_NEAR(results[0].distance, 0.0, 0.001)
+        << "reconcile must refresh a stale index row to the model's bytes";
+
+    auto cnt = db_b.db().query(
+        "SELECT COUNT(*) AS c FROM _VectorDoc_embedding_vec_rowids WHERE id = 'ch1'");
+    EXPECT_EQ(std::get<int64_t>(cnt[0].at("c")), 1);
+}
+
+// Two connections hammering upsert_vec0 on the SAME id: the old autocommit
+// DELETE+INSERT pair interleaves across connections into UNIQUE failures.
+// The fix (UPDATE-then-conditional-INSERT under one write transaction) makes
+// collisions structurally impossible.
+TEST_F(Vec0Test, ConcurrentUpsertSameRow_NoUniqueThrow) {
+    TempDB utmp{"vec0_upsert_race"};
+    lattice::lattice_db db_a(lattice::configuration(utmp.str()));
+    createVectorTable(db_a);
+    lattice::lattice_db db_b(lattice::configuration(utmp.str()));
+
+    std::atomic<int> failures{0};
+    auto hammer = [&failures](lattice::lattice_db& db, int seed) {
+        for (int i = 0; i < 300; ++i) {
+            auto v = pack_floats({static_cast<float>(seed), static_cast<float>(i), 0.0f});
+            try {
+                db.upsert_vec0("VectorDoc", "embedding", "contested", v);
+            } catch (const std::exception&) {
+                failures.fetch_add(1);
+            }
+        }
+    };
+    std::thread ta([&] { hammer(db_a, 1); });
+    std::thread tb([&] { hammer(db_b, 2); });
+    ta.join();
+    tb.join();
+
+    EXPECT_EQ(failures.load(), 0)
+        << "interleaved upserts of one id must never collide (UNIQUE) or fail";
+    auto cnt = db_a.db().query(
+        "SELECT COUNT(*) AS c FROM _VectorDoc_embedding_vec_rowids WHERE id = 'contested'");
+    EXPECT_EQ(std::get<int64_t>(cnt[0].at("c")), 1)
+        << "exactly one index row must survive the race";
+}

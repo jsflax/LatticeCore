@@ -4723,17 +4723,71 @@ public:
         db_->execute(delete_trigger);
     }
 
+    /// Idempotent, atomic refresh of one vec0 index row (Aug 2026 UNIQUE/lock
+    /// storm fix). Returns true if a write happened, false if the index
+    /// already held the row with these exact bytes.
+    ///
+    /// Two rules, each load-bearing:
+    ///   1. READ before writing. The writer's triggers fire inside its own
+    ///      transaction, so by the time any reconcile runs the shadow tables
+    ///      are usually already correct — every process that hears about a
+    ///      row re-writing identical data is what produced 28,308 UNIQUE
+    ///      failures and a write-lock storm on the hub (Aug 13 incident).
+    ///      The point-plan read takes no write lock at all.
+    ///   2. When a write IS needed, UPDATE-then-conditional-INSERT under one
+    ///      write transaction — the exact pattern the vec0 triggers use
+    ///      (vec0 DELETE is unreliable, and autocommit DELETE+INSERT pairs
+    ///      from concurrent processes interleave into UNIQUE failures; the
+    ///      held write lock makes interleaving impossible).
+    bool refresh_vec0_row(const std::string& vec_table,
+                          const std::string& global_id,
+                          const std::vector<uint8_t>& vec_data) {
+        try {
+            auto existing = db_->query(
+                "SELECT embedding FROM " + vec_table + " WHERE global_id = ?",
+                {global_id});
+            if (!existing.empty()) {
+                auto it = existing[0].find("embedding");
+                if (it != existing[0].end() &&
+                    std::holds_alternative<std::vector<uint8_t>>(it->second) &&
+                    std::get<std::vector<uint8_t>>(it->second) == vec_data) {
+                    return false;
+                }
+            }
+        } catch (...) {
+            // Unreadable index row — fall through and rewrite it.
+        }
+        // Join an enclosing transaction if one is open on this connection
+        // (trigger/apply context); otherwise own the write transaction.
+        const bool own_txn = !db_->is_in_transaction();
+        if (own_txn) db_->begin_transaction();
+        try {
+            db_->execute("UPDATE " + vec_table + " SET embedding = ? WHERE global_id = ?",
+                         {vec_data, global_id});
+            db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) "
+                         "SELECT ?, ? WHERE NOT EXISTS "
+                         "(SELECT 1 FROM " + vec_table + " WHERE global_id = ?)",
+                         {global_id, vec_data, global_id});
+            if (own_txn) db_->commit();
+        } catch (...) {
+            if (own_txn) { try { db_->rollback(); } catch (...) {} }
+            throw;
+        }
+        return true;
+    }
+
     /// Reconcile vec0 entries on this connection for a synced row.
-    /// Called when another connection wrote to the model table — vec0
-    /// shadow table changes aren't visible to this connection's virtual table.
+    /// Called when another connection wrote to the model table. Usually a
+    /// no-op read (the writer's triggers already indexed the row) — see
+    /// refresh_vec0_row for why it must never be a blind rewrite.
     void reconcile_vec0(const std::string& table, const std::string& global_id) {
         try {
             auto pattern = "_" + table + "_%_vec";
             auto vec_tables = db().query(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
                 {pattern});
-            LOG_INFO("vec0_reconcile", "table=%s globalId=%s pattern=%s matches=%zu",
-                     table.c_str(), global_id.c_str(), pattern.c_str(), vec_tables.size());
+            LOG_DEBUG("vec0_reconcile", "table=%s globalId=%s pattern=%s matches=%zu",
+                      table.c_str(), global_id.c_str(), pattern.c_str(), vec_tables.size());
 
             for (const auto& vt_row : vec_tables) {
                 auto name_it = vt_row.find("name");
@@ -4756,9 +4810,7 @@ public:
                 auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
                 if (vec_data.empty()) continue;
 
-                db().execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {global_id});
-                db().execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
-                            {global_id, vec_data});
+                refresh_vec0_row(vec_table, global_id, vec_data);
             }
         } catch (...) {
             // Non-fatal — vec0 is an optimization layer
@@ -4859,16 +4911,7 @@ public:
             ensure_vec0_table(model_table, column_name, dimensions);
         }
 
-        // Delete existing entry if any (vec0 doesn't support ON CONFLICT)
-        std::string delete_sql = "DELETE FROM " + vec_table + " WHERE global_id = ?";
-        db_->execute(delete_sql, {global_id});
-
-        // Insert new vector
-        std::string insert_sql = "INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)";
-
-        // Create blob from vector data
-        std::vector<uint8_t> blob_copy = vector_data;
-        db_->execute(insert_sql, {global_id, blob_copy});
+        refresh_vec0_row(vec_table, global_id, vector_data);
     }
 
     /// Delete a vector from the vec0 table.

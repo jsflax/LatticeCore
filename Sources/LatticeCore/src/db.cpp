@@ -750,7 +750,13 @@ void database::begin_transaction(bool exclusive) {
     // inside the busy handler, never to a sleeper.) The deadline, not the
     // per-attempt timeout, bounds the total wait: attempts repeat only for
     // same-connection transaction races, which resolve quickly.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30000);
+    //
+    // The budget is the configured busy timeout, NOT a constant: an
+    // interactive process that opened with busy_timeout_ms=2000 must not
+    // discover its explicit BEGINs still park for 30s (Aug 2026 hook-wedge
+    // incident — two such waits ate a 60s harness deadline whole).
+    const int budget_ms = busy_timeout_ms_ > 0 ? busy_timeout_ms_ : kDefaultBusyTimeoutMs;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
     int rc;
     for (;;) {
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(

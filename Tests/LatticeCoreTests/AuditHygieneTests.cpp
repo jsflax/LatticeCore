@@ -506,3 +506,114 @@ TEST(AuditHygiene, UnknownCheckpointServesFullHistory) {
     EXPECT_EQ(after_unknown.size(), known.size())
         << "unknown checkpoint must fall back to full history, not empty";
 }
+
+// ===========================================================================
+// H3 (Aug 13 2026) — chunk-failure containment: acks survive a failed chunk.
+//
+// A chunk-level failure (BEGIN lock timeout, COMMIT busy) used to unwind out
+// of apply_remote_changes, destroying the applied_ids of EARLIER, already-
+// COMMITTED chunks — durably applied entries were acked to nobody, so the
+// sender re-sent the whole window forever (spoke→hub frozen at
+// progress_acked=215008, four windows cycling at their 300s backoff caps).
+// ===========================================================================
+
+namespace {
+
+std::vector<lattice::audit_log_entry> h3_insert_entries(size_t n) {
+    std::vector<lattice::audit_log_entry> entries;
+    entries.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        lattice::audit_log_entry e;
+        e.global_id = "h3-audit-" + std::to_string(i);
+        e.table_name = "TestPerson";
+        e.operation = "INSERT";
+        e.global_row_id = "h3-person-" + std::to_string(i);
+        e.changed_fields = {
+            {"name", lattice::any_property(std::string("P") + std::to_string(i))},
+            {"age", lattice::any_property(int64_t(20 + (i % 50)))}};
+        e.changed_fields_names = {"name", "age"};
+        e.timestamp = "2026-08-13T12:00:00Z";
+        entries.push_back(std::move(e));
+    }
+    return entries;
+}
+
+// RAII reset: a failing assertion must not leave the hook installed for
+// every later test in the binary.
+struct ChunkHookGuard {
+    ~ChunkHookGuard() { lattice::test_hooks::apply_chunk_begin = nullptr; }
+};
+
+}  // namespace
+
+TEST(AuditHygiene, ChunkFailureStillAcksCommittedChunks) {
+    TempDB tmp{"h3_ack_survival"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    lattice::ensure_cursor_column(db.db());
+    lattice::register_replication_slot(db.db(), "chan-a");
+
+    // apply chunk size is 50: three chunks [0,50) [50,100) [100,120).
+    auto entries = h3_insert_entries(120);
+
+    ChunkHookGuard guard;
+    int hook_calls = 0;
+    lattice::test_hooks::apply_chunk_begin = [&hook_calls](size_t chunk_start) {
+        ++hook_calls;
+        if (chunk_start == 50) throw std::runtime_error("injected chunk failure");
+    };
+
+    auto acked = lattice::apply_remote_changes_for(db, entries, "chan-a");
+
+    // Chunk 1 committed and MUST be acked; the failed chunk (after one
+    // retry) and everything after it are not — the sender re-sends them.
+    ASSERT_EQ(acked.size(), 50u)
+        << "committed chunk's entries must be returned (= acked) despite the later failure";
+    for (size_t i = 0; i < acked.size(); ++i) {
+        EXPECT_EQ(acked[i], "h3-audit-" + std::to_string(i));
+    }
+    EXPECT_EQ(hook_calls, 3) << "chunk 0, failed chunk, exactly one retry";
+
+    auto persons = db.db().query(
+        "SELECT COUNT(*) AS c FROM TestPerson WHERE globalId LIKE 'h3-person-%'", {});
+    EXPECT_EQ(std::get<int64_t>(persons[0].at("c")), 50)
+        << "only the committed chunk's rows may exist";
+
+    // The download cursor must sit at the last COMMITTED entry — a cursor
+    // that leaked from the rolled-back chunk would create a download hole.
+    auto slot = db.db().query(
+        "SELECT last_received_event_id AS lid FROM _lattice_replication_slots "
+        "WHERE sync_id = 'chan-a'", {});
+    ASSERT_FALSE(slot.empty());
+    EXPECT_EQ(std::get<std::string>(slot[0].at("lid")), "h3-audit-49");
+}
+
+TEST(AuditHygiene, ChunkFailureRetriesOnceAndRecovers) {
+    TempDB tmp{"h3_retry_recovers"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    lattice::ensure_cursor_column(db.db());
+    lattice::register_replication_slot(db.db(), "chan-a");
+
+    auto entries = h3_insert_entries(120);
+
+    ChunkHookGuard guard;
+    int failures_left = 1;  // transient: first attempt at chunk 50 fails, retry succeeds
+    lattice::test_hooks::apply_chunk_begin = [&failures_left](size_t chunk_start) {
+        if (chunk_start == 50 && failures_left > 0) {
+            --failures_left;
+            throw std::runtime_error("injected transient failure");
+        }
+    };
+
+    auto acked = lattice::apply_remote_changes_for(db, entries, "chan-a");
+
+    ASSERT_EQ(acked.size(), 120u) << "a transient chunk failure must be absorbed by the retry";
+    auto persons = db.db().query(
+        "SELECT COUNT(*) AS c FROM TestPerson WHERE globalId LIKE 'h3-person-%'", {});
+    EXPECT_EQ(std::get<int64_t>(persons[0].at("c")), 120);
+
+    auto slot = db.db().query(
+        "SELECT last_received_event_id AS lid FROM _lattice_replication_slots "
+        "WHERE sync_id = 'chan-a'", {});
+    ASSERT_FALSE(slot.empty());
+    EXPECT_EQ(std::get<std::string>(slot[0].at("lid")), "h3-audit-119");
+}

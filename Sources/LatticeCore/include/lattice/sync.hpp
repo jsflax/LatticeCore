@@ -251,6 +251,14 @@ struct sync_config {
     /// This enables multiple synchronizers per database without interference.
     std::string sync_id;
 
+    /// Display identity for log lines ONLY — never used as a persistence key.
+    /// Defaults to sync_id when empty. IPC sets it to
+    /// "<sync_id>#<srv|cli>@<db-basename>": hub and spoke sides of one IPC
+    /// channel share the same sync_id, and their interleaved log lines under
+    /// one bare "[ipc:<channel>]" label cost hours of misdiagnosis across two
+    /// incidents (Aug 2026).
+    std::string log_label;
+
     /// All active sync_ids on this database (including this one).
     /// Used for eager cleanup: when all sync_ids have synced an entry,
     /// _lattice_sync_state rows are deleted and isSynchronized=1 is set.
@@ -375,6 +383,14 @@ protected:
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<sync_transport> ws_client_;
+
+    /// Log-line identity: config_.log_label when set, else sync_id. Cached
+    /// so LOG_ macros can take a stable c_str(). Set by init_sync.
+    std::string log_label_cache_;
+    const char* log_id() const {
+        return log_label_cache_.empty() ? config_.sync_id.c_str()
+                                        : log_label_cache_.c_str();
+    }
 
     std::atomic<bool> is_connected_{false};
     std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
@@ -616,6 +632,16 @@ void mark_audit_entries_synced_for(lattice_db& db,
 
 // Get events after a checkpoint (for server-side sync)
 std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
+
+namespace test_hooks {
+/// Test-only failure injection: invoked with chunk_start at the top of every
+/// apply chunk transaction, BEFORE its BEGIN. A test installs a throwing hook
+/// to deterministically simulate a chunk-level failure (lock timeout at
+/// BEGIN/COMMIT) and pin the containment contract: earlier committed chunks'
+/// entries are still returned (= acked), the failed chunk is retried once,
+/// then the delivery stops. nullptr (the default) in production.
+extern std::function<void(size_t chunk_start)> apply_chunk_begin;
+}  // namespace test_hooks
 
 // Apply remote audit log entries to a database (server-side receive path)
 // Disables sync triggers, executes model SQL, inserts AuditLog records, re-enables triggers.

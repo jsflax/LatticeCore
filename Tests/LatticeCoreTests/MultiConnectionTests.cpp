@@ -175,3 +175,26 @@ TEST(MultiConnection, BeginTransactionDeadlineBounded) {
 
     holder.rollback();
 }
+
+TEST(MultiConnection, BeginTransactionHonorsConfiguredBusyTimeout) {
+    // H1.1 (Aug 13 2026 hook wedge): an interactive process that opens with
+    // a small busy_timeout_ms must see its explicit BEGINs bounded by IT.
+    // The deadline was hard-coded to 30s regardless of configuration — two
+    // such waits ate a 60s hook harness deadline whole, with zero output.
+    TempDB tmp{"deadline_cfg"};
+    lattice::database holder(tmp.str());
+    holder.execute("CREATE TABLE t(x INTEGER)");
+    holder.begin_transaction();
+
+    lattice::database contender(tmp.str(), lattice::database::open_mode::read_write, 400);
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_THROW(contender.begin_transaction(), lattice::db_error);
+    auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_GE(waited_ms, 300);
+    EXPECT_LE(waited_ms, 5000)
+        << "configured 400ms budget must bound the BEGIN wait (was hard-coded 30s)";
+
+    holder.rollback();
+}

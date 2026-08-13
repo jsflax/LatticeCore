@@ -513,11 +513,19 @@ void lattice_db::handle_cross_process_notification() {
                 if (vec_data.empty()) continue;
 
                 try {
-                    db().execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {global_id});
-                    db().execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
-                                {global_id, vec_data});
+                    // Idempotent + atomic (refresh_vec0_row): the writer's
+                    // triggers already indexed this row in the common case,
+                    // so this is usually a lock-free read that skips. The
+                    // old blind DELETE+INSERT here — run by EVERY process
+                    // receiving the xproc notification — interleaved across
+                    // processes into 28K UNIQUE failures and a write-lock
+                    // storm that livelocked IPC sync (Aug 13 incident).
+                    refresh_vec0_row(vec_table, global_id, vec_data);
                 } catch (const std::exception& e) {
-                    LOG_WARN("xproc", "vec0 reconcile failed for %s: %s", vec_table.c_str(), e.what());
+                    // Expected under write bursts (lock contention); the
+                    // open-path gap reconcile and knn's count-mismatch
+                    // self-heal cover any row missed here.
+                    LOG_DEBUG("xproc", "vec0 reconcile failed for %s: %s", vec_table.c_str(), e.what());
                 }
             }
         }
@@ -647,6 +655,12 @@ void lattice_db::setup_sync_if_configured() {
     // Always use per-synchronizer sync state
     auto all_ids = collect_all_sync_ids(config_);
     sync_cfg.sync_id = "wss:" + config_.websocket_url;
+    {
+        // Log-only identity (see sync_config::log_label).
+        const auto slash = config_.path.find_last_of('/');
+        sync_cfg.log_label = sync_cfg.sync_id + "@" +
+            (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
+    }
     sync_cfg.all_active_sync_ids = all_ids;
     config_.tuning.apply(sync_cfg);
     // Upload coalescing stays at the library default (0 = legacy immediate
@@ -772,13 +786,20 @@ void lattice_db::setup_ipc_if_configured() {
         auto& sync_slot = ipc_synchronizers_[i].sync;
 
         ipc_synchronizers_[i].endpoint->start(
-            [this, sync_id, all_ids, &target, &sync_slot](std::unique_ptr<ipc_socket_client> transport) {
+            [this, sync_id, all_ids, &target, &sync_slot,
+             ep = ipc_synchronizers_[i].endpoint.get()](std::unique_ptr<ipc_socket_client> transport) {
                 LOG_INFO("ipc_sync", "[%s] Accept callback fired (sync_slot=%s, db=%s)",
                          sync_id.c_str(), sync_slot ? "OCCUPIED" : "empty",
                          config_.path.c_str());
 
                 sync_config ipc_cfg;
                 ipc_cfg.sync_id = sync_id;
+                // Log-only identity: hub and spoke share the same sync_id on
+                // an IPC channel; role + db basename is what makes their
+                // interleaved lines in one process log tell apart.
+                const auto slash = config_.path.find_last_of('/');
+                ipc_cfg.log_label = sync_id + (ep->is_server() ? "#srv@" : "#cli@") +
+                    (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
                 ipc_cfg.all_active_sync_ids = all_ids;
                 ipc_cfg.sync_filter = target.sync_filter;
                 ipc_cfg.narrowing_emits_removals = target.narrowing_emits_removals;

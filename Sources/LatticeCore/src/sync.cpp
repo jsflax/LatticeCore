@@ -579,6 +579,18 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
             server_sent_event event;
             event.event_type = type::replay_request;
             return event;
+
+        } else if (j.contains("rejected")) {
+            // Relay write-policy refusal ({"kind":"rejected","rejected":<reason>}).
+            // Before this branch existed, the frame parsed to nullopt and the
+            // refused entries wedged the upload floor forever (re-sent and
+            // re-refused on every reconnect). Program-plan SB-2b.
+            server_sent_event event;
+            event.event_type = type::rejected;
+            if (j["rejected"].is_string()) {
+                event.rejected_reason = j["rejected"].get<std::string>();
+            }
+            return event;
         }
     } catch (...) {
         return std::nullopt;
@@ -1165,6 +1177,39 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 
                 if (on_sync_complete_) {
                     on_sync_complete_(ids);
+                }
+            });
+
+        } else if (event->event_type == server_sent_event::type::rejected) {
+            // The relay refused our frame whole (write policy). We cannot know
+            // which frame of a pipelined window it was, so resolve EVERYTHING
+            // currently in flight as skipped: over-skipping is recoverable and
+            // observable (the host callback carries the ids); the alternative
+            // — leaving them unACKed — wedges the upload floor permanently and
+            // re-wedges on every reconnect. Loud by design: a policy refusal
+            // means a client wrote something the channel forbids (a bug).
+            auto reason = std::move(event->rejected_reason);
+            scheduler_->invoke([this, reason = std::move(reason)] {
+                if (is_destroyed_) return;
+                std::vector<std::string> skipped;
+                {
+                    std::lock_guard<std::mutex> lock(in_flight_mutex_);
+                    skipped.reserve(in_flight_ids_.size());
+                    for (const auto& [gid, audit_id] : in_flight_ids_) {
+                        skipped.push_back(gid);
+                    }
+                }
+                LOG_ERROR("synchronizer",
+                          "[%s] relay REJECTED frame (%s) — resolving %zu in-flight entries as SKIPPED, not synced",
+                          log_id(), reason.c_str(), skipped.size());
+                if (!skipped.empty()) {
+                    // Same floor bookkeeping as an ack — the entries are
+                    // terminally resolved — but deliberately NOT
+                    // on_sync_complete_: they were never applied anywhere.
+                    mark_as_synced(skipped);
+                }
+                if (on_sync_rejected_) {
+                    on_sync_rejected_(reason, skipped);
                 }
             });
 

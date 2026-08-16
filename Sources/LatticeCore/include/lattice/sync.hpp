@@ -150,11 +150,12 @@ using AuditLogEntryVector = std::vector<audit_log_entry>;
 // ============================================================================
 
 struct server_sent_event {
-    enum class type { audit_log, ack, replay_request };
+    enum class type { audit_log, ack, replay_request, rejected };
 
     type event_type;
     std::vector<audit_log_entry> audit_logs;  // For audit_log type
     std::vector<std::string> acked_ids;       // For ack type (UUIDs)
+    std::string rejected_reason;              // For rejected type (relay write-policy refusal)
 
     // Serialize to JSON
     std::string to_json() const;
@@ -286,6 +287,13 @@ struct sync_config {
 class synchronizer_base {
 public:
     using on_sync_complete_handler = std::function<void(const std::vector<std::string>& synced_ids)>;
+    /// Fired when the relay refuses a frame (write-policy). The refused
+    /// entries are resolved as SKIPPED — never applied server-side — so the
+    /// upload floor can advance instead of wedging forever; hosts should
+    /// surface this loudly (it means a client sent writes the channel's
+    /// policy forbids — a bug, not a transient).
+    using on_sync_rejected_handler = std::function<void(const std::string& reason,
+                                                        const std::vector<std::string>& skipped_ids)>;
     using on_error_handler = std::function<void(const std::string& error)>;
     using on_state_change_handler = std::function<void(bool connected)>;
 
@@ -352,6 +360,7 @@ public:
 
     // Event handlers
     void set_on_sync_complete(on_sync_complete_handler handler) { on_sync_complete_ = std::move(handler); }
+    void set_on_sync_rejected(on_sync_rejected_handler handler) { on_sync_rejected_ = std::move(handler); }
     void set_on_error(on_error_handler handler) { on_error_ = std::move(handler); }
     void set_on_state_change(on_state_change_handler handler) {
         on_state_change_ = std::move(handler);
@@ -495,6 +504,7 @@ protected:
     void reconcile_open_with_db();
 
     on_sync_complete_handler on_sync_complete_;
+    on_sync_rejected_handler on_sync_rejected_;
     on_error_handler on_error_;
     on_state_change_handler on_state_change_;
     mutable std::mutex progress_handler_mutex_;

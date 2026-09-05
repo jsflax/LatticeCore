@@ -7,6 +7,7 @@
 #include <cassert>
 #include <chrono>
 #include <concepts>
+#include <filesystem>
 #include <future>
 #include <thread>
 #include <sqlite-vec.h>
@@ -148,6 +149,37 @@ private:
     std::unordered_map<std::string, double> double_fields_;
     std::unordered_map<std::string, std::vector<uint8_t>> blob_fields_;
     std::unordered_map<std::string, std::shared_ptr<dynamic_object>> link_refs_;
+};
+
+/// What a TRUNCATE checkpoint actually did (swift_lattice::checkpoint).
+struct checkpoint_outcome {
+    bool busy = true;            // a reader/writer held the WAL — nothing could run
+    bool complete = false;       // every WAL frame folded back and the -wal truncated
+    int64_t log_frames = -1;     // frames in the WAL before the call (-1 unavailable)
+    int64_t checkpointed = -1;   // frames folded back (< log_frames = partial)
+};
+
+/// One audit row's HEADER — the columns that precede `changedFields` in the
+/// row, so reading them never walks the payload's overflow chain. What
+/// `Lattice.changeHeaders` yields per delivered change.
+struct audit_header {
+    bool found = false;
+    std::string table_name;
+    std::string operation;
+    int64_t row_id = 0;
+    std::string global_row_id;
+};
+
+/// What reclaim_space did — page counts are the ground truth for "the file
+/// shrank"; `error` is non-empty when VACUUM threw (also in last_bridge_error).
+struct reclaim_result {
+    bool ok = false;
+    int64_t pages_before = -1;
+    int64_t pages_after = -1;
+    int64_t wal_bytes_after = 0;
+    int passes = 0;
+    bool checkpoint_busy = false;
+    std::string error;
 };
 
 // Constraint definition for Swift interop
@@ -870,9 +902,11 @@ public:
     }
 
     /// Checkpoint the WAL file, flushing all changes to the main database file.
-    /// Logs the outcome — TRUNCATE checkpoints silently fail under concurrent
-    /// readers, and an ignored rc is how multi-GB WAL files accumulate.
-    void checkpoint() {
+    /// Logs AND returns the outcome — TRUNCATE checkpoints silently fail under
+    /// concurrent readers, and an ignored rc is how multi-GB WAL files
+    /// accumulate. `busy` 1 = a reader/writer held the WAL; `checkpointed <
+    /// log_frames` = partial.
+    checkpoint_outcome checkpoint() {
         // PRAGMA instead of sqlite3_wal_checkpoint_v2: on Linux this header is
         // compiled in TUs that include sqlite3ext.h, where the C API names are
         // macros over the undeclared sqlite3_api extension pointer. The pragma
@@ -894,6 +928,12 @@ public:
                      busy, nLog, nCkpt,
                      (busy == 0 && nCkpt < nLog) ? " (partial — readers held the WAL)" : "");
         }
+        checkpoint_outcome out;
+        out.busy = busy != 0;
+        out.log_frames = static_cast<int64_t>(nLog);
+        out.checkpointed = static_cast<int64_t>(nCkpt);
+        out.complete = busy == 0 && nLog >= 0 && nCkpt >= nLog;
+        return out;
     }
 
     /// Bounded WAL checkpoint — the sync-pacer recipe (sync.cpp
@@ -1093,15 +1133,99 @@ public:
 
     /// Rebuild the database file, reclaiming unused space.
     /// Closes the read connection before vacuuming and reopens it after.
-    void vacuum() {
+    /// Returns true on success; a failure is LOGGED (it used to vanish inside
+    /// the sealed wrapper — a "vacuum" that did nothing left no trace) and
+    /// rethrown, which the sealed tier turns into `false` + last_bridge_error.
+    ///
+    /// NOTE: in WAL mode VACUUM writes the rebuilt image into the WAL; the
+    /// main file only shrinks at the NEXT checkpoint. Callers that want the
+    /// file size back should use reclaim_space(), which orders the steps.
+    bool vacuum() {
         close_read_db();
         try {
             db().execute("VACUUM");
-        } catch (...) {
+        } catch (const std::exception& e) {
+            LOG_ERROR("swift_lattice", "VACUUM failed: %s", e.what());
             reopen_read_db();
             throw;
         }
         reopen_read_db();
+        return true;
+    }
+
+    /// The whole "give the disk space back" recipe, in the order SQLite needs
+    /// under WAL: release this process's own readers (the pooled read
+    /// generations hold BEGIN transactions that make a TRUNCATE partial) →
+    /// VACUUM (rebuilds the live pages into the WAL) → TRUNCATE checkpoint
+    /// (folds them into the main file and zeroes the WAL) → reopen readers.
+    /// A second pass runs only if the page count did not fall (a checkpoint
+    /// that lost to a concurrent reader). Reports what happened instead of
+    /// pretending: page counts before/after, WAL bytes left, busy flag, and
+    /// the failure message when a step threw.
+    reclaim_result reclaim_space(int max_passes = 2) {
+        reclaim_result r;
+        r.pages_before = page_count_();
+        for (int pass = 1; pass <= std::max(1, max_passes); ++pass) {
+            r.passes = pass;
+            retire_all_read_generations();
+            close_read_db();
+            try {
+                db().execute("VACUUM");
+            } catch (const std::exception& e) {
+                r.error = e.what();
+                LOG_ERROR("swift_lattice", "reclaim_space: VACUUM failed: %s", e.what());
+                reopen_read_db();
+                r.pages_after = page_count_();
+                return r;
+            }
+            auto ck = db().wal_checkpoint(/*truncate=*/true, /*busy_budget_ms=*/2000);
+            r.checkpoint_busy = ck.busy != 0;
+            reopen_read_db();
+            r.pages_after = page_count_();
+            if (r.pages_after < r.pages_before || !r.checkpoint_busy) break;
+        }
+        std::error_code ec;
+        const auto wal = std::filesystem::file_size(path() + "-wal", ec);
+        r.wal_bytes_after = ec ? 0 : static_cast<int64_t>(wal);
+        r.ok = r.error.empty();
+        LOG_INFO("swift_lattice", "reclaim_space: pages %lld -> %lld, wal=%lld bytes, passes=%d, busy=%d",
+                 (long long)r.pages_before, (long long)r.pages_after, (long long)r.wal_bytes_after,
+                 r.passes, r.checkpoint_busy ? 1 : 0);
+        return r;
+    }
+
+    int64_t page_count_() {
+        try {
+            auto rows = db().query("PRAGMA page_count", {});
+            if (!rows.empty()) {
+                const auto& v = rows[0].begin()->second;
+                if (const auto* i = std::get_if<int64_t>(&v)) return *i;
+            }
+        } catch (...) {}
+        return -1;
+    }
+
+    /// The header columns of one audit row (see `audit_header`). Selects only
+    /// columns declared BEFORE `changedFields`, so a 300 KB payload row costs
+    /// the same as an empty one.
+    audit_header audit_header_for(int64_t audit_id) {
+        audit_header h;
+        auto rows = read_db().query(
+            "SELECT tableName, operation, rowId, globalRowId FROM AuditLog WHERE id = ?", {audit_id});
+        if (rows.empty()) return h;
+        const auto& r = rows[0];
+        auto str = [&](const char* k) {
+            auto it = r.find(k);
+            return (it != r.end() && std::holds_alternative<std::string>(it->second))
+                ? std::get<std::string>(it->second) : std::string();
+        };
+        h.found = true;
+        h.table_name = str("tableName");
+        h.operation = str("operation");
+        h.global_row_id = str("globalRowId");
+        auto it = r.find("rowId");
+        if (it != r.end() && std::holds_alternative<int64_t>(it->second)) h.row_id = std::get<int64_t>(it->second);
+        return h;
     }
 
     const std::string& path() const { return config().path; }
@@ -3530,9 +3654,47 @@ public:
     int64_t vacuum_vec0(const std::string& table, const std::string& column) const {
         return sealed([&] { return impl().vacuum_vec0(table, column); });
     }
-    void vacuum() const { sealed([&] { impl().vacuum(); }); }
+    /// false when VACUUM threw — the message is in last_query_error().
+    bool vacuum() const { return sealed([&] { return impl().vacuum(); }); }
+    /// VACUUM + TRUNCATE checkpoint in the order WAL mode needs; see swift_lattice::reclaim_space.
+    reclaim_result reclaim_space(int max_passes = 2) const
+        SWIFT_NAME(reclaimSpace(maxPasses:)) {
+        return sealed([&] { return impl().reclaim_space(max_passes); });
+    }
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
         return sealed([&] { return impl().safe_compact_audit_log(stale_threshold_seconds); });
+    }
+    /// Age-based, cursor-safe history prune (see lattice_db::prune_audit_log).
+    int64_t prune_audit_log(int64_t retention_seconds) const
+        SWIFT_NAME(pruneAuditLog(retentionSeconds:)) {
+        return sealed([&] { return impl().prune_audit_log(retention_seconds); });
+    }
+    void record_audit_watermark() const SWIFT_NAME(recordAuditWatermark()) {
+        sealed([&] { impl().record_audit_watermark(); });
+    }
+    /// Test-only: shift every recorded watermark `seconds` into the past.
+    void backdate_audit_watermarks(int64_t seconds) const SWIFT_NAME(backdateAuditWatermarks(seconds:)) {
+        sealed([&] { impl().backdate_audit_watermarks(seconds); });
+    }
+    void set_replication_slot_observer(const std::string& sync_id, bool is_observer) const
+        SWIFT_NAME(setReplicationSlotObserver(syncId:isObserver:)) {
+        sealed([&] { impl().set_replication_slot_observer(sync_id, is_observer); });
+    }
+    /// Header of one audit row without touching its payload (changeHeaders).
+    audit_header audit_header_for(int64_t audit_id) const SWIFT_NAME(auditHeader(id:)) {
+        return sealed([&] { return impl().audit_header_for(audit_id); });
+    }
+    /// no_history late-binding for audit rows serialized OUTSIDE core (the
+    /// Swift relay's observer push): the live values of `columns` for one row
+    /// as the wire JSON object ({"col":{"kind":..,"value":..}}); "{}" when the
+    /// row is gone. See lattice::late_bind_no_history.
+    std::string no_history_live_values_json(const std::string& table_name,
+                                            const std::string& global_row_id,
+                                            const std::vector<std::string>& columns) const
+        SWIFT_NAME(noHistoryLiveValuesJSON(tableName:globalRowId:columns:)) {
+        return sealed([&] {
+            return lattice::no_history_live_values_json(impl().db(), table_name, global_row_id, columns);
+        });
     }
     int64_t normalize_audit_timestamps() const
         SWIFT_NAME(normalizeAuditTimestamps()) {
@@ -3542,10 +3704,14 @@ public:
         return sealed([&] { return impl().force_compact_audit_log(); });
     }
     void backdate_replication_slots(int64_t seconds) const { impl().backdate_replication_slots(seconds); }
-    void checkpoint() const { impl().checkpoint(); }
+    /// The TRUNCATE checkpoint's real outcome (busy / partial / complete).
+    checkpoint_outcome checkpoint() const { return impl().checkpoint(); }
+    /// Frames checkpointed; -1 when nothing could run; -2 when the call THREW
+    /// (distinct from a legitimate 0 — the sealed default used to collide).
     int64_t checkpoint_bounded(int64_t busy_budget_ms = 250) const
         SWIFT_NAME(checkpointBounded(busyBudgetMs:)) {
-        return sealed([&] { return impl().checkpoint_bounded(busy_budget_ms); });
+        const int64_t frames = sealed([&] { return impl().checkpoint_bounded(busy_budget_ms); });
+        return last_bridge_error().empty() ? frames : -2;
     }
     void optimize() const { impl().optimize(); }
 

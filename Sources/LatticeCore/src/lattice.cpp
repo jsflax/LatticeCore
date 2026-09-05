@@ -662,6 +662,7 @@ void lattice_db::setup_sync_if_configured() {
             (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
     }
     sync_cfg.all_active_sync_ids = all_ids;
+    sync_cfg.is_observer = config_.sync_is_observer;
     config_.tuning.apply(sync_cfg);
     // Upload coalescing stays at the library default (0 = legacy immediate
     // dispatch): with the upload floor + classify gating, passes are cheap,
@@ -801,6 +802,7 @@ void lattice_db::setup_ipc_if_configured() {
                 ipc_cfg.log_label = sync_id + (ep->is_server() ? "#srv@" : "#cli@") +
                     (slash == std::string::npos ? config_.path : config_.path.substr(slash + 1));
                 ipc_cfg.all_active_sync_ids = all_ids;
+                ipc_cfg.is_observer = config_.sync_is_observer;
                 ipc_cfg.sync_filter = target.sync_filter;
                 ipc_cfg.narrowing_emits_removals = target.narrowing_emits_removals;
                 config_.tuning.apply(ipc_cfg);

@@ -118,6 +118,10 @@ struct property_descriptor {
     std::string column_name;                    // custom column name (empty = use field name)
     bool is_union = false;                      // true when kind == union_type
     union_descriptor union_desc;                // populated when is_union == true
+    // Appended LAST (1.5.0) so Swift's imported memberwise init keeps its
+    // existing argument order and only gains a trailing `no_history:`.
+    bool no_history = false;                    // true: UPDATE audit rows record that the column changed, not its value
+                                                // (a streamed/growing column — sync late-binds the live value)
 };
 
 // Type trait to detect geo_bounds types (single value)

@@ -1269,6 +1269,51 @@ extern "C" int64_t lattice_db_generate_history(lattice_db_t* db) {
     }
 }
 
+extern "C" int64_t lattice_db_prune_audit_log(lattice_db_t* db, int64_t retention_seconds) {
+    if (!db) { set_error("null argument"); return -1; }
+    try {
+        return reinterpret_cast<lattice_db_internal*>(db)->get()->prune_audit_log(retention_seconds);
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    }
+}
+
+extern "C" lattice_status_t lattice_db_record_audit_watermark(lattice_db_t* db) {
+    if (!db) { set_error("null argument"); return LATTICE_ERROR_NULL_POINTER; }
+    try {
+        reinterpret_cast<lattice_db_internal*>(db)->get()->record_audit_watermark();
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
+extern "C" int64_t lattice_db_reclaim_space(lattice_db_t* db) {
+    if (!db) { set_error("null argument"); return -1; }
+    try {
+        auto r = reinterpret_cast<lattice_db_internal*>(db)->get()->reclaim_space();
+        if (!r.ok) { set_error(r.error.c_str()); return -1; }
+        return r.pages_after;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return -1;
+    }
+}
+
+extern "C" lattice_status_t lattice_db_set_slot_observer(lattice_db_t* db, const char* sync_id, int32_t is_observer) {
+    if (!db || !sync_id) { set_error("null argument"); return LATTICE_ERROR_NULL_POINTER; }
+    try {
+        reinterpret_cast<lattice_db_internal*>(db)->get()->set_replication_slot_observer(
+            std::string(sync_id), is_observer != 0);
+        return LATTICE_OK;
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return LATTICE_ERROR_DATABASE;
+    }
+}
+
 extern "C" void lattice_string_free(char* str) {
     if (str) {
         free(str);
@@ -2196,6 +2241,10 @@ extern "C" void lattice_sync_options_init(lattice_sync_options_t* options) {
     options->use_upload_floor = -1;
     options->sync_filter_json = nullptr;
     options->sync_id = nullptr;
+    // 1.5.0 tail fields — sentinels keep the library defaults (retention off,
+    // writer slots), which is also what an older, shorter caller struct means.
+    options->audit_retention_seconds = -1;
+    options->sync_is_observer = -1;
 }
 
 extern "C" lattice_db_t* lattice_db_create_with_sync_options(
@@ -2255,6 +2304,14 @@ extern "C" lattice_db_t* lattice_db_create_with_sync_options(
         config.set_sync_checkpoint_truncate_interval_ms(opts.checkpoint_truncate_interval_ms);
         if (opts.use_upload_floor >= 0) {
             config.set_sync_use_upload_floor(opts.use_upload_floor != 0);
+        }
+        // 1.5.0 tail fields: -1 (the init sentinel, and what an older caller's
+        // shorter struct leaves behind) keeps the library defaults.
+        if (opts.audit_retention_seconds >= 0) {
+            config.audit_retention_seconds = opts.audit_retention_seconds;
+        }
+        if (opts.sync_is_observer >= 0) {
+            config.sync_is_observer = opts.sync_is_observer != 0;
         }
 
         if (opts.sync_filter_json) {

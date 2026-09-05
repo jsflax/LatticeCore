@@ -506,6 +506,21 @@ struct configuration {
     /// a small value (e.g. 5000) so a stuck writer can't hang the UI thread.
     int busy_timeout_ms = kDefaultBusyTimeoutMs;
 
+    /// Audit-history retention, in seconds. 0 = keep forever (the pre-1.5
+    /// behavior). When > 0 the database runs one small maintenance thread
+    /// that prunes AuditLog entries every attached process has already
+    /// delivered — see prune_audit_log(). Cursor-safe: ids are never
+    /// renumbered, and N processes on one file share one prune per window.
+    int64_t audit_retention_seconds = 0;
+
+    /// This database's OWN sync connections register their replication slot
+    /// as an OBSERVER: a read-only dial whose upload floor never advances.
+    /// Observer slots are excluded from the compaction floor so a read-only
+    /// replica can still prune its history. Set for read-only / observer-token
+    /// connections; never inferred from the sync filter (an empty filter
+    /// means "upload everything", not "observer").
+    bool sync_is_observer = false;
+
     /// Sync tuning knobs, forwarded verbatim into every synchronizer this
     /// database creates (WSS and IPC). Every field is optional: unset means
     /// "keep sync_config's default" — this struct never re-states defaults,
@@ -907,6 +922,7 @@ public:
         adopt_path_wal_eviction_threshold();
         LOG_DEBUG("lattice_db", "setup_cross_process_notifier");
         setup_cross_process_notifier();
+        start_audit_maintenance();   // no-op unless audit_retention_seconds > 0
         LOG_DEBUG("lattice_db", "ctor done");
     }
 
@@ -3335,15 +3351,16 @@ public:
             db_->execute("DELETE FROM AuditLog");
             db_->execute("DELETE FROM _lattice_sync_state");
             db_->execute("DELETE FROM _lattice_sync_set");
-            // Reset AUTOINCREMENT counter so new entries start from 1.
-            // Without this, VACUUM preserves the counter and new entries
-            // get IDs in the millions, causing cursor comparison confusion.
-            db_->execute("DELETE FROM sqlite_sequence WHERE name = 'AuditLog'");
+            // The AUTOINCREMENT sequence is deliberately KEPT (1.5.0). Every
+            // attached process seeds its cross-process cursor from MAX(id)
+            // and reads forward, and the relay's observer-push cursor is a
+            // raw pk: restarting ids at 1 put every regenerated row BELOW
+            // those cursors, so siblings and push subscribers went silent
+            // until they reopened. Regenerated snapshots now take ids above
+            // the old maximum and flow through every live cursor.
             // Reset replication slots rather than delete — synchronizers
-            // don't need to re-register, they just re-sync from the start.
-            // upload_floor must reset with the cursor: sqlite_sequence was
-            // just zeroed, so a surviving floor would sit above every new id
-            // and silently skip the entire regenerated history.
+            // don't need to re-register, they just re-sync from the start:
+            // a zero floor re-enumerates the regenerated history.
             db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0");
             db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
         } catch (...) {
@@ -3411,9 +3428,13 @@ public:
         // unacked lower ids; observed live: 1,087 entries pending BELOW a
         // channel's confirmed). Compacting to it deletes un-uploaded history
         // unrecoverably; compacting to the floor is exactly safe.
+        // Observer slots (this database's own read-only dials) never advance
+        // a floor and are excluded — otherwise a read-only replica could never
+        // prune its own history. The column is added lazily on legacy files.
+        ensure_observer_column(*db_);
         auto rows = db_->query(
             "SELECT COUNT(*) as cnt, MIN(upload_floor) as safe_id "
-            "FROM _lattice_replication_slots");
+            "FROM _lattice_replication_slots WHERE is_observer = 0");
 
         if (rows.empty()) return -1;
 
@@ -3441,39 +3462,129 @@ public:
         // (flag flipped but rows half-deleted, or AuditLog pruned with its
         // sync-state rows orphaned); a transaction makes crash = clean
         // rollback, including the _SyncControl flag flip.
-        const int64_t prev_disabled = read_sync_disabled_flag();
+        return delete_audit_below_(safe_id, audit_cursor_row_needed_());
+    }
 
-        // The newest isFromRemote row is the LEGACY download-resume cursor.
-        // Since the cursor moved into _lattice_replication_slots
-        // (last_received_event_id, written per applied chunk and eagerly
-        // seeded), the row only needs preserving while some slot still has a
-        // NULL cursor — i.e. a channel that has neither seeded nor received
-        // since the upgrade. Once every slot carries a cursor, compaction may
-        // reclaim the row.
-        bool preserve_cursor_row = true;
-        {
-            bool has_cursor_col = false;
-            for (const auto& row : db_->query(
-                     "PRAGMA table_info(_lattice_replication_slots)", {})) {
-                auto it = row.find("name");
-                if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
-                    std::get<std::string>(it->second) == "last_received_event_id") {
-                    has_cursor_col = true;
-                    break;
-                }
-            }
-            if (has_cursor_col) {
-                auto nulls = db_->query(
-                    "SELECT COUNT(*) AS c FROM _lattice_replication_slots "
-                    "WHERE last_received_event_id IS NULL");
-                if (!nulls.empty() &&
-                    std::holds_alternative<int64_t>(nulls[0].at("c")) &&
-                    std::get<int64_t>(nulls[0].at("c")) == 0) {
-                    preserve_cursor_row = false;
-                }
+    /// Retention-based pruning — the cursor-safe tear-out for a store that
+    /// has NO sync partners (every local Orbital room, every single-process
+    /// app), and an additional bound for one that has them.
+    ///
+    /// What "safe" means here: the audit log's only local readers are the
+    /// live change feeds — each attached process seeds a cursor from MAX(id)
+    /// at open and reads forward, and a fresh open never replays history —
+    /// so an entry is dead once every process has delivered it, which is
+    /// milliseconds after its commit. The bound is therefore INSERTION time,
+    /// not the row's `timestamp` column: applied remote rows keep their
+    /// origin timestamp (older than their insertion), and a timestamp-based
+    /// bound would either delete fresh rows sitting below a stale one or
+    /// force a scan through every row's payload (the column sits after
+    /// `changedFields`, so reading it walks the overflow chain).
+    ///
+    /// Insertion time is tracked by WATERMARKS: `record_audit_watermark()`
+    /// stores (now, MAX(id)) in `_lattice_meta` (key `audit_wm:<epoch>`), and
+    /// the prune bound is the largest id recorded at or before
+    /// `now - retention`: every id at or below it existed a full retention
+    /// window ago. O(1) per sample, no index, no scan, immune to timestamp
+    /// skew. The first prune lands one window after sampling began.
+    ///
+    /// With replication slots the bound is additionally capped by the
+    /// MIN(upload_floor) over NON-observer slots (a synchronizer needs the
+    /// history it has not uploaded); observer slots are ignored. Never
+    /// touches sqlite_sequence. Returns rows removed.
+    int64_t prune_audit_log(int64_t retention_seconds) {
+        if (retention_seconds <= 0) return 0;
+        const double now = now_epoch_();
+        const double cutoff = now - static_cast<double>(retention_seconds);
+        record_audit_watermark_(now);   // always sample, so a bound exists next time
+        auto wm = audit_watermark_before_(cutoff);
+        if (!wm || *wm <= 0) return 0;
+        int64_t bound = *wm;
+
+        ensure_observer_column(*db_);
+        auto rows = db_->query(
+            "SELECT COUNT(*) AS cnt, MIN(upload_floor) AS floor "
+            "FROM _lattice_replication_slots WHERE is_observer = 0");
+        if (!rows.empty()) {
+            int64_t cnt = 0;
+            if (const auto* c = std::get_if<int64_t>(&rows[0].at("cnt"))) cnt = *c;
+            if (cnt > 0) {
+                int64_t floor = 0;
+                if (const auto* f = std::get_if<int64_t>(&rows[0].at("floor"))) floor = *f;
+                bound = std::min(bound, floor);
             }
         }
+        if (bound <= 0) return 0;
 
+        // Samples older than one window BEFORE the cutoff can never be the
+        // bound again — drop them so the meta table stays a handful of rows.
+        db_->execute(
+            "DELETE FROM _lattice_meta WHERE key LIKE 'audit_wm:%' "
+            "AND CAST(substr(key, 10) AS REAL) < ?",
+            {cutoff - static_cast<double>(retention_seconds)});
+        return delete_audit_below_(bound, audit_cursor_row_needed_());
+    }
+
+    /// Store a (now, MAX(id)) watermark for prune_audit_log(). Cheap (one
+    /// pk-btree MAX + one meta upsert); safe to call from any process.
+    void record_audit_watermark() { record_audit_watermark_(now_epoch_()); }
+
+    /// Backdate every recorded watermark by `seconds` (test-only, the
+    /// `backdate_replication_slots` counterpart): makes "a retention window
+    /// elapsed" deterministic without wall-clock sleeps.
+    void backdate_audit_watermarks(int64_t seconds) {
+        auto rows = db_->query("SELECT key, value FROM _lattice_meta WHERE key LIKE 'audit_wm:%'", {});
+        for (const auto& row : rows) {
+            const auto* key = std::get_if<std::string>(&row.at("key"));
+            const auto* value = std::get_if<std::string>(&row.at("value"));
+            if (!key || !value) continue;
+            const int64_t when = std::atoll(key->c_str() + 9);   // strlen("audit_wm:") == 9
+            db_->execute("DELETE FROM _lattice_meta WHERE key = ?", {*key});
+            db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                         {std::string("audit_wm:") + std::to_string(when - seconds), *value});
+        }
+    }
+
+    /// Flip one of this database's replication slots to/from observer.
+    void set_replication_slot_observer(const std::string& sync_id, bool is_observer) {
+        lattice::set_replication_slot_observer(*db_, sync_id, is_observer);
+    }
+
+    // ---- compaction internals (shared by safe_compact_audit_log / prune_audit_log)
+
+    /// The newest isFromRemote row is the LEGACY download-resume cursor.
+    /// Since the cursor moved into _lattice_replication_slots
+    /// (last_received_event_id, written per applied chunk and eagerly
+    /// seeded), the row only needs preserving while some slot still has a
+    /// NULL cursor — i.e. a channel that has neither seeded nor received
+    /// since the upgrade. Once every slot carries a cursor, compaction may
+    /// reclaim the row.
+    bool audit_cursor_row_needed_() {
+        bool has_cursor_col = false;
+        for (const auto& row : db_->query(
+                 "PRAGMA table_info(_lattice_replication_slots)", {})) {
+            auto it = row.find("name");
+            if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+                std::get<std::string>(it->second) == "last_received_event_id") {
+                has_cursor_col = true;
+                break;
+            }
+        }
+        if (!has_cursor_col) return true;
+        auto nulls = db_->query(
+            "SELECT COUNT(*) AS c FROM _lattice_replication_slots "
+            "WHERE last_received_event_id IS NULL");
+        return nulls.empty() ||
+               !std::holds_alternative<int64_t>(nulls[0].at("c")) ||
+               std::get<int64_t>(nulls[0].at("c")) != 0;
+    }
+
+    /// Delete AuditLog entries with id <= safe_id (and their per-sync state)
+    /// in ONE transaction. The bare autocommit sequence could commit a mixed
+    /// state on mid-pass crash (flag flipped but rows half-deleted, or
+    /// AuditLog pruned with its sync-state rows orphaned); a transaction
+    /// makes crash = clean rollback, including the _SyncControl flag flip.
+    int64_t delete_audit_below_(int64_t safe_id, bool preserve_cursor_row) {
+        const int64_t prev_disabled = read_sync_disabled_flag();
         int64_t deleted = 0;
         // Receipts may not exist yet on a database that has never applied
         // remote entries — the prune below must not abort the transaction.
@@ -3507,8 +3618,102 @@ public:
             try { db_->rollback(); } catch (...) {}
             throw;
         }
-
         return deleted;
+    }
+
+    double now_epoch_() const {
+        auto rows = db_->query("SELECT unixepoch('subsec') AS t", {});
+        if (rows.empty()) return 0;
+        const auto& v = rows[0].at("t");
+        if (const auto* d = std::get_if<double>(&v)) return *d;
+        if (const auto* i = std::get_if<int64_t>(&v)) return static_cast<double>(*i);
+        return 0;
+    }
+
+    void record_audit_watermark_(double now) {
+        auto rows = db_->query("SELECT COALESCE(MAX(id), 0) AS m FROM AuditLog", {});
+        int64_t max_id = 0;
+        if (!rows.empty()) {
+            if (const auto* m = std::get_if<int64_t>(&rows[0].at("m"))) max_id = *m;
+        }
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {std::string("audit_wm:") + std::to_string(static_cast<int64_t>(now)),
+                      std::to_string(max_id)});
+    }
+
+    /// Largest recorded MAX(id) among watermarks taken at or before `cutoff`.
+    std::optional<int64_t> audit_watermark_before_(double cutoff) const {
+        auto rows = db_->query(
+            "SELECT MAX(CAST(value AS INTEGER)) AS m FROM _lattice_meta "
+            "WHERE key LIKE 'audit_wm:%' AND CAST(substr(key, 10) AS REAL) <= ?",
+            {cutoff});
+        if (rows.empty()) return std::nullopt;
+        if (const auto* m = std::get_if<int64_t>(&rows[0].at("m"))) return *m;
+        return std::nullopt;
+    }
+
+    // ---- retention maintenance thread (armed only when audit_retention_seconds > 0)
+
+    void start_audit_maintenance() {
+        if (config_.read_only || config_.audit_retention_seconds <= 0) return;
+        if (audit_maint_thread_.joinable()) return;
+        audit_maint_thread_ = std::thread([this] {
+            const auto period = std::chrono::seconds(
+                std::max<int64_t>(1, config_.audit_retention_seconds / 2));
+            std::unique_lock<std::mutex> lock(audit_maint_mutex_);
+            for (;;) {
+                audit_maint_cv_.wait_for(lock, period, [this] { return audit_maint_stop_; });
+                if (audit_maint_stop_) return;
+                // DB work runs with the maintenance mutex RELEASED (the pacer's
+                // ABBA lesson: connection work under a wake-up mutex deadlocks
+                // against a writer whose change hook wants that mutex).
+                lock.unlock();
+                run_audit_retention_tick();
+                lock.lock();
+                if (audit_maint_stop_) return;
+            }
+        });
+    }
+
+    void stop_audit_maintenance() {
+        {
+            std::lock_guard<std::mutex> lock(audit_maint_mutex_);
+            audit_maint_stop_ = true;
+        }
+        audit_maint_cv_.notify_all();
+        if (audit_maint_thread_.joinable()) audit_maint_thread_.join();
+    }
+
+    /// One retention tick. N handles/processes on one file coordinate through
+    /// `_lattice_meta['audit_prune_at']`: whoever finds it older than half a
+    /// window stamps it and prunes; everyone else just records a watermark
+    /// so sampling never starves. Busy/locked errors are ordinary here (a
+    /// writer mid-transaction) — logged at debug, retried next tick.
+    void run_audit_retention_tick() {
+        if (closed_.load(std::memory_order_acquire)) return;
+        try {
+            const double now = now_epoch_();
+            const double half = static_cast<double>(config_.audit_retention_seconds) / 2.0;
+            auto rows = db_->query(
+                "SELECT CAST(value AS REAL) AS t FROM _lattice_meta WHERE key = 'audit_prune_at'", {});
+            if (!rows.empty()) {
+                double last = 0;
+                const auto& v = rows[0].at("t");
+                if (const auto* d = std::get_if<double>(&v)) last = *d;
+                else if (const auto* i = std::get_if<int64_t>(&v)) last = static_cast<double>(*i);
+                if (now - last < half) { record_audit_watermark_(now); return; }
+            }
+            db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?)",
+                         {std::to_string(now)});
+            const int64_t removed = prune_audit_log(config_.audit_retention_seconds);
+            if (removed > 0) {
+                LOG_INFO("lattice_db", "audit retention: pruned %lld entries older than %llds (path=%s)",
+                         (long long)removed, (long long)config_.audit_retention_seconds,
+                         config_.path.c_str());
+            }
+        } catch (const std::exception& e) {
+            LOG_DEBUG("lattice_db", "audit retention tick skipped: %s", e.what());
+        }
     }
 
     /// Backdate all replication slots' last_active_at by the given number of seconds.
@@ -3548,15 +3753,26 @@ public:
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
 
         try {
-            // Get all user tables (exclude system tables and virtual/auxiliary tables)
+            // Get all user tables (exclude system tables and virtual/auxiliary tables).
             // R*Tree creates shadow tables like _Table_col_rtree_node, _Table_col_rtree_rowid, etc.
+            // Underscore-prefixed tables are NOT excluded wholesale any more (1.5.0):
+            // model LINK tables (`_Parent_prop`, lhs/rhs[/rhs_type]) are real synced
+            // tables with real audit rows, and a compaction that skipped them
+            // regenerated every row DETACHED from its relationships — a fresh
+            // peer then held the rows but none of the links. Each table is
+            // classified by its columns below; internal/shadow tables are skipped
+            // by name here and by shape there.
             auto tables = db_->query(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name NOT LIKE 'sqlite_%' "
-                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', '_lattice_sync_set', '_lattice_replication_slots') "
+                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', "
+                "                 '_lattice_sync_set', '_lattice_replication_slots', '_lattice_applied_receipts') "
+                "AND name NOT LIKE '\\_lattice\\_%' ESCAPE '\\' "
                 "AND name NOT LIKE '%_vec0' "
                 "AND name NOT LIKE '%_rtree%' "
-                "AND name NOT LIKE '\\_%' ESCAPE '\\'");
+                "AND name NOT LIKE '%\\_fts' ESCAPE '\\' "
+                "AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\' "
+                "AND name NOT LIKE '%\\_old' ESCAPE '\\'");
 
             int64_t total_entries = 0;
 
@@ -3570,42 +3786,76 @@ public:
                 // Get column info for this table
                 auto cols = db_->query("PRAGMA table_info(" + table_name + ")");
 
-                std::ostringstream json_cols;
-                std::ostringstream json_names;
-                bool first = true;
-
+                // Classify by SHAPE, not by name: a link table has lhs/rhs/globalId
+                // and no id (its live trigger writes rowId 0 and the link row's
+                // globalId); a model table has id + globalId; anything else
+                // (FTS shadow tables, unknown internals) has no audit shape and
+                // is skipped instead of failing the whole regeneration.
+                bool has_id = false, has_global = false, has_lhs = false, has_rhs = false, has_rhs_type = false;
                 for (const auto& col : cols) {
                     auto name_it = col.find("name");
-                    auto type_it = col.find("type");
-                    if (name_it == col.end() || !std::holds_alternative<std::string>(name_it->second))
-                        continue;
-
-                    std::string col_name = std::get<std::string>(name_it->second);
-                    // Skip id and globalId - they're handled separately
-                    if (col_name == "id" || col_name == "globalId")
-                        continue;
-
-                    std::string col_type;
-                    if (type_it != col.end() && std::holds_alternative<std::string>(type_it->second)) {
-                        col_type = std::get<std::string>(type_it->second);
-                    }
-
-                    if (!first) {
-                        json_cols << ", ";
-                        json_names << ", ";
-                    }
-                    first = false;
-
-                    // Wrap BLOB columns with hex() for JSON compatibility
-                    if (col_type == "BLOB") {
-                        json_cols << "'" << col_name << "', hex(" << col_name << ")";
-                    } else {
-                        json_cols << "'" << col_name << "', " << col_name;
-                    }
-                    json_names << "'" << col_name << "'";
+                    if (name_it == col.end() || !std::holds_alternative<std::string>(name_it->second)) continue;
+                    const auto& n = std::get<std::string>(name_it->second);
+                    if (n == "id") has_id = true;
+                    else if (n == "globalId") has_global = true;
+                    else if (n == "lhs") has_lhs = true;
+                    else if (n == "rhs") has_rhs = true;
+                    else if (n == "rhs_type") has_rhs_type = true;
                 }
+                const bool is_link = has_lhs && has_rhs && has_global && !has_id;
+                if (!is_link && !(has_id && has_global)) continue;   // no audit shape
 
-                if (first) continue;  // No columns to track
+                std::ostringstream json_cols;
+                std::ostringstream json_names;
+                std::string row_id_expr = "id";
+                std::string order_expr = "t.id";
+
+                if (is_link) {
+                    // Exactly the live link trigger's payload (create_link_table_triggers /
+                    // create_virtual_link_table_triggers) so a receiver applies a
+                    // regenerated link the same way it applies a live one.
+                    json_cols << "'lhs', lhs, 'rhs', rhs";
+                    json_names << "'lhs', 'rhs'";
+                    if (has_rhs_type) {
+                        json_cols << ", 'rhs_type', rhs_type";
+                        json_names << ", 'rhs_type'";
+                    }
+                    row_id_expr = "0";
+                    order_expr = "t.rowid";
+                } else {
+                    bool first = true;
+                    for (const auto& col : cols) {
+                        auto name_it = col.find("name");
+                        auto type_it = col.find("type");
+                        if (name_it == col.end() || !std::holds_alternative<std::string>(name_it->second))
+                            continue;
+
+                        std::string col_name = std::get<std::string>(name_it->second);
+                        // Skip id and globalId - they're handled separately
+                        if (col_name == "id" || col_name == "globalId")
+                            continue;
+
+                        std::string col_type;
+                        if (type_it != col.end() && std::holds_alternative<std::string>(type_it->second)) {
+                            col_type = std::get<std::string>(type_it->second);
+                        }
+
+                        if (!first) {
+                            json_cols << ", ";
+                            json_names << ", ";
+                        }
+                        first = false;
+
+                        // Wrap BLOB columns with hex() for JSON compatibility
+                        if (col_type == "BLOB") {
+                            json_cols << "'" << col_name << "', hex(" << col_name << ")";
+                        } else {
+                            json_cols << "'" << col_name << "', " << col_name;
+                        }
+                        json_names << "'" << col_name << "'";
+                    }
+                    if (first) continue;  // No columns to track
+                }
 
                 // Insert audit entries in batches to avoid a single huge INSERT.
                 // Each iteration commits its own transaction; the `NOT EXISTS` check
@@ -3613,7 +3863,7 @@ public:
                 std::ostringstream sql;
                 sql << "INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, "
                     << "changedFields, changedFieldsNames, isSynchronized, timestamp, synthesized) "
-                    << "SELECT '" << table_name << "', 'INSERT', id, globalId, "
+                    << "SELECT '" << table_name << "', 'INSERT', " << row_id_expr << ", globalId, "
                     << "json_object(" << json_cols.str() << "), "
                     << "json_array(" << json_names.str() << "), "
                     << "0, unixepoch('subsec'), " << (mark_synthesized ? 1 : 0) << " "
@@ -3623,7 +3873,7 @@ public:
                     << "  WHERE a.tableName = '" << table_name << "' "
                     << "  AND a.globalRowId = t.globalId"
                     << ") "
-                    << "ORDER BY t.id "
+                    << "ORDER BY " << order_expr << " "
                     << "LIMIT " << batch_size;
                 std::string batch_sql = sql.str();
 
@@ -5400,6 +5650,12 @@ private:
     // (one per path per process). This is a non-owning pointer for post_notification.
     cross_process_notifier* shared_xproc_notifier_ = nullptr;
     std::atomic<int64_t> last_seen_audit_id_{0};
+
+    // Audit-retention maintenance thread (see start_audit_maintenance()).
+    std::thread audit_maint_thread_;
+    std::mutex audit_maint_mutex_;
+    std::condition_variable audit_maint_cv_;
+    bool audit_maint_stop_ = false;
     // Shared mutex captured by the xproc callback lambda so it outlives this
     // object.  The destructor locks it while unregistering, preventing the
     // callback from accessing a partially-destroyed lattice_db.
@@ -5652,8 +5908,19 @@ private:
         sql << ")";
         db_->execute(sql.str());
 
-        // Create audit triggers for sync/observation
-        create_model_table_triggers(schema.table_name, columns);
+        // Create audit triggers for sync/observation — with the schema's
+        // no_history set, and the marker ensure_audit_triggers compares on
+        // later opens (a fresh table took this path, not recreate_…).
+        std::set<std::string> no_history;
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::primitive && !prop.is_geo_bounds && prop.no_history) {
+                no_history.insert(prop.name);
+            }
+        }
+        create_model_table_triggers(schema.table_name, columns, no_history);
+        ensure_lattice_meta_table();
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {"trigger_flags:" + schema.table_name, no_history_marker(schema)});
 
         // Create R*Tree tables for geo_bounds properties
         for (const auto& prop : schema.properties) {
@@ -5913,6 +6180,14 @@ private:
                           schema.table_name.c_str());
             }
         }
+        // A flag-only schema change (a column gaining/losing no_history) adds
+        // no column, so the migration path lands here with nothing else to
+        // do — the marker comparison is what rebuilds the UPDATE trigger.
+        if (healthy && audit_trigger_flags_stale(schema)) {
+            LOG_INFO("lattice_db", "audit triggers for '%s' predate its no_history flags — recreating",
+                     schema.table_name.c_str());
+            healthy = false;
+        }
         if (!healthy) {
             recreate_model_table_triggers(schema);
         }
@@ -5925,6 +6200,7 @@ private:
         // Build column list for triggers
         // geo_bounds properties expand to 4 columns
         std::vector<std::pair<std::string, column_type>> columns;
+        std::set<std::string> no_history;
         for (const auto& prop : schema.properties) {
             if (prop.kind == property_kind::primitive) {
                 if (prop.is_geo_bounds) {
@@ -5934,12 +6210,49 @@ private:
                     columns.emplace_back(prop.name + "_maxLon", column_type::real);
                 } else {
                     columns.emplace_back(prop.name, prop.type);
+                    if (prop.no_history) no_history.insert(prop.name);
                 }
             }
         }
 
         // Create new triggers with all columns
-        create_model_table_triggers(schema.table_name, columns);
+        create_model_table_triggers(schema.table_name, columns, no_history);
+        // Remember which columns the installed triggers treat as no-history,
+        // so ensure_audit_triggers can tell "this store's triggers predate
+        // the flag" from "already current" without parsing trigger SQL.
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {"trigger_flags:" + schema.table_name, no_history_marker(schema)});
+    }
+
+    /// Sorted, comma-joined no_history column list — the value stored under
+    /// `_lattice_meta['trigger_flags:<table>']`. Empty when none.
+    static std::string no_history_marker(const model_schema& schema) {
+        std::set<std::string> names;
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::primitive && !prop.is_geo_bounds && prop.no_history) {
+                names.insert(prop.name);
+            }
+        }
+        std::string out;
+        for (const auto& n : names) { if (!out.empty()) out += ','; out += n; }
+        return out;
+    }
+
+    /// The installed triggers' no_history set differs from the schema's.
+    /// A store without the marker is "current" only when the schema has no
+    /// no_history columns — so stores that never used the flag do nothing,
+    /// and a model that GAINS the flag gets its triggers rebuilt once.
+    bool audit_trigger_flags_stale(const model_schema& schema) {
+        const std::string want = no_history_marker(schema);
+        std::string have;
+        try {
+            auto rows = db_->query("SELECT value FROM _lattice_meta WHERE key = ?",
+                                   {"trigger_flags:" + schema.table_name});
+            if (!rows.empty()) {
+                if (const auto* s = std::get_if<std::string>(&rows[0].at("value"))) have = *s;
+            }
+        } catch (...) {}
+        return want != have;
     }
 
     void rebuild_table(const model_schema& schema,
@@ -6468,7 +6781,8 @@ protected:
             << (p.is_full_text ? 1 : 0)
             << (p.is_indexed ? 1 : 0)
             << (p.is_unique ? 1 : 0)
-            << (p.is_union ? 1 : 0) << '\x01'
+            << (p.is_union ? 1 : 0)
+            << (p.no_history ? 1 : 0) << '\x01'
             << p.target_table << '\x01'
             << p.link_table << '\x01'
             << p.column_name;
@@ -6640,7 +6954,8 @@ protected:
     }
 
     void create_model_table_triggers(const std::string& table_name,
-                                      const std::vector<std::pair<std::string, column_type>>& columns) {
+                                      const std::vector<std::pair<std::string, column_type>>& columns,
+                                      const std::set<std::string>& no_history = {}) {
         // Skip if no columns to track
         if (columns.empty()) return;
 
@@ -6665,9 +6980,18 @@ protected:
                 json_names += ",";
             }
             update_when_clause += "OLD." + col + " IS NOT NEW." + col;
-            // For UPDATE: only include changed fields (simple values like Swift's format)
-            json_fields += "'" + col + "', "
-                "CASE WHEN OLD." + col + " IS NOT NEW." + col + " THEN " + value_expr("NEW", col, type) + " ELSE NULL END";
+            // For UPDATE: only include changed fields (simple values like Swift's format).
+            // A no_history column records THAT it changed (it still gates the
+            // trigger and appears in changedFieldsNames) but never its value:
+            // a streamed column rewritten ~10×/s otherwise copies its whole,
+            // growing body into every audit row (a 325 KB think block left
+            // 1.5 GB of history). Sync late-binds the live value at upload.
+            if (no_history.count(col)) {
+                json_fields += "'" + col + "', NULL";
+            } else {
+                json_fields += "'" + col + "', "
+                    "CASE WHEN OLD." + col + " IS NOT NEW." + col + " THEN " + value_expr("NEW", col, type) + " ELSE NULL END";
+            }
             json_names += "CASE WHEN OLD." + col + " IS NOT NEW." + col + " THEN '" + col + "' ELSE NULL END";
         }
 
@@ -7835,7 +8159,9 @@ inline void lattice_db::close() {
             std::this_thread::yield();
         }
     }
-    // 3. Stop all sync threads while all members are still alive.
+    // 3. Stop all sync threads while all members are still alive — the
+    //    retention thread first (it owns no sync state, but it does write).
+    stop_audit_maintenance();
     teardown_sync();
     // 4. Drain the scheduler before unregistering — the xproc callback may
     //    have queued observer work on the scheduler. Must complete while
@@ -7873,6 +8199,8 @@ inline lattice_db::~lattice_db() {
     LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",
              (void*)this, config_.path.c_str(), (long long)n);
     // close() may have already been called; each step is idempotent.
+    // 0. The retention thread must be joined before any member is torn down.
+    stop_audit_maintenance();
     // 1. Mark as dying (idempotent if close() already ran).
     LOG_INFO("lattice_db", "~dtor: setting alive=false, refcount=%d",
              (int)guard_->notify_refcount.load(std::memory_order_seq_cst));

@@ -954,6 +954,16 @@ void synchronizer_base::disconnect() {
     }
 
     ws_client_->disconnect();
+
+    // An observer's slot carries no upload state — evict it on a clean
+    // disconnect so it never lingers as a participant in anyone's floor.
+    if (config_.is_observer && !is_destroyed_) {
+        try {
+            remove_replication_slot(db().db(), config_.sync_id);
+        } catch (const std::exception& e) {
+            LOG_DEBUG("synchronizer", "[%s] observer slot eviction skipped: %s", log_id(), e.what());
+        }
+    }
 }
 
 void synchronizer_base::sync_now() {
@@ -1029,7 +1039,7 @@ void synchronizer_base::on_websocket_open() {
     scheduler_->invoke([this] {
         if (is_destroyed_) return;
 
-        register_replication_slot(db().db(), config_.sync_id);
+        register_replication_slot(db().db(), config_.sync_id, config_.is_observer);
 
         // Fresh floor-bookkeeping baseline for this connection: unresolved
         // ids will be re-enumerated by the (bounded) queries; carrying stale
@@ -2153,10 +2163,14 @@ void synchronizer_base::reconcile_open_with_db() {
         if (missing) erased_missing = true;
         resolve_audit_ids({min_open});
     }
-    // Out-of-band wipe guard: force_compact_audit_log resets the AUTOINCREMENT
-    // sequence, so a stale high last_enumerated_id_ could otherwise advance the
-    // floor ABOVE regenerated history — silently skipping it. When the sweep
-    // erased MISSING rows, clamp the floor back to current MAX(AuditLog.id).
+    // Out-of-band wipe guard. Historically force_compact_audit_log reset the
+    // AUTOINCREMENT sequence, so a stale high last_enumerated_id_ could
+    // advance the floor ABOVE regenerated history — silently skipping it.
+    // Since 1.5.0 the sequence is kept (regenerated rows take ids above the
+    // old maximum), so the clamp below is a no-op for that path; it stays as
+    // defense against any other out-of-band deletion (a hand-run DELETE, a
+    // restored backup) that leaves MAX(id) under an enumerated id. When the
+    // sweep erased MISSING rows, clamp the floor back to current MAX(AuditLog.id).
     if (erased_missing) {
         db().db().execute(R"(
             UPDATE _lattice_replication_slots
@@ -2695,6 +2709,114 @@ synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& co
 // Helper functions
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// no_history late-binding — see sync.hpp.
+// ---------------------------------------------------------------------------
+namespace {
+
+/// The no_history column names of `table_name` — read from the
+/// `_lattice_meta['trigger_flags:<table>']` marker the trigger installers
+/// write (a sorted, comma-joined list). That marker, not a schema registry,
+/// is the source of truth: it is what the INSTALLED triggers do, it exists
+/// for schemas registered from Swift/C-API (which never touch the C++
+/// registry), and it is visible to every process on the file. Empty for
+/// link tables, unmarked tables, and stores without a meta table.
+std::vector<std::string> no_history_columns(database& db, const std::string& table_name) {
+    std::vector<std::string> out;
+    if (table_name.empty() || table_name[0] == '_') return out;
+    try {
+        auto rows = db.query("SELECT value FROM _lattice_meta WHERE key = ?",
+                             {std::string("trigger_flags:") + table_name});
+        if (rows.empty()) return out;
+        auto it = rows[0].find("value");
+        if (it == rows[0].end() || !std::holds_alternative<std::string>(it->second)) return out;
+        const auto& csv = std::get<std::string>(it->second);
+        size_t start = 0;
+        while (start <= csv.size()) {
+            const size_t comma = csv.find(',', start);
+            const auto piece = csv.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            if (!piece.empty()) out.push_back(piece);
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    } catch (...) {
+        // No meta table (schemaless/raw store) — nothing is flagged.
+    }
+    return out;
+}
+
+bool value_is_absent(const audit_log_entry& e, const std::string& col) {
+    auto it = e.changed_fields.find(col);
+    return it == e.changed_fields.end() || it->second.kind == any_property_kind::null_kind;
+}
+
+} // namespace
+
+std::string no_history_live_values_json(database& db, const std::string& table_name,
+                                        const std::string& global_row_id,
+                                        const std::vector<std::string>& columns) {
+    json out = json::object();
+    if (columns.empty() || table_name.empty()) return out.dump();
+    std::string select = "SELECT ";
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i) select += ", ";
+        select += columns[i];
+    }
+    select += " FROM " + table_name + " WHERE globalId = ? LIMIT 1";
+    auto rows = db.query(select, {global_row_id});
+    if (rows.empty()) return out.dump();
+    for (const auto& col : columns) {
+        auto it = rows[0].find(col);
+        if (it == rows[0].end()) continue;
+        out[col] = any_property_to_json(any_property::from_column_value(it->second));
+    }
+    return out.dump();
+}
+
+void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries) {
+    std::unordered_map<std::string, std::vector<std::string>> flagged_by_table;
+    for (auto& e : entries) {
+        if (e.operation != "UPDATE") continue;
+        auto cached = flagged_by_table.find(e.table_name);
+        if (cached == flagged_by_table.end()) {
+            cached = flagged_by_table.emplace(e.table_name, no_history_columns(db, e.table_name)).first;
+        }
+        const auto& cols = cached->second;
+        if (cols.empty()) continue;
+        std::vector<std::string> need;
+        for (const auto& col : cols) {
+            const bool listed = std::find(e.changed_fields_names.begin(), e.changed_fields_names.end(), col)
+                                != e.changed_fields_names.end();
+            if (listed && value_is_absent(e, col)) need.push_back(col);
+        }
+        if (need.empty()) continue;
+
+        std::string select = "SELECT ";
+        for (size_t i = 0; i < need.size(); ++i) { if (i) select += ", "; select += need[i]; }
+        select += " FROM " + e.table_name + " WHERE globalId = ? LIMIT 1";
+        std::vector<database::row_t> rows;
+        try {
+            rows = db.query(select, {e.global_row_id});
+        } catch (const std::exception& ex) {
+            LOG_WARN("sync", "late_bind_no_history: %s.%s read failed: %s",
+                     e.table_name.c_str(), e.global_row_id.c_str(), ex.what());
+        }
+        for (const auto& col : need) {
+            auto it = rows.empty() ? database::row_t::const_iterator{} : rows[0].find(col);
+            if (!rows.empty() && it != rows[0].end()) {
+                e.changed_fields[col] = any_property::from_column_value(it->second);
+            } else {
+                // Row gone (or column unreadable): never ship a null for a
+                // column the receiver may have declared NOT NULL — drop it.
+                e.changed_fields.erase(col);
+                e.changed_fields_names.erase(
+                    std::remove(e.changed_fields_names.begin(), e.changed_fields_names.end(), col),
+                    e.changed_fields_names.end());
+            }
+        }
+    }
+}
+
 std::vector<audit_log_entry> query_audit_log(database& db,
     bool only_unsynced,
     std::optional<std::string> after_global_id)
@@ -2760,6 +2882,7 @@ std::vector<audit_log_entry> query_audit_log(database& db,
         entries.push_back(entry);
     }
 
+    late_bind_no_history(db, entries);   // fill no_history columns before anyone ships them
     return entries;
 }
 
@@ -3114,6 +3237,7 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
         entries.push_back(entry);
     }
 
+    late_bind_no_history(db, entries);   // the upload path: latest value at upload time
     return entries;
 }
 
@@ -3175,13 +3299,38 @@ void ensure_cursor_column(database& db) {
     }
 }
 
-void register_replication_slot(database& db, const std::string& sync_id) {
+void ensure_observer_column(database& db) {
+    for (const auto& row : db.query("PRAGMA table_info(_lattice_replication_slots)", {})) {
+        auto it = row.find("name");
+        if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+            std::get<std::string>(it->second) == "is_observer") {
+            return;
+        }
+    }
+    try {
+        db.execute("ALTER TABLE _lattice_replication_slots "
+                   "ADD COLUMN is_observer INTEGER NOT NULL DEFAULT 0", {});
+    } catch (const std::exception& e) {
+        // Racing ALTERs from two connections: one wins, the loser lands here.
+        LOG_DEBUG("sync", "ensure_observer_column: %s", e.what());
+    }
+}
+
+void register_replication_slot(database& db, const std::string& sync_id, bool is_observer) {
     ensure_cursor_column(db);
+    ensure_observer_column(db);
     db.execute(R"(
-        INSERT INTO _lattice_replication_slots (sync_id, last_active_at)
-        VALUES (?, datetime('now'))
-        ON CONFLICT(sync_id) DO UPDATE SET last_active_at = datetime('now')
-    )", {sync_id});
+        INSERT INTO _lattice_replication_slots (sync_id, last_active_at, is_observer)
+        VALUES (?, datetime('now'), ?)
+        ON CONFLICT(sync_id) DO UPDATE SET last_active_at = datetime('now'),
+                                          is_observer = excluded.is_observer
+    )", {sync_id, static_cast<int64_t>(is_observer ? 1 : 0)});
+}
+
+void set_replication_slot_observer(database& db, const std::string& sync_id, bool is_observer) {
+    ensure_observer_column(db);
+    db.execute("UPDATE _lattice_replication_slots SET is_observer = ? WHERE sync_id = ?",
+               {static_cast<int64_t>(is_observer ? 1 : 0), sync_id});
 }
 
 void advance_replication_slot(database& db, const std::string& sync_id, int64_t confirmed_audit_id) {
@@ -3469,6 +3618,34 @@ static std::vector<std::string> apply_remote_changes_impl(
                                 } else {
                                     ++it;
                                 }
+                            }
+                            apply_entry = &skew_filtered;
+                        }
+                    }
+
+                    // no_history receiver guard (1.5.0). A sender is supposed
+                    // to late-bind these columns before shipping; if one
+                    // arrives null anyway (older sender, a row deleted mid-
+                    // flight), binding NULL would violate a NOT NULL column
+                    // and the failed entry would be re-sent forever (the same
+                    // wedge the skew filter above closes). Drop the column and
+                    // apply the rest; the value follows in a later entry.
+                    if (is_model_table &&
+                        (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
+                        std::vector<std::string> drop;
+                        for (const auto& col : no_history_columns(db.db(), entry.table_name)) {
+                            const auto& names = apply_entry->changed_fields_names;
+                            if (std::find(names.begin(), names.end(), col) != names.end() &&
+                                value_is_absent(*apply_entry, col)) {
+                                drop.push_back(col);
+                            }
+                        }
+                        if (!drop.empty()) {
+                            if (apply_entry != &skew_filtered) skew_filtered = entry;
+                            for (const auto& col : drop) {
+                                skew_filtered.changed_fields.erase(col);
+                                auto& names = skew_filtered.changed_fields_names;
+                                names.erase(std::remove(names.begin(), names.end(), col), names.end());
                             }
                             apply_entry = &skew_filtered;
                         }

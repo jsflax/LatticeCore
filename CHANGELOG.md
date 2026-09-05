@@ -1,5 +1,71 @@
 # Changelog
 
+## [1.5.0] - 2026-09-05
+
+Audit-history hygiene. A consumer that rewrote one row ~10×/s grew an
+AuditLog to 142K rows / 17 GB with under 1 MB of live data: nothing pruned
+history on a store without sync partners, the only alternative renumbered
+ids (deafening every sibling process), a streamed column copied its whole
+growing body into every UPDATE row, force-compaction dropped link tables,
+and VACUUM's outcome was never reported.
+
+### Added
+- **`lattice_db::prune_audit_log(retention_seconds)`** — cursor-safe,
+  age-based pruning that never touches `sqlite_sequence`. The bound is
+  INSERTION time from recorded watermarks (`record_audit_watermark()` stores
+  `(now, MAX(id))` in `_lattice_meta`), not the row's own `timestamp` (an
+  applied remote row keeps its origin timestamp), capped by the floor of
+  non-observer replication slots. O(1) per sample, no index, no scan.
+- **`configuration::audit_retention_seconds`** (0 = off) arms one small
+  maintenance thread per database that runs the prune every half-window;
+  N handles/processes on one file coordinate through
+  `_lattice_meta['audit_prune_at']` and do ONE prune per interval.
+- **`property_descriptor::no_history`** — a column whose UPDATE audit rows
+  record the column NAME but not its value (`changedFields` carries `null`,
+  `changedFieldsNames` still lists it, the trigger still fires). INSERT and
+  DELETE rows keep full values. Sync **late-binds** the live value:
+  `query_audit_log_for_sync` and `events_after` fill such columns from the
+  live row (or drop the column when the row is gone); receivers never bind a
+  null for a `no_history` column (`apply_remote_changes` drops it instead).
+  `no_history_live_values_json()` provides the same fill for audit rows
+  serialized outside core. A schema that gains the flag rebuilds its UPDATE
+  trigger once on the next open (`_lattice_meta['trigger_flags:<table>']`).
+- **Observer replication slots** — `sync_config::is_observer` /
+  `configuration::sync_is_observer`, `register_replication_slot(db, id,
+  is_observer)`, `set_replication_slot_observer()`: a read-only dial's own
+  slot never advances a floor, so it is excluded from `safe_compact_audit_log`
+  and `prune_audit_log` bounds and evicted on clean disconnect. The column is
+  added lazily (`ensure_observer_column`, the `last_received_event_id`
+  pattern) — no schema epoch bump.
+- **Bridge** (`swift_lattice`): `reclaim_space()` — VACUUM → TRUNCATE
+  checkpoint → reopen, in the order WAL mode needs for the MAIN file to
+  shrink, reporting page counts; `bool vacuum()`; `checkpoint()` returns a
+  `checkpoint_outcome`; `checkpoint_bounded` returns -2 when the call threw
+  (a legitimate 0 used to be indistinguishable); `audit_header_for(id)` (row
+  header without touching the payload); `prune_audit_log`,
+  `record_audit_watermark`, `set_replication_slot_observer`,
+  `no_history_live_values_json` forwarders.
+- **C API**: `lattice_db_prune_audit_log`, `lattice_db_record_audit_watermark`,
+  `lattice_db_reclaim_space`, `lattice_db_set_slot_observer`;
+  `lattice_sync_options_t` gains `audit_retention_seconds` and
+  `sync_is_observer` at the tail (size-prefixed; sentinel -1 keeps defaults).
+  LatticeJS/wasm bindings mirror the bridge by hand and need a follow-up bump.
+
+### Changed
+- **`force_compact_audit_log()` keeps the AUTOINCREMENT sequence.** Every
+  attached process seeds its cross-process cursor from `MAX(id)` and reads
+  forward, and the relay's observer-push cursor is a raw pk; restarting ids at
+  1 put every regenerated row BELOW those cursors. Regenerated snapshots now
+  take ids above the old maximum and flow through every live cursor. Slots
+  still reset to floor 0 (a full re-scan, not incorrect).
+- **`generate_history()` regenerates link tables.** The blanket
+  underscore-prefix exclusion dropped every `_Parent_Child_prop` link table,
+  so a compaction regenerated rows detached from their relationships. Tables
+  are now classified by shape (link: `lhs`/`rhs`[/`rhs_type`] + `globalId`,
+  no `id`; model: `id` + `globalId`; anything else skipped), and link rows are
+  emitted in the live trigger's payload shape.
+- `safe_compact_audit_log` computes its floor over non-observer slots only.
+
 ## [1.2.1] - 2026-08-05
 
 ### Changed

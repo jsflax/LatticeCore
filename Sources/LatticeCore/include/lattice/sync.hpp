@@ -241,6 +241,11 @@ struct sync_config {
     /// disabling this restores the exact unbounded pre-floor queries.
     bool use_upload_floor = true;
 
+    /// This connection is an OBSERVER (read-only dial): its replication slot
+    /// is flagged is_observer=1, excluded from every compaction floor, and
+    /// evicted on a clean disconnect. See configuration::sync_is_observer.
+    bool is_observer = false;
+
     /// Upload filter. nullopt = sync everything (default).
     /// Empty vector = sync nothing. Non-empty = whitelist.
     std::optional<std::vector<sync_filter_entry>> sync_filter;
@@ -633,6 +638,26 @@ void mark_audit_entries_synced_for(lattice_db& db,
 // Get events after a checkpoint (for server-side sync)
 std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
 
+/// no_history late-binding (1.5.0). A column flagged `no_history` records
+/// THAT it changed in its UPDATE audit rows, never its value (see
+/// property_descriptor::no_history). Anything that ships audit entries to a
+/// peer must therefore fill such columns with the row's CURRENT value first:
+/// for every UPDATE entry whose table schema marks columns no_history and
+/// whose changedFieldsNames lists them with a null/missing value, read the
+/// live row and fill them in; if the row is gone, drop the column from both
+/// changedFields and changedFieldsNames (its DELETE entry follows). Invariant
+/// a consumer can rely on: a no_history column syncs its latest value at
+/// upload/push time, not every intermediate value. Called by
+/// query_audit_log_for_sync and events_after; exposed for other shippers.
+void late_bind_no_history(database& db, std::vector<audit_log_entry>& entries);
+
+/// The same fill for ONE row, as the wire JSON object ({"col": {"kind":..,
+/// "value":..}}) — for shippers that serialize audit rows outside core (the
+/// Swift relay's observer push). Missing row ⇒ "{}".
+std::string no_history_live_values_json(database& db, const std::string& table_name,
+                                        const std::string& global_row_id,
+                                        const std::vector<std::string>& columns);
+
 namespace test_hooks {
 /// Test-only failure injection: invoked with chunk_start at the top of every
 /// apply chunk transaction, BEFORE its BEGIN. A test installs a throwing hook
@@ -661,8 +686,21 @@ std::vector<std::string> apply_remote_changes_for(lattice_db& db,
 // Each synchronizer registers a slot; compaction only deletes entries
 // below the minimum confirmed_audit_id across all active slots.
 
-/// Register (or touch) a replication slot for the given sync_id.
-void register_replication_slot(database& db, const std::string& sync_id);
+/// Register (or touch) a replication slot for the given sync_id. `is_observer`
+/// marks a read-only dial whose floor never advances (excluded from compaction
+/// bounds); re-registration updates the flag so a connection that changes
+/// role is re-classified.
+void register_replication_slot(database& db, const std::string& sync_id,
+                               bool is_observer = false);
+
+/// Guarded migration: adds _lattice_replication_slots.is_observer (default 0)
+/// the same lazy way ensure_cursor_column adds the download cursor — no schema
+/// epoch bump, no slow-path cost. Idempotent and cheap.
+void ensure_observer_column(database& db);
+
+/// Flip a slot's observer flag (a relay that learns a connection's scope
+/// after registration).
+void set_replication_slot_observer(database& db, const std::string& sync_id, bool is_observer);
 
 /// Guarded migration: adds _lattice_replication_slots.last_received_event_id
 /// (the externalized download-resume cursor) and eagerly seeds it from the

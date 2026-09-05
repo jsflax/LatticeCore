@@ -470,8 +470,29 @@ LATTICE_EXPORT void lattice_db_mark_synced(lattice_db_t* db, const char* global_
 
 // Compact the audit log by replacing all entries with INSERT records
 // representing the current state of all objects. Drops all history.
-// Returns number of INSERT entries created.
+// Returns number of INSERT entries created. Since 1.5.0 the AuditLog id
+// sequence is KEPT (regenerated rows take ids above the old maximum, so
+// sibling processes' cursors keep working) and link tables are regenerated.
 LATTICE_EXPORT int64_t lattice_db_compact_audit_log(lattice_db_t* db);
+
+// Cursor-safe, age-based history prune (1.5.0): deletes AuditLog entries
+// that existed at least retention_seconds ago (by recorded watermarks, not
+// the row's own timestamp), capped by the floor of non-observer replication
+// slots. Never renumbers ids. Returns rows removed, or -1 on error.
+LATTICE_EXPORT int64_t lattice_db_prune_audit_log(lattice_db_t* db, int64_t retention_seconds);
+
+// Record a (now, MAX(id)) watermark for lattice_db_prune_audit_log (the
+// automatic thread does this when audit_retention_seconds is configured).
+LATTICE_EXPORT lattice_status_t lattice_db_record_audit_watermark(lattice_db_t* db);
+
+// VACUUM + TRUNCATE checkpoint in the order WAL mode needs so the main file
+// actually shrinks. Returns the page count after, or -1 on error (message via
+// lattice_last_error).
+LATTICE_EXPORT int64_t lattice_db_reclaim_space(lattice_db_t* db);
+
+// Flag one of this database's OWN replication slots as an observer (a
+// read-only dial whose floor never advances; excluded from compaction bounds).
+LATTICE_EXPORT lattice_status_t lattice_db_set_slot_observer(lattice_db_t* db, const char* sync_id, int32_t is_observer);
 
 // Generate audit log INSERT entries for objects not already in the audit log.
 // Preserves existing entries and only adds entries for missing objects.
@@ -828,6 +849,17 @@ typedef struct {
     // fails the open with LATTICE_ERROR_INVALID_ARGUMENT so that a future
     // override cannot be silently ignored by older libraries.
     const char* sync_id;
+
+    // --- appended in 1.5.0 (older callers' struct_size stops before here) ---
+
+    // Audit-history retention in seconds: applies when >= 0 (0 = keep
+    // forever, the pre-1.5 behavior); sentinel -1 = keep the library default.
+    int64_t audit_retention_seconds;
+
+    // This database's own sync connections register as OBSERVER slots
+    // (read-only dials excluded from compaction floors). Tri-state:
+    // 1 = on, 0 = off, -1 = keep default.
+    int32_t sync_is_observer;
 } lattice_sync_options_t;
 
 // Fill defaults: struct_size = sizeof(lattice_sync_options_t), every knob at

@@ -19,6 +19,7 @@
 name: C ABI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:

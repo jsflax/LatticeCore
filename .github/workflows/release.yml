@@ -1,50 +1,91 @@
 name: Release
+run-name: Release ${{ inputs.version || github.ref_name }} at ${{ inputs.expected_sha || github.sha }}
 
 on:
   push:
-    tags: ['[0-9]+.[0-9]+.[0-9]+']
+    tags: ['[0-9]+.[0-9]+.[0-9]+', '[0-9]+.[0-9]+.[0-9]+-*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit SemVer version without a v prefix'
+        required: true
+        type: string
+      expected_sha:
+        description: 'Exact validated main commit (full 40-character SHA)'
+        required: true
+        type: string
 
 permissions:
   contents: write
+  actions: read
+
+# Serialize publication; a newer request must never cancel an active release.
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  RELEASE_VERSION_INPUT: ${{ inputs.version }}
+  EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
 
 jobs:
-  test-macos:
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build and run C++ tests
-        run: swift run LatticeCoreTests
-
-  test-linux:
+  preflight:
     runs-on: ubuntu-latest
-    container: swift:6.2-noble
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: apt-get update && apt-get install -y libsqlite3-dev
-      - name: Build and run C++ tests
-        run: swift run LatticeCoreTests
+        with:
+          fetch-depth: 0
+      - name: Verify candidate commit, version, dependencies, and existing CI
+        id: candidate
+        run: |
+          VERSION="${RELEASE_VERSION_INPUT:-${GITHUB_REF_NAME#}}"
+          python3 release-train/release_train.py check --version "$VERSION" --expected-sha "$EXPECTED_SHA"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  test-macos:
+    needs: preflight
+    uses: ./.github/workflows/macos.yml
+  test-linux:
+    needs: preflight
+    uses: ./.github/workflows/linux.yml
+  test-capi:
+    needs: preflight
+    uses: ./.github/workflows/capi.yml
 
   release:
-    needs: [test-macos, test-linux]
+    needs: [preflight, test-macos, test-linux, test-capi]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Extract changelog entry
-        id: changelog
-        run: |
-          # Extract the section for this version from CHANGELOG.md
-          awk '/^## \['"${{ steps.version.outputs.version }}"'\]/{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md > release_notes.md
-          echo "has_notes=$([ -s release_notes.md ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.version.outputs.version }}
-          body_path: ${{ steps.changelog.outputs.has_notes == 'true' && 'release_notes.md' || '' }}
-          generate_release_notes: ${{ steps.changelog.outputs.has_notes != 'true' }}
+          fetch-depth: 0
+      - name: Recheck candidate after tests and emit source release receipt
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          python3 release-train/release_train.py candidate --version "$VERSION" --expected-sha "$EXPECTED_SHA" --output "$RUNNER_TEMP/candidate.json"
+          python3 release-train/release_train.py workflow-receipt --candidate "$RUNNER_TEMP/candidate.json" --output "$RUNNER_TEMP/release-receipt.json"
+          python3 - "$VERSION" "$RUNNER_TEMP/release-notes.md" <<'PYNOTES'
+          import pathlib, re, sys
+          text = pathlib.Path('CHANGELOG.md').read_text()
+          section = re.search(r'^## \[' + re.escape(sys.argv[1]) + r'\][^\n]*\n(.*?)(?=^## \[|\Z)', text, re.M | re.S)
+          pathlib.Path(sys.argv[2]).write_text(section[1].strip() + '\n')
+          PYNOTES
+      # workflow_dispatch runs these jobs directly: the GITHUB_TOKEN-created tag
+      # does not need a second push-triggered workflow (GitHub suppresses it).
+      - name: Publish validated source release
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          if ! git show-ref --verify --quiet "refs/tags/$VERSION"; then git tag "$VERSION" "$EXPECTED_SHA"; fi
+          git push origin "refs/tags/$VERSION"
+          FLAGS=(--latest)
+          if [[ "$VERSION" == *-* ]]; then FLAGS=(--prerelease --latest=false); fi
+          # create fails when a release already exists; never update its assets.
+          gh release create "$VERSION" "$RUNNER_TEMP/release-receipt.json" \
+            --verify-tag --target "$EXPECTED_SHA" --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${FLAGS[@]}"

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "branch": "main",
+  "prereleaseChannels": [
+    "alpha",
+    "beta",
+    "rc"
+  ],
+  "requiredNativeChecks": [],
+  "localDependencies": [],
+  "publishedDependencies": {},
+  "requiredPriorCI": [],
+  "artifacts": [],
+  "lockfiles": [],
+  "changelog": "CHANGELOG.md",
+  "releaseMode": "hosted",
+  "repository": "jsflax/LatticeCore",
+  "tagPrefix": ""
+}

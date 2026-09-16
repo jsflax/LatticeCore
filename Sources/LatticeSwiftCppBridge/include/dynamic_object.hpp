@@ -581,7 +581,7 @@ public:
     void refresh_row_cache() const SWIFT_NAME(refreshRowCache()) { impl_->refresh_row_cache(); }
     bool is_row_cache_enabled() const SWIFT_NAME(isRowCacheEnabled()) { return impl_->is_row_cache_enabled(); }
     void increment_int_field(const std::string& name, int64_t delta) const SWIFT_NAME(incrementIntField(named:by:)) {
-        impl_->increment_int_field(name, delta);
+        sealed([&] { impl_->increment_int_field(name, delta); });
     }
 
     void set_object(const std::string& name, const dynamic_object_ref& value) const SWIFT_NAME(setObject(named:_:)) {

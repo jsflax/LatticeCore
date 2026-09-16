@@ -721,6 +721,16 @@ public:
         add_preserving_global_id(*ref.impl_, preserved_global_id);
     }
 
+    // Preserve identity without allowing a SQLite/C++ failure to unwind through Swift.
+    void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id,
+                                  cxx_error& err) {
+        try {
+            add_preserving_global_id(*ref.impl_, preserved_global_id);
+        } catch (std::exception& e) {
+            err = e;
+        }
+    }
+
     void add_bulk(std::vector<dynamic_object>& objects);
     void add_bulk(std::vector<dynamic_object*>& objects);
 #if LATTICE_HAS_FRT
@@ -3583,12 +3593,18 @@ public:
     void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id) const {
         impl().add_preserving_global_id(ref, preserved_global_id);
     }
+    void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id,
+                                  cxx_error& err) const {
+        impl().add_preserving_global_id(ref, preserved_global_id, err);
+    }
 #if LATTICE_HAS_FRT
     void add_bulk(std::vector<dynamic_object_ref*>& objects) const { impl().add_bulk(objects); }
 #else
     void add_bulk(std::vector<dynamic_object_ref>& objects) const { impl().add_bulk(objects); }
 #endif
-    bool remove(const dynamic_object_ref& obj) const { return impl().remove(obj); }
+    bool remove(const dynamic_object_ref& obj) const {
+        return sealed([&] { return impl().remove(obj); });
+    }
 
     // Single-object lookups query the row — sealed like the bulk reads
     // (Swift cannot catch C++ exceptions): nullopt + last_bridge_error()

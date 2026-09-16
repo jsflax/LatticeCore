@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.5.0] - 2026-09-05
+## [2.0.0] - Unreleased
 
 Audit-history hygiene. A consumer that rewrote one row ~10×/s grew an
 AuditLog to 142K rows / 17 GB with under 1 MB of live data: nothing pruned
@@ -9,7 +9,17 @@ ids (deafening every sibling process), a streamed column copied its whole
 growing body into every UPDATE row, force-compaction dropped link tables,
 and VACUUM's outcome was never reported.
 
+### Breaking changes
+- Public C++/Swift bridge `vacuum()` now returns `bool`, and `checkpoint()`
+  returns `checkpoint_outcome`, instead of `void`. Update explicitly typed
+  method references and wrappers to the new result types. Calls that simply
+  discard the results retain their ordinary call form.
+- Rebuild bridge consumers against the selected 2.0.0 headers and library.
+  This release does not claim binary interchangeability with 1.4.x.
+
 ### Added
+- Add an error-reporting overload for preserving-global-ID insertion and
+  expose list bridge error messages; retain the existing insertion overload.
 - **`lattice_db::prune_audit_log(retention_seconds)`** — cursor-safe,
   age-based pruning that never touches `sqlite_sequence`. The bound is
   INSERTION time from recorded watermarks (`record_audit_watermark()` stores
@@ -50,6 +60,12 @@ and VACUUM's outcome was never reported.
   `lattice_sync_options_t` gains `audit_retention_seconds` and
   `sync_is_observer` at the tail (size-prefixed; sentinel -1 keeps defaults).
   LatticeJS/wasm bindings mirror the bridge by hand and need a follow-up bump.
+
+### Fixed
+- Route standard C++ exceptions from integer increments, list access and
+  mutation, and object removal through the bridge error channel so Swift
+  callers can detect these failures. Direct bridge consumers should inspect
+  the error channel rather than rely on those exceptions escaping.
 
 ### Changed
 - **`force_compact_audit_log()` keeps the AUTOINCREMENT sequence.** Every

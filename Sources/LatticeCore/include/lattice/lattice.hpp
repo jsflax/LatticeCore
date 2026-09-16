@@ -13,6 +13,8 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <type_traits>
+#include <utility>
 #include <random>
 #include <sstream>
 #include <atomic>
@@ -4525,6 +4527,89 @@ public:
         double distance;
     };
 
+private:
+    friend struct vec0_maintenance_test_access;
+    // Install/clear only with all participating threads joined. The private
+    // friend harness uses these phases for deterministic admission barriers.
+    std::function<void(const char*, const char*)> test_hook_vec0_maintenance_;
+
+    struct vec0_maintenance_frame {
+        sqlite3* connection;
+        vec0_maintenance_frame* previous;
+        explicit vec0_maintenance_frame(sqlite3* handle)
+            : connection(handle), previous(active_vec0_maintenance_) {
+            active_vec0_maintenance_ = this;
+        }
+        ~vec0_maintenance_frame() { active_vec0_maintenance_ = previous; }
+    };
+    static inline thread_local vec0_maintenance_frame* active_vec0_maintenance_ = nullptr;
+
+    // Shared-cache memory reuses its existing store write gate. Isolated
+    // memory and DELETE-journal WASM need only this per-instance gate.
+    std::recursive_timed_mutex vec0_memory_maintenance_gate_;
+
+    struct vec0_sqlite_hold {
+        sqlite3_mutex* mutex;
+        explicit vec0_sqlite_hold(sqlite3* connection)
+            : mutex(sqlite3_db_mutex(connection)) {
+            if (!mutex) throw db_error("vec0 maintenance requires a SQLite mutex");
+            sqlite3_mutex_enter(mutex);
+        }
+        ~vec0_sqlite_hold() noexcept { sqlite3_mutex_leave(mutex); }
+        vec0_sqlite_hold(const vec0_sqlite_hold&) = delete;
+        vec0_sqlite_hold& operator=(const vec0_sqlite_hold&) = delete;
+    };
+
+    template<typename F>
+    std::invoke_result_t<F> with_vec0_serialization(const char* operation,
+                                                   bool allow_internal_nesting,
+                                                   F&& body) {
+        auto* connection = db_->handle();
+        if (!allow_internal_nesting) {
+            for (auto* active = active_vec0_maintenance_; active; active = active->previous) {
+                if (active->connection == connection) {
+                    throw db_error("reentrant vec0 maintenance on the same connection");
+                }
+            }
+        }
+        notify_vec0_maintenance_test_hook(operation, "attempt");
+        auto run = [&]() -> std::invoke_result_t<F> {
+            vec0_maintenance_frame active(connection);
+            notify_vec0_maintenance_test_hook(operation, "acquired");
+            return std::forward<F>(body)();
+        };
+#ifdef __EMSCRIPTEN__
+        // DELETE journal uses post-statement delivery even for file paths.
+        constexpr bool post_statement_delivery = true;
+#else
+        const bool post_statement_delivery = config_.is_in_memory();
+#endif
+        if (post_statement_delivery) {
+            // Never hold SQLite across a memory settled callback. Reuse the
+            // shared store gate rather than introducing a second lock order.
+            auto& gate = store_write_gate_ ? *store_write_gate_ : vec0_memory_maintenance_gate_;
+            std::lock_guard<std::recursive_timed_mutex> hold(gate);
+            return run();
+        }
+        // File WAL callbacks already run on SQLite's writer thread. Holding
+        // this same recursive mutex creates no maintenance->SQLite inversion.
+        vec0_sqlite_hold hold(connection);
+        return run();
+    }
+
+protected:
+    // The Swift bridge's complete reconcile operation shares the same
+    // storage-appropriate scope with core vacuum. No startup-future wait.
+    template<typename F>
+    std::invoke_result_t<F> with_vec0_maintenance(const char* operation, F&& body) {
+        return with_vec0_serialization(operation, false, std::forward<F>(body));
+    }
+
+    void notify_vec0_maintenance_test_hook(const char* operation, const char* phase) {
+        if (test_hook_vec0_maintenance_) test_hook_vec0_maintenance_(operation, phase);
+    }
+
+public:
     /// Ensure a vec0 virtual table exists for a vector column.
     /// Table name format: _{ModelTable}_{column}_vec
     /// Dimensions are inferred from first insert.
@@ -4534,108 +4619,110 @@ public:
                            const std::string& column_name,
                            int dimensions,
                            int ivf_nlist = 0, int ivf_nprobe = 0) {
-        // Strip schema prefix (e.g. "main.Memory" → "Memory") — vec0 tables
-        // are always in the default schema, but hydrated objects from attached
-        // databases carry schema-qualified table names.
-        auto dot = model_table.find('.');
-        const std::string& bare_table = (dot != std::string::npos)
-            ? model_table.substr(dot + 1) : model_table;
-        std::string vec_table = "_" + bare_table + "_" + column_name + "_vec";
+        with_vec0_serialization("ensure", true, [&] {
+            // Strip schema prefix (e.g. "main.Memory" → "Memory") — vec0 tables
+            // are always in the default schema, but hydrated objects from attached
+            // databases carry schema-qualified table names.
+            auto dot = model_table.find('.');
+            const std::string& bare_table = (dot != std::string::npos)
+                ? model_table.substr(dot + 1) : model_table;
+            std::string vec_table = "_" + bare_table + "_" + column_name + "_vec";
 
-        // Check if table already exists
-        std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
-        auto results = db_->query(check_sql, {vec_table});
-        if (!results.empty()) {
-            // Table exists — check if triggers need updating
-            auto trig = db_->query(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='"
-                + vec_table + "_insert' LIMIT 1");
-            if (!trig.empty()) {
-                auto& sql_val = trig[0].at("sql");
-                auto& trig_sql = std::get<std::string>(sql_val);
-                // Current trigger format uses UPDATE+INSERT NOT EXISTS pattern
-                // (avoids DELETE on vec0 inside triggers, which is unreliable)
-                if (trig_sql.find("NOT EXISTS") != std::string::npos) {
-                    return; // Trigger already has correct pattern
+            // Check if table already exists
+            std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
+            auto results = db_->query(check_sql, {vec_table});
+            if (!results.empty()) {
+                // Table exists — check if triggers need updating
+                auto trig = db_->query(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='"
+                    + vec_table + "_insert' LIMIT 1");
+                if (!trig.empty()) {
+                    auto& sql_val = trig[0].at("sql");
+                    auto& trig_sql = std::get<std::string>(sql_val);
+                    // Current trigger format uses UPDATE+INSERT NOT EXISTS pattern
+                    // (avoids DELETE on vec0 inside triggers, which is unreliable)
+                    if (trig_sql.find("NOT EXISTS") != std::string::npos) {
+                        return; // Trigger already has correct pattern
+                    }
+                    // Stale trigger — drop all vec0 triggers to recreate
+                    db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
+                    db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
+                    db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
                 }
-                // Stale trigger — drop all vec0 triggers to recreate
-                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
-                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
-                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+                // Fall through to recreate triggers
             }
-            // Fall through to recreate triggers
-        }
 
-        // Create vec0 virtual table with globalId as primary key (if it doesn't exist)
-        if (results.empty()) {
-            std::ostringstream sql;
-            sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
-                << "global_id TEXT PRIMARY KEY, "
-                << "embedding float[" << dimensions << "]"
-                << (ivf_nlist > 0
-                    ? " indexed by ivf(nlist=" + std::to_string(ivf_nlist)
-                      + (ivf_nprobe > 0 ? ", nprobe=" + std::to_string(ivf_nprobe) : "")
-                      + ")"
-                    : "")
-                << ")";
-            LOG_INFO("ensure_vec0_table", "Creating IVF vec0 table: %s (dims=%d)", vec_table.c_str(), dimensions);
-            LOG_DEBUG("ensure_vec0_table", "SQL: %s", sql.str().c_str());
-            db_->execute(sql.str());
-        }
+            // Create vec0 virtual table with globalId as primary key (if it doesn't exist)
+            if (results.empty()) {
+                std::ostringstream sql;
+                sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
+                    << "global_id TEXT PRIMARY KEY, "
+                    << "embedding float[" << dimensions << "]"
+                    << (ivf_nlist > 0
+                        ? " indexed by ivf(nlist=" + std::to_string(ivf_nlist)
+                          + (ivf_nprobe > 0 ? ", nprobe=" + std::to_string(ivf_nprobe) : "")
+                          + ")"
+                        : "")
+                    << ")";
+                LOG_INFO("ensure_vec0_table", "Creating IVF vec0 table: %s (dims=%d)", vec_table.c_str(), dimensions);
+                LOG_DEBUG("ensure_vec0_table", "SQL: %s", sql.str().c_str());
+                db_->execute(sql.str());
+            }
 
-        // Create triggers to keep vec0 in sync with main table.
-        // Use main.-qualified model_table in the ON clause so triggers work
-        // even when a TEMP UNION ALL view shadows the model table (from attach()).
-        // Note: SQLite forbids qualified names inside trigger bodies, but the
-        // vec table references resolve correctly because ATTACH excludes virtual tables.
-        //
-        // IMPORTANT: vec0's DELETE is unreliable inside triggers (the shadow table
-        // deletion can silently fail, leaving a stale entry that causes UNIQUE
-        // constraint errors on the subsequent INSERT). Instead we use:
-        //   1. UPDATE existing vec0 entry (no-op if row doesn't exist)
-        //   2. INSERT only if no entry exists (conditional via NOT EXISTS)
-        // This avoids DELETE on vec0 entirely within trigger bodies.
+            // Create triggers to keep vec0 in sync with main table.
+            // Use main.-qualified model_table in the ON clause so triggers work
+            // even when a TEMP UNION ALL view shadows the model table (from attach()).
+            // Note: SQLite forbids qualified names inside trigger bodies, but the
+            // vec table references resolve correctly because ATTACH excludes virtual tables.
+            //
+            // IMPORTANT: vec0's DELETE is unreliable inside triggers (the shadow table
+            // deletion can silently fail, leaving a stale entry that causes UNIQUE
+            // constraint errors on the subsequent INSERT). Instead we use:
+            //   1. UPDATE existing vec0 entry (no-op if row doesn't exist)
+            //   2. INSERT only if no entry exists (conditional via NOT EXISTS)
+            // This avoids DELETE on vec0 entirely within trigger bodies.
 
-        // INSERT trigger
-        std::ostringstream insert_trigger;
-        insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_insert "
-                       << "AFTER INSERT ON main." << model_table << " "
-                       << "WHEN NEW." << column_name << " IS NOT NULL "
-                       << "AND length(NEW." << column_name << ") > 0 "
-                       << "BEGIN "
-                       << "UPDATE " << vec_table << " SET embedding = NEW." << column_name
-                       << " WHERE global_id = NEW.globalId; "
-                       << "INSERT INTO " << vec_table << "(global_id, embedding) "
-                       << "SELECT NEW.globalId, NEW." << column_name << " "
-                       << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
-                       << " WHERE global_id = NEW.globalId); "
-                       << "END";
-        db_->execute(insert_trigger.str());
+            // INSERT trigger
+            std::ostringstream insert_trigger;
+            insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_insert "
+                           << "AFTER INSERT ON main." << model_table << " "
+                           << "WHEN NEW." << column_name << " IS NOT NULL "
+                           << "AND length(NEW." << column_name << ") > 0 "
+                           << "BEGIN "
+                           << "UPDATE " << vec_table << " SET embedding = NEW." << column_name
+                           << " WHERE global_id = NEW.globalId; "
+                           << "INSERT INTO " << vec_table << "(global_id, embedding) "
+                           << "SELECT NEW.globalId, NEW." << column_name << " "
+                           << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
+                           << " WHERE global_id = NEW.globalId); "
+                           << "END";
+            db_->execute(insert_trigger.str());
 
-        // UPDATE trigger
-        std::ostringstream update_trigger;
-        update_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_update "
-                       << "AFTER UPDATE OF " << column_name << " ON main." << model_table << " "
-                       << "WHEN NEW." << column_name << " IS NOT NULL "
-                       << "AND length(NEW." << column_name << ") > 0 "
-                       << "BEGIN "
-                       << "UPDATE " << vec_table << " SET embedding = NEW." << column_name
-                       << " WHERE global_id = NEW.globalId; "
-                       << "INSERT INTO " << vec_table << "(global_id, embedding) "
-                       << "SELECT NEW.globalId, NEW." << column_name << " "
-                       << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
-                       << " WHERE global_id = NEW.globalId); "
-                       << "END";
-        db_->execute(update_trigger.str());
+            // UPDATE trigger
+            std::ostringstream update_trigger;
+            update_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_update "
+                           << "AFTER UPDATE OF " << column_name << " ON main." << model_table << " "
+                           << "WHEN NEW." << column_name << " IS NOT NULL "
+                           << "AND length(NEW." << column_name << ") > 0 "
+                           << "BEGIN "
+                           << "UPDATE " << vec_table << " SET embedding = NEW." << column_name
+                           << " WHERE global_id = NEW.globalId; "
+                           << "INSERT INTO " << vec_table << "(global_id, embedding) "
+                           << "SELECT NEW.globalId, NEW." << column_name << " "
+                           << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
+                           << " WHERE global_id = NEW.globalId); "
+                           << "END";
+            db_->execute(update_trigger.str());
 
-        // DELETE trigger
-        std::ostringstream delete_trigger;
-        delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_delete "
-                       << "AFTER DELETE ON main." << model_table << " "
-                       << "BEGIN "
-                       << "DELETE FROM " << vec_table << " WHERE global_id = OLD.globalId; "
-                       << "END";
-        db_->execute(delete_trigger.str());
+            // DELETE trigger
+            std::ostringstream delete_trigger;
+            delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_delete "
+                           << "AFTER DELETE ON main." << model_table << " "
+                           << "BEGIN "
+                           << "DELETE FROM " << vec_table << " WHERE global_id = OLD.globalId; "
+                           << "END";
+            db_->execute(delete_trigger.str());
+        });
     }
 
     /// Ensure an R*Tree virtual table exists for a geo_bounds column.
@@ -5185,67 +5272,70 @@ public:
                         const std::string& column_name) {
         std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
         try {
-            // Infer dimensions from existing vec0 info or first non-empty
-            // embedding. The info table is absent when the index was never
-            // created (rows applied by sync bypass the lazy create path) —
-            // that case MUST fall through to the sample probe so this
-            // function can build the index from scratch, not just rebuild it.
-            int dimensions = 0;
-            if (db_->table_exists(vec_table + "_info")) {
-                auto info_rows = db_->query(
-                    "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
-                if (!info_rows.empty()) {
-                    auto it = info_rows[0].find("value");
-                    if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                        dimensions = static_cast<int>(std::get<int64_t>(it->second));
+            return with_vec0_maintenance("vacuum", [&]() -> int64_t {
+                // Infer dimensions from existing vec0 info or first non-empty
+                // embedding. The info table is absent when the index was never
+                // created (rows applied by sync bypass the lazy create path) —
+                // that case MUST fall through to the sample probe so this
+                // function can build the index from scratch, not just rebuild it.
+                int dimensions = 0;
+                if (db_->table_exists(vec_table + "_info")) {
+                    auto info_rows = db_->query(
+                        "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
+                    if (!info_rows.empty()) {
+                        auto it = info_rows[0].find("value");
+                        if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                            dimensions = static_cast<int>(std::get<int64_t>(it->second));
+                        }
                     }
                 }
-            }
-            if (dimensions == 0) {
-                auto sample = db_->query(
-                    "SELECT length(" + column_name + ") as len FROM main." + model_table +
-                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0 LIMIT 1");
-                if (!sample.empty()) {
-                    auto it = sample[0].find("len");
-                    if (it != sample[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                        dimensions = static_cast<int>(std::get<int64_t>(it->second)) / static_cast<int>(sizeof(float));
+                if (dimensions == 0) {
+                    auto sample = db_->query(
+                        "SELECT length(" + column_name + ") as len FROM main." + model_table +
+                        " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0 LIMIT 1");
+                    if (!sample.empty()) {
+                        auto it = sample[0].find("len");
+                        if (it != sample[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                            dimensions = static_cast<int>(std::get<int64_t>(it->second)) / static_cast<int>(sizeof(float));
+                        }
                     }
                 }
-            }
-            if (dimensions == 0) return 0;
+                if (dimensions == 0) return 0;
 
-            // Drop the vec0 virtual table (cascades to shadow tables)
-            db_->execute("DROP TABLE IF EXISTS " + vec_table);
+                // Drop the vec0 virtual table (cascades to shadow tables)
+                db_->execute("DROP TABLE IF EXISTS " + vec_table);
+                notify_vec0_maintenance_test_hook("vacuum", "after-drop");
 
-            // Recreate vec0 + triggers
-            ensure_vec0_table(model_table, column_name, dimensions);
+                // Recreate vec0 + triggers
+                ensure_vec0_table(model_table, column_name, dimensions);
 
-            // Re-insert all vectors from the model table
-            auto all_rows = db_->query(
-                "SELECT globalId, " + column_name + " FROM main." + model_table +
-                " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
+                // Re-insert all vectors from the model table
+                auto all_rows = db_->query(
+                    "SELECT globalId, " + column_name + " FROM main." + model_table +
+                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
 
-            int64_t count = 0;
-            for (const auto& row : all_rows) {
-                auto gid_it = row.find("globalId");
-                if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
-                auto& gid = std::get<std::string>(gid_it->second);
-                auto col_it = row.find(column_name);
-                if (col_it == row.end() ||
-                    !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
-                auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
-                if (vec_data.empty()) continue;
-                try {
-                    db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
-                                {gid, vec_data});
-                    count++;
-                } catch (...) {}
-            }
+                int64_t count = 0;
+                for (const auto& row : all_rows) {
+                    auto gid_it = row.find("globalId");
+                    if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                    auto& gid = std::get<std::string>(gid_it->second);
+                    auto col_it = row.find(column_name);
+                    if (col_it == row.end() ||
+                        !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                    auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                    if (vec_data.empty()) continue;
+                    try {
+                        db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                    {gid, vec_data});
+                        count++;
+                    } catch (...) {}
+                }
 
-            LOG_INFO("vacuum_vec0", "Rebuilt %s: %lld vectors from %zu rows",
-                     vec_table.c_str(), (long long)count, all_rows.size());
+                LOG_INFO("vacuum_vec0", "Rebuilt %s: %lld vectors from %zu rows",
+                         vec_table.c_str(), (long long)count, all_rows.size());
 
-            return count;
+                return count;
+            });
         } catch (const std::exception& e) {
             LOG_ERROR("vacuum_vec0", "Failed to vacuum %s: %s", vec_table.c_str(), e.what());
             return -1;

@@ -22,6 +22,28 @@ public:
 };
 
 class database {
+    friend class lattice_db;
+    // The update hook may query globalId through database::query(). That
+    // nested query must not drain a prior row's dirty state while the outer
+    // SQLite statement still owns its connection mutex. Track the actual
+    // callback frame, including callers that step SQLite directly.
+    struct update_hook_scope {
+        sqlite3* connection;
+        update_hook_scope* previous;
+        static inline thread_local update_hook_scope* current = nullptr;
+        explicit update_hook_scope(database& db) noexcept
+            : connection(db.db_), previous(current) { current = this; }
+        ~update_hook_scope() noexcept { current = previous; }
+        update_hook_scope(const update_hook_scope&) = delete;
+        update_hook_scope& operator=(const update_hook_scope&) = delete;
+        static bool active_for(sqlite3* connection) noexcept {
+            for (auto* frame = current; frame; frame = frame->previous) {
+                if (frame->connection == connection) return true;
+            }
+            return false;
+        }
+    };
+
 public:
     /// Open mode for database connections
     enum class open_mode {

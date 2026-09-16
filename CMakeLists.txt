@@ -197,6 +197,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
+    Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
     Tests/LatticeCoreTests/AttachViewIntegrityTests.cpp
     Tests/LatticeCoreTests/AuditHygieneTests.cpp
     Tests/LatticeCoreTests/SyncPerfBench.cpp

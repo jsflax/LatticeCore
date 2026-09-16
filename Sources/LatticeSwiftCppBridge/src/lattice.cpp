@@ -1499,70 +1499,73 @@ void swift_lattice::dispatch_vec0_reconcile(const SchemaVector& schemas) {
 void swift_lattice::reconcile_vec0_gaps_for(const std::string& table, const std::string& prop) {
     std::string vec_table = "_" + table + "_" + prop + "_vec";
     try {
-        if (!db().table_exists(vec_table)) {
-            // Missing table + present vector data is the sync-only lifecycle:
-            // the DB was CREATED empty (open's Phase 6b had no rows to infer
-            // dims from), then hydrated by sync-apply — which never creates
-            // vec0 or its triggers. Every later open takes the fast path, so
-            // bailing here would leave the DB semantically unsearchable
-            // forever. Create the index (dims from a sample row); the gap
-            // fill below then backfills every row.
-            auto sample = db().query(
-                "SELECT length(" + prop + ") as len FROM main." + table +
-                " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0 LIMIT 1");
-            if (sample.empty()) return;
-            auto len_it = sample[0].find("len");
-            if (len_it == sample[0].end() ||
-                !std::holds_alternative<int64_t>(len_it->second)) return;
-            int dims = static_cast<int>(std::get<int64_t>(len_it->second) / sizeof(float));
-            if (dims <= 0) return;
-            ensure_vec0_table(table, prop, dims);
-        }
-        // Qualify the model table with `main.`: this task runs async after
-        // open, and attach() may have installed a UNION ALL TEMP view that
-        // SHADOWS the bare table name on this connection. Counting the view
-        // (local + attached rows) against the local-only vec0 index would
-        // "heal" the attached rows into main's vec0 — permanent orphans.
-        // The vec0 index only indexes main's rows, so reconcile must only
-        // ever read main's model table.
-        auto mc = db().query(
-            "SELECT COUNT(*) as cnt FROM main." + table +
-            " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0");
-        auto vc = db().query(
-            "SELECT COUNT(*) as cnt FROM " + vec_table);
-        int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
-        int64_t v = vc.empty() ? 0 : std::get<int64_t>(vc[0].at("cnt"));
-        if (m <= v) return;
-        LOG_INFO("swift_lattice", "vec0 reconcile: model=%lld vec0=%lld, filling gaps in %s",
-                 (long long)m, (long long)v, vec_table.c_str());
-        // Find gaps using the _rowids shadow table (regular indexed table)
-        // instead of the vec0 virtual table. Insert missing rows one at a
-        // time since vec0 doesn't support OR IGNORE.
-        std::string rowids_table = vec_table + "_rowids";
-        auto gaps = db().query(
-            "SELECT m.globalId, m." + prop +
-            " FROM main." + table + " m"
-            " LEFT JOIN " + rowids_table + " r ON r.id = m.globalId"
-            " WHERE m." + prop + " IS NOT NULL"
-            " AND length(m." + prop + ") > 0"
-            " AND r.id IS NULL");
-        for (const auto& row : gaps) {
-            auto gid_it = row.find("globalId");
-            auto vec_it = row.find(prop);
-            if (gid_it == row.end() || vec_it == row.end()) continue;
-            if (!std::holds_alternative<std::string>(gid_it->second)) continue;
-            if (!std::holds_alternative<std::vector<uint8_t>>(vec_it->second)) continue;
-            try {
-                db().execute(
-                    "INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
-                    {std::get<std::string>(gid_it->second),
-                     std::get<std::vector<uint8_t>>(vec_it->second)});
-            } catch (...) {}
-        }
-        if (!gaps.empty()) {
-            LOG_INFO("swift_lattice", "vec0 reconcile: filled %zu gaps in %s",
-                     gaps.size(), vec_table.c_str());
-        }
+        with_vec0_maintenance("reconcile", [&] {
+            if (!db().table_exists(vec_table)) {
+                // Missing table + present vector data is the sync-only lifecycle:
+                // the DB was CREATED empty (open's Phase 6b had no rows to infer
+                // dims from), then hydrated by sync-apply — which never creates
+                // vec0 or its triggers. Every later open takes the fast path, so
+                // bailing here would leave the DB semantically unsearchable
+                // forever. Create the index (dims from a sample row); the gap
+                // fill below then backfills every row.
+                auto sample = db().query(
+                    "SELECT length(" + prop + ") as len FROM main." + table +
+                    " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0 LIMIT 1");
+                if (sample.empty()) return;
+                auto len_it = sample[0].find("len");
+                if (len_it == sample[0].end() ||
+                    !std::holds_alternative<int64_t>(len_it->second)) return;
+                int dims = static_cast<int>(std::get<int64_t>(len_it->second) / sizeof(float));
+                if (dims <= 0) return;
+                ensure_vec0_table(table, prop, dims);
+            }
+            // Qualify the model table with `main.`: this task runs async after
+            // open, and attach() may have installed a UNION ALL TEMP view that
+            // SHADOWS the bare table name on this connection. Counting the view
+            // (local + attached rows) against the local-only vec0 index would
+            // "heal" the attached rows into main's vec0 — permanent orphans.
+            // The vec0 index only indexes main's rows, so reconcile must only
+            // ever read main's model table.
+            auto mc = db().query(
+                "SELECT COUNT(*) as cnt FROM main." + table +
+                " WHERE " + prop + " IS NOT NULL AND length(" + prop + ") > 0");
+            auto vc = db().query(
+                "SELECT COUNT(*) as cnt FROM " + vec_table);
+            int64_t m = mc.empty() ? 0 : std::get<int64_t>(mc[0].at("cnt"));
+            int64_t v = vc.empty() ? 0 : std::get<int64_t>(vc[0].at("cnt"));
+            if (m <= v) return;
+            LOG_INFO("swift_lattice", "vec0 reconcile: model=%lld vec0=%lld, filling gaps in %s",
+                     (long long)m, (long long)v, vec_table.c_str());
+            // Find gaps using the _rowids shadow table (regular indexed table)
+            // instead of the vec0 virtual table. Insert missing rows one at a
+            // time since vec0 doesn't support OR IGNORE.
+            std::string rowids_table = vec_table + "_rowids";
+            auto gaps = db().query(
+                "SELECT m.globalId, m." + prop +
+                " FROM main." + table + " m"
+                " LEFT JOIN " + rowids_table + " r ON r.id = m.globalId"
+                " WHERE m." + prop + " IS NOT NULL"
+                " AND length(m." + prop + ") > 0"
+                " AND r.id IS NULL");
+            notify_vec0_maintenance_test_hook("reconcile", "before-fill");
+            for (const auto& row : gaps) {
+                auto gid_it = row.find("globalId");
+                auto vec_it = row.find(prop);
+                if (gid_it == row.end() || vec_it == row.end()) continue;
+                if (!std::holds_alternative<std::string>(gid_it->second)) continue;
+                if (!std::holds_alternative<std::vector<uint8_t>>(vec_it->second)) continue;
+                try {
+                    db().execute(
+                        "INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                        {std::get<std::string>(gid_it->second),
+                         std::get<std::vector<uint8_t>>(vec_it->second)});
+                } catch (...) {}
+            }
+            if (!gaps.empty()) {
+                LOG_INFO("swift_lattice", "vec0 reconcile: filled %zu gaps in %s",
+                         gaps.size(), vec_table.c_str());
+            }
+        });
     } catch (const std::exception& e) {
         LOG_WARN("swift_lattice", "vec0 reconcile failed for %s: %s", vec_table.c_str(), e.what());
     }

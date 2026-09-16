@@ -87,6 +87,7 @@ void lattice_db::setup_change_hook() {
     sqlite3_update_hook(db_->handle(),
         [](void* user_data, int operation, const char* db_name, const char* table_name, sqlite3_int64 rowid) {
             auto* self = static_cast<lattice_db*>(user_data);
+            database::update_hook_scope callback_scope(*self->db_);
 
             std::string op;
             switch (operation) {

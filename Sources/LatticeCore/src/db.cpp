@@ -186,6 +186,10 @@ void database::set_txn_hooks(std::function<void()> settled, std::function<void()
 }
 
 void database::drain_if_settled() {
+    // A nested query from the update hook can finish before the outer
+    // implicit statement does. Autocommit alone does not identify that
+    // callback frame. Leave dirty state for the actual statement's tail.
+    if (update_hook_scope::active_for(db_)) return;
     // Post-statement drain point (docs/design-deferred-memory-delivery.md):
     // after a successful statement, autocommit != 0 means the top-level
     // transaction just closed (implicit, or the explicit COMMIT that funnels
@@ -194,11 +198,15 @@ void database::drain_if_settled() {
     // frames, so observer exceptions propagate to the writer instead of
     // unwinding through sqlite3_step. Clear the flag BEFORE draining so a
     // callback's own writes re-arm it rather than re-entering.
-    if (on_txn_settled_ && txn_dirty_.load(std::memory_order_relaxed) &&
-        sqlite3_get_autocommit(db_) != 0) {
-        txn_dirty_.store(false, std::memory_order_relaxed);
-        on_txn_settled_();
-    }
+    if (!on_txn_settled_ || !db_ || !txn_dirty_.load(std::memory_order_relaxed)) return;
+    auto* mutex = sqlite3_db_mutex(db_);
+    sqlite3_mutex_enter(mutex);
+    const bool deliver = sqlite3_get_autocommit(db_) != 0 &&
+        txn_dirty_.exchange(false, std::memory_order_relaxed);
+    sqlite3_mutex_leave(mutex);
+    // Claim under SQLite, deliver after releasing it. Unrelated active read
+    // cursors do not defer an already committed writer's notifications.
+    if (deliver) on_txn_settled_();
 }
 
 void database::discard_if_rolled_back() {

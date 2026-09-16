@@ -8,6 +8,7 @@
 #include <optional>
 #include <atomic>
 #include <dynamic_object.hpp>
+#include <error.hpp>
 
 namespace lattice {
     class link_list_ref;
@@ -112,7 +113,7 @@ struct link_list {
         link_list* list;
 
         element_proxy& operator=(const dynamic_object_ref& o);
-        void assign(const dynamic_object_ref& o) SWIFT_NAME(assign(_:)) { this->operator=(o); }
+        void assign(const dynamic_object_ref& o) SWIFT_NAME(assign(_:)) { sealed([&] { this->operator=(o); }); }
 
         // Access the underlying object
         std::shared_ptr<dynamic_object> operator->() { return object; }
@@ -273,33 +274,35 @@ public:
     swift_lattice_ref getLattice() const SWIFT_COMPUTED_PROPERTY;
 #endif
 
+    std::string last_query_error_message() const SWIFT_NAME(lastQueryErrorMessage()) { return last_bridge_error(); }
+
     std::string getLinkTableName() const SWIFT_COMPUTED_PROPERTY {
         return impl_->get_link_table_name();
     }
 
-    size_t size() const { return impl_->size(); }
-    bool empty() const { return impl_->empty(); }
+    size_t size() const { return sealed([&] { return impl_->size(); }); }
+    bool empty() const { return sealed([&] { return impl_->empty(); }); }
 
     link_list::element_proxy operator[](size_t idx) const {
-        return (*impl_)[idx];
+        return sealed([&] { return (*impl_)[idx]; });
     }
 
     // const (shallow): these mutate the pointee through the shared_ptr, so on
     // the value path they import non-mutating and are callable on a `let`.
     void push_back(const dynamic_object_ref& obj) const SWIFT_NAME(pushBack(_:)) {
-        impl_->push_back(obj);
+        sealed([&] { impl_->push_back(obj); });
     }
 
     void push_back(const swift_dynamic_object& obj) const {
-        impl_->push_back(obj);
+        sealed([&] { impl_->push_back(obj); });
     }
 
     void erase(size_t idx) const {
-        impl_->erase(idx);
+        sealed([&] { impl_->erase(idx); });
     }
 
     void clear() const {
-        impl_->clear();
+        sealed([&] { impl_->clear(); });
     }
 
     std::optional<size_t> find_index(const dynamic_object_ref& obj) const SWIFT_NAME(findIndex(_:)) {

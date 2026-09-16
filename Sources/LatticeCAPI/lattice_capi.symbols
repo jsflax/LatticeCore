@@ -44,6 +44,7 @@ lattice_db_observe_sync_error
 lattice_db_observe_sync_progress
 lattice_db_observe_sync_state
 lattice_db_observe_table
+lattice_db_prune_audit_log
 lattice_db_query
 lattice_db_query_distinct
 lattice_db_query_fts
@@ -51,6 +52,8 @@ lattice_db_query_nearest
 lattice_db_query_within_bounds
 lattice_db_read_upload_floor
 lattice_db_receive_sync_data
+lattice_db_reclaim_space
+lattice_db_record_audit_watermark
 lattice_db_release
 lattice_db_remove
 lattice_db_remove_cross_process_observer
@@ -60,6 +63,7 @@ lattice_db_remove_table_observer
 lattice_db_retain
 lattice_db_rollback
 lattice_db_set_network_factory
+lattice_db_set_slot_observer
 lattice_db_set_sync_filter
 lattice_db_thread_statement_count
 lattice_db_total_statement_count

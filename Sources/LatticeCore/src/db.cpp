@@ -946,6 +946,58 @@ std::vector<database::row_t> database::query(const std::string& sql,
     return results;
 }
 
+std::optional<column_value_t> database::query_managed_cell(
+    const std::string& sql, const std::string& column, primary_key_t row_id) {
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
+    ++t_statement_count;
+    if (closed_.load(std::memory_order_acquire)) return std::nullopt;
+
+    sqlite3_stmt* raw = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &raw, nullptr);
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>
+        statement(raw, &sqlite3_finalize);
+    if (rc != SQLITE_OK) {
+        auto errmsg = sqlite3_errmsg(db_);
+        LOG_ERROR("db", "%s in %s", errmsg, sql.c_str());
+        std::cerr << "db: " << errmsg << " " << sql.c_str() << std::endl;
+        throw db_error("Failed to prepare query: " + std::string(errmsg));
+    }
+    bind_value(raw, 1, row_id);
+
+    // Normal primitive getters select one column. Retain the old name-match
+    // behavior (including its last-duplicate-name rule) for manually assigned
+    // field SQL instead of silently treating a different result as the field.
+    int value_index = -1;
+    const int column_count = sqlite3_column_count(raw);
+    for (int i = 0; i < column_count; ++i) {
+        const char* name = sqlite3_column_name(raw, i);
+        if (!name) {
+            LOG_ERROR("db", "column_name OOM in %s", sql.c_str());
+            throw db_error("Query failed: out of memory reading column name");
+        }
+        if (column == name) value_index = i;
+    }
+
+    std::optional<column_value_t> value;
+    bool first_row = true;
+    while ((rc = sqlite3_step(raw)) == SQLITE_ROW) {
+        if (first_row && value_index >= 0) value = extract_column(raw, value_index);
+        first_row = false;
+    }
+    // Release the read statement before invoking any settled callback. Keep
+    // the same completion/error policy as query(); the RAII owner also covers
+    // allocation or conversion exceptions before normal completion.
+    statement.reset();
+    if (rc != SQLITE_DONE) {
+        auto error = std::string(sqlite3_errmsg(db_));
+        LOG_ERROR("db", "Query failed: %s", error.c_str());
+        discard_if_rolled_back();
+        throw db_error("Query failed: " + error);
+    }
+    drain_if_settled();
+    return value;
+}
+
 void database::refresh_wal_snapshot() {
     // A no-op SELECT forces SQLite to release the old WAL read snapshot
     // and acquire a fresh one on the next query.

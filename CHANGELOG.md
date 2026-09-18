@@ -18,6 +18,8 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Read live primitive fields through one owned SQL cell, avoiding generic
+  row containers while preserving fresh queries, physical routing and types.
 - Initialize the default native Double fallback to zero instead of reading
   uninitialized storage when a live value is absent or has the wrong type.
 - Deliver each stored AuditLog insertion once on WebAssembly persistent stores;

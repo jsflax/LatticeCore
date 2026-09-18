@@ -384,14 +384,11 @@ struct CONFORMS_TO_MANAGED managed<int64_t> : managed_base {
 
     [[nodiscard]] int64_t detach() const {
         if (is_bound()) {
-            auto rows = db->query(
+            auto cell = db->query_managed_cell(
                 "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
-                {row_id});
-            if (!rows.empty()) {
-                auto it = rows[0].find(column_name);
-                if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    return std::get<int64_t>(it->second);
-                }
+                column_name, row_id);
+            if (cell && std::holds_alternative<int64_t>(*cell)) {
+                return std::get<int64_t>(std::move(*cell));
             }
         }
         return unmanaged_value;
@@ -460,14 +457,11 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
 
     [[nodiscard]] double detach() const {
         if (is_bound()) {
-            auto rows = db->query(
+            auto cell = db->query_managed_cell(
                 "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
-                {row_id});
-            if (!rows.empty()) {
-                auto it = rows[0].find(column_name);
-                if (it != rows[0].end() && std::holds_alternative<double>(it->second)) {
-                    return std::get<double>(it->second);
-                }
+                column_name, row_id);
+            if (cell && std::holds_alternative<double>(*cell)) {
+                return std::get<double>(std::move(*cell));
             }
         }
         return unmanaged_value;
@@ -591,14 +585,11 @@ struct CONFORMS_TO_MANAGED managed<std::string> : managed_base {
     
     [[nodiscard]] std::string detach() const {
         if (is_bound()) {
-            auto rows = db->query(
+            auto cell = db->query_managed_cell(
                 "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
-                {row_id});
-            if (!rows.empty()) {
-                auto it = rows[0].find(column_name);
-                if (it != rows[0].end() && std::holds_alternative<std::string>(it->second)) {
-                    return std::get<std::string>(it->second);
-                }
+                column_name, row_id);
+            if (cell && std::holds_alternative<std::string>(*cell)) {
+                return std::get<std::string>(std::move(*cell));
             }
         }
         return unmanaged_value;

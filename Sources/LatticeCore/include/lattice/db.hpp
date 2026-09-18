@@ -52,6 +52,7 @@ struct physical_store_identity {
 
 class database {
     friend class lattice_db;
+    template<typename T, typename Enable> friend struct managed;
     // The update hook may query globalId through database::query(). That
     // nested query must not drain a prior row's dirty state while the outer
     // SQLite statement still owns its connection mutex. Track the actual
@@ -243,6 +244,12 @@ private:
     std::function<void()> on_txn_settled_;
     std::function<void()> on_txn_rolled_back_;
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
+    // Internal live primitive getter path. Preserve query()'s first-row/name
+    // and stored-type conventions without building generic result containers.
+    // Empty optional means no matching first-row cell; a present nullptr is
+    // SQL NULL. The owning connection, fresh statement and settled tail remain.
+    std::optional<column_value_t> query_managed_cell(
+        const std::string& sql, const std::string& column, primary_key_t row_id);
     // ATTACH-only internal operation. Capture metadata in the same SQLite
     // execution scope, before a competing writer can win a second acquisition.
     // This captures only internal metadata; deferred user delivery stays after it.

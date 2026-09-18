@@ -436,6 +436,13 @@ public:
         }
     }
 
+    /// Logical schema/model name captured at hydration or insertion. Keep it
+    /// separate from getTableName(), whose qualified route preserves physical
+    /// identity and directs live reads/writes to an attached store.
+    std::string get_model_table_name() const SWIFT_NAME(getModelTableName()) {
+        return lattice ? managed_.source.table_name : unmanaged_.table_name;
+    }
+
 private:
     // to_json internals (dynamic_object.cpp). out_json is a nlohmann::json*
     // passed as void* to keep the JSON dependency out of this header;
@@ -683,6 +690,10 @@ public:
 
     std::string get_table_name() const SWIFT_NAME(getTableName()) {
         return impl_->get_table_name();
+    }
+
+    std::string get_model_table_name() const SWIFT_NAME(getModelTableName()) {
+        return impl_->get_model_table_name();
     }
 
     /// Object-graph → JSON — see dynamic_object::to_json for the pinned contract.

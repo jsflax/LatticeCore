@@ -3,6 +3,7 @@
 ## [2.1.0] - Unreleased
 
 ### Added
+- Expose the logical model name separately from an object’s physical store route so Swift virtual results can select the correct concrete type after attachment.
 - Add bounded, selected-column file reads with one owned snapshot cursor,
   row and copied-value byte budgets, cooperative cancellation, deadlines,
   explicit resource admission, and completion notification after cleanup.

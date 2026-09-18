@@ -63,6 +63,10 @@ TEST(VirtualUnionRoute, AttachedOnlyModelRetainsIdentityBoundPredicateAndLiveWri
     dynamic_object_ref hydrated(rows[0]);
     ASSERT_EQ(hydrated.get()->lattice.get(), main->get());
     EXPECT_EQ(managed_route(rows[0].table_name()).schema_sql, alias);
+    EXPECT_EQ(hydrated.get_model_table_name(), "UnionMuseum");
+    EXPECT_EQ(hydrated.get()->get_model_table_name(), "UnionMuseum");
+    EXPECT_EQ(hydrated.get_table_name(), alias + ".UnionMuseum");
+    EXPECT_EQ(museum->get_model_table_name(), "UnionMuseum");
     EXPECT_EQ(hydrated.get_int("id"), museum->get_int("id"));
     EXPECT_EQ(hydrated.get_string("globalId"), museum->get_string("globalId"));
     EXPECT_EQ(hydrated.get_string("name"), "Louvre");
@@ -102,6 +106,13 @@ TEST(VirtualUnionRoute, MixedMainAndRoutedArmsKeepReplicasSeparateWithPagination
         {std::string("France")});
     ASSERT_EQ(rows.size(), 3u);
     dynamic_object_ref local_hydrated(rows[1]), remote_hydrated(rows[2]);
+    dynamic_object_ref restaurant_hydrated(rows[0]);
+    EXPECT_EQ(restaurant_hydrated.get_model_table_name(), "UnionRestaurant");
+    EXPECT_EQ(restaurant_hydrated.get_table_name(), "main.UnionRestaurant");
+    EXPECT_EQ(local_hydrated.get_model_table_name(), "UnionMuseum");
+    EXPECT_EQ(remote_hydrated.get_model_table_name(), "UnionMuseum");
+    EXPECT_EQ(local_hydrated.get_table_name(), "main.UnionMuseum");
+    EXPECT_NE(local_hydrated.get_table_name(), remote_hydrated.get_table_name());
     EXPECT_EQ(local_hydrated.get_int("id"), remote_hydrated.get_int("id"));
     EXPECT_EQ(local_hydrated.get_string("globalId"), remote_hydrated.get_string("globalId"));
     EXPECT_EQ(local_hydrated.get_string("name"), "Local museum");
@@ -139,4 +150,14 @@ TEST(VirtualUnionRoute, OrdinaryRegisteredMainArmIgnoresUnroutedTempShadow) {
     EXPECT_EQ(raw[0].count("_source"), 0u);
     EXPECT_EQ(raw[0].count("_lattice_attach_token"), 0u);
     EXPECT_EQ(original->get_int("rank"), 7);
+}
+
+TEST(VirtualUnionRoute, UnmanagedLogicalNamePreservesDotsWithoutRouteParsing) {
+    swift_dynamic_object source;
+    source.table_name = "literal.model.name";
+    dynamic_object object(source);
+    dynamic_object_ref reference(source);
+    EXPECT_EQ(object.get_model_table_name(), "literal.model.name");
+    EXPECT_EQ(reference.get_model_table_name(), "literal.model.name");
+    EXPECT_EQ(reference.get_table_name(), "literal.model.name");
 }

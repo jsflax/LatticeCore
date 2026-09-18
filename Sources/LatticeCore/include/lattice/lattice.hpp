@@ -1617,7 +1617,14 @@ public:
         // cross-process handler from re-dispatching entries that
         // flush_changes is about to (or just did) deliver.
         if (shared_xproc_notifier_) {
-            auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
+            // The ordinary reader can have an older implicit snapshot held by
+            // another active SELECT. Reading its MAX here could rewind the
+            // cursor advanced by this commit's update hook, letting the xproc
+            // reader replay a locally delivered row. The committing writer
+            // sees this commit even when the ordinary reader is still pinned.
+            // WAL callbacks permit SQL after commit; memory delivery reaches
+            // this point only after its statement has settled.
+            auto max_rows = db_->query("SELECT MAX(id) AS max_id FROM AuditLog");
             if (!max_rows.empty()) {
                 auto it = max_rows[0].find("max_id");
                 if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {

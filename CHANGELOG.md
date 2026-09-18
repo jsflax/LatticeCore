@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.0.1] - Unreleased
+
+### Fixed
+- Read the committed audit cursor from the writer connection when flushing
+  local observations. An unfinished SELECT on the ordinary reader could
+  retain an older snapshot, rewind that cursor, and cause cross-process
+  handling to deliver the same local insert twice.
+- Add focused observer regressions for pinned-reader delivery and existing
+  rollback/audit-disabled cursor recovery. No schema or public API changes.
+
 ## [2.0.0] - Unreleased
 
 Audit-history hygiene. A consumer that rewrote one row ~10×/s grew an

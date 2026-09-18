@@ -2,6 +2,7 @@
 #include <stdexcept>
 
 namespace lattice {
+void projection_request::set_max_capture_bytes(int64_t value) { query_.max_capture_bytes = value; }
 void projection_request::set_text(std::string& target, const std::string& value) {
     sealed([&] {
         if (value.size() > 65536) throw std::invalid_argument("projection SQL metadata exceeds bound");

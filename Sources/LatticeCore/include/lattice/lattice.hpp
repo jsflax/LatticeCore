@@ -1135,9 +1135,9 @@ public:
 
         // Prepare once
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_->handle(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-            LOG_ERROR("db", "Failed to prepare bulk insert: %s", sqlite3_errmsg(db_->handle()));
-            throw std::runtime_error("Failed to prepare bulk insert: " + std::string(sqlite3_errmsg(db_->handle())));
+        if (sqlite3_prepare_v2(db_->internal_handle(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            LOG_ERROR("db", "Failed to prepare bulk insert: %s", sqlite3_errmsg(db_->internal_handle()));
+            throw std::runtime_error("Failed to prepare bulk insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
         }
 
         std::vector<managed<U>> results;
@@ -1210,12 +1210,12 @@ public:
 
                 // Execute
                 if (sqlite3_step(stmt) != SQLITE_DONE) {
-                    LOG_ERROR("db", "Failed to insert (bulk): %s", sqlite3_errmsg(db_->handle()));
-                    throw std::runtime_error("Failed to insert: " + std::string(sqlite3_errmsg(db_->handle())));
+                    LOG_ERROR("db", "Failed to insert (bulk): %s", sqlite3_errmsg(db_->internal_handle()));
+                    throw std::runtime_error("Failed to insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
                 }
 
                 // Get the new ID (or existing ID for upsert)
-                auto id = sqlite3_last_insert_rowid(db_->handle());
+                auto id = sqlite3_last_insert_rowid(db_->internal_handle());
                 primary_key_t actual_id = id;
                 global_id_t actual_gid = gid;
 
@@ -1266,7 +1266,7 @@ public:
             if (db_->is_in_transaction()) {
                 db_->rollback();
             }
-            auto msg = sqlite3_errmsg(db_->handle());
+            auto msg = sqlite3_errmsg(db_->internal_handle());
             sqlite3_finalize(stmt);
             throw;
         }
@@ -3375,7 +3375,7 @@ public:
             for (const auto& gid : global_row_ids) {
                 db_->execute("DELETE FROM \"" + table + "\" WHERE globalId = ? COLLATE NOCASE",
                              {gid});
-                if (sqlite3_changes(db_->handle()) == 0) continue;
+                if (sqlite3_changes(db_->internal_handle()) == 0) continue;
                 deleted++;
                 // Shape mirrors reconcile's narrowing synthesis (sync.cpp):
                 // the ONLY producer of marked deletes until now, and the
@@ -3410,7 +3410,7 @@ public:
         db_->execute(
             "UPDATE AuditLog SET timestamp = unixepoch(timestamp) "
             "WHERE typeof(timestamp) = 'text' AND unixepoch(timestamp) IS NOT NULL");
-        return static_cast<int64_t>(sqlite3_changes(db_->handle()));
+        return static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
     }
 
     /// Nuclear compaction: deletes ALL history, regenerates INSERT snapshots,
@@ -3676,7 +3676,7 @@ public:
             } else {
                 db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
             }
-            deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
+            deleted = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
             db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
             // Bound the no-op receipts table (insertion-ordered rowid horizon;
             // a receipt only matters while some sender could still re-deliver
@@ -3972,7 +3972,7 @@ public:
                         throw;
                     }
 
-                    int64_t inserted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
+                    int64_t inserted = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
 
                     db_->commit();
                     total_entries += inserted;
@@ -4682,7 +4682,7 @@ private:
     std::invoke_result_t<F> with_vec0_serialization(const char* operation,
                                                    bool allow_internal_nesting,
                                                    F&& body) {
-        auto* connection = db_->handle();
+        auto* connection = db_->internal_handle();
         if (!allow_internal_nesting) {
             for (auto* active = active_vec0_maintenance_; active; active = active->previous) {
                 if (active->connection == connection) {
@@ -5792,6 +5792,9 @@ private:
     void resume_projection_reads();
     mutable std::mutex projection_service_mutex_;
     std::shared_ptr<projection_service> projection_service_;
+    // Retained across service replacement/maintenance so native batches from a
+    // prior service still count against this parent's aggregate capture quota.
+    std::shared_ptr<projection_capture_account> projection_capture_account_;
     bool projection_admission_paused_ = false; // protected by service mutex
 
     using projection_pressure_map = std::map<std::string, std::shared_ptr<projection_pressure_source>, std::less<>>;
@@ -6938,11 +6941,11 @@ private:
     void register_sql_functions() {
         // sync_disabled() lets triggers check if sync is disabled
         sqlite3_create_function(
-            db_->handle(),
+            db_->internal_handle(),
             "sync_disabled",
             0,  // No arguments
             SQLITE_UTF8,
-            db_->handle(),  // Pass db handle as user data
+            db_->internal_handle(),  // Pass db handle as user data
             [](sqlite3_context* ctx, int, sqlite3_value**) {
                 sqlite3* db = static_cast<sqlite3*>(sqlite3_user_data(ctx));
                 sqlite3_stmt* stmt = nullptr;

@@ -56,7 +56,7 @@ int64_t swift_lattice::apply_selected_mutations(const selected_mutation_batch& b
     // while this explicit transaction remains open; commit belongs to Swift.
     std::lock_guard<std::mutex> topology_guard(attach_mutex_);
     if (is_closed() || db().is_closed()) invalid_batch("lattice is closed");
-    connection_guard writer_guard(db().handle());
+    connection_guard writer_guard(db().internal_handle());
     if (!owns_write_transaction())
         invalid_batch("requires a Core transaction owned by the calling thread");
 
@@ -169,7 +169,7 @@ int64_t swift_lattice::apply_selected_mutations(const selected_mutation_batch& b
     }
     if (groups.empty()) return 0;
 
-    const int variable_limit = sqlite3_limit(db().handle(), SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    const int variable_limit = sqlite3_limit(db().internal_handle(), SQLITE_LIMIT_VARIABLE_NUMBER, -1);
     const size_t mutation_binds = assignment_params.size() + guard_params.size();
     if (variable_limit <= 0 || mutation_binds + 2 > static_cast<size_t>(variable_limit))
         invalid_batch("mutation exceeds SQLite parameter limit");

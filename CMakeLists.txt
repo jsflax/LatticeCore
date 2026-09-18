@@ -69,6 +69,8 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
     Sources/LatticeCore/src/projection.cpp
+    Sources/LatticeCore/src/projection_memory.cpp
+    Sources/LatticeCore/src/projection_capture_policy.cpp
     Sources/LatticeCore/src/cross_process_notifier_darwin.cpp
     Sources/LatticeCore/src/cross_process_notifier_linux.cpp
     Sources/LatticeCore/src/cross_process_notifier_noop.cpp
@@ -204,6 +206,9 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp
     Tests/LatticeCoreTests/BulkMutationTests.cpp
     Tests/LatticeCoreTests/ProjectionReadTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryServiceTests.cpp
     Tests/LatticeCoreTests/SpatialShapeBridgeTests.cpp
     Tests/LatticeCoreTests/ManagedPhysicalRouteTests.cpp
     Tests/LatticeCoreTests/VirtualUnionRouteTests.cpp

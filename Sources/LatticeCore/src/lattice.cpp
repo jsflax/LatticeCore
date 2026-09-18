@@ -217,7 +217,7 @@ void lattice_db::setup_change_hook() {
     }
 
     // Update hook - buffers changes (called for each row change)
-    sqlite3_update_hook(db_->handle(),
+    sqlite3_update_hook(db_->internal_handle(),
         [](void* user_data, int operation, const char* db_name, const char* table_name, sqlite3_int64 rowid) {
             auto* self = static_cast<lattice_db*>(user_data);
             database::update_hook_scope callback_scope(*self->db_);
@@ -345,7 +345,7 @@ void lattice_db::setup_change_hook() {
     );
 
     // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
-    sqlite3_wal_hook(db_->handle(),
+    sqlite3_wal_hook(db_->internal_handle(),
         [](void* user_data, sqlite3*, const char* schema, int nframes) -> int {
             auto* self = static_cast<lattice_db*>(user_data);
 

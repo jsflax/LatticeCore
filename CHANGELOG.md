@@ -8,7 +8,13 @@
   row and copied-value byte budgets, cooperative cancellation, deadlines,
   explicit resource admission, and completion notification after cleanup.
   Preserve predicate bindings, order, grouping, distinct and geographic
-  bounds. Memory stores and WebAssembly projection execution remain unsupported.
+  bounds. WebAssembly projection execution remains unsupported.
+- Add native memory-store projected reads that capture selected values on
+  first demand, then release the writer before yielding batches. Capture
+  storage defaults to32 MiB per request with a64 MiB per-parent ceiling;
+  retained batches remain charged. Require committed idle state, supported
+  SQLite objects and Lattice-owned attachment changes; reject escaped raw
+  handles and unsafe expressions explicitly.
 - Add transaction-owned selected-object mutation batches with timestamp
   assignment and checked atomic integer increments. Validate all selected
   rows and physical attachment routes before writing; retain ordinary audit

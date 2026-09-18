@@ -1,6 +1,8 @@
 #include "lattice/projection.hpp"
 #include "lattice/lattice.hpp"
 #include "lattice/spatial_query.hpp"
+#include "projection_memory.hpp"
+#include "projection_capture_policy.hpp"
 #include <condition_variable>
 #include <cctype>
 #include <cmath>
@@ -18,6 +20,8 @@ using clock_type = std::chrono::steady_clock;
 constexpr size_t kMaxColumns = 64;
 constexpr size_t kMaxBatchRows = 512;
 constexpr size_t kMaxOperations = 64;
+// Source integration gate: lift only after the policy and memory service slice.
+constexpr bool kMemoryCaptureEnabled = true;
 constexpr size_t kMaxLeases = 2; // Explicit resource choice; not a measured optimum.
 constexpr int64_t kMaxRequestBytes = 1024 * 1024;
 std::atomic<uint64_t> next_operation_id{1};
@@ -85,18 +89,22 @@ public:
     void unclaim();
     bool acquire_lease();
     void release_lease();
+    std::shared_ptr<projection_capture_budget> reserve_capture(size_t limit);
     void erase(uint64_t id);
     void stop_all(projection_status reason, bool closing);
     size_t resources() const;
     void shutdown();
     struct topology {
         std::string path;
+        bool memory = false;
         std::vector<std::pair<std::string, std::string>> attachments;
         std::vector<std::shared_ptr<const physical_store_identity>> identities;
+        std::map<std::string, std::shared_ptr<const physical_store_identity>> files_by_schema;
         std::vector<std::string> views;
         int64_t idle_ttl_ms = 30000, max_age_ms = 300000;
     };
     topology capture(const std::shared_ptr<database_read_control>& control);
+    void capture_memory(projection_operation_state&, const topology&);
 private:
     lattice_db* owner_; // Only accessed while a counted claim prevents teardown.
     mutable std::mutex mutex_;
@@ -115,7 +123,9 @@ struct projection_operation_state : std::enable_shared_from_this<projection_oper
     std::atomic<bool> executing{false}, resources{false}, done{false};
     std::unique_ptr<database> connection;
     sqlite3_stmt* statement = nullptr;
-    bool leased = false;
+    bool leased = false, initialized = false;
+    std::shared_ptr<projection_capture_budget> capture_budget;
+    std::unique_ptr<projection_capture_storage> captured_rows;
     projection_store_ticket stores;
     int64_t column_count = 0, rows = 0, bytes = 0;
     std::atomic<int64_t> last_access_ms{0}, lease_start_ms{0};
@@ -145,6 +155,8 @@ struct projection_operation_state : std::enable_shared_from_this<projection_oper
     void cleanup_locked() noexcept;
     void sweep() noexcept;
     void initialize();
+    void prepare_query(sqlite3*, const projection_service::topology&, projection_capture_policy* = nullptr);
+    void capture_all(sqlite3*);
     projection_read_batch next(int64_t max_rows);
     projection_read_batch result(projection_status status, std::shared_ptr<const std::vector<column_value_t>> cells = {}) {
         projection_read_batch batch;
@@ -406,7 +418,7 @@ void projection_operation_state::notify_released() noexcept {
 }
 void projection_operation_state::cleanup_locked() noexcept {
     if (connection) {
-        auto* handle = connection->handle();
+        auto* handle = connection->internal_handle();
         control->unpublish(handle);
         sqlite3_progress_handler(handle, 0, nullptr, nullptr);
         sqlite3_busy_timeout(handle, 0);
@@ -414,6 +426,10 @@ void projection_operation_state::cleanup_locked() noexcept {
         if (sqlite3_get_autocommit(handle) == 0) sqlite3_exec(handle, "ROLLBACK", nullptr, nullptr, nullptr);
         connection.reset();
     }
+    // Borrowed SQL scopes must already have finalized/unlocked before stored
+    // rows reach this operation. Teardown owns only immutable backing here.
+    captured_rows.reset();
+    if (capture_budget) { capture_budget->finish(); capture_budget.reset(); }
     if (leased) { leased = false; service->release_lease(); }
     stores.release(); // Connection/transaction and service lock are gone first.
     resources.store(false, std::memory_order_release);
@@ -453,6 +469,18 @@ bool projection_service::acquire_lease() {
 }
 void projection_service::release_lease() {
     std::lock_guard<std::mutex> lock(mutex_); --leases_; settled_.notify_all();
+}
+std::shared_ptr<projection_capture_budget> projection_service::reserve_capture(size_t limit) {
+    // A counted claim protects owner_ through this operation. Do not hold the
+    // service mutex, SQL mutex or topology lock when acquiring the parent leaf.
+    std::shared_ptr<projection_capture_account> account;
+    {
+        std::lock_guard<std::mutex> lock(owner_->projection_service_mutex_);
+        if (!owner_->projection_capture_account_)
+            owner_->projection_capture_account_ = std::make_shared<projection_capture_account>();
+        account = owner_->projection_capture_account_;
+    }
+    return account->reserve(limit); // Account owns counters, never the parent.
 }
 void projection_service::erase(uint64_t id) {
     std::lock_guard<std::mutex> lock(mutex_); operations_.erase(id); settled_.notify_all();
@@ -498,18 +526,29 @@ projection_service::topology projection_service::capture(const std::shared_ptr<d
     }
     if (owner_->closed_.load()) fail(projection_status::closed, "lattice is closed");
     if (!owner_->db_) fail(projection_status::snapshot_expired, "writer is unavailable during exclusive maintenance");
-    if (owner_->config_.is_in_memory()) fail(projection_status::unsupported, "memory projection requires an isolated capture implementation");
     if (!owner_->attachment_topology_valid_) fail(projection_status::snapshot_expired, "attachment topology is incomplete");
     topology result;
-    auto main_identity = owner_->db_->physical_identity("main", control, true);
-    if (control->stopped()) fail(static_cast<projection_status>(control->stop_code.load()), "projection stopped waiting for store metadata");
-    if (!main_identity) fail(projection_status::unsupported, "projection requires a supported stable local file identity");
-    result.path = main_identity->filename;
-    result.identities.push_back(main_identity);
+    if (owner_->config_.path.empty())
+        fail(projection_status::unsupported, "temporary empty-filename projection storage is unsupported");
+    result.memory = owner_->config_.is_in_memory();
     result.attachments = owner_->attached_dbs_;
+    for (const auto& [_, path] : result.attachments) {
+        if (path.empty()) fail(projection_status::unsupported, "temporary projection attachment storage is unsupported");
+        result.memory = result.memory || configuration::path_is_memory(path);
+    }
+    if (result.memory && !kMemoryCaptureEnabled)
+        fail(projection_status::unsupported, "memory capture policy and service qualification is pending");
+    if (!owner_->config_.is_in_memory()) {
+        auto main_identity = owner_->db_->physical_identity("main", control, true);
+        if (control->stopped()) fail(static_cast<projection_status>(control->stop_code.load()), "projection stopped waiting for store metadata");
+        if (!main_identity) fail(projection_status::unsupported, "projection requires a supported stable local file identity");
+        result.path = main_identity->filename;
+        result.identities.push_back(main_identity);
+        result.files_by_schema.emplace("main", main_identity);
+    }
     for (auto& [alias, path] : result.attachments) {
-        if (configuration::path_is_memory(path)) fail(projection_status::unsupported, "memory attachments are unsupported for projection leases");
         if (!owner_->attached_route_tokens_.count(alias)) fail(projection_status::snapshot_expired, "attachment token is invalid");
+        if (configuration::path_is_memory(path)) continue;
         const auto expected = owner_->attached_projection_identities_.find(alias);
         if (expected == owner_->attached_projection_identities_.end() || !expected->second)
             fail(projection_status::unsupported, "attachment has no supported stable local file identity");
@@ -518,12 +557,91 @@ projection_service::topology projection_service::capture(const std::shared_ptr<d
         if (!actual || !(*actual == *expected->second))
             fail(projection_status::snapshot_expired, "attachment physical file changed");
         result.identities.push_back(expected->second);
+        result.files_by_schema.emplace(alias, expected->second);
         path = expected->second->filename;
     }
     for (const auto& [_, sql] : owner_->attached_view_sql_) result.views.push_back(sql);
     result.idle_ttl_ms = owner_->read_generation_ttl_ms_.load();
     result.max_age_ms = owner_->read_generation_max_age_ms_.load();
     return result;
+}
+
+
+void projection_service::capture_memory(projection_operation_state& operation, const topology& topology) {
+    // The caller holds a counted service claim, never the service mutex. That
+    // claim protects owner_/db_ through this stack-only borrower and its locks.
+    auto gate = owner_->store_write_gate();
+    std::unique_lock<std::recursive_timed_mutex> gate_lock;
+    if (gate) {
+        gate_lock = std::unique_lock<std::recursive_timed_mutex>(*gate, std::try_to_lock);
+        if (!gate_lock.owns_lock())
+            fail(projection_status::admission_rejected, "memory projection writer gate is busy");
+    }
+    std::unique_lock<std::mutex> topology_lock(owner_->attach_mutex_, std::defer_lock);
+    while (!topology_lock.try_lock()) {
+        operation.check();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    operation.check();
+    if (owner_->closed_.load() || !owner_->db_ || !owner_->attachment_topology_valid_)
+        fail(projection_status::snapshot_expired, "memory projection topology is unavailable");
+    std::vector<std::string> schemas{"main"};
+    for (const auto& [alias, _] : topology.attachments) schemas.push_back(alias);
+    {
+        database_projection_capture capture(*owner_->db_, operation.control, operation.statement);
+        // Raw ATTACH/DETACH is outside the owned memory-topology contract.
+        // Still reject a detectable same-name file replacement before any
+        // catalog/module work, while this connection can no longer rebind it.
+        for (const auto& [schema, expected] : topology.files_by_schema) {
+            auto actual = owner_->db_->physical_identity_locked(schema, operation.control);
+            operation.check();
+            if (!actual || !(*actual == *expected))
+                fail(projection_status::snapshot_expired, "memory projection physical file changed before capture");
+        }
+        {
+            projection_capture_policy policy(capture, operation.capture_budget, operation.query);
+            if (!policy.matches_schemas(schemas))
+                fail(projection_status::snapshot_expired, "untracked memory projection attachment topology");
+            operation.prepare_query(capture.handle(), topology, &policy);
+            operation.capture_all(capture.handle());
+            operation.check();
+        } // Finalize projected/catalog statements and detach authorizer delegate.
+    } // Restore actual writer policy and release SQLite before other locks.
+}
+
+void projection_operation_state::capture_all(sqlite3* handle) {
+    int64_t captured_count = 0, captured_bytes = 0;
+    for (;;) {
+        check();
+        const int rc = sqlite3_step(statement);
+        if (rc == SQLITE_DONE) { check(); return; }
+        if (rc != SQLITE_ROW) {
+            check();
+            if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED ||
+                (rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED)
+                fail(projection_status::admission_rejected, "memory projection source is busy");
+            throw db_error(sqlite3_errmsg(handle));
+        }
+        check();
+        if (captured_count >= query.max_rows)
+            fail(projection_status::row_budget_exceeded, "projection row budget exceeded");
+        int64_t row_bytes = 0;
+        for (int column = 0; column < column_count; ++column) {
+            const int type = sqlite3_column_type(statement, column);
+            if (type == SQLITE_TEXT && !sqlite3_column_text(statement, column))
+                throw db_error("projection text conversion failed inside SQLite");
+            const int64_t size = type == SQLITE_NULL ? 0 :
+                (type == SQLITE_INTEGER || type == SQLITE_FLOAT ? 8 : sqlite3_column_bytes(statement, column));
+            if (size < 0 || size > query.max_copied_bytes - captured_bytes - row_bytes)
+                fail(projection_status::byte_budget_exceeded, "projection copied-byte budget exceeded");
+            row_bytes += size;
+        }
+        // All encoded sizes are checked before copying. A partial append error
+        // terminalizes the operation; the caller never retries this row/chunk.
+        captured_rows->append(statement);
+        captured_bytes += row_bytes;
+        ++captured_count;
+    }
 }
 
 projection_read_operation projection_service::start(const projection_query& query) {
@@ -559,6 +677,7 @@ projection_read_operation projection_service::start(const projection_query& quer
         !query.columns.empty() && query.columns.size() <= kMaxColumns && query.order_columns.size() <= kMaxColumns &&
         query.parameters.size() <= 1024 &&
         query.limit >= -1 && query.offset >= 0 && query.max_rows >= 0 && query.max_copied_bytes >= 0 &&
+        query.max_capture_bytes > 0 && query.max_capture_bytes <= static_cast<int64_t>(projection_capture_account::ceiling) &&
         valid_timeout;
     for (const auto* text : {&query.table, &query.where_clause, &query.order_by, &query.group_by, &query.distinct_by})
         valid = valid && text->find('\0') == std::string::npos && add_size(text->size());
@@ -619,7 +738,8 @@ void projection_operation_state::initialize() {
     check();
     if (query.table.empty() || query.table.find('\0') != std::string::npos || query.columns.empty() ||
         query.columns.size() > kMaxColumns || query.limit < -1 || query.offset < 0 || query.max_rows < 0 ||
-        query.max_copied_bytes < 0 || query.timeout_ms <= 0)
+        query.max_copied_bytes < 0 || query.max_capture_bytes <= 0 ||
+        query.max_capture_bytes > static_cast<int64_t>(projection_capture_account::ceiling) || query.timeout_ms <= 0)
         fail(projection_status::invalid_request, "invalid projection request or budget");
     if (!query.group_by.empty() && !query.distinct_by.empty() && !query.order_by.empty() && query.order_columns.empty())
         fail(projection_status::invalid_request, "nested projection grouping requires explicit ORDER BY column dependencies");
@@ -664,6 +784,14 @@ void projection_operation_state::initialize() {
     if (admission != projection_status::batch) fail(admission, status_message(admission));
     idle_ttl_ms = topology.idle_ttl_ms; max_age_ms = topology.max_age_ms;
     lease_start_ms.store(now_ms()); last_access_ms.store(now_ms());
+    if (topology.memory) {
+        capture_budget = service->reserve_capture(static_cast<size_t>(query.max_capture_bytes));
+        captured_rows = std::make_unique<projection_capture_storage>(capture_budget, column_count);
+        service->capture_memory(*this, topology);
+        check();
+        initialized = true;
+        return;
+    }
     connection = std::make_unique<database>(readonly_uri(topology.path), database::open_mode::read_only, 0, control);
     auto private_identity = connection->physical_identity("main", control, true);
     check();
@@ -673,7 +801,7 @@ void projection_operation_state::initialize() {
     for (const auto& [alias, path] : topology.attachments) {
         check();
         connection->execute("ATTACH DATABASE ? AS " + quote_sql_identifier(alias), {readonly_uri(path)});
-        if (sqlite3_db_readonly(connection->handle(), alias.c_str()) != 1)
+        if (sqlite3_db_readonly(connection->internal_handle(), alias.c_str()) != 1)
             fail(projection_status::database_failure, "projection attachment was not opened read-only");
         private_identity = connection->physical_identity(alias, control, true);
         check();
@@ -685,19 +813,27 @@ void projection_operation_state::initialize() {
     connection->execute("BEGIN");
     check();
 
-    // Metadata reads use the private connection. Compare column-name spans
-    // without first copying arbitrary schema text or materializing row maps.
+    prepare_query(connection->internal_handle(), topology);
+    initialized = true;
+}
+
+void projection_operation_state::prepare_query(sqlite3* handle,
+    const projection_service::topology& topology, projection_capture_policy* policy) {
+    // File metadata stays on its private connection; memory metadata comes
+    // only from the preflighted policy while its schema guards remain active.
     sqlite3_stmt* metadata = nullptr;
     struct finalizer { sqlite3_stmt*& p; ~finalizer() { if (p) sqlite3_finalize(p); } } metadata_cleanup{metadata};
+    bool has_source = false;
+    if (policy) policy->validate_columns(query, has_source);
+    else {
     const auto metadata_sql = "PRAGMA table_info(" + quote_sql_identifier(query.table) + ')';
     database::record_statement();
-    int rc = sqlite3_prepare_v2(connection->handle(), metadata_sql.c_str(), -1, &metadata, nullptr);
-    if (rc != SQLITE_OK) throw db_error(sqlite3_errmsg(connection->handle()));
+    int rc = sqlite3_prepare_v2(handle, metadata_sql.c_str(), -1, &metadata, nullptr);
+    if (rc != SQLITE_OK) throw db_error(sqlite3_errmsg(handle));
     std::set<std::string> missing(query.columns.begin(), query.columns.end());
     missing.insert(query.order_columns.begin(), query.order_columns.end());
     if (!query.group_by.empty()) missing.insert(query.group_by);
     if (!query.distinct_by.empty()) missing.insert(query.distinct_by);
-    bool has_source = false;
     size_t inspected_columns = 0;
     while ((rc = sqlite3_step(metadata)) == SQLITE_ROW) {
         check();
@@ -711,9 +847,10 @@ void projection_operation_state::initialize() {
             else ++it;
         }
     }
-    if (rc != SQLITE_DONE) throw db_error(sqlite3_errmsg(connection->handle()));
+    if (rc != SQLITE_DONE) throw db_error(sqlite3_errmsg(handle));
     sqlite3_finalize(metadata); metadata = nullptr;
     if (!missing.empty()) fail(projection_status::schema_changed, "projected or shape-dependent stored column is missing");
+    }
 
     std::string predicate = query.where_clause;
     if (query.bounds) {
@@ -723,15 +860,16 @@ void projection_operation_state::initialize() {
         // property name itself need not appear in table_info(model).
         auto table_exists = [&](const std::string& schema, const std::string& table) {
             check();
+            if (policy) return policy->table_exists(schema, table);
             const auto sql = "SELECT 1 FROM " + quote_sql_identifier(schema) +
                 ".sqlite_master WHERE type='table' AND name=? LIMIT 1";
             database::record_statement();
-            int result = sqlite3_prepare_v2(connection->handle(), sql.c_str(), -1, &metadata, nullptr);
-            if (result != SQLITE_OK) throw db_error(sqlite3_errmsg(connection->handle()));
+            int result = sqlite3_prepare_v2(handle, sql.c_str(), -1, &metadata, nullptr);
+            if (result != SQLITE_OK) throw db_error(sqlite3_errmsg(handle));
             bind_checked(metadata, 1, table);
             result = sqlite3_step(metadata);
             check();
-            if (result != SQLITE_ROW && result != SQLITE_DONE) throw db_error(sqlite3_errmsg(connection->handle()));
+            if (result != SQLITE_ROW && result != SQLITE_DONE) throw db_error(sqlite3_errmsg(handle));
             const bool exists = result == SQLITE_ROW;
             sqlite3_finalize(metadata); metadata = nullptr;
             return exists;
@@ -786,9 +924,12 @@ void projection_operation_state::initialize() {
         query.offset > 0 ? std::optional<int64_t>(query.offset) : std::nullopt,
         group, distinct, select);
     const char* tail = nullptr;
-    database::record_statement();
-    rc = sqlite3_prepare_v2(connection->handle(), sql.c_str(), -1, &statement, &tail);
-    if (rc != SQLITE_OK) throw db_error(sqlite3_errmsg(connection->handle()));
+    if (policy) policy->prepare_read(sql);
+    else {
+        database::record_statement();
+        const int rc = sqlite3_prepare_v2(handle, sql.c_str(), -1, &statement, &tail);
+        if (rc != SQLITE_OK) throw db_error(sqlite3_errmsg(handle));
+    }
     while (tail && *tail && std::isspace(static_cast<unsigned char>(*tail))) ++tail;
     if (!statement || (tail && *tail) || !sqlite3_stmt_readonly(statement) ||
         sqlite3_column_count(statement) != column_count ||
@@ -829,10 +970,21 @@ projection_read_batch projection_operation_state::next(int64_t max_rows) {
     try {
         check();
         if (max_rows <= 0) fail(projection_status::invalid_request, "batch size must be positive");
-        if (!connection) initialize();
+        if (!initialized) initialize();
         const size_t row_capacity = static_cast<size_t>(std::min<int64_t>(max_rows, kMaxBatchRows));
         if (column_count <= 0 || row_capacity > std::numeric_limits<size_t>::max() / static_cast<size_t>(column_count))
             fail(projection_status::invalid_request, "batch metadata size overflow");
+        if (captured_rows) {
+            auto captured = captured_rows->take(static_cast<int64_t>(row_capacity));
+            check();
+            rows += captured->row_count(); bytes += captured->copied_bytes();
+            const bool complete = captured->row_count() < static_cast<int64_t>(row_capacity);
+            if (complete) { done.store(true); cleanup_locked(); }
+            else last_access_ms.store(now_ms());
+            auto batch = result(complete ? projection_status::done : projection_status::batch);
+            batch.captured_ = std::move(captured);
+            return batch;
+        }
         auto cells = std::make_shared<std::vector<column_value_t>>();
         const size_t capacity = row_capacity * static_cast<size_t>(column_count);
         if (capacity > cells->max_size()) fail(projection_status::invalid_request, "batch metadata exceeds container limit");
@@ -845,7 +997,7 @@ projection_read_batch projection_operation_state::next(int64_t max_rows) {
                 check(); done.store(true); cleanup_locked();
                 return result(projection_status::done, std::move(cells));
             }
-            if (rc != SQLITE_ROW) { check(); throw db_error(sqlite3_errmsg(connection->handle())); }
+            if (rc != SQLITE_ROW) { check(); throw db_error(sqlite3_errmsg(connection->internal_handle())); }
             check();
             if (rows >= query.max_rows) fail(projection_status::row_budget_exceeded, "projection row budget exceeded");
             int64_t row_bytes = 0;
@@ -886,6 +1038,9 @@ projection_read_batch projection_operation_state::next(int64_t max_rows) {
         }
         check(); last_access_ms.store(now_ms());
         return result(projection_status::batch, std::move(cells));
+    } catch (const projection_capture_failure& failure) {
+        control->stop(static_cast<int32_t>(failure.status));
+        try { error = failure.what(); } catch (...) {}
     } catch (const projection_failure& failure) {
         control->stop(static_cast<int32_t>(failure.status));
         try { error = failure.what(); } catch (...) {}
@@ -924,8 +1079,12 @@ bool projection_read_operation::when_released(void* context, void (*callback)(vo
     }
     state->notify_released(); return true;
 }
-int64_t projection_read_batch::row_count() const noexcept { return cells_ && columns_ > 0 ? static_cast<int64_t>(cells_->size() / columns_) : 0; }
+int64_t projection_read_batch::row_count() const noexcept {
+    if (captured_) return captured_->row_count();
+    return cells_ && columns_ > 0 ? static_cast<int64_t>(cells_->size() / columns_) : 0;
+}
 column_value_t projection_read_batch::value(int64_t row, int64_t column) const {
+    if (captured_) return captured_->value(row, column);
     if (!cells_ || row < 0 || column < 0 || row >= row_count() || column >= columns_)
         throw std::out_of_range("projection cell index out of range");
     return (*cells_)[static_cast<size_t>(row) * static_cast<size_t>(columns_) + static_cast<size_t>(column)];

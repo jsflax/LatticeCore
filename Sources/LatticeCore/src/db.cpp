@@ -417,6 +417,17 @@ void database::close() {
     closed_.store(true, std::memory_order_release);
 }
 
+sqlite3* database::handle() const {
+    // The connection stays allocated through logical close. As with every raw
+    // access, callers must keep the database wrapper alive and not move it.
+    if (!db_) return nullptr;
+    auto* mutex = sqlite3_db_mutex(db_);
+    sqlite3_mutex_enter(mutex);
+    raw_handle_escaped_.store(true, std::memory_order_release);
+    sqlite3_mutex_leave(mutex);
+    return db_;
+}
+
 void database::set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back) {
     on_txn_settled_ = std::move(settled);
     on_txn_rolled_back_ = std::move(rolled_back);
@@ -475,6 +486,7 @@ database::database(database&& other) noexcept
     : db_(other.db_), path_(std::move(other.path_)), mode_(other.mode_),
       busy_timeout_ms_(other.busy_timeout_ms_), read_control_(std::move(other.read_control_)),
       main_physical_identity_(std::atomic_load(&other.main_physical_identity_)) {
+    raw_handle_escaped_.store(other.raw_handle_escaped_.load(std::memory_order_acquire));
     other.db_ = nullptr;
 }
 
@@ -485,6 +497,7 @@ database& database::operator=(database&& other) noexcept {
             sqlite3_close_v2(db_);
         }
         db_ = other.db_;
+        raw_handle_escaped_.store(other.raw_handle_escaped_.load(std::memory_order_acquire));
         mode_ = other.mode_;
         busy_timeout_ms_ = other.busy_timeout_ms_;
         read_control_ = std::move(other.read_control_);

@@ -1525,8 +1525,8 @@ private:
     struct bbox_connection_guard {
         sqlite3_mutex* mutex;
         explicit bbox_connection_guard(database& connection) {
-            if (connection.is_closed() || !connection.handle()) throw db_error("spatial connection is closed");
-            mutex = sqlite3_db_mutex(connection.handle());
+            if (connection.is_closed() || !connection.internal_handle()) throw db_error("spatial connection is closed");
+            mutex = sqlite3_db_mutex(connection.internal_handle());
             sqlite3_mutex_enter(mutex);
         }
         ~bbox_connection_guard() { sqlite3_mutex_leave(mutex); }
@@ -1544,8 +1544,8 @@ private:
         struct finalize { sqlite3_stmt*& statement; ~finalize() { if (statement) sqlite3_finalize(statement); } } cleanup{statement};
         const char* tail = nullptr;
         database::record_statement();
-        if (sqlite3_prepare_v2(connection.handle(), sql.c_str(), -1, &statement, &tail) != SQLITE_OK)
-            throw db_error(sqlite3_errmsg(connection.handle()));
+        if (sqlite3_prepare_v2(connection.internal_handle(), sql.c_str(), -1, &statement, &tail) != SQLITE_OK)
+            throw db_error(sqlite3_errmsg(connection.internal_handle()));
         while (tail && *tail && std::isspace(static_cast<unsigned char>(*tail))) ++tail;
         if (!statement || (tail && *tail) || !sqlite3_stmt_readonly(statement) ||
             sqlite3_bind_parameter_count(statement) != static_cast<int>(parameters.size()))
@@ -1596,7 +1596,7 @@ private:
             }
             rows.push_back(std::move(row));
         }
-        if (result != SQLITE_DONE) throw db_error(sqlite3_errmsg(connection.handle()));
+        if (result != SQLITE_DONE) throw db_error(sqlite3_errmsg(connection.internal_handle()));
         return rows;
     }
 

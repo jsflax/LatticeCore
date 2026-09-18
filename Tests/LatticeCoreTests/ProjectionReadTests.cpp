@@ -247,9 +247,10 @@ TEST(ProjectionRead, IncompleteBoundsAndInvalidFieldsFailExplicitly) {
     EXPECT_EQ(missing.next_batch(1).status_code(), status(projection_status::schema_changed));
     EXPECT_FALSE(missing.has_resources());
     lattice_db memory;
-    auto unsupported = memory.start_projection(fixture.query());
-    EXPECT_EQ(unsupported.next_batch(1).status_code(), status(projection_status::unsupported));
-    EXPECT_FALSE(unsupported.has_resources());
+    // Native memory is supported, but this separate store has no fixture table.
+    auto missing_memory_table = memory.start_projection(fixture.query());
+    EXPECT_EQ(missing_memory_table.next_batch(1).status_code(), status(projection_status::schema_changed));
+    EXPECT_FALSE(missing_memory_table.has_resources());
 }
 
 TEST(ProjectionRead, GroupDistinctAndNestedShapesMatchStoredValueQueries) {

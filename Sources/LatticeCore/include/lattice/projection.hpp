@@ -18,7 +18,8 @@ enum class projection_status : int32_t {
     batch = 0, done = 1, cancelled = 2, deadline_exceeded = 3,
     row_budget_exceeded = 4, byte_budget_exceeded = 5, snapshot_expired = 6,
     unsupported = 7, schema_changed = 8, database_failure = 9,
-    invalid_request = 10, closed = 11, concurrent_next = 12, admission_rejected = 13
+    invalid_request = 10, closed = 11, concurrent_next = 12, admission_rejected = 13,
+    capture_budget_exceeded = 14
 };
 
 struct physical_store_identity;
@@ -79,6 +80,10 @@ struct projection_query {
     int64_t offset = 0;
     int64_t max_rows = 100000;
     int64_t max_copied_bytes = 8 * 1024 * 1024;
+    /// Native memory reads capture the complete selected result on first pull.
+    /// Includes requested backing allocations and metadata, not SQLite/malloc
+    /// overhead or caller-decoded values. 64 MiB aggregate per-parent policy.
+    int64_t max_capture_bytes = 32 * 1024 * 1024;
     int64_t timeout_ms = 5000;
     std::optional<projection_bounds> bounds;
     bool has_bounds = false; // Compatibility flag alone is an invalid request.
@@ -87,6 +92,8 @@ struct projection_query {
 /// Immutable shared backing; only the current batch belongs to the library.
 /// Copied bytes count NULL=0, INTEGER/REAL=8, UTF-8 text bytes and BLOB bytes.
 /// This is an extraction budget, not SQLite workspace or total allocator/RSS.
+struct projection_capture_batch;
+struct projection_capture_account;
 class projection_read_batch {
 public:
     int32_t status_code() const noexcept { return static_cast<int32_t>(status_); }
@@ -104,6 +111,7 @@ private:
     std::string error_;
     int64_t columns_ = 0, cumulative_rows_ = 0, cumulative_bytes_ = 0;
     std::shared_ptr<const std::vector<column_value_t>> cells_;
+    std::shared_ptr<const projection_capture_batch> captured_;
 };
 
 /// Value handle with a shared PImpl; no FRT, actor, or platform-age dependency.

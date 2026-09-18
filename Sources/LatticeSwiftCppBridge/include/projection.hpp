@@ -31,6 +31,7 @@ public:
     void set_offset(int64_t value) SWIFT_NAME(setOffset(_:)) { query_.offset = value; }
     void set_max_rows(int64_t value) SWIFT_NAME(setMaxRows(_:)) { query_.max_rows = value; }
     void set_max_copied_bytes(int64_t value) SWIFT_NAME(setMaxCopiedBytes(_:)) { query_.max_copied_bytes = value; }
+    void set_max_capture_bytes(int64_t value) SWIFT_NAME(setMaxCaptureBytes(_:));
     void set_timeout_milliseconds(int64_t value) SWIFT_NAME(setTimeoutMilliseconds(_:)) { query_.timeout_ms = value; }
 private:
     friend class swift_lattice_ref;

@@ -53,6 +53,10 @@ struct physical_store_identity {
 class database {
     friend class lattice_db;
     template<typename T, typename Enable> friend struct managed;
+    friend class swift_lattice;
+    friend class projection_service;
+    friend struct projection_operation_state;
+    friend struct database_projection_capture;
     // The update hook may query globalId through database::query(). That
     // nested query must not drain a prior row's dirty state while the outer
     // SQLite statement still owns its connection mutex. Track the actual
@@ -218,8 +222,10 @@ public:
     /// failed statements whose implicit transaction already rolled back.
     void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back);
 
-    // Raw access (use sparingly)
-    sqlite3* handle() const { return db_; }
+    /// Raw access permanently opts this connection out of strict borrowed
+    /// memory projection capture: external SQLite handlers cannot be restored
+    /// or proven read-only. Waits behind an active capture before exposing it.
+    sqlite3* handle() const;
 
     // Bind a value to a prepared statement (public for lattice_db bulk insert)
     void bind_value(sqlite3_stmt* stmt, int index, const column_value_t& value);
@@ -228,7 +234,10 @@ public:
     bool is_closed() const { return closed_.load(std::memory_order_acquire); }
 
 private:
+    // Trusted Core/bridge callers only; never return this pointer to a client.
+    sqlite3* internal_handle() const noexcept { return db_; }
     sqlite3* db_ = nullptr;
+    mutable std::atomic<bool> raw_handle_escaped_{false};
     std::string path_;
     open_mode mode_;
     // Set by close(); ops short-circuit when set. db_ stays valid until ~database,

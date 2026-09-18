@@ -199,6 +199,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
+    Tests/LatticeCoreTests/IPCFramingRegressionTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp
     Tests/LatticeCoreTests/BulkMutationTests.cpp

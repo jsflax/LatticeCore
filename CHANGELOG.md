@@ -18,6 +18,9 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Suppress SIGPIPE per socket send on Linux when an IPC peer closes during
+  framing. Return the existing write failure instead of terminating the
+  process; retain Darwin socket setup and generic non-socket behavior.
 - Preserve each physical route and attachment token through heterogeneous
   virtual UNION queries, including models present only in attached stores.
   Keep ordinary main-store arms pinned to main when a TEMP view shadows them.

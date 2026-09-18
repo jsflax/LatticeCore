@@ -1,5 +1,62 @@
 # Changelog
 
+## [2.1.0] - Unreleased
+
+### Added
+- Add bounded, selected-column file reads with one owned snapshot cursor,
+  row and copied-value byte budgets, cooperative cancellation, deadlines,
+  explicit resource admission, and completion notification after cleanup.
+  Preserve predicate bindings, order, grouping, distinct and geographic
+  bounds. Memory stores and WebAssembly projection execution remain unsupported.
+- Add transaction-owned selected-object mutation batches with timestamp
+  assignment and checked atomic integer increments. Validate all selected
+  rows and physical attachment routes before writing; retain ordinary audit
+  and trigger behavior.
+- Expose immutable collection-query row images and statement-free managed
+  identity separately from live fields and materialized values.
+- Add payload-free coarse invalidation hooks as reconciliation hints.
+  These hooks do not provide a durable event cursor or transaction replay.
+
+### Fixed
+- Preserve geographic query shape, bound precision and physical-store
+  identity through attached queries, counts and pagination. Resolve update
+  hook identities from the callback's quoted physical schema and table.
+- Retire projected snapshots across parent close, maintenance, attachment
+  topology changes and physical-store WAL pressure without interrupting a
+  subsequent writer or unrelated store.
+- Capture attachment identity and schema metadata within their owning SQLite
+  execution scope so a continuously active writer cannot win every repeated
+  metadata acquisition. Keep existing metadata types and filtering; report a
+  null SQLite TEXT conversion as an allocation error instead of an empty name.
+
+### Compatibility and validation scope
+- Rebuild Core and all C++/Swift bridge consumers together. Internal object
+  layouts changed; binary interchangeability is not assumed. The public C
+  ABI declarations and export list remain unchanged.
+- This is a qualification candidate. Full native, C ABI, SDK and JS/WASM
+  compatibility remain release gates. No benchmark speedup is claimed;
+  native memory projection and durable cursor-backed observation remain open.
+
+## [2.0.2] - Unreleased
+
+### Fixed
+- Destroy removed table, object and invalidation observer captures after
+  releasing their registry locks. A captured object can synchronously cancel
+  another observer during destruction without deadlocking the same registry.
+- Preserve survivor order, missing-token behavior and existing in-flight
+  callback semantics; add bounded native child regressions for each removal
+  path. No schema or public API changes.
+
+## [2.0.1] - Unreleased
+
+### Fixed
+- Read the committed audit cursor from the writer connection when flushing
+  local observations. An unfinished SELECT on the ordinary reader could
+  retain an older snapshot, rewind that cursor, and cause cross-process
+  handling to deliver the same local insert twice.
+- Add focused observer regressions for pinned-reader delivery and existing
+  rollback/audit-disabled cursor recovery. No schema or public API changes.
+
 ## [2.0.0] - Unreleased
 
 Audit-history hygiene. A consumer that rewrote one row ~10×/s grew an

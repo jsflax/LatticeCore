@@ -3,6 +3,7 @@
 #include "log.hpp"
 #include "types.hpp"
 #include "db.hpp"
+#include "projection.hpp"
 #include "schema.hpp"
 #include "managed.hpp"
 #include "scheduler.hpp"
@@ -1617,7 +1618,14 @@ public:
         // cross-process handler from re-dispatching entries that
         // flush_changes is about to (or just did) deliver.
         if (shared_xproc_notifier_) {
-            auto max_rows = read_db().query("SELECT MAX(id) AS max_id FROM AuditLog");
+            // The ordinary reader can have an older implicit snapshot held by
+            // another active SELECT. Reading its MAX here could rewind the
+            // cursor advanced by this commit's update hook, letting the xproc
+            // reader replay a locally delivered row. The committing writer
+            // sees this commit even when the ordinary reader is still pinned.
+            // WAL callbacks permit SQL after commit; memory delivery reaches
+            // this point only after its statement has settled.
+            auto max_rows = db_->query("SELECT MAX(id) AS max_id FROM AuditLog");
             if (!max_rows.empty()) {
                 auto it = max_rows[0].find("max_id");
                 if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
@@ -2005,17 +2013,24 @@ public:
     observer_id add_table_observer(const std::string& table_name,
                                     std::function<void(const std::vector<change_event>&)> callback) {
         std::lock_guard<std::mutex> lock(observers_mutex_);
-        auto id = next_observer_id_++;
+        auto id = next_observer_id_.fetch_add(1, std::memory_order_relaxed);
         table_observers_[table_name][id] = std::move(callback);
         return id;
     }
 
     // Remove a table observer
     void remove_table_observer(const std::string& table_name, observer_id id) {
-        std::lock_guard<std::mutex> lock(observers_mutex_);
-        auto it = table_observers_.find(table_name);
-        if (it != table_observers_.end()) {
-            it->second.erase(id);
+        // A callback's final capture may cancel another observer. Release it
+        // after unlocking, while keeping removal itself linearized under lock.
+        std::function<void(const std::vector<change_event>&)> removed;
+        {
+            std::lock_guard<std::mutex> lock(observers_mutex_);
+            auto table_it = table_observers_.find(table_name);
+            if (table_it == table_observers_.end()) return;
+            auto observer_it = table_it->second.find(id);
+            if (observer_it == table_it->second.end()) return;
+            removed.swap(observer_it->second);
+            table_it->second.erase(observer_it);
         }
     }
 
@@ -2028,41 +2043,57 @@ public:
     observer_id add_object_observer(const std::string& table_name, int64_t row_id,
                                      std::function<void(const std::string&)> callback) {
         std::lock_guard<std::mutex> lock(object_observers_mutex_);
-        auto id = next_observer_id_++;
+        auto id = next_observer_id_.fetch_add(1, std::memory_order_relaxed);
         object_observers_[table_name][row_id].emplace_back(id, std::move(callback));
         return id;
     }
 
     /// Remove a specific object observer
     void remove_object_observer(const std::string& table_name, int64_t row_id, observer_id id) {
-        std::lock_guard<std::mutex> lock(object_observers_mutex_);
-        auto table_it = object_observers_.find(table_name);
-        if (table_it == object_observers_.end()) return;
+        std::function<void(const std::string&)> removed;
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            auto table_it = object_observers_.find(table_name);
+            if (table_it == object_observers_.end()) return;
 
-        auto row_it = table_it->second.find(row_id);
-        if (row_it == table_it->second.end()) return;
+            auto row_it = table_it->second.find(row_id);
+            if (row_it == table_it->second.end()) return;
 
-        auto& observers = row_it->second;
-        observers.erase(
-            std::remove_if(observers.begin(), observers.end(),
-                [id](const auto& pair) { return pair.first == id; }),
-            observers.end());
+            auto& observers = row_it->second;
+            auto it = std::find_if(observers.begin(), observers.end(),
+                [id](const auto& entry) { return entry.first == id; });
+            if (it != observers.end()) {
+                removed.swap(it->second);
+                // Shift the empty slot with swaps: preserve survivor order and
+                // never destroy a surviving callback while holding the mutex.
+                for (auto next = it + 1; next != observers.end(); ++it, ++next) {
+                    it->swap(*next);
+                }
+                observers.pop_back();
+            }
 
-        // Clean up empty entries
-        if (observers.empty()) {
-            table_it->second.erase(row_it);
-            if (table_it->second.empty()) {
-                object_observers_.erase(table_it);
+            // Clean up empty entries
+            if (observers.empty()) {
+                table_it->second.erase(row_it);
+                if (table_it->second.empty()) {
+                    object_observers_.erase(table_it);
+                }
             }
         }
     }
 
     /// Remove all observers for a specific object
     void remove_all_object_observers(const std::string& table_name, int64_t row_id) {
-        std::lock_guard<std::mutex> lock(object_observers_mutex_);
-        auto table_it = object_observers_.find(table_name);
-        if (table_it != object_observers_.end()) {
-            table_it->second.erase(row_id);
+        std::vector<std::pair<observer_id, std::function<void(const std::string&)>>> removed;
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            auto table_it = object_observers_.find(table_name);
+            if (table_it == object_observers_.end()) return;
+            auto row_it = table_it->second.find(row_id);
+            if (row_it != table_it->second.end()) {
+                removed.swap(row_it->second);
+                table_it->second.erase(row_it);
+            }
             if (table_it->second.empty()) {
                 object_observers_.erase(table_it);
             }
@@ -2251,11 +2282,19 @@ public:
     /// Remove a previously registered invalidation hook. Safe to call from
     /// inside a hook callback (hooks are copied out before invocation).
     void remove_invalidation_hook(uint64_t token) {
-        std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
-        invalidation_hooks_.erase(
-            std::remove_if(invalidation_hooks_.begin(), invalidation_hooks_.end(),
-                           [token](const auto& entry) { return entry.first == token; }),
-            invalidation_hooks_.end());
+        invalidation_hook_detailed_fn removed;
+        {
+            std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
+            auto it = std::find_if(invalidation_hooks_.begin(), invalidation_hooks_.end(),
+                [token](const auto& entry) { return entry.first == token; });
+            if (it == invalidation_hooks_.end()) return;
+            removed.swap(it->second);
+            // Move the empty slot to the end without releasing any survivor.
+            for (auto next = it + 1; next != invalidation_hooks_.end(); ++it, ++next) {
+                it->swap(*next);
+            }
+            invalidation_hooks_.pop_back();
+        }
     }
 
     /// Fire hooks on every alive same-path instance (isolated `:memory:`
@@ -2281,6 +2320,7 @@ public:
     /// — the synchronizer owns its own lattice_db instance, so signalling
     /// only its own hooks would miss the app handles holding the keepers.
     void request_generation_advance() {
+        if (db_) retire_projection_store(db_->physical_identity());
         fire_invalidation_hooks({}, invalidation_reason::advance);
     }
 
@@ -2380,6 +2420,11 @@ public:
     /// OLDEST live generation (spec §2.2(e)) — reads against it re-resolve
     /// through the tolerant ladder. A pending WAL-threshold eviction is
     /// executed first, so the new pin lands on a rewound log (§3.4).
+    /// Private owned cursors never use the tolerant generation fallback.
+    projection_read_operation start_projection(const projection_query& query);
+    void cancel_projection_reads(projection_status reason = projection_status::snapshot_expired);
+    size_t projection_resources_outstanding() const;
+
     uint64_t acquire_read_generation() {
 #ifdef __EMSCRIPTEN__
         return 0;
@@ -2539,8 +2584,9 @@ public:
 
     /// Live generations held by THIS instance.
     size_t local_read_generations_outstanding() {
+        const size_t projections = projection_resources_outstanding();
         std::lock_guard<std::mutex> lock(read_pool_mutex_);
-        return live_generations_.size();
+        return live_generations_.size() + projections;
     }
 
     /// Live generations across EVERY alive same-path instance. Spec §3.3
@@ -2553,8 +2599,12 @@ public:
         size_t total = 0;
         instance_registry::instance().for_each_alive(config_.path,
             [&total](lattice_db* inst) {
-                total += inst->local_read_generations_outstanding();
+                std::lock_guard<std::mutex> lock(inst->read_pool_mutex_);
+                total += inst->live_generations_.size();
             });
+        // Physical projection identities include foreign parents' attached
+        // leases, once per operation, independent of URI/symlink spelling.
+        if (db_) total += projection_store_readers(db_->physical_identity());
         return total;
     }
 
@@ -2623,6 +2673,8 @@ public:
     /// bridged in Commit 4 — Lattice.retireAllGenerations() (§3.6 iOS
     /// suspension contract).
     void retire_all_read_generations() {
+        if (db_) retire_projection_store(db_->physical_identity());
+        cancel_projection_reads(projection_status::snapshot_expired);
         std::vector<std::shared_ptr<read_generation>> gens;
         {
             std::lock_guard<std::mutex> lock(read_pool_mutex_);
@@ -2859,16 +2911,31 @@ private:
                           inst->wal_eviction_pending_.load(std::memory_order_relaxed);
             });
         if (!pending) return;
+        std::vector<std::pair<std::shared_ptr<projection_pressure_source>, uint64_t>> pressure;
         instance_registry::instance().for_each_alive(config_.path,
-            [](lattice_db* inst) { inst->retire_all_read_generations(); });
+            [&pressure](lattice_db* inst) {
+                for (const auto& source : inst->projection_pressure_sources()) {
+                    if (source->pending()) pressure.emplace_back(source, source->raised.load());
+                }
+                inst->retire_all_read_generations();
+            });
+        for (const auto& [source, _] : pressure) retire_projection_store(source->identity);
+        for (const auto& [source, _] : pressure)
+            if (projection_store_readers(source->identity) != 0) return;
         if (read_generations_outstanding() != 0) return;  // racing acquire — retry next tick
         if (db_ && !config_.read_only && !closed_.load(std::memory_order_seq_cst)) {
             auto res = db_->wal_checkpoint(/*truncate=*/true, /*busy_budget_ms=*/250);
             if (res.busy != 0) db_->wal_checkpoint(/*truncate=*/false);
         }
+        for (const auto& [source, through] : pressure) source->acknowledge(through);
         instance_registry::instance().for_each_alive(config_.path,
             [](lattice_db* inst) {
-                inst->wal_eviction_pending_.store(false, std::memory_order_relaxed);
+                // Clear first, then detect any later raise. Hook ordering is
+                // raise generation -> legacy pending flag, so neither racing
+                // sequence can erase a newer pressure episode.
+                inst->wal_eviction_pending_.store(false, std::memory_order_seq_cst);
+                for (const auto& source : inst->projection_pressure_sources())
+                    if (source->pending()) inst->wal_eviction_pending_.store(true, std::memory_order_seq_cst);
             });
 #endif
     }
@@ -4164,6 +4231,13 @@ public:
     void detach(lattice_db& lattice);
     void detach_alias(const std::string& alias);
 
+    /// Current topology only; no SQL. Callers can conservatively disable
+    /// identity-only optimizations when row ids span physical stores.
+    bool has_attached_stores() const {
+        std::lock_guard<std::mutex> lock(attach_mutex_);
+        return !attached_dbs_.empty();
+    }
+
     database& db() { return *db_; }
 
     /// Get the connection for reads (falls back to the write connection for
@@ -4205,18 +4279,11 @@ public:
         xproc_read_db_.reset();
     }
 
-    /// Close the write connection
-    void close_write_db() {
-        db_.reset();
-    }
-
-    /// Reopen the write connection
-    void reopen_write_db() {
-        db_ = std::make_unique<database>(config_.path, database::open_mode::read_write,
-                                         config_.busy_timeout_ms);
-        register_sql_functions();  // per-connection: triggers need sync_disabled()
-        setup_change_hook();
-    }
+    /// Exclusive writer maintenance. Ordinary writes/attach remain caller-
+    /// serialized; projection admission is paused and existing operations are
+    /// drained before the writer can be reset. Reopen restores saved topology.
+    void close_write_db();
+    void reopen_write_db();
 
     /// Explicitly close all database connections and stop background services.
     /// Safe to call before deleting the database files. After calling close(),
@@ -5604,9 +5671,20 @@ protected:
     // TEMP view attach created so regeneration can drop exactly what it
     // owns (view names are the bare table names; the set is identical on
     // every view-bearing handle).
-    std::mutex attach_mutex_;
+    mutable std::mutex attach_mutex_;
     std::vector<std::pair<std::string, std::string>> attached_dbs_;
+    std::unordered_map<std::string, int64_t> attached_route_tokens_;
+    std::unordered_map<int64_t, std::shared_ptr<const void>> attached_route_metadata_;
+    int64_t next_attachment_token_ = 1;
     std::set<std::string> attached_view_names_;
+    std::map<std::string, std::string> attached_view_sql_;
+    std::map<std::string, std::shared_ptr<const physical_store_identity>> attached_projection_identities_;
+    bool attachment_topology_valid_ = true;
+
+    // Only these attachment helpers access database's private metadata funnel.
+    static std::vector<std::string> attachment_column_names(
+        database* db, const std::string& schema_sql, const std::string& table_name);
+    static std::unordered_set<std::string> attachment_model_tables(database* db, const char* master);
 
     /// The connections that carry attach views: db_ always (when open),
     /// read_db_ only where it exists (sync-enabled and in-memory lattices
@@ -5619,12 +5697,58 @@ protected:
     }
 
     void rebuild_attached_views();
+    void detach_alias_if_current(const std::string& alias,
+                                 const std::optional<std::string>& expected_path,
+                                 std::optional<int64_t> expected_token);
+
+    // Opaque immutable extension metadata shares the topology lock/lifetime.
+    // The Swift bridge supplies its own schema snapshot; Core never inspects it.
+    void attach_with_metadata(lattice_db& source, std::shared_ptr<const void> metadata);
+    void invalidate_attachment_route(const std::string& alias) noexcept {
+        auto it = attached_route_tokens_.find(alias);
+        if (it == attached_route_tokens_.end()) return;
+        attached_route_metadata_.erase(it->second);
+        attached_route_tokens_.erase(it);
+    }
+
+    /// Raw SQL BEGIN does not establish Core transaction ownership.
+    bool owns_write_transaction() const {
+        return db_ && !db_->is_closed() && db_->is_in_transaction() &&
+            txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id();
+    }
 
 private:
     template<typename U> friend class query;
     template<typename U> friend class results;
+    friend class projection_service;
+    friend struct projection_operation_state;
+    friend struct projection_pressure_test_access;
     friend class synchronizer_base;
     friend class synchronizer;
+
+    void shutdown_projection_reads();
+    void pause_projection_reads();
+    void resume_projection_reads();
+    mutable std::mutex projection_service_mutex_;
+    std::shared_ptr<projection_service> projection_service_;
+    bool projection_admission_paused_ = false; // protected by service mutex
+
+    using projection_pressure_map = std::map<std::string, std::shared_ptr<projection_pressure_source>, std::less<>>;
+    void setup_projection_pressure();
+    void replace_projection_pressure_source(const std::string& schema,
+                                           std::shared_ptr<projection_pressure_source> source);
+    void publish_projection_pressure(std::unique_ptr<const projection_pressure_map> next);
+    void raise_projection_pressure(const char* schema) noexcept;
+    std::vector<std::shared_ptr<projection_pressure_source>> projection_pressure_sources() const;
+    void deactivate_projection_pressure();
+    // Two-slot grace protocol: hook readers increment before loading a map,
+    // recheck the current slot, and release before callbacks/SQL. Publishers
+    // switch slots then drain only old readers, outside SQLite/registry locks.
+    // All protocol atomics are seq_cst. At most two immutable maps exist.
+    mutable std::atomic<unsigned> projection_pressure_slot_{0};
+    mutable std::atomic<uint64_t> projection_pressure_readers_[2]{};
+    std::atomic<const projection_pressure_map*> projection_pressure_maps_[2]{};
+    std::unique_ptr<const projection_pressure_map> projection_pressure_owners_[2];
 
     configuration config_;
     std::unique_ptr<database> db_;       // Write connection
@@ -5724,7 +5848,9 @@ private:
 
     // Table-level observer storage (for Results observation)
     std::mutex observers_mutex_;
-    observer_id next_observer_id_ = 1;
+    // Table and object registrations hold different registry mutexes. Token
+    // allocation is shared; registry publication stays under each own mutex.
+    std::atomic<observer_id> next_observer_id_{1};
     std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>> table_observers_;
 
     // Per-object observer storage (for individual model observation)
@@ -7323,6 +7449,13 @@ protected:
         if (source_it != row.end() && std::holds_alternative<std::string>(source_it->second)) {
             auto source_schema = std::get<std::string>(source_it->second);
             obj.table_name_ = source_schema + "." + table_name;
+            auto token_it = row.find("_lattice_attach_token");
+            obj.attachment_token_ = source_schema == "main" ? 0 : -1;
+            if (source_schema != "main" && token_it != row.end() &&
+                std::holds_alternative<int64_t>(token_it->second) &&
+                std::get<int64_t>(token_it->second) > 0) {
+                obj.attachment_token_ = std::get<int64_t>(token_it->second);
+            }
         } else {
             obj.table_name_ = table_name;
         }
@@ -7330,7 +7463,7 @@ protected:
         // Populate the source object's values from the row
         if constexpr (has_source_member<T>::value) {
             for (const auto& [key, value] : row) {
-                if (key != "id" && key != "globalId" && key != "_source") {
+                if (key != "id" && key != "globalId" && key != "_source" && key != "_lattice_attach_token") {
                     obj.source.values[key] = value;
                 }
             }
@@ -8235,8 +8368,9 @@ inline void lattice_db::teardown_sync(bool fire_handoff) {
 }
 
 inline void lattice_db::close() {
-    // 0. Logical close: reads/writes short-circuit to empty from here on.
+    // Close admission before draining: no service may be created in between.
     closed_.store(true, std::memory_order_seq_cst);
+    shutdown_projection_reads();
     // 1. Mark as dying — prevents new notify_change() calls from starting.
     guard_->alive.store(false, std::memory_order_seq_cst);
     // 2. Wait for any in-flight notify_change() calls on OTHER threads to
@@ -8279,12 +8413,16 @@ inline void lattice_db::close() {
     // are owned as unique_ptr members and freed in ~lattice_db (after the threads
     // above are joined), where the sqlite3* is released single-threaded. close() on
     // the wrapper just flips its flag so post-close ops return empty.
+    deactivate_projection_pressure();
     if (db_)            db_->close();
     if (read_db_)       read_db_->close();
     if (xproc_read_db_) xproc_read_db_->close();
 }
 
 inline lattice_db::~lattice_db() {
+    deactivate_projection_pressure();
+    closed_.store(true, std::memory_order_seq_cst);
+    shutdown_projection_reads();
     auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
     LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",
              (void*)this, config_.path.c_str(), (long long)n);

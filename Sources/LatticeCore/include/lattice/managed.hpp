@@ -259,6 +259,7 @@ public:
 
 protected:
     friend class lattice_db;
+    friend class swift_lattice;
     friend struct managed_base;  // For bind_to_parent access
     template<typename U, typename> friend struct managed;
     template<typename U> friend class query;
@@ -268,6 +269,9 @@ protected:
     std::string table_name_;
     primary_key_t id_ = 0;
     global_id_t global_id_;
+    // Nonpersisted physical-route generation, captured by query SQL. Zero is
+    // main; positive values identify one attachment lifetime; -1 is invalid.
+    int64_t attachment_token_ = 0;
 
     std::vector<std::string> property_names_;
     std::unordered_map<std::string, column_type> property_types_;

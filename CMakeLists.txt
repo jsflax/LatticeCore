@@ -68,6 +68,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
+    Sources/LatticeCore/src/projection.cpp
     Sources/LatticeCore/src/cross_process_notifier_darwin.cpp
     Sources/LatticeCore/src/cross_process_notifier_linux.cpp
     Sources/LatticeCore/src/cross_process_notifier_noop.cpp
@@ -90,6 +91,8 @@ target_link_libraries(LatticeCore PUBLIC
 # =============================================================================
 add_library(LatticeSwiftCppBridge STATIC
     Sources/LatticeSwiftCppBridge/src/lattice.cpp
+    Sources/LatticeSwiftCppBridge/src/bulk_mutation.cpp
+    Sources/LatticeSwiftCppBridge/src/projection.cpp
     Sources/LatticeSwiftCppBridge/src/dynamic_object.cpp
     Sources/LatticeSwiftCppBridge/src/managed_object.cpp
     Sources/LatticeSwiftCppBridge/src/unmanaged_object.cpp
@@ -193,8 +196,14 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
+    Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
+    Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
+    Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp
+    Tests/LatticeCoreTests/BulkMutationTests.cpp
+    Tests/LatticeCoreTests/ProjectionReadTests.cpp
+    Tests/LatticeCoreTests/SpatialShapeBridgeTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp

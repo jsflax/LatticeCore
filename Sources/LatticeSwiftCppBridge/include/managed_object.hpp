@@ -50,6 +50,14 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     swift_dynamic_object source;
     std::unordered_map<std::string, property_descriptor> properties_;
     std::unordered_map<std::string, managed_base> fields;  // Managed property wrappers for read/write
+
+    // The exact SQL row returned by a collection query, retained only long
+    // enough to extract query-position metadata (e.g. a keyset anchor).
+    // Separate from source.values / unmanaged_values_: neither live field
+    // reads nor writes, inserts, or row-cache refreshes consult this image.
+    // Copies share an immutable image; consumers release it before publishing
+    // live models so large payloads do not stay resident with those models.
+    std::shared_ptr<const database::row_t> query_row_image_;
     
     managed() = default;
     managed(managed&&) = default;

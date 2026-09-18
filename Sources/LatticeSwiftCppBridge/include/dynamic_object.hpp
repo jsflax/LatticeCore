@@ -96,6 +96,47 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
         new (&managed_) managed<swift_dynamic_object>(*o.get_value());
         lattice = managed_.lattice_shared();
     }
+
+    /// Identity captured when this handle was bound, without reading the row
+    /// or changing materialized-read mode. Zero means unmanaged. This is not
+    /// an existence check: deleting the row does not erase a held handle's id.
+    int64_t managed_primary_key() const noexcept SWIFT_NAME(managedPrimaryKey()) {
+        return lattice ? managed_.id_ : 0;
+    }
+
+    /// Collection-query metadata, independent of live and materialized reads.
+    /// An image survives writes/deletes unchanged until explicitly released.
+    bool has_query_row_image() const noexcept SWIFT_NAME(hasQueryRowImage()) {
+        return lattice && managed_.query_row_image_ != nullptr;
+    }
+
+    /// Exact stored type: -1 = absent, 0 = SQL NULL, 1 = Int64, 2 = Double,
+    /// 3 = String, 4 = blob. Missing metadata never falls back to a SQL read.
+    int32_t query_row_value_type(const std::string& name) const
+        SWIFT_NAME(queryRowValueType(named:)) {
+        if (!has_query_row_image()) return -1;
+        const auto& image = *managed_.query_row_image_;
+        auto it = image.find(name);
+        return it == image.end() ? -1 : static_cast<int32_t>(it->second.index());
+    }
+
+    /// Copy one value out of the immutable query image. Check the type first
+    /// to distinguish absence from SQL NULL, and the bridge error immediately
+    /// afterward for allocation failure. No live-read fallback or cache change.
+    column_value_t query_row_value(const std::string& name) const
+        SWIFT_NAME(queryRowValue(named:)) {
+        return sealed([&]() -> column_value_t {
+            if (!has_query_row_image()) return nullptr;
+            const auto& image = *managed_.query_row_image_;
+            auto it = image.find(name);
+            return it == image.end() ? column_value_t{nullptr} : it->second;
+        });
+    }
+
+    /// Drop only this handle's query metadata; keep its field/cache semantics.
+    void release_query_row_image() noexcept SWIFT_NAME(releaseQueryRowImage()) {
+        if (lattice) managed_.query_row_image_.reset();
+    }
     
     // ------------------------------------------------------------------
     // Row cache (materialized reads)
@@ -664,6 +705,31 @@ public:
     // Check if this is a managed (persisted) object
     bool is_managed() const {
         return impl_ != nullptr && impl_->lattice != nullptr;
+    }
+
+    /// Statement-free bound identity; zero for an empty or unmanaged ref.
+    int64_t managed_primary_key() const noexcept SWIFT_NAME(managedPrimaryKey()) {
+        return impl_ ? impl_->managed_primary_key() : 0;
+    }
+
+    bool has_query_row_image() const noexcept SWIFT_NAME(hasQueryRowImage()) {
+        return impl_ && impl_->has_query_row_image();
+    }
+
+    int32_t query_row_value_type(const std::string& name) const
+        SWIFT_NAME(queryRowValueType(named:)) {
+        return impl_ ? impl_->query_row_value_type(name) : -1;
+    }
+
+    column_value_t query_row_value(const std::string& name) const
+        SWIFT_NAME(queryRowValue(named:)) {
+        if (impl_) return impl_->query_row_value(name);
+        last_bridge_error().clear();
+        return nullptr;
+    }
+
+    void release_query_row_image() const noexcept SWIFT_NAME(releaseQueryRowImage()) {
+        if (impl_) impl_->release_query_row_image();
     }
 
 private:

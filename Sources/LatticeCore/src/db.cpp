@@ -1,10 +1,15 @@
 #include "lattice/db.hpp"
+#include "lattice/projection.hpp"
 #include "lattice/log.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <algorithm>
+#include <sys/stat.h>
+#include <exception>
 
 namespace lattice {
 
@@ -23,8 +28,229 @@ uint64_t database::thread_statement_count() {
 }
 
 
-database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
-    : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
+bool database_read_control::stopped() noexcept {
+    if (stop_code.load(std::memory_order_acquire) != 0) return true;
+    if (std::chrono::steady_clock::now() < deadline) return false;
+    int32_t expected = 0;
+    stop_code.compare_exchange_strong(expected, static_cast<int32_t>(projection_status::deadline_exceeded));
+    return true;
+}
+void database_read_control::stop(int32_t reason) noexcept {
+    int32_t expected = 0;
+    stop_code.compare_exchange_strong(expected, reason, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> lock(target_mutex);
+    if (target) sqlite3_interrupt(target);
+}
+void database_read_control::publish(sqlite3* handle) noexcept {
+    std::lock_guard<std::mutex> lock(target_mutex);
+    target = handle;
+    if (stopped()) sqlite3_interrupt(target);
+}
+void database_read_control::unpublish(sqlite3* handle) noexcept {
+    std::lock_guard<std::mutex> lock(target_mutex);
+    if (target == handle) target = nullptr;
+}
+void database::record_statement() {
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
+    ++t_statement_count;
+}
+
+std::shared_ptr<const physical_store_identity> database::physical_identity(
+    const std::string& schema, const std::shared_ptr<database_read_control>& control,
+    bool validate_current) const {
+#if defined(__EMSCRIPTEN__) || (!defined(__APPLE__) && !defined(__linux__))
+    return {};
+#else
+    if (schema == "main" && !validate_current) {
+        if (auto cached = std::atomic_load(&main_physical_identity_)) return cached;
+    }
+    if (!db_) return {};
+    auto* mutex = sqlite3_db_mutex(db_);
+    if (!mutex) return {};
+    const auto wait_end = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max(0, busy_timeout_ms_));
+    while (sqlite3_mutex_try(mutex) != SQLITE_OK) {
+        if ((control && control->stopped()) || (!control && std::chrono::steady_clock::now() >= wait_end)) return {};
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    struct unlock { sqlite3_mutex* mutex; ~unlock() { sqlite3_mutex_leave(mutex); } } unlock{mutex};
+    return physical_identity_locked(schema, control);
+#endif
+}
+
+std::shared_ptr<const physical_store_identity> database::physical_identity_locked(
+    const std::string& schema, const std::shared_ptr<database_read_control>& control) const {
+#if defined(__EMSCRIPTEN__) || (!defined(__APPLE__) && !defined(__linux__))
+    return {};
+#else
+    if (control && control->stopped()) return {};
+    const char* filename = sqlite3_db_filename(db_, schema.c_str());
+    if (!filename || !*filename || sqlite3_uri_boolean(filename, "immutable", 0)) return {};
+    sqlite3_vfs* vfs = nullptr;
+    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_VFS_POINTER, &vfs) != SQLITE_OK ||
+        !vfs || !vfs->zName || (std::string(vfs->zName) != "unix" && std::string(vfs->zName) != "unix-excl")) return {};
+    int moved = 1;
+    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved) return {};
+    std::error_code error;
+    const auto canonical = std::filesystem::canonical(filename, error);
+    if (error) return {};
+    struct stat before{}, after{};
+    if (::stat(canonical.c_str(), &before) != 0 || !S_ISREG(before.st_mode)) return {};
+    moved = 1;
+    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved ||
+        ::stat(canonical.c_str(), &after) != 0 || before.st_dev != after.st_dev || before.st_ino != after.st_ino) return {};
+    if (control && control->stopped()) return {};
+    auto identity = std::make_shared<physical_store_identity>();
+    identity->device = static_cast<uint64_t>(after.st_dev);
+    identity->inode = static_cast<uint64_t>(after.st_ino);
+    identity->filename = canonical.string();
+    if (schema == "main") {
+        auto cached = std::atomic_load(&main_physical_identity_);
+        if (cached && !(*cached == *identity)) return {};
+        if (!cached) std::atomic_store(&main_physical_identity_, std::shared_ptr<const physical_store_identity>(identity));
+    }
+    return identity;
+#endif
+}
+
+
+std::shared_ptr<const physical_store_identity> database::attach_and_capture_identity(
+    const std::string& attach_sql, const std::string& schema) {
+    if (closed_.load(std::memory_order_acquire)) return {};
+    struct capture_context {
+        database* owner;
+        const std::string* schema;
+        std::shared_ptr<const physical_store_identity> identity;
+        std::exception_ptr error;
+    } context{this, &schema, {}, {}};
+    // ATTACH produces no rows. This single constant row provides an internal
+    // capture point inside the same sqlite3_exec as the successful ATTACH.
+    const std::string sql = attach_sql + "; SELECT 1";
+    record_statement(); // ATTACH attempt; the executed SELECT is counted below.
+    char* message = nullptr;
+    const int rc = sqlite3_exec(db_, sql.c_str(),
+        [](void* raw, int columns, char**, char**) noexcept -> int {
+            auto& capture = *static_cast<capture_context*>(raw);
+            try {
+                // Also tolerate legacy PRAGMA empty_result_callbacks: the
+                // rowless ATTACH itself must never act as the capture point.
+                if (columns != 1) return 0;
+                database::record_statement();
+                auto* mutex = sqlite3_db_mutex(capture.owner->db_);
+                // FULLMUTEX connections have a recursive mutex. Verify usable
+                // ownership without polling; unsupported configurations retain
+                // legacy attachment but cannot authorize projected provenance.
+                if (!mutex || sqlite3_mutex_try(mutex) != SQLITE_OK) return 0;
+                struct unlock {
+                    sqlite3_mutex* mutex;
+                    ~unlock() { sqlite3_mutex_leave(mutex); }
+                } release{mutex};
+                capture.identity = capture.owner->physical_identity_locked(*capture.schema, {});
+                return 0;
+            } catch (...) {
+                capture.error = std::current_exception();
+                return 1; // SQLite finalizes before C++ propagates this error.
+            }
+        }, &context, &message);
+    const std::unique_ptr<char, decltype(&sqlite3_free)> free_message(message, &sqlite3_free);
+    if (rc != SQLITE_OK) {
+        discard_if_rolled_back();
+        if (context.error) std::rethrow_exception(context.error);
+        throw db_error("SQL execution failed: " + std::string(message ? message : "Unknown error") +
+                       " (SQL: " + attach_sql + ")");
+    }
+    drain_if_settled();
+    return context.identity;
+}
+
+std::vector<std::string> database::query_attachment_text_metadata(
+    const std::string& sql, const std::string& column) {
+    if (closed_.load(std::memory_order_acquire)) return {};
+    struct metadata_context {
+        database* owner;
+        const std::string* sql;
+        const std::string* column;
+        std::vector<std::string> values;
+        std::exception_ptr error;
+        bool entered = false;
+        bool statement_failed = false;
+    } context{this, &sql, &column, {}, {}};
+    // Do not use pragma_* table-valued functions: ordinary tables can shadow
+    // those names. The nested original PRAGMA/SELECT also preserves real SQLite
+    // types, which sqlite3_exec's string-only result callback would erase.
+    record_statement(); // Constant rendezvous statement.
+    char* message = nullptr;
+    const int rc = sqlite3_exec(db_, "SELECT 1",
+        [](void* raw, int columns, char** values, char**) noexcept -> int {
+            auto& capture = *static_cast<metadata_context*>(raw);
+            try {
+                if (!values) return 0; // Legacy empty_result_callbacks.
+                if (columns != 1 || capture.entered)
+                    throw db_error("Unexpected attachment metadata rendezvous shape");
+                capture.entered = true;
+                auto* mutex = sqlite3_db_mutex(capture.owner->db_);
+                if (mutex && sqlite3_mutex_try(mutex) != SQLITE_OK)
+                    throw db_error("Attachment metadata execution scope unavailable");
+                struct unlock {
+                    sqlite3_mutex* mutex;
+                    ~unlock() { if (mutex) sqlite3_mutex_leave(mutex); }
+                } release{mutex};
+                // NULL means the connection has no SQLite mutex (e.g. a
+                // single-threaded WASM build); preserve its existing mode.
+                database::record_statement(); // Actual metadata attempt.
+                sqlite3_stmt* raw_statement = nullptr;
+                const int prepare_rc = sqlite3_prepare_v2(capture.owner->db_,
+                    capture.sql->c_str(), -1, &raw_statement, nullptr);
+                const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>
+                    statement(raw_statement, &sqlite3_finalize);
+                if (prepare_rc != SQLITE_OK)
+                    throw db_error("Failed to prepare attachment metadata: " +
+                        std::string(sqlite3_errmsg(capture.owner->db_)));
+                if (!statement || !sqlite3_stmt_readonly(statement.get()))
+                    throw db_error("Attachment metadata requires a read-only statement");
+                int selected = -1;
+                const int count = sqlite3_column_count(statement.get());
+                for (int index = 0; index < count; ++index) {
+                    const char* name = sqlite3_column_name(statement.get(), index);
+                    if (!name) throw db_error("Attachment metadata column name allocation failed");
+                    if (*capture.column == name) selected = index;
+                }
+                int step_rc = SQLITE_OK;
+                while ((step_rc = sqlite3_step(statement.get())) == SQLITE_ROW) {
+                    if (selected < 0 || sqlite3_column_type(statement.get(), selected) != SQLITE_TEXT)
+                        continue; // Existing callers ignore missing/non-TEXT name values.
+                    const auto* value = sqlite3_column_text(statement.get(), selected);
+                    if (!value) throw db_error("Attachment metadata text allocation failed");
+                    // Match extract_column's current C-string semantics. This
+                    // is metadata only, not a new general binary/text codec.
+                    capture.values.emplace_back(reinterpret_cast<const char*>(value));
+                }
+                if (step_rc != SQLITE_DONE) {
+                    capture.statement_failed = true;
+                    throw db_error("Attachment metadata query failed: " +
+                        std::string(sqlite3_errmsg(capture.owner->db_)));
+                }
+                return 0; // Statement finalizes before releasing the recursive scope.
+            } catch (...) {
+                capture.error = std::current_exception();
+                return 1;
+            }
+        }, &context, &message);
+    const std::unique_ptr<char, decltype(&sqlite3_free)> free_message(message, &sqlite3_free);
+    if (rc != SQLITE_OK || context.error) {
+        if (context.statement_failed) discard_if_rolled_back();
+        if (context.error) std::rethrow_exception(context.error);
+        throw db_error("Attachment metadata execution failed: " +
+            std::string(message ? message : "Unknown error"));
+    }
+    if (!context.entered) throw db_error("Attachment metadata rendezvous did not execute");
+    drain_if_settled();
+    return std::move(context.values);
+}
+
+database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
+                   std::shared_ptr<database_read_control> read_control)
+    : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
     int rc;
@@ -57,6 +283,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
         throw db_error("Failed to open database: " + error);
     }
 
+    try {
     // Statement-level busy timeout MUST be installed before ANY statement runs.
     // It used to be set after the open-time pragmas, so the very first
     // `PRAGMA journal_mode = WAL` had no busy handler — a concurrent open or
@@ -64,7 +291,21 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     // "database is locked" instantly instead of waiting. Instances now
     // genuinely close and reopen (weak instance cache), so open-time races
     // are common rather than exceptional.
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);
+    if (read_control_) {
+        read_control_->publish(db_);
+        sqlite3_progress_handler(db_, 1000, [](void* context) -> int {
+            return static_cast<database_read_control*>(context)->stopped() ? 1 : 0;
+        }, read_control_.get());
+        sqlite3_busy_handler(db_, [](void* context, int) -> int {
+            auto* control = static_cast<database_read_control*>(context);
+            if (control->stopped()) return 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return control->stopped() ? 0 : 1;
+        }, read_control_.get());
+        if (read_control_->stopped()) throw db_error("owned read cancelled before initialization");
+    } else {
+        sqlite3_busy_timeout(db_, busy_timeout_ms_);
+    }
 
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
@@ -75,8 +316,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     if (mode == open_mode::read_write) {
         execute("PRAGMA journal_mode = DELETE");
     }
-    execute("PRAGMA cache_size = 50000");       // Large cache for performance
-    execute("PRAGMA temp_store = MEMORY");      // Temp tables in RAM
+    execute(read_control_ ? "PRAGMA cache_size = 2000" : "PRAGMA cache_size = 50000");       // Large cache for performance
+    execute(read_control_ ? "PRAGMA temp_store = FILE" : "PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #else
     // Native mode: Enable WAL mode for better concurrency (only on read-write connection)
     if (mode == open_mode::read_write) {
@@ -84,9 +325,9 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     }
 
     // Performance optimizations (matching Lattice.swift)
-    execute("PRAGMA cache_size = 50000");       // Large cache for performance
-    execute("PRAGMA mmap_size = 300000000");    // Memory-mapped I/O (~300MB)
-    execute("PRAGMA temp_store = MEMORY");      // Temp tables in RAM
+    execute(read_control_ ? "PRAGMA cache_size = 2000" : "PRAGMA cache_size = 50000");       // Large cache for performance
+    execute(read_control_ ? "PRAGMA mmap_size = 0" : "PRAGMA mmap_size = 300000000");    // Memory-mapped I/O (~300MB)
+    execute(read_control_ ? "PRAGMA temp_store = FILE" : "PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #endif
 
     // (busy timeout installed immediately after open, above — before the
@@ -123,14 +364,22 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     // Initialize sqlite-vec extension for vector search
     int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
     if (vec_rc != SQLITE_OK) {
+        if (read_control_) read_control_->unpublish(db_);
         sqlite3_close_v2(db_);
         db_ = nullptr;
         LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
         throw db_error("Failed to initialize sqlite-vec extension");
     }
+    } catch (...) {
+        if (read_control_) read_control_->unpublish(db_);
+        if (db_) sqlite3_close_v2(db_);
+        db_ = nullptr;
+        throw;
+    }
 }
 
 database::~database() {
+    if (read_control_) read_control_->unpublish(db_);
     if (db_) {
         if (mode_ == open_mode::read_write) {
             // The connection is closing — silence change/commit hooks first.
@@ -223,16 +472,23 @@ void database::discard_if_rolled_back() {
 }
 
 database::database(database&& other) noexcept
-    : db_(other.db_), path_(std::move(other.path_)) {
+    : db_(other.db_), path_(std::move(other.path_)), mode_(other.mode_),
+      busy_timeout_ms_(other.busy_timeout_ms_), read_control_(std::move(other.read_control_)),
+      main_physical_identity_(std::atomic_load(&other.main_physical_identity_)) {
     other.db_ = nullptr;
 }
 
 database& database::operator=(database&& other) noexcept {
     if (this != &other) {
+        if (read_control_) read_control_->unpublish(db_);
         if (db_) {
             sqlite3_close_v2(db_);
         }
         db_ = other.db_;
+        mode_ = other.mode_;
+        busy_timeout_ms_ = other.busy_timeout_ms_;
+        read_control_ = std::move(other.read_control_);
+        std::atomic_store(&main_physical_identity_, std::atomic_load(&other.main_physical_identity_));
         path_ = std::move(other.path_);
         other.db_ = nullptr;
     }
@@ -738,6 +994,11 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
                   truncate ? "TRUNCATE" : "PASSIVE", e.what(), path_.c_str());
     }
     sqlite3_busy_timeout(db_, busy_timeout_ms_);  // restore statement-level timeout
+    if (truncate && result.busy != 0) {
+        // Signal only after the checkpoint statement returned. This does not
+        // claim the current BUSY attempt succeeded; a later retry may truncate.
+        try { retire_projection_store(physical_identity()); } catch (...) {}
+    }
     return result;
 #endif
 }

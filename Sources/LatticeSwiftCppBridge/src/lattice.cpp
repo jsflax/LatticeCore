@@ -1692,7 +1692,11 @@ bool lattice::swift_lattice::attach(swift_lattice &lattice) {
     // (same contract as receive_sync_data/last_receive_error).
     { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_.reset(); }
     try {
-        lattice_db::attach(lattice);
+        // Capture only the source store's own schema before topology changes.
+        // Core binds this immutable metadata to the attachment token under its
+        // topology lock and erases it whenever that token is invalidated.
+        auto metadata = std::make_shared<const attached_schema_map>(lattice.schemas_);
+        attach_with_metadata(lattice, std::move(metadata));
         return true;
     } catch (const std::exception& e) {
         { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_ = std::string(e.what()); }

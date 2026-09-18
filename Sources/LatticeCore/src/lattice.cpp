@@ -5,6 +5,7 @@
 #include "lattice/ipc.hpp"
 #include <cstdlib>
 #include <set>
+#include <limits>
 #include <unordered_set>
 #include <sys/file.h>
 #include <fcntl.h>
@@ -64,7 +65,135 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
     return raw;
 }
 
+void lattice_db::publish_projection_pressure(std::unique_ptr<const projection_pressure_map> next) {
+    // Caller serializes publishers with attach_mutex_ (or is constructing the
+    // instance before hooks exist). No SQLite/registry/service lock is held.
+    const unsigned old = projection_pressure_slot_.load();
+    const unsigned fresh = 1 - old;
+    projection_pressure_owners_[fresh] = std::move(next);
+    projection_pressure_maps_[fresh].store(projection_pressure_owners_[fresh].get());
+    projection_pressure_slot_.store(fresh);
+    // New readers use fresh. A stale pre-increment reader rechecks the slot
+    // before dereferencing; validated old readers keep this count nonzero.
+    while (projection_pressure_readers_[old].load() != 0) std::this_thread::yield();
+    projection_pressure_maps_[old].store(nullptr);
+    projection_pressure_owners_[old].reset();
+}
+void lattice_db::replace_projection_pressure_source(const std::string& schema,
+                                                   std::shared_ptr<projection_pressure_source> source) {
+    const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
+    auto next = current ? std::make_unique<projection_pressure_map>(*current) : std::make_unique<projection_pressure_map>();
+    auto prior = next->find(schema);
+    auto retired = prior == next->end() ? std::shared_ptr<projection_pressure_source>{} : prior->second;
+    if (source) { source->active.store(true); (*next)[schema] = std::move(source); }
+    else next->erase(schema);
+    publish_projection_pressure(std::move(next));
+    if (retired) retired->active.store(false);
+}
+void lattice_db::raise_projection_pressure(const char* schema) noexcept {
+    for (;;) {
+        const unsigned slot = projection_pressure_slot_.load();
+        projection_pressure_readers_[slot].fetch_add(1);
+        if (slot != projection_pressure_slot_.load()) {
+            projection_pressure_readers_[slot].fetch_sub(1); continue;
+        }
+        const auto* map = projection_pressure_maps_[slot].load();
+        if (map) {
+            const auto found = map->find(schema ? schema : "main");
+            if (found != map->end()) found->second->raise();
+        }
+        projection_pressure_readers_[slot].fetch_sub(1);
+        return;
+    }
+}
+std::vector<std::shared_ptr<projection_pressure_source>> lattice_db::projection_pressure_sources() const {
+    for (;;) {
+        const unsigned slot = projection_pressure_slot_.load();
+        projection_pressure_readers_[slot].fetch_add(1);
+        if (slot != projection_pressure_slot_.load()) {
+            projection_pressure_readers_[slot].fetch_sub(1); continue;
+        }
+        struct release { std::atomic<uint64_t>& readers; ~release() { readers.fetch_sub(1); } } release{projection_pressure_readers_[slot]};
+        std::vector<std::shared_ptr<projection_pressure_source>> sources;
+        const auto* map = projection_pressure_maps_[slot].load();
+        if (map) for (const auto& [_, source] : *map) sources.push_back(source);
+        return sources;
+    }
+}
+void lattice_db::setup_projection_pressure() {
+    if (config_.is_in_memory()) return;
+    // Best effort: legacy opens keep working on unsupported VFS/filesystems.
+    // Projected reads later require a validated identity before admission.
+    try {
+        auto source = make_projection_pressure_source(db_->physical_identity());
+        if (source) {
+            std::lock_guard<std::mutex> lock(attach_mutex_);
+            if (wal_eviction_pending_.load()) source->raise();
+            replace_projection_pressure_source("main", std::move(source));
+        }
+    } catch (...) {}
+}
+void lattice_db::deactivate_projection_pressure() {
+    std::lock_guard<std::mutex> lock(attach_mutex_);
+    // Publisher serialization keeps this map alive; destruction/close needs
+    // neither allocation nor a reader grace section to deactivate its atoms.
+    const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
+    if (current) for (const auto& [_, source] : *current) source->active.store(false);
+}
+
+void lattice_db::close_write_db() {
+    pause_projection_reads();
+    retire_all_read_generations();
+    deactivate_projection_pressure();
+    std::lock_guard<std::mutex> lock(attach_mutex_);
+    db_.reset();
+    wal_eviction_pending_.store(false);
+}
+void lattice_db::reopen_write_db() {
+    pause_projection_reads();
+    retire_all_read_generations();
+    deactivate_projection_pressure();
+    if (closed_.load()) throw std::runtime_error("cannot reopen a closed lattice");
+    auto reopened = std::make_unique<database>(config_.path, database::open_mode::read_write,
+                                              config_.busy_timeout_ms);
+    {
+        std::lock_guard<std::mutex> lock(attach_mutex_);
+        if (!attachment_topology_valid_)
+            throw std::runtime_error("cannot reopen an incomplete attachment topology");
+        for (const auto& [alias, path] : attached_dbs_) {
+            std::string quoted = "\"";
+            for (char c : alias) { quoted += c; if (c == '"') quoted += '"'; }
+            quoted += '"';
+            reopened->execute("ATTACH DATABASE ? AS " + quoted, {path});
+            const auto expected = attached_projection_identities_.find(alias);
+            if (expected != attached_projection_identities_.end() && expected->second) {
+                auto actual = reopened->physical_identity(alias, {}, true);
+                if (!actual || !(*actual == *expected->second))
+                    throw std::runtime_error("attached physical file changed during writer maintenance");
+            }
+        }
+        for (const auto& [_, sql] : attached_view_sql_) reopened->execute(sql);
+        db_ = std::move(reopened);
+        wal_eviction_pending_.store(false);
+        register_sql_functions();
+    }
+    setup_change_hook();
+    {
+        std::lock_guard<std::mutex> lock(attach_mutex_);
+        const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
+        if (current) for (const auto& [schema, source] : *current) {
+            if (schema != "main") {
+                source->acknowledge(source->raised.load());
+                source->active.store(true);
+            }
+        }
+    }
+    // A failed reopen leaves admission paused; success starts a fresh service.
+    resume_projection_reads();
+}
+
 void lattice_db::setup_change_hook() {
+    setup_projection_pressure();
     LOG_DEBUG("setup_change_hook", "Setting up hooks for path: %s", config_.path.c_str());
 
     // Cache the page size for the WAL-threshold eviction check (results spec
@@ -165,7 +294,17 @@ void lattice_db::setup_change_hook() {
             // Get the globalId for this row (only for model tables)
             std::string global_id;
             if (!is_link_table && operation != SQLITE_DELETE) {
-                std::string sql = "SELECT globalId FROM " + table + " WHERE id = ?";
+                // The update hook identifies a physical schema. A logical
+                // attached-union view can contain the same local id from
+                // another store, so resolve only the row that SQLite changed.
+                const auto quote_identifier = [](const std::string& name) {
+                    std::string quoted = "\"";
+                    for (const char c : name) { quoted += c; if (c == '\"') quoted += '\"'; }
+                    return quoted + '\"';
+                };
+                const std::string schema = db_name ? db_name : "main";
+                const std::string sql = "SELECT globalId FROM " + quote_identifier(schema) +
+                    "." + quote_identifier(table) + " WHERE id = ?";
                 auto rows = self->db_->query(sql, {static_cast<int64_t>(rowid)});
                 if (!rows.empty()) {
                     auto it = rows[0].find("globalId");
@@ -203,7 +342,7 @@ void lattice_db::setup_change_hook() {
 
     // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
     sqlite3_wal_hook(db_->handle(),
-        [](void* user_data, sqlite3*, const char*, int nframes) -> int {
+        [](void* user_data, sqlite3*, const char* schema, int nframes) -> int {
             auto* self = static_cast<lattice_db*>(user_data);
 
             // WAL-threshold keeper eviction (results spec §3.4): nframes is
@@ -217,7 +356,8 @@ void lattice_db::setup_change_hook() {
                                           .load(std::memory_order_relaxed);
             if (threshold > 0 &&
                 static_cast<int64_t>(nframes) * self->wal_page_size_ > threshold) {
-                self->wal_eviction_pending_.store(true, std::memory_order_relaxed);
+                self->raise_projection_pressure(schema);
+                self->wal_eviction_pending_.store(true, std::memory_order_seq_cst);
             }
 
             const bool delivered = self->flush_changes();
@@ -851,14 +991,15 @@ void lattice_db::setup_ipc_if_configured() {
 #endif // !__EMSCRIPTEN__
 }
 
-static std::vector<std::string> get_column_names(database* db, const std::string& schema, const std::string& table_name) {
-    auto rows = db->query("PRAGMA " + schema + ".table_info(" + table_name + ")");
-    std::vector<std::string> cols;
-    for (const auto& row : rows) {
-        auto it = row.find("name");
-        if (it != row.end() && std::holds_alternative<std::string>(it->second))
-            cols.push_back(std::get<std::string>(it->second));
-    }
+std::vector<std::string> lattice_db::attachment_column_names(
+    database* db, const std::string& schema_sql, const std::string& table_name) {
+    // schema_sql is main or a caller-built escaped attachment qualifier.
+    // PRAGMA's argument is a string literal, not an unquoted model identifier.
+    std::string argument = "'";
+    for (char c : table_name) { argument += c; if (c == '\'') argument += '\''; }
+    argument += "'";
+    auto cols = db->query_attachment_text_metadata(
+        "PRAGMA " + schema_sql + ".table_info(" + argument + ")", "name");
     std::sort(cols.begin(), cols.end());
     return cols;
 }
@@ -877,27 +1018,38 @@ constexpr const char* kAttachTableFilter =
     "AND name NOT LIKE '\\_%%' ESCAPE '\\' "
     "AND name NOT IN ('AuditLog')";
 
-std::unordered_set<std::string> model_tables(lattice::database* db, const char* master) {
+} // namespace
+
+std::unordered_set<std::string> lattice_db::attachment_model_tables(database* db, const char* master) {
     char sql[512];
     snprintf(sql, sizeof(sql), kAttachTableFilter, master);
     std::unordered_set<std::string> out;
-    for (const auto& row : db->query(sql)) {
-        auto it = row.find("name");
-        if (it != row.end() && std::holds_alternative<std::string>(it->second))
-            out.insert(std::get<std::string>(it->second));
-    }
+    for (auto& name : db->query_attachment_text_metadata(sql, "name"))
+        out.insert(std::move(name));
     return out;
 }
-} // namespace
 
 void lattice_db::attach(lattice_db &lattice) {
+    attach_with_metadata(lattice, {});
+}
+
+void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const void> metadata) {
+    // Resolve source metadata BEFORE taking recipient locks; no foreign parent
+    // or SQLite lock can nest beneath this recipient's topology/service locks.
+    std::shared_ptr<const physical_store_identity> source_identity;
+    std::shared_ptr<projection_pressure_source> pressure_source;
+    try {
+        if (lattice.db_) source_identity = lattice.db_->physical_identity("main", {}, true);
+        pressure_source = make_projection_pressure_source(source_identity);
+        if (pressure_source) pressure_source->active.store(false);
+    } catch (...) {} // Unsupported identity must not break legacy attachment.
     // Serialize attach/detach: the already-attached consult below is
     // check-then-act, and view regeneration must not interleave with a
     // concurrent attach/detach on another thread.
     std::lock_guard<std::mutex> attach_lock(attach_mutex_);
 
-    if (!lattice.db_) {
-        throw std::runtime_error("attach: the database being attached is closed");
+    if (closed_.load() || !db_ || !lattice.db_) {
+        throw std::runtime_error("attach: a database is closed");
     }
 
     const std::string alias = attach_alias_for(lattice.config_.path);
@@ -906,7 +1058,11 @@ void lattice_db::attach(lattice_db &lattice) {
     // different path is a caller error.
     for (const auto& [existing_alias, existing_path] : attached_dbs_) {
         if (existing_alias == alias) {
-            if (existing_path == lattice.config_.path) return;
+            if (existing_path == lattice.config_.path) {
+                if (!attached_route_tokens_.count(alias))
+                    throw std::runtime_error("attach: incomplete prior topology change; detach before retry");
+                return;
+            }
             throw std::runtime_error(
                 "attach: alias '" + alias + "' is already attached to a different database (" +
                 existing_path + ")");
@@ -921,12 +1077,22 @@ void lattice_db::attach(lattice_db &lattice) {
         if (handles.empty()) {
             throw std::runtime_error("attach: this database is closed");
         }
-        auto main_set = model_tables(handles.front(), "main.sqlite_master");
-        auto other_set = model_tables(lattice.db_.get(), "main.sqlite_master");
+        auto main_set = attachment_model_tables(handles.front(), "main.sqlite_master");
+        auto other_set = attachment_model_tables(lattice.db_.get(), "main.sqlite_master");
+        auto validate_metadata_names = [](const auto& columns, const std::string& table) {
+            for (const auto& name : columns) {
+                if (name == "_source" || name == "_lattice_attach_token")
+                    throw std::runtime_error("attach: reserved routing column '" + name +
+                                             "' in model table '" + table + "'");
+            }
+        };
+        for (const auto& table_name : main_set)
+            validate_metadata_names(attachment_column_names(handles.front(), "main", table_name), table_name);
         for (const auto& table_name : other_set) {
+            auto other_cols = attachment_column_names(lattice.db_.get(), "main", table_name);
+            validate_metadata_names(other_cols, table_name);
             if (!main_set.count(table_name)) continue;
-            auto main_cols = get_column_names(handles.front(), "main", table_name);
-            auto other_cols = get_column_names(lattice.db_.get(), "main", table_name);
+            auto main_cols = attachment_column_names(handles.front(), "main", table_name);
             if (main_cols != other_cols) {
                 LOG_ERROR("db", "Schema mismatch for table '%s' between main and attached DB '%s'",
                           table_name.c_str(), alias.c_str());
@@ -939,8 +1105,9 @@ void lattice_db::attach(lattice_db &lattice) {
 
     // ATTACH on every view-bearing handle (null-tolerant — sync-enabled and
     // in-memory lattices have no read_db_; the old code null-dereferenced).
-    // SQLite's own duplicate-alias error is treated as idempotent success:
-    // belt to the bookkeeping check's suspenders.
+    // Bookkeeping already handles idempotence. An unbookkept duplicate alias
+    // may be a partial earlier attach or a raw SQL binding to another file;
+    // let SQLite reject it rather than minting provenance for the wrong file.
     // Escape single quotes in the path for the SQL literal (paths and named-
     // memory names are caller-controlled strings).
     std::string escaped_path;
@@ -949,23 +1116,50 @@ void lattice_db::attach(lattice_db &lattice) {
         escaped_path += c;
         if (c == '\'') escaped_path += '\'';
     }
-    for (auto* handle : view_handles()) {
-        try {
+    if (next_attachment_token_ == std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("attach: attachment generation exhausted");
+    const int64_t token = next_attachment_token_++;
+    attachment_topology_valid_ = false;
+    cancel_projection_reads(projection_status::snapshot_expired);
+    try {
+        // Publish before ATTACH permits writes to this alias. No hook takes
+        // topology locks or observes a map being mutated.
+        if (pressure_source) replace_projection_pressure_source(alias, pressure_source);
+        std::shared_ptr<const physical_store_identity> actual_identity;
+        for (auto* handle : view_handles()) {
             std::string escaped_alias;
             escaped_alias.reserve(alias.size());
             for (char c : alias) {
                 escaped_alias += c;
                 if (c == '\"') escaped_alias += '\"';
             }
-            handle->execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
-        } catch (const db_error& e) {
-            if (std::string(e.what()).find("already in use") == std::string::npos) throw;
+            const std::string attach_sql = "ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"";
+            if (handle == db_.get())
+                actual_identity = handle->attach_and_capture_identity(attach_sql, alias);
+            else
+                handle->execute(attach_sql);
         }
-    }
 
-    attached_dbs_.emplace_back(alias, lattice.config_.path);
-    attached_aliases_.push_back(alias);
-    rebuild_attached_views();
+        if (source_identity && actual_identity && *source_identity == *actual_identity)
+            attached_projection_identities_[alias] = source_identity;
+        else {
+            attached_projection_identities_[alias] = {};
+            replace_projection_pressure_source(alias, {});
+        }
+        attached_route_tokens_[alias] = token;
+        attached_dbs_.emplace_back(alias, lattice.config_.path);
+        attached_aliases_.push_back(alias);
+        rebuild_attached_views();
+        if (metadata) attached_route_metadata_[token] = std::move(metadata);
+        attachment_topology_valid_ = true;
+    } catch (...) {
+        // Existing attach is not cross-connection atomic. A partially changed
+        // topology must never authorize a checked mutation through this alias.
+        invalidate_attachment_route(alias);
+        attached_projection_identities_.erase(alias);
+        replace_projection_pressure_source(alias, {});
+        throw;
+    }
 }
 
 void lattice_db::detach(lattice_db &lattice) {
@@ -974,22 +1168,41 @@ void lattice_db::detach(lattice_db &lattice) {
     // share an alias — a never-attached path must be a clean no-op, never a
     // detach of a same-stem victim.
     std::string alias;
+    int64_t token = -1;
     {
         std::lock_guard<std::mutex> attach_lock(attach_mutex_);
         auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
             [&](const auto& entry) { return entry.second == lattice.config_.path; });
         if (it == attached_dbs_.end()) return;  // not attached: idempotent no-op
         alias = it->first;
+        auto route = attached_route_tokens_.find(alias);
+        if (route != attached_route_tokens_.end()) token = route->second;
     }
-    detach_alias(alias);
+    detach_alias_if_current(alias, lattice.config_.path, token);
 }
 
 void lattice_db::detach_alias(const std::string& alias) {
+    detach_alias_if_current(alias, std::nullopt, std::nullopt);
+}
+
+void lattice_db::detach_alias_if_current(const std::string& alias,
+                                        const std::optional<std::string>& expected_path,
+                                        std::optional<int64_t> expected_token) {
     std::lock_guard<std::mutex> attach_lock(attach_mutex_);
 
     auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
         [&](const auto& entry) { return entry.first == alias; });
     if (it == attached_dbs_.end()) return;  // idempotent no-op
+    auto route = attached_route_tokens_.find(alias);
+    const int64_t token = route == attached_route_tokens_.end() ? -1 : route->second;
+    if ((expected_path && it->second != *expected_path) ||
+        (expected_token && token != *expected_token)) return;
+
+    // Invalidate before the first side effect, including when a later DROP or
+    // DETACH fails. Old row handles stay invalid after an alias is reused.
+    attachment_topology_valid_ = false;
+    cancel_projection_reads(projection_status::snapshot_expired);
+    invalidate_attachment_route(alias);
 
     // Views reference the alias — drop them all first (regeneration for the
     // remaining aliases happens after the DETACH).
@@ -1019,11 +1232,14 @@ void lattice_db::detach_alias(const std::string& alias) {
         }
     }
 
+    attached_projection_identities_.erase(alias);
+    replace_projection_pressure_source(alias, {});
     attached_dbs_.erase(it);
     attached_aliases_.erase(
         std::remove(attached_aliases_.begin(), attached_aliases_.end(), alias),
         attached_aliases_.end());
     rebuild_attached_views();
+    attachment_topology_valid_ = true;
 }
 
 // Caller holds attach_mutex_. Drops every view attach created, then
@@ -1032,6 +1248,8 @@ void lattice_db::detach_alias(const std::string& alias) {
 // second alias sharing a table name silently never joined the union view)
 // and restores main-table visibility after the last detach.
 void lattice_db::rebuild_attached_views() {
+    attached_view_sql_.clear();
+    std::map<std::string, std::string> rebuilt_sql;
     for (auto* handle : view_handles()) {
         for (const auto& view : attached_view_names_) {
             handle->execute("DROP VIEW IF EXISTS \"" + view + "\"");
@@ -1041,78 +1259,86 @@ void lattice_db::rebuild_attached_views() {
     if (attached_dbs_.empty()) return;
 
     for (auto* handle : view_handles()) {
-        auto main_set = model_tables(handle, "main.sqlite_master");
+        auto main_set = attachment_model_tables(handle, "main.sqlite_master");
 
         // table → arms. An arm is (schema-qualifier, _source label).
         std::map<std::string, std::vector<std::pair<std::string, std::string>>> arms;
         for (const auto& [alias, _] : attached_dbs_) {
-            const std::string quoted = "\"" + alias + "\"";
+            std::string quoted = "\"";
+            for (char c : alias) { quoted += c; if (c == '\"') quoted += '\"'; }
+            quoted += "\"";
             char master[600];
             snprintf(master, sizeof(master), "%s.sqlite_master", quoted.c_str());
-            for (const auto& table_name : model_tables(handle, master)) {
+            for (const auto& table_name : attachment_model_tables(handle, master)) {
                 arms[table_name].emplace_back(quoted, quoted);
             }
         }
 
         for (const auto& [table_name, alias_arms] : arms) {
             const bool in_main = main_set.count(table_name) > 0;
-            std::string sql;
-            if (!in_main && alias_arms.size() == 1) {
-                // Attached-only table with a single source: plain passthrough
-                // (matches the historical view shape — no _source column).
-                sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name +
-                      " AS SELECT * FROM " + alias_arms.front().first + "." + table_name;
-            } else {
-                // UNION ALL matches columns BY POSITION, and each database's
-                // physical column order is whatever its create-time schema
-                // iteration produced (an unordered map — effectively random
-                // per file). `SELECT *` arms therefore SCRAMBLE values across
-                // same-named columns whenever two files disagree — observed
-                // live: a WHERE over the view read an attached row's
-                // modifiedAt as deletedAt and filtered every spoke row out
-                // of recall. Project every arm's columns explicitly, in one
-                // canonical order, so the view maps by NAME. A column
-                // missing from some arm then fails view creation loudly
-                // instead of scrambling silently.
-                const std::string first_schema =
-                    in_main ? "main" : alias_arms.front().first;
-                auto ordered_cols = [&]() {
-                    auto rows = handle->query(
-                        "PRAGMA " + first_schema + ".table_info(" + table_name + ")");
-                    std::string cols;
-                    for (const auto& row : rows) {
-                        auto it = row.find("name");
-                        if (it == row.end() ||
-                            !std::holds_alternative<std::string>(it->second)) continue;
-                        if (!cols.empty()) cols += ", ";
-                        cols += "\"" + std::get<std::string>(it->second) + "\"";
-                    }
-                    return cols;
-                }();
-                sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
-                bool first = true;
-                if (in_main) {
-                    sql += "SELECT " + ordered_cols + ", 'main' AS _source FROM main." + table_name;
-                    first = false;
+            // UNION ALL matches columns BY POSITION, and each database's
+            // physical column order is whatever its create-time schema
+            // iteration produced (an unordered map — effectively random
+            // per file). `SELECT *` arms therefore SCRAMBLE values across
+            // same-named columns whenever two files disagree — observed
+            // live: a WHERE over the view read an attached row's
+            // modifiedAt as deletedAt and filtered every spoke row out
+            // of recall. Project every arm's columns explicitly, in one
+            // canonical order, so the view maps by NAME. A column
+            // missing from some arm then fails view creation loudly
+            // instead of scrambling silently.
+            const std::string first_schema =
+                in_main ? "main" : alias_arms.front().first;
+            auto ordered_cols = [&]() {
+                // Preserve physical column order here; only comparison above sorts.
+                std::string argument = "'";
+                for (char c : table_name) { argument += c; if (c == '\'') argument += '\''; }
+                argument += "'";
+                const auto names = handle->query_attachment_text_metadata(
+                    "PRAGMA " + first_schema + ".table_info(" + argument + ")", "name");
+                std::string cols;
+                for (const auto& name : names) {
+                    if (!cols.empty()) cols += ", ";
+                    cols += "\"" + name + "\"";
                 }
-                for (const auto& [qualifier, label] : alias_arms) {
-                    if (!first) sql += " UNION ALL ";
-                    // The label is caller-controlled (derived from the attached
-                    // path) — escape single quotes for the SQL string literal.
-                    std::string escaped_label;
-                    escaped_label.reserve(label.size());
-                    for (char c : label) {
-                        escaped_label += c;
-                        if (c == '\'') escaped_label += '\'';
-                    }
-                    sql += "SELECT " + ordered_cols + ", '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
-                    first = false;
+                return cols;
+            }();
+            std::string sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
+            bool first = true;
+            if (in_main) {
+                sql += "SELECT " + ordered_cols + ", 'main' AS _source, 0 AS _lattice_attach_token FROM main." + table_name;
+                first = false;
+            }
+            for (const auto& [qualifier, label] : alias_arms) {
+                if (!first) sql += " UNION ALL ";
+                // The label is caller-controlled (derived from the attached
+                // path) — escape single quotes for the SQL string literal.
+                std::string escaped_label;
+                escaped_label.reserve(label.size());
+                for (char c : label) {
+                    escaped_label += c;
+                    if (c == '\'') escaped_label += '\'';
                 }
+                // qualifier/label are escaped SQL identifiers. Resolve the
+                // token from that same spelling; absent means failed topology.
+                int64_t token = -1;
+                for (const auto& [alias, candidate] : attached_route_tokens_) {
+                    std::string quoted = "\"";
+                    for (char c : alias) { quoted += c; if (c == '\"') quoted += '\"'; }
+                    quoted += "\"";
+                    if (quoted == qualifier) { token = candidate; break; }
+                }
+                sql += "SELECT " + ordered_cols + ", '" + escaped_label +
+                       "' AS _source, " + std::to_string(token) +
+                       " AS _lattice_attach_token FROM " + qualifier + "." + table_name;
+                first = false;
             }
             handle->execute(sql);
             attached_view_names_.insert(table_name);
+            rebuilt_sql[table_name] = sql;
         }
     }
+    attached_view_sql_ = std::move(rebuilt_sql);
 }
 
 // ============================================================================

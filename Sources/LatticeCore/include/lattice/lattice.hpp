@@ -19,6 +19,8 @@
 #include <random>
 #include <sstream>
 #include <atomic>
+#include <limits>
+#include <exception>
 #include <iomanip>
 #include <mutex>
 #include <map>
@@ -3418,32 +3420,7 @@ public:
     /// Active synchronizers will re-sync all data.
     /// @return Number of INSERT entries created
     int64_t force_compact_audit_log() {
-        // Clear all existing audit log entries (with sync disabled)
-        const int64_t prev_disabled = read_sync_disabled_flag();
-        db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-        try {
-            db_->execute("DELETE FROM AuditLog");
-            db_->execute("DELETE FROM _lattice_sync_state");
-            db_->execute("DELETE FROM _lattice_sync_set");
-            // The AUTOINCREMENT sequence is deliberately KEPT (1.5.0). Every
-            // attached process seeds its cross-process cursor from MAX(id)
-            // and reads forward, and the relay's observer-push cursor is a
-            // raw pk: restarting ids at 1 put every regenerated row BELOW
-            // those cursors, so siblings and push subscribers went silent
-            // until they reopened. Regenerated snapshots now take ids above
-            // the old maximum and flow through every live cursor.
-            // Reset replication slots rather than delete — synchronizers
-            // don't need to re-register, they just re-sync from the start:
-            // a zero floor re-enumerates the regenerated history.
-            db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0");
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-        } catch (...) {
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            throw;
-        }
-
-        // Generate fresh INSERT entries for all objects
-        return generate_history();
+        return generate_history_owned_(20000, true, true);
     }
 
     /// Re-arm a synchronizer's filtered snapshot for a fresh peer: forget
@@ -3731,6 +3708,18 @@ private:
         db_->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
                      "  globalId TEXT PRIMARY KEY)", {});
         db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        // The inherited public count uses sqlite3_changes(int). Decide
+        // invalidation independently: on older deployment targets a delete
+        // larger than INT_MAX must still advance the cooperative revision.
+        const std::string deletion_predicate = preserve_cursor_row
+            ? "id <= ? AND id NOT IN (SELECT id FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1)"
+            : "id <= ?";
+        const auto existence = db_->query(
+            "SELECT EXISTS(SELECT 1 FROM AuditLog WHERE " + deletion_predicate + ") AS removes", {safe_id});
+        if (existence.size() != 1 || !std::holds_alternative<int64_t>(existence[0].at("removes")))
+            throw db_error("audit maintenance requires an exact deletion predicate result");
+        const auto removes = std::get<int64_t>(existence[0].at("removes"));
+        if (removes != 0 && removes != 1) throw db_error("invalid audit deletion predicate result");
         if (preserve_cursor_row) {
             db_->execute(
                 "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
@@ -3740,6 +3729,7 @@ private:
             db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
         }
         const int64_t deleted = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+        if (removes != 0) advance_history_revision_in_transaction_();
         db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
         db_->execute(R"(
             DELETE FROM _lattice_applied_receipts WHERE rowid <=
@@ -3881,73 +3871,209 @@ public:
     /// the CANONICAL copy (e.g. server-side history compaction) and receivers
     /// SHOULD be refreshed to exactly this state.
     int64_t generate_history(int64_t batch_size = 20000, bool mark_synthesized = true) {
+        return generate_history_owned_(batch_size, mark_synthesized, false);
+    }
+
+private:
+    friend struct history_generation_test_access;
+    static constexpr const char* history_revision_key_ = "history_generation_revision_v1";
+
+    struct history_operation_hold {
+        lattice_db& owner;
+        explicit history_operation_hold(lattice_db& value) : owner(value) {
+            if (owner.history_generation_active_.exchange(true, std::memory_order_acq_rel))
+                throw db_error("history generation is already active on this owner");
+        }
+        ~history_operation_hold() { owner.history_generation_active_.store(false, std::memory_order_release); }
+        history_operation_hold(const history_operation_hold&) = delete;
+        history_operation_hold& operator=(const history_operation_hold&) = delete;
+    };
+
+    // Called only inside an owned write transaction. A missing row is the
+    // pre-protocol generation. Unknown/malformed metadata is never accepted.
+    std::string history_revision_in_transaction_() {
+        const auto rows = db_->query("SELECT value FROM main._lattice_meta WHERE key = ?",
+                                     {std::string(history_revision_key_)});
+        if (rows.empty()) return {};
+        if (rows.size() != 1) throw db_error("invalid history generation metadata");
+        const auto it = rows[0].find("value");
+        if (it == rows[0].end() || !std::holds_alternative<std::string>(it->second))
+            throw db_error("invalid history generation metadata");
+        const auto& value = std::get<std::string>(it->second);
+        if (value.size() != 36) throw db_error("invalid history generation metadata");
+        for (size_t i = 0; i < value.size(); ++i) {
+            const char c = value[i];
+            if (i == 8 || i == 13 || i == 18 || i == 23) {
+                if (c != '-') throw db_error("invalid history generation metadata");
+            } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                throw db_error("invalid history generation metadata");
+            }
+        }
+        return value;
+    }
+
+    std::string advance_history_revision_in_transaction_() {
+        // Validate an existing value before replacing it; corruption is not a reset.
+        (void)history_revision_in_transaction_();
+        const auto value = generate_global_id();
+        db_->execute("INSERT INTO main._lattice_meta(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     {std::string(history_revision_key_), value});
+        return value;
+    }
+
+    int64_t history_sync_flag_in_transaction_() {
+        const auto rows = db_->query("SELECT disabled FROM main._SyncControl WHERE id=1");
+        if (rows.size() != 1) throw db_error("history generation requires one sync control row");
+        const auto it = rows[0].find("disabled");
+        if (it == rows[0].end() || !std::holds_alternative<int64_t>(it->second))
+            throw db_error("history generation requires an integer sync control flag");
+        return std::get<int64_t>(it->second);
+    }
+
+    int64_t history_schema_in_transaction_() {
+        const auto rows = db_->query("PRAGMA main.schema_version");
+        if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("schema_version")))
+            throw db_error("history generation requires a schema generation");
+        return std::get<int64_t>(rows[0].at("schema_version"));
+    }
+
+    struct history_table_plan {
+        std::string name;
+        std::vector<std::unordered_map<std::string, column_value_t>> columns;
+        bool link = false;
+        bool rhs_type = false;
+        std::optional<int64_t> maximum;
+    };
+
+    // Each phase uses the already-qualified maintenance ownership/rollback
+    // scope. Nothing is held across all commits except a fail-fast operation
+    // admission bit. Revision comparison detects cooperative resets/prunes
+    // on other connections; old binaries and raw DELETEs do not participate.
+    int64_t generate_history_owned_(int64_t batch_size, bool mark_synthesized, bool force,
+                                  const std::function<void(bool)>& between_units_for_testing = {}) {
+        history_operation_hold admission(*this);
         if (batch_size <= 0) batch_size = 20000;
-
-        // Transient index on (tableName, globalRowId) for the NOT EXISTS check
-        // below. Created here and dropped at the end so we don't pay ongoing
-        // write-maintenance cost on the audit triggers' hot path. One-time
-        // build cost is proportional to current AuditLog size.
-        db_->execute(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_table_global_tmp "
-            "ON AuditLog(tableName, globalRowId)");
-
-        // Temporarily disable sync to prevent triggers from firing
-        const int64_t prev_disabled = read_sync_disabled_flag();
-        db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-
+        // sqlite3_changes is an int on every supported deployment, including
+        // older Apple OS versions without the changes64 entry point.
+        if (batch_size > static_cast<int64_t>(std::numeric_limits<int>::max()))
+            throw db_error("history generation batch size exceeds the supported count range");
+        std::vector<history_table_plan> plans;
+        std::string revision;
+        int64_t schema_version = 0;
+        int64_t total_entries = 0;
+        // A unique index is owned only by this invocation. Force's finite
+        // frontier needs no anti-join index, and no pre-existing index is dropped.
+        const std::string index_name = force ? std::string{} :
+            "_lattice_history_generation_" + generate_global_id();
+        bool index_created = false;
+        const auto cleanup = [&] {
+            if (!index_created) return;
+            with_audit_prune_transaction_([&]() -> int64_t {
+                db_->execute("DROP INDEX IF EXISTS main." + managed_quote_identifier(index_name));
+                return 0;
+            });
+            index_created = false;
+        };
         try {
-            // Get all user tables (exclude system tables and virtual/auxiliary tables).
-            // R*Tree creates shadow tables like _Table_col_rtree_node, _Table_col_rtree_rowid, etc.
-            // Underscore-prefixed tables are NOT excluded wholesale any more (1.5.0):
-            // model LINK tables (`_Parent_prop`, lhs/rhs[/rhs_type]) are real synced
-            // tables with real audit rows, and a compaction that skipped them
-            // regenerated every row DETACHED from its relationships — a fresh
-            // peer then held the rows but none of the links. Each table is
-            // classified by its columns below; internal/shadow tables are skipped
-            // by name here and by shape there.
-            auto tables = db_->query(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' "
-                "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', "
-                "                 '_lattice_sync_set', '_lattice_replication_slots', '_lattice_applied_receipts') "
-                "AND name NOT LIKE '\\_lattice\\_%' ESCAPE '\\' "
-                "AND name NOT LIKE '%_vec0' "
-                "AND name NOT LIKE '%_rtree%' "
-                "AND name NOT LIKE '%\\_fts' ESCAPE '\\' "
-                "AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\' "
-                "AND name NOT LIKE '%\\_old' ESCAPE '\\'");
-
-            int64_t total_entries = 0;
-
-            for (const auto& table_row : tables) {
-                auto it = table_row.find("name");
-                if (it == table_row.end() || !std::holds_alternative<std::string>(it->second))
-                    continue;
-
-                std::string table_name = std::get<std::string>(it->second);
-
-                // Get column info for this table
-                auto cols = db_->query("PRAGMA table_info(" + table_name + ")");
-
-                // Classify by SHAPE, not by name: a link table has lhs/rhs/globalId
-                // and no id (its live trigger writes rowId 0 and the link row's
-                // globalId); a model table has id + globalId; anything else
-                // (FTS shadow tables, unknown internals) has no audit shape and
-                // is skipped instead of failing the whole regeneration.
-                bool has_id = false, has_global = false, has_lhs = false, has_rhs = false, has_rhs_type = false;
-                for (const auto& col : cols) {
-                    auto name_it = col.find("name");
-                    if (name_it == col.end() || !std::holds_alternative<std::string>(name_it->second)) continue;
-                    const auto& n = std::get<std::string>(name_it->second);
-                    if (n == "id") has_id = true;
-                    else if (n == "globalId") has_global = true;
-                    else if (n == "lhs") has_lhs = true;
-                    else if (n == "rhs") has_rhs = true;
-                    else if (n == "rhs_type") has_rhs_type = true;
+            with_audit_prune_transaction_([&]() -> int64_t {
+                revision = history_revision_in_transaction_();
+                // Remote apply lazily creates this internal dedup table. Own
+                // that setup before capturing the schema cookie so a first
+                // ordinary apply between batches does not invalidate us.
+                // Existing receipts survive both force and standalone history.
+                db_->execute("CREATE TABLE IF NOT EXISTS main._lattice_applied_receipts ("
+                             "  globalId TEXT PRIMARY KEY)", {});
+                const auto tables = db_->query(
+                    "SELECT name FROM main.sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%' "
+                    "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', "
+                    "                 '_lattice_sync_set', '_lattice_replication_slots', '_lattice_applied_receipts') "
+                    "AND name NOT LIKE '\\_lattice\\_%' ESCAPE '\\' "
+                    "AND name NOT LIKE '%_vec0' AND name NOT LIKE '%_rtree%' "
+                    "AND name NOT LIKE '%\\_fts' ESCAPE '\\' "
+                    "AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\' "
+                    "AND name NOT LIKE '%\\_old' ESCAPE '\\'");
+                for (const auto& row : tables) {
+                    history_table_plan plan;
+                    plan.name = std::get<std::string>(row.at("name"));
+                    plan.columns = db_->query("PRAGMA main.table_info(" + managed_quote_identifier(plan.name) + ")");
+                    bool has_id = false, has_global = false, has_lhs = false, has_rhs = false;
+                    bool integer_primary_id = false, shadowed_rowid = false;
+                    int primary_columns = 0;
+                    for (const auto& col : plan.columns) {
+                        const auto& name = std::get<std::string>(col.at("name"));
+                        if (std::get<int64_t>(col.at("pk")) > 0) ++primary_columns;
+                        std::string folded = name;
+                        for (auto& c : folded) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                        if (folded == "rowid" || folded == "_rowid_" || folded == "oid") shadowed_rowid = true;
+                        if (name == "id") {
+                            has_id = true;
+                            integer_primary_id = std::get<std::string>(col.at("type")) == "INTEGER" &&
+                                                 std::get<int64_t>(col.at("pk")) == 1;
+                        } else if (name == "globalId") has_global = true;
+                        else if (name == "lhs") has_lhs = true;
+                        else if (name == "rhs") has_rhs = true;
+                        else if (name == "rhs_type") plan.rhs_type = true;
+                    }
+                    plan.link = has_lhs && has_rhs && has_global && !has_id;
+                    if (!plan.link && !(has_id && has_global)) continue;
+                    if (force) {
+                        bool separate_primary_index = false;
+                        for (const auto& index : db_->query("PRAGMA main.index_list(" + managed_quote_identifier(plan.name) + ")")) {
+                            const auto origin = index.find("origin");
+                            if (origin != index.end() && std::holds_alternative<std::string>(origin->second) &&
+                                std::get<std::string>(origin->second) == "pk") separate_primary_index = true;
+                        }
+                        // A sole INTEGER PRIMARY KEY alias has no separate PK
+                        // index. DESC/non-alias and WITHOUT ROWID shapes do.
+                        if (!plan.link && (!integer_primary_id || primary_columns != 1 || separate_primary_index))
+                            throw db_error("force history generation requires a sole integer rowid primary key");
+                        if (plan.link && shadowed_rowid)
+                            throw db_error("force history generation requires an unshadowed link rowid");
+                        const auto maximum = db_->query("SELECT MAX(" + std::string(plan.link ? "rowid" : "id") +
+                            ") AS k FROM main." + managed_quote_identifier(plan.name));
+                        const auto& key = maximum.at(0).at("k");
+                        if (const auto* value = std::get_if<int64_t>(&key)) plan.maximum = *value;
+                        else if (!std::holds_alternative<std::nullptr_t>(key))
+                            throw db_error("force history generation requires an integer row frontier");
+                    }
+                    plans.push_back(std::move(plan));
                 }
-                const bool is_link = has_lhs && has_rhs && has_global && !has_id;
-                if (!is_link && !(has_id && has_global)) continue;   // no audit shape
-
+                if (force) {
+                    const int64_t disabled = history_sync_flag_in_transaction_();
+                    db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
+                    db_->execute("DELETE FROM main.AuditLog");
+                    db_->execute("DELETE FROM main._lattice_sync_state");
+                    db_->execute("DELETE FROM main._lattice_sync_set");
+                    db_->execute("UPDATE main._lattice_replication_slots SET confirmed_audit_id=0,upload_floor=0");
+                    // AuditLog sqlite_sequence is deliberately retained.
+                    revision = advance_history_revision_in_transaction_();
+                    db_->execute("UPDATE main._SyncControl SET disabled=? WHERE id=1", {disabled});
+                } else {
+                    db_->execute("CREATE INDEX main." + managed_quote_identifier(index_name) +
+                                 " ON AuditLog(tableName,globalRowId)");
+                    index_created = true;
+                }
+                schema_version = history_schema_in_transaction_();
+                return 0;
+            });
+            // Private, per-invocation friend-test seam. Never installed on the
+            // owner or called under the owned transaction/store gate. Public
+            // entry points pass no callback; actual production hooks stay intact.
+            if (between_units_for_testing) between_units_for_testing(true);
+            const auto validate_generation = [&] {
+                if (history_revision_in_transaction_() != revision)
+                    throw db_error("history generation was invalidated by another reset or prune");
+                if (history_schema_in_transaction_() != schema_version)
+                    throw db_error("history generation schema changed between batches");
+            };
+            for (const auto& plan : plans) {
+                const auto& table_name = plan.name;
+                const auto& cols = plan.columns;
+                const bool is_link = plan.link;
+                const bool has_rhs_type = plan.rhs_type;
+                if (force && !plan.maximum) continue;
                 std::ostringstream json_cols;
                 std::ostringstream json_names;
                 std::string row_id_expr = "id";
@@ -3997,56 +4123,72 @@ public:
                         }
                         json_names << "'" << col_name << "'";
                     }
-                    if (first) continue;  // No columns to track
+                    if (first) continue;  // Preserve the existing no-payload table behavior
                 }
 
-                // Insert audit entries in batches to avoid a single huge INSERT.
-                // Each iteration commits its own transaction; the `NOT EXISTS` check
-                // naturally excludes rows already audited in earlier batches.
-                std::ostringstream sql;
-                sql << "INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, "
-                    << "changedFields, changedFieldsNames, isSynchronized, timestamp, synthesized) "
-                    << "SELECT '" << table_name << "', 'INSERT', " << row_id_expr << ", globalId, "
-                    << "json_object(" << json_cols.str() << "), "
-                    << "json_array(" << json_names.str() << "), "
-                    << "0, unixepoch('subsec'), " << (mark_synthesized ? 1 : 0) << " "
-                    << "FROM " << table_name << " t "
-                    << "WHERE NOT EXISTS ("
-                    << "  SELECT 1 FROM AuditLog a "
-                    << "  WHERE a.tableName = '" << table_name << "' "
-                    << "  AND a.globalRowId = t.globalId"
-                    << ") "
-                    << "ORDER BY " << order_expr << " "
-                    << "LIMIT " << batch_size;
-                std::string batch_sql = sql.str();
 
+                std::ostringstream base;
+                base << "INSERT INTO main.AuditLog (tableName,operation,rowId,globalRowId,"
+                     << "changedFields,changedFieldsNames,isSynchronized,timestamp,synthesized) "
+                     << "SELECT ?, 'INSERT', " << row_id_expr << ",globalId,json_object(" << json_cols.str()
+                     << "),json_array(" << json_names.str() << "),0,unixepoch('subsec'),"
+                     << (mark_synthesized ? 1 : 0) << " FROM main." << managed_quote_identifier(table_name) << " t ";
+                const std::string key = is_link ? "t.rowid" : "t.id";
+                std::optional<int64_t> previous;
                 for (;;) {
-                    db_->begin_transaction();
-                    try {
-                        db_->execute(batch_sql);
-                    } catch (...) {
-                        db_->rollback();
-                        throw;
-                    }
-
-                    int64_t inserted = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
-
-                    db_->commit();
+                    bool exhausted = false;
+                    const int64_t inserted = with_audit_prune_transaction_([&]() -> int64_t {
+                        validate_generation();
+                        std::string where;
+                        std::vector<column_value_t> params{table_name};
+                        if (force) {
+                            std::string range = key + " <= ?";
+                            std::vector<column_value_t> bounds{*plan.maximum};
+                            if (previous) { range += " AND " + key + " > ?"; bounds.push_back(*previous); }
+                            bounds.push_back(batch_size);
+                            const auto frontier = db_->query("SELECT MAX(k) AS last_key,COUNT(*) AS selected FROM (SELECT " +
+                                key + " AS k FROM main." + managed_quote_identifier(table_name) + " t WHERE " + range +
+                                " ORDER BY " + key + " LIMIT ?)", bounds);
+                            const auto selected = std::get<int64_t>(frontier.at(0).at("selected"));
+                            if (selected == 0) { exhausted = true; return 0; }
+                            const auto upper = std::get<int64_t>(frontier.at(0).at("last_key"));
+                            where = "WHERE " + key + " <= ?";
+                            params.push_back(upper);
+                            if (previous) { where += " AND " + key + " > ?"; params.push_back(*previous); }
+                            previous = upper;
+                            exhausted = selected < batch_size;
+                        } else {
+                            where = "WHERE NOT EXISTS (SELECT 1 FROM main.AuditLog a WHERE a.tableName=? AND a.globalRowId=t.globalId)";
+                            params.push_back(table_name);
+                        }
+                        where += " ORDER BY " + order_expr + " LIMIT ?";
+                        params.push_back(batch_size);
+                        const auto disabled = history_sync_flag_in_transaction_();
+                        db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
+                        db_->execute(base.str() + where, params);
+                        const auto count = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+                        if (count > std::numeric_limits<int64_t>::max() - total_entries)
+                            throw db_error("history generation count overflow");
+                        db_->execute("UPDATE main._SyncControl SET disabled=? WHERE id=1", {disabled});
+                        return count;
+                    });
                     total_entries += inserted;
-
-                    if (inserted < batch_size) break;
+                    if (between_units_for_testing) between_units_for_testing(false);
+                    if (force ? exhausted : inserted < batch_size) break;
                 }
             }
-
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            db_->execute("DROP INDEX IF EXISTS idx_audit_log_table_global_tmp");
+            with_audit_prune_transaction_([&]() -> int64_t { validate_generation(); return 0; });
+            cleanup();
             return total_entries;
         } catch (...) {
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            db_->execute("DROP INDEX IF EXISTS idx_audit_log_table_global_tmp");
-            throw;
+            const auto original = std::current_exception();
+            try { cleanup(); }
+            catch (...) { LOG_ERROR("lattice_db", "history generation index cleanup failed; original error retained"); }
+            std::rethrow_exception(original);
         }
     }
+
+public:
 
     // SQL builder for query_rows — extracted (results spec Commit 4) so the
     // bridge's generation-scoped reads (objects_at/query_ids_at) route the
@@ -5982,6 +6124,7 @@ private:
 
     // Audit-retention maintenance thread (see start_audit_maintenance()).
     std::thread audit_maint_thread_;
+    std::atomic<bool> history_generation_active_{false};
     std::mutex audit_maint_mutex_;
     std::condition_variable audit_maint_cv_;
     bool audit_maint_stop_ = false;

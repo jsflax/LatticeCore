@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <map>
+#include <mutex>
 
 namespace lattice {
 
@@ -303,47 +304,92 @@ public:
     }
 };
 
+// Calls may arrive from a synchronizer's pacer and its caller at once.
+// Snapshots own their bytes; callbacks run after unlocking so they may reenter.
+// The caller must still keep the transport alive until all calls finish.
 class mock_sync_transport : public sync_transport {
 public:
     void connect(const std::string& url,
                 const std::map<std::string, std::string>& headers = {}) override {
-        url_ = url;
-        state_ = transport_state::open;
-        if (on_open_) on_open_();
+        on_open_handler callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            url_ = url;
+            state_ = transport_state::open;
+            callback = on_open_;
+        }
+        if (callback) callback();
     }
 
     void disconnect() override {
-        state_ = transport_state::closed;
-        if (on_close_) on_close_(1000, "Normal closure");
+        on_close_handler callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_ = transport_state::closed;
+            callback = on_close_;
+        }
+        if (callback) callback(1000, "Normal closure");
     }
 
-    transport_state state() const override { return state_; }
+    transport_state state() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return state_;
+    }
 
     void send(const transport_message& message) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         sent_messages_.push_back(message);
     }
 
-    void set_on_open(on_open_handler handler) override { on_open_ = handler; }
-    void set_on_message(on_message_handler handler) override { on_message_ = handler; }
-    void set_on_error(on_error_handler handler) override { on_error_ = handler; }
-    void set_on_close(on_close_handler handler) override { on_close_ = handler; }
+    void set_on_open(on_open_handler handler) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        on_open_.swap(handler);
+    }
+    void set_on_message(on_message_handler handler) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        on_message_.swap(handler);
+    }
+    void set_on_error(on_error_handler handler) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        on_error_.swap(handler);
+    }
+    void set_on_close(on_close_handler handler) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        on_close_.swap(handler);
+    }
 
-    // Test helpers
+    // Test helpers. A concurrent replacement does not cancel an already-copied
+    // callback; its captures must remain valid until that callback completes.
     void simulate_message(const transport_message& msg) {
-        if (on_message_) on_message_(msg);
+        on_message_handler callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = on_message_;
+        }
+        if (callback) callback(msg);
     }
 
     void simulate_error(const std::string& error) {
-        if (on_error_) on_error_(error);
+        on_error_handler callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = on_error_;
+        }
+        if (callback) callback(error);
     }
 
-    const std::vector<transport_message>& get_sent_messages() const {
+    std::vector<transport_message> get_sent_messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return sent_messages_;
     }
 
-    void clear_sent_messages() { sent_messages_.clear(); }
+    void clear_sent_messages() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sent_messages_.clear();
+    }
 
 private:
+    mutable std::mutex mutex_;
     std::string url_;
     transport_state state_ = transport_state::closed;
     on_open_handler on_open_;

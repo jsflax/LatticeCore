@@ -1,10 +1,173 @@
 #include "TestHelpers.hpp"
 #include <regex>
 #include <set>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <csignal>
+#include <cstdio>
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include <unistd.h>
+#endif
 
 // ============================================================================
 // Sync Unit Tests — AuditLog, sync protocol, synchronizer
 // ============================================================================
+
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+void bounded_mock_case(const std::function<void()>& body) {
+    struct Style {
+        std::string old = GTEST_FLAG_GET(death_test_style);
+        ~Style() { GTEST_FLAG_SET(death_test_style, old); }
+    } style;
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGALRM);
+        if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR ||
+            sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+        alarm(10);
+        try {
+            body();
+            if (::testing::Test::HasFailure()) _exit(1);
+            std::fputs("mock_transport_complete\n", stderr);
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "mock_transport_failure: %s\n", error.what());
+            _exit(1);
+        }
+    }, ::testing::ExitedWithCode(0), "mock_transport_complete");
+}
+
+// The default immediate scheduler can send on both the caller and pacer
+// threads. The mock owns the synchronization of its own collected messages.
+void mock_concurrent_send_snapshot() {
+    lattice::mock_sync_transport transport;
+    constexpr int messages_per_sender = 512;
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    int ready = 0;
+    bool start = false;
+    std::atomic<bool> gate_timed_out{false};
+    auto sender = [&](const char* prefix) {
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            ++ready;
+            gate_cv.notify_all();
+            if (!gate_cv.wait_for(lock, std::chrono::seconds(5), [&] { return start; })) {
+                gate_timed_out.store(true);
+                return;
+            }
+        }
+        for (int i = 0; i < messages_per_sender; ++i) {
+            transport.send(lattice::transport_message::from_string(
+                std::string(prefix) + std::to_string(i) + std::string(128, 'x')));
+            if (i % 8 == 0) std::this_thread::yield();
+        }
+    };
+    std::thread left(sender, "left-");
+    std::thread right(sender, "right-");
+    bool both_ready;
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        both_ready = gate_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ready == 2; });
+        start = true; // release and join even if admission failed
+    }
+    gate_cv.notify_all();
+    bool snapshots_valid = true;
+    size_t prior_size = 0;
+    for (int sample = 0; sample < 256; ++sample) {
+        const auto snapshot = transport.get_sent_messages();
+        if (snapshot.size() < prior_size || snapshot.size() > 2 * messages_per_sender) {
+            snapshots_valid = false;
+        }
+        prior_size = snapshot.size();
+        for (const auto& message : snapshot) {
+            const auto text = message.as_string();
+            if ((text.rfind("left-", 0) != 0 && text.rfind("right-", 0) != 0) ||
+                text.size() < 133 || text.substr(text.size() - 128) != std::string(128, 'x')) {
+                snapshots_valid = false;
+            }
+        }
+        std::this_thread::yield();
+    }
+    left.join();
+    right.join();
+    ASSERT_TRUE(both_ready);
+    ASSERT_FALSE(gate_timed_out.load());
+    EXPECT_TRUE(snapshots_valid);
+    const auto snapshot = transport.get_sent_messages();
+    ASSERT_EQ(snapshot.size(), 2u * messages_per_sender);
+    std::set<std::string> observed;
+    for (const auto& message : snapshot) observed.insert(message.as_string());
+    ASSERT_EQ(observed.size(), 2u * messages_per_sender);
+    for (int i = 0; i < messages_per_sender; ++i) {
+        EXPECT_EQ(observed.count("left-" + std::to_string(i) + std::string(128, 'x')), 1u);
+        EXPECT_EQ(observed.count("right-" + std::to_string(i) + std::string(128, 'x')), 1u);
+    }
+    const auto retained_first = snapshot.front().as_string();
+    transport.clear_sent_messages();
+    EXPECT_TRUE(transport.get_sent_messages().empty());
+    EXPECT_EQ(snapshot.size(), 2u * messages_per_sender);
+    EXPECT_EQ(snapshot.front().as_string(), retained_first);
+}
+
+void mock_callback_reentry() {
+    lattice::mock_sync_transport transport;
+    int opens = 0;
+    int messages = 0;
+    int errors = 0;
+    int closes = 0;
+    transport.set_on_open([&] {
+        ++opens;
+        EXPECT_EQ(transport.state(), lattice::transport_state::open);
+        transport.send(lattice::transport_message::from_string("open"));
+        transport.set_on_open({});
+    });
+    transport.set_on_message([&](const lattice::transport_message& message) {
+        ++messages;
+        transport.send(message);
+        transport.set_on_message([&](const lattice::transport_message&) { ++messages; });
+    });
+    transport.set_on_error([&](const std::string&) {
+        ++errors;
+        EXPECT_EQ(transport.get_sent_messages().size(), 2u);
+        transport.set_on_error({});
+    });
+    transport.set_on_close([&](int code, const std::string&) {
+        ++closes;
+        EXPECT_EQ(code, 1000);
+        EXPECT_EQ(transport.state(), lattice::transport_state::closed);
+        transport.clear_sent_messages();
+        transport.set_on_close({});
+    });
+    transport.connect("ws://mock");
+    transport.simulate_message(lattice::transport_message::from_string("message"));
+    transport.simulate_message(lattice::transport_message::from_string("replacement"));
+    transport.simulate_error("error");
+    transport.simulate_error("removed");
+    transport.disconnect();
+    transport.connect("ws://mock");
+    transport.disconnect();
+    EXPECT_EQ(opens, 1);
+    EXPECT_EQ(messages, 2);
+    EXPECT_EQ(errors, 1);
+    EXPECT_EQ(closes, 1);
+    EXPECT_TRUE(transport.get_sent_messages().empty());
+}
+
+} // namespace
+TEST(MockTransport, ConcurrentSendAndSnapshotRetainEveryMessage) {
+    bounded_mock_case(mock_concurrent_send_snapshot);
+}
+TEST(MockTransport, CallbacksReenterAndReplaceHandlersWithoutHoldingStateLock) {
+    bounded_mock_case(mock_callback_reentry);
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // AuditLog Triggers
@@ -312,7 +475,7 @@ TEST(Sync, SynchronizerConnectAndUpload) {
 
     // Trigger upload
     sync.sync_now();
-    auto& sent = mock_ws->get_sent_messages();
+    auto sent = mock_ws->get_sent_messages();
     ASSERT_FALSE(sent.empty());
     EXPECT_NE(sent[0].as_string().find("\"auditLog\""), std::string::npos);
 
@@ -390,7 +553,7 @@ TEST(Sync, SynchronizerReceiveRemote) {
         lattice::server_sent_event::make_audit_log({remote}).to_json()));
 
     // Verify ack sent back
-    auto& ack_sent = mock_ws->get_sent_messages();
+    auto ack_sent = mock_ws->get_sent_messages();
     ASSERT_FALSE(ack_sent.empty());
 
     // Verify remote person created

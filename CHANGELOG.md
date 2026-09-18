@@ -18,6 +18,8 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Deliver each stored AuditLog insertion once on WebAssembly persistent stores;
+  use the existing direct hook events instead of deriving duplicates.
 - Destroy projection-pressure maps in the native translation unit so optimized
   Swift callers do not need to emit their nested libc++ deletion helpers.
 - Claim each audit-retention interval with one conditional SQLite write so

@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.0.4] - Unreleased
+## [2.0.4] - 2026-09-18
 
 ### Fixed
 - Keep internal ordinary and cross-process reader connections alive through
@@ -11,6 +11,14 @@
   transaction. Concurrent writer-slot registration or reset can no longer
   invalidate a floor read before pruning begins. Preserve caller transactions,
   trigger flags, rollback errors and post-commit observer work.
+- Generate each audit-history batch in its own owned transaction and capture
+  its inserted-row count before a concurrent acknowledgement can overwrite it.
+  Force regeneration uses a finite row frontier and snapshots current complete
+  rows, including rows with partial remote-update history.
+- Detect cooperative destructive maintenance or schema changes between
+  regeneration batches. Prepare the existing remote-dedup receipt table before
+  capturing the schema version, and preserve its receipts during regeneration.
+  Batches commit independently; this is not one snapshot across all model tables.
 - Add bounded regressions for reader retirement, routing, topology restoration
   and audit-maintenance ownership. Legacy raw connection references still
   require caller serialization; an internal read borrow does not extend its

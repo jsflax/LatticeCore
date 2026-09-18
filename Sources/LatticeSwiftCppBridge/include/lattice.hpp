@@ -13,7 +13,6 @@
 #include <future>
 #include <set>
 #include <thread>
-#include <sqlite-vec.h>
 
 #include <dynamic_object.hpp>
 #include <bulk_mutation.hpp>

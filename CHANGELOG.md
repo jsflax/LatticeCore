@@ -3,6 +3,13 @@
 ## [2.0.4] - 2026-09-18
 
 ### Fixed
+- Serialize scheduled native sync work when a synchronizer receives the exact
+  C++ `immediate_scheduler`, including overlapping pacer and caller requests.
+  Keep each upload pass's enumeration-limit result local to that pass.
+- Copy ACK timeout inputs before starting the detached watchdog, so delayed
+  startup does not read the synchronizer before checking its lifetime guard.
+- Protect mock transport state, message storage and callback slots against
+  concurrent access; invoke copied callbacks outside the transport mutex.
 - Keep internal ordinary and cross-process reader connections alive through
   their complete query when maintenance retires or replaces a connection.
   Restore attached views before publishing replacement readers, and release
@@ -25,6 +32,22 @@
   parent Lattice object's lifetime or grant write access.
 - Rebuild Core and C++/Swift bridge consumers together: connection ownership
   changes private object layout. No schema migration or C API signature change.
+
+### Changed
+- For the exact native immediate scheduler, dispatched work runs inline while
+  idle; overlapping or reentrant `sync_now()` work queues and returns. Existing
+  upload coalescing still applies. This call is not an upload/ACK completion
+  barrier. `drain(deadline)` is a bounded wait for an external caller and may
+  expire; do not call it from a sync callback or while holding a database lock
+  the queued work needs.
+- Custom schedulers, including subclasses of `immediate_scheduler`, retain
+  their dispatch policy. Worker/actor schedulers and WASM behavior are unchanged;
+  custom native schedulers remain responsible for serialized sync operations.
+- `mock_sync_transport::get_sent_messages()` now returns an owning snapshot.
+  Replace borrowed `auto&` bindings with owning values and keep the snapshot
+  alive while using its references/iterators; fetch again for later messages.
+  The mock is now noncopyable. Rebuild downstream C++ test helpers and bridge
+  consumers; no production transport or C API signature changes are introduced.
 
 ## [2.0.3] - Unreleased
 

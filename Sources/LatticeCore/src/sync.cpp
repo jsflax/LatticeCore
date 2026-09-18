@@ -1,3 +1,4 @@
+#include "sync_immediate_scheduler.hpp"
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
 #include <nlohmann/json.hpp>
@@ -598,7 +599,14 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched) {
     config_ = config;
     log_label_cache_ = config_.log_label;
+#ifndef __EMSCRIPTEN__
+    // A native pacer introduces concurrent callers even when the owner chose
+    // inline dispatch. Serialize this synchronizer's scheduled operations;
+    // custom/actor/worker schedulers retain their existing execution policy.
+    scheduler_ = detail::make_synchronizer_scheduler(std::move(sched));
+#else
     scheduler_ = sched;
+#endif
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
     LOG_INFO("synchronizer", "[%s] CREATED (WSS, this=%p, db=%s, alive=%lld)",
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
@@ -615,7 +623,14 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
                                    std::unique_ptr<sync_transport> transport) {
     config_ = config;
     log_label_cache_ = config_.log_label;
+#ifndef __EMSCRIPTEN__
+    // A native pacer introduces concurrent callers even when the owner chose
+    // inline dispatch. Serialize this synchronizer's scheduled operations;
+    // custom/actor/worker schedulers retain their existing execution policy.
+    scheduler_ = detail::make_synchronizer_scheduler(std::move(sched));
+#else
     scheduler_ = sched;
+#endif
     ws_client_ = std::move(transport);
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
     LOG_INFO("synchronizer", "[%s] CREATED (IPC, this=%p, db=%s, alive=%lld)",
@@ -891,9 +906,17 @@ synchronizer_base::~synchronizer_base() {
     // access db_, config_, ws_client_ etc. after they're destroyed.
     // Skip if we're on the scheduler thread (destructor called from within
     // a callback) — the work will finish as part of the current call stack.
-    if (scheduler_ && !scheduler_->is_on_thread()) {
-        LOG_INFO("synchronizer", "[%s] ~synchronizer: draining scheduler...", log_id());
-        scheduler_->shutdown();
+    if (scheduler_) {
+#ifndef __EMSCRIPTEN__
+        const bool owns_inline_adapter =
+            dynamic_cast<detail::sync_immediate_scheduler*>(scheduler_.get()) != nullptr;
+#else
+        const bool owns_inline_adapter = false;
+#endif
+        if (owns_inline_adapter || !scheduler_->is_on_thread()) {
+            LOG_INFO("synchronizer", "[%s] ~synchronizer: draining scheduler...", log_id());
+            scheduler_->shutdown();
+        }
     }
     auto n = g_sync_instance_count.fetch_sub(1, std::memory_order_relaxed) - 1;
     LOG_INFO("synchronizer", "[%s] ~synchronizer END (this=%p, alive=%lld)", log_id(), (void*)this, (long long)n);
@@ -1723,7 +1746,7 @@ void synchronizer_base::reconcile_sync_filter() {
 // Upload pending changes (with sync filter support)
 // ============================================================================
 
-std::vector<audit_log_entry> synchronizer_base::query_pending_entries() {
+std::vector<audit_log_entry> synchronizer_base::query_pending_entries(bool& enumeration_hit_limit) {
     int64_t floor = 0;
     size_t limit = 0;
     if (config_.use_upload_floor) {
@@ -1740,7 +1763,7 @@ std::vector<audit_log_entry> synchronizer_base::query_pending_entries() {
     }
     auto entries = query_audit_log_for_sync(
         db().db(), config_.sync_id, config_.sync_filter, floor, limit);
-    last_enumeration_hit_limit_ = (limit > 0 && entries.size() >= limit);
+    enumeration_hit_limit = (limit > 0 && entries.size() >= limit);
 
     // Filter out entries already in-flight (sent but not yet ACK'd), and
     // record every enumerated real audit id as OPEN — the floor may only
@@ -2272,15 +2295,20 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     std::vector<std::string> sent_ids;
     sent_ids.reserve(entries.size());
     for (const auto& e : entries) sent_ids.push_back(e.global_id);
-    std::thread([guard = ack_guard_, self = this, sent_ids = std::move(sent_ids)] {
+    // Read immutable timeout inputs while this operation still owns the
+    // synchronizer. A detached worker may first run after teardown finishes.
+    const auto ack_timeout_base_ms = config_.ack_timeout_base_ms;
+    const int resend_failures = ack_resend_failures_.load(std::memory_order_relaxed);
+    std::thread([guard = ack_guard_, self = this, sent_ids = std::move(sent_ids),
+                 ack_timeout_base_ms, resend_failures] {
         // Consecutive-failure backoff: a server that stalls (accepts frames,
         // never ACKs) must not be re-hammered with the same window every 10s
         // while each resend pass re-queries the audit log. 10s, 20s, 40s...
         // capped at 5 min; reset to 10s by any ACK (mark_as_synced).
         const auto kAckTimeoutBase =
-            std::chrono::milliseconds(self->config_.ack_timeout_base_ms);
+            std::chrono::milliseconds(ack_timeout_base_ms);
         constexpr auto kAckTimeoutMax = std::chrono::minutes(5);
-        const int failures = self->ack_resend_failures_.load(std::memory_order_relaxed);
+        const int failures = resend_failures;
         const auto timeout = std::min<std::chrono::steady_clock::duration>(
             kAckTimeoutBase * (int64_t(1) << std::min(failures, 5)), kAckTimeoutMax);
         // ACK-PROGRESS deadline, WINDOW-LOCAL: the peer acks a frame only
@@ -2352,7 +2380,8 @@ void synchronizer_base::upload_pending_changes() {
             scan_horizon = std::get<int64_t>(h[0].at("m"));
         }
     }
-    auto entries = query_pending_entries();
+    bool enumeration_hit_limit = false;
+    auto entries = query_pending_entries(enumeration_hit_limit);
     if (entries.empty()) {
         // A channel whose filter matches nothing NEVER enumerates a row, so
         // its floor never advances and its slot pins compaction at 0 forever
@@ -2405,7 +2434,7 @@ void synchronizer_base::upload_pending_changes() {
     // false — the ACK / ack-timeout path owns continuation there.
     //
     // New-event bursts (observer requests) still coalesce via request_upload.
-    if (last_enumeration_hit_limit_ && (sent > 0 || skipped > 0)) {
+    if (enumeration_hit_limit && (sent > 0 || skipped > 0)) {
         scheduler_->invoke([this] {
             if (is_destroyed_) return;
             upload_pending_changes();

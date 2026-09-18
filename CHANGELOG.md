@@ -18,6 +18,8 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Initialize the default native Double fallback to zero instead of reading
+  uninitialized storage when a live value is absent or has the wrong type.
 - Deliver each stored AuditLog insertion once on WebAssembly persistent stores;
   use the existing direct hook events instead of deriving duplicates.
 - Destroy projection-pressure maps in the native translation unit so optimized

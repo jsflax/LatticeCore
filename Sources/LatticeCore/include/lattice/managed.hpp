@@ -445,7 +445,7 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
     using SwiftType = double;
     using OptionalType = managed<std::optional<double>>;
     
-    double unmanaged_value;
+    double unmanaged_value = 0.0;
     
     managed() = default;
     managed(double v) : unmanaged_value(v) {}

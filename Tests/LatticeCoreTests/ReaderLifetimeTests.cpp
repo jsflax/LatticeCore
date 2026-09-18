@@ -2,6 +2,11 @@
 // define LATTICE_READER_BASELINE_ADAPTER only for the exact-source red experiment.
 // The baseline adapter is intentionally non-owning and never queries a reader
 // after the destruction marker fires. It is not a proposed production fallback.
+// This executable calls SQLite directly; it is not a loadable extension.
+// sqlite-vec.h is transitively imported by the bridge header on Linux.
+#ifndef SQLITE_CORE
+#define SQLITE_CORE 1
+#endif
 #include <gtest/gtest.h>
 #include <LatticeCore.hpp>
 #include <lattice.hpp>
@@ -330,45 +335,181 @@ int attached_reopen() {
     return read_value(*primary.owner->borrow_read_connection()) == 47 ? 0 : 65;
 }
 
-// SQLite's actual per-open extension seam deterministically gates/fails a
-// staged connection. It is scoped to a fresh exec child and unregistered after
-// the opening thread joins. No production-only testing hook is introduced.
+// A per-child delegating VFS supplies the actual file-open boundary without
+// requiring loadable/automatic extension support. All non-injected operations
+// receive the original VFS pointer, preserving its private pAppData contract.
+// No sqlite3_file/IO-method wrapper or production-only hook is introduced.
 struct OpenControl {
-    std::atomic<unsigned> calls{0};
+    std::atomic<unsigned> calls{0}, attached_calls{0}, injected{0}, gated{0};
+    std::atomic<bool> callback_failed{false}, cleanup_failed{false};
     unsigned fail_at = 0;
     bool gate_first = false, deny_attach = false;
     Gate gate;
 };
-OpenControl* open_control = nullptr;
-int controlled_open(sqlite3* db, char** error, const sqlite3_api_routines*) noexcept {
-    try {
-        auto& control = *open_control;
-        const auto call = control.calls.fetch_add(1) + 1;
-        if (control.gate_first && call == 1) control.gate.enter();
-        if (control.fail_at == call) {
-            *error = sqlite3_mprintf("reader lifetime test: second staged open refused");
-            return SQLITE_ERROR;
-        }
-        if (control.deny_attach) {
-            return sqlite3_set_authorizer(db,
-                [](void*, int action, const char*, const char*, const char*, const char*) {
-                    return action == SQLITE_ATTACH ? SQLITE_DENY : SQLITE_OK;
-                }, nullptr);
-        }
-        return SQLITE_OK;
-    } catch (...) { return SQLITE_ERROR; }
-}
 struct OpenRegistration {
-    explicit OpenRegistration(OpenControl& control) {
-        open_control = &control;
-        if (sqlite3_auto_extension(reinterpret_cast<void (*)()>(controlled_open)) != SQLITE_OK) {
-            open_control = nullptr;
-            throw std::runtime_error("auto extension registration failed");
+    using Symbol = void (*)(void);
+    sqlite3_vfs wrapper{};
+    sqlite3_vfs* parent = nullptr;
+    OpenControl& control;
+    std::string primary_path, attached_path;
+    bool registered = false;
+    static constexpr const char* name = "lattice-reader-lifetime-test-vfs";
+    static OpenRegistration& self(sqlite3_vfs* vfs) noexcept {
+        return *static_cast<OpenRegistration*>(vfs->pAppData);
+    }
+    std::string full_path(const std::string& path) {
+        if (path.empty()) return {};
+        // The fixtures use plain owned paths, never a URI or caller profile.
+        // Normalize with the actual parent VFS used for all subsequent opens.
+        if (parent->mxPathname <= 0 || parent->mxPathname > 1024 * 1024)
+            throw std::runtime_error("unsupported fixture VFS pathname bound");
+        std::vector<char> text(static_cast<size_t>(parent->mxPathname) + 1, '\0');
+        if (parent->xFullPathname(parent, path.c_str(), static_cast<int>(text.size()), text.data()) != SQLITE_OK ||
+            std::memchr(text.data(), '\0', text.size()) == nullptr)
+            throw std::runtime_error("fixture VFS full pathname failed");
+        return text.data();
+    }
+    static int open(sqlite3_vfs* vfs, const char* path, sqlite3_file* file,
+                    int flags, int* output_flags) noexcept {
+        auto& value = self(vfs);
+        // Required even for xOpen failure: SQLite may inspect pMethods.
+        file->pMethods = nullptr;
+        if (output_flags) *output_flags = 0;
+        try {
+            const bool database_file = (flags & SQLITE_OPEN_MAIN_DB) != 0;
+            const bool primary = database_file && path && value.primary_path == path;
+            const bool attachment = database_file && path && !value.attached_path.empty() && value.attached_path == path;
+            if (primary) {
+                // Reopen must create read-only readers; fail closed on a route
+                // change instead of silently injecting into a writer.
+                if (!(flags & SQLITE_OPEN_READONLY) || (flags & SQLITE_OPEN_READWRITE)) {
+                    value.control.callback_failed.store(true);
+                    return SQLITE_CANTOPEN;
+                }
+                const auto call = value.control.calls.fetch_add(1) + 1;
+                if (value.control.gate_first && call == 1) {
+                    value.control.gated.fetch_add(1);
+                    value.control.gate.enter();
+                }
+                if (value.control.fail_at == call) {
+                    value.control.injected.fetch_add(1);
+                    return SQLITE_CANTOPEN;
+                }
+            }
+            if (attachment) {
+                value.control.attached_calls.fetch_add(1);
+                if (value.control.deny_attach) {
+                    value.control.injected.fetch_add(1);
+                    return SQLITE_CANTOPEN;
+                }
+            }
+            return value.parent->xOpen(value.parent, path, file, flags, output_flags);
+        } catch (...) {
+            value.control.callback_failed.store(true);
+            return SQLITE_IOERR;
         }
     }
-    ~OpenRegistration() {
-        sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(controlled_open));
-        open_control = nullptr;
+    OpenRegistration(OpenControl& value, const std::string& primary,
+                     const std::string& attachment = {}) : control(value) {
+        parent = sqlite3_vfs_find(nullptr);
+        if (!parent || parent->iVersion < 1 || parent->iVersion > 3 ||
+            !parent->xOpen || !parent->xFullPathname || sqlite3_vfs_find(name))
+            throw std::runtime_error("unsupported or occupied fixture VFS");
+        primary_path = full_path(primary); attached_path = full_path(attachment);
+        // Read only fields defined by the parent's advertised ABI version.
+        // Every callback forwards the parent, never this wrapper, to its
+        // original method. The SQLite-owned file retains the parent IO methods.
+        wrapper.iVersion = parent->iVersion;
+        wrapper.szOsFile = parent->szOsFile; wrapper.mxPathname = parent->mxPathname;
+        wrapper.zName = name; wrapper.pAppData = this;
+        wrapper.xOpen = open;
+        wrapper.xDelete = [](sqlite3_vfs* v, const char* p, int sync) {
+            auto* b = self(v).parent; return b->xDelete(b, p, sync);
+        };
+        wrapper.xAccess = [](sqlite3_vfs* v, const char* p, int flags, int* out) {
+            auto* b = self(v).parent; return b->xAccess(b, p, flags, out);
+        };
+        wrapper.xFullPathname = [](sqlite3_vfs* v, const char* p, int n, char* out) {
+            auto* b = self(v).parent; return b->xFullPathname(b, p, n, out);
+        };
+        if (parent->xDlOpen) wrapper.xDlOpen = [](sqlite3_vfs* v, const char* p) {
+            auto* b = self(v).parent; return b->xDlOpen(b, p);
+        };
+        if (parent->xDlError) wrapper.xDlError = [](sqlite3_vfs* v, int n, char* out) {
+            auto* b = self(v).parent; b->xDlError(b, n, out);
+        };
+        if (parent->xDlSym) wrapper.xDlSym = [](sqlite3_vfs* v, void* h, const char* p) -> Symbol {
+            auto* b = self(v).parent; return b->xDlSym(b, h, p);
+        };
+        if (parent->xDlClose) wrapper.xDlClose = [](sqlite3_vfs* v, void* h) {
+            auto* b = self(v).parent; b->xDlClose(b, h);
+        };
+        wrapper.xRandomness = [](sqlite3_vfs* v, int n, char* out) {
+            auto* b = self(v).parent; return b->xRandomness(b, n, out);
+        };
+        wrapper.xSleep = [](sqlite3_vfs* v, int n) {
+            auto* b = self(v).parent; return b->xSleep(b, n);
+        };
+        wrapper.xCurrentTime = [](sqlite3_vfs* v, double* out) {
+            auto* b = self(v).parent; return b->xCurrentTime(b, out);
+        };
+        if (parent->xGetLastError) wrapper.xGetLastError = [](sqlite3_vfs* v, int n, char* out) {
+            auto* b = self(v).parent; return b->xGetLastError(b, n, out);
+        };
+        if (parent->iVersion >= 2 && parent->xCurrentTimeInt64)
+            wrapper.xCurrentTimeInt64 = [](sqlite3_vfs* v, sqlite3_int64* out) {
+                auto* b = self(v).parent; return b->xCurrentTimeInt64(b, out);
+            };
+        if (parent->iVersion >= 3) {
+            if (parent->xSetSystemCall) wrapper.xSetSystemCall = [](sqlite3_vfs* v, const char* p, sqlite3_syscall_ptr f) {
+                auto* b = self(v).parent; return b->xSetSystemCall(b, p, f);
+            };
+            if (parent->xGetSystemCall) wrapper.xGetSystemCall = [](sqlite3_vfs* v, const char* p) {
+                auto* b = self(v).parent; return b->xGetSystemCall(b, p);
+            };
+            if (parent->xNextSystemCall) wrapper.xNextSystemCall = [](sqlite3_vfs* v, const char* p) {
+                auto* b = self(v).parent; return b->xNextSystemCall(b, p);
+            };
+        }
+        const int rc = sqlite3_vfs_register(&wrapper, 1);
+        if (rc != SQLITE_OK) throw std::runtime_error("fixture VFS registration failed");
+        registered = true;
+        if (sqlite3_vfs_find(nullptr) != &wrapper) {
+            restore(); throw std::runtime_error("fixture VFS did not become default");
+        }
+    }
+    void restore() noexcept {
+        if (!registered) return;
+        // Only after opener.join() and destruction of every unpublished staged
+        // database. Existing fixture owners were opened through parent before
+        // registration. No new reader is published in any injected case.
+        const bool current = sqlite3_vfs_find(nullptr) == &wrapper;
+        const int restore_rc = sqlite3_vfs_register(parent, 1);
+        const int remove_rc = sqlite3_vfs_unregister(&wrapper);
+        if (!current || restore_rc != SQLITE_OK || remove_rc != SQLITE_OK ||
+            sqlite3_vfs_find(nullptr) != parent || sqlite3_vfs_find(name) != nullptr)
+            control.cleanup_failed.store(true);
+        registered = false;
+    }
+    ~OpenRegistration() { restore(); }
+    OpenRegistration(const OpenRegistration&) = delete;
+    OpenRegistration& operator=(const OpenRegistration&) = delete;
+};
+// Even an unexpected successful publication must not retain a connection
+// referencing the stack VFS after unregistration. Evaluate the publication
+// oracle first; then retire the test-owned pair on every exit.
+struct RetireBeforeVfsRestore {
+    lattice::lattice_db& owner;
+    ~RetireBeforeVfsRestore() noexcept {
+        // stop_listening on Darwin cancels future delivery but may leave an
+        // already-copied callback. close() first disables/drains instance guard
+        // holds and the scheduler before retiring any newly published reader.
+        // No fixture observer borrows the new pair after this quiescence.
+        try { owner.close(); owner.close_read_db(); }
+        catch (...) {
+            std::fputs("reader_lifetime VFS owner quiescence failed\n", stderr);
+            _exit(93); // Do not unwind a stack VFS whose borrowers are unproven.
+        }
     }
 };
 int failed_reopen(bool topology) {
@@ -382,15 +523,18 @@ int failed_reopen(bool topology) {
     OpenControl control;
     control.fail_at = topology ? 0 : 2;
     control.deny_attach = topology;
-    bool refused = false;
+    bool refused = false, unchanged = false;
     {
-        OpenRegistration registration(control);
+        OpenRegistration registration(control, fixture.path.string(), topology ? secondary.path.string() : std::string{});
+        RetireBeforeVfsRestore retire{owner};
         try { owner.reopen_read_db(); }
         catch (const lattice::db_error&) { refused = true; }
+        unchanged = owner.borrow_read_connection() == ordinary && owner.borrow_xproc_read_connection() == xproc &&
+            ordinary->query("SELECT value FROM ReaderLifetimeProbe") == expected;
     }
-    return refused && control.calls.load() == 2 &&
-        owner.borrow_read_connection() == ordinary && owner.borrow_xproc_read_connection() == xproc &&
-        ordinary->query("SELECT value FROM ReaderLifetimeProbe") == expected ? 0 : 66;
+    return refused && control.calls.load() == 2 && control.injected.load() == 1 &&
+        control.attached_calls.load() == (topology ? 1u : 0u) && unchanged &&
+        !control.callback_failed.load() && !control.cleanup_failed.load() ? 0 : 66;
 }
 int late_reopen(bool logical_close) {
     Fixture fixture;
@@ -399,8 +543,10 @@ int late_reopen(bool logical_close) {
     OpenControl control; control.gate_first = true;
     std::exception_ptr parent_error, worker_error;
     bool refused = false;
+    int result = 67;
     {
-        OpenRegistration registration(control);
+        OpenRegistration registration(control, fixture.path.string());
+        RetireBeforeVfsRestore retire{owner};
         std::thread opener([&] {
             try { owner.reopen_read_db(); }
             catch (const lattice::db_error& error) {
@@ -414,15 +560,20 @@ int late_reopen(bool logical_close) {
             else owner.close_read_db();
         } catch (...) { parent_error = std::current_exception(); }
         control.gate.finish(); opener.join();
+        if (parent_error) std::rethrow_exception(parent_error);
+        if (worker_error) std::rethrow_exception(worker_error);
+        if (refused && control.calls.load() == 2) {
+            if (logical_close) {
+                result = owner.is_closed() && owner.borrow_read_connection() == original &&
+                    owner.query_read("SELECT value FROM ReaderLifetimeProbe").empty() ? 0 : 68;
+            } else {
+                result = owner.borrow_read_connection().get() == &owner.db() && read_value(owner.db()) == 47 ? 0 : 69;
+            }
+        }
     }
-    if (parent_error) std::rethrow_exception(parent_error);
-    if (worker_error) std::rethrow_exception(worker_error);
-    if (!refused || control.calls.load() != 2) return 67;
-    if (logical_close) {
-        return owner.is_closed() && owner.borrow_read_connection() == original &&
-            owner.query_read("SELECT value FROM ReaderLifetimeProbe").empty() ? 0 : 68;
-    }
-    return owner.borrow_read_connection().get() == &owner.db() && read_value(owner.db()) == 47 ? 0 : 69;
+    if (control.gated.load() != 1 || control.injected.load() != 0 ||
+        control.callback_failed.load() || control.cleanup_failed.load()) return 67;
+    return result;
 }
 int active_statement_checkpoint() {
     Fixture fixture;

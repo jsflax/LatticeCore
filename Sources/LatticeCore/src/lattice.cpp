@@ -1401,14 +1401,21 @@ void managed<std::vector<geo_bounds*>>::push_back(const geo_bounds& bounds) {
         lattice->ensure_geo_bounds_list_table(table_name, column_name);
     }
 
-    // Insert into list table using insert() which returns the row id
-    primary_key_t new_row_id = db->insert(list_table_, {
-        {"parent_id", parent_global_id_},
-        {"minLat", bounds.min_lat},
-        {"maxLat", bounds.max_lat},
-        {"minLon", bounds.min_lon},
-        {"maxLon", bounds.max_lon}
-    });
+    // list_table_ is already a physical, schema-qualified target. insert()
+    // prefixes main for logical model names. RETURNING also captures this
+    // row's identity before the settled tail can invoke callbacks that write.
+    const auto inserted = db->query(
+        "INSERT INTO " + list_table_ +
+        " (parent_id, minLat, maxLat, minLon, maxLon) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        {parent_global_id_, bounds.min_lat, bounds.max_lat, bounds.min_lon, bounds.max_lon});
+    if (inserted.size() != 1) {
+        throw db_error("Geo bounds insert did not return one row id");
+    }
+    const auto id = inserted[0].find("id");
+    if (id == inserted[0].end() || !std::holds_alternative<int64_t>(id->second)) {
+        throw db_error("Geo bounds insert returned an invalid row id");
+    }
+    const primary_key_t new_row_id = std::get<int64_t>(id->second);
 
     // Create cached wrapper
     auto wrapper = std::make_shared<managed<geo_bounds*>>(bounds);

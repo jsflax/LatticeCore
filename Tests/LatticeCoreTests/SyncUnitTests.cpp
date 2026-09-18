@@ -1,10 +1,173 @@
 #include "TestHelpers.hpp"
 #include <regex>
 #include <set>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <csignal>
+#include <cstdio>
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include <unistd.h>
+#endif
 
 // ============================================================================
 // Sync Unit Tests — AuditLog, sync protocol, synchronizer
 // ============================================================================
+
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+void bounded_mock_case(const std::function<void()>& body) {
+    struct Style {
+        std::string old = GTEST_FLAG_GET(death_test_style);
+        ~Style() { GTEST_FLAG_SET(death_test_style, old); }
+    } style;
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGALRM);
+        if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR ||
+            sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+        alarm(10);
+        try {
+            body();
+            if (::testing::Test::HasFailure()) _exit(1);
+            std::fputs("mock_transport_complete\n", stderr);
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "mock_transport_failure: %s\n", error.what());
+            _exit(1);
+        }
+    }, ::testing::ExitedWithCode(0), "mock_transport_complete");
+}
+
+// The default immediate scheduler can send on both the caller and pacer
+// threads. The mock owns the synchronization of its own collected messages.
+void mock_concurrent_send_snapshot() {
+    lattice::mock_sync_transport transport;
+    constexpr int messages_per_sender = 512;
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    int ready = 0;
+    bool start = false;
+    std::atomic<bool> gate_timed_out{false};
+    auto sender = [&](const char* prefix) {
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            ++ready;
+            gate_cv.notify_all();
+            if (!gate_cv.wait_for(lock, std::chrono::seconds(5), [&] { return start; })) {
+                gate_timed_out.store(true);
+                return;
+            }
+        }
+        for (int i = 0; i < messages_per_sender; ++i) {
+            transport.send(lattice::transport_message::from_string(
+                std::string(prefix) + std::to_string(i) + std::string(128, 'x')));
+            if (i % 8 == 0) std::this_thread::yield();
+        }
+    };
+    std::thread left(sender, "left-");
+    std::thread right(sender, "right-");
+    bool both_ready;
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        both_ready = gate_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ready == 2; });
+        start = true; // release and join even if admission failed
+    }
+    gate_cv.notify_all();
+    bool snapshots_valid = true;
+    size_t prior_size = 0;
+    for (int sample = 0; sample < 256; ++sample) {
+        const auto snapshot = transport.get_sent_messages();
+        if (snapshot.size() < prior_size || snapshot.size() > 2 * messages_per_sender) {
+            snapshots_valid = false;
+        }
+        prior_size = snapshot.size();
+        for (const auto& message : snapshot) {
+            const auto text = message.as_string();
+            if ((text.rfind("left-", 0) != 0 && text.rfind("right-", 0) != 0) ||
+                text.size() < 133 || text.substr(text.size() - 128) != std::string(128, 'x')) {
+                snapshots_valid = false;
+            }
+        }
+        std::this_thread::yield();
+    }
+    left.join();
+    right.join();
+    ASSERT_TRUE(both_ready);
+    ASSERT_FALSE(gate_timed_out.load());
+    EXPECT_TRUE(snapshots_valid);
+    const auto snapshot = transport.get_sent_messages();
+    ASSERT_EQ(snapshot.size(), 2u * messages_per_sender);
+    std::set<std::string> observed;
+    for (const auto& message : snapshot) observed.insert(message.as_string());
+    ASSERT_EQ(observed.size(), 2u * messages_per_sender);
+    for (int i = 0; i < messages_per_sender; ++i) {
+        EXPECT_EQ(observed.count("left-" + std::to_string(i) + std::string(128, 'x')), 1u);
+        EXPECT_EQ(observed.count("right-" + std::to_string(i) + std::string(128, 'x')), 1u);
+    }
+    const auto retained_first = snapshot.front().as_string();
+    transport.clear_sent_messages();
+    EXPECT_TRUE(transport.get_sent_messages().empty());
+    EXPECT_EQ(snapshot.size(), 2u * messages_per_sender);
+    EXPECT_EQ(snapshot.front().as_string(), retained_first);
+}
+
+void mock_callback_reentry() {
+    lattice::mock_sync_transport transport;
+    int opens = 0;
+    int messages = 0;
+    int errors = 0;
+    int closes = 0;
+    transport.set_on_open([&] {
+        ++opens;
+        EXPECT_EQ(transport.state(), lattice::transport_state::open);
+        transport.send(lattice::transport_message::from_string("open"));
+        transport.set_on_open({});
+    });
+    transport.set_on_message([&](const lattice::transport_message& message) {
+        ++messages;
+        transport.send(message);
+        transport.set_on_message([&](const lattice::transport_message&) { ++messages; });
+    });
+    transport.set_on_error([&](const std::string&) {
+        ++errors;
+        EXPECT_EQ(transport.get_sent_messages().size(), 2u);
+        transport.set_on_error({});
+    });
+    transport.set_on_close([&](int code, const std::string&) {
+        ++closes;
+        EXPECT_EQ(code, 1000);
+        EXPECT_EQ(transport.state(), lattice::transport_state::closed);
+        transport.clear_sent_messages();
+        transport.set_on_close({});
+    });
+    transport.connect("ws://mock");
+    transport.simulate_message(lattice::transport_message::from_string("message"));
+    transport.simulate_message(lattice::transport_message::from_string("replacement"));
+    transport.simulate_error("error");
+    transport.simulate_error("removed");
+    transport.disconnect();
+    transport.connect("ws://mock");
+    transport.disconnect();
+    EXPECT_EQ(opens, 1);
+    EXPECT_EQ(messages, 2);
+    EXPECT_EQ(errors, 1);
+    EXPECT_EQ(closes, 1);
+    EXPECT_TRUE(transport.get_sent_messages().empty());
+}
+
+} // namespace
+TEST(MockTransport, ConcurrentSendAndSnapshotRetainEveryMessage) {
+    bounded_mock_case(mock_concurrent_send_snapshot);
+}
+TEST(MockTransport, CallbacksReenterAndReplaceHandlersWithoutHoldingStateLock) {
+    bounded_mock_case(mock_callback_reentry);
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // AuditLog Triggers
@@ -312,7 +475,7 @@ TEST(Sync, SynchronizerConnectAndUpload) {
 
     // Trigger upload
     sync.sync_now();
-    auto& sent = mock_ws->get_sent_messages();
+    auto sent = mock_ws->get_sent_messages();
     ASSERT_FALSE(sent.empty());
     EXPECT_NE(sent[0].as_string().find("\"auditLog\""), std::string::npos);
 
@@ -390,7 +553,7 @@ TEST(Sync, SynchronizerReceiveRemote) {
         lattice::server_sent_event::make_audit_log({remote}).to_json()));
 
     // Verify ack sent back
-    auto& ack_sent = mock_ws->get_sent_messages();
+    auto ack_sent = mock_ws->get_sent_messages();
     ASSERT_FALSE(ack_sent.empty());
 
     // Verify remote person created
@@ -1675,3 +1838,183 @@ TEST(SyncTuningTest, ApplyOverlaysOnlySetFields) {
     EXPECT_EQ(untouched.upload_coalesce_ms, defaults.upload_coalesce_ms);
     EXPECT_EQ(untouched.use_upload_floor, defaults.use_upload_floor);
 }
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include <exception>
+#include <stdexcept>
+namespace {
+struct sync_operation_gate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool signalled = false;
+    void signal() {
+        { std::lock_guard<std::mutex> lock(mutex); signalled = true; }
+        cv.notify_all();
+    }
+    bool wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(5), [&] { return signalled; });
+    }
+};
+
+// Real synchronizer transport boundary. Only the first send is held; later
+// sends ACK synchronously to exercise same-thread callback reentry as well.
+struct held_sync_transport final : lattice::mock_sync_transport {
+    sync_operation_gate entered, release;
+    std::atomic<bool> first{true};
+    std::atomic<int> active_sends{0};
+    std::atomic<bool> overlapped{false};
+    void send(const lattice::transport_message& message) override {
+        struct Active {
+            held_sync_transport& owner;
+            explicit Active(held_sync_transport& value) : owner(value) {
+                if (owner.active_sends.fetch_add(1) != 0) owner.overlapped.store(true);
+            }
+            ~Active() { owner.active_sends.fetch_sub(1); }
+        } active{*this};
+        lattice::mock_sync_transport::send(message);
+        auto event = lattice::server_sent_event::from_json(message.as_string());
+        if (!event || event->event_type != lattice::server_sent_event::type::audit_log ||
+            event->audit_logs.empty()) throw std::runtime_error("expected nonempty audit frame");
+        if (first.exchange(false)) {
+            entered.signal();
+            if (!release.wait()) throw std::runtime_error("initial send gate timed out");
+            // The second caller submitted this frame's exact ACK while held.
+            return;
+        }
+        std::vector<std::string> ids;
+        for (const auto& entry : event->audit_logs) ids.push_back(entry.global_id);
+        simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_ack(ids).to_json()));
+    }
+};
+}
+
+TEST(Sync, ImmediateQueueSerializesFilterAndACKDuringUpload) {
+    bounded_mock_case([] {
+        auto require = [](bool condition, const char* message) {
+            if (!condition) throw std::runtime_error(message);
+        };
+        TempDB tmp{"sync_operation_queue"};
+        lattice::configuration db_config(tmp.str());
+        db_config.audit_retention_seconds = 0;
+        auto owned = std::make_unique<lattice::lattice_db>(db_config);
+        auto* db = owned.get();
+        for (int age = 1; age <= 3; ++age)
+            db->add(TestPerson{"queue-" + std::to_string(age), age, std::nullopt});
+        auto seeds = db->db().query(
+            "SELECT a.globalId AS audit_gid, a.globalRowId AS row_gid, p.age AS age "
+            "FROM AuditLog a JOIN TestPerson p ON p.globalId=a.globalRowId "
+            "WHERE a.tableName='TestPerson' AND a.operation='INSERT' ORDER BY p.age");
+        require(seeds.size() == 3, "exact three original INSERT audits required");
+        std::vector<std::string> audit_ids, row_ids;
+        for (size_t i = 0; i < seeds.size(); ++i) {
+            require(std::get<int64_t>(seeds[i].at("age")) == static_cast<int64_t>(i + 1),
+                    "seed age identity mismatch");
+            audit_ids.push_back(std::get<std::string>(seeds[i].at("audit_gid")));
+            row_ids.push_back(std::get<std::string>(seeds[i].at("row_gid")));
+        }
+        lattice::sync_config config;
+        config.sync_id = "controlled-operation-queue";
+        config.all_active_sync_ids = {config.sync_id};
+        config.upload_coalesce_ms = 0;
+        config.checkpoint_passive_interval_ms = 0;
+        config.checkpoint_truncate_interval_ms = 0;
+        config.narrowing_emits_removals = false;
+        config.sync_filter = std::vector<lattice::sync_filter_entry>{{"TestPerson", "age = 1"}};
+        auto transport = std::make_unique<held_sync_transport>();
+        auto* wire = transport.get();
+        std::mutex ack_mutex;
+        std::vector<std::string> acked;
+        std::atomic<bool> ack_inside_send{false};
+        lattice::synchronizer sync(std::move(owned), config, std::move(transport));
+        sync.set_on_sync_complete([&](const std::vector<std::string>& ids) {
+            if (wire->active_sends.load() != 0) ack_inside_send.store(true);
+            std::lock_guard<std::mutex> lock(ack_mutex);
+            acked.insert(acked.end(), ids.begin(), ids.end());
+        });
+        std::exception_ptr opening_error, caller_error;
+        std::thread opening([&] {
+            try { sync.connect(); } catch (...) { opening_error = std::current_exception(); }
+        });
+        const bool entered = wire->entered.wait();
+        sync_operation_gate submitted;
+        std::thread caller;
+        bool caller_returned = false;
+        if (entered) {
+            caller = std::thread([&] {
+                try {
+                    // Both arrive while the same real upload is held. Only the
+                    // latest filter may reconcile; neither may run concurrently.
+                    sync.update_sync_filter({{"TestPerson", "age = 2"}});
+                    sync.update_sync_filter({{"TestPerson", "age = 3"}});
+                    wire->simulate_message(lattice::transport_message::from_string(
+                        lattice::server_sent_event::make_ack({audit_ids[0]}).to_json()));
+                    sync.sync_now();
+                } catch (...) { caller_error = std::current_exception(); }
+                submitted.signal();
+            });
+            caller_returned = submitted.wait();
+        }
+        const auto held_messages = wire->get_sent_messages();
+        bool no_ack_while_held;
+        { std::lock_guard<std::mutex> lock(ack_mutex); no_ack_while_held = acked.empty(); }
+        wire->release.signal(); // Always release before joining or throwing.
+        if (caller.joinable()) caller.join();
+        opening.join(); // Idle inline drain includes all queued filter/ACK work.
+        if (opening_error) std::rethrow_exception(opening_error);
+        if (caller_error) std::rethrow_exception(caller_error);
+        require(entered && caller_returned, "second caller must return while first send remains held");
+        require(held_messages.size() == 1 && no_ack_while_held,
+                "filter/ACK work executed before the held upload returned");
+        require(!wire->overlapped.load() && !ack_inside_send.load(),
+                "real sends or ACK completion overlapped/reentered a send");
+
+        auto sent_entries = [&] {
+            std::vector<lattice::audit_log_entry> result;
+            for (const auto& message : wire->get_sent_messages()) {
+                auto event = lattice::server_sent_event::from_json(message.as_string());
+                require(event && event->event_type == lattice::server_sent_event::type::audit_log,
+                        "unexpected transport frame");
+                result.insert(result.end(), event->audit_logs.begin(), event->audit_logs.end());
+            }
+            return result;
+        };
+        auto sent = sent_entries();
+        require(sent.size() == 2 && sent[0].global_id == audit_ids[0] &&
+                sent[1].global_id == audit_ids[2] && sent[0].operation == "INSERT" &&
+                sent[1].operation == "INSERT", "expected exact first/latest INSERT audits, no middle filter");
+        { std::lock_guard<std::mutex> lock(ack_mutex);
+          require(acked == std::vector<std::string>({audit_ids[0], audit_ids[2]}),
+                  "queued and reentrant ACKs must complete in exact order"); }
+        require(sync.get_progress().pending_upload == 0, "both exact frames must be ACKed");
+        auto members = db->db().query(
+            "SELECT global_row_id FROM _lattice_sync_set WHERE sync_id = ? AND table_name = 'TestPerson'",
+            {config.sync_id});
+        require(members.size() == 1 && std::get<std::string>(members[0].at("global_row_id")) == row_ids[2],
+                "latest filter membership must select only age 3");
+
+        // A subsequent write tests persistent latest-filter state, not just
+        // which of two queued lambdas happened to emit during the first drain.
+        db->db().execute("UPDATE TestPerson SET name = ? WHERE age = ?", {std::string("middle-updated"), int64_t{2}});
+        db->db().execute("UPDATE TestPerson SET name = ? WHERE age = ?", {std::string("latest-updated"), int64_t{3}});
+        auto updated = db->db().query(
+            "SELECT globalId FROM AuditLog WHERE tableName='TestPerson' AND operation='UPDATE' "
+            "AND globalRowId = ? ORDER BY id DESC LIMIT 1", {row_ids[2]});
+        require(updated.size() == 1, "latest row UPDATE audit missing");
+        const auto update_id = std::get<std::string>(updated[0].at("globalId"));
+        sync.sync_now();
+        sent = sent_entries();
+        require(sent.size() == 3 && sent[2].global_id == update_id && sent[2].operation == "UPDATE" &&
+                sent[2].global_row_id == row_ids[2], "only the exact latest-filter UPDATE may be sent");
+        require(sent[2].changed_fields_to_json().find("latest-updated") != std::string::npos,
+                "latest UPDATE value must cross the actual transport");
+        { std::lock_guard<std::mutex> lock(ack_mutex);
+          require(acked == std::vector<std::string>({audit_ids[0], audit_ids[2], update_id}),
+                  "final exact audit ACK set/order mismatch"); }
+        require(!wire->overlapped.load() && !ack_inside_send.load() &&
+                sync.get_progress().pending_upload == 0, "final send/ACK serialization or pending state invalid");
+        sync.disconnect(); // Lifecycle changes occur only after both callers joined.
+    });
+}
+#endif

@@ -195,6 +195,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp
+    Tests/LatticeCoreTests/ReaderLifetimeTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
@@ -202,6 +203,9 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
     Tests/LatticeCoreTests/AttachViewIntegrityTests.cpp
     Tests/LatticeCoreTests/AuditHygieneTests.cpp
+    Tests/LatticeCoreTests/AuditRetentionTests.cpp
+    Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncPerfBench.cpp
     Tests/LatticeCoreTests/CAPISurfaceTests.cpp
     Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c

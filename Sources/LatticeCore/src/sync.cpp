@@ -838,7 +838,7 @@ void synchronizer_base::setup_observer() {
             for (const auto& [_, op, row_id, __, ___] : batch) {
                 if (op != "INSERT") continue;
                 if (!is_connected_) continue;
-                auto rows = db().read_db().query(
+                auto rows = db().query_read(
                     "SELECT ss.is_synchronized FROM _lattice_sync_state ss "
                     "WHERE ss.audit_entry_id = ? AND ss.sync_id = ?",
                     {row_id, config_.sync_id}

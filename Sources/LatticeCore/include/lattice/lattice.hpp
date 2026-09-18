@@ -2012,7 +2012,7 @@ public:
     observer_id add_table_observer(const std::string& table_name,
                                     std::function<void(const std::vector<change_event>&)> callback) {
         std::lock_guard<std::mutex> lock(observers_mutex_);
-        auto id = next_observer_id_++;
+        auto id = next_observer_id_.fetch_add(1, std::memory_order_relaxed);
         table_observers_[table_name][id] = std::move(callback);
         return id;
     }
@@ -2042,7 +2042,7 @@ public:
     observer_id add_object_observer(const std::string& table_name, int64_t row_id,
                                      std::function<void(const std::string&)> callback) {
         std::lock_guard<std::mutex> lock(object_observers_mutex_);
-        auto id = next_observer_id_++;
+        auto id = next_observer_id_.fetch_add(1, std::memory_order_relaxed);
         object_observers_[table_name][row_id].emplace_back(id, std::move(callback));
         return id;
     }
@@ -5762,7 +5762,9 @@ private:
 
     // Table-level observer storage (for Results observation)
     std::mutex observers_mutex_;
-    observer_id next_observer_id_ = 1;
+    // Table and object registrations hold different registry mutexes. Token
+    // allocation is shared; registry publication stays under each own mutex.
+    std::atomic<observer_id> next_observer_id_{1};
     std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>> table_observers_;
 
     // Per-object observer storage (for individual model observation)

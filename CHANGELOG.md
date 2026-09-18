@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.3] - Unreleased
+
+### Fixed
+- Allocate table and object observer tokens through one shared atomic counter.
+  Concurrent registration previously incremented a plain counter under two
+  different registry locks, causing an unsynchronized access.
+- Preserve the shared token namespace, initial token 1, existing unsigned wrap
+  behavior and per-registry cancellation semantics. Add a bounded concurrent
+  registration/cancellation regression. No schema or public API changes.
+- Rebuild Core and all C++/Swift bridge consumers together: the private counter
+  member type changed, so binary layout compatibility is not assumed.
+
 ## [2.0.2] - Unreleased
 
 ### Fixed

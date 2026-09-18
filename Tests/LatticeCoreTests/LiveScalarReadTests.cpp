@@ -151,12 +151,21 @@ TEST(LiveScalarRead, SettledCallbackRunsAfterFinalizationAndCanReenter) {
 }
 
 TEST(LiveScalarRead, MaterializedModeStaysPinnedAndBridgeErrorsRemainSealed) {
-    lattice::swift_lattice owner(swift_configuration(":memory:"), scalar_schemas());
+#if LATTICE_HAS_FRT
+    auto owner_ref = std::unique_ptr<swift_lattice_ref>(
+        swift_lattice_ref::create(swift_configuration(":memory:"), scalar_schemas()));
+#else
+    auto owner_ref = std::make_unique<swift_lattice_ref>(
+        swift_lattice_ref::create(swift_configuration(":memory:"), scalar_schemas()));
+#endif
+    auto& owner = *owner_ref->get();
     swift_dynamic_object source;
     source.table_name = "ScalarModel"; source.properties = scalar_schemas()[0].properties;
     source.values["i"] = int64_t(7); source.values["r"] = 2.5; source.values["t"] = std::string("first");
     dynamic_object_ref object(source);
     owner.add_preserving_global_id(*object.get(), fake_uuid(1));
+    ASSERT_EQ(object.get()->lattice.get(), owner_ref->get());
+    ASSERT_NE(object.managed_primary_key(), 0);
     object.enable_row_cache();
     owner.db().execute("UPDATE ScalarModel SET i=9,r=4.5,t='second'");
     const auto before = database::thread_statement_count();

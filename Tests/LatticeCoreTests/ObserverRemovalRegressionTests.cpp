@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 #include <LatticeCore.hpp>
 #include <cstdio>
+#include <array>
+#include <atomic>
+#include <thread>
+#include <unordered_set>
 #include <memory>
 #include <vector>
 
@@ -90,6 +94,64 @@ int removal_case(RemovalKind kind, bool retain_until_after_removal) {
     return 0;
 }
 
+int concurrent_registration_case() {
+    constexpr size_t worker_count = 4;
+    constexpr size_t per_worker = 1024;
+    constexpr size_t total = worker_count * per_worker;
+    struct Registration { observer_id id = 0; bool table = false; };
+    std::array<Registration, total> registrations{};
+    std::array<std::atomic<unsigned>, total> deliveries{};
+    lattice::lattice_db owner; // Destroy callbacks before their captured counters.
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> start{false};
+    std::array<std::thread, worker_count> workers;
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+        workers[worker] = std::thread([&, worker] {
+            ready.fetch_add(1);
+            while (!start.load()) std::this_thread::yield();
+            for (size_t index = worker * per_worker; index < (worker + 1) * per_worker; ++index) {
+                const bool table = worker % 2 == 0;
+                const auto id = table
+                    ? owner.add_table_observer("TokenProbe", [&, index](const auto&) {
+                        deliveries[index].fetch_add(1);
+                    })
+                    : owner.add_object_observer("TokenProbe", 17, [&, index](const auto&) {
+                        deliveries[index].fetch_add(1);
+                    });
+                registrations[index] = {id, table};
+            }
+        });
+    }
+    while (ready.load() != worker_count) std::this_thread::yield();
+    start.store(true);
+    for (auto& worker : workers) worker.join();
+    std::unordered_set<observer_id> tokens;
+    for (const auto& registration : registrations) {
+        if (registration.id == 0 || !tokens.insert(registration.id).second) {
+            std::fputs("registration_duplicate_or_zero_token\n", stderr);
+            return 10;
+        }
+    }
+    const std::vector<lattice::lattice_db::change_event> batch{
+        {"TokenProbe", "INSERT", 17, "token-probe-17", "[]"}};
+    owner.notify_changes_batched(batch);
+    for (const auto& count : deliveries) if (count.load() != 1) return 11;
+    auto remove = [&](const Registration& registration) {
+        if (registration.table) owner.remove_table_observer("TokenProbe", registration.id);
+        else owner.remove_object_observer("TokenProbe", 17, registration.id);
+    };
+    for (size_t index = 0; index < total; index += 3) remove(registrations[index]);
+    owner.notify_changes_batched(batch);
+    for (size_t index = 0; index < total; ++index)
+        if (deliveries[index].load() != (index % 3 == 0 ? 1u : 2u)) return 12;
+    for (const auto& registration : registrations) remove(registration);
+    owner.notify_changes_batched(batch);
+    for (size_t index = 0; index < total; ++index)
+        if (deliveries[index].load() != (index % 3 == 0 ? 1u : 2u)) return 13;
+    std::fputs("registration_complete unique=4096 subset_cancelled survivors_delivered final_silence\n", stderr);
+    return 0;
+}
+
 void require_bounded_removal(RemovalKind kind, bool retained_control) {
     // Exec a fresh child even in a suite that has background threads. The
     // child's alarm makes an old under-lock destruction fail in five seconds
@@ -134,6 +196,20 @@ TEST(ObserverRemovalRegression, AllObjectFinalCaptureCanCancelSibling) {
 TEST(ObserverRemovalRegression, AllObjectRetainedCaptureControl) {
     require_bounded_removal(RemovalKind::all_objects, true);
 }
+TEST(ObserverTokenRegistration, ConcurrentKindsRemainUniqueAndIndependentlyCancellable) {
+    struct RestoreDeathTestStyle {
+        std::string previous = ::testing::FLAGS_gtest_death_test_style;
+        ~RestoreDeathTestStyle() { ::testing::FLAGS_gtest_death_test_style = std::move(previous); }
+    } restore_style;
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({
+        std::signal(SIGALRM, SIG_DFL);
+        alarm(5);
+        const auto result = concurrent_registration_case();
+        _exit(result);
+    }, ::testing::ExitedWithCode(0), "registration_complete unique=4096 subset_cancelled survivors_delivered final_silence");
+}
+
 #else
 TEST(ObserverRemovalRegression, RequiresNativeBoundedChildProcesses) {
     GTEST_SKIP() << "Observer removal reentrancy regression requires native POSIX death tests";

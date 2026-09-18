@@ -7527,6 +7527,13 @@ protected:
             obj.table_name_ = table_name;
         }
 
+        // Model identity is metadata of the managed wrapper. T itself is the
+        // unmanaged dynamic value and has no .source member. Keep this apart
+        // from row-value hydration so live fields remain statement-fresh.
+        if constexpr (has_source_member<managed<T>>::value) {
+            obj.source.table_name = table_name;
+        }
+
         // Populate the source object's values from the row
         if constexpr (has_source_member<T>::value) {
             for (const auto& [key, value] : row) {

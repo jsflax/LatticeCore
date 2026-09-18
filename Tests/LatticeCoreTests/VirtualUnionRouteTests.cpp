@@ -60,7 +60,13 @@ TEST(VirtualUnionRoute, AttachedOnlyModelRetainsIdentityBoundPredicateAndLiveWri
         {std::string("France")});
     ASSERT_TRUE(last_bridge_error().empty()) << last_bridge_error();
     ASSERT_EQ(rows.size(), 1u);
-    dynamic_object_ref hydrated(rows[0]);
+    EXPECT_EQ(rows[0].source.table_name, "UnionMuseum");
+    EXPECT_TRUE(rows[0].source.values.empty());
+    auto copied = rows[0];
+    auto moved = std::move(copied);
+    EXPECT_EQ(moved.source.table_name, "UnionMuseum");
+    EXPECT_TRUE(moved.source.values.empty());
+    dynamic_object_ref hydrated(moved);
     ASSERT_EQ(hydrated.get()->lattice.get(), main->get());
     EXPECT_EQ(managed_route(rows[0].table_name()).schema_sql, alias);
     EXPECT_EQ(hydrated.get_model_table_name(), "UnionMuseum");

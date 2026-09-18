@@ -5756,6 +5756,12 @@ private:
     bool projection_admission_paused_ = false; // protected by service mutex
 
     using projection_pressure_map = std::map<std::string, std::shared_ptr<projection_pressure_source>, std::less<>>;
+    struct projection_pressure_map_deleter {
+        // Keep nested map destruction in the native translation unit. Swift's
+        // optimized C++ import can otherwise emit references to libc++ template
+        // helpers that have no emitted definition in the final executable.
+        void operator()(const projection_pressure_map* value) const noexcept;
+    };
     void setup_projection_pressure();
     void replace_projection_pressure_source(const std::string& schema,
                                            std::shared_ptr<projection_pressure_source> source);
@@ -5770,7 +5776,7 @@ private:
     mutable std::atomic<unsigned> projection_pressure_slot_{0};
     mutable std::atomic<uint64_t> projection_pressure_readers_[2]{};
     std::atomic<const projection_pressure_map*> projection_pressure_maps_[2]{};
-    std::unique_ptr<const projection_pressure_map> projection_pressure_owners_[2];
+    std::unique_ptr<const projection_pressure_map, projection_pressure_map_deleter> projection_pressure_owners_[2];
 
     configuration config_;
     std::unique_ptr<database> db_;       // Write connection

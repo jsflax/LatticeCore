@@ -65,12 +65,16 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
     return raw;
 }
 
+void lattice_db::projection_pressure_map_deleter::operator()(const projection_pressure_map* value) const noexcept {
+    delete value;
+}
+
 void lattice_db::publish_projection_pressure(std::unique_ptr<const projection_pressure_map> next) {
     // Caller serializes publishers with attach_mutex_ (or is constructing the
     // instance before hooks exist). No SQLite/registry/service lock is held.
     const unsigned old = projection_pressure_slot_.load();
     const unsigned fresh = 1 - old;
-    projection_pressure_owners_[fresh] = std::move(next);
+    projection_pressure_owners_[fresh].reset(next.release());
     projection_pressure_maps_[fresh].store(projection_pressure_owners_[fresh].get());
     projection_pressure_slot_.store(fresh);
     // New readers use fresh. A stale pre-increment reader rechecks the slot

@@ -18,6 +18,8 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Destroy projection-pressure maps in the native translation unit so optimized
+  Swift callers do not need to emit their nested libc++ deletion helpers.
 - Claim each audit-retention interval with one conditional SQLite write so
   simultaneous maintenance handles cannot both acquire the same interval.
   Release a failed pass's own claim for retry while preserving newer claims;

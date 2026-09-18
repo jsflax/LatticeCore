@@ -151,7 +151,7 @@ TEST(LiveScalarRead, SettledCallbackRunsAfterFinalizationAndCanReenter) {
 }
 
 TEST(LiveScalarRead, MaterializedModeStaysPinnedAndBridgeErrorsRemainSealed) {
-    swift_lattice owner(swift_configuration(":memory:"), scalar_schemas());
+    lattice::swift_lattice owner(swift_configuration(":memory:"), scalar_schemas());
     swift_dynamic_object source;
     source.table_name = "ScalarModel"; source.properties = scalar_schemas()[0].properties;
     source.values["i"] = int64_t(7); source.values["r"] = 2.5; source.values["t"] = std::string("first");

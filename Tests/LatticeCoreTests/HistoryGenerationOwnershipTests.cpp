@@ -12,6 +12,7 @@
 #include <exception>
 #include <stdexcept>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #if GTEST_HAS_DEATH_TEST && (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
@@ -22,8 +23,10 @@
 #include <mach-o/dyld.h>
 #endif
 extern char** environ;
-struct HistoryOwnedRow { int64_t value = 0; int64_t companion = 0; };
+struct HistoryOwnedRow { int64_t value = 0; std::optional<int64_t> companion = 0; };
 LATTICE_SCHEMA(HistoryOwnedRow, value, companion);
+struct HistoryOwnedEmpty { int64_t value = 0; };
+LATTICE_SCHEMA(HistoryOwnedEmpty, value);
 namespace lattice {
 struct history_generation_test_access {
     static int64_t force(lattice_db& owner, int64_t batch, const std::function<void(bool)>& between = {}) {
@@ -92,6 +95,11 @@ void reset_interleave(int mode, bool memory) {
                 entry.timestamp="1700000000.0"; entry.changed_fields_names={"value"};
                 entry.changed_fields["value"]=any_property(int64_t{81});
                 require(apply_remote_changes(owner,{entry}).size()==1,"remote update applied");
+                const auto updated=owner.db().query("SELECT value,companion FROM HistoryOwnedRow WHERE id=1");
+                require(updated.size()==1&&std::get<int64_t>(updated[0].at("value"))==81,
+                        "partial remote upsert changes the supplied value");
+                require(std::get<int64_t>(updated[0].at("companion"))==110,
+                        "partial remote upsert retains the omitted seeded companion");
             }
         } catch(...) { error=std::current_exception(); }
     });
@@ -251,15 +259,33 @@ void malformed_revision() {
     require(rejected&&owner.db().query("SELECT * FROM AuditLog ORDER BY id")==prior,"unknown revision never repaired by destructive reset");settled(owner);
 }
 void owned_count_with_ack() {
-    File path;lattice_db owner(config(path.path));seed(owner);owner.db().execute("DELETE FROM AuditLog");
+    File path;
+    // Create an empty registered model before owner schema setup. The trace
+    // below requires its zero-row batch before the seeded model's batch, so
+    // this fixture exercises the full-suite registry condition explicitly.
+    {
+        database initial(path.path);
+        initial.execute("CREATE TABLE HistoryOwnedEmpty("
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        "globalId TEXT UNIQUE COLLATE NOCASE,value INTEGER NOT NULL)");
+    }
+    lattice_db owner(config(path.path));seed(owner);owner.db().execute("DELETE FROM AuditLog");
+    require(scalar(owner.db(),"SELECT COUNT(*) FROM HistoryOwnedEmpty")==0,
+            "registered control remains empty");
     struct Admission {
         std::mutex mutex;std::condition_variable changed;
-        bool entered=false,attempted=false,stop=false;std::exception_ptr worker_error;
+        bool entered=false,attempted=false,stop=false,empty_before_target=false;std::exception_ptr worker_error;
         static int trace(unsigned event,void* raw,void* statement,void*) noexcept {
             auto& s=*static_cast<Admission*>(raw);
             const char* sql=sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
             if(event!=SQLITE_TRACE_PROFILE||!sql||std::strncmp(sql,"INSERT INTO main.AuditLog",25)!=0)return 0;
-            std::unique_lock lock(s.mutex);if(s.entered)return 0;s.entered=true;s.changed.notify_all();
+            std::unique_lock lock(s.mutex);
+            if(std::strstr(sql," FROM main.\"HistoryOwnedEmpty\" t ")) {
+                if(!s.entered)s.empty_before_target=true;
+                return 0;
+            }
+            if(!std::strstr(sql," FROM main.\"HistoryOwnedRow\" t ")||s.entered)return 0;
+            s.entered=true;s.changed.notify_all();
             // Only wait for attempted admission, NEVER for the blocked SQL to finish.
             s.changed.wait(lock,[&]{return s.attempted;});return 0;
         }
@@ -280,16 +306,19 @@ void owned_count_with_ack() {
     try {
         count=history_generation_test_access::generate(owner,2,[&](bool prepared) {
             if(prepared||!worker.joinable())return;
-            // The first batch has committed and released SQLite ownership.
-            // Let the competing public ACK finish before the next unit asks
-            // for an idle connection; never wait for it from the trace hook.
-            worker.join();
+            // Empty model batches may precede the seeded table. Join only
+            // after its PROFILE seam admitted the worker and this unit has
+            // committed/released SQLite ownership. Never join in the hook.
+            bool target_completed=false;
+            {std::lock_guard lock(admission.mutex);target_completed=admission.entered;}
+            if(target_completed)worker.join();
         });
     }catch(...){operation_error=std::current_exception();}
     {std::lock_guard lock(admission.mutex);admission.stop=true;}admission.changed.notify_all();if(worker.joinable())worker.join();
     sqlite3_trace_v2(raw,0,nullptr,nullptr);
     if(operation_error)std::rethrow_exception(operation_error);
     if(admission.worker_error)std::rethrow_exception(admission.worker_error);
+    require(admission.empty_before_target,"empty registered model batch preceded the ACK target");
     require(admission.entered&&admission.attempted,"competing ACK attempted during batch completion");
     require(count==2&&scalar(owner.db(),"SELECT COUNT(*) FROM AuditLog")==2,"owned count stays two");
     require(scalar(owner.db(),"SELECT COUNT(*) FROM AuditLog WHERE isSynchronized=1")==1,"public ACK completed");settled(owner);

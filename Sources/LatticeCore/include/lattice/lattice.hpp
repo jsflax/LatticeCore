@@ -840,8 +840,8 @@ public:
     // Construct with path (uses default scheduler, no sync)
     explicit lattice_db(const std::string& path)
         : config_(path)
-        , db_(std::make_unique<database>(path, database::open_mode::read_write))
-        , read_db_(!configuration::path_is_memory(path) ? std::make_unique<database>(path, database::open_mode::read_only) : nullptr)
+        , db_(std::make_shared<database>(path, database::open_mode::read_write))
+        , read_db_(!configuration::path_is_memory(path) ? std::make_shared<database>(path, database::open_mode::read_only) : nullptr)
         , scheduler_(std::make_shared<immediate_scheduler>()) {
         setup_store_write_gate();
         ensure_tables();
@@ -854,7 +854,7 @@ public:
     // Construct in-memory (uses default scheduler, no sync)
     lattice_db()
         : config_()
-        , db_(std::make_unique<database>(":memory:", database::open_mode::read_write))
+        , db_(std::make_shared<database>(":memory:", database::open_mode::read_write))
         , read_db_(nullptr)  // In-memory DB can't have separate read connection
         , scheduler_(std::make_shared<immediate_scheduler>()) {
         setup_store_write_gate();
@@ -889,13 +889,13 @@ public:
 
     explicit lattice_db(const configuration& config, bool defer_sync = false)
         : config_(config)
-        , db_(std::make_unique<database>(resolve_path(config),
+        , db_(std::make_shared<database>(resolve_path(config),
               config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
               config.busy_timeout_ms))
         , read_db_(config.read_only ? nullptr :
-                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
+                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
-                         std::make_unique<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
+                         std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
@@ -1235,7 +1235,7 @@ public:
                             }
                         }
                     }
-                    auto rows = read_db().query("SELECT id, globalId FROM " + schema.table_name +
+                    auto rows = query_read("SELECT id, globalId FROM " + schema.table_name +
                                                 " WHERE " + where.str(), params);
                     if (!rows.empty()) {
                         actual_id = std::get<int64_t>(rows[0].at("id"));
@@ -1442,7 +1442,7 @@ public:
         const auto& schema = managed<T>::schema();
         std::string sql = "SELECT * FROM " + schema.table_name;
         // Use read connection for queries (concurrent reads)
-        auto rows = read_db().query(sql);
+        auto rows = query_read(sql);
 
         std::vector<managed<T>> items;
         items.reserve(rows.size());
@@ -1579,7 +1579,7 @@ public:
             }
             if (!audit_id_list.empty()) {
                 std::unordered_map<int64_t, std::string> gid_by_id;
-                auto rows = read_db().query(
+                auto rows = query_read(
                     "SELECT id, globalId FROM AuditLog WHERE id IN (" + audit_id_list + ")");
                 for (const auto& row : rows) {
                     auto id_it = row.find("id");
@@ -1645,7 +1645,7 @@ public:
         bool had_internal_changes = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
             if (table == "AuditLog" || internal_table_parents.count(table)) continue;
-            auto meta = read_db().query(
+            auto meta = query_read(
                 "SELECT value FROM _lattice_meta WHERE key = ?",
                 {"internal_table:" + table}
             );
@@ -1723,7 +1723,7 @@ public:
                 std::string changed_fields;
                 if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
                     && row_id > 0 && table != "AuditLog") {
-                    auto cfn_rows = read_db().query(
+                    auto cfn_rows = query_read(
                         "SELECT changedFieldsNames FROM AuditLog "
                         "WHERE tableName = ? AND rowId = ? ORDER BY id DESC LIMIT 1",
                         {table, row_id}
@@ -1770,7 +1770,7 @@ public:
             LOG_DEBUG("flush_changes", "Querying AuditLog for table=%s rowId=%lld op=%s", table.c_str(), (long long)row_id, op.c_str());
 
             // Query for AuditLog entry created by trigger for this model change
-            auto audit_rows = read_db().query(
+            auto audit_rows = query_read(
                 "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND rowId = ? AND operation = ? ORDER BY id DESC LIMIT 1",
                 {table, row_id, op}
             );
@@ -1805,7 +1805,7 @@ public:
             for (const auto& [table, op, row_id, global_id] : changes) {
                 if (!internal_table_parents.count(table)) continue;
 
-                auto audit_rows = read_db().query(
+                auto audit_rows = query_read(
                     "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND operation = ? ORDER BY id DESC LIMIT 1",
                     {table, op}
                 );
@@ -2968,7 +2968,7 @@ public:
     std::optional<managed<T>> find(primary_key_t id, const std::string& table_name) {
         std::string sql = "SELECT * FROM " + table_name + " WHERE id = ?";
         // Use read connection for queries
-        auto rows = read_db().query(sql, {id});
+        auto rows = query_read(sql, {id});
 
         if (rows.empty()) {
             return std::nullopt;
@@ -2987,7 +2987,7 @@ public:
     std::optional<managed<T>> find_by_global_id(const global_id_t& gid, const std::string& table_name) {
         std::string sql = "SELECT * FROM " + table_name + " WHERE globalId = ?";
         // Use read connection for queries
-        auto rows = read_db().query(sql, {gid});
+        auto rows = query_read(sql, {gid});
 
         if (rows.empty()) {
             return std::nullopt;
@@ -3163,7 +3163,7 @@ public:
                  std::optional<std::string> group_by = std::nullopt,
                  std::optional<std::string> distinct_by = std::nullopt,
                  const std::vector<column_value_t>& params = {}) {
-        auto rows = read_db().query(build_count_sql(table_name, where_clause, group_by, distinct_by), params);
+        auto rows = query_read(build_count_sql(table_name, where_clause, group_by, distinct_by), params);
         if (!rows.empty()) {
             auto it = rows[0].find("cnt");
             if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
@@ -3451,58 +3451,60 @@ public:
     /// @param stale_threshold_seconds If > 0, evict slots inactive for this long
     /// @return Number of entries deleted, or -1 if no slots exist (no-op)
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) {
-        // 1. Optionally evict stale slots
-        if (stale_threshold_seconds > 0) {
-            db_->execute(
-                "DELETE FROM _lattice_replication_slots "
-                "WHERE last_active_at < datetime('now', '-' || ? || ' seconds')",
-                {stale_threshold_seconds});
-        }
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            // 1. Optionally evict stale slots
+            if (stale_threshold_seconds > 0) {
+                db_->execute(
+                    "DELETE FROM _lattice_replication_slots "
+                    "WHERE last_active_at < datetime('now', '-' || ? || ' seconds')",
+                    {stale_threshold_seconds});
+            }
 
-        // 2. Deletion bound: MIN(upload_floor) over live slots — the floor is
-        // the CONTIGUOUS resolved frontier ("no entry pending for this
-        // sync_id has id <= upload_floor", advanced only as ids resolve by
-        // ack or skip). confirmed_audit_id must NOT participate: it is a
-        // HOLEY high-watermark (advance takes each ACKed chunk's max, and a
-        // partial apply acks only the applied subset — confirmed jumps past
-        // unacked lower ids; observed live: 1,087 entries pending BELOW a
-        // channel's confirmed). Compacting to it deletes un-uploaded history
-        // unrecoverably; compacting to the floor is exactly safe.
-        // Observer slots (this database's own read-only dials) never advance
-        // a floor and are excluded — otherwise a read-only replica could never
-        // prune its own history. The column is added lazily on legacy files.
-        ensure_observer_column(*db_);
-        auto rows = db_->query(
-            "SELECT COUNT(*) as cnt, MIN(upload_floor) as safe_id "
-            "FROM _lattice_replication_slots WHERE is_observer = 0");
+            // 2. Deletion bound: MIN(upload_floor) over live slots — the floor is
+            // the CONTIGUOUS resolved frontier ("no entry pending for this
+            // sync_id has id <= upload_floor", advanced only as ids resolve by
+            // ack or skip). confirmed_audit_id must NOT participate: it is a
+            // HOLEY high-watermark (advance takes each ACKed chunk's max, and a
+            // partial apply acks only the applied subset — confirmed jumps past
+            // unacked lower ids; observed live: 1,087 entries pending BELOW a
+            // channel's confirmed). Compacting to it deletes un-uploaded history
+            // unrecoverably; compacting to the floor is exactly safe.
+            // Observer slots (this database's own read-only dials) never advance
+            // a floor and are excluded — otherwise a read-only replica could never
+            // prune its own history. The column is added lazily on legacy files.
+            ensure_observer_column(*db_);
+            auto rows = db_->query(
+                "SELECT COUNT(*) as cnt, MIN(upload_floor) as safe_id "
+                "FROM _lattice_replication_slots WHERE is_observer = 0");
 
-        if (rows.empty()) return -1;
+            if (rows.empty()) return -1;
 
-        auto cnt_it = rows[0].find("cnt");
-        auto safe_it = rows[0].find("safe_id");
-        if (cnt_it == rows[0].end() || safe_it == rows[0].end())
-            return -1;
+            auto cnt_it = rows[0].find("cnt");
+            auto safe_it = rows[0].find("safe_id");
+            if (cnt_it == rows[0].end() || safe_it == rows[0].end())
+                return -1;
 
-        int64_t slot_count = 0;
-        if (std::holds_alternative<int64_t>(cnt_it->second)) {
-            slot_count = std::get<int64_t>(cnt_it->second);
-        }
+            int64_t slot_count = 0;
+            if (std::holds_alternative<int64_t>(cnt_it->second)) {
+                slot_count = std::get<int64_t>(cnt_it->second);
+            }
 
-        // 3. If no slots or safe_id <= 0 → no-op
-        if (slot_count == 0) return -1;
+            // 3. If no slots or safe_id <= 0 → no-op
+            if (slot_count == 0) return -1;
 
-        int64_t safe_id = 0;
-        if (std::holds_alternative<int64_t>(safe_it->second)) {
-            safe_id = std::get<int64_t>(safe_it->second);
-        }
-        if (safe_id <= 0) return 0;
+            int64_t safe_id = 0;
+            if (std::holds_alternative<int64_t>(safe_it->second)) {
+                safe_id = std::get<int64_t>(safe_it->second);
+            }
+            if (safe_id <= 0) return 0;
 
-        // 4. Delete floor-covered entries — in ONE transaction. The bare
-        // autocommit sequence could commit a mixed state on mid-pass crash
-        // (flag flipped but rows half-deleted, or AuditLog pruned with its
-        // sync-state rows orphaned); a transaction makes crash = clean
-        // rollback, including the _SyncControl flag flip.
-        return delete_audit_below_(safe_id, audit_cursor_row_needed_());
+            // 4. Delete floor-covered entries — in ONE transaction. The bare
+            // autocommit sequence could commit a mixed state on mid-pass crash
+            // (flag flipped but rows half-deleted, or AuditLog pruned with its
+            // sync-state rows orphaned); a transaction makes crash = clean
+            // rollback, including the _SyncControl flag flip.
+            return delete_audit_below_in_transaction_(safe_id, audit_cursor_row_needed_());
+        });
     }
 
     /// Retention-based pruning — the cursor-safe tear-out for a store that
@@ -3533,35 +3535,37 @@ public:
     /// touches sqlite_sequence. Returns rows removed.
     int64_t prune_audit_log(int64_t retention_seconds) {
         if (retention_seconds <= 0) return 0;
-        const double now = now_epoch_();
-        const double cutoff = now - static_cast<double>(retention_seconds);
-        record_audit_watermark_(now);   // always sample, so a bound exists next time
-        auto wm = audit_watermark_before_(cutoff);
-        if (!wm || *wm <= 0) return 0;
-        int64_t bound = *wm;
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            const double now = now_epoch_();
+            const double cutoff = now - static_cast<double>(retention_seconds);
+            record_audit_watermark_(now);   // always sample, so a bound exists next time
+            auto wm = audit_watermark_before_(cutoff);
+            if (!wm || *wm <= 0) return 0;
+            int64_t bound = *wm;
 
-        ensure_observer_column(*db_);
-        auto rows = db_->query(
-            "SELECT COUNT(*) AS cnt, MIN(upload_floor) AS floor "
-            "FROM _lattice_replication_slots WHERE is_observer = 0");
-        if (!rows.empty()) {
-            int64_t cnt = 0;
-            if (const auto* c = std::get_if<int64_t>(&rows[0].at("cnt"))) cnt = *c;
-            if (cnt > 0) {
-                int64_t floor = 0;
-                if (const auto* f = std::get_if<int64_t>(&rows[0].at("floor"))) floor = *f;
-                bound = std::min(bound, floor);
+            ensure_observer_column(*db_);
+            auto rows = db_->query(
+                "SELECT COUNT(*) AS cnt, MIN(upload_floor) AS floor "
+                "FROM _lattice_replication_slots WHERE is_observer = 0");
+            if (!rows.empty()) {
+                int64_t cnt = 0;
+                if (const auto* c = std::get_if<int64_t>(&rows[0].at("cnt"))) cnt = *c;
+                if (cnt > 0) {
+                    int64_t floor = 0;
+                    if (const auto* f = std::get_if<int64_t>(&rows[0].at("floor"))) floor = *f;
+                    bound = std::min(bound, floor);
+                }
             }
-        }
-        if (bound <= 0) return 0;
+            if (bound <= 0) return 0;
 
-        // Samples older than one window BEFORE the cutoff can never be the
-        // bound again — drop them so the meta table stays a handful of rows.
-        db_->execute(
-            "DELETE FROM _lattice_meta WHERE key LIKE 'audit_wm:%' "
-            "AND CAST(substr(key, 10) AS REAL) < ?",
-            {cutoff - static_cast<double>(retention_seconds)});
-        return delete_audit_below_(bound, audit_cursor_row_needed_());
+            // Samples older than one window BEFORE the cutoff can never be the
+            // bound again — drop them so the meta table stays a handful of rows.
+            db_->execute(
+                "DELETE FROM _lattice_meta WHERE key LIKE 'audit_wm:%' "
+                "AND CAST(substr(key, 10) AS REAL) < ?",
+                {cutoff - static_cast<double>(retention_seconds)});
+            return delete_audit_below_in_transaction_(bound, audit_cursor_row_needed_());
+        });
     }
 
     /// Store a (now, MAX(id)) watermark for prune_audit_log(). Cheap (one
@@ -3618,48 +3622,101 @@ public:
                std::get<int64_t>(nulls[0].at("c")) != 0;
     }
 
-    /// Delete AuditLog entries with id <= safe_id (and their per-sync state)
-    /// in ONE transaction. The bare autocommit sequence could commit a mixed
-    /// state on mid-pass crash (flag flipped but rows half-deleted, or
-    /// AuditLog pruned with its sync-state rows orphaned); a transaction
-    /// makes crash = clean rollback, including the _SyncControl flag flip.
+    /// Compatibility entry point: the caller's bound may be stricter, but
+    /// cannot bypass the writer floors or a newly required legacy cursor.
     int64_t delete_audit_below_(int64_t safe_id, bool preserve_cursor_row) {
-        const int64_t prev_disabled = read_sync_disabled_flag();
-        int64_t deleted = 0;
-        // Receipts may not exist yet on a database that has never applied
-        // remote entries — the prune below must not abort the transaction.
+        if (safe_id <= 0) return 0;
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            ensure_observer_column(*db_);
+            const auto floors = db_->query(
+                "SELECT MIN(upload_floor) AS floor FROM _lattice_replication_slots "
+                "WHERE is_observer = 0");
+            if (!floors.empty()) {
+                if (const auto* floor = std::get_if<int64_t>(&floors[0].at("floor")))
+                    safe_id = std::min(safe_id, *floor);
+            }
+            if (safe_id <= 0) return 0;
+            return delete_audit_below_in_transaction_(
+                safe_id, preserve_cursor_row || audit_cursor_row_needed_());
+        });
+    }
+
+private:
+    friend struct audit_maintenance_test_access;
+    template<typename F>
+    int64_t with_audit_prune_transaction_(F&& body) {
+        int64_t result = 0;
+        if (store_write_gate_)
+            database::maintenance_scope::probe_before_store_gate(*db_);
+        {
+            store_write_gate_hold gate(*this);
+            database::maintenance_scope ownership(*db_);
+            // Ownership rejects an existing same-connection transaction.
+            // BEGIN then excludes every other connection until COMMIT.
+            db_->begin_transaction();
+            try {
+                result = std::forward<F>(body)();
+                db_->commit();
+                // COMMIT actually executes even after logical close. A WAL
+                // callback can begin a successor transaction; it is not ours
+                // to reject or roll back after successful COMMIT returns.
+            } catch (...) {
+                // Preserve the original error. A failed rollback makes this
+                // wrapper unusable; subsequent operations must not join an
+                // indeterminate transaction through its normal API.
+                try {
+                    if (db_->is_in_transaction()) db_->rollback();
+                    if (db_->is_in_transaction())
+                        throw db_error("audit maintenance rollback did not settle its transaction");
+                }
+                catch (...) { db_->closed_.store(true, std::memory_order_release); }
+                throw;
+            }
+        }
+        // Memory/WASM settled callbacks may enter another thread/connection.
+        // No maintenance mutex or newly acquired store gate survives delivery.
+        db_->drain_if_settled();
+        return result;
+    }
+
+    // Called only while this thread owns the complete write transaction.
+    // Safety bounds, cursor requirements and the saved trigger flag therefore
+    // come from the same protected state as the deletion.
+    int64_t delete_audit_below_in_transaction_(int64_t safe_id, bool preserve_cursor_row) {
+        // Do not use the legacy best-effort getter: a failed read must never
+        // become a fabricated flag value that is later committed as restore.
+        const auto flag_rows = db_->query("SELECT disabled FROM _SyncControl WHERE id = 1");
+        if (flag_rows.size() != 1)
+            throw db_error("audit maintenance requires one sync control row");
+        const auto flag = flag_rows[0].find("disabled");
+        if (flag == flag_rows[0].end() || !std::holds_alternative<int64_t>(flag->second))
+            throw db_error("audit maintenance requires an integer sync control flag");
+        const int64_t prev_disabled = std::get<int64_t>(flag->second);
+        // Receipts may not exist yet on a database that never applied remote
+        // entries. Their creation participates in this transaction as well.
         db_->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
                      "  globalId TEXT PRIMARY KEY)", {});
-        db_->begin_transaction();
-        try {
-            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-            if (preserve_cursor_row) {
-                db_->execute(
-                    "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
-                    "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
-                    "  ORDER BY id DESC LIMIT 1)",
-                    {safe_id});
-            } else {
-                db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
-            }
-            deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
-            db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
-            // Bound the no-op receipts table (insertion-ordered rowid horizon;
-            // a receipt only matters while some sender could still re-deliver
-            // its entry, which the resend machinery bounds to far less).
-            db_->execute(R"(
-                DELETE FROM _lattice_applied_receipts WHERE rowid <=
-                    (SELECT COALESCE(MAX(rowid), 0) FROM _lattice_applied_receipts)
-                    - 500000
-            )", {});
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            db_->commit();
-        } catch (...) {
-            try { db_->rollback(); } catch (...) {}
-            throw;
+        db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        if (preserve_cursor_row) {
+            db_->execute(
+                "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
+                "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
+                "  ORDER BY id DESC LIMIT 1)", {safe_id});
+        } else {
+            db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
         }
+        const int64_t deleted = static_cast<int64_t>(sqlite3_changes(db_->handle()));
+        db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
+        db_->execute(R"(
+            DELETE FROM _lattice_applied_receipts WHERE rowid <=
+                (SELECT COALESCE(MAX(rowid), 0) FROM _lattice_applied_receipts)
+                - 500000
+        )", {});
+        db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
         return deleted;
     }
+
+public:
 
     double now_epoch_() const {
         auto rows = db_->query("SELECT unixepoch('subsec') AS t", {});
@@ -4011,7 +4068,7 @@ public:
         std::optional<std::string> group_by = std::nullopt,
         std::optional<std::string> distinct_by = std::nullopt,
         const std::vector<column_value_t>& params = {}) {
-        return read_db().query(build_query_rows_sql(
+        return query_read(build_query_rows_sql(
             table_name, where_clause, order_by, limit, offset, group_by, distinct_by), params);
     }
 
@@ -4032,7 +4089,7 @@ public:
         // Get columns for each table using PRAGMA table_info (name -> type)
         std::vector<std::map<std::string, std::string>> table_columns;
         for (const auto& table_name : table_names) {
-            auto pragma_result = read_db().query("PRAGMA table_info(" + table_name + ")");
+            auto pragma_result = query_read("PRAGMA table_info(" + table_name + ")");
             std::map<std::string, std::string> cols;
             for (const auto& row : pragma_result) {
                 auto name_it = row.find("name");
@@ -4121,7 +4178,7 @@ public:
                 repeated.insert(repeated.end(), params.begin(), params.end());
             }
         }
-        return read_db().query(sql.str(), repeated);
+        return query_read(sql.str(), repeated);
     }
 
     // Transaction support. On shared-cache stores the per-store write gate
@@ -4202,74 +4259,52 @@ public:
     void detach(lattice_db& lattice);
     void detach_alias(const std::string& alias);
 
+    /// Legacy raw connection access. The caller must keep this lattice alive
+    /// and serialize the reference against close/reopen/maintenance. These raw
+    /// signatures remain source-compatible; they are not owned reader leases.
     database& db() { return *db_; }
+    database& read_db() { return *borrow_read_connection(); }
+    database& xproc_read_db() { return *borrow_xproc_read_connection(); }
 
-    /// Get the connection for reads (falls back to the write connection for
-    /// in-memory DBs).
-    ///
-    /// While the write connection has an OPEN transaction, reads route
-    /// through the write connection instead of the dedicated read-only one:
-    /// under WAL a separate reader sees only committed state, so a count()/
-    /// query_rows()/find() issued inside an explicit transaction (C-ABI
-    /// lattice_db_begin_transaction, bridge/core begin_transaction, or an
-    /// internal write block) would silently miss that transaction's
-    /// uncommitted writes. The Swift bridge's generation-scoped readers
-    /// already read via the write connection; this closes the same gap for
-    /// the core/C-ABI read paths. `is_in_transaction()` is SQLite's live
-    /// autocommit state, so the routing self-corrects on COMMIT/ROLLBACK no
-    /// matter which code path executed it. Both connections are opened
-    /// SQLITE_OPEN_FULLMUTEX, so a cross-thread read that lands on the write
-    /// connection serializes safely; outside a transaction behavior is
-    /// unchanged (concurrent reads stay off the writer).
-    database& read_db() {
-        // Thread-scoped: only the transaction-owning thread reads through
-        // the write connection (read-your-writes); every other thread keeps
-        // the dedicated reader and sees only committed state. A raw BEGIN
-        // that bypassed begin_transaction() records no owner, so routing
-        // simply doesn't engage (the safe, pre-1.0 behavior).
-        if (read_db_ && db_->is_in_transaction() &&
-            txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
-            return *db_;
-        }
-        return read_db_ ? *read_db_ : *db_;
-    }
+    /// Owned internal read access. Keep this lattice alive through the entire
+    /// borrow, including its release: writer hooks refer back to the lattice.
+    /// Borrowed connections are for read-only use: no DML or write-capable
+    /// UDFs, especially on a retired writer fallback. Writer hooks target the
+    /// lattice's current writer.
+    /// Readers may finish on a retired connection, so retirement does not
+    /// promise an exclusive checkpoint/VACUUM gap or erase SQLite busy results.
+    /// Only the explicit-transaction owning thread reads through the writer;
+    /// xproc prefers its dedicated connection even on that thread.
+    std::shared_ptr<database> borrow_read_connection();
+    std::shared_ptr<database> borrow_xproc_read_connection();
+    std::vector<database::row_t> query_read(
+        const std::string& sql, const std::vector<column_value_t>& params = {});
+    std::vector<database::row_t> query_xproc(
+        const std::string& sql, const std::vector<column_value_t>& params = {});
 
-    /// Get the xproc-dedicated read connection (falls back to read_db for in-memory/read-only)
-    database& xproc_read_db() { return xproc_read_db_ ? *xproc_read_db_ : read_db(); }
-
-    /// Close the read-only connections (for operations requiring exclusive access)
-    void close_read_db() {
-        read_db_.reset();
-        xproc_read_db_.reset();
-    }
-
-    /// Close the write connection
-    void close_write_db() {
-        db_.reset();
-    }
-
-    /// Reopen the write connection
-    void reopen_write_db() {
-        db_ = std::make_unique<database>(config_.path, database::open_mode::read_write,
-                                         config_.busy_timeout_ms);
-        register_sql_functions();  // per-connection: triggers need sync_disabled()
-        setup_change_hook();
-    }
+    /// Retire published readers without waiting for borrowers. Last-owner
+    /// destruction occurs off locks acquired here; callers must not retain
+    /// external SQLite/attachment locks across final-owner destruction. Existing
+    /// leases retain their connection until the complete query/callback tail.
+    void close_read_db();
+    /// Raw writer users still require exclusive maintenance serialization.
+    /// Do not retain an external SQLite/attachment lock across retirement:
+    /// final connection destruction can invoke application-owned destructors.
+    void close_write_db();
+    void reopen_write_db();
 
     /// Explicitly close all database connections and stop background services.
-    /// Safe to call before deleting the database files. After calling close(),
-    /// any further operations on this instance are undefined behavior.
+    /// The parent must outlive in-flight operations and owned reader borrows.
+    /// SQLite's logical close guard short-circuits later operations; an already
+    /// running operation may finish. This does not grant raw getter safety.
     void close();
 
-    /// Reopen the read-only connections after exclusive operations
-    void reopen_read_db() {
-        if (!config_.is_in_memory() && !config_.read_only) {
-            read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only,
-                                                  config_.busy_timeout_ms);
-            xproc_read_db_ = std::make_unique<database>(config_.path, database::open_mode::read_only,
-                                                        config_.busy_timeout_ms);
-        }
-    }
+    /// Publish a fully opened reader pair with current attached views, or leave
+    /// the prior published state intact. A newer close/reopen invalidates a
+    /// staged open instead of allowing it to undo that lifecycle transition.
+    /// Contended attachment bookkeeping is refused, never waited on behind a
+    /// potentially held writer SQLite mutex. No published half-pair on error.
+    void reopen_read_db();
 
     // ------------------------------------------------------------------
     // In-memory-only registration helpers. These populate the same
@@ -5646,17 +5681,15 @@ protected:
     std::vector<std::pair<std::string, std::string>> attached_dbs_;
     std::set<std::string> attached_view_names_;
 
-    /// The connections that carry attach views: db_ always (when open),
-    /// read_db_ only where it exists (sync-enabled and in-memory lattices
-    /// have no read connection — the old code null-dereferenced here).
-    std::vector<database*> view_handles() {
-        std::vector<database*> handles;
-        if (db_) handles.push_back(db_.get());
-        if (read_db_) handles.push_back(read_db_.get());
-        return handles;
-    }
+    // Exact TEMP view definitions rebuilt by attach/detach; reopening a handle
+    // restores them together with the aliases before that handle is published.
+    std::map<std::string, std::string> attached_view_sql_;
 
-    void rebuild_attached_views();
+    /// Caller holds attach_mutex_. Keep this owning snapshot alive until AFTER
+    /// releasing that lock; a final database destructor can invoke user code.
+    std::vector<std::shared_ptr<database>> view_handles();
+    void rebuild_attached_views(const std::vector<std::shared_ptr<database>>& handles);
+    void restore_attached_views(database& connection);
 
 private:
     template<typename U> friend class query;
@@ -5665,16 +5698,19 @@ private:
     friend class synchronizer;
 
     configuration config_;
-    std::unique_ptr<database> db_;       // Write connection
-    std::unique_ptr<database> read_db_;
+    // Publication only: never hold this mutex across SQLite, callbacks, or
+    // destruction. attach -> publication is the only nested lock direction.
+    std::mutex connection_ownership_mutex_;
+    uint64_t connection_revision_ = 0;
+    std::shared_ptr<database> db_;       // Write connection / fallback owner
+    std::shared_ptr<database> read_db_;
     // Thread that opened the current explicit transaction (see read_db()).
     std::atomic<std::thread::id> txn_owner_thread_{};  // Read-only connection for concurrent reads
-    std::unique_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler
+    std::shared_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler
                                                // (avoids SQLite lock contention with read_db_
                                                // when observer callbacks query on MainActor)
-    // Set by close() for is_closed(). The actual read/write-after-close guard lives
-    // in the `database` wrapper (which stays alive until ~lattice_db), so the
-    // connections are never freed out from under a reader on another thread.
+    // Set by close() for is_closed(). Published and borrowed owners retain the
+    // wrapper; database::close() provides the logical read/write guard.
     std::atomic<bool> closed_{false};
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<synchronizer> synchronizer_;
@@ -5774,7 +5810,8 @@ private:
 
     // Setup hooks for change notifications
     // Update hook buffers changes, WAL hook flushes on commit (matches Swift's pattern)
-    void setup_change_hook();
+    void setup_change_hook() { setup_change_hook(*db_); }
+    void setup_change_hook(database& connection);
 
     // Cross-process observation — notifier is owned by instance_registry
     // (one per path per process). This is a non-owning pointer for post_notification.
@@ -6782,14 +6819,15 @@ private:
     /// Register per-connection SQL functions. This is connection state, not a
     /// database write — it must run on EVERY open, including the write-free
     /// fast path (triggers reference sync_disabled() at execution time).
-    void register_sql_functions() {
+    void register_sql_functions() { register_sql_functions(*db_); }
+    void register_sql_functions(database& connection) {
         // sync_disabled() lets triggers check if sync is disabled
         sqlite3_create_function(
-            db_->handle(),
+            connection.handle(),
             "sync_disabled",
             0,  // No arguments
             SQLITE_UTF8,
-            db_->handle(),  // Pass db handle as user data
+            connection.handle(),  // Pass db handle as user data
             [](sqlite3_context* ctx, int, sqlite3_value**) {
                 sqlite3* db = static_cast<sqlite3*>(sqlite3_user_data(ctx));
                 sqlite3_stmt* stmt = nullptr;
@@ -7446,7 +7484,7 @@ std::vector<managed<T>> query<T>::execute() {
     }
 
     // Use read connection for queries
-    auto rows = db_.read_db().query(sql);
+    auto rows = db_.query_read(sql);
     std::vector<managed<T>> items;
     items.reserve(rows.size());
 
@@ -7485,7 +7523,7 @@ size_t query<T>::count() {
     }
 
     // Use read connection for queries
-    auto rows = db_.read_db().query(sql);
+    auto rows = db_.query_read(sql);
     if (!rows.empty()) {
         auto it = rows[0].find("cnt");
         if (it != rows[0].end()) {
@@ -7997,7 +8035,7 @@ void results<T>::execute_query() {
     }
 
     // Execute and hydrate using read connection
-    auto rows = db_->read_db().query(sql);
+    auto rows = db_->query_read(sql);
     items_.clear();
     items_.reserve(rows.size());
     for (const auto& row : rows) {
@@ -8030,7 +8068,7 @@ notification_token results<T>::observe(observer_t callback) {
             (void)batch;
             // Re-query to get fresh results using read connection
             std::string sql = "SELECT * FROM " + table_name;
-            auto rows = db->read_db().query(sql);
+            auto rows = db->query_read(sql);
 
             std::vector<managed<T>> items;
             items.reserve(rows.size());
@@ -8076,7 +8114,7 @@ notification_token results<T>::observe(change_observer_t callback) {
 
             // Re-query to get current state using read connection
             std::string sql = "SELECT id FROM " + table_name;
-            auto rows = db->read_db().query(sql);
+            auto rows = db->query_read(sql);
 
             std::vector<int64_t> current_ids;
             current_ids.reserve(rows.size());
@@ -8123,7 +8161,7 @@ notification_token results<T>::observe(change_observer_t callback) {
 
             // Update items_ with fresh data using read connection
             std::string full_sql = "SELECT * FROM " + table_name;
-            auto full_rows = db->read_db().query(full_sql);
+            auto full_rows = db->query_read(full_sql);
             items_.clear();
             items_.reserve(full_rows.size());
             for (const auto& row : full_rows) {
@@ -8276,7 +8314,13 @@ inline void lattice_db::teardown_sync(bool fire_handoff) {
 
 inline void lattice_db::close() {
     // 0. Logical close: reads/writes short-circuit to empty from here on.
-    closed_.store(true, std::memory_order_seq_cst);
+    std::shared_ptr<database> writer, reader, xproc;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        closed_.store(true, std::memory_order_seq_cst);
+        ++connection_revision_;
+        writer = db_; reader = read_db_; xproc = xproc_read_db_;
+    }
     // 1. Mark as dying — prevents new notify_change() calls from starting.
     guard_->alive.store(false, std::memory_order_seq_cst);
     // 2. Wait for any in-flight notify_change() calls on OTHER threads to
@@ -8314,14 +8358,12 @@ inline void lattice_db::close() {
         for (auto& conn : idle_read_pool_) conn->close();
         idle_read_pool_.clear();
     }
-    // Logically close the connections but DO NOT destroy the wrappers: a reader on
-    // another thread may still hold a `database&` from read_db()/db(). The wrappers
-    // are owned as unique_ptr members and freed in ~lattice_db (after the threads
-    // above are joined), where the sqlite3* is released single-threaded. close() on
-    // the wrapper just flips its flag so post-close ops return empty.
-    if (db_)            db_->close();
-    if (read_db_)       read_db_->close();
-    if (xproc_read_db_) xproc_read_db_->close();
+    // Logical close and eventual last-owner destruction stay off publication
+    // locks. A concurrently retired reader can finish through its owned lease;
+    // all operations still require the parent to remain alive.
+    if (writer) writer->close();
+    if (reader) reader->close();
+    if (xproc) xproc->close();
 }
 
 inline lattice_db::~lattice_db() {

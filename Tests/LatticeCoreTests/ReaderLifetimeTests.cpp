@@ -346,6 +346,26 @@ struct OpenControl {
     bool gate_first = false, deny_attach = false;
     Gate gate;
 };
+// SQLite's Unix VFS reports successful symlink resolution with the extended
+// success SQLITE_OK_SYMLINK. The pager accepts it unless OPEN_NOFOLLOW is set;
+// these fixtures use ordinary read-only opens and never request NOFOLLOW.
+std::string fixture_full_path(sqlite3_vfs* parent, const std::string& path) {
+    if (path.empty()) return {};
+    if (parent->mxPathname <= 0 || parent->mxPathname > 1024 * 1024)
+        throw std::runtime_error("unsupported fixture VFS pathname bound");
+    std::vector<char> text(static_cast<size_t>(parent->mxPathname) + 1, '\0');
+    const int rc = parent->xFullPathname(parent, path.c_str(), static_cast<int>(text.size()), text.data());
+    const auto* end = static_cast<const char*>(std::memchr(text.data(), '\0', text.size()));
+    const size_t bytes = end ? static_cast<size_t>(end - text.data()) : text.size();
+    const bool accepted = rc == SQLITE_OK || rc == SQLITE_OK_SYMLINK;
+    // Fixed scalar diagnostics only, at most two normalizations per fixture.
+    // Do not print paths or relax exact normalized xOpen matching below.
+    std::fprintf(stderr, "reader_lifetime vfs_full_path rc=%d accepted=%d terminated=%d bytes=%zu capacity=%zu sqlite=%d\n",
+                 rc, accepted ? 1 : 0, end ? 1 : 0, bytes, text.size(), sqlite3_libversion_number());
+    if (!accepted || !end || bytes == 0)
+        throw std::runtime_error("fixture VFS full pathname failed rc=" + std::to_string(rc));
+    return std::string(text.data(), bytes);
+}
 struct OpenRegistration {
     using Symbol = void (*)(void);
     sqlite3_vfs wrapper{};
@@ -356,18 +376,6 @@ struct OpenRegistration {
     static constexpr const char* name = "lattice-reader-lifetime-test-vfs";
     static OpenRegistration& self(sqlite3_vfs* vfs) noexcept {
         return *static_cast<OpenRegistration*>(vfs->pAppData);
-    }
-    std::string full_path(const std::string& path) {
-        if (path.empty()) return {};
-        // The fixtures use plain owned paths, never a URI or caller profile.
-        // Normalize with the actual parent VFS used for all subsequent opens.
-        if (parent->mxPathname <= 0 || parent->mxPathname > 1024 * 1024)
-            throw std::runtime_error("unsupported fixture VFS pathname bound");
-        std::vector<char> text(static_cast<size_t>(parent->mxPathname) + 1, '\0');
-        if (parent->xFullPathname(parent, path.c_str(), static_cast<int>(text.size()), text.data()) != SQLITE_OK ||
-            std::memchr(text.data(), '\0', text.size()) == nullptr)
-            throw std::runtime_error("fixture VFS full pathname failed");
-        return text.data();
     }
     static int open(sqlite3_vfs* vfs, const char* path, sqlite3_file* file,
                     int flags, int* output_flags) noexcept {
@@ -415,7 +423,7 @@ struct OpenRegistration {
         if (!parent || parent->iVersion < 1 || parent->iVersion > 3 ||
             !parent->xOpen || !parent->xFullPathname || sqlite3_vfs_find(name))
             throw std::runtime_error("unsupported or occupied fixture VFS");
-        primary_path = full_path(primary); attached_path = full_path(attachment);
+        primary_path = fixture_full_path(parent, primary); attached_path = fixture_full_path(parent, attachment);
         // Read only fields defined by the parent's advertised ABI version.
         // Every callback forwards the parent, never this wrapper, to its
         // original method. The SQLite-owned file retains the parent IO methods.
@@ -495,6 +503,38 @@ struct OpenRegistration {
     OpenRegistration(const OpenRegistration&) = delete;
     OpenRegistration& operator=(const OpenRegistration&) = delete;
 };
+// Owned canonical/symlink controls use the same real parent VFS as the four
+// injection cases. A plain reader is destroyed before unregistering the wrapper.
+int vfs_pathname_control(bool symlink) {
+    Fixture fixture;
+    const auto canonical = std::filesystem::canonical(fixture.path);
+    struct OwnedLink {
+        std::filesystem::path path;
+        ~OwnedLink() { if (!path.empty()) { std::error_code ignored; std::filesystem::remove(path, ignored); } }
+    } link;
+    std::filesystem::path selected = canonical;
+    if (symlink) {
+        const auto alias = fixture.path.parent_path() /
+            ("reader-vfs-link-" + std::to_string(getpid()) + "-" + std::to_string(Clock::now().time_since_epoch().count()));
+        std::filesystem::create_directory_symlink(canonical.parent_path(), alias);
+        link.path = alias; // only publish cleanup ownership after successful creation
+        selected = alias / canonical.filename();
+        if (!std::filesystem::is_symlink(alias)) return 80;
+    }
+    OpenControl control;
+    bool exact = false, value = false;
+    {
+        OpenRegistration registration(control, selected.string());
+        exact = registration.primary_path == canonical.string();
+        {
+            lattice::database reader(selected.string(), lattice::database::open_mode::read_only);
+            value = read_value(reader) == 47;
+        }
+    }
+    return exact && value && control.calls.load() == 1 && control.attached_calls.load() == 0 &&
+        control.injected.load() == 0 && control.gated.load() == 0 &&
+        !control.callback_failed.load() && !control.cleanup_failed.load() ? 0 : 81;
+}
 // Even an unexpected successful publication must not retain a connection
 // referencing the stack VFS after unregistration. Evaluate the publication
 // oracle first; then retire the test-owned pair on every exit.
@@ -675,6 +715,7 @@ int bounded(int kind) {
         else if (kind == 19) result = active_statement_checkpoint();
         else if (kind == 20) result = attach_keeps_snapshot();
         else if (kind == 21 || kind == 22) result = busy_reopen(kind == 22);
+        else if (kind == 23 || kind == 24) result = vfs_pathname_control(kind == 24);
         else
 #endif
         result = kind == 7 ? read_only_fallback() : kind == 6 ? transaction_route() :
@@ -717,6 +758,8 @@ READER_CASE(ActiveRetiredStatementPreservesBusyCheckpointResult, 19)
 READER_CASE(AttachOwnsEveryViewHandleUntilTopologyUnlock, 20)
 READER_CASE(BusyReopenPreservesPublishedPair, 21)
 READER_CASE(BusyReopenPreservesAlreadyRetiredFallback, 22)
+READER_CASE(CanonicalVfsPathMatchesReadOnlyOpen, 23)
+READER_CASE(SymlinkVfsPathMatchesReadOnlyOpen, 24)
 #endif
 #undef READER_CASE
 #endif

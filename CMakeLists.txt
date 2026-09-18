@@ -193,6 +193,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
+    Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp

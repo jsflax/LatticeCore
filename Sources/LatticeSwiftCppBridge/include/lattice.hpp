@@ -1046,7 +1046,7 @@ public:
     /// entry counts if ANY channel considers its row shared. EXISTS keeps
     /// the count per-entry — a row in N channels' sets never double-counts.
     int64_t pending_sync_entry_count() {
-        auto rows = xproc_read_db().query(
+        auto rows = query_xproc(
             "SELECT COUNT(*) FROM AuditLog a"
             " WHERE a.isSynchronized = 0"
             " AND EXISTS (SELECT 1 FROM _lattice_sync_set ss"
@@ -1152,7 +1152,9 @@ public:
     }
 
     /// Rebuild the database file, reclaiming unused space.
-    /// Closes the read connection before vacuuming and reopens it after.
+    /// Retires published readers before vacuuming and reopens them after.
+    /// In-flight owned readers may finish on the retired connections; their
+    /// SQLite snapshots can still make maintenance busy or partial.
     /// Returns true on success; a failure is LOGGED (it used to vanish inside
     /// the sealed wrapper — a "vacuum" that did nothing left no trace) and
     /// rethrown, which the sealed tier turns into `false` + last_bridge_error.
@@ -1174,8 +1176,8 @@ public:
     }
 
     /// The whole "give the disk space back" recipe, in the order SQLite needs
-    /// under WAL: release this process's own readers (the pooled read
-    /// generations hold BEGIN transactions that make a TRUNCATE partial) →
+    /// under WAL: retire this process's published readers and pooled read
+    /// generations (in-flight borrows can still make a TRUNCATE partial) →
     /// VACUUM (rebuilds the live pages into the WAL) → TRUNCATE checkpoint
     /// (folds them into the main file and zeroes the WAL) → reopen readers.
     /// A second pass runs only if the page count did not fall (a checkpoint
@@ -1230,7 +1232,7 @@ public:
     /// the same as an empty one.
     audit_header audit_header_for(int64_t audit_id) {
         audit_header h;
-        auto rows = read_db().query(
+        auto rows = query_read(
             "SELECT tableName, operation, rowId, globalRowId FROM AuditLog WHERE id = ?", {audit_id});
         if (rows.empty()) return h;
         const auto& r = rows[0];
@@ -1982,7 +1984,7 @@ public:
     /// failure; never throws into Swift.
     int64_t data_version() {
         try {
-            auto rows = xproc_read_db().query("PRAGMA data_version", {});
+            auto rows = query_xproc("PRAGMA data_version", {});
             if (!rows.empty()) {
                 auto it = rows[0].find("data_version");
                 if (it != rows[0].end() &&

@@ -25,6 +25,11 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Retain internal ordinary and cross-process readers through complete queries
+  while maintenance replaces connections. Restore attached views before reader
+  publication and release retired connections outside bookkeeping locks.
+  Raw connection references remain caller-serialized, and the parent must
+  outlive owned read borrows. Rebuild Core and bridge consumers together.
 - Suppress SIGPIPE per socket send on Linux when an IPC peer closes during
   framing. Return the existing write failure instead of terminating the
   process; retain Darwin socket setup and generic non-socket behavior.

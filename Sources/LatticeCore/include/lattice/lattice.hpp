@@ -3485,58 +3485,60 @@ public:
     /// @param stale_threshold_seconds If > 0, evict slots inactive for this long
     /// @return Number of entries deleted, or -1 if no slots exist (no-op)
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) {
-        // 1. Optionally evict stale slots
-        if (stale_threshold_seconds > 0) {
-            db_->execute(
-                "DELETE FROM _lattice_replication_slots "
-                "WHERE last_active_at < datetime('now', '-' || ? || ' seconds')",
-                {stale_threshold_seconds});
-        }
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            // 1. Optionally evict stale slots
+            if (stale_threshold_seconds > 0) {
+                db_->execute(
+                    "DELETE FROM _lattice_replication_slots "
+                    "WHERE last_active_at < datetime('now', '-' || ? || ' seconds')",
+                    {stale_threshold_seconds});
+            }
 
-        // 2. Deletion bound: MIN(upload_floor) over live slots — the floor is
-        // the CONTIGUOUS resolved frontier ("no entry pending for this
-        // sync_id has id <= upload_floor", advanced only as ids resolve by
-        // ack or skip). confirmed_audit_id must NOT participate: it is a
-        // HOLEY high-watermark (advance takes each ACKed chunk's max, and a
-        // partial apply acks only the applied subset — confirmed jumps past
-        // unacked lower ids; observed live: 1,087 entries pending BELOW a
-        // channel's confirmed). Compacting to it deletes un-uploaded history
-        // unrecoverably; compacting to the floor is exactly safe.
-        // Observer slots (this database's own read-only dials) never advance
-        // a floor and are excluded — otherwise a read-only replica could never
-        // prune its own history. The column is added lazily on legacy files.
-        ensure_observer_column(*db_);
-        auto rows = db_->query(
-            "SELECT COUNT(*) as cnt, MIN(upload_floor) as safe_id "
-            "FROM _lattice_replication_slots WHERE is_observer = 0");
+            // 2. Deletion bound: MIN(upload_floor) over live slots — the floor is
+            // the CONTIGUOUS resolved frontier ("no entry pending for this
+            // sync_id has id <= upload_floor", advanced only as ids resolve by
+            // ack or skip). confirmed_audit_id must NOT participate: it is a
+            // HOLEY high-watermark (advance takes each ACKed chunk's max, and a
+            // partial apply acks only the applied subset — confirmed jumps past
+            // unacked lower ids; observed live: 1,087 entries pending BELOW a
+            // channel's confirmed). Compacting to it deletes un-uploaded history
+            // unrecoverably; compacting to the floor is exactly safe.
+            // Observer slots (this database's own read-only dials) never advance
+            // a floor and are excluded — otherwise a read-only replica could never
+            // prune its own history. The column is added lazily on legacy files.
+            ensure_observer_column(*db_);
+            auto rows = db_->query(
+                "SELECT COUNT(*) as cnt, MIN(upload_floor) as safe_id "
+                "FROM _lattice_replication_slots WHERE is_observer = 0");
 
-        if (rows.empty()) return -1;
+            if (rows.empty()) return -1;
 
-        auto cnt_it = rows[0].find("cnt");
-        auto safe_it = rows[0].find("safe_id");
-        if (cnt_it == rows[0].end() || safe_it == rows[0].end())
-            return -1;
+            auto cnt_it = rows[0].find("cnt");
+            auto safe_it = rows[0].find("safe_id");
+            if (cnt_it == rows[0].end() || safe_it == rows[0].end())
+                return -1;
 
-        int64_t slot_count = 0;
-        if (std::holds_alternative<int64_t>(cnt_it->second)) {
-            slot_count = std::get<int64_t>(cnt_it->second);
-        }
+            int64_t slot_count = 0;
+            if (std::holds_alternative<int64_t>(cnt_it->second)) {
+                slot_count = std::get<int64_t>(cnt_it->second);
+            }
 
-        // 3. If no slots or safe_id <= 0 → no-op
-        if (slot_count == 0) return -1;
+            // 3. If no slots or safe_id <= 0 → no-op
+            if (slot_count == 0) return -1;
 
-        int64_t safe_id = 0;
-        if (std::holds_alternative<int64_t>(safe_it->second)) {
-            safe_id = std::get<int64_t>(safe_it->second);
-        }
-        if (safe_id <= 0) return 0;
+            int64_t safe_id = 0;
+            if (std::holds_alternative<int64_t>(safe_it->second)) {
+                safe_id = std::get<int64_t>(safe_it->second);
+            }
+            if (safe_id <= 0) return 0;
 
-        // 4. Delete floor-covered entries — in ONE transaction. The bare
-        // autocommit sequence could commit a mixed state on mid-pass crash
-        // (flag flipped but rows half-deleted, or AuditLog pruned with its
-        // sync-state rows orphaned); a transaction makes crash = clean
-        // rollback, including the _SyncControl flag flip.
-        return delete_audit_below_(safe_id, audit_cursor_row_needed_());
+            // 4. Delete floor-covered entries — in ONE transaction. The bare
+            // autocommit sequence could commit a mixed state on mid-pass crash
+            // (flag flipped but rows half-deleted, or AuditLog pruned with its
+            // sync-state rows orphaned); a transaction makes crash = clean
+            // rollback, including the _SyncControl flag flip.
+            return delete_audit_below_in_transaction_(safe_id, audit_cursor_row_needed_());
+        });
     }
 
     /// Retention-based pruning — the cursor-safe tear-out for a store that
@@ -3567,35 +3569,37 @@ public:
     /// touches sqlite_sequence. Returns rows removed.
     int64_t prune_audit_log(int64_t retention_seconds) {
         if (retention_seconds <= 0) return 0;
-        const double now = now_epoch_();
-        const double cutoff = now - static_cast<double>(retention_seconds);
-        record_audit_watermark_(now);   // always sample, so a bound exists next time
-        auto wm = audit_watermark_before_(cutoff);
-        if (!wm || *wm <= 0) return 0;
-        int64_t bound = *wm;
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            const double now = now_epoch_();
+            const double cutoff = now - static_cast<double>(retention_seconds);
+            record_audit_watermark_(now);   // always sample, so a bound exists next time
+            auto wm = audit_watermark_before_(cutoff);
+            if (!wm || *wm <= 0) return 0;
+            int64_t bound = *wm;
 
-        ensure_observer_column(*db_);
-        auto rows = db_->query(
-            "SELECT COUNT(*) AS cnt, MIN(upload_floor) AS floor "
-            "FROM _lattice_replication_slots WHERE is_observer = 0");
-        if (!rows.empty()) {
-            int64_t cnt = 0;
-            if (const auto* c = std::get_if<int64_t>(&rows[0].at("cnt"))) cnt = *c;
-            if (cnt > 0) {
-                int64_t floor = 0;
-                if (const auto* f = std::get_if<int64_t>(&rows[0].at("floor"))) floor = *f;
-                bound = std::min(bound, floor);
+            ensure_observer_column(*db_);
+            auto rows = db_->query(
+                "SELECT COUNT(*) AS cnt, MIN(upload_floor) AS floor "
+                "FROM _lattice_replication_slots WHERE is_observer = 0");
+            if (!rows.empty()) {
+                int64_t cnt = 0;
+                if (const auto* c = std::get_if<int64_t>(&rows[0].at("cnt"))) cnt = *c;
+                if (cnt > 0) {
+                    int64_t floor = 0;
+                    if (const auto* f = std::get_if<int64_t>(&rows[0].at("floor"))) floor = *f;
+                    bound = std::min(bound, floor);
+                }
             }
-        }
-        if (bound <= 0) return 0;
+            if (bound <= 0) return 0;
 
-        // Samples older than one window BEFORE the cutoff can never be the
-        // bound again — drop them so the meta table stays a handful of rows.
-        db_->execute(
-            "DELETE FROM _lattice_meta WHERE key LIKE 'audit_wm:%' "
-            "AND CAST(substr(key, 10) AS REAL) < ?",
-            {cutoff - static_cast<double>(retention_seconds)});
-        return delete_audit_below_(bound, audit_cursor_row_needed_());
+            // Samples older than one window BEFORE the cutoff can never be the
+            // bound again — drop them so the meta table stays a handful of rows.
+            db_->execute(
+                "DELETE FROM _lattice_meta WHERE key LIKE 'audit_wm:%' "
+                "AND CAST(substr(key, 10) AS REAL) < ?",
+                {cutoff - static_cast<double>(retention_seconds)});
+            return delete_audit_below_in_transaction_(bound, audit_cursor_row_needed_());
+        });
     }
 
     /// Store a (now, MAX(id)) watermark for prune_audit_log(). Cheap (one
@@ -3652,48 +3656,101 @@ public:
                std::get<int64_t>(nulls[0].at("c")) != 0;
     }
 
-    /// Delete AuditLog entries with id <= safe_id (and their per-sync state)
-    /// in ONE transaction. The bare autocommit sequence could commit a mixed
-    /// state on mid-pass crash (flag flipped but rows half-deleted, or
-    /// AuditLog pruned with its sync-state rows orphaned); a transaction
-    /// makes crash = clean rollback, including the _SyncControl flag flip.
+    /// Compatibility entry point: the caller's bound may be stricter, but
+    /// cannot bypass the writer floors or a newly required legacy cursor.
     int64_t delete_audit_below_(int64_t safe_id, bool preserve_cursor_row) {
-        const int64_t prev_disabled = read_sync_disabled_flag();
-        int64_t deleted = 0;
-        // Receipts may not exist yet on a database that has never applied
-        // remote entries — the prune below must not abort the transaction.
+        if (safe_id <= 0) return 0;
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            ensure_observer_column(*db_);
+            const auto floors = db_->query(
+                "SELECT MIN(upload_floor) AS floor FROM _lattice_replication_slots "
+                "WHERE is_observer = 0");
+            if (!floors.empty()) {
+                if (const auto* floor = std::get_if<int64_t>(&floors[0].at("floor")))
+                    safe_id = std::min(safe_id, *floor);
+            }
+            if (safe_id <= 0) return 0;
+            return delete_audit_below_in_transaction_(
+                safe_id, preserve_cursor_row || audit_cursor_row_needed_());
+        });
+    }
+
+private:
+    friend struct audit_maintenance_test_access;
+    template<typename F>
+    int64_t with_audit_prune_transaction_(F&& body) {
+        int64_t result = 0;
+        if (store_write_gate_)
+            database::maintenance_scope::probe_before_store_gate(*db_);
+        {
+            store_write_gate_hold gate(*this);
+            database::maintenance_scope ownership(*db_);
+            // Ownership rejects an existing same-connection transaction.
+            // BEGIN then excludes every other connection until COMMIT.
+            db_->begin_transaction();
+            try {
+                result = std::forward<F>(body)();
+                db_->commit();
+                // COMMIT actually executes even after logical close. A WAL
+                // callback can begin a successor transaction; it is not ours
+                // to reject or roll back after successful COMMIT returns.
+            } catch (...) {
+                // Preserve the original error. A failed rollback makes this
+                // wrapper unusable; subsequent operations must not join an
+                // indeterminate transaction through its normal API.
+                try {
+                    if (db_->is_in_transaction()) db_->rollback();
+                    if (db_->is_in_transaction())
+                        throw db_error("audit maintenance rollback did not settle its transaction");
+                }
+                catch (...) { db_->closed_.store(true, std::memory_order_release); }
+                throw;
+            }
+        }
+        // Memory/WASM settled callbacks may enter another thread/connection.
+        // No maintenance mutex or newly acquired store gate survives delivery.
+        db_->drain_if_settled();
+        return result;
+    }
+
+    // Called only while this thread owns the complete write transaction.
+    // Safety bounds, cursor requirements and the saved trigger flag therefore
+    // come from the same protected state as the deletion.
+    int64_t delete_audit_below_in_transaction_(int64_t safe_id, bool preserve_cursor_row) {
+        // Do not use the legacy best-effort getter: a failed read must never
+        // become a fabricated flag value that is later committed as restore.
+        const auto flag_rows = db_->query("SELECT disabled FROM _SyncControl WHERE id = 1");
+        if (flag_rows.size() != 1)
+            throw db_error("audit maintenance requires one sync control row");
+        const auto flag = flag_rows[0].find("disabled");
+        if (flag == flag_rows[0].end() || !std::holds_alternative<int64_t>(flag->second))
+            throw db_error("audit maintenance requires an integer sync control flag");
+        const int64_t prev_disabled = std::get<int64_t>(flag->second);
+        // Receipts may not exist yet on a database that never applied remote
+        // entries. Their creation participates in this transaction as well.
         db_->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
                      "  globalId TEXT PRIMARY KEY)", {});
-        db_->begin_transaction();
-        try {
-            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-            if (preserve_cursor_row) {
-                db_->execute(
-                    "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
-                    "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
-                    "  ORDER BY id DESC LIMIT 1)",
-                    {safe_id});
-            } else {
-                db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
-            }
-            deleted = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
-            db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
-            // Bound the no-op receipts table (insertion-ordered rowid horizon;
-            // a receipt only matters while some sender could still re-deliver
-            // its entry, which the resend machinery bounds to far less).
-            db_->execute(R"(
-                DELETE FROM _lattice_applied_receipts WHERE rowid <=
-                    (SELECT COALESCE(MAX(rowid), 0) FROM _lattice_applied_receipts)
-                    - 500000
-            )", {});
-            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-            db_->commit();
-        } catch (...) {
-            try { db_->rollback(); } catch (...) {}
-            throw;
+        db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        if (preserve_cursor_row) {
+            db_->execute(
+                "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
+                "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
+                "  ORDER BY id DESC LIMIT 1)", {safe_id});
+        } else {
+            db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
         }
+        const int64_t deleted = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+        db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
+        db_->execute(R"(
+            DELETE FROM _lattice_applied_receipts WHERE rowid <=
+                (SELECT COALESCE(MAX(rowid), 0) FROM _lattice_applied_receipts)
+                - 500000
+        )", {});
+        db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
         return deleted;
     }
+
+public:
 
     double now_epoch_() const {
         auto rows = db_->query("SELECT unixepoch('subsec') AS t", {});

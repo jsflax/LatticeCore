@@ -413,7 +413,9 @@ void database::close() {
     // Logical close: ops short-circuit after this. The sqlite3* itself is freed in
     // ~database (single-threaded), so a concurrent reader holding this wrapper can
     // never deref a freed handle — it either sees closed_ and returns empty, or runs
-    // a final query on the still-open connection.
+    // a final query on the still-open connection. An already admitted private
+    // maintenance scope likewise settles its complete transaction on its
+    // owning thread; logical close never strands that transaction halfway.
     closed_.store(true, std::memory_order_release);
 }
 
@@ -450,6 +452,9 @@ void database::drain_if_settled() {
     // implicit statement does. Autocommit alone does not identify that
     // callback frame. Leave dirty state for the actual statement's tail.
     if (update_hook_scope::active_for(db_)) return;
+    // The explicit maintenance tail delivers after releasing its outer
+    // SQLite mutex and store gate. Keep dirty state pending until then.
+    if (maintenance_scope::active_for(db_)) return;
     // Post-statement drain point (docs/design-deferred-memory-delivery.md):
     // after a successful statement, autocommit != 0 means the top-level
     // transaction just closed (implicit, or the explicit COMMIT that funnels
@@ -514,7 +519,7 @@ int64_t database::changes() const {
 }
 
 void database::execute(const std::string& sql, const std::vector<column_value_t>& params) {
-    if (closed_.load(std::memory_order_acquire)) return;
+    if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
     if (params.empty()) {
@@ -900,7 +905,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
                                              const std::vector<column_value_t>& params) {
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
-    if (closed_.load(std::memory_order_acquire)) return {};
+    if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return {};
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
@@ -1068,8 +1073,57 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
 #endif
 }
 
+bool database::maintenance_scope::idle(database& db) noexcept {
+    if (!db.db_ || db.closed_.load(std::memory_order_acquire) ||
+        sqlite3_get_autocommit(db.db_) == 0 ||
+        sqlite3_txn_state(db.db_, nullptr) != SQLITE_TXN_NONE ||
+        update_hook_scope::active_for(db.db_)) return false;
+    for (auto* statement = sqlite3_next_stmt(db.db_, nullptr);
+         statement; statement = sqlite3_next_stmt(db.db_, statement)) {
+        if (sqlite3_stmt_busy(statement)) return false;
+    }
+    return true;
+}
+
+void database::maintenance_scope::probe_before_store_gate(database& db) {
+    auto* mutex = db.db_ ? sqlite3_db_mutex(db.db_) : nullptr;
+#ifndef __EMSCRIPTEN__
+    if (!mutex) throw db_error("audit maintenance requires a serialized connection");
+#endif
+    // A SQLite callback may already own this recursive mutex while another
+    // writer owns the shared-memory gate and is waiting for SQLite. Reject
+    // callback/statement reentry BEFORE waiting for that gate. This probe
+    // acquires no gate and never waits for another SQLite thread.
+    if (sqlite3_mutex_try(mutex) != SQLITE_OK)
+        throw db_error("audit maintenance connection is busy");
+    const bool available = idle(db);
+    sqlite3_mutex_leave(mutex);
+    if (!available) throw db_error("audit maintenance requires an idle connection");
+}
+
+database::maintenance_scope::maintenance_scope(database& db)
+    : owner(db), mutex(db.db_ ? sqlite3_db_mutex(db.db_) : nullptr) {
+#ifndef __EMSCRIPTEN__
+    if (!mutex) throw db_error("audit maintenance requires a serialized connection");
+#endif
+    sqlite3_mutex_enter(mutex);
+    // Recheck after admission: the pre-gate probe is not an ownership lease.
+    // Never wait for another transaction while retaining its owner's mutex.
+    if (!idle(db)) {
+        sqlite3_mutex_leave(mutex);
+        throw db_error("audit maintenance requires an idle connection");
+    }
+    previous = current;
+    current = this;
+}
+
+database::maintenance_scope::~maintenance_scope() noexcept {
+    current = previous;
+    sqlite3_mutex_leave(mutex);
+}
+
 void database::begin_transaction(bool exclusive) {
-    if (closed_.load(std::memory_order_acquire)) return;
+    if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
     // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).
     // EXCLUSIVE: acquires write lock AND blocks all readers.
     // Use exclusive for migrations so stale connections can't read mid-migration.

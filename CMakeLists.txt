@@ -219,6 +219,8 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
     Tests/LatticeCoreTests/AttachViewIntegrityTests.cpp
     Tests/LatticeCoreTests/AuditHygieneTests.cpp
+    Tests/LatticeCoreTests/AuditRetentionTests.cpp
+    Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncPerfBench.cpp
     Tests/LatticeCoreTests/CAPISurfaceTests.cpp
     Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c

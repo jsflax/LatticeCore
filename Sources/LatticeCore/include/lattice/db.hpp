@@ -78,6 +78,29 @@ class database {
         }
     };
 
+    // Private multi-statement maintenance ownership. FULLMUTEX alone only
+    // serializes individual SQLite calls; another thread must not join this
+    // owner's transaction between its safety reads and writes. The caller
+    // takes any store gate first and drains notifications after both scopes.
+    struct maintenance_scope {
+        database& owner;
+        sqlite3_mutex* mutex;
+        maintenance_scope* previous = nullptr;
+        static inline thread_local maintenance_scope* current = nullptr;
+        static bool idle(database& db) noexcept;
+        static void probe_before_store_gate(database& db);
+        explicit maintenance_scope(database& db);
+        ~maintenance_scope() noexcept;
+        maintenance_scope(const maintenance_scope&) = delete;
+        maintenance_scope& operator=(const maintenance_scope&) = delete;
+        static bool active_for(sqlite3* connection) noexcept {
+            for (auto* frame = current; frame; frame = frame->previous) {
+                if (frame->owner.db_ == connection) return true;
+            }
+            return false;
+        }
+    };
+
 public:
     /// Open mode for database connections
     enum class open_mode {

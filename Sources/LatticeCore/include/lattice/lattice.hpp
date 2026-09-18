@@ -4092,10 +4092,25 @@ public:
             table_columns.push_back(std::move(cols));
         }
 
+        // Routing metadata belongs to each physical arm, not to the shared
+        // model schema. An attached-only model's passthrough view has these
+        // columns even when a different, main-only model does not. ATTACH
+        // rejects either reserved name in physical model columns beforehand.
+        std::vector<bool> routed_arms;
+        bool has_routed_arm = false;
+        for (const auto& columns : table_columns) {
+            const bool routed = columns.count("_source") != 0 &&
+                                columns.count("_lattice_attach_token") != 0;
+            routed_arms.push_back(routed);
+            has_routed_arm = has_routed_arm || routed;
+        }
+
         // Find shared columns (intersection where name AND type match)
         std::vector<std::string> shared_columns;
         if (!table_columns.empty()) {
             for (const auto& [name, type] : table_columns[0]) {
+                if (has_routed_arm &&
+                    (name == "_source" || name == "_lattice_attach_token")) continue;
                 bool shared = true;
                 for (size_t i = 1; i < table_columns.size(); i++) {
                     auto it = table_columns[i].find(name);
@@ -4130,7 +4145,26 @@ public:
                 sql << ", \"" << col << "\"";
             }
 
-            sql << " FROM " << table_name;
+            if (has_routed_arm) {
+                if (routed_arms[i]) {
+                    // Qualify metadata references: if the view disappears
+                    // between metadata inspection and execution, SQLite must
+                    // fail the query instead of treating a quoted missing
+                    // column as a string literal.
+                    const auto relation = managed_quote_identifier(table_name);
+                    sql << ", " << relation << ".\"_source\" AS \"_source\""
+                        << ", " << relation << ".\"_lattice_attach_token\" AS \"_lattice_attach_token\"";
+                } else {
+                    sql << ", 'main' AS \"_source\", 0 AS \"_lattice_attach_token\"";
+                }
+            }
+
+            // Pin a registered main-model arm even if ATTACH installs a
+            // same-named TEMP view after the PRAGMA above. Routed arms retain
+            // their logical view and carry its actual per-row source/token.
+            // This preserves physical identity, not an atomic topology snapshot.
+            sql << " FROM " << (routed_arms[i] ? managed_quote_identifier(table_name)
+                                             : managed_table_sql(table_name));
             if (where_clause && !where_clause->empty()) {
                 sql << " WHERE " << *where_clause;
             }

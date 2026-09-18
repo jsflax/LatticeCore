@@ -18,6 +18,9 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Preserve each physical route and attachment token through heterogeneous
+  virtual UNION queries, including models present only in attached stores.
+  Keep ordinary main-store arms pinned to main when a TEMP view shadows them.
 - Read live primitive fields through one owned SQL cell, avoiding generic
   row containers while preserving fresh queries, physical routing and types.
 - Initialize the default native Double fallback to zero instead of reading

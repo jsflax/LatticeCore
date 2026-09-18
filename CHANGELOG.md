@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.0.2] - Unreleased
+
+### Fixed
+- Destroy removed table, object and invalidation observer captures after
+  releasing their registry locks. A captured object can synchronously cancel
+  another observer during destruction without deadlocking the same registry.
+- Preserve survivor order, missing-token behavior and existing in-flight
+  callback semantics; add bounded native child regressions for each removal
+  path. No schema or public API changes.
+
 ## [2.0.1] - Unreleased
 
 ### Fixed

@@ -2019,10 +2019,17 @@ public:
 
     // Remove a table observer
     void remove_table_observer(const std::string& table_name, observer_id id) {
-        std::lock_guard<std::mutex> lock(observers_mutex_);
-        auto it = table_observers_.find(table_name);
-        if (it != table_observers_.end()) {
-            it->second.erase(id);
+        // A callback's final capture may cancel another observer. Release it
+        // after unlocking, while keeping removal itself linearized under lock.
+        std::function<void(const std::vector<change_event>&)> removed;
+        {
+            std::lock_guard<std::mutex> lock(observers_mutex_);
+            auto table_it = table_observers_.find(table_name);
+            if (table_it == table_observers_.end()) return;
+            auto observer_it = table_it->second.find(id);
+            if (observer_it == table_it->second.end()) return;
+            removed.swap(observer_it->second);
+            table_it->second.erase(observer_it);
         }
     }
 
@@ -2042,34 +2049,50 @@ public:
 
     /// Remove a specific object observer
     void remove_object_observer(const std::string& table_name, int64_t row_id, observer_id id) {
-        std::lock_guard<std::mutex> lock(object_observers_mutex_);
-        auto table_it = object_observers_.find(table_name);
-        if (table_it == object_observers_.end()) return;
+        std::function<void(const std::string&)> removed;
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            auto table_it = object_observers_.find(table_name);
+            if (table_it == object_observers_.end()) return;
 
-        auto row_it = table_it->second.find(row_id);
-        if (row_it == table_it->second.end()) return;
+            auto row_it = table_it->second.find(row_id);
+            if (row_it == table_it->second.end()) return;
 
-        auto& observers = row_it->second;
-        observers.erase(
-            std::remove_if(observers.begin(), observers.end(),
-                [id](const auto& pair) { return pair.first == id; }),
-            observers.end());
+            auto& observers = row_it->second;
+            auto it = std::find_if(observers.begin(), observers.end(),
+                [id](const auto& entry) { return entry.first == id; });
+            if (it != observers.end()) {
+                removed.swap(it->second);
+                // Shift the empty slot with swaps: preserve survivor order and
+                // never destroy a surviving callback while holding the mutex.
+                for (auto next = it + 1; next != observers.end(); ++it, ++next) {
+                    it->swap(*next);
+                }
+                observers.pop_back();
+            }
 
-        // Clean up empty entries
-        if (observers.empty()) {
-            table_it->second.erase(row_it);
-            if (table_it->second.empty()) {
-                object_observers_.erase(table_it);
+            // Clean up empty entries
+            if (observers.empty()) {
+                table_it->second.erase(row_it);
+                if (table_it->second.empty()) {
+                    object_observers_.erase(table_it);
+                }
             }
         }
     }
 
     /// Remove all observers for a specific object
     void remove_all_object_observers(const std::string& table_name, int64_t row_id) {
-        std::lock_guard<std::mutex> lock(object_observers_mutex_);
-        auto table_it = object_observers_.find(table_name);
-        if (table_it != object_observers_.end()) {
-            table_it->second.erase(row_id);
+        std::vector<std::pair<observer_id, std::function<void(const std::string&)>>> removed;
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            auto table_it = object_observers_.find(table_name);
+            if (table_it == object_observers_.end()) return;
+            auto row_it = table_it->second.find(row_id);
+            if (row_it != table_it->second.end()) {
+                removed.swap(row_it->second);
+                table_it->second.erase(row_it);
+            }
             if (table_it->second.empty()) {
                 object_observers_.erase(table_it);
             }
@@ -2258,11 +2281,19 @@ public:
     /// Remove a previously registered invalidation hook. Safe to call from
     /// inside a hook callback (hooks are copied out before invocation).
     void remove_invalidation_hook(uint64_t token) {
-        std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
-        invalidation_hooks_.erase(
-            std::remove_if(invalidation_hooks_.begin(), invalidation_hooks_.end(),
-                           [token](const auto& entry) { return entry.first == token; }),
-            invalidation_hooks_.end());
+        invalidation_hook_detailed_fn removed;
+        {
+            std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
+            auto it = std::find_if(invalidation_hooks_.begin(), invalidation_hooks_.end(),
+                [token](const auto& entry) { return entry.first == token; });
+            if (it == invalidation_hooks_.end()) return;
+            removed.swap(it->second);
+            // Move the empty slot to the end without releasing any survivor.
+            for (auto next = it + 1; next != invalidation_hooks_.end(); ++it, ++next) {
+                it->swap(*next);
+            }
+            invalidation_hooks_.pop_back();
+        }
     }
 
     /// Fire hooks on every alive same-path instance (isolated `:memory:`

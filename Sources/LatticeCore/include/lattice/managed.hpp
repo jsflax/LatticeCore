@@ -8,6 +8,7 @@
 #include "../nlohmann/json.hpp"
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <ostream>
 #include <unordered_map>
 #include <map>
@@ -89,6 +90,77 @@ struct managed;
 // ============================================================================
 // managed_base - Base for property wrappers (holds DB binding info)
 // ============================================================================
+
+// Managed identities keep their historical logical/attached route strings for
+// schema lookup and observation. SQL must pin an unqualified identity to main:
+// ATTACH can later install a same-named TEMP UNION view over multiple stores.
+struct managed_table_route {
+    std::string schema_sql = "main";
+    std::string table;
+};
+
+inline std::string managed_quote_identifier(const std::string& name) {
+    if (name.empty() || name.find('\0') != std::string::npos)
+        throw std::invalid_argument("invalid managed SQL identifier");
+    std::string result = "\"";
+    for (char c : name) { result += c; if (c == '\"') result += c; }
+    return result + '\"';
+}
+
+inline managed_table_route managed_route(const std::string& name) {
+    managed_table_route route;
+    route.table = name;
+    const auto dot = name.find('.');
+    const auto bare_identifier = [](const std::string& text) {
+        if (text.empty()) return false;
+        for (size_t i = 0; i < text.size(); ++i) {
+            const char c = text[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+                (i != 0 && c >= '0' && c <= '9')) continue;
+            return false;
+        }
+        return true;
+    };
+    if (dot != std::string::npos && bare_identifier(name.substr(0, dot))) {
+        route.schema_sql = name.substr(0, dot);
+        route.table = name.substr(dot + 1);
+    } else if (!name.empty() && name.front() == '\"') {
+        // Attached hydration emits a double-quoted schema, escaping quotes.
+        for (size_t i = 1; i < name.size(); ++i) {
+            if (name[i] != '\"') continue;
+            if (i + 1 < name.size() && name[i + 1] == '\"') { ++i; continue; }
+            if (i + 1 < name.size() && name[i + 1] == '.') {
+                route.schema_sql = name.substr(0, i + 1);
+                route.table = name.substr(i + 2);
+            }
+            break;
+        }
+    }
+    // Accept an already quoted table token as well as the raw table suffix
+    // emitted by hydrate(). Decode only a complete valid quoted identifier.
+    if (route.table.size() >= 2 && route.table.front() == '\"') {
+        std::string decoded;
+        for (size_t i = 1; i < route.table.size(); ++i) {
+            if (route.table[i] != '\"') { decoded += route.table[i]; continue; }
+            if (i + 1 < route.table.size() && route.table[i + 1] == '\"') {
+                decoded += '\"'; ++i; continue;
+            }
+            if (i + 1 == route.table.size()) route.table = std::move(decoded);
+            break;
+        }
+    }
+    return route;
+}
+
+inline std::string managed_table_sql(const std::string& name) {
+    const auto route = managed_route(name);
+    return route.schema_sql + '.' + managed_quote_identifier(route.table);
+}
+
+inline std::string managed_sidecar_sql(const std::string& model, const std::string& suffix) {
+    const auto route = managed_route(model);
+    return route.schema_sql + '.' + managed_quote_identifier("_" + route.table + "_" + suffix);
+}
 
 struct managed_base {
     database* db = nullptr;
@@ -196,7 +268,7 @@ public:
 
     virtual void set_value(const std::string& name, const column_value_t& value) {
         if (is_managed()) {
-            db_->update(table_name_, id_, {{name, value}});
+            db_->update(managed_table_sql(table_name_), id_, {{name, value}});
         }
         unmanaged_values_[name] = value;
         // Notify observers of property change
@@ -304,7 +376,7 @@ struct CONFORMS_TO_MANAGED managed<int64_t> : managed_base {
 
     managed& operator=(int64_t v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, v}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
         }
         unmanaged_value = v;
         return *this;
@@ -313,7 +385,7 @@ struct CONFORMS_TO_MANAGED managed<int64_t> : managed_base {
     [[nodiscard]] int64_t detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -343,7 +415,7 @@ struct CONFORMS_TO_MANAGED managed<int> : managed_base {
 
     managed& operator=(int v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, static_cast<int64_t>(v)}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<int64_t>(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -352,7 +424,7 @@ struct CONFORMS_TO_MANAGED managed<int> : managed_base {
     [[nodiscard]] int detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -380,7 +452,7 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
     
     managed& operator=(double v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, v}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
         }
         unmanaged_value = v;
         return *this;
@@ -389,7 +461,7 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
     [[nodiscard]] double detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -417,7 +489,7 @@ struct CONFORMS_TO_MANAGED managed<float> : managed_base {
 
     managed& operator=(float v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, static_cast<double>(v)}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<double>(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -426,7 +498,7 @@ struct CONFORMS_TO_MANAGED managed<float> : managed_base {
     [[nodiscard]] float detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -454,7 +526,7 @@ struct CONFORMS_TO_MANAGED managed<bool> : managed_base {
 
     managed& operator=(bool v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, static_cast<int64_t>(v ? 1 : 0)}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<int64_t>(v ? 1 : 0)}});
         }
         unmanaged_value = v;
         return *this;
@@ -463,7 +535,7 @@ struct CONFORMS_TO_MANAGED managed<bool> : managed_base {
     [[nodiscard]] bool detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -509,7 +581,7 @@ struct CONFORMS_TO_MANAGED managed<std::string> : managed_base {
     
     managed& operator=(std::string v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, v}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
         }
         unmanaged_value = v;
         return *this;
@@ -520,7 +592,7 @@ struct CONFORMS_TO_MANAGED managed<std::string> : managed_base {
     [[nodiscard]] std::string detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -546,7 +618,7 @@ struct CONFORMS_TO_MANAGED managed<timestamp_t> : managed_base {
 
     managed& operator=(timestamp_t v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, detail::to_column_value(v)}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, detail::to_column_value(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -555,7 +627,7 @@ struct CONFORMS_TO_MANAGED managed<timestamp_t> : managed_base {
     [[nodiscard]] timestamp_t detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -585,7 +657,7 @@ struct CONFORMS_TO_MANAGED managed<uuid_t> : managed_base {
 
     managed& operator=(const uuid_t& v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, detail::to_column_value(v)}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, detail::to_column_value(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -594,7 +666,7 @@ struct CONFORMS_TO_MANAGED managed<uuid_t> : managed_base {
     [[nodiscard]] uuid_t detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -635,7 +707,7 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
     // Override bind_to_parent to set up R*Tree table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        rtree_table_ = "_" + parent->table_name_ + "_" + prop_name + "_rtree";
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
     }
 
     // For dynamic objects with property_descriptor
@@ -645,7 +717,7 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
         table_name = parent->table_name_;
         column_name = p.name;
         row_id = parent->id_;
-        rtree_table_ = "_" + parent->table_name_ + "_" + p.name + "_rtree";
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(p.name) + "_rtree");
     }
 
     // Column names for the 4 components (main table)
@@ -659,7 +731,7 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
 
     managed& operator=(const geo_bounds& v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {
+            db->update(managed_table_sql(table_name), row_id, {
                 {col_min_lat(), v.min_lat},
                 {col_max_lat(), v.max_lat},
                 {col_min_lon(), v.min_lon},
@@ -676,7 +748,7 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
             auto rows = db->query(
                 "SELECT " + col_min_lat() + ", " + col_max_lat() + ", " +
                 col_min_lon() + ", " + col_max_lon() +
-                " FROM " + table_name + " WHERE id = ?",
+                " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 const auto& row = rows[0];
@@ -732,7 +804,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
     // Override bind_to_parent to set up R*Tree table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        rtree_table_ = "_" + parent->table_name_ + "_" + prop_name + "_rtree";
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
     }
 
     void bind_to_parent(model_base* parent, const property_descriptor& p) {
@@ -741,7 +813,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
         table_name = parent->table_name_;
         column_name = p.name;
         row_id = parent->id_;
-        rtree_table_ = "_" + parent->table_name_ + "_" + p.name + "_rtree";
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(p.name) + "_rtree");
     }
 
     // Column names
@@ -762,14 +834,14 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
     managed& operator=(std::optional<geo_bounds> v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
             if (v) {
-                db->update(table_name, row_id, {
+                db->update(managed_table_sql(table_name), row_id, {
                     {col_min_lat(), v->min_lat},
                     {col_max_lat(), v->max_lat},
                     {col_min_lon(), v->min_lon},
                     {col_max_lon(), v->max_lon}
                 });
             } else {
-                db->update(table_name, row_id, {
+                db->update(managed_table_sql(table_name), row_id, {
                     {col_min_lat(), nullptr},
                     {col_max_lat(), nullptr},
                     {col_min_lon(), nullptr},
@@ -783,7 +855,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
 
     managed& operator=(std::nullopt_t) {
         if (is_bound()) {
-            db->update(table_name, row_id, {
+            db->update(managed_table_sql(table_name), row_id, {
                 {col_min_lat(), nullptr},
                 {col_max_lat(), nullptr},
                 {col_min_lon(), nullptr},
@@ -803,7 +875,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
             auto rows = db->query(
                 "SELECT " + col_min_lat() + ", " + col_max_lat() + ", " +
                 col_min_lon() + ", " + col_max_lon() +
-                " FROM " + table_name + " WHERE id = ?",
+                " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 const auto& row = rows[0];
@@ -866,8 +938,8 @@ struct CONFORMS_TO_MANAGED managed<std::vector<geo_bounds>> : managed_base {
     // Bind to parent - sets up list table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        list_table_ = "_" + parent->table_name_ + "_" + std::string(prop_name);
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name));
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -877,8 +949,8 @@ struct CONFORMS_TO_MANAGED managed<std::vector<geo_bounds>> : managed_base {
         table_name = parent->table_name_;
         column_name = p.name;
         row_id = parent->id_;
-        list_table_ = "_" + parent->table_name_ + "_" + p.name;
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, p.name);
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, p.name + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -1049,8 +1121,15 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds*> : managed_base {
                 {"minLon", v.min_lon},
                 {"maxLon", v.max_lon}
             });
-            // Update R*Tree if it exists
-            if (db->table_exists(rtree_table_)) {
+            // table_exists() accepts a bare main-schema name, whereas this
+            // sidecar follows the managed row's physical schema. Generated
+            // lists also have an UPDATE trigger; preserve this explicit
+            // fallback for bound list rows without those triggers.
+            const auto rtree_route = managed_route(rtree_table_);
+            const auto rtree_exists = db->query("SELECT 1 AS present FROM " +
+                rtree_route.schema_sql + ".sqlite_master WHERE type = 'table' AND name = ?",
+                {rtree_route.table});
+            if (!rtree_exists.empty()) {
                 db->execute("UPDATE " + rtree_table_ + " SET minLat = ?, maxLat = ?, minLon = ?, maxLon = ? WHERE id = ?",
                     {v.min_lat, v.max_lat, v.min_lon, v.max_lon, list_row_id_});
             }
@@ -1124,8 +1203,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<geo_bounds*>> : managed_
     // Bind to parent - sets up list table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        list_table_ = "_" + parent->table_name_ + "_" + std::string(prop_name);
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name));
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -1135,8 +1214,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<geo_bounds*>> : managed_
         table_name = parent->table_name_;
         column_name = p.name;
         row_id = parent->id_;
-        list_table_ = "_" + parent->table_name_ + "_" + p.name;
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, p.name);
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, p.name + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -1266,10 +1345,10 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
                     
                 } else {
                     column_value_t cv = detail::to_column_value(*v);
-                    db->update(table_name, row_id, {{column_name, cv}});
+                    db->update(managed_table_sql(table_name), row_id, {{column_name, cv}});
                 }
             } else {
-                db->update(table_name, row_id, {{column_name, nullptr}});
+                db->update(managed_table_sql(table_name), row_id, {{column_name, nullptr}});
             }
         } else {
             unmanaged_value = v;
@@ -1279,7 +1358,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
 
     managed& operator=(std::nullopt_t) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, nullptr}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, nullptr}});
         } else {
             unmanaged_value = std::nullopt;
         }
@@ -1288,7 +1367,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
 
     void set_nil() {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, nullptr}});
+            db->update(managed_table_sql(table_name), row_id, {{column_name, nullptr}});
         } else {
             unmanaged_value = std::nullopt;
         }
@@ -1297,7 +1376,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
     [[nodiscard]] std::optional<T> detach() const {
         if (is_bound()) {
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -1322,7 +1401,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
 
     bool has_value() const SWIFT_NAME(hasValue()) {
         if (is_bound()) {
-            auto rows = db->query("SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+            auto rows = db->query("SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                                   {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -1393,7 +1472,7 @@ struct CONFORMS_TO_MANAGED managed<std::vector<T>, std::enable_if_t<is_primitive
     std::vector<T> detach() const {
         if (!is_bound()) return unmanaged_value;
 
-        std::string sql = "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?";
+        std::string sql = "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?";
         auto rows = db->query(sql, {row_id});
         if (rows.empty()) return unmanaged_value;
 
@@ -1418,7 +1497,7 @@ struct CONFORMS_TO_MANAGED managed<std::vector<T>, std::enable_if_t<is_primitive
         if (!is_bound()) return;
 
         std::string json_str = nlohmann::json(val).dump();
-        std::string sql = "UPDATE " + table_name + " SET " + column_name + " = ? WHERE id = ?";
+        std::string sql = "UPDATE " + managed_table_sql(table_name) + " SET " + column_name + " = ? WHERE id = ?";
         db->execute(sql, {json_str, row_id});
     }
 
@@ -1467,7 +1546,7 @@ struct CONFORMS_TO_MANAGED managed<std::vector<uint8_t>> : managed_base {
     std::vector<uint8_t> detach() const {
         if (!is_bound()) return unmanaged_value;
 
-        std::string sql = "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?";
+        std::string sql = "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?";
         auto rows = db->query(sql, {row_id});
         if (rows.empty()) return unmanaged_value;
 

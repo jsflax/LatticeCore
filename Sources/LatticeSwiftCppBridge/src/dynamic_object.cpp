@@ -507,7 +507,7 @@ void lattice::dynamic_object::refresh_row_cache() {
     std::vector<lattice::database::row_t> rows;
     try {
         rows = db->query(
-            "SELECT * FROM " + managed_.table_name_ + " WHERE id = ?",
+            "SELECT * FROM " + managed_table_sql(managed_.table_name_) + " WHERE id = ?",
             {managed_.id_});
     } catch (const std::exception& e) {
         fprintf(stderr,

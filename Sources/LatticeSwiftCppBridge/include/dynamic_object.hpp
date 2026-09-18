@@ -323,7 +323,7 @@ public:
             auto* db = managed_.db_;
             if (!db) return;
             db->execute(
-                "UPDATE " + managed_.table_name_ + " SET " + name + " = " + name +
+                "UPDATE " + managed_table_sql(managed_.table_name_) + " SET " + name + " = " + name +
                     " + ? WHERE id = ?",
                 {delta, managed_.id_});
             // New value unknown here — drop the cached key so the next
@@ -661,24 +661,24 @@ public:
 
     // geo_bounds accessors
     geo_bounds get_geo_bounds(const std::string& name) const SWIFT_NAME(getGeoBounds(named:)) {
-        return impl_->get_geo_bounds(name);
+        return sealed([&] { return impl_->get_geo_bounds(name); });
     }
 
     void set_geo_bounds(const std::string& name, const geo_bounds& value) const SWIFT_NAME(setGeoBounds(named:_:)) {
-        impl_->set_geo_bounds(name, value);
+        sealed([&] { impl_->set_geo_bounds(name, value); });
     }
 
     void set_geo_bounds(const std::string& name, double minLat, double maxLat, double minLon, double maxLon) const SWIFT_NAME(setGeoBounds(named:minLat:maxLat:minLon:maxLon:)) {
-        impl_->set_geo_bounds(name, minLat, maxLat, minLon, maxLon);
+        sealed([&] { impl_->set_geo_bounds(name, minLat, maxLat, minLon, maxLon); });
     }
 
     bool has_geo_bounds(const std::string& name) const SWIFT_NAME(hasGeoBounds(named:)) {
-        return impl_->has_geo_bounds(name);
+        return sealed([&] { return impl_->has_geo_bounds(name); });
     }
 
 
     void remove_geo_bounds_at(const std::string& name, size_t index) const SWIFT_NAME(removeGeoBounds(named:at:)) {
-        impl_->remove_geo_bounds_at(name, index);
+        sealed([&] { impl_->remove_geo_bounds_at(name, index); });
     }
 
     std::string get_table_name() const SWIFT_NAME(getTableName()) {

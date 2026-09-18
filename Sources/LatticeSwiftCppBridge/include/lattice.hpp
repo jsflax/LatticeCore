@@ -3897,6 +3897,7 @@ public:
     void commit() const { sealed([&] { impl().commit(); }); }
     void rollback() const { sealed([&] { impl().rollback(); }); }
     void close() const { impl().close(); }
+    bool is_closed() const SWIFT_NAME(isClosed()) { return impl().is_closed(); }
     bool has_attached_stores() const SWIFT_NAME(hasAttachedStores()) {
         return impl().has_attached_stores();
     }

@@ -3754,26 +3754,29 @@ public:
     }
 
     /// One retention tick. N handles/processes on one file coordinate through
-    /// `_lattice_meta['audit_prune_at']`: whoever finds it older than half a
-    /// window stamps it and prunes; everyone else just records a watermark
+    /// `_lattice_meta['audit_prune_at']`: one conditional write claims a half
+    /// window and prunes; everyone else just records a watermark
     /// so sampling never starves. Busy/locked errors are ordinary here (a
     /// writer mid-transaction) — logged at debug, retried next tick.
     void run_audit_retention_tick() {
-        if (closed_.load(std::memory_order_acquire)) return;
+        if (closed_.load(std::memory_order_acquire) || config_.read_only ||
+            config_.audit_retention_seconds <= 0) return;
+        std::string claim_stamp;
+        bool claimed = false;
         try {
             const double now = now_epoch_();
             const double half = static_cast<double>(config_.audit_retention_seconds) / 2.0;
-            auto rows = db_->query(
-                "SELECT CAST(value AS REAL) AS t FROM _lattice_meta WHERE key = 'audit_prune_at'", {});
-            if (!rows.empty()) {
-                double last = 0;
-                const auto& v = rows[0].at("t");
-                if (const auto* d = std::get_if<double>(&v)) last = *d;
-                else if (const auto* i = std::get_if<int64_t>(&v)) last = static_cast<double>(*i);
-                if (now - last < half) { record_audit_watermark_(now); return; }
-            }
-            db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?)",
-                         {std::to_string(now)});
+            claim_stamp = std::to_string(now);
+            // A separate SELECT and unconditional stamp lets simultaneous
+            // handles both prune. SQLite serializes this test-and-write across
+            // connections and processes; only the winner receives a row.
+            const auto claim = db_->query(
+                "INSERT INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+                "WHERE COALESCE(CAST(_lattice_meta.value AS REAL), 0) <= ? "
+                "RETURNING value", {claim_stamp, now - half});
+            if (claim.empty()) { record_audit_watermark_(now); return; }
+            claimed = true;
             const int64_t removed = prune_audit_log(config_.audit_retention_seconds);
             if (removed > 0) {
                 LOG_INFO("lattice_db", "audit retention: pruned %lld entries older than %llds (path=%s)",
@@ -3781,6 +3784,15 @@ public:
                          config_.path.c_str());
             }
         } catch (const std::exception& e) {
+            if (claimed) {
+                // A failed pass should be retried next tick. Compare the exact
+                // stamp so a slower failed owner cannot erase a newer claim.
+                // If cleanup is also busy, ordinary expiry remains the fallback.
+                try {
+                    db_->execute("DELETE FROM _lattice_meta WHERE key = 'audit_prune_at' AND value = ?",
+                                 {claim_stamp});
+                } catch (...) {}
+            }
             LOG_DEBUG("lattice_db", "audit retention tick skipped: %s", e.what());
         }
     }
@@ -4997,9 +5009,19 @@ public:
     /// Ensure a geo_bounds list table exists with its R*Tree.
     /// Creates table: _<ModelTable>_<column> with parent_id and geo bounds columns
     /// Creates R*Tree: _<ModelTable>_<column>_rtree for spatial indexing
-    void ensure_geo_bounds_list_table(const std::string& model_table,
+    void ensure_geo_bounds_list_table(const std::string& model_route,
                                       const std::string& column_name) {
+        const auto route = managed_route(model_route);
+        const std::string& model_table = route.table;
         std::string list_table = "_" + model_table + "_" + column_name;
+        if (route.schema_sql != "main") {
+            // Attached schemas are owned by their source. Never create a
+            // main-schema sidecar while mutating an attached managed object.
+            auto rows = db_->query("SELECT name FROM " + route.schema_sql +
+                ".sqlite_master WHERE type = 'table' AND name = ?", {list_table});
+            if (rows.empty()) throw db_error("attached geographic list table is missing");
+            return;
+        }
         std::string rtree_table = list_table + "_rtree";
 
         // Register as internal table — AuditLog entries won't be surfaced to observers.
@@ -8683,7 +8705,7 @@ inline void managed<std::vector<uint8_t>>::set_value(const std::vector<uint8_t>&
         ensure_vec0_for_blob(lattice, table_name, column_name, val);
     }
 
-    std::string sql = "UPDATE " + table_name + " SET " + column_name + " = ? WHERE id = ?";
+    std::string sql = "UPDATE " + managed_table_sql(table_name) + " SET " + column_name + " = ? WHERE id = ?";
     db->execute(sql, {val, row_id});
 }
 

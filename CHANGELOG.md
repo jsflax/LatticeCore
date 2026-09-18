@@ -18,6 +18,16 @@
   These hooks do not provide a durable event cursor or transaction replay.
 
 ### Fixed
+- Claim each audit-retention interval with one conditional SQLite write so
+  simultaneous maintenance handles cannot both acquire the same interval.
+  Release a failed pass's own claim for retry while preserving newer claims;
+  keep insertion-time watermarks, upload floors and audit IDs unchanged.
+- Route managed scalar and geographic SQL to the physical store when an
+  attached UNION view shadows the model's logical name. Keep geographic list
+  sidecars and their RTree updates in that same schema, including quoted
+  attachment aliases. Seal geographic SQL failures at the Swift bridge.
+- Expose the shared native close state to Swift so retained collection caches
+  can reject new reads after their database closes.
 - Preserve geographic query shape, bound precision and physical-store
   identity through attached queries, counts and pagination. Resolve update
   hook identities from the callback's quoted physical schema and table.

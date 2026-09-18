@@ -255,7 +255,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         m.table_name = this->table_name_;
         m.column_name = name;
         m.row_id = this->id_;
-        m.rtree_table_ = "_" + this->table_name_ + "_" + name + "_rtree";
+        m.rtree_table_ = managed_sidecar_sql(this->table_name_, name + "_rtree");
         return m;
     }
 
@@ -267,7 +267,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         m.table_name = this->table_name_;
         m.column_name = name;
         m.row_id = this->id_;
-        m.rtree_table_ = "_" + this->table_name_ + "_" + name + "_rtree";
+        m.rtree_table_ = managed_sidecar_sql(this->table_name_, name + "_rtree");
         return m;
     }
 
@@ -280,8 +280,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         m.table_name = this->table_name_;
         m.column_name = name;
         m.row_id = this->id_;
-        m.list_table_ = "_" + this->table_name_ + "_" + name;
-        m.rtree_table_ = m.list_table_ + "_rtree";
+        m.list_table_ = managed_sidecar_sql(this->table_name_, name);
+        m.rtree_table_ = managed_sidecar_sql(this->table_name_, name + "_rtree");
         m.parent_global_id_ = this->global_id_;
         return m;
     }

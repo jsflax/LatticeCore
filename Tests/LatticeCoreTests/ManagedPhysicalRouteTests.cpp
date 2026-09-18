@@ -144,8 +144,8 @@ TEST(ManagedPhysicalRoute, AttachedGeoAndListWritesUseQuotedPhysicalSchema) {
     EXPECT_EQ(std::get<std::string>(source_labels[1].at("_source")), "main");
     auto rows = main->get()->objects("ManagedRouteItem", std::string("name = 'attached'"));
     ASSERT_EQ(rows.size(), 1u);
-    EXPECT_EQ(managed_route(rows[0].table_name_).schema_sql, expected_alias);
-    EXPECT_EQ(managed_route(rows[0].table_name_).table, "ManagedRouteItem");
+    EXPECT_EQ(managed_route(rows[0].table_name()).schema_sql, expected_alias);
+    EXPECT_EQ(managed_route(rows[0].table_name()).table, "ManagedRouteItem");
     dynamic_object_ref attached(rows[0]);
     attached.set_geo_bounds("location", geo_bounds(0, 0, 0, 0));
     ASSERT_TRUE(last_bridge_error().empty()) << last_bridge_error();

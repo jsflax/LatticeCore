@@ -61,7 +61,10 @@ void recovery_name(const std::shared_ptr<lattice::lattice_db>& owner, int64_t id
         writer.execute("UPDATE main.TestPerson SET name=? WHERE id=?", {name, id});
         writer.execute("UPDATE _SyncControl SET disabled=0 WHERE id=1");
     });
-    EXPECT_EQ(result.state, recovery_install_state::committed);
+    std::string primary;
+    if(result.primary_error)try{std::rethrow_exception(result.primary_error);}
+    catch(const std::exception& e){primary=e.what();}catch(...){primary="non-standard primary error";}
+    EXPECT_EQ(result.state, recovery_install_state::committed)<<primary;
     EXPECT_FALSE(result.primary_error); EXPECT_FALSE(result.postcommit_error);
 }
 }

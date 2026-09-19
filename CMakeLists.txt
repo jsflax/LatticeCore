@@ -225,6 +225,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/RecoveryWitnessTests.cpp
     Tests/LatticeCoreTests/RecoveryRefreshWorkerTests.cpp
     Tests/LatticeCoreTests/RecoveryRefreshBridgeTests.cpp
+    Tests/LatticeCoreTests/RecoveryRefreshAdmissionTests.cpp
     Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp

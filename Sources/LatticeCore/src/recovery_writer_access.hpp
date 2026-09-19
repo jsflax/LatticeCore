@@ -11,6 +11,7 @@ struct recovery_install_result {
     std::exception_ptr primary_error, cleanup_error, postcommit_error;
 };
 struct recovery_install_test_access;
+struct recovery_install_admission_test_access;
 // active_writer borrows either an explicit Core-owned transaction or the exact
 // private install frame below. It never creates ownership from autocommit=false.
 // Its returned pointer is valid only within the caller's admitted transaction.
@@ -25,8 +26,10 @@ private:
     struct frame;
     static thread_local frame* current_;
     static recovery_install_result install_impl(std::shared_ptr<lattice_db>,
-        const std::function<void(database&)>&, const std::function<void()>& after_unlock);
+        const std::function<void(database&)>&, const std::function<void()>& after_unlock,
+        const std::function<void()>& after_writer_capture = {});
     static void deliver(lattice_db&, const lattice_db::recovery_commit_batch&);
     friend struct recovery_install_test_access;
+    friend struct recovery_install_admission_test_access;
 };
 } // namespace lattice::detail

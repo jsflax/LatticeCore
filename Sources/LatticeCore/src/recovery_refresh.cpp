@@ -34,7 +34,9 @@ struct statement_guard {
     explicit statement_guard(sqlite3* db) : mutex(sqlite3_db_mutex(db)), owned(sqlite3_mutex_try(mutex) == SQLITE_OK) {}
     ~statement_guard() { if (owned) sqlite3_mutex_leave(mutex); }
 };
+thread_local size_t* preparation_writer_inspections = nullptr; // private test seam; inert otherwise
 bool settled(database& writer, sqlite3* h, std::shared_ptr<const physical_store_identity>* identity = nullptr) {
+    if (preparation_writer_inspections) ++*preparation_writer_inspections;
     statement_guard guard(h);
     if (!guard.owned || writer.is_closed() || sqlite3_get_autocommit(h) == 0) return false;
     for (auto* s = sqlite3_next_stmt(h, nullptr); s; s = sqlite3_next_stmt(h, s))
@@ -387,18 +389,12 @@ std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattic
         connection_revision = owner.connection_revision_;
         writer = owner.db_;
     }
-    // Native held scalar fields still use their captured physical writer.
-    // Preserve explicit transaction/statement snapshots; retry after settlement.
-    std::shared_ptr<const physical_store_identity> writer_identity;
-    if (!writer || !settled(*writer, writer->internal_handle(), &writer_identity)) return std::nullopt;
+    if (!writer) return std::nullopt;
     if (!probe) {
         probe = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */);
         std::lock_guard<std::mutex> lock(shared->mutex);
         shared->probe_reader = probe;
     }
-    const auto probe_identity = probe->physical_identity("main", {}, true);
-    if (!writer_identity || !probe_identity || !(*probe_identity == *writer_identity))
-        throw db_error("recovery refresh physical store changed");
     probe->execute("BEGIN");
     bool reading = true;
     std::optional<recovery_witness> witness;
@@ -445,6 +441,15 @@ std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattic
         }
         throw;
     }
+    // Absent/unchanged witness polls above use only the private reader. Even
+    // a momentary writer-mutex inspection would make idle foreground install
+    // admission spuriously refuse. Actual refresh still validates its writer,
+    // explicit transaction/statement snapshot and physical file before publish.
+    std::shared_ptr<const physical_store_identity> writer_identity;
+    if (!settled(*writer, writer->internal_handle(), &writer_identity)) return std::nullopt;
+    const auto probe_identity = probe->physical_identity("main", {}, true);
+    if (!writer_identity || !probe_identity || !(*probe_identity == *writer_identity))
+        throw db_error("recovery refresh physical store changed");
     auto fresh = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */);
     const auto fresh_identity = fresh->physical_identity("main", {}, true);
     if (!fresh_identity || !(*fresh_identity == *writer_identity))
@@ -464,6 +469,19 @@ std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattic
     if (!settled(*writer, writer->internal_handle())) return std::nullopt;
 
     return recovery_refresh_prepared{subscription_revision, connection_revision, managed_revision, std::move(witness), std::move(names)};
+}
+bool recovery_refresh_test_access::prepare_once(lattice_db& owner, size_t& writer_inspections) {
+    auto shared = recovery_refresh_access::state(owner, false);
+    if (!shared) throw db_error("deterministic recovery preparation needs subscribed state");
+    { std::lock_guard<std::mutex> lock(shared->mutex);
+      if (!shared->manual || shared->in_flight) throw db_error("deterministic recovery preparation needs idle manual state"); }
+    writer_inspections = 0;
+    struct count_scope {
+        size_t* previous = preparation_writer_inspections;
+        explicit count_scope(size_t& count) { preparation_writer_inspections = &count; }
+        ~count_scope() { preparation_writer_inspections = previous; }
+    } count{writer_inspections};
+    return recovery_refresh_access::prepare(owner, shared).has_value();
 }
 void recovery_refresh_access::deliver(lattice_db& owner, const std::shared_ptr<recovery_refresh_state>& shared,
                                      const recovery_refresh_prepared& prepared) {

@@ -41,7 +41,8 @@ recovery_install_result recovery_writer_access::install(std::shared_ptr<lattice_
 }
 
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
-    const std::function<void(database&)>& body, const std::function<void()>& after_unlock) {
+    const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
+    const std::function<void()>& after_writer_capture) {
     recovery_install_result result;
     std::shared_ptr<database> writer;
     lattice_db::recovery_commit_batch batch;
@@ -49,14 +50,15 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
     database::sync_apply_chunk_state settlement;
     try {
         if (!owner || !body) throw db_error("recovery install requires an owning store and body");
-        uint64_t revision;
         {
             std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
             if (owner->closed_.load()) throw db_error("recovery install: owner is closed");
             writer = owner->db_;
-            revision = owner->connection_revision_;
         }
         if (!writer) throw db_error("recovery install: no published writer");
+        // Private deterministic test rendezvous only; no owner/store/SQLite
+        // lock is held here. Production supplies no callback.
+        if (after_writer_capture) after_writer_capture();
         database::maintenance_scope::probe_before_store_gate(*writer);
         {
             lattice_db::store_write_gate_hold gate(*owner);
@@ -72,7 +74,11 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
             auto* context = writer->lattice_update_hook_context_.get();
             {
                 std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
-                if (owner->closed_.load() || owner->connection_revision_ != revision || owner->db_ != writer ||
+                // Reader publication increments connection_revision_ too, but
+                // does not revoke this exact strongly retained writer. Closing
+                // or replacing the writer remains fenced by pointer/owner/hook
+                // identity plus maintenance admission; retention prevents ABA.
+                if (owner->closed_.load() || owner->db_ != writer ||
                     !context || context->owner != owner.get() || context->connection != writer->internal_handle() ||
                     context->sync_chunk || context->entry_cursor_active || context->recovery_delivery_deferred)
                     throw db_error("recovery install: admission invalidated or hook ownership unavailable");

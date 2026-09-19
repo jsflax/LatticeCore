@@ -29,5 +29,10 @@ private:
 // production never calls this and receives the real worker plus periodic retry.
 struct recovery_refresh_test_access {
     static void use_manual_preparation(lattice_db&);
+    // Synchronous deterministic probe for tests configured as manual. Counts
+    // every writer inspection in this call, without installing a user callback.
+    // A prepared reader may publish, but this seam does not deliver/ack it.
+    // The test must serialize requests and retain its owner for the whole call.
+    static bool prepare_once(lattice_db&, size_t& writer_inspections);
 };
 } // namespace lattice::detail

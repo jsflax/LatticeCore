@@ -80,7 +80,10 @@ TEST_F(ScopedRecoveryUUID, ExistingSpellingStablePKAndHeldObserverSurviveOnFileA
         clear_history();auto r=request();r.full_rows={person(canonical,actual==canonical?upper_uuid(canonical):canonical,"installed")};
         r.initial_row_grants={{"TestPerson",canonical}};const auto original=r.full_rows[0].values;
         int callbacks=0;auto token=held.observe([&](lattice::object_change<TestPerson>&){++callbacks;EXPECT_EQ(held.name.detach(),"installed");});
-        ASSERT_EQ(run(r).transaction.state,state::committed);
+        const auto installed=run(r);std::string primary;
+        if(installed.transaction.primary_error)try{std::rethrow_exception(installed.transaction.primary_error);}
+        catch(const std::exception& e){primary=e.what();}catch(...){primary="non-standard primary error";}
+        ASSERT_EQ(installed.transaction.state,state::committed)<<primary;
         EXPECT_EQ(held.id(),pk);EXPECT_EQ(held.global_id(),actual);EXPECT_EQ(held.name.detach(),"installed");EXPECT_GT(callbacks,0);
         EXPECT_EQ(text("SELECT globalId FROM TestPerson"),actual);EXPECT_EQ(r.full_rows[0].values,original);
         EXPECT_EQ(r.identity.content_digest,"content1");EXPECT_EQ(r.identity.manifest_digest,"manifest1");

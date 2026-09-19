@@ -501,7 +501,7 @@ TEST_F(RecoveryObligationStore, AddressedPointUpdateWorkDoesNotScanRetainedLedge
     committed([&](auto& db){
         struct vm_budget {
             sqlite3* handle; int steps=0;
-            explicit vm_budget(sqlite3* db):handle(db) { sqlite3_progress_handler(handle,1,[](void* p){auto& b=*static_cast<vm_budget*>(p);return ++b.steps>20000;},this); }
+            explicit vm_budget(sqlite3* db):handle(db) { sqlite3_progress_handler(handle,1,[](void* p) -> int {auto& b=*static_cast<vm_budget*>(p);return ++b.steps>20000;},this); }
             ~vm_budget(){sqlite3_progress_handler(handle,0,nullptr,nullptr);}
         };
         { vm_budget bound(db.handle()); EXPECT_EQ(s.claim_export(address,{last.record.original_id}).canonical_original_ids.size(),1u); EXPECT_LE(bound.steps,20000); }

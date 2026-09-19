@@ -1734,12 +1734,13 @@ private:
             for (const auto& column : columns) {
                 const auto& name = std::get<std::string>(column.at("name"));
                 constexpr std::string_view suffix = "_minLat";
-                if (name.size() <= suffix.size() || !name.ends_with(suffix)) continue;
+                if (name.size() <= suffix.size() ||
+                    name.compare(name.size() - suffix.size(), suffix.size(), suffix.data(), suffix.size()) != 0) continue;
                 const auto prefix = name.substr(0, name.size() - suffix.size());
-                if (!physical_names.contains(prefix) &&
-                    physical_names.contains(prefix + "_maxLat") &&
-                    physical_names.contains(prefix + "_minLon") &&
-                    physical_names.contains(prefix + "_maxLon")) names.push_back(prefix);
+                if (physical_names.find(prefix) == physical_names.end() &&
+                    physical_names.find(prefix + "_maxLat") != physical_names.end() &&
+                    physical_names.find(prefix + "_minLon") != physical_names.end() &&
+                    physical_names.find(prefix + "_maxLon") != physical_names.end()) names.push_back(prefix);
             }
             return recovery_field_names.emplace(table, names.dump()).first->second;
         };

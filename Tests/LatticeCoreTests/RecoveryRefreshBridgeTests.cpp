@@ -26,7 +26,7 @@ void refresh_destroy(void* pointer) { ++static_cast<refresh_receipt*>(pointer)->
 
 TEST(RecoveryRefreshBridge, RefForwardingDeliversWithoutAuditPayloadAndCoalescesWitness) {
     TempDB path("refresh-bridge-forwarding"); auto ref = recovery_ref(path.str());
-    auto owner = lattice::swift_lattice_ref::shared_for_lattice(ref->get());
+    std::shared_ptr<lattice::lattice_db> owner = lattice::swift_lattice_ref::shared_for_lattice(ref->get());
     ASSERT_TRUE(owner);
     const auto installed = lattice::detail::recovery_writer_access::install(owner, [&](auto&) {
         lattice::detail::bump_recovery_witness(*owner);

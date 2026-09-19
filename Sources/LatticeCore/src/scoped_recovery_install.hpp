@@ -30,6 +30,7 @@ struct recovery_pending_grant {
     recovery_row_key target;
     recovery_pending_outcome outcome;
 };
+enum class recovery_identity_mode { exact_string, uuid };
 struct scoped_recovery_request {
     receive_install_binding binding;
     receive_install_identity identity;
@@ -46,6 +47,11 @@ struct scoped_recovery_request {
     // Exact original identity + target + H-bound outcome. Also establishes
     // scope for absent-from-full lost-ACK inserts and never-dispatched inserts.
     std::vector<recovery_pending_grant> pending;
+    // Explicit per-scope matching policy. UUID mode changes comparison only:
+    // retained local row spelling/PK, source payload and AuditLog bytes survive.
+    // It requires complete NOCASE unique globalId keys and never migrates an
+    // existing exact-string scope declaration implicitly.
+    recovery_identity_mode identity_mode = recovery_identity_mode::exact_string;
 };
 struct scoped_recovery_result {
     recovery_install_result transaction;

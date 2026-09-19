@@ -1,5 +1,6 @@
 #include "scoped_recovery_install.hpp"
 #include "recovery_witness.hpp"
+#include "canonical_writer_adapter.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
@@ -28,6 +29,19 @@ std::string fold(std::string s) {
     return s;
 }
 key folded(key k) { k.global_id=fold(std::move(k.global_id)); return k; }
+struct identities {
+    bool uuid;
+    explicit identities(recovery_identity_mode mode) : uuid(mode==recovery_identity_mode::uuid) {
+        require(mode==recovery_identity_mode::exact_string || mode==recovery_identity_mode::uuid,
+            "recovery invalid identity mode");
+    }
+    std::string id(const std::string& value) const {
+        return uuid ? canonical_writer_adapter::uuid_key(value) : value;
+    }
+    key normalized(const key& value) const {return {value.table,id(value.global_id)};}
+    bool equal(const std::string& one,const std::string& two) const {return id(one)==id(two);}
+    std::string collation() const {return uuid ? " COLLATE NOCASE" : "";}
+};
 uint64_t scalar_bytes(const recovery_scalar& v) {
     if (auto* p=std::get_if<std::string>(&v)) return p->size();
     if (auto* p=std::get_if<blob>(&v)) return p->size();
@@ -91,6 +105,45 @@ struct stmt {
         return {reinterpret_cast<const char*>(bytes),static_cast<size_t>(size)};
     }
 };
+// Only the explicitly selected UUID mode calls these. A complete unique
+// NOCASE key makes each normalized globalId lookup indexed and unambiguous.
+// Partial, expression, multi-column or binary-only keys cannot establish it.
+void require_uuid_key(sqlite3* db,const std::string& table,work_budget& budget) {
+    stmt indexes(db,"PRAGMA main.index_list("+quote(table)+")");
+    bool found=false;
+    while(indexes.next()) {
+        budget.charge(8);
+        const auto unique=indexes.number(2),partial=indexes.number(4);
+        require((unique==0||unique==1)&&(partial==0||partial==1),"recovery corrupt index flags");
+        if(!unique||partial) continue;
+        const auto name=indexes.string(1,budget.limits.field_bytes);budget.identity(name);
+        stmt columns(db,"PRAGMA main.index_xinfo("+quote(name)+")");
+        size_t count=0;bool match=true;
+        while(columns.next()) {
+            budget.charge(8);const auto used=columns.number(5);
+            require(used==0||used==1,"recovery corrupt index key flag");
+            if(!used)continue;
+            ++count;
+            if(columns.number(1)<0 || sqlite3_column_type(columns.p,2)!=SQLITE_TEXT ||
+                sqlite3_column_type(columns.p,4)!=SQLITE_TEXT) {match=false;continue;}
+            const auto column=columns.string(2,budget.limits.field_bytes);
+            const auto collation=columns.string(4,budget.limits.field_bytes);
+            budget.identity(column);budget.identity(collation);
+            match=match && column=="globalId" && fold(collation)=="nocase";
+        }
+        found=found || (count==1&&match);
+    }
+    require(found,"recovery UUID identity requires a complete NOCASE unique key");
+}
+std::string local_uuid_spelling(sqlite3* db,const key& canonical,work_budget& budget) {
+    stmt row(db,"SELECT globalId FROM main."+quote(canonical.table)+" WHERE globalId=? COLLATE NOCASE LIMIT 2");
+    row.text(1,canonical.global_id);
+    if(!row.next())return canonical.global_id;
+    auto actual=row.string(0,36);budget.identity(actual);
+    require(canonical_writer_adapter::uuid_key(actual)==canonical.global_id&&!row.next(),
+        "recovery ambiguous or corrupt local UUID identity");
+    return actual;
+}
 void execute(sqlite3* db,const std::string& sql) { stmt s(db,sql);s.done(); }
 void changed(sqlite3* db) { require(sqlite3_changes(db)==1,"recovery metadata/effect write was ignored"); }
 int64_t checked_add(int64_t a,uint64_t b,int64_t maximum) {
@@ -207,14 +260,14 @@ void valid_value(const recovery_outbox_column& c,const recovery_scalar& v) {
         (type=="blob"&&std::holds_alternative<blob>(v)),"recovery value violates actual column type");
     if(auto* d=std::get_if<double>(&v)) require(std::isfinite(*d),"recovery nonfinite row value");
 }
-void validate_row(const recovery_outbox_table& table,const key& k,const values& row) {
+void validate_row(const recovery_outbox_table& table,const key& k,const values& row,const identities& ids) {
     const size_t expected=table.columns.size()-(table.kind==recovery_outbox_table_kind::model?1:0);
     require(row.size()==expected && !row.count("id"),"recovery incomplete final row or remote local PK");
     for(const auto& c:table.columns) {
         if(c.name=="id") continue;
         auto it=row.find(c.name);require(it!=row.end(),"recovery missing final column");valid_value(c,it->second);
     }
-    require(std::get<std::string>(row.at("globalId"))==k.global_id,"recovery global identity disagreement");
+    require(ids.equal(std::get<std::string>(row.at("globalId")),k.global_id),"recovery global identity disagreement");
 }
 values captured_values(const recovery_outbox_capture& capture,const recovery_outbox_current_row& row) {
     values result;
@@ -292,7 +345,7 @@ struct planned_row {
     bool unresolved=false;
 };
 void replay(const recovery_outbox_audit& audit,const recovery_outbox_table& table,
-            planned_row& row,work_budget& budget) {
+            planned_row& row,work_budget& budget,const identities& ids) {
     const auto names=strict_json(audit.changed_names_json);
     require(names.is_array(),"recovery changed names are not an array");
     if(names.size()==1&&names[0].is_string()&&names[0].get<std::string>()=="__lattice_filter_removal")
@@ -311,7 +364,9 @@ void replay(const recovery_outbox_audit& audit,const recovery_outbox_table& tabl
         const auto it=fields.find(name);require(it!=fields.end(),"recovery missing changed field value");
         if(name=="id") continue; // immutable local PK is never replayed from another origin
         if(name=="globalId") {
-            require(original_scalar(*it,c)==recovery_scalar(audit.global_row_id),"recovery original global identity mismatch");continue;
+            const auto original=original_scalar(*it,c);
+            require(ids.uuid ? ids.equal(std::get<std::string>(original),audit.global_row_id) :
+                original==recovery_scalar(audit.global_row_id),"recovery original global identity mismatch");continue;
         }
         recovery_scalar v;
         if(latest.count(name)) {
@@ -333,7 +388,7 @@ std::string declaration(const scoped_recovery_request& r,uint64_t maximum) {
         number(value.size());require(value.size()<=maximum-result.size(),"recovery declaration byte budget exceeded");
         result.append(value);
     };
-    number(1);number(r.model_tables.size());for(const auto& name:r.model_tables)text(name);
+    number(r.identity_mode==recovery_identity_mode::uuid?2:1);number(r.model_tables.size());for(const auto& name:r.model_tables)text(name);
     number(r.scoped_link_tables.size());for(const auto& name:r.scoped_link_tables)text(name);
     number(r.relations.size());for(const auto& link:r.relations){text(link.table);text(link.lhs_model);text(link.rhs_model);}
     return result;
@@ -371,6 +426,7 @@ void check_relation_metadata(sqlite3* db,const scoped_recovery_request& request,
 }
 void install_body(lattice_db& owner,database& writer,const scoped_recovery_request& request,
                   const scoped_recovery_limits& limits) {
+    const identities ids(request.identity_mode);
     auto* db=writer.handle();work_budget budget{limits};metadata durable(db,limits);
     require(request.identity.mode==receive_install_mode::full,"recovery model installer supports full scope only");
     require(request.model_tables.size()<=limits.capture.tables&&request.relations.size()<=limits.capture.tables&&
@@ -407,9 +463,10 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         require(old->second==declared,"recovery scope declaration changed");
     }
     else require(request.identity.expected_revision==0,"recovery installed scope membership is missing");
-    std::map<key,key> targets; // folded->original; refusal instead of implicit case canonicalization
-    auto target=[&](const key& k) {
-        budget.identity(k.table);budget.identity(k.global_id);
+    std::map<key,key> targets; // folded -> exact key or explicit canonical UUID key
+    auto target=[&](const key& input) {
+        budget.identity(input.table);budget.identity(input.global_id);
+        const key k=ids.normalized(input);
         require(k.global_id.find('\0')==std::string::npos,"recovery NUL global row identity is unsupported by NOCASE keys");
         require(admitted_tables.count(k.table),"recovery row target is outside declared scope tables");
         const auto normalized=folded(k);
@@ -417,30 +474,36 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         if(found!=targets.end()) require(found->second==k,"recovery case-alias input target");
         else {require(targets.size()<limits.targets,"recovery target union limit exceeded");targets.emplace(normalized,k);}
         if(auto own=durable.ownership.find(normalized);own!=durable.ownership.end())
-            require(own->second.channel==request.binding.channel&&own->second.target==k,"recovery target owned by another scope or spelling");
+            require(own->second.channel==request.binding.channel&&ids.normalized(own->second.target)==k,"recovery target owned by another scope or spelling");
+        return k;
     };
     for(const auto& [_,m]:durable.ownership)if(m.channel==request.binding.channel)target(m.target);
     std::set<key> granted;
     for(const auto& k:request.initial_row_grants) {
         require(request.identity.expected_revision==0,"recovery initial adoption after installation is unsupported");
-        target(k);require(granted.insert(k).second,"recovery duplicate initial row grant");
+        require(granted.insert(target(k)).second,"recovery duplicate initial row grant");
     }
     std::map<std::string,const recovery_pending_grant*> receipts;
     for(const auto& grant:request.pending) {
         budget.identity(grant.audit_global_id);
         require(grant.audit_global_id.find('\0')==std::string::npos,"recovery NUL audit identity is unsupported by NOCASE keys");
-        target(grant.target);granted.insert(grant.target);
-        require(receipts.emplace(grant.audit_global_id,&grant).second,"recovery duplicate pending identity grant");
+        granted.insert(target(grant.target));
+        require(receipts.emplace(ids.id(grant.audit_global_id),&grant).second,"recovery duplicate pending identity grant");
         require(grant.outcome==recovery_pending_outcome::committed_effect||grant.outcome==recovery_pending_outcome::committed_noop||
             grant.outcome==recovery_pending_outcome::not_committed,"recovery unknown or policy-only pending outcome");
     }
     std::map<key,const recovery_full_row*> full;
     for(const auto& row:request.full_rows) {
-        target(row.key);require(full.emplace(row.key,&row).second,"recovery duplicate full row");
+        require(full.emplace(target(row.key),&row).second,"recovery duplicate full row");
         require(row.values.size()<=limits.capture.columns_per_table,"recovery full row field count exceeded");
         for(const auto& [name,value]:row.values){budget.identity(name);budget.value(value);}
     }
-    for(const auto& [_,k]:targets)requested[k.table].push_back(k.global_id);
+    if(ids.uuid) {
+        for(const auto& [table,_]:requested)require_uuid_key(db,table,budget);
+        require_uuid_key(db,"AuditLog",budget);
+    }
+    for(const auto& [_,k]:targets)
+        requested[k.table].push_back(ids.uuid?local_uuid_spelling(db,k,budget):k.global_id);
     auto current=capture_recovery_rows(owner,requested,limits.capture);
     std::map<std::string,recovery_outbox_table> schemas;
     for(auto& table:current.tables) {
@@ -451,14 +514,14 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     check_relation_metadata(db,request,schemas,limits);
     std::map<key,planned_row> plan;
     for(const auto& row:current.current_rows) {
-        key k{current.tables.at(row.table_index).name,row.lookup_global_id};
+        key k=ids.normalized({current.tables.at(row.table_index).name,row.lookup_global_id});
         planned_row p;p.local_id=row.local_row_id;
         if(row.present) {
             p.before=captured_values(current,row);
             require(durable.ownership.count(folded(k))||granted.count(k),"recovery existing unowned row needs explicit grant");
         }
         if(auto input=full.find(k);input!=full.end()) {
-            validate_row(schemas.at(k.table),k,input->second->values);
+            validate_row(schemas.at(k.table),k,input->second->values,ids);
             p.after=input->second->values;
             for(auto& [name,value]:*p.after)if(fold(column(schemas.at(k.table),name).declared_type)=="real"&&std::holds_alternative<int64_t>(value))
                 value=static_cast<double>(std::get<int64_t>(value));
@@ -472,48 +535,66 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     std::vector<const recovery_outbox_audit*> accepted;
     std::set<std::string> classified;
     for(const auto& audit:pending.audit) {
-        const key k{audit.table_name,audit.global_row_id};
-        auto receipt=receipts.find(audit.global_id);
-        require(receipt!=receipts.end()&&receipt->second->target==k,"recovery pending identity lacks exact target-bound outcome");
-        require(classified.insert(audit.global_id).second,"recovery duplicate original AuditLog identity");
+        const key k=ids.normalized({audit.table_name,audit.global_row_id});
+        auto receipt=receipts.find(ids.id(audit.global_id));
+        require(receipt!=receipts.end()&&ids.normalized(receipt->second->target)==k,"recovery pending identity lacks exact target-bound outcome");
+        require(classified.insert(ids.id(audit.global_id)).second,"recovery duplicate original AuditLog identity");
         if(receipt->second->outcome==recovery_pending_outcome::not_committed) {
-            auto& row=plan.at(k);row.unresolved=true;replay(audit,schemas.at(k.table),row,budget);
+            auto& row=plan.at(k);row.unresolved=true;replay(audit,schemas.at(k.table),row,budget,ids);
         } else accepted.push_back(&audit);
     }
     // An explicit grant may refer to a receipt already settled locally, but
     // cannot acquire an unrelated row without an actual original audit record.
-    for(const auto& grant:request.pending)if(!classified.count(grant.audit_global_id)) {
+    for(const auto& grant:request.pending)if(!classified.count(ids.id(grant.audit_global_id))) {
         stmt audit(db,"SELECT a.tableName,a.globalRowId,ss.is_synchronized FROM main.AuditLog a "
-            "LEFT JOIN main._lattice_sync_state ss ON ss.audit_entry_id=a.id AND ss.sync_id=?1 WHERE a.globalId=?2 LIMIT 2");
+            "LEFT JOIN main._lattice_sync_state ss ON ss.audit_entry_id=a.id AND ss.sync_id=?1 WHERE a.globalId=?2"+ids.collation()+" LIMIT 2");
         audit.text(1,request.binding.channel);audit.text(2,grant.audit_global_id);
         require(audit.next()&&audit.string(0,limits.field_bytes)==grant.target.table&&
-            audit.string(1,limits.field_bytes)==grant.target.global_id&&audit.number(2)==1&&!audit.next(),
+            ids.equal(audit.string(1,limits.field_bytes),grant.target.global_id)&&audit.number(2)==1&&!audit.next(),
             "recovery pending target grant has no retained original channel receipt");
         require(grant.outcome!=recovery_pending_outcome::not_committed,"recovery not-committed outcome contradicts settled local receipt");
     }
+    // Work on owned copies only. A surviving local spelling is authoritative
+    // for storage, not a rewrite of the authenticated source values/digests.
+    if(ids.uuid) for(auto& [k,row]:plan) {
+        if(row.after&&row.before)(*row.after)["globalId"]=row.before->at("globalId");
+    }
     std::set<key> membership;
     for(const auto& [k,row]:plan) {
-        if(row.after){validate_row(schemas.at(k.table),k,*row.after);membership.insert(k);}
-        else if(row.unresolved)membership.insert(k);
+        if(row.after) {
+            validate_row(schemas.at(k.table),k,*row.after,ids);
+            membership.insert({k.table,ids.uuid?std::get<std::string>(row.after->at("globalId")):k.global_id});
+        } else if(row.unresolved)membership.insert({k.table,
+            ids.uuid&&row.before?std::get<std::string>(row.before->at("globalId")):k.global_id});
     }
     // Final link endpoint closure is explicit and checked before any model
     // effect. This slice does not permit references into another scope.
     std::map<std::string,recovery_relation> relations;
     for(const auto& relation:request.relations)relations.emplace(relation.table,relation);
     std::map<std::string,std::set<std::pair<std::string,std::string>>> pairs;
-    for(const auto& [k,row]:plan)if(row.after&&scoped_links.count(k.table)) {
+    for(auto& [k,row]:plan)if(row.after&&scoped_links.count(k.table)) {
         const auto& relation=relations.at(k.table);
+        if(ids.uuid) for(const auto& endpoint:{std::pair{relation.lhs_model,std::string("lhs")},
+                                                std::pair{relation.rhs_model,std::string("rhs")}}) {
+            const auto target=ids.normalized({endpoint.first,std::get<std::string>(row.after->at(endpoint.second))});
+            const auto found=plan.find(target);
+            require(found!=plan.end()&&found->second.after,"recovery link endpoint is absent or outside this scope");
+            (*row.after)[endpoint.second]=found->second.after->at("globalId");
+        }
         const auto lhs=std::get<std::string>(row.after->at("lhs"));const auto rhs=std::get<std::string>(row.after->at("rhs"));
         require(!lhs.empty()&&!rhs.empty(),"recovery empty link endpoint");
         for(const auto& endpoint:{key{relation.lhs_model,lhs},key{relation.rhs_model,rhs}}) {
-            const auto found=plan.find(endpoint);
+            const auto found=plan.find(ids.normalized(endpoint));
             require(found!=plan.end()&&found->second.after,"recovery link endpoint is absent or outside this scope");
         }
         require(pairs[k.table].emplace(lhs,rhs).second,"recovery duplicate link endpoint pair");
-        stmt collision(db,"SELECT globalId FROM main."+quote(k.table)+" WHERE lhs=? AND rhs=? LIMIT 2");
+        stmt collision(db,"SELECT globalId FROM main."+quote(k.table)+" WHERE lhs=?"+ids.collation()+
+            " AND rhs=?"+ids.collation()+(ids.uuid?"":" LIMIT 2"));
         collision.text(1,lhs);collision.text(2,rhs);
+        uint64_t collisions=0;
         while(collision.next()) {
-            key existing{k.table,collision.string(0,limits.field_bytes)};
+            if(ids.uuid)require(collisions++<limits.targets,"recovery link collision check limit exceeded");
+            key existing=ids.normalized({k.table,collision.string(0,limits.field_bytes)});
             auto found=plan.find(existing);
             require(existing==k || (found!=plan.end()&&!found->second.after),"recovery link pair overlaps a preserved row");
         }
@@ -526,7 +607,7 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
                 references.text(1,k.global_id);uint64_t n=0;
                 while(references.next()) {
                     require(n++<limits.targets,"recovery reference check limit exceeded");
-                    key link{relation.table,references.string(0,limits.field_bytes)};
+                    key link=ids.normalized({relation.table,references.string(0,limits.field_bytes)});
                     auto it=plan.find(link);
                     require(it!=plan.end()&&!it->second.after,"recovery deletion would orphan a preserved outside-scope link");
                 }
@@ -545,7 +626,7 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     execute(db,"UPDATE main._SyncControl SET disabled=1 WHERE id=1");changed(db);
     {stmt flag(db,"SELECT disabled FROM main._SyncControl WHERE id=1");require(flag.next()&&flag.number(0)==1&&!flag.next(),"recovery audit suppression failed");}
     auto remove=[&](const key& k) {
-        stmt sql(db,"DELETE FROM main."+quote(k.table)+" WHERE globalId=?");sql.text(1,k.global_id);sql.done();changed(db);
+        stmt sql(db,"DELETE FROM main."+quote(k.table)+" WHERE globalId=?"+ids.collation());sql.text(1,k.global_id);sql.done();changed(db);
     };
     // Remove doomed links before models; surviving model rows use UPDATE and
     // retain their physical PK. Final pair changes use DELETE/INSERT for links
@@ -558,7 +639,7 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         std::string sql=update?"UPDATE main."+quote(k.table)+" SET ":"INSERT INTO main."+quote(k.table)+"(";
         int index=0;
         for(const auto& [name,_]:*row.after){if(index++)sql+=",";sql+=quote(name);if(update)sql+="=?";}
-        if(update)sql+=" WHERE globalId=?";
+        if(update)sql+=" WHERE globalId=?"+ids.collation();
         else {sql+=") VALUES(";for(int i=0;i<index;++i){if(i)sql+=",";sql+="?";}sql+=")";}
         stmt effect(db,sql);int at=1;for(const auto& [_,v]:*row.after)effect.value(at++,v);
         if(update)effect.text(at,k.global_id);effect.done();changed(db);
@@ -567,9 +648,16 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     for(const auto& [k,row]:plan)if(scoped_links.count(k.table))write(k,row);
     // Positive postcondition before publication. A user trigger/IGNORE cannot
     // silently claim the planned final state or replace a surviving local PK.
+    if(ids.uuid) {
+        for(auto& [_,keys]:requested)keys.clear();
+        for(const auto& [k,row]:plan) {
+            const auto* value=row.after?&*row.after:row.before?&*row.before:nullptr;
+            requested[k.table].push_back(value?std::get<std::string>(value->at("globalId")):k.global_id);
+        }
+    }
     auto actual=capture_recovery_rows(owner,requested,limits.capture);
     for(const auto& row:actual.current_rows) {
-        key k{actual.tables.at(row.table_index).name,row.lookup_global_id};const auto& expected=plan.at(k);
+        key k=ids.normalized({actual.tables.at(row.table_index).name,row.lookup_global_id});const auto& expected=plan.at(k);
         require(row.present==expected.after.has_value(),"recovery final row presence mismatch");
         if(row.present) {
             require(captured_values(actual,row)==*expected.after,"recovery final row value mismatch");

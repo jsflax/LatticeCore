@@ -1,10 +1,13 @@
 #include "sync_snapshot_source.hpp"
+#include "canonical_source_capture.hpp"
 #include "sync_recovery_values.hpp"
 #include <lattice/lattice.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <map>
+#include <tuple>
 
 namespace lattice::detail::sync_recovery {
 namespace {
@@ -312,6 +315,221 @@ unsealed_materialization capture(lattice_db& owner, const std::vector<source_rel
     held.finish();
     return result;
 }
+
+using source_key = std::pair<std::string,std::string>;
+std::string canonical_uuid(const std::string& id) {
+    check(id.size()==36,"canonical source requires UUID identities");
+    auto key=nocase_key(id);
+    for(size_t i=0;i<key.size();++i) {
+        const char c=key[i];
+        check((i==8||i==13||i==18||i==23)?c=='-':
+            ((c>='0'&&c<='9')||(c>='a'&&c<='f')),"canonical source requires UUID identities");
+    }
+    return key;
+}
+std::vector<uint8_t> source_bytes(const std::string& s) { return {s.begin(),s.end()}; }
+std::string source_integer_column(const std::string& name) {
+    return "CASE WHEN typeof("+name+")='integer' THEN "+name+" END AS "+name;
+}
+
+unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
+    const canonical_store_binding& binding,const std::vector<source_relation>& scope,
+    std::optional<int64_t> base,const std::vector<canonical_capture_request>& requests,
+    const canonical_capture_limits& b,const std::function<void(size_t,uint64_t)>& after_batch) {
+    validate_budget(b.rows);
+    check(!scope.empty()&&scope.size()<=b.rows.tables&&b.requests>0&&b.requests<=4096&&
+        b.requested_targets>0&&b.requested_targets<=4096&&b.marker_batch>0&&b.marker_batch<=4096&&
+        requests.size()<=b.requests,"invalid canonical capture limits");
+    const auto& l=b.store;
+    check(l.markers>=0&&l.marker_bytes>=0&&l.receipts>=0&&l.receipt_bytes>=0&&l.batch_identities>0&&
+        l.identity_bytes>=36&&l.identity_bytes<=256&&l.operation_bytes>=36&&l.operation_bytes<=256,
+        "invalid canonical storage limits");
+    for(const auto* id:{&binding.source,&binding.epoch,&binding.scope,&binding.schema})
+        check(!id->empty()&&id->size()<=static_cast<size_t>(l.identity_bytes),"canonical source binding too large");
+    auto sorted=scope;
+    std::sort(sorted.begin(),sorted.end(),[](const auto& a,const auto& z){return a.table<z.table;});
+    for(size_t i=0;i<sorted.size();++i) {
+        (void)quote_source_identifier(sorted[i].table);
+        check(i==0||sorted[i-1].table!=sorted[i].table,"duplicate canonical source relation");
+    }
+    uint64_t target_count=0;
+    std::optional<std::string> previous_original;
+    for(const auto& q:requests) {
+        check(canonical_uuid(q.original_id)==q.original_id,"canonical original key is not normalized");
+        check(!previous_original||*previous_original<q.original_id,"duplicate or unordered canonical receipt request");
+        previous_original=q.original_id;
+        check(!q.targets.empty()&&q.targets.size()<=b.requested_targets-target_count,"canonical requested target limit exceeded");
+        target_count+=q.targets.size();std::set<source_key> unique;
+        for(const auto& t:q.targets) {
+            check(t.table.size()<=256&&canonical_uuid(t.global_id)==t.global_id,
+                "canonical target key is not normalized");
+            check(unique.emplace(t.table,t.global_id).second,"duplicate canonical requested target");
+        }
+    }
+    view held(owner);unsealed_canonical_capture result;
+    std::string state_sql="SELECT ";
+    for(const char* name:{"id","version","head","floor","markers","marker_bytes","receipts","receipt_bytes",
+        "max_markers","max_marker_bytes","max_receipts","max_receipt_bytes","max_batch","max_identity","max_operation"})
+        state_sql+=source_integer_column(name)+",";
+    state_sql+="CASE WHEN typeof(source)='blob' AND length(source)<=256 THEN source END AS source,"
+        "CASE WHEN typeof(epoch)='blob' AND length(epoch)<=256 THEN epoch END AS epoch,"
+        "CASE WHEN typeof(scope)='blob' AND length(scope)<=256 THEN scope END AS scope,"
+        "CASE WHEN typeof(schema_id)='blob' AND length(schema_id)<=256 THEN schema_id END AS schema_id "
+        "FROM main._lattice_canonical_store LIMIT 2";
+    const auto state=held.query(state_sql);
+    check(state.size()==1,"canonical source store singleton missing");const auto& metadata=state.front();
+    check(integer(metadata,"id")==1&&integer(metadata,"version")==1&&byte_string(metadata,"source")==binding.source&&
+        byte_string(metadata,"epoch")==binding.epoch&&byte_string(metadata,"scope")==binding.scope&&
+        byte_string(metadata,"schema_id")==binding.schema,"canonical source binding mismatch");
+    check(integer(metadata,"max_markers")==l.markers&&integer(metadata,"max_marker_bytes")==l.marker_bytes&&
+        integer(metadata,"max_receipts")==l.receipts&&integer(metadata,"max_receipt_bytes")==l.receipt_bytes&&
+        integer(metadata,"max_batch")==l.batch_identities&&integer(metadata,"max_identity")==l.identity_bytes&&
+        integer(metadata,"max_operation")==l.operation_bytes,"canonical source limits mismatch");
+    result.head=integer(metadata,"head");result.floor=integer(metadata,"floor");
+    check(result.floor>=0&&result.head>=result.floor,"canonical source frontier is corrupt");
+    for(const auto& field:{std::pair{"markers",l.markers},std::pair{"marker_bytes",l.marker_bytes},
+                          std::pair{"receipts",l.receipts},std::pair{"receipt_bytes",l.receipt_bytes}})
+        check(integer(metadata,field.first)>=0&&integer(metadata,field.first)<=field.second,"canonical source counter is corrupt");
+    if(base)check(*base>=result.floor&&*base<=result.head,"canonical source base retired or ahead");
+    // Validate the entire retained metadata set BEFORE filtering by (B,H]. A
+    // bad SQLite storage class or an ahead-of-head position must not disappear
+    // behind the range predicate and turn a partial delta into a claimed H.
+    // These queries return constants/aggregates, never unbounded stored bytes.
+    const auto tables=held.query("SELECT wr FROM pragma_table_list WHERE schema='main' AND name IN "
+        "('_lattice_canonical_store','_lattice_canonical_touch','_lattice_canonical_receipt')");
+    check(tables.size()==3,"canonical source metadata schema missing");
+    for(const auto& table:tables)check(integer(table,"wr")==1,"canonical source metadata must be WITHOUT ROWID");
+    check(held.query("SELECT 1 AS invalid FROM main._lattice_canonical_touch WHERE "
+        "typeof(relation)!='blob' OR length(relation) NOT BETWEEN 1 AND ? OR "
+        "typeof(identity)!='blob' OR length(identity)!=36 OR typeof(position)!='integer' OR position<=? OR position>? OR "
+        "typeof(charge)!='integer' OR charge!=24+length(relation)+length(identity) LIMIT 1",
+        {l.identity_bytes,result.floor,result.head}).empty(),"canonical source retained marker is corrupt");
+    check(held.query("SELECT 1 AS invalid FROM main._lattice_canonical_receipt WHERE "
+        "typeof(original_id)!='blob' OR length(original_id)!=36 OR typeof(position)!='integer' OR position<=0 OR position>? OR "
+        "typeof(outcome)!='integer' OR outcome NOT IN(1,2,3) OR (relation IS NULL)!=(identity IS NULL) OR "
+        "(relation IS NOT NULL AND (typeof(relation)!='blob' OR length(relation) NOT BETWEEN 1 AND ? OR "
+        "typeof(identity)!='blob' OR length(identity)!=36)) OR typeof(charge)!='integer' OR "
+        "charge!=32+length(original_id)+COALESCE(length(relation),0)+COALESCE(length(identity),0) LIMIT 1",
+        {result.head,l.identity_bytes}).empty(),"canonical source retained receipt is corrupt");
+    const auto actual_markers=held.query("SELECT COUNT(*) AS n,COALESCE(SUM(charge),0) AS bytes FROM main._lattice_canonical_touch");
+    const auto actual_receipts=held.query("SELECT COUNT(*) AS n,COALESCE(SUM(charge),0) AS bytes FROM main._lattice_canonical_receipt");
+    check(actual_markers.size()==1&&actual_receipts.size()==1&&
+        integer(actual_markers[0],"n")==integer(metadata,"markers")&&
+        integer(actual_markers[0],"bytes")==integer(metadata,"marker_bytes")&&
+        integer(actual_receipts[0],"n")==integer(metadata,"receipts")&&
+        integer(actual_receipts[0],"bytes")==integer(metadata,"receipt_bytes"),
+        "canonical source counters differ from retained storage");
+    const auto cookie=held.query("PRAGMA main.schema_version");
+    check(cookie.size()==1,"canonical source schema cookie missing");result.schema_cookie=integer(cookie.front(),"schema_version");
+    std::map<std::string,size_t> layouts;
+    for(const auto& relation:sorted) {
+        layouts.emplace(relation.table,result.layouts.size());result.layouts.push_back(layout(held,relation,b.rows));
+        check(result.layouts.back().identity_collation=="NOCASE","canonical source requires indexed NOCASE identities");
+    }
+    auto charge=[&](uint64_t bytes) {
+        check(bytes<=b.rows.wire.total_bytes-result.copied_logical_bytes,"canonical capture logical-byte budget exceeded");
+        result.copied_logical_bytes+=bytes;
+    };
+    std::set<source_key> selected;
+    auto select=[&](const source_key& k) {
+        check(layouts.count(k.first),"canonical identity is outside complete declared scope");
+        check(canonical_uuid(k.second)==k.second,"canonical stored key is not normalized");
+        if(selected.count(k))return;
+        check(selected.size()<b.rows.wire.total_rows,"canonical source identity budget exceeded");
+        charge(32+k.first.size()+k.second.size());selected.insert(k);
+    };
+    size_t batches=0;
+    if(after_batch)after_batch(batches,held.generation);
+    if(!base) {
+        for(const auto& table:result.layouts) {
+            std::optional<std::string> last;std::optional<std::string> last_index;
+            std::set<std::string> normalized_ids;
+            for(;;) {
+                std::string sql="SELECT CASE WHEN typeof(r.globalId)='text' AND length(CAST(r.globalId AS BLOB))=36 "
+                    "THEN CAST(r.globalId AS BLOB) END AS globalId FROM main."+quote_source_identifier(table.table)+" AS r";
+                std::vector<column_value_t> params;
+                if(last){sql+=" WHERE r.globalId>? COLLATE "+table.identity_collation;params.push_back(*last);}
+                sql+=" ORDER BY r.globalId COLLATE "+table.identity_collation+" LIMIT ?";
+                params.push_back(static_cast<int64_t>(std::min<uint64_t>(b.rows.wire.rows_per_page,b.rows.wire.total_rows-selected.size()+1)));
+                const auto ids=held.query(sql,params);if(ids.empty())break;
+                for(const auto& row:ids) {
+                    const auto id=byte_string(row,"globalId");const auto normalized=canonical_uuid(id);
+                    const auto index=table.identity_collation=="NOCASE"?normalized:id;
+                    check(!last_index||*last_index<index,"canonical source keyset is not increasing");
+                    check(normalized_ids.insert(normalized).second,"canonical source UUID alias collision");
+                    select({table.table,normalized});last=id;last_index=index;
+                }
+                if(after_batch)after_batch(++batches,held.generation);
+            }
+        }
+    } else {
+        std::optional<std::tuple<int64_t,std::string,std::string>> cursor;
+        for(;;) {
+            std::string sql="SELECT "+source_integer_column("position")+",CASE WHEN typeof(relation)='blob' AND length(relation) BETWEEN 1 AND 256 THEN relation END AS relation,"
+                "CASE WHEN typeof(identity)='blob' AND length(identity)=36 THEN identity END AS identity,"+source_integer_column("charge")+" "
+                "FROM main._lattice_canonical_touch AS m INDEXED BY _lattice_canonical_touch_position WHERE m.position>? AND m.position<=?";
+            std::vector<column_value_t> params{*base,result.head};
+            if(cursor){sql+=" AND (m.position,m.relation,m.identity)>(?,?,?)";params.push_back(std::get<0>(*cursor));
+                params.push_back(source_bytes(std::get<1>(*cursor)));params.push_back(source_bytes(std::get<2>(*cursor)));}
+            sql+=" ORDER BY m.position,m.relation,m.identity LIMIT ?";params.push_back(static_cast<int64_t>(b.marker_batch));
+            const auto markers=held.query(sql,params);if(markers.empty())break;
+            for(const auto& marker:markers) {
+                const auto position=integer(marker,"position");const auto relation=byte_string(marker,"relation");const auto id=byte_string(marker,"identity");
+                check(position>*base&&position<=result.head&&integer(marker,"charge")==static_cast<int64_t>(24+relation.size()+id.size()),
+                    "canonical source marker is corrupt");
+                const auto next=std::tuple{position,relation,id};check(!cursor||*cursor<next,"canonical marker keyset is not increasing");
+                select({relation,id});cursor=next;
+            }
+            if(after_batch)after_batch(++batches,held.generation);
+        }
+    }
+    for(const auto& asked:requests) {
+        for(const auto& target:asked.targets)select({target.table,target.global_id});
+        const auto rows=held.query("SELECT "+source_integer_column("position")+","+source_integer_column("outcome")+","
+            "CASE WHEN relation IS NULL THEN NULL WHEN typeof(relation)='blob' AND length(relation) BETWEEN 1 AND 256 THEN relation END AS relation,"
+            "CASE WHEN identity IS NULL THEN NULL WHEN typeof(identity)='blob' AND length(identity)=36 THEN identity END AS identity,"
+            "typeof(relation) AS rt,typeof(identity) AS it,"+source_integer_column("charge")+" FROM main._lattice_canonical_receipt WHERE original_id=? LIMIT 2",
+            {source_bytes(asked.original_id)});
+        check(rows.size()<=1,"canonical source receipt identity collision");
+        canonical_source_receipt fact{asked.original_id,{}};charge(48+asked.original_id.size());
+        if(!rows.empty()) {
+            const auto& row=rows.front();const auto position=integer(row,"position"),outcome=integer(row,"outcome");
+            check(position>0&&position<=result.head&&outcome>=1&&outcome<=3,"canonical source receipt is corrupt");
+            const auto rt=string_value(row,"rt"),it=string_value(row,"it");std::optional<canonical_identity> target;
+            uint64_t bytes=32+asked.original_id.size();
+            if(rt=="blob"&&it=="blob") {
+                target=canonical_identity{byte_string(row,"relation"),byte_string(row,"identity")};
+                check(canonical_uuid(target->global_id)==target->global_id&&layouts.count(target->table),"canonical receipt target is outside scope");
+                check(std::find(asked.targets.begin(),asked.targets.end(),*target)!=asked.targets.end(),"canonical receipt target differs from requested original");
+                bytes+=target->table.size()+target->global_id.size();charge(target->table.size()+target->global_id.size());
+            } else check(rt=="null"&&it=="null","canonical source receipt target is corrupt");
+            check(integer(row,"charge")==static_cast<int64_t>(bytes),"canonical receipt charge is corrupt");
+            fact.stored=canonical_receipt{{asked.original_id,static_cast<canonical_receipt_outcome>(outcome),target},position};
+        }
+        result.receipts.push_back(std::move(fact));
+    }
+    for(const auto& key:selected) {
+        const auto& table=result.layouts.at(layouts.at(key.first));
+        const auto found=held.query("SELECT CASE WHEN typeof(globalId)='text' AND length(CAST(globalId AS BLOB))=36 "
+            "THEN CAST(globalId AS BLOB) END AS globalId FROM main."+quote_source_identifier(key.first)+
+            " WHERE globalId=? COLLATE NOCASE LIMIT 2",{key.second});
+        check(found.size()<=1,"canonical source UUID alias collision");
+        canonical_source_row row{{key.first,key.second},{}};
+        if(!found.empty()) {
+            const auto actual_id=byte_string(found.front(),"globalId");check(canonical_uuid(actual_id)==key.second,"canonical source row identity changed");
+            const auto remaining=b.rows.wire.total_bytes-result.copied_logical_bytes;
+            auto raw=copy_row(held,table,actual_id,b.rows,remaining);
+            const value_limits scalar_limit{static_cast<size_t>(b.rows.wire.string_bytes),b.rows.columns_per_table,256,
+                static_cast<size_t>(b.rows.wire.string_bytes),static_cast<size_t>(b.rows.wire.string_bytes)};
+            auto values=decode_values(raw.payload,scalar_limit);values.emplace("globalId",actual_id);
+            row.payload=encode_values(values,scalar_limit);charge(row.payload->size());
+        }
+        result.rows.push_back(std::move(row));
+        if(after_batch)after_batch(++batches,held.generation);
+    }
+    (void)held.query("SELECT 1 AS live");held.finish();return result;
+}
+
 } // namespace
 
 unsealed_materialization materialize_source(lattice_db& owner, const std::vector<source_relation>& scope, const source_limits& b) {
@@ -321,6 +539,20 @@ namespace source_test_hooks {
 unsealed_materialization materialize(lattice_db& owner, const std::vector<source_relation>& scope, const source_limits& b,
                                      const std::function<void(size_t, uint64_t)>& after_capture_batch) {
     return capture(owner, scope, b, after_capture_batch);
+}
+}
+
+unsealed_canonical_capture capture_canonical_source(lattice_db& owner,const canonical_store_binding& binding,
+    const std::vector<source_relation>& scope,std::optional<int64_t> base,
+    const std::vector<canonical_capture_request>& requests,const canonical_capture_limits& budget) {
+    return capture_canonical_impl(owner,binding,scope,base,requests,budget,{});
+}
+namespace source_test_hooks {
+unsealed_canonical_capture capture_canonical(lattice_db& owner,const canonical_store_binding& binding,
+    const std::vector<source_relation>& scope,std::optional<int64_t> base,
+    const std::vector<canonical_capture_request>& requests,const canonical_capture_limits& budget,
+    const std::function<void(size_t,uint64_t)>& after_batch) {
+    return capture_canonical_impl(owner,binding,scope,base,requests,budget,after_batch);
 }
 }
 } // namespace lattice::detail::sync_recovery

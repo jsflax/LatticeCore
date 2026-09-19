@@ -318,7 +318,7 @@ static recovery_outbox_capture capture_pending_impl(lattice_db& owner,
     if (sync_id.empty()) fail(code::invalid_argument, "outbox requires a channel identity");
     auto* writer = recovery_writer_access::active_writer(owner);
     if (!writer) fail(code::transaction_required, "outbox requires this thread's owned main write transaction");
-    auto* db = writer->handle();
+    auto* db = recovery_writer_access::active_handle(owner,*writer);
     budget b{limits};
     recovery_outbox_capture result;
     b.charge(sync_id.size()); result.sync_id = sync_id;
@@ -426,17 +426,18 @@ recovery_outbox_capture capture_recovery_rows(lattice_db& owner,
     const recovery_outbox_limits& limits) {
     auto* writer=recovery_writer_access::active_writer(owner);
     if (!writer) fail(code::transaction_required,"row capture requires an owned main writer");
+    auto* db=recovery_writer_access::active_handle(owner,*writer);
     budget b{limits}; recovery_outbox_capture result;
     for (const auto& [name,keys]:requested) {
         b.count(result.tables.size(),limits.tables,"row capture table limit exceeded");
         const auto index=result.tables.size();
-        result.tables.push_back(table(writer->handle(),name,b));
+        result.tables.push_back(table(db,name,b));
         std::set<std::string> seen;
         for (const auto& key:keys) {
             if (key.empty() || !seen.insert(key).second)
                 fail(code::invalid_argument,"row capture empty or duplicate key");
             b.count(result.current_rows.size(),limits.current_rows,"row capture row limit exceeded");
-            result.current_rows.push_back(current(writer->handle(),index,result.tables.back(),key,b));
+            result.current_rows.push_back(current(db,index,result.tables.back(),key,b));
         }
     }
     if (recovery_writer_access::active_writer(owner)!=writer)

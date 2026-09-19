@@ -391,6 +391,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
 }
 
 database::~database() {
+    if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
     if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
     if (read_control_) read_control_->unpublish(db_);
     if (db_) {
@@ -423,6 +424,7 @@ database::~database() {
 }
 
 void database::close() {
+    if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
     // Logical close: ops short-circuit after this. The sqlite3* itself is freed in
     // ~database (single-threaded), so a concurrent reader holding this wrapper can
     // never deref a freed handle — it either sees closed_ and returns empty, or runs
@@ -440,6 +442,9 @@ sqlite3* database::handle() const {
     auto* mutex = sqlite3_db_mutex(db_);
     sqlite3_mutex_enter(mutex);
     raw_handle_escaped_.store(true, std::memory_order_release);
+    // A known raw escape ends future producer admission. There is no SQLite
+    // getter that could establish which external authorizer a caller installs.
+    if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
     sqlite3_mutex_leave(mutex);
     return db_;
 }
@@ -511,6 +516,9 @@ database::database(database&& other) noexcept
     canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
     canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
     canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
+    local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
+    local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
+    channel_reset_unsettled_.store(other.channel_reset_unsettled_.exchange(false));
     lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
     if (lattice_update_hook_context_) {
         txn_dirty_.store(other.txn_dirty_.exchange(false));
@@ -522,6 +530,7 @@ database::database(database&& other) noexcept
 
 database& database::operator=(database&& other) noexcept {
     if (this != &other) {
+        if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
         if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
         if (read_control_) read_control_->unpublish(db_);
         if (db_) {
@@ -537,6 +546,9 @@ database& database::operator=(database&& other) noexcept {
         canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
         canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
         canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
+        local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
+        local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
+        channel_reset_unsettled_.store(other.channel_reset_unsettled_.exchange(false));
         lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
         db_ = other.db_;
         if (lattice_update_hook_context_) {
@@ -567,6 +579,16 @@ int64_t database::changes() const {
     return sqlite3_changes64(db_);
 }
 
+int database::step_statement_(sqlite3_stmt* statement) const {
+    auto* mutex=sqlite3_db_mutex(db_);sqlite3_mutex_enter(mutex);
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    // Transactions such as COMMIT are SQLite-readonly but have no result
+    // columns. Only actual read diagnostics may step while fenced.
+    const bool refused=channel_reset_unsettled_.load(std::memory_order_acquire) &&
+        (!sqlite3_stmt_readonly(statement)||sqlite3_column_count(statement)==0);
+    return refused?SQLITE_ABORT:sqlite3_step(statement);
+}
+
 void database::execute(const std::string& sql, const std::vector<column_value_t>& params) {
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
@@ -574,7 +596,17 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
     if (params.empty()) {
         // Fast path for parameterless queries
         char* errmsg = nullptr;
-        int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errmsg);
+        int rc;
+        {
+            auto* mutex=sqlite3_db_mutex(db_);sqlite3_mutex_enter(mutex);
+            struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+            const bool explicit_rollback=sql=="ROLLBACK";
+            if(channel_reset_unsettled_.load(std::memory_order_acquire)&&!explicit_rollback)
+                throw db_error("channel reset unsettled; explicit rollback required");
+            rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errmsg);
+            if(rc==SQLITE_OK&&explicit_rollback&&sqlite3_get_autocommit(db_)!=0)
+                channel_reset_unsettled_.store(false,std::memory_order_release);
+        }
         if (rc != SQLITE_OK) {
             std::string error = errmsg ? errmsg : "Unknown error";
             sqlite3_free(errmsg);
@@ -601,7 +633,7 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
         // SQLITE_ROW for DML statements (DELETE returns the deleted row).
         // Drain all rows before expecting SQLITE_DONE.
         do {
-            rc = sqlite3_step(stmt);
+            rc = step_statement_(stmt);
         } while (rc == SQLITE_ROW);
 
         // Capture error message BEFORE finalize, which resets connection error state
@@ -632,7 +664,7 @@ bool database::table_exists(const std::string& name) const {
     }
 
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    bool exists = (sqlite3_step(stmt) == SQLITE_ROW);
+    bool exists = (step_statement_(stmt) == SQLITE_ROW);
     sqlite3_finalize(stmt);
 
     return exists;
@@ -651,7 +683,7 @@ std::unordered_map<std::string, std::string> database::get_table_info(const std:
     }
 
     // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while (step_statement_(stmt) == SQLITE_ROW) {
         const char* name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         const char* type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
 
@@ -846,13 +878,13 @@ primary_key_t database::insert(const std::string& table,
         bind_value(stmt, index++, val);
     }
 
-    rc = sqlite3_step(stmt);
+    rc = step_statement_(stmt);
 
     if (!conflict_columns.empty()) {
         primary_key_t affected_rowid = 0;
         if (rc == SQLITE_ROW) {
             affected_rowid = sqlite3_column_int64(stmt, 0);
-            rc = sqlite3_step(stmt);  // drain RETURNING
+            rc = step_statement_(stmt);  // drain RETURNING
         }
         sqlite3_finalize(stmt);
         if (rc != SQLITE_DONE) {
@@ -919,7 +951,7 @@ void database::update(const std::string& table,
     }
     sqlite3_bind_int64(stmt, index, id);
 
-    rc = sqlite3_step(stmt);
+    rc = step_statement_(stmt);
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
@@ -945,7 +977,7 @@ void database::remove(const std::string& table, primary_key_t id) {
     }
 
     sqlite3_bind_int64(stmt, 1, id);
-    rc = sqlite3_step(stmt);
+    rc = step_statement_(stmt);
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
@@ -996,7 +1028,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
         col_names.emplace_back(name);
     }
 
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    while ((rc = step_statement_(stmt)) == SQLITE_ROW) {
         row_t row;
         for (int i = 0; i < col_count; ++i) {
             row[col_names[static_cast<size_t>(i)]] = extract_column(stmt, i);
@@ -1053,7 +1085,7 @@ std::optional<column_value_t> database::query_managed_cell(
 
     std::optional<column_value_t> value;
     bool first_row = true;
-    while ((rc = sqlite3_step(raw)) == SQLITE_ROW) {
+    while ((rc = step_statement_(raw)) == SQLITE_ROW) {
         if (first_row && value_index >= 0) value = extract_column(raw, value_index);
         first_row = false;
     }
@@ -1200,6 +1232,7 @@ database::maintenance_scope::~maintenance_scope() noexcept {
 }
 
 void database::begin_transaction(bool exclusive) {
+    if(channel_reset_unsettled_.load(std::memory_order_acquire))throw db_error("channel reset unsettled; explicit rollback required");
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
     // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).
     // EXCLUSIVE: acquires write lock AND blocks all readers.
@@ -1262,6 +1295,7 @@ void database::begin_transaction(bool exclusive) {
 }
 
 bool database::try_begin_immediate(int /*timeout_ms*/) {
+    if(channel_reset_unsettled_.load(std::memory_order_acquire))return false;
     if (closed_.load(std::memory_order_acquire)) return false;
     // Non-blocking: temporarily set busy timeout to 0, try BEGIN IMMEDIATE once,
     // then restore the original timeout. This never sleeps.

@@ -1,6 +1,10 @@
 #include "recovery_writer_access.hpp"
 
 namespace lattice::detail {
+namespace recovery_channel_reset_test_hooks {
+thread_local void (*after_writer_capture)()=nullptr;
+thread_local void (*after_write_admission)()=nullptr;
+}
 
 struct recovery_writer_access::frame {
     lattice_db& owner;
@@ -13,13 +17,22 @@ struct recovery_writer_access::frame {
 };
 thread_local recovery_writer_access::frame* recovery_writer_access::current_ = nullptr;
 
+bool recovery_writer_access::active_install_for(const lattice_db* owner, sqlite3* connection) noexcept {
+    for (auto* f = current_; f; f = f->previous) {
+        if (&f->owner == owner && f->writer.internal_handle() == connection)
+            return f->settlement.state == database::sync_apply_chunk_state::phase::active;
+    }
+    return false;
+}
+
 database* recovery_writer_access::active_writer(lattice_db& owner) {
     for (auto* f = current_; f; f = f->previous) {
         if (&f->owner != &owner) continue;
         // A consumed scope must not fall through to public ownership of a
         // successor. Logical close does not revoke this admitted physical turn.
         auto* h = f->writer.internal_handle();
-        if (f->settlement.state != database::sync_apply_chunk_state::phase::active ||
+        if (f->writer.channel_reset_unsettled_.load(std::memory_order_acquire) ||
+            f->settlement.state != database::sync_apply_chunk_state::phase::active ||
             sqlite3_get_autocommit(h) != 0 || sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE)
             return nullptr;
         return &f->writer;
@@ -30,7 +43,7 @@ database* recovery_writer_access::active_writer(lattice_db& owner) {
         !owner.owns_write_transaction()) return nullptr;
     auto& writer = owner.db();
     auto* h = writer.internal_handle();
-    if (writer.is_closed() || sqlite3_get_autocommit(h) != 0 ||
+    if (writer.is_closed() || writer.channel_reset_unsettled_.load(std::memory_order_acquire) || sqlite3_get_autocommit(h) != 0 ||
         sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE) return nullptr;
     return &writer;
 }
@@ -38,6 +51,148 @@ database* recovery_writer_access::active_writer(lattice_db& owner) {
 recovery_install_result recovery_writer_access::install(std::shared_ptr<lattice_db> owner,
     const std::function<void(database&)>& body) {
     return install_impl(std::move(owner), body, {});
+}
+
+sqlite3* recovery_writer_access::active_handle(lattice_db& owner, database& expected_writer) {
+    if(active_writer(owner)!=&expected_writer)
+        throw db_error("recovery handle requires the exact active owned writer");
+    return expected_writer.internal_handle();
+}
+
+void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& channel,bool retire) {
+    std::shared_ptr<database> writer;
+    {
+        std::lock_guard<std::mutex> lock(owner.connection_ownership_mutex_);
+        if(owner.closed_.load())throw db_error("channel reset: owner closed");
+        writer=owner.db_;
+    }
+    if(!writer)throw db_error("channel reset: no actual writer");
+    if(recovery_channel_reset_test_hooks::after_writer_capture)recovery_channel_reset_test_hooks::after_writer_capture();
+    using phase=database::sync_apply_chunk_state::phase;
+    if(writer->channel_reset_unsettled_.load(std::memory_order_acquire))throw db_error("channel reset unsettled; explicit rollback required");
+    // These fixed statements belong to the retained admission, including an
+    // ordinary caller-owned turn that is logically closed during the unit.
+    // Checked native execution avoids database::execute's post-close no-op.
+    const auto prepare=[&](const char* sql,const std::string* parameter=nullptr) {
+        database::record_statement();sqlite3_stmt* raw=nullptr;
+        const int prepared=sqlite3_prepare_v2(writer->internal_handle(),sql,-1,&raw,nullptr);
+        std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+        if(prepared!=SQLITE_OK||!raw)throw db_error(std::string("channel reset prepare failed: ")+sqlite3_errmsg(writer->internal_handle()));
+        if(parameter&&(parameter->size()>static_cast<size_t>(std::numeric_limits<int>::max())||
+           sqlite3_bind_text(raw,1,parameter->data(),static_cast<int>(parameter->size()),SQLITE_TRANSIENT)!=SQLITE_OK))
+            throw db_error("channel reset bind failed");
+        return statement;
+    };
+    const auto run=[&](const char* sql,const std::string* parameter=nullptr) {
+        auto statement=prepare(sql,parameter);
+        if(sqlite3_step(statement.get())!=SQLITE_DONE)throw db_error(std::string("channel reset step failed: ")+sqlite3_errmsg(writer->internal_handle()));
+    };
+    const auto exists=[&](const char* sql) {
+        auto statement=prepare(sql,&channel);const int rc=sqlite3_step(statement.get());
+        if(rc==SQLITE_DONE)return false;
+        if(rc!=SQLITE_ROW||sqlite3_step(statement.get())!=SQLITE_DONE)
+            throw db_error("channel reset addressed read failed or was ambiguous");
+        return true;
+    };
+    const auto mutate=[&] {
+        const bool had_slot=exists("SELECT 1 FROM _lattice_replication_slots WHERE sync_id=? LIMIT 2");
+        run("DELETE FROM _lattice_sync_state WHERE sync_id=?",&channel);
+        run("DELETE FROM _lattice_sync_set WHERE sync_id=?",&channel);
+        if(retire)run("DELETE FROM _lattice_replication_slots WHERE sync_id=?",&channel);
+        else run("UPDATE _lattice_replication_slots SET confirmed_audit_id=0,upload_floor=0 WHERE sync_id=?",&channel);
+        if(exists("SELECT 1 FROM _lattice_sync_state WHERE sync_id=? LIMIT 1")||
+           exists("SELECT 1 FROM _lattice_sync_set WHERE sync_id=? LIMIT 1"))
+            throw db_error("channel reset postimage mismatch: retained channel state");
+        auto slot=prepare("SELECT CASE WHEN typeof(confirmed_audit_id)='integer' THEN confirmed_audit_id END,CASE WHEN typeof(upload_floor)='integer' THEN upload_floor END FROM _lattice_replication_slots WHERE sync_id=? LIMIT 2",&channel);
+        const int rc=sqlite3_step(slot.get());
+        if(retire||!had_slot) {
+            if(rc!=SQLITE_DONE)throw db_error("channel reset postimage mismatch: unexpected slot");
+        } else if(rc!=SQLITE_ROW||sqlite3_column_type(slot.get(),0)!=SQLITE_INTEGER||sqlite3_column_int64(slot.get(),0)!=0||
+                  sqlite3_column_type(slot.get(),1)!=SQLITE_INTEGER||sqlite3_column_int64(slot.get(),1)!=0||sqlite3_step(slot.get())!=SQLITE_DONE)
+            throw db_error("channel reset postimage mismatch: slot floors not zero integers");
+    };
+    auto* active=active_writer(owner);
+    if(active) {
+        if(active!=writer.get())throw db_error("channel reset: captured writer changed");
+        auto* h=writer->internal_handle();auto* mutex=sqlite3_db_mutex(h);
+        if(sqlite3_mutex_try(mutex)!=SQLITE_OK)throw db_error("channel reset: owned writer is busy");
+        struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+        if(active_writer(owner)!=writer.get()||database::update_hook_scope::active_for(h))throw db_error("channel reset: owned transaction changed or callback reentry");
+        auto* hook=writer->lattice_update_hook_context_.get();
+        if(!hook||hook->owner!=&owner||hook->connection!=h)throw db_error("channel reset: hook identity unavailable");
+        require_recovery_local_producer_maintenance_absent(*writer);
+        if(recovery_channel_reset_test_hooks::after_write_admission)recovery_channel_reset_test_hooks::after_write_admission();
+        database::sync_apply_chunk_state local;local.state=phase::active;
+        auto* settlement=hook->sync_chunk?hook->sync_chunk:&local;
+        if(settlement->state!=phase::active)throw db_error("channel reset: caller transaction is settled");
+        if(!hook->sync_chunk)hook->sync_chunk=&local;
+        struct detach {
+            database::lattice_update_hook_context& hook;database::sync_apply_chunk_state& local;
+            ~detach(){if(hook.sync_chunk==&local)hook.sync_chunk=nullptr;}
+        } detach_marker{*hook,local};
+        bool opened=false;
+        try {
+            run("SAVEPOINT _lattice_producer_channel_reset");opened=true;
+            mutate();
+            run("RELEASE _lattice_producer_channel_reset");
+        } catch(...) {
+            const auto original=std::current_exception();
+            if(opened&&settlement->state==phase::active) {
+                // ABORT restores only this unit. RAISE(ROLLBACK) already
+                // consumed the caller's transaction and must not be repeated.
+                try {
+                    run("ROLLBACK TO _lattice_producer_channel_reset");
+                    run("RELEASE _lattice_producer_channel_reset");
+                } catch(...) {
+                    writer->channel_reset_unsettled_.store(true,std::memory_order_release);
+                    throw recovery_channel_reset_error(original,std::current_exception());
+                }
+            }
+            std::rethrow_exception(original);
+        }
+        return; // Never COMMIT or ROLLBACK caller-owned work.
+    }
+    database::maintenance_scope::probe_before_store_gate(*writer);
+    {
+        lattice_db::store_write_gate_hold gate(owner);
+        database::maintenance_scope maintenance(*writer);
+        auto* hook=writer->lattice_update_hook_context_.get();
+        {
+            std::lock_guard<std::mutex> lock(owner.connection_ownership_mutex_);
+            if(owner.closed_.load()||owner.db_!=writer||!hook||hook->owner!=&owner||hook->connection!=writer->internal_handle()||hook->sync_chunk)
+                throw db_error("channel reset: writer admission changed");
+        }
+        database::sync_apply_chunk_state settlement;
+        hook->sync_chunk=&settlement;
+        struct detach {
+            database::lattice_update_hook_context& hook;database::sync_apply_chunk_state& settlement;
+            ~detach(){if(hook.sync_chunk==&settlement)hook.sync_chunk=nullptr;}
+        } detach_marker{*hook,settlement};
+        try {
+            writer->begin_transaction();settlement.state=phase::active;
+            require_recovery_local_producer_maintenance_absent(*writer);
+            if(recovery_channel_reset_test_hooks::after_write_admission)recovery_channel_reset_test_hooks::after_write_admission();
+            mutate();writer->commit();
+            if(settlement.state==phase::active)hook->note_settled(true);
+        } catch(...) {
+            const auto original=std::current_exception();
+            // WAL marks the real COMMIT before observers. Do not infer our
+            // ownership from a successor transaction opened by a callback.
+            if(settlement.state==phase::active) {
+                try {writer->rollback();}
+                catch(...) {
+                    writer->channel_reset_unsettled_.store(true,std::memory_order_release);
+                    throw recovery_channel_reset_error(original,std::current_exception());
+                }
+            }
+            std::rethrow_exception(original);
+        }
+    }
+    writer->drain_if_settled();
+}
+
+void reset_sync_channel_with_producer_fence(lattice_db& owner,const std::string& channel,bool retire) {
+    recovery_writer_access::reset_channel(owner,channel,retire);
 }
 
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
@@ -82,6 +237,9 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                     !context || context->owner != owner.get() || context->connection != writer->internal_handle() ||
                     context->sync_chunk || context->entry_cursor_active || context->recovery_delivery_deferred)
                     throw db_error("recovery install: admission invalidated or hook ownership unavailable");
+                const auto producer_allowed = std::atomic_load(&writer->local_producer_write_allowed_);
+                if (producer_allowed && !producer_allowed->load(std::memory_order_acquire))
+                    throw db_error("recovery install: local producer admission was revoked");
                 // Admission linearizes here. A later close may fence new work,
                 // but the retained writer can settle under maintenance_scope.
             }

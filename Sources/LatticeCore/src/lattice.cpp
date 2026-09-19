@@ -466,6 +466,7 @@ void lattice_db::reopen_write_db() {
         const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
         if (current) for (const auto& [_, source] : *current) source->active.store(false);
         restore_attached_views(*staged);
+        detail::prepare_recovery_local_producer(*this, staged);
         // This overload installs only hooks; pressure setup below runs after
         // publication and outside attachment admission, as on the broad base.
         setup_change_hook(*staged);
@@ -479,7 +480,12 @@ void lattice_db::reopen_write_db() {
                 db_ != previous_writer)
                 throw db_error("write reopen invalidated by concurrent maintenance");
             ++connection_revision_;
+            if (previous_writer) {
+                if (auto allowed = std::atomic_load(&previous_writer->local_producer_write_allowed_))
+                    allowed->store(false, std::memory_order_release);
+            }
             staged.swap(db_);
+            detail::publish_recovery_local_producer(*this, *db_);
             std::atomic_store(&managed_attachment_view_, std::move(managed_view));
         }
         wal_eviction_pending_.store(false);

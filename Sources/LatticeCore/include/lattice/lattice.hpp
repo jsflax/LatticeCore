@@ -47,7 +47,7 @@ template<typename T> class results;
 class lattice_db;
 class synchronizer_base;
 class synchronizer;
-namespace detail { struct recovery_writer_access; class canonical_writer_adapter; struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
+namespace detail { struct recovery_writer_access; class canonical_writer_adapter; class recovery_local_producer_adapter; struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -1206,7 +1206,7 @@ public:
                 }
 
                 // Execute
-                if (sqlite3_step(stmt) != SQLITE_DONE) {
+                if (db_->step_statement_(stmt) != SQLITE_DONE) {
                     LOG_ERROR("db", "Failed to insert (bulk): %s", sqlite3_errmsg(db_->internal_handle()));
                     throw std::runtime_error("Failed to insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
                 }
@@ -3545,9 +3545,7 @@ public:
     /// cannot corrupt other synchronizers' filtered-set membership, so the
     /// full re-arm is safe on any topology, including multi-channel hubs.
     void reset_sync_state(const std::string& sync_id) {
-        db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
-        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
-        db_->execute("UPDATE _lattice_replication_slots SET confirmed_audit_id = 0, upload_floor = 0 WHERE sync_id = ?", {sync_id});
+        detail::reset_sync_channel_with_producer_fence(*this,sync_id,false);
         LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_state, sync_set, slot cursors)",
                  sync_id.c_str());
     }
@@ -3561,9 +3559,7 @@ public:
     /// sync_state rows inflated the eager-collapse count — an entry could
     /// collapse to isSynchronized=1 before a still-live channel relayed it.
     void remove_sync_channel_state(const std::string& sync_id) {
-        db_->execute("DELETE FROM _lattice_sync_state WHERE sync_id = ?", {sync_id});
-        db_->execute("DELETE FROM _lattice_sync_set WHERE sync_id = ?", {sync_id});
-        db_->execute("DELETE FROM _lattice_replication_slots WHERE sync_id = ?", {sync_id});
+        detail::reset_sync_channel_with_producer_fence(*this,sync_id,true);
         LOG_INFO("lattice_db", "remove_sync_channel_state(%s): channel retired (state, set, slot removed)",
                  sync_id.c_str());
     }
@@ -3574,6 +3570,7 @@ public:
     /// @param stale_threshold_seconds If > 0, evict slots inactive for this long
     /// @return Number of entries deleted, or -1 if no slots exist (no-op)
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
         return with_audit_prune_transaction_([&]() -> int64_t {
             // 1. Optionally evict stale slots
             if (stale_threshold_seconds > 0) {
@@ -3657,6 +3654,7 @@ public:
     /// history it has not uploaded); observer slots are ignored. Never
     /// touches sqlite_sequence. Returns rows removed.
     int64_t prune_audit_log(int64_t retention_seconds) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
         if (retention_seconds <= 0) return 0;
         return with_audit_prune_transaction_([&]() -> int64_t {
             const double now = now_epoch_();
@@ -3748,6 +3746,7 @@ public:
     /// Compatibility entry point: the caller's bound may be stricter, but
     /// cannot bypass the writer floors or a newly required legacy cursor.
     int64_t delete_audit_below_(int64_t safe_id, bool preserve_cursor_row) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
         if (safe_id <= 0) return 0;
         return with_audit_prune_transaction_([&]() -> int64_t {
             ensure_observer_column(*db_);
@@ -3791,6 +3790,9 @@ private:
             // BEGIN then excludes every other connection until COMMIT.
             db_->begin_transaction();
             try {
+                // Recheck durable enrollment after BEGIN excludes sibling
+                // enrollment; an earlier context-only check is insufficient.
+                detail::require_recovery_local_producer_maintenance_absent(*db_);
                 result = std::forward<F>(body)();
                 db_->commit();
                 // COMMIT actually executes even after logical close. A WAL
@@ -4077,6 +4079,7 @@ private:
     // on other connections; old binaries and raw DELETEs do not participate.
     int64_t generate_history_owned_(int64_t batch_size, bool mark_synthesized, bool force,
                                   const std::function<void(bool)>& between_units_for_testing = {}) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
         history_operation_hold admission(*this);
         if (batch_size <= 0) batch_size = 20000;
         // sqlite3_changes is an int on every supported deployment, including
@@ -6114,6 +6117,7 @@ protected:
     friend struct detail::recovery_writer_access;
     friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
+    friend class detail::recovery_local_producer_adapter;
     friend struct managed_attachment_test_access;
     struct managed_attachment_binding {
         std::string alias, filename;
@@ -6342,7 +6346,10 @@ private:
 
     // Setup hooks for change notifications
     // Update hook buffers changes, WAL hook flushes on commit (matches Swift's pattern)
-    void setup_change_hook() { setup_projection_pressure(); setup_change_hook(*db_); }
+    void setup_change_hook() {
+        setup_projection_pressure(); setup_change_hook(*db_);
+        detail::publish_recovery_local_producer(*this, *db_);
+    }
     void setup_change_hook(database& connection);
 
     // Cross-process observation — notifier is owned by instance_registry
@@ -6410,6 +6417,15 @@ private:
         // Per-connection SQL function registration — required on BOTH paths
         // (triggers call sync_disabled() at execution time on this connection).
         register_sql_functions();
+        // Enrolled programs must be validated before any ordinary migration can
+        // replace them. Bootstrap returns bounded untrusted facts; exact schema,
+        // SQL and this constructor's physical hook publication admit the writer.
+        if (detail::prepare_recovery_local_producer(*this, db_)) {
+            if (!fingerprint_marker_valid(compute_core_fingerprint_key()))
+                throw db_error("local producer enrolled schema requires explicit migration");
+            note_tables_for_all_schemas();
+            return;
+        }
 
         // FAST PATH: when the schema fingerprint marker matches the current
         // schema cookie, every statement below is provably a no-op. Populate
@@ -7667,6 +7683,7 @@ protected:
                                       const std::set<std::string>& no_history = {},
                                       const std::string& canonical_receipt_tail = {},
                                       std::vector<std::string>* emitted = nullptr) {
+        if (!emitted && detail::preserve_recovery_local_producer_relation(*db_, table_name)) return;
         // Skip if no columns to track
         if (columns.empty()) return;
 
@@ -7790,6 +7807,7 @@ protected:
     void create_link_table_triggers(const std::string& link_table_name,
                                     const std::string& canonical_receipt_tail = {},
                                     std::vector<std::string>* emitted = nullptr) {
+        if (!emitted && detail::preserve_recovery_local_producer_relation(*db_, link_table_name)) return;
         if (!emitted && db_->canonical_trigger_only_) {
             detail::require_canonical_relation(*db_, link_table_name);
             return; // Exact fixed-scope programs were validated at attachment.

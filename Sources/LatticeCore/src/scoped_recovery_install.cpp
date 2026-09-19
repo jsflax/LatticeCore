@@ -1,4 +1,5 @@
 #include "scoped_recovery_install.hpp"
+#include "canonical_scoped_install.hpp"
 #include "recovery_witness.hpp"
 #include "canonical_writer_adapter.hpp"
 #include <nlohmann/json.hpp>
@@ -425,11 +426,70 @@ void check_relation_metadata(sqlite3* db,const scoped_recovery_request& request,
         }
     }
 }
+void verify_planned_rows(lattice_db& owner,const std::map<std::string,std::vector<std::string>>& requested,
+    const std::map<key,planned_row>& plan,const std::set<std::string>& models,
+    const scoped_recovery_limits& limits,const identities& ids) {
+    auto actual=capture_recovery_rows(owner,requested,limits.capture);
+    for(const auto& row:actual.current_rows) {
+        key k=ids.normalized({actual.tables.at(row.table_index).name,row.lookup_global_id});const auto& expected=plan.at(k);
+        require(row.present==expected.after.has_value(),"recovery final row presence mismatch");
+        if(row.present) {
+            require(captured_values(actual,row)==*expected.after,"recovery final row value mismatch");
+            if(models.count(k.table)&&expected.before)require(row.local_row_id==expected.local_id,"recovery surviving local PK changed");
+        }
+    }
+}
+struct installed_plan {
+    // Bounded actual original identities from positive Q, including entries
+    // already settled before this attempt. No negative/fresh-write inference.
+    struct receipt { int64_t audit_id; std::string original_id; };
+    std::map<std::string,std::vector<std::string>> requested;
+    std::map<key,planned_row> rows;
+    std::set<std::string> models;
+    std::set<key> membership;
+    std::string channel,declaration;
+    int64_t disabled=0;
+    std::vector<receipt> receipts;
+    std::optional<recovery_witness> witness;
+    void verify(lattice_db& owner,database& writer,const scoped_recovery_limits& limits,const identities& ids) const {
+        verify_planned_rows(owner,requested,rows,models,limits,ids);
+        auto* db=recovery_writer_access::active_handle(owner,writer);
+        metadata actual(db,limits);
+        require(actual.declarations.count(channel) && actual.declarations.at(channel)==declaration,
+            "canonical final scope declaration changed");
+        std::set<key> members;
+        for(const auto& [_,member]:actual.ownership)if(member.channel==channel)members.insert(member.target);
+        require(members==membership,"canonical final scope membership changed");
+        // Receiver completion and journal settlement can run triggers after the
+        // model installer's own checks. Revalidate these owned outputs only
+        // after those writes; no repair or broader whole-database claim.
+        require(receipts.size()<=limits.receipts,"canonical final receipt count exceeded");
+        for(const auto& expected:receipts) {
+            stmt read(db,"SELECT ss.is_synchronized FROM main.AuditLog a "
+                "JOIN main._lattice_sync_state ss ON ss.audit_entry_id=a.id AND ss.sync_id=?1 "
+                "WHERE a.id=?2 AND a.globalId=?3 COLLATE NOCASE LIMIT 2");
+            read.text(1,channel);read.integer(2,expected.audit_id);read.text(3,expected.original_id);
+            require(read.next()&&read.number(0)==1&&!read.next(),"canonical final scoped receipt changed");
+        }
+        {
+            stmt flag(db,"SELECT disabled FROM main._SyncControl WHERE id=1 LIMIT 2");
+            require(flag.next()&&flag.number(0)==disabled&&!flag.next(),"canonical final sync control changed");
+        }
+        require(witness.has_value() && read_recovery_witness(writer)==witness,
+            "canonical final recovery witness changed");
+    }
+};
+void validate_install_limits(const scoped_recovery_limits& limits) {
+    require(limits.channels>0&&limits.members>=0&&limits.metadata_bytes>0&&limits.targets>0&&
+        limits.receipts>0&&limits.fields>0&&limits.field_bytes>0&&limits.field_bytes<=static_cast<uint64_t>(INT_MAX)&&
+        limits.logical_bytes>0,"recovery invalid explicit limits");
+}
 void install_body(lattice_db& owner,database& writer,const scoped_recovery_request& request,
                   const scoped_recovery_limits& limits,
-                  const std::vector<recovery_row_image>* explicit_images) {
+                  const std::vector<recovery_row_image>* explicit_images,
+                  installed_plan* final_plan=nullptr) {
     const identities ids(request.identity_mode);
-    auto* db=writer.handle();work_budget budget{limits};metadata durable(db,limits);
+    auto* db=recovery_writer_access::active_handle(owner,writer);work_budget budget{limits};metadata durable(db,limits);
     const bool delta=request.identity.mode==receive_install_mode::delta;
     require(explicit_images || request.identity.mode==receive_install_mode::full,"recovery model installer supports full scope only");
     require(!explicit_images || request.full_rows.empty(),"recovery explicit images cannot mix with legacy full rows");
@@ -679,15 +739,7 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
             requested[k.table].push_back(value?std::get<std::string>(value->at("globalId")):k.global_id);
         }
     }
-    auto actual=capture_recovery_rows(owner,requested,limits.capture);
-    for(const auto& row:actual.current_rows) {
-        key k=ids.normalized({actual.tables.at(row.table_index).name,row.lookup_global_id});const auto& expected=plan.at(k);
-        require(row.present==expected.after.has_value(),"recovery final row presence mismatch");
-        if(row.present) {
-            require(captured_values(actual,row)==*expected.after,"recovery final row value mismatch");
-            if(models.count(k.table)&&expected.before)require(row.local_row_id==expected.local_id,"recovery surviving local PK changed");
-        }
-    }
+    verify_planned_rows(owner,requested,plan,models,limits,ids);
     {
         stmt restore(db,"UPDATE main._SyncControl SET disabled=? WHERE id=1 AND disabled=1");restore.integer(1,disabled);restore.done();changed(db);
         stmt flag(db,"SELECT disabled FROM main._SyncControl WHERE id=1");require(flag.next()&&flag.number(0)==disabled&&!flag.next(),"recovery audit suppression restore failed");
@@ -700,15 +752,15 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         read.integer(1,audit->id);read.text(2,request.binding.channel);
         require(read.next()&&read.number(0)==1&&!read.next(),"recovery scoped obligation settlement failed");
     }
+    if(final_plan)*final_plan={std::move(requested),std::move(plan),std::move(models),std::move(membership),
+        request.binding.channel,declared,disabled,{},{}};
 }
 scoped_recovery_result install_images(std::shared_ptr<lattice_db> owner,
     const scoped_recovery_request& request,const scoped_recovery_limits& limits,
     const std::vector<recovery_row_image>* explicit_images) {
     scoped_recovery_result result;
     result.transaction=recovery_writer_access::install(owner,[&](database& writer) {
-        require(limits.channels>0&&limits.members>=0&&limits.metadata_bytes>0&&limits.targets>0&&
-            limits.receipts>0&&limits.fields>0&&limits.field_bytes>0&&limits.field_bytes<=static_cast<uint64_t>(INT_MAX)&&
-            limits.logical_bytes>0,"recovery invalid explicit limits");
+        validate_install_limits(limits);
         // Admission remains inside the original retained-owner frame, including
         // exact retries. Reject two competing row inputs before state work.
         require(!explicit_images || request.full_rows.empty(),"recovery explicit images cannot mix with legacy full rows");
@@ -735,5 +787,193 @@ scoped_recovery_result install_scoped_recovery_images(std::shared_ptr<lattice_db
     const scoped_recovery_request& request,const std::vector<recovery_row_image>& images,
     const scoped_recovery_limits& limits) {
     return install_images(std::move(owner),request,limits,&images);
+}
+
+scoped_recovery_result install_staged_canonical_range(const canonical_install_admission& grant) {
+    namespace cr=canonical_range;
+    scoped_recovery_result result;
+    const auto& limits=grant.limits_.install;
+    result.transaction=recovery_writer_access::install(grant.owner_,[&](database& writer) {
+        validate_install_limits(limits);
+        require(grant.journal_revision_>0 && !grant.coverage_id_.empty() &&
+            grant.coverage_id_.size()<=limits.field_bytes,"canonical installation lacks bound coverage admission");
+        require(grant.journal_.channel==grant.attempt_.channel &&
+            grant.profile_.binding.channel==grant.attempt_.channel,"canonical admission channel differs");
+        receive_install_store state(grant.owner_,limits.installations);state.initialize();
+        canonical_range_staging staged(grant.owner_,limits.installations,grant.limits_.codec,grant.limits_.staging);
+        staged.initialize();
+        recovery_obligation_store journal(grant.owner_,grant.limits_.obligations,limits.installations);journal.initialize();
+        const cr::frame ending{grant.attempt_,grant.route_,cr::end{grant.manifest_digest_}};
+        const auto verified=staged.verify_end(ending);
+        require(verified.content_verified && verified.state.frozen_request.request_digest==grant.request_digest_ &&
+            verified.installation_binding==grant.profile_.binding,"canonical admission differs from retained stage");
+        auto current_journal=journal.read(grant.journal_.channel);
+        require(current_journal && current_journal->address==grant.journal_ && current_journal->profile==grant.profile_,
+            "canonical admission differs from current journal binding");
+        const auto& identity=verified.installation_identity;
+        std::optional<recovery_obligation_snapshot> before;
+        std::optional<installed_plan> final_plan;
+        std::vector<recovery_obligation_receipt_claim> positives;
+        std::vector<installed_plan::receipt> positive_receipts;
+        std::map<std::string,recovery_obligation_entry> retained;
+        std::vector<std::string> content_pages,receipt_pages;
+        const auto journal_usage=journal.usage();
+        auto same_stage=[&] {
+            const auto again=staged.resume(grant.attempt_,grant.manifest_digest_,grant.route_);
+            require(again.content_verified && again.route_generation==verified.route_generation &&
+                again.state==verified.state && again.installation_identity==identity &&
+                again.installation_binding==verified.installation_binding,"canonical retained stage changed during install");
+            // M/C/E do not bind partition boundaries for an equal page count.
+            // Each canonical encoded page must still be the page we consumed.
+            require(content_pages.size()==verified.state.offer.counts.content_pages &&
+                receipt_pages.size()==verified.state.offer.counts.receipt_pages,"canonical consumed page inventory incomplete");
+            for(size_t n=0;n<content_pages.size();++n)
+                require(std::get<cr::content_page>(staged.read_verified_page(grant.attempt_,grant.manifest_digest_,grant.route_,cr::stream_kind::content,n)).digest==content_pages[n],
+                    "canonical consumed content page changed");
+            for(size_t n=0;n<receipt_pages.size();++n)
+                require(std::get<cr::receipt_page>(staged.read_verified_page(grant.attempt_,grant.manifest_digest_,grant.route_,cr::stream_kind::receipts,n)).digest==receipt_pages[n],
+                    "canonical consumed receipt page changed");
+        };
+        result.installation=state.apply_if_new(verified.installation_binding,identity,grant.supersede_,[&](database& actual) {
+            require(&actual==&writer && recovery_writer_access::active_writer(*grant.owner_)==&writer,
+                "canonical physical writer changed");
+            before=journal.snapshot_for_install(grant.journal_,identity.sequence);
+            require(before->scope.revision==grant.journal_revision_ && before->scope.profile==grant.profile_,
+                "canonical final journal revision differs from admission");
+            work_budget budget{limits};const identities ids(recovery_identity_mode::uuid);
+            const auto& request=verified.state.frozen_request;
+            require(request.receipts.size()<=limits.receipts && before->entries.size()<=limits.receipts &&
+                verified.state.offer.counts.identities<=limits.targets &&
+                verified.state.offer.counts.receipts<=limits.receipts,"canonical aggregate collection limit exceeded");
+            std::map<std::string,const cr::receipt_request*> requested;
+            for(const auto& q:request.receipts) {
+                budget.identity(q.original_id);
+                require(q.namespace_id==std::optional<std::string>{grant.profile_.receipt_namespace},
+                    "canonical requested namespace is not admitted");
+                // One original has one actual target. Broader rebase requests
+                // remain a protocol feature; this first assembler refuses them.
+                require(q.targets.size()==1,"canonical assembler requires one exact requested target");
+                budget.identity(q.targets[0].table);budget.identity(q.targets[0].id);
+                const auto original=ids.id(q.original_id);
+                require(requested.emplace(original,&q).second,"canonical request has UUID alias originals");
+                auto entry=journal.find(grant.journal_,original);
+                require(entry && entry->canonical_target_id==ids.id(q.targets[0].id) &&
+                    entry->record.table==q.targets[0].table,"canonical request lacks actual journal original/target");
+                retained.emplace(original,std::move(*entry));
+            }
+            for(const auto& entry:before->entries)
+                require(requested.count(entry.canonical_original_id),"canonical final obligation is absent from frozen Q; reconciliation required");
+            require(grant.contract_.model_tables.size()<=limits.capture.tables &&
+                grant.contract_.relations.size()<=limits.capture.tables && grant.contract_.scoped_link_tables.size()<=limits.capture.tables &&
+                grant.contract_.initial_row_grants.size()<=limits.targets,"canonical scope collection limit exceeded");
+            for(const auto& name:grant.contract_.model_tables)budget.identity(name);
+            for(const auto& relation:grant.contract_.relations){budget.identity(relation.table);budget.identity(relation.lhs_model);budget.identity(relation.rhs_model);}
+            for(const auto& name:grant.contract_.scoped_link_tables)budget.identity(name);
+            for(const auto& row:grant.contract_.initial_row_grants){budget.identity(row.table);budget.identity(row.global_id);}
+            scoped_recovery_request context;
+            context.binding=verified.installation_binding;context.identity=identity;context.supersede=grant.supersede_;
+            context.model_tables=grant.contract_.model_tables;context.relations=grant.contract_.relations;
+            context.scoped_link_tables=grant.contract_.scoped_link_tables;
+            context.initial_row_grants=grant.contract_.initial_row_grants;context.identity_mode=recovery_identity_mode::uuid;
+            std::vector<recovery_row_image> images;
+            images.reserve(static_cast<size_t>(verified.state.offer.counts.identities));
+            std::set<key> unique_images;
+            for(uint64_t n=0;n<verified.state.offer.counts.content_pages;++n) {
+                auto page=std::get<cr::content_page>(staged.read_verified_page(grant.attempt_,grant.manifest_digest_,grant.route_,cr::stream_kind::content,n));
+                budget.identity(page.digest);content_pages.push_back(page.digest);
+                for(const auto& item:page.items) {
+                    budget.identity(item.key.table);budget.identity(item.key.id);
+                    require(images.size()<limits.targets,"canonical image aggregate count exceeded");
+                    const key k{item.key.table,item.key.id};
+                    require(unique_images.insert(ids.normalized(k)).second,"canonical content has UUID alias identities");
+                    recovery_row_image image{k,std::nullopt};
+                    if(const auto* present=std::get_if<cr::present>(&item.value)) {
+                        auto cap=grant.limits_.codec.values;
+                        cap.fields=std::min<uint64_t>(cap.fields,(limits.fields-budget.fields)/2);
+                        cap.name_bytes=std::min<uint64_t>(cap.name_bytes,limits.field_bytes);
+                        cap.value_bytes=std::min<uint64_t>(cap.value_bytes,limits.field_bytes);
+                        cap.decoded_bytes=std::min<uint64_t>(cap.decoded_bytes,limits.logical_bytes-budget.bytes);
+                        image.present=sync_recovery::decode_values(present->payload,cap);
+                        for(const auto& [name,value]:*image.present){budget.identity(name);budget.value(value);}
+                    }
+                    images.push_back(std::move(image));
+                }
+            }
+            std::set<std::string> seen;
+            for(uint64_t n=0;n<verified.state.offer.counts.receipt_pages;++n) {
+                auto page=std::get<cr::receipt_page>(staged.read_verified_page(grant.attempt_,grant.manifest_digest_,grant.route_,cr::stream_kind::receipts,n));
+                budget.identity(page.digest);receipt_pages.push_back(page.digest);
+                for(const auto& item:page.items) {
+                    budget.identity(item.original_id);
+                    const auto original=ids.id(item.original_id);
+                    require(requested.count(original) && seen.size()<limits.receipts && seen.insert(original).second,
+                        "canonical receipt has missing or duplicate requested original");
+                    const auto& entry=retained.at(original);
+                    recovery_pending_outcome outcome;
+                    if(const auto* positive=std::get_if<cr::committed>(&item.value)) {
+                        require(positive->namespace_id==grant.profile_.receipt_namespace && positive->coverage_id==grant.coverage_id_ &&
+                            positive->position<=static_cast<uint64_t>(identity.head) && positive->accepted_target &&
+                            positive->accepted_target->table==entry.record.table &&
+                            ids.id(positive->accepted_target->id)==entry.canonical_target_id && positive->outcome!=cr::decision::policy,
+                            "canonical positive receipt lacks bound source coverage/target");
+                        outcome=positive->outcome==cr::decision::applied?recovery_pending_outcome::committed_effect:recovery_pending_outcome::committed_noop;
+                        recovery_obligation_receipt_claim claim{entry.canonical_original_id,grant.profile_.receipt_namespace,
+                            static_cast<int64_t>(positive->position),positive->outcome==cr::decision::applied?
+                                recovery_obligation_outcome::applied:recovery_obligation_outcome::no_op};
+                        require(!entry.acknowledged || entry.acknowledged==claim,"canonical positive contradicts retained first ACK");
+                        if(entry.stage!=recovery_obligation_stage::settled)positives.push_back(std::move(claim));
+                        require(positive_receipts.size()<limits.receipts && entry.record.audit_id>0,
+                            "canonical positive actual receipt bound exceeded");
+                        positive_receipts.push_back({entry.record.audit_id,entry.canonical_original_id});
+                    } else if(const auto* negative=std::get_if<cr::not_committed>(&item.value)) {
+                        require(negative->namespace_id==grant.profile_.receipt_namespace && negative->coverage_id==grant.coverage_id_ &&
+                            entry.stage==recovery_obligation_stage::open && !entry.acknowledged,
+                            "canonical negative lacks coverage or contradicts retained receipt");
+                        outcome=recovery_pending_outcome::not_committed;
+                    } else refuse("canonical unknown receipt requires reconciliation");
+                    budget.identity(entry.record.original_id);budget.identity(entry.record.table);budget.identity(entry.record.target_id);
+                    context.pending.push_back({entry.record.original_id,{entry.record.table,entry.record.target_id},outcome});
+                }
+            }
+            require(seen.size()==requested.size(),"canonical receipt stream omitted a requested original");
+            final_plan.emplace();
+            install_body(*grant.owner_,writer,context,limits,&images,&*final_plan);
+            same_stage();
+            const auto unchanged=journal.snapshot_for_install(grant.journal_,identity.sequence);
+            require(unchanged.scope==before->scope && unchanged.entries==before->entries,
+                "canonical journal changed during model effects");
+            final_plan->receipts=std::move(positive_receipts);
+            final_plan->witness=bump_recovery_witness(*grant.owner_);
+        });
+        if(result.installation->disposition==receive_install_disposition::installed) {
+            require(before.has_value(),"canonical new installation lost its journal snapshot");
+            // Actual receiver completion must precede journal settlement; both
+            // still live inside the retained outer transaction, never two commits.
+            const auto expected=journal.settle_install(grant.journal_,before->scope.revision,identity,positives);
+            same_stage();journal.audit();
+            require(journal.read(grant.journal_.channel)==std::optional<recovery_obligation_scope>{expected},
+                "canonical journal completion postimage changed");
+            auto expected_usage=journal_usage;
+            const auto old_size=before->scope.installed_manifest.size();
+            const auto new_size=expected.installed_manifest.size();
+            require(expected_usage.encoded_bytes>=static_cast<int64_t>(old_size),"canonical journal charge underflow");
+            expected_usage.encoded_bytes-=static_cast<int64_t>(old_size);
+            require(new_size<=static_cast<uint64_t>(INT64_MAX-expected_usage.encoded_bytes),"canonical journal charge overflow");
+            expected_usage.encoded_bytes+=static_cast<int64_t>(new_size);
+            require(journal.usage()==expected_usage,"canonical journal usage changed beyond settlement");
+            for(const auto& positive:positives) {
+                auto& entry=retained.at(canonical_writer_adapter::uuid_key(positive.original_id));
+                entry.acknowledged=positive;entry.acknowledged->original_id=entry.canonical_original_id;
+                entry.stage=recovery_obligation_stage::settled;entry.settled_install_sequence=identity.sequence;
+            }
+            for(const auto& [original,entry]:retained)
+                require(journal.find(grant.journal_,original)==std::optional<recovery_obligation_entry>{entry},
+                    "canonical journal final original postimage changed");
+            require(final_plan.has_value(),"canonical final model plan missing");
+            final_plan->verify(*grant.owner_,writer,limits,identities(recovery_identity_mode::uuid));
+        }
+    });
+    if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();
+    return result;
 }
 } // namespace lattice::detail

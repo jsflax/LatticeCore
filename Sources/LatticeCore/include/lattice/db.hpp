@@ -58,8 +58,14 @@ struct recovery_writer_access;
 struct recovery_witness_access;
 struct recovery_refresh_access;
 class canonical_writer_adapter;
+class recovery_local_producer_adapter;
 class recovery_obligation_producer_store;
 void require_canonical_relation(database&, const std::string&);
+bool prepare_recovery_local_producer(lattice_db&, const std::shared_ptr<database>&);
+void publish_recovery_local_producer(lattice_db&, database&) noexcept;
+bool preserve_recovery_local_producer_relation(database&, const std::string&);
+void require_recovery_local_producer_maintenance_absent(database&);
+void reset_sync_channel_with_producer_fence(lattice_db&, const std::string&, bool retire);
 
 // One ordinary attached-field operation. Main/manual database fields keep
 // their existing path. The implementation never acquires a topology mutex
@@ -92,12 +98,23 @@ class database {
     friend struct detail::recovery_witness_access;
     friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
+    friend class detail::recovery_local_producer_adapter;
     friend class detail::recovery_obligation_producer_store;
     friend void detail::require_canonical_relation(database&, const std::string&);
+    friend bool detail::preserve_recovery_local_producer_relation(database&, const std::string&);
+    friend void detail::require_recovery_local_producer_maintenance_absent(database&);
     // Private fixed-scope trigger qualification lacks upstream receipt settlement.
     bool canonical_trigger_only_ = false;
     std::shared_ptr<void> canonical_callback_custody_;
     std::shared_ptr<std::atomic<bool>> canonical_write_allowed_;
+    // Private receiver producer admission. Heap custody follows the physical
+    // connection across wrapper moves; no all-route capability is implied.
+    std::shared_ptr<void> local_producer_callback_custody_;
+    std::shared_ptr<std::atomic<bool>> local_producer_write_allowed_;
+    // A failed channel-reset cleanup cannot leave partial work committable.
+    // Only an explicit successful rollback clears this physical-writer fence.
+    std::atomic<bool> channel_reset_unsettled_{false};
+    int step_statement_(sqlite3_stmt*) const;
     friend class detail::managed_route_scope;
     // Only database can construct this key. The keyed overload remains
     // accessible to make_shared so keepers retain its single allocation.

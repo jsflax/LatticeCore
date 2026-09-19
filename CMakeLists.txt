@@ -71,6 +71,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/recovery_refresh.cpp
     Sources/LatticeCore/src/receive_install_state.cpp
     Sources/LatticeCore/src/recovery_obligation_store.cpp
+    Sources/LatticeCore/src/recovery_local_producer.cpp
     Sources/LatticeCore/src/receive_ledger.cpp
     Sources/LatticeCore/src/recovery_staging.cpp
     Sources/LatticeCore/src/recovery_install_transaction.cpp
@@ -232,8 +233,10 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryDeltaTests.cpp
+    Tests/LatticeCoreTests/CanonicalScopedInstallTests.cpp
     Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp
     Tests/LatticeCoreTests/RecoveryObligationStoreTests.cpp
+    Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp
     Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp
     Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp

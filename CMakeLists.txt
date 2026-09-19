@@ -4,6 +4,7 @@ project(LatticeCore VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+option(LATTICE_SYNC_COMMIT_PROBE "Opt-in tagged WAL probe and qualification tests" OFF)
 
 # For Android, we need to bundle SQLite3
 if(ANDROID)
@@ -65,6 +66,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
     Sources/LatticeCore/src/schema.cpp
     Sources/LatticeCore/src/sync.cpp
+    Sources/LatticeCore/src/sync_commit_probe.cpp
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
@@ -83,6 +85,9 @@ target_include_directories(LatticeCore PUBLIC
 # and every sqlite3_* call expands to the undefined sqlite3_api thunk table
 # (bites on Linux, where libsqlite3-dev ships sqlite3ext.h).
 target_compile_definitions(LatticeCore PRIVATE SQLITE_CORE)
+if(LATTICE_SYNC_COMMIT_PROBE)
+    target_compile_definitions(LatticeCore PUBLIC LATTICE_SYNC_COMMIT_PROBE)
+endif()
 target_link_libraries(LatticeCore PUBLIC
     SqliteVec
     SQLite::SQLite3
@@ -195,6 +200,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/SyncCommitProbeTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp
     Tests/LatticeCoreTests/SchemaTests.cpp

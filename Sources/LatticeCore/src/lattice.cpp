@@ -480,8 +480,13 @@ void lattice_db::setup_change_hook(database& connection) {
 
     // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
     sqlite3_wal_hook(connection.internal_handle(),
-        [](void* user_data, sqlite3*, const char* schema, int nframes) -> int {
+        [](void* user_data, sqlite3* connection, const char* schema, int nframes) -> int {
             auto* self = static_cast<lattice_db*>(user_data);
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+            sync_commit_probe_detail::record(self, connection, schema);
+#else
+            (void)connection;
+#endif
 
             // WAL-threshold keeper eviction (results spec §3.4): nframes is
             // the log's total frame count after this commit. Crossing the
@@ -533,7 +538,12 @@ void lattice_db::setup_change_hook(database& connection) {
     // hook-list and registry mutexes) is a leaf lock never held across SQL.
     connection.set_txn_hooks(
         [this] { flush_changes(); },
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+        [this, probe_connection = connection.internal_handle()] {
+            sync_commit_probe_detail::rolled_back(this, probe_connection);
+#else
         [this] {
+#endif
             discard_change_buffer();
             fire_invalidation_hooks({}, invalidation_reason::rollback);
         });

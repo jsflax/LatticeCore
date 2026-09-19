@@ -3,6 +3,9 @@
 #include "log.hpp"
 #include "types.hpp"
 #include "db.hpp"
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+#include "sync_commit_probe.hpp"
+#endif
 #include "projection.hpp"
 #include "schema.hpp"
 #include "managed.hpp"
@@ -4398,6 +4401,33 @@ public:
         }
         return query_read(sql.str(), repeated);
     }
+
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+    // Test-only; no new owner, raw-handle escape, statement, transaction or
+    // lifetime policy. Caller retains and serially owns this instance until
+    // finish on the same native thread, with no close/reopen in between.
+    // Arm LAST in a successful one-insert checked transaction body: the next
+    // backend operation must be its COMMIT. Same-thread raw SQL/reentrancy
+    // between arm and COMMIT is outside the fixture contract.
+    int32_t sync_commit_probe_arm(uint64_t operation, uint64_t attempt) noexcept {
+        if (!operation || !attempt) return 1;
+        if (sync_commit_probe_detail::snapshot().status != 2) return 2;
+        if (closed_.load(std::memory_order_acquire) || !db_ ||
+            db_->is_closed() || config_.is_in_memory()) return 3;
+        auto* connection = db_->internal_handle();
+        if (!connection ||
+            txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+            sqlite3_get_autocommit(connection) ||
+            sqlite3_txn_state(connection, "main") != SQLITE_TXN_WRITE) return 4;
+        return sync_commit_probe_detail::arm(this, connection, operation, attempt);
+    }
+    sync_commit_probe_receipt sync_commit_probe_finish(uint64_t operation,
+                                                       uint64_t attempt) noexcept {
+        // Deliberately no db access: errors/rollback may already have closed
+        // the transaction. A matching finish must clear even an unconsumed arm.
+        return sync_commit_probe_detail::finish(this, operation, attempt);
+    }
+#endif
 
     // Transaction support. On shared-cache stores the per-store write gate
     // (results spec §4.1) is held for the duration of the transaction, so

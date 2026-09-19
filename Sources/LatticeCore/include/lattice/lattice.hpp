@@ -3650,6 +3650,16 @@ public:
 
 private:
     friend struct audit_maintenance_test_access;
+    friend struct sync_entry_rollback_test_access;
+    friend std::vector<std::string> apply_remote_changes(
+        lattice_db&, const std::vector<audit_log_entry>&);
+    friend std::vector<std::string> apply_remote_changes_for(
+        lattice_db&, const std::vector<audit_log_entry>&, const std::string&);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&, const std::optional<std::string>&);
+
+    void publish_local_audit_id_(int64_t row_id);
+
     template<typename F>
     int64_t with_audit_prune_transaction_(F&& body) {
         int64_t result = 0;

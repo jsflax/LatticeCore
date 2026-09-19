@@ -197,6 +197,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
     Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp
+    Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
     Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp

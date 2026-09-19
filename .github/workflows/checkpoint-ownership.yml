@@ -1,0 +1,141 @@
+name: Checkpoint ownership qualification
+run-name: Checkpoint baseline and candidate at ${{ github.sha }}
+
+on:
+  push:
+    branches: [codex/sync-checkpoint-qualification-20260919]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Preserve every first result; later requests never cancel an active run.
+concurrency:
+  group: checkpoint-ownership-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checkpoint-linux:
+    runs-on: ubuntu-latest
+    container: swift:6.3-noble
+    timeout-minutes: 60
+    env:
+      CHECKPOINT_DRIVER_SHA: ${{ github.sha }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Create owned localdev roots
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          [[ "$CHECKPOINT_DRIVER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          CHECKPOINT_ROOT="$HOME/localdev/lattice-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CHECKPOINT_ROOT"
+          mkdir -p "$CHECKPOINT_ROOT"/{tmp,module-cache}
+          export TMPDIR="$CHECKPOINT_ROOT/tmp" TMP="$CHECKPOINT_ROOT/tmp" TEMP="$CHECKPOINT_ROOT/tmp"
+          {
+            echo "CHECKPOINT_ROOT=$CHECKPOINT_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+            echo "CLANG_MODULE_CACHE_PATH=$CHECKPOINT_ROOT/module-cache"
+          } >> "$GITHUB_ENV"
+      - name: Install hosted system dependencies
+        shell: bash
+        timeout-minutes: 5
+        run: apt-get update && apt-get install -y git clang cmake libsqlite3-dev python3
+      - name: Fetch exact qualification driver
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          git init "$CHECKPOINT_ROOT/driver"
+          git -C "$CHECKPOINT_ROOT/driver" fetch --depth=1 https://github.com/jsflax/LatticeCore.git "$CHECKPOINT_DRIVER_SHA"
+          git -C "$CHECKPOINT_ROOT/driver" checkout --detach "$CHECKPOINT_DRIVER_SHA"
+          test "$(git -C "$CHECKPOINT_ROOT/driver" rev-parse HEAD)" = "$CHECKPOINT_DRIVER_SHA"
+
+      - name: Pure receipt acceptance tests
+        shell: bash
+        timeout-minutes: 2
+        working-directory: ${{ env.CHECKPOINT_ROOT }}/driver/qualification/checkpoint
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_run.py 2>&1 | tee "$CHECKPOINT_ROOT/pure-oracles.log"
+
+      - name: First baseline then candidate native qualification
+        shell: bash
+        timeout-minutes: 46
+        run: |
+          set -euo pipefail
+          python3 "$CHECKPOINT_ROOT/driver/qualification/checkpoint/run.py"             --root "$CHECKPOINT_ROOT" --driver-sha "$CHECKPOINT_DRIVER_SHA"
+
+      - name: Preserve first receipts even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-${{ github.job }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.CHECKPOINT_ROOT }}/receipts
+            ${{ env.CHECKPOINT_ROOT }}/pure-oracles.log
+          if-no-files-found: error
+          retention-days: 7
+
+  checkpoint-macos:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      CHECKPOINT_DRIVER_SHA: ${{ github.sha }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Create owned localdev roots
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          [[ "$CHECKPOINT_DRIVER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          CHECKPOINT_ROOT="$HOME/localdev/lattice-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CHECKPOINT_ROOT"
+          mkdir -p "$CHECKPOINT_ROOT"/{tmp,module-cache}
+          export TMPDIR="$CHECKPOINT_ROOT/tmp" TMP="$CHECKPOINT_ROOT/tmp" TEMP="$CHECKPOINT_ROOT/tmp"
+          {
+            echo "CHECKPOINT_ROOT=$CHECKPOINT_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+            echo "CLANG_MODULE_CACHE_PATH=$CHECKPOINT_ROOT/module-cache"
+          } >> "$GITHUB_ENV"
+      - name: Fetch exact qualification driver
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          git init "$CHECKPOINT_ROOT/driver"
+          git -C "$CHECKPOINT_ROOT/driver" fetch --depth=1 https://github.com/jsflax/LatticeCore.git "$CHECKPOINT_DRIVER_SHA"
+          git -C "$CHECKPOINT_ROOT/driver" checkout --detach "$CHECKPOINT_DRIVER_SHA"
+          test "$(git -C "$CHECKPOINT_ROOT/driver" rev-parse HEAD)" = "$CHECKPOINT_DRIVER_SHA"
+
+      - name: Pure receipt acceptance tests
+        shell: bash
+        timeout-minutes: 2
+        working-directory: ${{ env.CHECKPOINT_ROOT }}/driver/qualification/checkpoint
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_run.py 2>&1 | tee "$CHECKPOINT_ROOT/pure-oracles.log"
+
+      - name: First baseline then candidate native qualification
+        shell: bash
+        timeout-minutes: 46
+        run: |
+          set -euo pipefail
+          python3 "$CHECKPOINT_ROOT/driver/qualification/checkpoint/run.py"             --root "$CHECKPOINT_ROOT" --driver-sha "$CHECKPOINT_DRIVER_SHA"
+
+      - name: Preserve first receipts even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-${{ github.job }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.CHECKPOINT_ROOT }}/receipts
+            ${{ env.CHECKPOINT_ROOT }}/pure-oracles.log
+          if-no-files-found: error
+          retention-days: 7

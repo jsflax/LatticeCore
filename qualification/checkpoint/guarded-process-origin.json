@@ -1,0 +1,6 @@
+{
+  "source": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/sdk-sync-probe-qualification-001/Scripts/run-development.py",
+  "sourceSHA256": "76e905ef04299f66c92b4657e6be07dcb5e60848a75d1fa6f6ed0b541242c5cf",
+  "extraction": "bytes before newline def pins(path):, with one provenance comment",
+  "extractedSHA256": "28a9f92679082b63a4743e2e01620cf434abf3b12fb79d7fd18178cab19c440b"
+}

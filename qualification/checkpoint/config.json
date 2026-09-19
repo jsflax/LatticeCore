@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "baseCommit": "a05fd480236430ab0d707ed0201d3edbef299de5",
+  "sourceRepository": "jsflax/LatticeCore",
+  "candidatePacketSHA256": "6ea294e15d44f47b8cc214da704037be4c474733a93d58cc09319acdd6753ca2",
+  "baselineOriginalPatchSHA256": "c76e275a4907bd71c5c63840a934d5e45b8ece62b46425139d9bbcc60741bcfd",
+  "baselineNormalization": "candidate db.hpp comment-only documentation is shared; baseline is a05 plus tests/probe plus aligned comments, not unmodified a05",
+  "tests": [
+    "RawPragmaRowReproducesAckCommitFailureAndRetry",
+    "BoundedCheckpointOwnsConnectionUntilTimeoutRestoredThenAckPersists",
+    "BusyReaderMapsLikePragmaAndRetiresOnlyAfterUnlockAndRestore",
+    "OpenCallerTransactionRefusedWithoutCommitRollbackOrTimeoutLeak",
+    "UnqualifiedScopeIncludesAttachedWalAndPreservesMainFrameCounters",
+    "ReadOnlyAndClosedAreNoOpsWithoutProbeOrTimeoutMutation"
+  ],
+  "baselineFailures": [
+    "BoundedCheckpointOwnsConnectionUntilTimeoutRestoredThenAckPersists",
+    "BusyReaderMapsLikePragmaAndRetiresOnlyAfterUnlockAndRestore",
+    "OpenCallerTransactionRefusedWithoutCommitRollbackOrTimeoutLeak"
+  ],
+  "variants": {
+    "baseline": {
+      "tree": "0375713dcf95a6833f7d9656f522ce52ede7dffa",
+      "patchSHA256": "aef702631af8b50120607db21a4fa79311d690d59268b8a08df1d2d20c9073d0",
+      "files": {
+        "CMakeLists.txt": "17e00d2a0f5f55ec3baa4509445a5d69b691087c05212f7c32926efa4ae03700",
+        "Sources/LatticeCore/include/lattice/db.hpp": "b49075e27fe2730a09013e2b78133dc39e47c8fc894e8d9c8ca6b678084b4453",
+        "Sources/LatticeCore/src/db.cpp": "75a47481f8ef92b5ee3e83006acf048c87a6959a3c00810049026c2b98377964",
+        "Sources/LatticeCore/src/checkpoint_test_probe.hpp": "b185aa1d2a869f7fb13386d3539afc2ee394fcf081ffc416f72531d50f1c4649",
+        "Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp": "b9c5e34c7fa4dbb48300ab706109d09a50c9143db85769ac90a098ea0cad8947"
+      }
+    },
+    "candidate": {
+      "tree": "25fbede5327f017ea11cb3e2fde0aa6bbcddce7b",
+      "patchSHA256": "357eae068880441d53f09385cd7173ae8c5c9070d541ba00d860522b2193aba1",
+      "files": {
+        "CMakeLists.txt": "17e00d2a0f5f55ec3baa4509445a5d69b691087c05212f7c32926efa4ae03700",
+        "Sources/LatticeCore/include/lattice/db.hpp": "b49075e27fe2730a09013e2b78133dc39e47c8fc894e8d9c8ca6b678084b4453",
+        "Sources/LatticeCore/src/db.cpp": "8718e23a5b8646f7d604d08b825b86d5b5bccaec1cbcadda68dc8978102d4485",
+        "Sources/LatticeCore/src/checkpoint_test_probe.hpp": "b185aa1d2a869f7fb13386d3539afc2ee394fcf081ffc416f72531d50f1c4649",
+        "Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp": "b9c5e34c7fa4dbb48300ab706109d09a50c9143db85769ac90a098ea0cad8947"
+      }
+    }
+  },
+  "limits": {
+    "overallSeconds": 2700,
+    "finalizationReserveSeconds": 180,
+    "configureSeconds": 120,
+    "baselineBuildSeconds": 1500,
+    "candidateBuildSeconds": 600,
+    "testSeconds": 60,
+    "parallelBuildJobs": 2,
+    "freeFloorBytes": 12884901888,
+    "packetCeilingBytes": 17179869184,
+    "logCeilingBytes": 67108864
+  },
+  "transitionPatchSHA256": "1cdbd7aa478bb330dc77c094422aca95c38bb662729e6db64ef3c7cb8c2fa3a4"
+}

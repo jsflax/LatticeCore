@@ -840,6 +840,7 @@ private:
 // ============================================================================
 
 class lattice_db {
+    struct recovery_commit_batch;
 public:
     // Construct with path (uses default scheduler, no sync)
     explicit lattice_db(const std::string& path)
@@ -1536,13 +1537,19 @@ public:
     /// false when there was nothing to deliver (empty buffer or re-entrant
     /// call under is_flushing_); true after delivering one batch, so the
     /// caller re-checks the buffer for observer-callback writes.
-    bool flush_changes_once() {
+    bool flush_changes_once() { return flush_changes_once_impl(nullptr, nullptr); }
+
+private:
+    // Only the private owned recovery frame supplies a batch/writer. Ordinary
+    // delivery retains its historical queries, callbacks and bounded drain.
+    bool flush_changes_once_impl(database* recovery_writer, recovery_commit_batch* batch) {
         LOG_DEBUG("flush_changes", "Called");
         std::vector<std::tuple<std::string, std::string, int64_t, std::string>> changes;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
-            if (change_buffer_.empty() || is_flushing_) return false;
+            if (change_buffer_.empty() || is_flushing_ ||
+                (recovery_change_buffer_reserved_ && !batch)) return false;
             is_flushing_ = true;
             changes = std::move(change_buffer_);
             change_buffer_.clear();
@@ -1569,6 +1576,11 @@ public:
 
         LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
+        const auto batch_query = [&](const std::string& sql,
+                                     const std::vector<column_value_t>& params = {}) {
+            return recovery_writer ? recovery_writer->query(sql, params) : query_read(sql, params);
+        };
+
         // Backfill globalId for AuditLog INSERTs buffered by the update hook.
         // The memory/Emscripten hook buffers them with an empty globalId — the
         // row wasn't safely readable from inside the hook; here the transaction
@@ -1583,7 +1595,7 @@ public:
             }
             if (!audit_id_list.empty()) {
                 std::unordered_map<int64_t, std::string> gid_by_id;
-                auto rows = query_read(
+                auto rows = batch_query(
                     "SELECT id, globalId FROM AuditLog WHERE id IN (" + audit_id_list + ")");
                 for (const auto& row : rows) {
                     auto id_it = row.find("id");
@@ -1620,7 +1632,7 @@ public:
         // BEFORE notifying observers. This prevents any instance's
         // cross-process handler from re-dispatching entries that
         // flush_changes is about to (or just did) deliver.
-        if (shared_xproc_notifier_) {
+        if (batch || shared_xproc_notifier_) {
             // The ordinary reader can have an older implicit snapshot held by
             // another active SELECT. Reading its MAX here could rewind the
             // cursor advanced by this commit's update hook, letting the xproc
@@ -1628,12 +1640,13 @@ public:
             // sees this commit even when the ordinary reader is still pinned.
             // WAL callbacks permit SQL after commit; memory delivery reaches
             // this point only after its statement has settled.
-            auto max_rows = db_->query("SELECT MAX(id) AS max_id FROM AuditLog");
+            auto max_rows = (recovery_writer ? recovery_writer : db_.get())->query("SELECT MAX(id) AS max_id FROM AuditLog");
             if (!max_rows.empty()) {
                 auto it = max_rows[0].find("max_id");
                 if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
                     auto max_id = std::get<int64_t>(it->second);
-                    for_each_alive([max_id](lattice_db* inst) {
+                    if (batch) batch->audit_frontier = max_id;
+                    else for_each_alive([max_id](lattice_db* inst) {
                         inst->last_seen_audit_id_.store(max_id, std::memory_order_release);
                     });
                 }
@@ -1649,7 +1662,7 @@ public:
         bool had_internal_changes = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
             if (table == "AuditLog" || internal_table_parents.count(table)) continue;
-            auto meta = query_read(
+            auto meta = batch_query(
                 "SELECT value FROM _lattice_meta WHERE key = ?",
                 {"internal_table:" + table}
             );
@@ -1727,7 +1740,7 @@ public:
                 std::string changed_fields;
                 if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
                     && row_id > 0 && table != "AuditLog") {
-                    auto cfn_rows = query_read(
+                    auto cfn_rows = batch_query(
                         "SELECT changedFieldsNames FROM AuditLog "
                         "WHERE tableName = ? AND rowId = ? ORDER BY id DESC LIMIT 1",
                         {table, row_id}
@@ -1779,7 +1792,7 @@ public:
             LOG_DEBUG("flush_changes", "Querying AuditLog for table=%s rowId=%lld op=%s", table.c_str(), (long long)row_id, op.c_str());
 
             // Query for AuditLog entry created by trigger for this model change
-            auto audit_rows = query_read(
+            auto audit_rows = batch_query(
                 "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND rowId = ? AND operation = ? ORDER BY id DESC LIMIT 1",
                 {table, row_id, op}
             );
@@ -1814,7 +1827,7 @@ public:
             for (const auto& [table, op, row_id, global_id] : changes) {
                 if (!internal_table_parents.count(table)) continue;
 
-                auto audit_rows = query_read(
+                auto audit_rows = batch_query(
                     "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND operation = ? ORDER BY id DESC LIMIT 1",
                     {table, op}
                 );
@@ -1882,7 +1895,8 @@ public:
                 }
                 changed[i].changed_fields = std::move(joined);
             }
-            for_each_alive([&changed](lattice_db* instance) {
+            if (batch) batch->invalidations = std::move(changed);
+            else for_each_alive([&changed](lattice_db* instance) {
                 instance->fire_invalidation_hooks_local(changed,
                                                         invalidation_reason::commit);
             });
@@ -1893,7 +1907,8 @@ public:
         // (e.g. ClaudeCodeIRC's RoomSyncServer) one frame per logical
         // transaction even when that transaction spans the parent DELETE
         // plus its cascade link-table DELETEs.
-        if (!events.empty()) {
+        if (batch) batch->events = std::move(events);
+        else if (!events.empty()) {
             for_each_alive([&events](lattice_db* instance) {
                 instance->notify_changes_batched(events);
             });
@@ -1904,12 +1919,13 @@ public:
         // already cause the synchronizer to pick up ALL unsynced entries including
         // internal ones). Dispatch via scheduler to avoid calling sync_now() from
         // within the WAL hook — synchronous calls race with WebSocket ACK handlers.
-        if (had_internal_changes && !triggered_regular_audit) {
+        if (batch) batch->needs_upload_hint = had_internal_changes && !triggered_regular_audit;
+        else if (had_internal_changes && !triggered_regular_audit) {
             trigger_sync_upload();
         }
 
         // Post cross-process notification (cursor already advanced above)
-        if (shared_xproc_notifier_ && !config_.read_only) {
+        if (!batch && shared_xproc_notifier_ && !config_.read_only) {
             shared_xproc_notifier_->post_notification();
         }
 
@@ -1918,6 +1934,7 @@ public:
         return true;
     }
 
+public:
     // ========================================================================
     // Sync API (matches Lattice.swift)
     // ========================================================================
@@ -6102,6 +6119,21 @@ private:
     // >= 0 means this process holds the lock and owns the WSS synchronizer.
     // -1 means lock not held (another process owns it, or sync not configured).
     int sync_lock_fd_ = -1;
+
+    struct recovery_commit_batch {
+        std::vector<change_event> events;
+        std::vector<invalidation_table_change> invalidations;
+        std::optional<int64_t> audit_frontier;
+        bool needs_upload_hint = false;
+    };
+    // Guarded by change_buffer_mutex_. A generic flush cannot steal the
+    // admitted recovery transaction's rows, including a preexisting drain
+    // that already cleared txn_dirty_ before this frame acquired SQLite.
+    bool recovery_change_buffer_reserved_ = false;
+    // Physical-writer publication also refuses same-thread recursive SQLite
+    // callbacks during an admitted private install; whole-owner close may fence
+    // new admission without replacing the retained writer.
+    std::atomic<size_t> active_recovery_install_operations_{0};
 
     // Change buffering - accumulates changes until WAL hook fires
     std::mutex change_buffer_mutex_;

@@ -54,6 +54,7 @@ class lattice_db;
 class database;
 namespace detail {
 struct exact_vector_rows_access;
+struct recovery_writer_access;
 
 // One ordinary attached-field operation. Main/manual database fields keep
 // their existing path. The implementation never acquires a topology mutex
@@ -82,6 +83,7 @@ public:
 class database {
     friend class lattice_db;
     friend struct detail::exact_vector_rows_access;
+    friend struct detail::recovery_writer_access;
     friend class detail::managed_route_scope;
     // Only database can construct this key. The keyed overload remains
     // accessible to make_shared so keepers retain its single allocation.
@@ -136,6 +138,7 @@ class database {
         // Only touched while owning this physical connection's SQLite mutex.
         // The added hook path uses POD, with no allocation/SQL/user callback.
         sync_apply_chunk_state* sync_chunk = nullptr;
+        bool recovery_delivery_deferred = false;
         bool entry_cursor_active = false;
         bool entry_cursor_present = false;
         int64_t entry_cursor_last = 0;

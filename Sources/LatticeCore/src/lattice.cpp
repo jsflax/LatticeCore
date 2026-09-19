@@ -376,6 +376,8 @@ void lattice_db::close_read_db() {
 }
 
 void lattice_db::close_write_db() {
+    if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer close refused during owned recovery install");
     if (detail::managed_route_scope::active_for(this) ||
         active_managed_attachment_operations_.load(std::memory_order_acquire) != 0)
         throw db_error("writer close refused during managed scalar access or delivery");
@@ -437,6 +439,8 @@ void lattice_db::restore_attached_views(database& connection) {
 }
 
 void lattice_db::reopen_write_db() {
+    if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer reopen refused during owned recovery install");
     if (detail::managed_route_scope::active_for(this) ||
         active_managed_attachment_operations_.load(std::memory_order_acquire) != 0)
         throw db_error("writer reopen refused during managed scalar access or delivery");
@@ -710,6 +714,10 @@ void lattice_db::setup_change_hook(database& connection) {
                 self->raise_projection_pressure(schema);
                 self->wal_eviction_pending_.store(true, std::memory_order_seq_cst);
             }
+
+            // The private recovery call owns this commit's detached tail.
+            // Generic dirty-state drain must never consume that batch.
+            if (context->recovery_delivery_deferred) return SQLITE_OK;
 
             const bool delivered = self->flush_changes();
             if (!delivered) {

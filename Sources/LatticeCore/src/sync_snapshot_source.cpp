@@ -9,7 +9,7 @@
 namespace lattice::detail::sync_recovery {
 namespace {
 void check(bool value, const char* message) { if (!value) throw protocol_error(message); }
-std::string quoted(const std::string& name) {
+std::string quote_source_identifier(const std::string& name) {
     check(!name.empty() && name.size() <= 256, "source identifier length refused");
     std::string result = "\"";
     for (unsigned char c : name) {
@@ -86,7 +86,7 @@ void validate_budget(const source_limits& b) {
 source_layout layout(view& v, const source_relation& relation, const source_limits& b) {
     check(relation.complete_table_scope, "filtered or undeclared source scope refused");
     check(relation.kind == relation_kind::model || relation.kind == relation_kind::link, "unknown source relation kind");
-    (void)quoted(relation.table);
+    (void)quote_source_identifier(relation.table);
     const auto folded = upper(relation.table);
     check(folded != "AUDITLOG" && folded != "_SYNCCONTROL" && folded.rfind("_LATTICE_", 0) != 0 &&
           folded.rfind("SQLITE_", 0) != 0, "internal source relation refused");
@@ -104,7 +104,7 @@ source_layout layout(view& v, const source_relation& relation, const source_limi
     bool id = false, global = false; size_t primary_columns = 0;
     for (const auto& c : columns) {
         source_column col{string_value(c, "name"), upper(string_value(c, "type")), integer(c, "notnull") != 0, integer(c, "pk")};
-        (void)quoted(col.name);
+        (void)quote_source_identifier(col.name);
         check(integer(c, "hidden") == 0 && col.primary_key_order >= 0, "generated/hidden source column refused");
         check(col.sql_type == "INTEGER" || col.sql_type == "REAL" || col.sql_type == "TEXT" || col.sql_type == "BLOB",
               "unsupported source declared type");
@@ -135,7 +135,7 @@ source_layout layout(view& v, const source_relation& relation, const source_limi
     check(indexes.size() <= b.indexes_per_table, "source index budget exceeded");
     for (const auto& index : indexes) {
         if (integer(index, "unique") != 1 || integer(index, "partial") != 0) continue;
-        const auto name = string_value(index, "name"); (void)quoted(name);
+        const auto name = string_value(index, "name"); (void)quote_source_identifier(name);
         const auto fields = v.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=256 THEN name END AS name,"
             "CASE WHEN length(CAST(coll AS BLOB))<=16 THEN coll END AS coll "
             "FROM pragma_index_xinfo(?) WHERE \"key\"=1 ORDER BY seqno LIMIT 2", {name});
@@ -166,14 +166,14 @@ row copy_row(view& v, const source_layout& table, const std::string& id, const s
         if (c.name == "id" || c.name == "globalId") continue;
         if (!columns.empty()) sizes += ',';
         const auto n = std::to_string(columns.size());
-        sizes += "typeof(" + quoted(c.name) + ") AS t" + n + ",length(CAST(" + quoted(c.name) + " AS BLOB)) AS n" + n;
+        sizes += "typeof(" + quote_source_identifier(c.name) + ") AS t" + n + ",length(CAST(" + quote_source_identifier(c.name) + " AS BLOB)) AS n" + n;
         // JSON property spelling + kind/value envelope, numeric spelling.
         payload_upper += 6 * c.name.size() + 96;
         columns.push_back(c.name);
     }
     check(!columns.empty(), "source relation without payload columns refused");
     check(payload_upper <= payload_limit, "source row structural budget exceeded");
-    sizes += " FROM main." + quoted(table.table) + " WHERE \"globalId\"=? COLLATE " + table.identity_collation + " LIMIT 2";
+    sizes += " FROM main." + quote_source_identifier(table.table) + " WHERE \"globalId\"=? COLLATE " + table.identity_collation + " LIMIT 2";
     const auto measured = v.query(sizes, {id});
     check(measured.size() == 1, "source row identity changed");
     std::vector<std::string> storage_classes;
@@ -190,13 +190,13 @@ row copy_row(view& v, const source_layout& table, const std::string& id, const s
     std::string select = "SELECT ";
     for (size_t i = 0; i < columns.size(); ++i) {
         if (i) select += ',';
-        const auto column = quoted(columns[i]);
+        const auto column = quote_source_identifier(columns[i]);
         // The inherited generic TEXT extractor is NUL-terminated. Read text
         // as sized BLOB bytes here; the preceding same-view typeof determines
         // whether to reconstruct TEXT or preserve an actual BLOB.
         select += storage_classes[i] == "text" ? "CAST(" + column + " AS BLOB) AS " + column : column;
     }
-    select += " FROM main." + quoted(table.table) + " WHERE \"globalId\"=? COLLATE " + table.identity_collation + " LIMIT 2";
+    select += " FROM main." + quote_source_identifier(table.table) + " WHERE \"globalId\"=? COLLATE " + table.identity_collation + " LIMIT 2";
     const auto values = v.query(select, {id});
     check(values.size() == 1, "source row identity changed");
     row_values payload;
@@ -225,13 +225,13 @@ unsealed_materialization capture(lattice_db& owner, const std::vector<source_rel
                                  const std::function<void(size_t, uint64_t)>& after_capture_batch) {
     validate_budget(b); check(!scope.empty() && scope.size() <= b.tables, "source scope budget exceeded");
     for (const auto& relation : scope) {
-        (void)quoted(relation.table);
+        (void)quote_source_identifier(relation.table);
         check(relation.table.size() <= b.wire.string_bytes, "source identity exceeds string budget");
     }
     auto sorted = scope;
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& z) { return a.table < z.table; });
     for (size_t i = 0; i < sorted.size(); ++i) {
-        (void)quoted(sorted[i].table);
+        (void)quote_source_identifier(sorted[i].table);
         check(i == 0 || sorted[i-1].table != sorted[i].table, "duplicate source relation");
     }
     view held(owner);
@@ -258,7 +258,7 @@ unsealed_materialization capture(lattice_db& owner, const std::vector<source_rel
         for (;;) {
             std::string sql = "SELECT CASE WHEN typeof(source_row.\"globalId\")='text' AND "
                 "length(CAST(source_row.\"globalId\" AS BLOB)) BETWEEN 1 AND 256 "
-                "THEN CAST(source_row.\"globalId\" AS BLOB) END AS globalId FROM main." + quoted(table.table) + " AS source_row";
+                "THEN CAST(source_row.\"globalId\" AS BLOB) END AS globalId FROM main." + quote_source_identifier(table.table) + " AS source_row";
             std::vector<column_value_t> params;
             if (last) { sql += " WHERE source_row.\"globalId\" > ? COLLATE " + table.identity_collation; params.push_back(*last); }
             // Qualify the physical column: ordering the CASE alias would
@@ -272,7 +272,7 @@ unsealed_materialization capture(lattice_db& owner, const std::vector<source_rel
             const auto ids = held.query(sql, params);
             if (ids.empty()) break;
             for (const auto& item : ids) {
-                const auto id = byte_string(item, "globalId"); (void)quoted(id);
+                const auto id = byte_string(item, "globalId"); (void)quote_source_identifier(id);
                 check(id.size() <= b.wire.string_bytes, "source identity exceeds string budget");
                 const auto index_key = table.identity_collation == "NOCASE" ? nocase_key(id) : id;
                 check(!last_index_key || *last_index_key < index_key, "source row order invalid");

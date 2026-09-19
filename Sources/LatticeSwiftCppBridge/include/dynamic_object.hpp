@@ -86,6 +86,14 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     dynamic_object(const swift_dynamic_object& o) : lattice(nullptr) {
         new (&unmanaged_) swift_dynamic_object(o);
     }
+
+    // Construct default unmanaged storage in its final owning object. The
+    // existing constructor still seeds every schema-defined default/list.
+    dynamic_object(const std::string& table,
+                   const std::unordered_map<std::string, property_descriptor>& props)
+        : lattice(nullptr) {
+        new (&unmanaged_) swift_dynamic_object(table, props);
+    }
     
     dynamic_object(const managed<swift_dynamic_object>& o) : lattice(nullptr) {
         new (&managed_) managed<swift_dynamic_object>(o);
@@ -95,6 +103,47 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     dynamic_object(const managed<swift_dynamic_object*>& o) : lattice(nullptr) {
         new (&managed_) managed<swift_dynamic_object>(*o.get_value());
         lattice = managed_.lattice_shared();
+    }
+
+    /// Identity captured when this handle was bound, without reading the row
+    /// or changing materialized-read mode. Zero means unmanaged. This is not
+    /// an existence check: deleting the row does not erase a held handle's id.
+    int64_t managed_primary_key() const noexcept SWIFT_NAME(managedPrimaryKey()) {
+        return lattice ? managed_.id_ : 0;
+    }
+
+    /// Collection-query metadata, independent of live and materialized reads.
+    /// An image survives writes/deletes unchanged until explicitly released.
+    bool has_query_row_image() const noexcept SWIFT_NAME(hasQueryRowImage()) {
+        return lattice && managed_.query_row_image_ != nullptr;
+    }
+
+    /// Exact stored type: -1 = absent, 0 = SQL NULL, 1 = Int64, 2 = Double,
+    /// 3 = String, 4 = blob. Missing metadata never falls back to a SQL read.
+    int32_t query_row_value_type(const std::string& name) const
+        SWIFT_NAME(queryRowValueType(named:)) {
+        if (!has_query_row_image()) return -1;
+        const auto& image = *managed_.query_row_image_;
+        auto it = image.find(name);
+        return it == image.end() ? -1 : static_cast<int32_t>(it->second.index());
+    }
+
+    /// Copy one value out of the immutable query image. Check the type first
+    /// to distinguish absence from SQL NULL, and the bridge error immediately
+    /// afterward for allocation failure. No live-read fallback or cache change.
+    column_value_t query_row_value(const std::string& name) const
+        SWIFT_NAME(queryRowValue(named:)) {
+        return sealed([&]() -> column_value_t {
+            if (!has_query_row_image()) return nullptr;
+            const auto& image = *managed_.query_row_image_;
+            auto it = image.find(name);
+            return it == image.end() ? column_value_t{nullptr} : it->second;
+        });
+    }
+
+    /// Drop only this handle's query metadata; keep its field/cache semantics.
+    void release_query_row_image() noexcept SWIFT_NAME(releaseQueryRowImage()) {
+        if (lattice) managed_.query_row_image_.reset();
     }
     
     // ------------------------------------------------------------------
@@ -108,7 +157,7 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     // observed). Materialized mode serves gets from the hydrated snapshot.
     //
     // Contract:
-    // - Opt-in; default read path is bit-for-bit untouched.
+    // - Opt-in; default reads preserve live per-column semantics.
     // - A materialized object is a read SNAPSHOT as of hydration/refresh;
     //   concurrent writers are invisible until refreshRowCache().
     // - Fail-safe: any miss or variant/type mismatch falls through to the
@@ -170,7 +219,12 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
                     // (NULL convention, affinity coercion) — never guess here.
                 }
             }
-            return managed_.get_managed_field<T>(name);
+            if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, double> ||
+                          std::is_same_v<T, std::string>) {
+                return managed_.read_live_scalar<T>(name);
+            } else {
+                return managed_.get_managed_field<T>(name);
+            }
         } else {
             auto value = unmanaged_.get(name);
             return *std::get_if<T>(&value);
@@ -281,10 +335,14 @@ public:
         if (lattice) {
             auto* db = managed_.db_;
             if (!db) return;
+            {
+            detail::managed_route_scope route_guard(db, managed_.lattice_, managed_.table_name_,
+                managed_.attachment_token_, managed_.attachment_writer_);
             db->execute(
-                "UPDATE " + managed_.table_name_ + " SET " + name + " = " + name +
+                "UPDATE " + managed_table_sql(managed_.table_name_) + " SET " + name + " = " + name +
                     " + ? WHERE id = ?",
                 {delta, managed_.id_});
+            }
             // New value unknown here — drop the cached key so the next
             // materialized read falls through live instead of going stale.
             managed_.source.values.erase(name);
@@ -395,6 +453,13 @@ public:
         }
     }
 
+    /// Logical schema/model name captured at hydration or insertion. Keep it
+    /// separate from getTableName(), whose qualified route preserves physical
+    /// identity and directs live reads/writes to an attached store.
+    std::string get_model_table_name() const SWIFT_NAME(getModelTableName()) {
+        return lattice ? managed_.source.table_name : unmanaged_.table_name;
+    }
+
 private:
     // to_json internals (dynamic_object.cpp). out_json is a nlohmann::json*
     // passed as void* to keep the JSON dependency out of this header;
@@ -403,6 +468,14 @@ private:
     static void json_walk(const dynamic_object& obj, int64_t depth,
                           std::set<std::string>& visited, void* out_json);
     link_list list_backing(const std::string& name) const;
+
+    // Exact hydration already owns the parent through its ref. Avoid a cache
+    // lookup (and cache/SQLite lock edge) while the exact writer lease is held.
+    dynamic_object(const managed<swift_dynamic_object>& object,
+                   std::shared_ptr<swift_lattice> owner) : lattice(std::move(owner)) {
+        if (!lattice) throw db_error("exact managed object has no owning lattice");
+        new (&managed_) managed<swift_dynamic_object>(object);
+    }
 
     union {
         swift_dynamic_object unmanaged_;
@@ -415,6 +488,7 @@ private:
     friend class swift_lattice;
     friend struct link_list;
     friend class dynamic_object_ref;
+    friend struct managed_attachment_test_access;
 };
 
 
@@ -452,6 +526,21 @@ public:
         auto impl = std::make_shared<dynamic_object>();
         impl->unmanaged_.table_name = table_name;
         return _make(impl);
+    }
+
+    static LATTICE_DOREF_RET create_unmanaged(
+        const std::string& table,
+        const std::unordered_map<std::string, property_descriptor>& props)
+        SWIFT_NAME(createUnmanaged(table:properties:)) LATTICE_DOREF_UNRETAINED {
+        return _make(std::make_shared<dynamic_object>(table, props));
+    }
+
+    // Copy a managed row directly into its final owning object. The row is
+    // borrowed only during this call; the resulting ref owns its managed copy.
+    static LATTICE_DOREF_RET wrap_managed(
+        const managed<swift_dynamic_object>& row)
+        SWIFT_NAME(wrapManaged(_:)) LATTICE_DOREF_UNRETAINED {
+        return _make(std::make_shared<dynamic_object>(row));
     }
 
     static LATTICE_DOREF_RET wrap(std::shared_ptr<dynamic_object> obj) LATTICE_DOREF_UNRETAINED {
@@ -620,28 +709,32 @@ public:
 
     // geo_bounds accessors
     geo_bounds get_geo_bounds(const std::string& name) const SWIFT_NAME(getGeoBounds(named:)) {
-        return impl_->get_geo_bounds(name);
+        return sealed([&] { return impl_->get_geo_bounds(name); });
     }
 
     void set_geo_bounds(const std::string& name, const geo_bounds& value) const SWIFT_NAME(setGeoBounds(named:_:)) {
-        impl_->set_geo_bounds(name, value);
+        sealed([&] { impl_->set_geo_bounds(name, value); });
     }
 
     void set_geo_bounds(const std::string& name, double minLat, double maxLat, double minLon, double maxLon) const SWIFT_NAME(setGeoBounds(named:minLat:maxLat:minLon:maxLon:)) {
-        impl_->set_geo_bounds(name, minLat, maxLat, minLon, maxLon);
+        sealed([&] { impl_->set_geo_bounds(name, minLat, maxLat, minLon, maxLon); });
     }
 
     bool has_geo_bounds(const std::string& name) const SWIFT_NAME(hasGeoBounds(named:)) {
-        return impl_->has_geo_bounds(name);
+        return sealed([&] { return impl_->has_geo_bounds(name); });
     }
 
 
     void remove_geo_bounds_at(const std::string& name, size_t index) const SWIFT_NAME(removeGeoBounds(named:at:)) {
-        impl_->remove_geo_bounds_at(name, index);
+        sealed([&] { impl_->remove_geo_bounds_at(name, index); });
     }
 
     std::string get_table_name() const SWIFT_NAME(getTableName()) {
         return impl_->get_table_name();
+    }
+
+    std::string get_model_table_name() const SWIFT_NAME(getModelTableName()) {
+        return impl_->get_model_table_name();
     }
 
     /// Object-graph → JSON — see dynamic_object::to_json for the pinned contract.
@@ -666,9 +759,35 @@ public:
         return impl_ != nullptr && impl_->lattice != nullptr;
     }
 
+    /// Statement-free bound identity; zero for an empty or unmanaged ref.
+    int64_t managed_primary_key() const noexcept SWIFT_NAME(managedPrimaryKey()) {
+        return impl_ ? impl_->managed_primary_key() : 0;
+    }
+
+    bool has_query_row_image() const noexcept SWIFT_NAME(hasQueryRowImage()) {
+        return impl_ && impl_->has_query_row_image();
+    }
+
+    int32_t query_row_value_type(const std::string& name) const
+        SWIFT_NAME(queryRowValueType(named:)) {
+        return impl_ ? impl_->query_row_value_type(name) : -1;
+    }
+
+    column_value_t query_row_value(const std::string& name) const
+        SWIFT_NAME(queryRowValue(named:)) {
+        if (impl_) return impl_->query_row_value(name);
+        last_bridge_error().clear();
+        return nullptr;
+    }
+
+    void release_query_row_image() const noexcept SWIFT_NAME(releaseQueryRowImage()) {
+        if (impl_) impl_->release_query_row_image();
+    }
+
 private:
     dynamic_object_ref() = default;
 
+    friend class exact_vector_live_result; // nonallocating legacy failure value
     friend struct dynamic_object;
     friend struct swift_lattice;
     friend struct link_list;

@@ -8,6 +8,9 @@
 #include <unordered_map>
 #include <atomic>
 #include <functional>
+#include <chrono>
+#include <memory>
+#include <mutex>
 
 namespace lattice {
 
@@ -21,8 +24,89 @@ public:
     explicit db_error(const std::string& msg) : std::runtime_error(msg) {}
 };
 
+/// Only installed on a connection exclusively owned by one read operation.
+/// Target publication protects sqlite3_interrupt from late cancellation/UAF.
+struct database_read_control {
+    std::atomic<int32_t> stop_code{0};
+    std::chrono::steady_clock::time_point deadline;
+    std::mutex target_mutex;
+    sqlite3* target = nullptr;
+    bool stopped() noexcept;
+    void stop(int32_t reason) noexcept;
+    void publish(sqlite3* handle) noexcept;
+    void unpublish(sqlite3* handle) noexcept;
+};
+
+/// Native live-file identity. filename is SQLite's decoded absolute filename,
+/// canonicalized for diagnostics; matching uses device/inode, not spelling.
+/// Capture validates pathname stability with HAS_MOVED, not an atomic fstat of
+/// SQLite's descriptor. Concurrent external replacement during capture is
+/// unsupported; detected movement/replacement fails projected reads closed.
+struct physical_store_identity {
+    uint64_t device = 0, inode = 0;
+    std::string filename;
+    bool operator==(const physical_store_identity& other) const noexcept {
+        return device == other.device && inode == other.inode;
+    }
+};
+
+class lattice_db;
+class database;
+namespace detail {
+struct exact_vector_rows_access;
+class exact_vector_read_lease;
+
+// One ordinary attached-field operation. Main/manual database fields keep
+// their existing path. The implementation never acquires a topology mutex
+// beneath SQLite; it validates the published generation while holding SQLite.
+class managed_route_scope {
+    friend class exact_vector_read_lease;
+    database* db_ = nullptr;
+    std::shared_ptr<database> writer_owner_;
+    lattice_db* owner_ = nullptr;
+    sqlite3_mutex* mutex_ = nullptr;
+    std::unique_lock<std::recursive_timed_mutex> vector_gate_;
+    managed_route_scope* previous_ = nullptr;
+    int exceptions_ = 0;
+    bool drain_on_exit_ = true;
+    static thread_local managed_route_scope* current_;
+    void admit(database*, lattice_db*, sqlite3_mutex*, bool drain) noexcept;
+    // Owned exact reads share TLS/publication admission without draining a
+    // prior write's callbacks. Only the private read lease can use this path.
+    managed_route_scope(lattice_db&, std::shared_ptr<database>);
+public:
+    managed_route_scope(database*, lattice_db*, const std::string& table,
+                        int64_t token, const std::weak_ptr<database>& writer,
+                        bool vector_write = false);
+    ~managed_route_scope() noexcept(false);
+    managed_route_scope(const managed_route_scope&) = delete;
+    managed_route_scope& operator=(const managed_route_scope&) = delete;
+    static bool active_for(const database*) noexcept;
+    static bool active_for(const lattice_db*) noexcept;
+};
+}
+
 class database {
     friend class lattice_db;
+    friend struct detail::exact_vector_rows_access;
+    friend class detail::managed_route_scope;
+    friend class detail::exact_vector_read_lease;
+    // Only database can construct this key. The keyed overload remains
+    // accessible to make_shared so keepers retain its single allocation.
+    class initialization_key {
+        friend class database;
+        const bool keeper_cache_;
+        explicit initialization_key(bool keeper_cache) : keeper_cache_(keeper_cache) {}
+    public:
+        initialization_key(const initialization_key&) = default;
+    };
+    static std::shared_ptr<database> make_read_keeper(const std::string& path,
+                                                    int busy_timeout_ms);
+    template<typename T, typename Enable> friend struct managed;
+    friend class swift_lattice;
+    friend class projection_service;
+    friend struct projection_operation_state;
+    friend struct database_projection_capture;
     // The update hook may query globalId through database::query(). That
     // nested query must not drain a prior row's dirty state while the outer
     // SQLite statement still owns its connection mutex. Track the actual
@@ -75,8 +159,22 @@ public:
     };
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
-                      int busy_timeout_ms = kDefaultBusyTimeoutMs);
+                      int busy_timeout_ms = kDefaultBusyTimeoutMs,
+                      std::shared_ptr<database_read_control> read_control = {});
+    // Private construction capability; no caller can manufacture the key.
+    database(const std::string& path, open_mode mode, int busy_timeout_ms,
+             std::shared_ptr<database_read_control> read_control, initialization_key key);
     ~database();
+
+    /// No SQL statements. Best-effort for legacy callers; nullptr means an
+    /// unsupported/moved/nonfilesystem store or interrupted metadata wait.
+    /// The main identity is cached lazily; validation is required on a newly
+    /// opened private lease. Callers never hold a global registry lock here.
+    std::shared_ptr<const physical_store_identity> physical_identity(
+        const std::string& schema = "main",
+        const std::shared_ptr<database_read_control>& control = {},
+        bool validate_current = false) const;
+
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.
     /// The underlying sqlite3* is NOT freed here — it is released in ~database (which
@@ -181,6 +279,8 @@ public:
     /// issued from the calling thread. Exact budgets for single-threaded
     /// read paths, immune to parallel test suites in the same process.
     static uint64_t thread_statement_count();
+    /// Raw bounded read cursors use the same statement accounting funnel.
+    static void record_statement();
 
     /// Mark this connection dirty: buffered row changes await delivery once
     /// the enclosing transaction settles. Relaxed store — callable from inside
@@ -198,23 +298,32 @@ public:
     /// failed statements whose implicit transaction already rolled back.
     void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back);
 
-    // Raw access (use sparingly)
-    sqlite3* handle() const { return db_; }
+    /// Raw access permanently opts this connection out of strict borrowed
+    /// memory projection capture: external SQLite handlers cannot be restored
+    /// or proven read-only. Waits behind an active capture before exposing it.
+    sqlite3* handle() const;
 
-    // Bind a value to a prepared statement (public for lattice_db bulk insert)
+    // Bind a value to a prepared statement (public for lattice_db bulk insert).
+    // Throws db_error on the first SQLite binding failure; does not step,
+    // finalize, or alter transaction ownership. The caller owns the statement.
     void bind_value(sqlite3_stmt* stmt, int index, const column_value_t& value);
 
     /// Whether close() has been called. Ops check this and short-circuit.
     bool is_closed() const { return closed_.load(std::memory_order_acquire); }
 
 private:
+    // Trusted Core/bridge callers only; never return this pointer to a client.
+    sqlite3* internal_handle() const noexcept { return db_; }
     sqlite3* db_ = nullptr;
+    mutable std::atomic<bool> raw_handle_escaped_{false};
     std::string path_;
     open_mode mode_;
     // Set by close(); ops short-circuit when set. db_ stays valid until ~database,
     // so this is a logical-close flag, not a lifetime guard.
     std::atomic<bool> closed_{false};
     int busy_timeout_ms_ = kDefaultBusyTimeoutMs;
+    std::shared_ptr<database_read_control> read_control_;
+    mutable std::shared_ptr<const physical_store_identity> main_physical_identity_;
     // Deferred delivery (docs/design-deferred-memory-delivery.md): set by the
     // update hook via mark_txn_dirty(); consumed by drain_if_settled() at the
     // success tail of every statement wrapper; cleared by the rollback hook.
@@ -222,6 +331,25 @@ private:
     std::function<void()> on_txn_settled_;
     std::function<void()> on_txn_rolled_back_;
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
+    // Internal live primitive getter path. Preserve query()'s first-row/name
+    // and stored-type conventions without building generic result containers.
+    // Empty optional means no matching first-row cell; a present nullptr is
+    // SQL NULL. The owning connection, fresh statement and settled tail remain.
+    std::optional<column_value_t> query_managed_cell(
+        const std::string& sql, const std::string& column, primary_key_t row_id);
+    // ATTACH-only internal operation. Capture metadata in the same SQLite
+    // execution scope, before a competing writer can win a second acquisition.
+    // This captures only internal metadata; deferred user delivery stays after it.
+    std::shared_ptr<const physical_store_identity> attach_and_capture_identity(
+        const std::string& attach_sql, const std::string& schema);
+    // Caller owns this handle's recursive SQLite mutex.
+    std::shared_ptr<const physical_store_identity> physical_identity_locked(
+        const std::string& schema,
+        const std::shared_ptr<database_read_control>& control) const;
+    // Attachment schema metadata only. Run the existing single read statement
+    // inside one SQLite execution scope; keep original SQLite types and names.
+    std::vector<std::string> query_attachment_text_metadata(
+        const std::string& sql, const std::string& column);
     void drain_if_settled();
     void discard_if_rolled_back();
 };

@@ -106,7 +106,8 @@ TEST_F(CanonicalSourceCapture, FullAddsAbsentReceiptTargetsWithoutTurningAllMiss
 TEST_F(CanonicalSourceCapture, RetiredAndAheadBasesRefuseWhileFullRemainsAvailable) {
     put('1',"before");const auto floor=head();db.begin_transaction();
     canonical_change_store(db,binding,store_limits).advance_floor(floor,floor);db.commit();
-    EXPECT_THROW(capture(0),sr::protocol_error);EXPECT_THROW(capture(floor+1),sr::protocol_error);
+    EXPECT_THROW(capture(0),sr::protocol_error);
+    EXPECT_THROW(capture(floor+1),sr::protocol_error);
     const auto got=capture();EXPECT_EQ(got.floor,floor);ASSERT_EQ(got.rows.size(),1u);EXPECT_EQ(body(got.rows[0]),"before");
 }
 
@@ -142,7 +143,8 @@ TEST_F(CanonicalSourceCapture, MalformedReceiptAndMarkerStorageRefuseBeforePaylo
 
 TEST_F(CanonicalSourceCapture, NonUuidRowsAndUndeclaredScopeAreNotSilentlyDropped) {
     db.db().execute("INSERT INTO CanonicalCaptureRecord(globalId,body,rank) VALUES('legacy','body',1)");
-    EXPECT_THROW(capture(),sr::protocol_error);scope[0].complete_table_scope=false;EXPECT_THROW(capture(),sr::protocol_error);
+    EXPECT_THROW(capture(),sr::protocol_error);scope[0].complete_table_scope=false;
+    EXPECT_THROW(capture(),sr::protocol_error);
     EXPECT_EQ(db.local_read_generations_outstanding(),0u);
 }
 
@@ -188,7 +190,8 @@ TEST_F(CanonicalSourceCapture, CounterDriftAndUnrequestedCorruptReceiptsRefuseBe
     for(const auto* field:{"markers","marker_bytes","receipts","receipt_bytes"}) {
         const auto original=db.db().query(std::string("SELECT ")+field+" AS n FROM _lattice_canonical_store");
         db.db().execute(std::string("UPDATE _lattice_canonical_store SET ")+field+"=0");
-        EXPECT_THROW(capture(h),sr::protocol_error);EXPECT_THROW(capture(),sr::protocol_error);
+        EXPECT_THROW(capture(h),sr::protocol_error);
+        EXPECT_THROW(capture(),sr::protocol_error);
         db.db().execute(std::string("UPDATE _lattice_canonical_store SET ")+field+"=?",{original.at(0).at("n")});
     }
     db.db().execute("UPDATE _lattice_canonical_receipt SET position=zeroblob(65536)");

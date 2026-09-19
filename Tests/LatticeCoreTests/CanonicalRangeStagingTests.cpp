@@ -243,7 +243,8 @@ TEST(CanonicalRangeHash, StreamFacadeMatchesIndependentGoldenAcrossPages) {
     for(const auto& row:x.rows)content.append(row);for(const auto& row:x.receipts)receipts.append(row);
     EXPECT_EQ(content.finish(),"748c3b98eec56e4e9cc909654e334a37a6c56e0df20fc8a808ce9e2c1de99a03");
     EXPECT_EQ(receipts.finish(),"56e76613b67f5cd51cb776605c5828c49d20dc740195aa1813b2905ce5d35417");
-    EXPECT_THROW(content.finish(),cr::protocol_error);EXPECT_THROW(receipts.append(x.receipts[0]),cr::protocol_error);
+    EXPECT_THROW(content.finish(),cr::protocol_error);
+    EXPECT_THROW(receipts.append(x.receipts[0]),cr::protocol_error);
 }
 
 TEST(CanonicalRangeHash, StreamFacadeRefusesPrematureFinishWrongStreamOrderAndTotals) {
@@ -340,7 +341,8 @@ TEST(CanonicalRangeStagingFile, ReopenAfterAbandonRetainsPriorInstalledEvidence)
     {auto owner=open();Owned tx(*owner);receive_install_store install(owner,il);canonical_range_staging staged(owner,il,first.b,caps());staged.initialize();const auto state=install.read(first.a.channel);ASSERT_TRUE(state);
      EXPECT_EQ(state->revision,1);EXPECT_EQ(state->last_sequence,2);EXPECT_FALSE(state->active);EXPECT_EQ(state->last_installed,installed_identity);EXPECT_EQ(staged.usage().channels,0);
      const auto retry=staged.begin(first.a,first.r,first.m,1);EXPECT_EQ(retry.disposition,receive_install_disposition::already_installed);EXPECT_FALSE(retry.staged);
-     EXPECT_THROW(staged.begin(active.a,active.r,active.m,1),receive_install_error);EXPECT_THROW(install.complete(active.binding(),*abandoned_identity,installed_identity),receive_install_error);tx.commit();}
+     EXPECT_THROW(staged.begin(active.a,active.r,active.m,1),receive_install_error);
+     EXPECT_THROW(install.complete(active.binding(),*abandoned_identity,installed_identity),receive_install_error);tx.commit();}
 }
 
 

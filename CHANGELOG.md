@@ -3,6 +3,9 @@
 ## [2.0.5] - 2026-09-19
 
 ### Fixed
+- Deliver each audit row once for persistent Emscripten stores, including link
+  table changes. These stores already buffer audit inserts directly; avoid
+  deriving a second notification from the same committed model change.
 - Pass the synchronizer's actual scheduler to transport factories, including
   lazy connection setup and handoff to another owner. Browser bindings can now
   retire queued transport callbacks with their database owner. Existing

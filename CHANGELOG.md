@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.0.6] - 2026-09-19
+
+### Fixed
+- Preserve complete SQLite TEXT byte lengths, including embedded NUL bytes,
+  when binding and extracting native values.
+- Escape quoted attachment aliases when building attached views and detaching
+  databases.
+- Initialize missing or wrong-type native Double values deterministically.
+- Initialize snapshot-reader caches at their final size, avoiding a redundant
+  cache-setting statement while retaining ordinary reader defaults.
+
+### Compatibility
+- Rebuild Core and generated C++ bridge consumers together. No persistent
+  schema, sync wire format, or public C ABI change is intended.
+- This maintenance release does not include the development projection,
+  exact-read, batch-mutation, relay-admission, or automatic-recovery APIs.
+  It does not claim the broader 2× p95 performance target.
+
 ## [2.0.5] - 2026-09-19
 
 ### Fixed

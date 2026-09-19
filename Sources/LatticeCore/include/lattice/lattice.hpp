@@ -2454,13 +2454,9 @@ public:
         }
         try {
             if (!conn) {
-                conn = std::make_shared<database>(config_.path,
-                                                  database::open_mode::read_only,
-                                                  config_.busy_timeout_ms);
-                // Keeper cache clamp (spec §2.5): the writer-sized default
-                // (50,000 pages, db.cpp) would reserve ~600 MB of page-cache
-                // headroom across a full pool.
-                conn->execute("PRAGMA cache_size = 2000");
+                // Set the keeper's final cache budget during initialization,
+                // avoiding the writer-sized default and a second cache pragma.
+                conn = database::make_read_keeper(config_.path, config_.busy_timeout_ms);
             }
             conn->execute("BEGIN");
             conn->query("SELECT 1 FROM sqlite_schema LIMIT 1");  // the pin/fence

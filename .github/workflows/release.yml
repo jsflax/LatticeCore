@@ -36,10 +36,35 @@ jobs:
     outputs:
       version: ${{ steps.candidate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Fetch authenticated full-history source into owned localdev directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          CORE_JOB_ROOT="$HOME/localdev/lattice-core-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CORE_JOB_ROOT"
+          mkdir -p "$CORE_JOB_ROOT/tmp"
+          export TMPDIR="$CORE_JOB_ROOT/tmp" TMP="$CORE_JOB_ROOT/tmp" TEMP="$CORE_JOB_ROOT/tmp"
+          {
+            echo "CORE_JOB_ROOT=$CORE_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+          } >> "$GITHUB_ENV"
+          git init "$CORE_JOB_ROOT/source"
+          git -C "$CORE_JOB_ROOT/source" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          # Retain authenticated fetch/push, without persisting the token.
+          git -C "$CORE_JOB_ROOT/source" config credential.https://github.com.helper ''
+          git -C "$CORE_JOB_ROOT/source" config --add credential.https://github.com.helper '!gh auth git-credential'
+          # Preserve fetch-depth: 0 history and every branch/tag used by release policy.
+          git -C "$CORE_JOB_ROOT/source" fetch --force --prune origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+          git -C "$CORE_JOB_ROOT/source" fetch origin "$GITHUB_SHA"
+          git -C "$CORE_JOB_ROOT/source" checkout --detach "$GITHUB_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse --is-shallow-repository)" = false
       - name: Verify candidate commit, version, dependencies, and existing CI
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         id: candidate
         run: |
           VERSION="${RELEASE_VERSION_INPUT:-${GITHUB_REF_NAME#}}"
@@ -60,16 +85,41 @@ jobs:
     needs: [preflight, test-macos, test-linux, test-capi]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Fetch authenticated full-history source into owned localdev directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          CORE_JOB_ROOT="$HOME/localdev/lattice-core-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CORE_JOB_ROOT"
+          mkdir -p "$CORE_JOB_ROOT/tmp"
+          export TMPDIR="$CORE_JOB_ROOT/tmp" TMP="$CORE_JOB_ROOT/tmp" TEMP="$CORE_JOB_ROOT/tmp"
+          {
+            echo "CORE_JOB_ROOT=$CORE_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+          } >> "$GITHUB_ENV"
+          git init "$CORE_JOB_ROOT/source"
+          git -C "$CORE_JOB_ROOT/source" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          # Retain authenticated fetch/push, without persisting the token.
+          git -C "$CORE_JOB_ROOT/source" config credential.https://github.com.helper ''
+          git -C "$CORE_JOB_ROOT/source" config --add credential.https://github.com.helper '!gh auth git-credential'
+          # Preserve fetch-depth: 0 history and every branch/tag used by release policy.
+          git -C "$CORE_JOB_ROOT/source" fetch --force --prune origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+          git -C "$CORE_JOB_ROOT/source" fetch origin "$GITHUB_SHA"
+          git -C "$CORE_JOB_ROOT/source" checkout --detach "$GITHUB_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse --is-shallow-repository)" = false
       - name: Recheck candidate after tests and emit source release receipt
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          python3 release-train/release_train.py candidate --version "$VERSION" --expected-sha "$EXPECTED_SHA" --output "$RUNNER_TEMP/candidate.json"
-          python3 release-train/release_train.py workflow-receipt --candidate "$RUNNER_TEMP/candidate.json" --output "$RUNNER_TEMP/release-receipt.json"
-          python3 - "$VERSION" "$RUNNER_TEMP/release-notes.md" <<'PYNOTES'
+          python3 release-train/release_train.py candidate --version "$VERSION" --expected-sha "$EXPECTED_SHA" --output "$CORE_JOB_ROOT/tmp/candidate.json"
+          python3 release-train/release_train.py workflow-receipt --candidate "$CORE_JOB_ROOT/tmp/candidate.json" --output "$CORE_JOB_ROOT/tmp/release-receipt.json"
+          python3 - "$VERSION" "$CORE_JOB_ROOT/tmp/release-notes.md" <<'PYNOTES'
           import pathlib, re, sys
           text = pathlib.Path('CHANGELOG.md').read_text()
           section = re.search(r'^## \[' + re.escape(sys.argv[1]) + r'\][^\n]*\n(.*?)(?=^## \[|\Z)', text, re.M | re.S)
@@ -78,6 +128,7 @@ jobs:
       # workflow_dispatch runs these jobs directly: the GITHUB_TOKEN-created tag
       # does not need a second push-triggered workflow (GitHub suppresses it).
       - name: Publish validated source release
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
@@ -86,6 +137,6 @@ jobs:
           FLAGS=(--latest)
           if [[ "$VERSION" == *-* ]]; then FLAGS=(--prerelease --latest=false); fi
           # create fails when a release already exists; never update its assets.
-          gh release create "$VERSION" "$RUNNER_TEMP/release-receipt.json" \
+          gh release create "$VERSION" "$CORE_JOB_ROOT/tmp/release-receipt.json" \
             --verify-tag --target "$EXPECTED_SHA" --title "$VERSION" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" "${FLAGS[@]}"
+            --notes-file "$CORE_JOB_ROOT/tmp/release-notes.md" "${FLAGS[@]}"

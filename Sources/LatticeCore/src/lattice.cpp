@@ -869,6 +869,18 @@ std::string attach_alias_for(const std::string& path) {
     return p.filename().replace_extension().string();
 }
 
+// Attachment aliases come from caller-controlled path stems. Use the same
+// SQLite identifier escaping for view qualifiers and DETACH.
+std::string quoted_attach_alias(const std::string& alias) {
+    std::string quoted = "\"";
+    for (char c : alias) {
+        quoted += c;
+        if (c == '"') quoted += '"';
+    }
+    quoted += '"';
+    return quoted;
+}
+
 // Model tables only — excludes sqlite internals, _-prefixed virtual/shadow
 // tables, and Lattice bookkeeping. %s is the sqlite_master to scan.
 constexpr const char* kAttachTableFilter =
@@ -1176,7 +1188,7 @@ void lattice_db::detach_alias(const std::string& alias) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         for (;;) {
             try {
-                handle->execute("DETACH DATABASE \"" + alias + "\"");
+                handle->execute("DETACH DATABASE " + quoted_attach_alias(alias));
                 break;
             } catch (const db_error& e) {
                 const std::string msg = e.what();
@@ -1216,7 +1228,7 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
         // table → arms. An arm is (schema-qualifier, _source label).
         std::map<std::string, std::vector<std::pair<std::string, std::string>>> arms;
         for (const auto& [alias, _] : attached_dbs_) {
-            const std::string quoted = "\"" + alias + "\"";
+            const std::string quoted = quoted_attach_alias(alias);
             char master[600];
             snprintf(master, sizeof(master), "%s.sqlite_master", quoted.c_str());
             for (const auto& table_name : model_tables(handle.get(), master)) {

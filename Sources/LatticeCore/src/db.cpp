@@ -504,6 +504,11 @@ database::database(database&& other) noexcept
     : db_(other.db_), path_(std::move(other.path_)), mode_(other.mode_),
       busy_timeout_ms_(other.busy_timeout_ms_), read_control_(std::move(other.read_control_)),
       main_physical_identity_(std::atomic_load(&other.main_physical_identity_)) {
+    lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
+    if (lattice_update_hook_context_) {
+        txn_dirty_.store(other.txn_dirty_.exchange(false));
+        set_txn_hooks(std::move(other.on_txn_settled_), std::move(other.on_txn_rolled_back_));
+    }
     raw_handle_escaped_.store(other.raw_handle_escaped_.load(std::memory_order_acquire));
     other.db_ = nullptr;
 }
@@ -512,9 +517,29 @@ database& database::operator=(database&& other) noexcept {
     if (this != &other) {
         if (read_control_) read_control_->unpublish(db_);
         if (db_) {
+            // Uninstall before replacing our old owned context. close_v2 can
+            // defer physical destruction while an escaped statement exists.
+            if (lattice_update_hook_context_) {
+                sqlite3_update_hook(db_, nullptr, nullptr);
+                sqlite3_wal_hook(db_, nullptr, nullptr);
+                sqlite3_rollback_hook(db_, nullptr, nullptr);
+            }
             sqlite3_close_v2(db_);
         }
+        lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
         db_ = other.db_;
+        if (lattice_update_hook_context_) {
+            txn_dirty_.store(other.txn_dirty_.exchange(false));
+            // The SQLite update/WAL userdata address has not changed. The
+            // rollback trampoline uses database*, so explicitly rebind it.
+            set_txn_hooks(std::move(other.on_txn_settled_), std::move(other.on_txn_rolled_back_));
+        } else {
+            // Replacing a hooked writer with an unhooked wrapper must not
+            // retain callbacks whose old connection context was just freed.
+            on_txn_settled_ = {};
+            on_txn_rolled_back_ = {};
+            txn_dirty_.store(false);
+        }
         raw_handle_escaped_.store(other.raw_handle_escaped_.load(std::memory_order_acquire));
         mode_ = other.mode_;
         busy_timeout_ms_ = other.busy_timeout_ms_;

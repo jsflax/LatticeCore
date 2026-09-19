@@ -8,6 +8,7 @@
 #include <limits>
 #include <exception>
 #include <unordered_set>
+#include <cstring>
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -547,10 +548,19 @@ void lattice_db::setup_change_hook(database& connection) {
     }
 
     // Update hook - buffers changes (called for each row change)
+    // Installation/replacement follows the existing writer ownership rules.
+    // Retain the registered address through moves; destructor uninstalls the
+    // hook before releasing this connection-owned context.
+    if (!connection.lattice_update_hook_context_)
+        connection.lattice_update_hook_context_ = std::make_unique<database::lattice_update_hook_context>();
+    auto& hook_context = *connection.lattice_update_hook_context_;
+    hook_context.owner = this;
+    hook_context.connection = connection.internal_handle();
     sqlite3_update_hook(connection.internal_handle(),
         [](void* user_data, int operation, const char* db_name, const char* table_name, sqlite3_int64 rowid) {
-            auto* self = static_cast<lattice_db*>(user_data);
-            database::update_hook_scope callback_scope(*self->db_);
+            auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
+            auto* self = context->owner;
+            database::update_hook_scope callback_scope(context->connection);
 
             std::string op;
             switch (operation) {
@@ -605,11 +615,15 @@ void lattice_db::setup_change_hook(database& connection) {
                     // observer callbacks — both on this instance and on other
                     // same-process instances sharing the same database file.
                     if (operation == SQLITE_INSERT) {
-                        instance_registry::instance().for_each_alive(self->config_.path,
-                            [rowid](lattice_db* inst) {
-                                inst->last_seen_audit_id_.store(
-                                    static_cast<int64_t>(rowid), std::memory_order_release);
-                            });
+                        if (context->entry_cursor_active && db_name &&
+                            std::strcmp(db_name, "main") == 0) {
+                            // A rolled-back entry may free this ID for an
+                            // external writer. Publish only after RELEASE.
+                            context->entry_cursor_last = static_cast<int64_t>(rowid);
+                            context->entry_cursor_present = true;
+                        } else {
+                            self->publish_local_audit_id_(static_cast<int64_t>(rowid));
+                        }
                     }
                 }
                 return;
@@ -671,13 +685,16 @@ void lattice_db::setup_change_hook(database& connection) {
             }
 #endif
         },
-        this
+        connection.lattice_update_hook_context_.get()
     );
 
     // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
     sqlite3_wal_hook(connection.internal_handle(),
-        [](void* user_data, sqlite3*, const char* schema, int nframes) -> int {
-            auto* self = static_cast<lattice_db*>(user_data);
+        [](void* user_data, sqlite3* connection, const char* schema, int nframes) -> int {
+            auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
+            auto* self = context->owner;
+            if (context->connection == connection && schema && std::strcmp(schema, "main") == 0)
+                context->note_settled(true);
 
             // WAL-threshold keeper eviction (results spec §3.4): nframes is
             // the log's total frame count after this commit. Crossing the
@@ -707,7 +724,7 @@ void lattice_db::setup_change_hook(database& connection) {
             }
             return SQLITE_OK;
         },
-        this
+        connection.lattice_update_hook_context_.get()
     );
 
     // Transaction-settled drain + rollback discard
@@ -729,9 +746,16 @@ void lattice_db::setup_change_hook(database& connection) {
     // hook-list and registry mutexes) is a leaf lock never held across SQL.
     connection.set_txn_hooks(
         [this] { flush_changes(); },
-        [this] {
+        [this, context = connection.lattice_update_hook_context_.get()] {
+            context->note_settled(false);
             discard_change_buffer();
             fire_invalidation_hooks({}, invalidation_reason::rollback);
+        });
+}
+void lattice_db::publish_local_audit_id_(int64_t row_id) {
+    instance_registry::instance().for_each_alive(config_.path,
+        [row_id](lattice_db* inst) {
+            inst->last_seen_audit_id_.store(row_id, std::memory_order_release);
         });
 }
 void lattice_db::setup_cross_process_notifier() {

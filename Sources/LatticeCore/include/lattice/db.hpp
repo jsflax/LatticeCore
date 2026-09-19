@@ -108,7 +108,9 @@ class database {
         update_hook_scope* previous;
         static inline thread_local update_hook_scope* current = nullptr;
         explicit update_hook_scope(database& db) noexcept
-            : connection(db.db_), previous(current) { current = this; }
+            : update_hook_scope(db.db_) {}
+        explicit update_hook_scope(sqlite3* handle) noexcept
+            : connection(handle), previous(current) { current = this; }
         ~update_hook_scope() noexcept { current = previous; }
         update_hook_scope(const update_hook_scope&) = delete;
         update_hook_scope& operator=(const update_hook_scope&) = delete;
@@ -119,6 +121,33 @@ class database {
             return false;
         }
     };
+
+    // SQLite retains this address as update-hook userdata. Heap ownership
+    // keeps it stable when a database wrapper moves; physical identity does
+    // not depend on which writer the lattice currently publishes. The raw
+    // lattice owner must still outlive all uses of the connection.
+    struct sync_apply_chunk_state {
+        enum class phase { not_started, active, committed, rolled_back };
+        phase state = phase::not_started;
+    };
+    struct lattice_update_hook_context {
+        lattice_db* owner = nullptr;
+        sqlite3* connection = nullptr;
+        // Only touched while owning this physical connection's SQLite mutex.
+        // The added hook path uses POD, with no allocation/SQL/user callback.
+        sync_apply_chunk_state* sync_chunk = nullptr;
+        bool entry_cursor_active = false;
+        bool entry_cursor_present = false;
+        int64_t entry_cursor_last = 0;
+        void note_settled(bool committed) noexcept {
+            if (!sync_chunk) return;
+            sync_chunk->state = committed ? sync_apply_chunk_state::phase::committed
+                                          : sync_apply_chunk_state::phase::rolled_back;
+            // Consume before callbacks can open a successor transaction.
+            sync_chunk = nullptr;
+        }
+    };
+    std::unique_ptr<lattice_update_hook_context> lattice_update_hook_context_;
 
     // Private multi-statement maintenance ownership. FULLMUTEX alone only
     // serializes individual SQLite calls; another thread must not join this

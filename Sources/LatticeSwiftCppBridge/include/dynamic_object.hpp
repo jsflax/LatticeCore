@@ -157,7 +157,7 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     // observed). Materialized mode serves gets from the hydrated snapshot.
     //
     // Contract:
-    // - Opt-in; default read path is bit-for-bit untouched.
+    // - Opt-in; default reads preserve live per-column semantics.
     // - A materialized object is a read SNAPSHOT as of hydration/refresh;
     //   concurrent writers are invisible until refreshRowCache().
     // - Fail-safe: any miss or variant/type mismatch falls through to the
@@ -219,7 +219,12 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
                     // (NULL convention, affinity coercion) — never guess here.
                 }
             }
-            return managed_.get_managed_field<T>(name);
+            if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, double> ||
+                          std::is_same_v<T, std::string>) {
+                return managed_.read_live_scalar<T>(name);
+            } else {
+                return managed_.get_managed_field<T>(name);
+            }
         } else {
             auto value = unmanaged_.get(name);
             return *std::get_if<T>(&value);

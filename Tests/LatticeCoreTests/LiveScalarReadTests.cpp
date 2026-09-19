@@ -178,3 +178,285 @@ TEST(LiveScalarRead, MaterializedModeStaysPinnedAndBridgeErrorsRemainSealed) {
     EXPECT_FALSE(last_bridge_error().empty());
     last_bridge_error().clear();
 }
+
+namespace {
+// Keep the pre-optimization public field-wrapper route as the differential
+// oracle. The direct path is exercised through actual dynamic_object getters.
+std::unique_ptr<swift_lattice_ref> scalar_route_owner(const std::string& path) {
+#if LATTICE_HAS_FRT
+    auto result = std::unique_ptr<swift_lattice_ref>(
+        swift_lattice_ref::create(swift_configuration(path), scalar_schemas()));
+#else
+    auto result = std::make_unique<swift_lattice_ref>(
+        swift_lattice_ref::create(swift_configuration(path), scalar_schemas()));
+#endif
+    result->get()->stop_audit_maintenance();
+    return result;
+}
+std::unique_ptr<dynamic_object_ref> scalar_route_object(swift_lattice_ref& owner,
+                                                       int64_t integer = 7) {
+    swift_dynamic_object source;
+    source.table_name = "ScalarModel";
+    source.properties = scalar_schemas()[0].properties;
+    source.values["i"] = integer;
+    source.values["r"] = 2.5;
+    source.values["t"] = std::string("first");
+    auto result = std::make_unique<dynamic_object_ref>(source);
+    owner.get()->add_preserving_global_id(*result->get(), fake_uuid(1));
+    return result;
+}
+template <typename T>
+T scalar_route_legacy(swift_lattice_ref& owner, const dynamic_object_ref& object,
+                      const std::string& name) {
+    managed<T> field;
+    field.assign(&owner.get()->db(), owner.get(), object.get_table_name(), name,
+                 object.managed_primary_key());
+    return field.detach();
+}
+struct ScalarRouteAuthorization {
+    int read_result = SQLITE_OK;
+    std::vector<std::string> actions;
+    std::string* caller_name = nullptr;
+    bool capture_failed = false;
+    static int callback(void* raw, int action, const char* a, const char* b,
+                        const char* c, const char* d) noexcept {
+        auto& state = *static_cast<ScalarRouteAuthorization*>(raw);
+        try {
+            state.actions.push_back(std::to_string(action) + "|" + (a ? a : "<null>") +
+                "|" + (b ? b : "<null>") + "|" + (c ? c : "<null>") + "|" +
+                (d ? d : "<null>"));
+            if (state.caller_name) {
+                *state.caller_name = "changed_by_authorizer";
+                state.caller_name = nullptr;
+            }
+            return action == SQLITE_READ && b && std::strcmp(b, "i") == 0
+                ? state.read_result : SQLITE_OK;
+        } catch (...) {
+            state.capture_failed = true;
+            return SQLITE_DENY;
+        }
+    }
+};
+struct ScalarRouteAuthorizerReset {
+    sqlite3* raw;
+    ~ScalarRouteAuthorizerReset() { sqlite3_set_authorizer(raw, nullptr, nullptr); }
+};
+}
+
+TEST(ScalarGetterRoute, SixHundredActualDynamicReadsRemainLiveAndFresh) {
+    auto owner = scalar_route_owner(":memory:");
+    auto object = scalar_route_object(*owner);
+    auto* raw = owner->get()->db().handle();
+    ScalarRouteAuthorization authorization;
+    ScalarRouteAuthorizerReset reset{raw};
+    ASSERT_EQ(sqlite3_set_authorizer(raw, ScalarRouteAuthorization::callback,
+                                   &authorization), SQLITE_OK);
+    const auto before = database::thread_statement_count();
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_EQ(object->get_int("i"), 7);
+        EXPECT_DOUBLE_EQ(object->get_double("r"), 2.5);
+        EXPECT_EQ(object->get_string("t"), "first");
+        EXPECT_TRUE(object->get_bool("i"));
+        EXPECT_FLOAT_EQ(object->get_float("r"), 2.5f);
+        EXPECT_EQ(object->get_int("id"), object->managed_primary_key());
+    }
+    EXPECT_EQ(database::thread_statement_count() - before, 600u);
+    EXPECT_FALSE(authorization.capture_failed);
+    EXPECT_FALSE(authorization.actions.empty());
+    EXPECT_EQ(sqlite3_next_stmt(raw, nullptr), nullptr);
+    sqlite3_set_authorizer(raw, nullptr, nullptr);
+    owner->get()->db().execute("UPDATE ScalarModel SET i=17,r=4.5,t='later'");
+    EXPECT_EQ(object->get_int("i"), 17);
+    EXPECT_DOUBLE_EQ(object->get_double("r"), 4.5);
+    EXPECT_EQ(object->get_string("t"), "later");
+}
+
+TEST(ScalarGetterRoute, MutableAuthorizerWithoutReinstallMatchesLegacyActions) {
+    auto owner = scalar_route_owner(":memory:");
+    auto object = scalar_route_object(*owner);
+    auto* raw = owner->get()->db().handle();
+    ScalarRouteAuthorization authorization;
+    ScalarRouteAuthorizerReset reset{raw};
+    ASSERT_EQ(sqlite3_set_authorizer(raw, ScalarRouteAuthorization::callback,
+                                   &authorization), SQLITE_OK);
+    for (int policy : {SQLITE_OK, SQLITE_DENY, SQLITE_IGNORE, SQLITE_OK}) {
+        authorization.read_result = policy; // No setter between these changes.
+        authorization.actions.clear();
+        if (policy == SQLITE_DENY) {
+            EXPECT_THROW(scalar_route_legacy<int64_t>(*owner, *object, "i"), db_error);
+        } else {
+            EXPECT_EQ(scalar_route_legacy<int64_t>(*owner, *object, "i"),
+                      policy == SQLITE_IGNORE ? 0 : 7);
+        }
+        const auto legacy_actions = authorization.actions;
+        authorization.actions.clear();
+        if (policy == SQLITE_DENY) {
+            EXPECT_THROW(object->get()->get_int("i"), db_error);
+        } else {
+            EXPECT_EQ(object->get()->get_int("i"), policy == SQLITE_IGNORE ? 0 : 7);
+        }
+        EXPECT_EQ(authorization.actions, legacy_actions);
+        EXPECT_FALSE(authorization.capture_failed);
+        EXPECT_EQ(sqlite3_next_stmt(raw, nullptr), nullptr);
+    }
+    // Removal and replacement continue to affect the next fresh preparation.
+    ASSERT_EQ(sqlite3_set_authorizer(raw, nullptr, nullptr), SQLITE_OK);
+    EXPECT_EQ(object->get_int("i"), 7);
+    authorization.read_result = SQLITE_DENY;
+    ASSERT_EQ(sqlite3_set_authorizer(raw, ScalarRouteAuthorization::callback,
+                                   &authorization), SQLITE_OK);
+    EXPECT_THROW(object->get()->get_int("i"), db_error);
+}
+
+TEST(ScalarGetterRoute, AuthorizerCannotChangeTheSnapshottedRequestedName) {
+    auto owner = scalar_route_owner(":memory:");
+    auto object = scalar_route_object(*owner);
+    auto* raw = owner->get()->db().handle();
+    ScalarRouteAuthorization authorization;
+    ScalarRouteAuthorizerReset reset{raw};
+    ASSERT_EQ(sqlite3_set_authorizer(raw, ScalarRouteAuthorization::callback,
+                                   &authorization), SQLITE_OK);
+    std::string name = "i";
+    authorization.caller_name = &name;
+    EXPECT_EQ(scalar_route_legacy<int64_t>(*owner, *object, name), 7);
+    EXPECT_EQ(name, "changed_by_authorizer");
+    const auto legacy_actions = authorization.actions;
+    name = "i";
+    authorization.actions.clear();
+    authorization.caller_name = &name;
+    EXPECT_EQ(object->get()->get_int(name), 7);
+    EXPECT_EQ(name, "changed_by_authorizer");
+    EXPECT_EQ(authorization.actions, legacy_actions);
+    EXPECT_FALSE(authorization.capture_failed);
+}
+
+TEST(ScalarGetterRoute, OwningTransactionAndExternalWritesKeepPhysicalVisibility) {
+    TempDB path("scalar_route_visibility");
+    auto owner = scalar_route_owner(path.str());
+    auto object = scalar_route_object(*owner);
+    auto& db = owner->get()->db();
+    db.begin_transaction();
+    db.execute("UPDATE ScalarModel SET i=19,r=8.5,t='uncommitted'");
+    EXPECT_EQ(object->get_int("i"), 19);
+    EXPECT_DOUBLE_EQ(object->get_double("r"), 8.5);
+    EXPECT_EQ(object->get_string("t"), "uncommitted");
+    EXPECT_TRUE(db.is_in_transaction());
+    db.rollback();
+    EXPECT_EQ(object->get_int("i"), 7);
+    // Bypass the ref factory's same-path cache so this is a second physical
+    // connection with the normal audit UDFs and triggers installed.
+    swift_lattice other(swift_configuration(path.str()), scalar_schemas());
+    other.stop_audit_maintenance();
+    ASSERT_NE(other.db().handle(), db.handle());
+    other.db().execute("UPDATE ScalarModel SET i=23,r=9.5,t='external'");
+    EXPECT_EQ(object->get_int("i"), 23);
+    EXPECT_DOUBLE_EQ(object->get_double("r"), 9.5);
+    EXPECT_EQ(object->get_string("t"), "external");
+}
+
+TEST(ScalarGetterRoute, AttachedEqualIDsAndQuotedSchemaKeepLegacyRoutes) {
+    TempDB local_path("scalar_route_local"), arm_path("scalar_route_arm_\"quote");
+    auto local = scalar_route_owner(local_path.str()), arm = scalar_route_owner(arm_path.str());
+    auto local_object = scalar_route_object(*local, 7);
+    auto arm_object = scalar_route_object(*arm, 71);
+    ASSERT_EQ(local_object->managed_primary_key(), arm_object->managed_primary_key());
+    ASSERT_TRUE(local->get()->attach(*arm->get()));
+    auto rows = local->get()->objects("ScalarModel", std::string("i = 71"));
+    ASSERT_EQ(rows.size(), 1u);
+    dynamic_object_ref attached(rows[0]);
+    EXPECT_NE(attached.get_table_name(), local_object->get_table_name());
+    EXPECT_NE(managed_route(attached.get_table_name()).schema_sql, "main");
+    EXPECT_EQ(attached.get_int("i"), scalar_route_legacy<int64_t>(*local, attached, "i"));
+    EXPECT_EQ(attached.get_int("i"), 71);
+    EXPECT_EQ(local_object->get_int("i"), 7);
+    attached.set_int("i", 81);
+    EXPECT_EQ(arm_object->get_int("i"), 81);
+    EXPECT_EQ(local_object->get_int("i"), 7);
+}
+
+TEST(ScalarGetterRoute, UnmanagedAndMaterializedPathsRetainTheirSQLBoundaries) {
+    swift_dynamic_object source;
+    source.table_name = "ScalarModel";
+    source.values["i"] = int64_t(37);
+    source.values["r"] = 3.5;
+    source.values["t"] = std::string("unmanaged");
+    dynamic_object_ref unmanaged(source);
+    auto before = database::thread_statement_count();
+    EXPECT_EQ(unmanaged.get_int("i"), 37);
+    EXPECT_DOUBLE_EQ(unmanaged.get_double("r"), 3.5);
+    EXPECT_EQ(unmanaged.get_string("t"), "unmanaged");
+    EXPECT_EQ(database::thread_statement_count() - before, 0u);
+    auto owner = scalar_route_owner(":memory:");
+    auto object = scalar_route_object(*owner);
+    object->enable_row_cache();
+    owner->get()->db().execute("UPDATE ScalarModel SET i=11,r=8.5,t='new'");
+    before = database::thread_statement_count();
+    EXPECT_EQ(object->get_int("i"), 7);
+    EXPECT_DOUBLE_EQ(object->get_double("r"), 2.5);
+    EXPECT_EQ(object->get_string("t"), "first");
+    EXPECT_EQ(object->get_int("id"), object->managed_primary_key());
+    EXPECT_EQ(database::thread_statement_count() - before, 0u);
+    // A missing expression in the snapshot still executes its live SELECT.
+    before = database::thread_statement_count();
+    EXPECT_EQ(object->get_int("NULL"), 0);
+    EXPECT_EQ(database::thread_statement_count() - before, 1u);
+    owner->get()->db().execute("UPDATE ScalarModel SET i='wrong',r='wrong',t=X'0102'");
+    object->refresh_row_cache();
+    owner->get()->db().execute("UPDATE ScalarModel SET i=11,r=8.5,t='new'");
+    before = database::thread_statement_count();
+    EXPECT_EQ(object->get_int("i"), 11);
+    EXPECT_DOUBLE_EQ(object->get_double("r"), 8.5);
+    EXPECT_EQ(object->get_string("t"), "new");
+    EXPECT_EQ(database::thread_statement_count() - before, 3u);
+    object->disable_row_cache();
+    before = database::thread_statement_count();
+    EXPECT_EQ(object->get_int("i"), 11);
+    EXPECT_DOUBLE_EQ(object->get_double("r"), 8.5);
+    EXPECT_EQ(object->get_string("t"), "new");
+    EXPECT_EQ(database::thread_statement_count() - before, 3u);
+}
+
+TEST(ScalarGetterRoute, CustomFieldSQLFallbackErrorsAndCloseMatchLegacy) {
+    auto owner = scalar_route_owner(":memory:");
+    auto object = scalar_route_object(*owner);
+    for (const auto* name : {"i", "i + 1", "i AS other", "NULL", "'wrong type'"}) {
+        EXPECT_EQ(object->get()->get_int(name), scalar_route_legacy<int64_t>(*owner, *object, name));
+    }
+    EXPECT_EQ(object->get_int("i + 1"), 8);
+    EXPECT_THROW(object->get()->get_int("no_such_column"), db_error);
+    last_bridge_error().clear();
+    EXPECT_EQ(object->get_int("no_such_column"), 0);
+    EXPECT_FALSE(last_bridge_error().empty());
+    last_bridge_error().clear();
+    auto* raw = owner->get()->db().handle();
+    ASSERT_EQ(sqlite3_create_function_v2(raw, "fail_scalar_route", 0, SQLITE_UTF8, nullptr,
+        [](sqlite3_context* c, int, sqlite3_value**) {
+            sqlite3_result_error(c, "scalar route step failure", -1);
+        }, nullptr, nullptr, nullptr), SQLITE_OK);
+    EXPECT_THROW(object->get()->get_int("fail_scalar_route()"), db_error);
+    EXPECT_EQ(sqlite3_next_stmt(raw, nullptr), nullptr);
+    owner->get()->db().close();
+    EXPECT_EQ(object->get_int("i"), 0);
+    EXPECT_DOUBLE_EQ(object->get_double("r"), 0.0);
+    EXPECT_EQ(object->get_string("t"), "");
+}
+
+TEST(ScalarGetterRoute, SettledCallbackStillSeesFinalizedStatementAndCanReenter) {
+    auto owner = scalar_route_owner(":memory:");
+    auto object = scalar_route_object(*owner);
+    auto& db = owner->get()->db();
+    auto* raw = db.handle();
+    int callbacks = 0;
+    struct ClearHooks {
+        database& db;
+        ~ClearHooks() { db.set_txn_hooks({}, {}); }
+    } clear_hooks{db};
+    db.set_txn_hooks([&] {
+        ++callbacks;
+        EXPECT_EQ(sqlite3_next_stmt(raw, nullptr), nullptr);
+        EXPECT_EQ(object->get_int("i"), 7);
+    }, [] {});
+    db.mark_txn_dirty();
+    EXPECT_EQ(object->get_int("i"), 7);
+    EXPECT_EQ(callbacks, 1);
+}

@@ -7,6 +7,8 @@
 #include <bridging.hpp>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <unmanaged_object.hpp>
 #include <LatticeCore.hpp>
 
@@ -402,6 +404,27 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
 
     friend struct dynamic_object;
     friend struct link_list;
+
+private:
+    // Dynamic scalar reads need a value, not a separately bound field wrapper.
+    // Keep the column snapshot: an authorizer can mutate its caller's name
+    // string during prepare, before query_managed_cell matches result names.
+    template <typename T>
+    T read_live_scalar(const std::string& name) const {
+        static_assert(std::is_same_v<T, int64_t> || std::is_same_v<T, double> ||
+                      std::is_same_v<T, std::string>);
+        const std::string column = name;
+        if (this->db_ && this->id_ != 0) {
+            auto cell = this->db_->query_managed_cell(
+                "SELECT " + column + " FROM " + managed_table_sql(this->table_name_) + " WHERE id = ?",
+                column, this->id_);
+            if (cell && std::holds_alternative<T>(*cell)) {
+                return std::get<T>(std::move(*cell));
+            }
+        }
+        // The old get_managed_field<T> path default-constructed its wrapper.
+        return T{};
+    }
 };
 }
 

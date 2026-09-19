@@ -923,6 +923,25 @@ synchronizer_base::~synchronizer_base() {
 }
 
 void synchronizer_base::connect() {
+    const bool enabled = !config_.websocket_url.empty() || ws_client_->supports_reconnect();
+    const auto lifecycle = advance_reconnect_lifecycle(enabled);
+    connect_for_lifecycle(lifecycle);
+}
+
+uint64_t synchronizer_base::advance_reconnect_lifecycle(bool enabled) {
+    auto prior = reconnect_lifecycle_.load();
+    uint64_t next;
+    do {
+        next = ((prior & ~uint64_t{1}) + 2) | (enabled ? uint64_t{1} : uint64_t{0});
+    } while (!reconnect_lifecycle_.compare_exchange_weak(prior, next));
+    return next;
+}
+
+void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
+    // This rejects obsolete QUEUED work before cursor lookup (which can seed a
+    // slot) or dialing. It does not preempt an already-admitted transport call,
+    // and the token is not an object-lifetime or platform-callback fence.
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
@@ -933,14 +952,12 @@ void synchronizer_base::connect() {
         // synchronizers never reconnect. (The old blanket `false` here left
         // IPC clients permanently dead after a peer restart: the claimed
         // "client retries via endpoint" path never existed.)
-        should_reconnect_ = ws_client_->supports_reconnect();
         LOG_INFO("synchronizer", "[%s] IPC connect: supports_reconnect=%d",
-                 log_id(), should_reconnect_ ? 1 : 0);
+                 log_id(), (lifecycle & 1) ? 1 : 0);
+        if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
         ws_client_->connect("", {});
         return;
     }
-
-    should_reconnect_ = true;  // Enable auto-reconnect for WSS
 
     std::string url = config_.websocket_url;
 
@@ -959,6 +976,9 @@ void synchronizer_base::connect() {
         headers["Authorization"] = "Bearer " + config_.authorization_token;
     }
 
+    // Cursor lookup may take time. Do not publish an old attempt after an
+    // explicit stop or replacement completed while its parameters were read.
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
     ws_client_->connect(url, headers);
 }
 
@@ -966,7 +986,7 @@ void synchronizer_base::disconnect() {
     LOG_INFO("synchronizer", "[%s] disconnect() (this=%p, is_connected=%d, db=%s)",
              log_id(), (void*)this, is_connected_ ? 1 : 0,
              db().config().path.c_str());
-    should_reconnect_ = false;  // Prevent auto-reconnect
+    advance_reconnect_lifecycle(false);  // Invalidate already-queued retries too.
     is_connected_ = false;
     reconnect_attempts_ = 0;
 
@@ -2575,13 +2595,15 @@ void synchronizer_base::maybe_reset_backoff_after_stable_connection(bool was_ope
 }
 
 void synchronizer_base::schedule_reconnect() {
+    const auto lifecycle = reconnect_lifecycle_.load();
+    const bool should_reconnect = (lifecycle & 1) != 0;
     bool within_limit = config_.max_reconnect_attempts == 0
         || reconnect_attempts_ < config_.max_reconnect_attempts;
-    if (!(should_reconnect_ && !is_connected_ && within_limit)) {
+    if (!(should_reconnect && !is_connected_ && within_limit)) {
         LOG_INFO("synchronizer", "[%s] schedule_reconnect: NOT reconnecting (should=%d connected=%d within_limit=%d)",
-                 log_id(), should_reconnect_ ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
+                 log_id(), should_reconnect ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
     }
-    if (should_reconnect_ && !is_connected_ && within_limit) {
+    if (should_reconnect && !is_connected_ && within_limit) {
 #ifdef __EMSCRIPTEN__
         // The browser build is single-threaded (immediate_scheduler runs
         // inline on the main thread): the blocking backoff below would freeze
@@ -2600,18 +2622,20 @@ void synchronizer_base::schedule_reconnect() {
                  log_id(), reconnect_attempts_.load(), delay);
 
         // Schedule reconnection with an interruptible sleep.
-        // Short-sleep loop checks is_destroyed_ so that scheduler_->shutdown()
-        // in the destructor doesn't block for the full backoff delay.
-        scheduler_->invoke([this, delay] {
+        // Destruction, explicit stop, or a replacement connect invalidates this
+        // queued retry. Keep the existing backoff policy; a current retry must
+        // not call public connect(), which publishes fresh retry permission.
+        scheduler_->invoke([this, delay, lifecycle] {
+            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
             auto end = std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(static_cast<int>(delay * 1000));
             while (std::chrono::steady_clock::now() < end) {
-                if (is_destroyed_) return;
+                if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            if (is_destroyed_) return;
+            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
             if (!is_connected_) {
-                connect();
+                connect_for_lifecycle(lifecycle);
             }
         });
     }

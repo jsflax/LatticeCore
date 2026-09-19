@@ -594,9 +594,9 @@ TEST_F(RecoveryLocalProducer, ResetAndRemoveSavepointsPreserveCallerTransactionO
         const auto reset=[&]{if(retire)owner->remove_sync_channel_state("reset");else owner->reset_sync_state("reset");};
         {own_transaction transaction(*owner);
             owner->db().execute("UPDATE LocalOriginalStream SET body='caller-work'");
-            refused_at(reset,"reset second stage");EXPECT_TRUE(owner->owns_write_transaction());EXPECT_EQ(reset_rows(*owner),before);
+            refused_at(reset,"reset second stage");EXPECT_EQ(recovery_writer_access::active_writer(*owner),&owner->db());EXPECT_EQ(reset_rows(*owner),before);
             EXPECT_EQ(scalar(owner->db(),"SELECT COUNT(*) AS n FROM LocalOriginalStream WHERE body='caller-work'"),1);
-            owner->db().execute("DROP TRIGGER reset_fail_second");ASSERT_NO_THROW(reset());EXPECT_TRUE(owner->owns_write_transaction());
+            owner->db().execute("DROP TRIGGER reset_fail_second");ASSERT_NO_THROW(reset());EXPECT_EQ(recovery_writer_access::active_writer(*owner),&owner->db());
             EXPECT_EQ(scalar(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE sync_id='reset'"),0);
             // Destructor rolls back only the caller's still-owned transaction.
         }

@@ -729,7 +729,11 @@ void database::bind_value(sqlite3_stmt* stmt, int index, const column_value_t& v
         } else if constexpr (std::is_same_v<T, double>) {
             sqlite3_bind_double(stmt, index, v);
         } else if constexpr (std::is_same_v<T, std::string>) {
-            sqlite3_bind_text(stmt, index, v.c_str(), -1, SQLITE_TRANSIENT);
+            // Preserve every UTF-8 byte, including embedded NULs. Keep the
+            // existing unchecked bind-return policy; error custody is separate.
+            sqlite3_bind_text64(stmt, index, v.c_str(),
+                                static_cast<sqlite3_uint64>(v.size()),
+                                SQLITE_TRANSIENT, SQLITE_UTF8);
         } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
             if (v.empty()) {
                 sqlite3_bind_zeroblob(stmt, index, 0);
@@ -749,7 +753,9 @@ column_value_t database::extract_column(sqlite3_stmt* stmt, int index) {
             return sqlite3_column_double(stmt, index);
         case SQLITE_TEXT: {
             const char* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, index));
-            return std::string(text ? text : "");
+            if (!text) return std::string{};  // Preserve conversion-failure fallback.
+            const int size = sqlite3_column_bytes(stmt, index);
+            return std::string(text, static_cast<size_t>(size));
         }
         case SQLITE_BLOB: {
             const void* data = sqlite3_column_blob(stmt, index);

@@ -8,12 +8,12 @@ using namespace lattice::detail;
 using state=recovery_install_state;
 using outcome=recovery_pending_outcome;
 using values=lattice::detail::sync_recovery::row_values;
-lattice::configuration config(const std::string& path) {
+lattice::configuration scoped_configuration(const std::string& path) {
     lattice::configuration c(path);c.audit_retention_seconds=0;return c;
 }
 class ScopedOwner:public lattice::lattice_db {
 public:
-    explicit ScopedOwner(const std::string& path=":memory:"):lattice_db(config(path)) {}
+    explicit ScopedOwner(const std::string& path=":memory:"):lattice_db(scoped_configuration(path)) {}
     void document_schema() {
         lattice::model_schema s;s.table_name="RecoveryDocument";
         lattice::property_descriptor body;body.name="body";body.type=lattice::column_type::text;body.no_history=true;
@@ -172,7 +172,7 @@ TEST_F(ScopedRecoveryInstall, LatestNoHistoryOnlyDoesNotRestoreUnrelatedCurrentC
     owner->document_schema();owner->db().execute("INSERT INTO RecoveryDocument(globalId,body,title,bytes) VALUES('doc','old','old-title',X'0001')");clear_history();
     owner->db().execute("UPDATE RecoveryDocument SET body='latest-owned' WHERE globalId='doc'");
     auto r=request();r.model_tables={"RecoveryDocument"};r.full_rows={{{"RecoveryDocument","doc"},
-        {{"globalId",std::string("doc")},{"body",std::string("remote-body")},{"title",std::string("remote-title")},{"bytes",std::vector<uint8_t>{9,0,8}}}};
+        {{"globalId",std::string("doc")},{"body",std::string("remote-body")},{"title",std::string("remote-title")},{"bytes",std::vector<uint8_t>{9,0,8}}}}};
     add_grants(r,{"RecoveryDocument","doc"});committed(run(r));
     const auto row=owner->db().query("SELECT body,title,bytes FROM RecoveryDocument").at(0);
     EXPECT_EQ(std::get<std::string>(row.at("body")),"latest-owned");EXPECT_EQ(std::get<std::string>(row.at("title")),"remote-title");

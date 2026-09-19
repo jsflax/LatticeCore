@@ -68,6 +68,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/receive_ledger.cpp
     Sources/LatticeCore/src/recovery_staging.cpp
     Sources/LatticeCore/src/recovery_install_transaction.cpp
+    Sources/LatticeCore/src/canonical_change_store.cpp
     Sources/LatticeCore/src/sync_recovery_protocol.cpp
     Sources/LatticeCore/src/sync_recovery_values.cpp
     Sources/LatticeCore/src/sync_recovery_outbox.cpp
@@ -212,6 +213,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp
+    Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp
     Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp

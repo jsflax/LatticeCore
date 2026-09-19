@@ -200,13 +200,14 @@ ScalarRouteStatements scalar_route_statements(sqlite3* raw) {
 
 // Keep the pre-optimization public field-wrapper route as the differential
 // oracle. The direct path is exercised through actual dynamic_object getters.
-std::unique_ptr<swift_lattice_ref> scalar_route_owner(const std::string& path) {
+std::unique_ptr<swift_lattice_ref> scalar_route_owner(
+    const std::string& path, const SchemaVector& schemas = scalar_schemas()) {
 #if LATTICE_HAS_FRT
     auto result = std::unique_ptr<swift_lattice_ref>(
-        swift_lattice_ref::create(swift_configuration(path), scalar_schemas()));
+        swift_lattice_ref::create(swift_configuration(path), schemas));
 #else
     auto result = std::make_unique<swift_lattice_ref>(
-        swift_lattice_ref::create(swift_configuration(path), scalar_schemas()));
+        swift_lattice_ref::create(swift_configuration(path), schemas));
 #endif
     result->get()->stop_audit_maintenance();
     return result;
@@ -425,7 +426,9 @@ TEST(ScalarGetterRoute, UnmanagedAndMaterializedPathsRetainTheirSQLBoundaries) {
     EXPECT_DOUBLE_EQ(unmanaged.get_double("r"), 3.5);
     EXPECT_EQ(unmanaged.get_string("t"), "unmanaged");
     EXPECT_EQ(database::thread_statement_count() - before, 0u);
-    auto owner = scalar_route_owner(":memory:");
+    auto schemas = scalar_schemas();
+    schemas[0].properties.at("t").nullable = true;
+    auto owner = scalar_route_owner(":memory:", schemas);
     auto object = scalar_route_object(*owner);
     auto* raw = owner->get()->db().handle();
     const auto statements = scalar_route_statements(raw);
@@ -443,7 +446,13 @@ TEST(ScalarGetterRoute, UnmanagedAndMaterializedPathsRetainTheirSQLBoundaries) {
     EXPECT_EQ(object->get_int("NULL"), 0);
     EXPECT_EQ(database::thread_statement_count() - before, 1u);
     EXPECT_EQ(scalar_route_statements(raw), statements);
-    owner->get()->db().execute("UPDATE ScalarModel SET i='wrong',r='wrong',t=X'0102'");
+    // Numeric variant mismatches and known-NULL text all fall through to
+    // live reads. NULL is valid for this nullable column and normal audit JSON;
+    // a BLOB stored in a declared TEXT column is not valid audit JSON.
+    owner->get()->db().execute("UPDATE ScalarModel SET i='wrong',r='wrong',t=NULL");
+    const auto stored = owner->get()->db().query("SELECT typeof(t) AS t_type FROM ScalarModel");
+    ASSERT_EQ(stored.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(stored[0].at("t_type")), "null");
     object->refresh_row_cache();
     owner->get()->db().execute("UPDATE ScalarModel SET i=11,r=8.5,t='new'");
     before = database::thread_statement_count();

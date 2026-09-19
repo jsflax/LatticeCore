@@ -11,11 +11,42 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     container: swift:6.2-noble
+    env:
+      CORE_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install dependencies
-        run: apt-get update && apt-get install -y libsqlite3-dev
+        run: apt-get update && apt-get install -y git libsqlite3-dev
+
+      - name: Fetch exact source into owned localdev directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CORE_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          CORE_JOB_ROOT="$HOME/localdev/lattice-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CORE_JOB_ROOT"
+          mkdir -p "$CORE_JOB_ROOT"/{tmp,swift-build,swift-cache,swift-config,swift-security,module-cache,symbols,test-logs}
+          export TMPDIR="$CORE_JOB_ROOT/tmp" TMP="$CORE_JOB_ROOT/tmp" TEMP="$CORE_JOB_ROOT/tmp"
+          {
+            echo "CORE_JOB_ROOT=$CORE_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+            echo "CLANG_MODULE_CACHE_PATH=$CORE_JOB_ROOT/module-cache"
+            echo "SWIFT_MODULECACHE_PATH=$CORE_JOB_ROOT/module-cache"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$CORE_JOB_ROOT/module-cache"
+            echo "LATTICE_TEST_LOG_PATH=$CORE_JOB_ROOT/test-logs/native.log"
+          } >> "$GITHUB_ENV"
+          git init "$CORE_JOB_ROOT/source"
+          git -C "$CORE_JOB_ROOT/source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$CORE_SOURCE_SHA"
+          git -C "$CORE_JOB_ROOT/source" checkout --detach "$CORE_SOURCE_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SOURCE_SHA"
 
       - name: Build and run C++ tests
-        run: swift run LatticeCoreTests
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: |
+          swift run --package-path "$CORE_JOB_ROOT/source" \
+            --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
+            --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
+            LatticeCoreTests

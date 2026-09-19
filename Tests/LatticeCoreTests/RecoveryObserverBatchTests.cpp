@@ -239,7 +239,7 @@ TEST(RecoveryObserverBatch, FieldMetadataRefusalRollsBackBeforePublishingFinalVi
         const auto id = physical_id(owner->db(), "TestPerson", held.global_id());
         int calls = 0, denied = 0;
         auto model = owner->add_table_observer("TestPerson", [&](const auto&) { ++calls; });
-        auto* handle = owner->db().internal_handle();
+        auto* handle = owner->db().handle();
         auto result = access::install(owner, [&](auto& db) {
             db.execute("UPDATE _SyncControl SET disabled=1 WHERE id=1");
             db.execute("UPDATE TestPerson SET name='discard' WHERE id=?", {id});

@@ -401,7 +401,11 @@ protected:
 
     std::atomic<bool> is_connected_{false};
     std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
-    std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
+    // Explicit connect/disconnect publish a new generation. The low bit carries
+    // retry permission in the SAME atomic value, so an overlapping old call
+    // cannot pair its permission with a newer lifecycle's generation. A retry
+    // only borrows its captured token; it never enables reconnect itself.
+    std::atomic<uint64_t> reconnect_lifecycle_{1};
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before
@@ -562,6 +566,8 @@ protected:
     void reconcile_sync_filter();
 
     // Reconnection
+    uint64_t advance_reconnect_lifecycle(bool enabled);
+    void connect_for_lifecycle(uint64_t lifecycle);
     void schedule_reconnect();
 
     // Get last received event ID for checkpoint

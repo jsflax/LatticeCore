@@ -106,10 +106,10 @@ TEST(LiveScalarRead, NullWrongTypeMissingAndClosedKeepExplicitFallbacks) {
 
 TEST(LiveScalarRead, ExistingTextAndColumnNameConventionsAreUnchanged) {
     database db(":memory:"); make_scalar_table(db); fields value(db);
-    // Existing extract_column truncates at embedded NUL. This optimization
-    // deliberately does not change that independent conversion convention.
+    // Core 2.0.6 preserves embedded NUL bytes in native TEXT extraction.
+    // The live scalar route must retain the same complete value.
     db.execute("UPDATE ScalarRead SET t=CAST(X'610062' AS TEXT)");
-    EXPECT_EQ(value.text.detach(), "a");
+    EXPECT_EQ(value.text.detach(), std::string("a\0b", 3));
     db.execute("UPDATE ScalarRead SET t=''"); EXPECT_EQ(value.text.detach(), "");
     // Existing map lookup uses the original assigned name, not the SQL alias.
     value.integer.column_name = "i AS other";

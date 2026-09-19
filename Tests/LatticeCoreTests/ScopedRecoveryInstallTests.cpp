@@ -87,7 +87,7 @@ TEST_F(ScopedRecoveryInstall, StableHeldModelAndFinalObserverValuesOnFileAndMemo
             EXPECT_EQ(name(gid),"canonical");
             EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT age FROM TestPerson WHERE globalId=?",{gid}).at(0).at("age")),77);
         });
-        committed(run(r));EXPECT_EQ(held.id(),pk);EXPECT_EQ(std::get<std::string>(held.get_value("name")),"canonical");
+        committed(run(r));EXPECT_EQ(held.id(),pk);EXPECT_EQ(held.name.detach(),"canonical");
         EXPECT_GT(callbacks,0);EXPECT_TRUE(fields.count("name"));EXPECT_TRUE(fields.count("age"));
         EXPECT_EQ(number("SELECT COUNT(*) FROM AuditLog"),0);token.invalidate();owner.reset();
     }
@@ -209,31 +209,31 @@ TEST_F(ScopedRecoveryInstall, ExactNulTextAndBlobAreBoundAndVerifiedWithoutCStri
 }
 
 TEST_F(ScopedRecoveryInstall, RealOrdinaryLinksInstallAndDisappearWithTheirScopedEndpoint) {
-    owner->ensure_link_table("RecoveryLinks","TestPerson","TestDog");
-    auto r=request();r.model_tables.push_back("TestDog");r.relations={{"RecoveryLinks","TestPerson","TestDog"}};r.scoped_link_tables={"RecoveryLinks"};
+    owner->ensure_link_table("_RecoveryLinks","TestPerson","TestDog");
+    auto r=request();r.model_tables.push_back("TestDog");r.relations={{"_RecoveryLinks","TestPerson","TestDog"}};r.scoped_link_tables={"_RecoveryLinks"};
     r.full_rows={person("person","parent"),{{"TestDog","dog"},{{"globalId",std::string("dog")},{"name",std::string("pet")},{"weight",4.5},{"is_good_boy",int64_t{1}}}},
-        {{"RecoveryLinks","link"},{{"globalId",std::string("link")},{"lhs",std::string("person")},{"rhs",std::string("dog")}}}};
-    committed(run(r));EXPECT_EQ(number("SELECT COUNT(*) FROM RecoveryLinks WHERE lhs='person' AND rhs='dog'"),1);
+        {{"_RecoveryLinks","link"},{{"globalId",std::string("link")},{"lhs",std::string("person")},{"rhs",std::string("dog")}}}};
+    committed(run(r));EXPECT_EQ(number("SELECT COUNT(*) FROM _RecoveryLinks WHERE lhs='person' AND rhs='dog'"),1);
     auto empty=next(r);empty.full_rows.clear();committed(run(empty));
-    EXPECT_EQ(number("SELECT COUNT(*) FROM RecoveryLinks"),0);EXPECT_EQ(number("SELECT COUNT(*) FROM TestDog"),0);
+    EXPECT_EQ(number("SELECT COUNT(*) FROM _RecoveryLinks"),0);EXPECT_EQ(number("SELECT COUNT(*) FROM TestDog"),0);
     EXPECT_EQ(rows("person"),0);EXPECT_EQ(number("SELECT COUNT(*) FROM AuditLog"),0);
 }
 
 TEST_F(ScopedRecoveryInstall, OutsideScopeReferenceRefusesDeletionWithoutTouchingItsIntent) {
-    owner->ensure_link_table("RecoveryLinks","TestPerson","TestDog");auto r=request();r.model_tables.push_back("TestDog");
-    r.relations={{"RecoveryLinks","TestPerson","TestDog"}};r.scoped_link_tables={"RecoveryLinks"};
+    owner->ensure_link_table("_RecoveryLinks","TestPerson","TestDog");auto r=request();r.model_tables.push_back("TestDog");
+    r.relations={{"_RecoveryLinks","TestPerson","TestDog"}};r.scoped_link_tables={"_RecoveryLinks"};
     r.full_rows={person("person"),{{"TestDog","dog"},{{"globalId",std::string("dog")},{"name",std::string("pet")},{"weight",1.0},{"is_good_boy",int64_t{1}}}}};
-    committed(run(r));owner->db().execute("INSERT INTO RecoveryLinks(lhs,rhs,globalId) VALUES('person','dog','local-link')");
+    committed(run(r));owner->db().execute("INSERT INTO _RecoveryLinks(lhs,rhs,globalId) VALUES('person','dog','local-link')");
     const auto audit=owner->db().query("SELECT * FROM AuditLog");auto remove=next(r);remove.full_rows.clear();refused(run(remove));
-    EXPECT_EQ(rows("person"),1);EXPECT_EQ(number("SELECT COUNT(*) FROM RecoveryLinks"),1);
+    EXPECT_EQ(rows("person"),1);EXPECT_EQ(number("SELECT COUNT(*) FROM _RecoveryLinks"),1);
     EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog"),audit);EXPECT_EQ(snapshot(r).revision,1);
 }
 
 TEST_F(ScopedRecoveryInstall, MissingRelationDescriptorAndDanglingFinalEndpointRefuse) {
-    owner->ensure_link_table("RecoveryLinks","TestPerson","TestDog");auto r=request();r.full_rows={person("person")};refused(run(r));
-    r.relations={{"RecoveryLinks","TestPerson","TestDog"}};r.scoped_link_tables={"RecoveryLinks"};
-    r.full_rows.push_back({{"RecoveryLinks","link"},{{"globalId",std::string("link")},{"lhs",std::string("person")},{"rhs",std::string("absent")}}});
-    refused(run(r));EXPECT_EQ(rows("person"),0);EXPECT_EQ(number("SELECT COUNT(*) FROM RecoveryLinks"),0);
+    owner->ensure_link_table("_RecoveryLinks","TestPerson","TestDog");auto r=request();r.full_rows={person("person")};refused(run(r));
+    r.relations={{"_RecoveryLinks","TestPerson","TestDog"}};r.scoped_link_tables={"_RecoveryLinks"};
+    r.full_rows.push_back({{"_RecoveryLinks","link"},{{"globalId",std::string("link")},{"lhs",std::string("person")},{"rhs",std::string("absent")}}});
+    refused(run(r));EXPECT_EQ(rows("person"),0);EXPECT_EQ(number("SELECT COUNT(*) FROM _RecoveryLinks"),0);
 }
 
 TEST_F(ScopedRecoveryInstall, IgnoredModelAndReceiptWritesRollbackAllStateThenRetryWorks) {

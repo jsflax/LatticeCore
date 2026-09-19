@@ -199,7 +199,7 @@ TEST(RecoveryObserverBatch, SuppressedLinkDeleteRefreshesParentWithoutRevivingDe
         auto owner = observer_store(path);
         auto parent = owner->add(TestOwner{"parent", nullptr});
         auto pet = owner->add(TestPet{"pet", 2.0});
-        owner->ensure_link_table("_TestOwner_TestPet_pet");
+        owner->ensure_link_table("_TestOwner_TestPet_pet", "TestOwner:pet", "TestPet");
         auto add_link = [&] {
             owner->db().execute("INSERT INTO _TestOwner_TestPet_pet(lhs,rhs) VALUES(?,?)", {parent.global_id(), pet.global_id()});
         };
@@ -353,6 +353,10 @@ TEST(RecoveryObserverBatch, GeoQuartetAlsoRefreshesItsLogicalPropertyName) {
             db.execute("UPDATE TestPlace SET location_minLat=-1,location_maxLat=2,location_minLon=-3,location_maxLon=4 WHERE id=?", {id});
             db.execute("UPDATE _SyncControl SET disabled=0 WHERE id=1");
         });
+        if (result.primary_error) {
+            try { std::rethrow_exception(result.primary_error); }
+            catch (const std::exception& error) { ADD_FAILURE() << "geographic recovery refusal: " << error.what(); }
+        }
         EXPECT_EQ(result.state, state::committed);
         EXPECT_EQ(result.postcommit_error, nullptr);
         EXPECT_EQ(calls, 1);

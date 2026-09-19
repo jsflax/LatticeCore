@@ -216,6 +216,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ManagedPhysicalRouteTests.cpp
     Tests/LatticeCoreTests/VirtualUnionRouteTests.cpp
     Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
+    Tests/LatticeCoreTests/UnmanagedConstructionTests.cpp
     Tests/LatticeCoreTests/LiveScalarReadTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp

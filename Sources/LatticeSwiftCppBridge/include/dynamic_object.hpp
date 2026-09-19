@@ -86,6 +86,14 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(Lattice.CxxObject) dynamic_object {
     dynamic_object(const swift_dynamic_object& o) : lattice(nullptr) {
         new (&unmanaged_) swift_dynamic_object(o);
     }
+
+    // Construct default unmanaged storage in its final owning object. The
+    // existing constructor still seeds every schema-defined default/list.
+    dynamic_object(const std::string& table,
+                   const std::unordered_map<std::string, property_descriptor>& props)
+        : lattice(nullptr) {
+        new (&unmanaged_) swift_dynamic_object(table, props);
+    }
     
     dynamic_object(const managed<swift_dynamic_object>& o) : lattice(nullptr) {
         new (&managed_) managed<swift_dynamic_object>(o);
@@ -500,6 +508,13 @@ public:
         auto impl = std::make_shared<dynamic_object>();
         impl->unmanaged_.table_name = table_name;
         return _make(impl);
+    }
+
+    static LATTICE_DOREF_RET create_unmanaged(
+        const std::string& table,
+        const std::unordered_map<std::string, property_descriptor>& props)
+        SWIFT_NAME(createUnmanaged(table:properties:)) LATTICE_DOREF_UNRETAINED {
+        return _make(std::make_shared<dynamic_object>(table, props));
     }
 
     static LATTICE_DOREF_RET wrap(std::shared_ptr<dynamic_object> obj) LATTICE_DOREF_UNRETAINED {

@@ -611,7 +611,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     LOG_INFO("synchronizer", "[%s] CREATED (WSS, this=%p, db=%s, alive=%lld)",
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
     auto factory = get_network_factory();
-    ws_client_ = factory->create_sync_transport();
+    ws_client_ = factory->create_sync_transport(scheduler_);
     setup_transport_handlers();
     setup_observer();
 #ifndef __EMSCRIPTEN__

@@ -12,6 +12,8 @@
 
 namespace lattice {
 
+struct scheduler;
+
 // Type aliases for Swift interop (Swift can't use templated types directly)
 using HeadersMap = std::map<std::string, std::string>;
 using ByteVector = std::vector<uint8_t>;
@@ -226,6 +228,14 @@ public:
 
     virtual std::unique_ptr<http_client> create_http_client() = 0;
     virtual std::unique_ptr<sync_transport> create_sync_transport() = 0;
+
+    // Called with the synchronizer's actual scheduler, including lazy setup
+    // and handoff to another owner. Platforms that bind transport callbacks
+    // to an owner can override this; existing factories keep their behavior.
+    virtual std::unique_ptr<sync_transport> create_sync_transport(
+        std::shared_ptr<scheduler> /*owner_scheduler*/) {
+        return create_sync_transport();
+    }
 };
 
 // Global factory registration (set by platform layer)

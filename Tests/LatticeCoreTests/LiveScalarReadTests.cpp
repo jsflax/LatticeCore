@@ -521,3 +521,47 @@ TEST(ScalarGetterRoute, SettledCallbackStillSeesFinalizedStatementAndCanReenter)
     EXPECT_EQ(callbacks, 1);
     EXPECT_EQ(scalar_route_statements(raw), statements);
 }
+
+TEST(ScalarGetterSQL, BuilderPreservesExactSQLAcrossIdentifierAndExpressionSpellings) {
+    std::vector<std::string> tables{
+        "ScalarModel", "_Model9", "9Model", "main.ScalarModel", "arm.ScalarModel",
+        "\"a.\"\"quoted\".ScalarModel", "\"main\".\"ScalarModel\"", "a.b.c",
+        "\"a\"\"b\"", "\"unfinished", "two words", "模型", std::string(1'024, 'x')
+    };
+    // Exercise parser boundaries without replacing its existing interpretation
+    // with a new identifier grammar. The expected bytes use the old expression.
+    const std::string alphabet = "aA_09.\" \t";
+    for (const char a : alphabet) {
+        tables.emplace_back(1, a);
+        for (const char b : alphabet) tables.push_back(std::string{a, b});
+    }
+    const std::vector<std::string> columns{
+        "i", "", "i + 1", "i AS other", "i AS i, r AS i", "'é'", std::string("i\0tail", 6)
+    };
+    size_t compared = 0;
+    for (const auto& table : tables) {
+        std::string route;
+        try { route = managed_table_sql(table); }
+        catch (const std::invalid_argument&) { continue; } // covered below
+        for (const auto& column : columns) {
+            SCOPED_TRACE(table);
+            EXPECT_EQ(detail::managed_scalar_select_sql(table, column),
+                      "SELECT " + column + " FROM " + route + " WHERE id = ?");
+            ++compared;
+        }
+    }
+    EXPECT_GT(compared, 600u);
+}
+
+TEST(ScalarGetterSQL, InvalidTableRoutesKeepTheExistingException) {
+    for (const std::string table : {std::string{}, std::string("\0", 1),
+            std::string("a\0b", 3), std::string("main."), std::string("\"\""),
+            std::string("main.\"\""), std::string("\"arm\".")}) {
+        SCOPED_TRACE(table);
+        std::string original_error;
+        try { (void)managed_table_sql(table); FAIL() << "expected invalid original route"; }
+        catch (const std::invalid_argument& error) { original_error = error.what(); }
+        try { (void)detail::managed_scalar_select_sql(table, "i"); FAIL() << "expected invalid new route"; }
+        catch (const std::invalid_argument& error) { EXPECT_EQ(error.what(), original_error); }
+    }
+}

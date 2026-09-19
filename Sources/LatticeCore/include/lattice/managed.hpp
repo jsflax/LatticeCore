@@ -157,6 +157,42 @@ inline std::string managed_table_sql(const std::string& name) {
     return route.schema_sql + '.' + managed_quote_identifier(route.table);
 }
 
+namespace detail {
+// The common model name needs no route decoding or quote escaping. Keep the
+// existing parser for every other spelling, including attached and quoted
+// names. Column SQL is intentionally appended unchanged, as in the old getter.
+inline std::string managed_scalar_select_sql(const std::string& table,
+                                             const std::string& column) {
+    bool bare = !table.empty();
+    for (size_t i = 0; i < table.size() && bare; ++i) {
+        const char c = table[i];
+        bare = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+               (i != 0 && c >= '0' && c <= '9');
+    }
+    const std::string routed = bare ? std::string{} : managed_table_sql(table);
+    std::string sql;
+    auto remaining = sql.max_size();
+    const auto account = [&remaining](size_t count) {
+        if (count > remaining) throw std::length_error("managed scalar SQL is too long");
+        remaining -= count;
+    };
+    account(sizeof("SELECT  FROM  WHERE id = ?") - 1);
+    account(column.size());
+    if (bare) {
+        account(sizeof("main.\"\"") - 1);
+        account(table.size());
+    } else {
+        account(routed.size());
+    }
+    sql.reserve(sql.max_size() - remaining);
+    sql.append("SELECT ").append(column).append(" FROM ");
+    if (bare) sql.append("main.\"").append(table).push_back('"');
+    else sql.append(routed);
+    sql.append(" WHERE id = ?");
+    return sql;
+}
+} // namespace detail
+
 inline std::string managed_sidecar_sql(const std::string& model, const std::string& suffix) {
     const auto route = managed_route(model);
     return route.schema_sql + '.' + managed_quote_identifier("_" + route.table + "_" + suffix);

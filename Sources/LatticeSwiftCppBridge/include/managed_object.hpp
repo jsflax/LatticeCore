@@ -416,7 +416,7 @@ private:
         const std::string column = name;
         if (this->db_ && this->id_ != 0) {
             auto cell = this->db_->query_managed_cell(
-                "SELECT " + column + " FROM " + managed_table_sql(this->table_name_) + " WHERE id = ?",
+                detail::managed_scalar_select_sql(this->table_name_, column),
                 column, this->id_);
             if (cell && std::holds_alternative<T>(*cell)) {
                 return std::get<T>(std::move(*cell));

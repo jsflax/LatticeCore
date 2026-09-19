@@ -343,6 +343,7 @@ struct planned_row {
     std::optional<values> before,after;
     std::optional<int64_t> local_id;
     bool unresolved=false;
+    bool base_replaced=true, preserve_membership=false;
 };
 void replay(const recovery_outbox_audit& audit,const recovery_outbox_table& table,
             planned_row& row,work_budget& budget,const identities& ids) {
@@ -425,12 +426,16 @@ void check_relation_metadata(sqlite3* db,const scoped_recovery_request& request,
     }
 }
 void install_body(lattice_db& owner,database& writer,const scoped_recovery_request& request,
-                  const scoped_recovery_limits& limits) {
+                  const scoped_recovery_limits& limits,
+                  const std::vector<recovery_row_image>* explicit_images) {
     const identities ids(request.identity_mode);
     auto* db=writer.handle();work_budget budget{limits};metadata durable(db,limits);
-    require(request.identity.mode==receive_install_mode::full,"recovery model installer supports full scope only");
+    const bool delta=request.identity.mode==receive_install_mode::delta;
+    require(explicit_images || request.identity.mode==receive_install_mode::full,"recovery model installer supports full scope only");
+    require(!explicit_images || request.full_rows.empty(),"recovery explicit images cannot mix with legacy full rows");
     require(request.model_tables.size()<=limits.capture.tables&&request.relations.size()<=limits.capture.tables&&
-        request.scoped_link_tables.size()<=limits.capture.tables&&request.full_rows.size()<=limits.targets&&
+        request.scoped_link_tables.size()<=limits.capture.tables&&
+        (explicit_images?explicit_images->size():request.full_rows.size())<=limits.targets&&
         request.initial_row_grants.size()<=limits.targets&&request.pending.size()<=limits.receipts,
         "recovery input collection limit exceeded");
     std::set<std::string> admitted_tables,models,scoped_links;
@@ -492,12 +497,21 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         require(grant.outcome==recovery_pending_outcome::committed_effect||grant.outcome==recovery_pending_outcome::committed_noop||
             grant.outcome==recovery_pending_outcome::not_committed,"recovery unknown or policy-only pending outcome");
     }
-    std::map<key,const recovery_full_row*> full;
-    for(const auto& row:request.full_rows) {
-        require(full.emplace(target(row.key),&row).second,"recovery duplicate full row");
-        require(row.values.size()<=limits.capture.columns_per_table,"recovery full row field count exceeded");
-        for(const auto& [name,value]:row.values){budget.identity(name);budget.value(value);}
-    }
+    // Non-owning views into immutable caller input. Never normalize or rewrite
+    // the source row payload while constructing the separate local plan.
+    std::map<key,const values*> images;
+    auto image=[&](const key& k,const values* row) {
+        require(images.emplace(target(k),row).second,explicit_images?
+            "recovery duplicate row image":"recovery duplicate full row");
+        if(!row)return;
+        require(row->size()<=limits.capture.columns_per_table,"recovery full row field count exceeded");
+        for(const auto& [name,value]:*row){budget.identity(name);budget.value(value);}
+    };
+    if(explicit_images)for(const auto& row:*explicit_images)image(row.key,row.present?&*row.present:nullptr);
+    else for(const auto& row:request.full_rows)image(row.key,&row.values);
+    if(delta)for(const auto& grant:request.pending)
+        require(grant.outcome==recovery_pending_outcome::not_committed || images.count(ids.normalized(grant.target)),
+            "recovery committed delta outcome requires explicit rebase image");
     if(ids.uuid) {
         for(const auto& [table,_]:requested)require_uuid_key(db,table,budget);
         require_uuid_key(db,"AuditLog",budget);
@@ -520,9 +534,13 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
             p.before=captured_values(current,row);
             require(durable.ownership.count(folded(k))||granted.count(k),"recovery existing unowned row needs explicit grant");
         }
-        if(auto input=full.find(k);input!=full.end()) {
-            validate_row(schemas.at(k.table),k,input->second->values,ids);
-            p.after=input->second->values;
+        const auto input=images.find(k);
+        p.base_replaced=!delta || input!=images.end();
+        p.preserve_membership=delta && input==images.end() && durable.ownership.count(folded(k));
+        if(!p.base_replaced)p.after=p.before;
+        if(input!=images.end() && input->second) {
+            validate_row(schemas.at(k.table),k,*input->second,ids);
+            p.after=*input->second;
             for(auto& [name,value]:*p.after)if(fold(column(schemas.at(k.table),name).declared_type)=="real"&&std::holds_alternative<int64_t>(value))
                 value=static_cast<double>(std::get<int64_t>(value));
         }
@@ -540,7 +558,8 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         require(receipt!=receipts.end()&&ids.normalized(receipt->second->target)==k,"recovery pending identity lacks exact target-bound outcome");
         require(classified.insert(ids.id(audit.global_id)).second,"recovery duplicate original AuditLog identity");
         if(receipt->second->outcome==recovery_pending_outcome::not_committed) {
-            auto& row=plan.at(k);row.unresolved=true;replay(audit,schemas.at(k.table),row,budget,ids);
+            auto& row=plan.at(k);row.unresolved=true;
+            if(row.base_replaced)replay(audit,schemas.at(k.table),row,budget,ids);
         } else accepted.push_back(&audit);
     }
     // An explicit grant may refer to a receipt already settled locally, but
@@ -564,6 +583,10 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         if(row.after) {
             validate_row(schemas.at(k.table),k,*row.after,ids);
             membership.insert({k.table,ids.uuid?std::get<std::string>(row.after->at("globalId")):k.global_id});
+        } else if(row.preserve_membership) {
+            // An omitted row may be locally absent (e.g. pending DELETE).
+            // Preserve the original member spelling as well as ownership.
+            membership.insert(durable.ownership.at(folded(k)).target);
         } else if(row.unresolved)membership.insert({k.table,
             ids.uuid&&row.before?std::get<std::string>(row.before->at("globalId")):k.global_id});
     }
@@ -574,7 +597,7 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     std::map<std::string,std::set<std::pair<std::string,std::string>>> pairs;
     for(auto& [k,row]:plan)if(row.after&&scoped_links.count(k.table)) {
         const auto& relation=relations.at(k.table);
-        if(ids.uuid) for(const auto& endpoint:{std::pair{relation.lhs_model,std::string("lhs")},
+        if(ids.uuid && row.base_replaced) for(const auto& endpoint:{std::pair{relation.lhs_model,std::string("lhs")},
                                                 std::pair{relation.rhs_model,std::string("rhs")}}) {
             const auto target=ids.normalized({endpoint.first,std::get<std::string>(row.after->at(endpoint.second))});
             const auto found=plan.find(target);
@@ -587,7 +610,8 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
             const auto found=plan.find(ids.normalized(endpoint));
             require(found!=plan.end()&&found->second.after,"recovery link endpoint is absent or outside this scope");
         }
-        require(pairs[k.table].emplace(lhs,rhs).second,"recovery duplicate link endpoint pair");
+        require(pairs[k.table].emplace(delta?ids.id(lhs):lhs,delta?ids.id(rhs):rhs).second,
+            "recovery duplicate link endpoint pair");
         stmt collision(db,"SELECT globalId FROM main."+quote(k.table)+" WHERE lhs=?"+ids.collation()+
             " AND rhs=?"+ids.collation()+(ids.uuid?"":" LIMIT 2"));
         collision.text(1,lhs);collision.text(2,rhs);
@@ -677,19 +701,21 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         require(read.next()&&read.number(0)==1&&!read.next(),"recovery scoped obligation settlement failed");
     }
 }
-} // namespace
-
-scoped_recovery_result install_scoped_recovery(std::shared_ptr<lattice_db> owner,
-    const scoped_recovery_request& request,const scoped_recovery_limits& limits) {
+scoped_recovery_result install_images(std::shared_ptr<lattice_db> owner,
+    const scoped_recovery_request& request,const scoped_recovery_limits& limits,
+    const std::vector<recovery_row_image>* explicit_images) {
     scoped_recovery_result result;
     result.transaction=recovery_writer_access::install(owner,[&](database& writer) {
         require(limits.channels>0&&limits.members>=0&&limits.metadata_bytes>0&&limits.targets>0&&
             limits.receipts>0&&limits.fields>0&&limits.field_bytes>0&&limits.field_bytes<=static_cast<uint64_t>(INT_MAX)&&
             limits.logical_bytes>0,"recovery invalid explicit limits");
+        // Admission remains inside the original retained-owner frame, including
+        // exact retries. Reject two competing row inputs before state work.
+        require(!explicit_images || request.full_rows.empty(),"recovery explicit images cannot mix with legacy full rows");
         receive_install_store state(owner,limits.installations);state.initialize();state.bind(request.binding);
         result.installation=state.apply_if_new(request.binding,request.identity,request.supersede,[&](database& actual) {
             require(&actual==&writer&&recovery_writer_access::active_writer(*owner)==&writer,"recovery physical writer changed");
-            install_body(*owner,writer,request,limits);
+            install_body(*owner,writer,request,limits,explicit_images);
             // Only a newly applied installation reaches this body. Its witness
             // commits/rolls back with model, membership and installed receipt;
             // exact retries and generic writer-access reads do not advance it.
@@ -698,5 +724,16 @@ scoped_recovery_result install_scoped_recovery(std::shared_ptr<lattice_db> owner
     });
     if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();
     return result;
+}
+} // namespace
+
+scoped_recovery_result install_scoped_recovery(std::shared_ptr<lattice_db> owner,
+    const scoped_recovery_request& request,const scoped_recovery_limits& limits) {
+    return install_images(std::move(owner),request,limits,nullptr);
+}
+scoped_recovery_result install_scoped_recovery_images(std::shared_ptr<lattice_db> owner,
+    const scoped_recovery_request& request,const std::vector<recovery_row_image>& images,
+    const scoped_recovery_limits& limits) {
+    return install_images(std::move(owner),request,limits,&images);
 }
 } // namespace lattice::detail

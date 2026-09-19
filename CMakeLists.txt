@@ -228,6 +228,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp
+    Tests/LatticeCoreTests/ScopedRecoveryDeltaTests.cpp
     Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp
     Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp

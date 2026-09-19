@@ -1138,7 +1138,9 @@ public:
 
         // Prepare once
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_->internal_handle(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        const int prepare_rc = sqlite3_prepare_v2(db_->internal_handle(), sql.str().c_str(), -1, &stmt, nullptr);
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(stmt, &sqlite3_finalize);
+        if (prepare_rc != SQLITE_OK) {
             LOG_ERROR("db", "Failed to prepare bulk insert: %s", sqlite3_errmsg(db_->internal_handle()));
             throw std::runtime_error("Failed to prepare bulk insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
         }
@@ -1167,11 +1169,12 @@ public:
                 managed<U> m(std::forward<T>(obj));
 
                 // Generate globalId
-                auto gid = generate_global_id();
+                column_value_t gid_value = generate_global_id();
+                const auto& gid = std::get<std::string>(gid_value);
 
                 // Bind parameters
                 int idx = 1;
-                sqlite3_bind_text(stmt, idx++, gid.c_str(), -1, SQLITE_TRANSIENT);
+                db_->bind_value(stmt, idx++, gid_value);
 
                 // Collect and bind primitive values
                 auto values = m.collect_values();
@@ -1191,7 +1194,7 @@ public:
                                     }
                                 }
                                 if (!found) {
-                                    sqlite3_bind_null(stmt, idx++);
+                                    db_->bind_value(stmt, idx++, nullptr);
                                 }
                             }
                         } else {
@@ -1205,7 +1208,7 @@ public:
                                 }
                             }
                             if (!found) {
-                                sqlite3_bind_null(stmt, idx++);
+                                db_->bind_value(stmt, idx++, nullptr);
                             }
                         }
                     }
@@ -1258,23 +1261,46 @@ public:
                 results.push_back(std::move(m));
 
                 // Reset for next iteration
-                sqlite3_reset(stmt);
-                sqlite3_clear_bindings(stmt);
+                const int reset_rc = sqlite3_reset(stmt);
+                if (reset_rc != SQLITE_OK) {
+                    throw db_error("Bulk statement reset failed (SQLite code " + std::to_string(reset_rc) +
+                                   "): " + sqlite3_errstr(reset_rc));
+                }
+                const int clear_rc = sqlite3_clear_bindings(stmt);
+                if (clear_rc != SQLITE_OK) {
+                    throw db_error("Bulk binding clear failed (SQLite code " + std::to_string(clear_rc) +
+                                   "): " + sqlite3_errstr(clear_rc));
+                }
             }
 
+            // No bulk statement may survive into a settled callback at COMMIT.
+            const int finalize_rc = sqlite3_finalize(statement.release());
+            if (finalize_rc != SQLITE_OK) {
+                throw db_error("Bulk statement finalization failed (SQLite code " + std::to_string(finalize_rc) +
+                               "): " + sqlite3_errstr(finalize_rc));
+            }
             if (!was_in_transaction) {
                 db_->commit();
             }
         } catch (...) {
-            if (db_->is_in_transaction()) {
-                db_->rollback();
+            const auto original = std::current_exception();
+            statement.reset();
+            // Preserve the existing policy: an in-flight caller transaction
+            // is also rolled back. A failed cleanup cannot replace the first
+            // operation error, nor imply that rollback actually succeeded.
+            try {
+                if (db_->is_in_transaction()) {
+                    db_->rollback();
+                }
+            } catch (...) {
+                // Logging can itself allocate/lock; it is secondary cleanup too.
+                try {
+                    LOG_ERROR("db", "Bulk rollback failed while preserving the original operation error");
+                } catch (...) {}
             }
-            auto msg = sqlite3_errmsg(db_->internal_handle());
-            sqlite3_finalize(stmt);
-            throw;
+            std::rethrow_exception(original);
         }
 
-        sqlite3_finalize(stmt);
         return results;
     }
 

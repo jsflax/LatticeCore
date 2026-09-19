@@ -303,7 +303,9 @@ public:
     /// or proven read-only. Waits behind an active capture before exposing it.
     sqlite3* handle() const;
 
-    // Bind a value to a prepared statement (public for lattice_db bulk insert)
+    // Bind a value to a prepared statement (public for lattice_db bulk insert).
+    // Throws db_error on the first SQLite binding failure; does not step,
+    // finalize, or alter transaction ownership. The caller owns the statement.
     void bind_value(sqlite3_stmt* stmt, int index, const column_value_t& value);
 
     /// Whether close() has been called. Ops check this and short-circuit.

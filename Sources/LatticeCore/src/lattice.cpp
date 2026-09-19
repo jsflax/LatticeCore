@@ -1685,7 +1685,7 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         for (;;) {
             try {
-                handle->execute("DETACH DATABASE \"" + alias + "\"");
+                handle->execute("DETACH DATABASE " + managed_quote_identifier(alias));
                 break;
             } catch (const db_error& e) {
                 const std::string msg = e.what();

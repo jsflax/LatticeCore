@@ -27,6 +27,28 @@ struct audit_maintenance_test_access {
         return owner.with_audit_prune_transaction_(std::forward<F>(body));
     }
 };
+struct retention_background_test_access {
+    using phase = lattice_db::retention_phase;
+    using reason = lattice_db::retention_stop_reason;
+    using progress = lattice_db::retention_tick_progress;
+    using limits = lattice_db::retention_tick_limits;
+    static void enable(lattice_db& owner) { owner.config_.audit_retention_seconds = 600; }
+    static progress tick(lattice_db& owner, limits budget,
+                         const std::function<void(phase)>& between = {}) {
+        return owner.run_audit_retention_tick_(false, budget, between);
+    }
+    static void start_worker(lattice_db& owner, limits budget,
+                             const std::function<void(phase)>& between, progress& output) {
+        owner.audit_maint_thread_ = std::thread([&owner, budget, between, &output] {
+            output = owner.run_audit_retention_tick_(true, budget, between);
+        });
+    }
+    static bool stopping(lattice_db& owner) {
+        std::lock_guard<std::mutex> lock(owner.audit_maint_mutex_);
+        return owner.audit_maint_stop_;
+    }
+};
+
 }
 
 struct AuditMaintenanceRow { int64_t value = 0; };
@@ -463,6 +485,207 @@ void successful_commit_does_not_rollback_observer_transaction() {
             "callback transaction remains explicitly caller-resolvable");
 }
 
+using Background = retention_background_test_access;
+Background::limits tiny_budget(size_t units = 2) { return {2, units, 2}; }
+void expire_claim(lattice_db& owner) {
+    owner.db().execute("UPDATE _lattice_meta SET value='0' WHERE key='audit_prune_at'");
+}
+void background_caps_and_pairs() {
+    OwnedFile file; lattice_db owner(config(file.path.string()));
+    const auto original = seed(owner, false); Background::enable(owner);
+    owner.db().begin_transaction();
+    for (int64_t id = 1; id <= row_count; ++id)
+        for (int channel = 0; channel < 32; ++channel)
+            owner.db().execute("INSERT INTO _lattice_sync_state VALUES(?,?,1)", {id, "fanout-" + std::to_string(channel)});
+    owner.db().execute("UPDATE _SyncControl SET disabled=1 WHERE id=1");
+    owner.db().commit();
+    const auto result = Background::tick(owner, tiny_budget());
+    require(result.audit_rows == 4 && result.audit_units == 2 && result.fast_retry &&
+            result.reason == Background::reason::more_possible, "audit unit/tick cap returns confirmed partial progress");
+    require(ids(owner.db()) == IDs(original.begin() + 4, original.end()), "only first four exact identities removed");
+    require(raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_sync_state") == 8 * 32 &&
+            raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_sync_state WHERE audit_entry_id<=4") == 0,
+            "all selected fanout removed atomically; every other live row keeps its state");
+    require(raw_scalar(owner.db().handle(), "SELECT disabled FROM _SyncControl WHERE id=1") == 1 &&
+            raw_scalar(owner.db().handle(), "SELECT seq FROM sqlite_sequence WHERE name='AuditLog'") == row_count,
+            "saved flag and AUTOINCREMENT preserved");
+    require(raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_meta WHERE key='audit_prune_at'") == 0,
+            "confirmed partial release enables retry");
+}
+void background_floor_and_cursor(bool change_cursor) {
+    OwnedFile file; lattice_db owner(config(file.path.string()));
+    const auto original = seed(owner, false); Background::enable(owner);
+    if (change_cursor) owner.db().execute("UPDATE AuditLog SET isFromRemote=1 WHERE id=2");
+    int batches = 0;
+    const auto result = Background::tick(owner, tiny_budget(), [&](auto phase) {
+        if (phase != Background::phase::audit || ++batches != 1) return;
+        if (change_cursor) {
+            owner.db().execute("INSERT INTO AuditLog(globalId,tableName,operation,isFromRemote,timestamp) "
+                               "VALUES('new-remote-after-frontier','AuditMaintenanceRow','UPDATE',1,1)");
+        } else register_replication_slot(owner.db(), target);
+    });
+    if (change_cursor) {
+        const auto remaining = ids(owner.db());
+        require(result.audit_rows == 4 && remaining.size() == 9, "two cursor-aware batches complete");
+        require(remaining.front().first == 5 && remaining.back().first == 13 &&
+                remaining.back().second == "new-remote-after-frontier", "former cursor reconsidered, ancient-timestamp new arrival above frontier retained");
+    } else {
+        const IDs expected(original.begin() + 2, original.end());
+        require(result.audit_rows == 2 && result.reason == Background::reason::floor_blocked && !result.fast_retry,
+                "new zero floor stops the next unit without fast polling");
+        require(ids(owner.db()) == expected && pending(owner.db()) == expected, "all remaining writer-pending identities survive");
+    }
+}
+void background_cleanup_survives_empty_audit(bool cursor) {
+    OwnedFile file; lattice_db owner(config(file.path.string()));
+    seed(owner, false); Background::enable(owner);
+    if (cursor) owner.db().execute("UPDATE AuditLog SET isFromRemote=1 WHERE id=12");
+    owner.db().begin_transaction();
+    for (int i = 1; i <= 5; ++i) {
+        owner.db().execute("INSERT INTO _lattice_sync_state VALUES(0,?,1)", {"orphan-" + std::to_string(i)});
+        owner.db().execute("INSERT INTO _lattice_sync_state VALUES(12,?,1)", {"live-cursor-" + std::to_string(i)});
+    }
+    for (int64_t i = 1; i <= 8; ++i)
+        owner.db().execute("INSERT INTO _lattice_applied_receipts(rowid,globalId) VALUES(?,?)", {i, "old-" + std::to_string(i)});
+    owner.db().execute("INSERT INTO _lattice_applied_receipts(rowid,globalId) VALUES(500008,'retained-receipt')");
+    const auto now = static_cast<int64_t>(owner.now_epoch_());
+    for (int i = 1; i <= 6; ++i)
+        owner.db().execute("INSERT INTO _lattice_meta(key,value) VALUES(?,'12')", {"audit_wm:" + std::to_string(now - 2400 - i)});
+    owner.db().commit();
+    Background::limits budget{256, 1, 2};
+    auto result = Background::tick(owner, budget);
+    require(result.audit_rows == (cursor ? 11 : 12) && result.receipt_rows == 2 && result.orphan_rows == 2 &&
+            result.watermark_rows == 2 && result.fast_retry, "first invocation exhausts audit before bounded cleanup");
+    require(ids(owner.db()).size() == (cursor ? 1 : 0), "expected empty/cursor-only remainder");
+    require(owner.audit_watermark_before_(owner.now_epoch_() - 600).value_or(0) == 12,
+            "aged anchor survives partial cleanup so next invocation can continue");
+    int retries = 0;
+    while (result.fast_retry && retries++ < 8) {
+        result = Background::tick(owner, budget);
+        require(result.audit_rows == 0, "cleanup retries do not invent audit progress");
+    }
+    require(!result.fast_retry && result.reason == Background::reason::drained && retries <= 8,
+            "finite cleanup tail drains despite empty/cursor-only AuditLog");
+    require(raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_applied_receipts") == 1 &&
+            raw_scalar(owner.db().handle(), "SELECT rowid FROM _lattice_applied_receipts") == 500008,
+            "sparse rowid-distance horizon preserved, not newest-row count");
+    require(raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_sync_state WHERE audit_entry_id=0") == 0 &&
+            raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_sync_state WHERE audit_entry_id=12") == (cursor ? 5 : 0),
+            "orphans drain but retained cursor state is not erased");
+}
+void background_second_unit_failure() {
+    OwnedFile file; lattice_db owner(config(file.path.string()));
+    const auto original = seed(owner, false); Background::enable(owner);
+    owner.db().execute("UPDATE _SyncControl SET disabled=1 WHERE id=1");
+    int batches = 0;
+    const auto result = Background::tick(owner, tiny_budget(), [&](auto phase) {
+        if (phase != Background::phase::audit || ++batches != 1) return;
+        sqlite3_set_authorizer(owner.db().handle(), [](void*, int action, const char* table, const char*, const char*, const char*) {
+            return action == SQLITE_DELETE && table && std::strcmp(table, "_lattice_sync_state") == 0 ? SQLITE_DENY : SQLITE_OK;
+        }, nullptr);
+    });
+    sqlite3_set_authorizer(owner.db().handle(), nullptr, nullptr);
+    require(result.reason == Background::reason::failed && result.audit_rows == 2 && result.last_unit_unconfirmed && !result.fast_retry,
+            "second-unit failure preserves first confirmed count, no success/retry claim");
+    require(ids(owner.db()) == IDs(original.begin() + 2, original.end()) &&
+            raw_scalar(owner.db().handle(), "SELECT disabled FROM _SyncControl WHERE id=1") == 1 &&
+            sqlite3_get_autocommit(owner.db().handle()) == 1, "second audit deletion rolls back with paired cleanup and saved flag");
+    require(raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_meta WHERE key='audit_prune_at'") == 0,
+            "failure releases only its claim");
+}
+void background_settled_interference(int mode) {
+    lattice_db owner(config("file:retention-background-settled?mode=memory&cache=shared"));
+    seed(owner, false); Background::enable(owner);
+    auto& db = owner.db(); int callbacks = 0;
+    // Actual maintenance_scope tail delivery, not the between-units seam.
+    db.set_txn_hooks([&] {
+        ++callbacks;
+        if (mode == 2 && callbacks == 3) throw std::runtime_error("second-unit-settled-error");
+        if (callbacks != 2) return;
+        if (mode == 0) owner.delete_audit_below_(row_count, false);
+        if (mode == 1) db.execute("UPDATE _lattice_meta SET value='newer-owner' WHERE key='audit_prune_at'");
+    }, [] {});
+    const auto result = Background::tick(owner, tiny_budget());
+    db.set_txn_hooks({}, {});
+    require(result.audit_rows == 2, "first committed unit is confirmed before subsequent interference");
+    if (mode == 0) {
+        require(result.reason == Background::reason::revision_changed && ids(db).empty(),
+                "next unit detects callback prune; does not accept its newer revision by rereading");
+    } else if (mode == 1) {
+        require(result.reason == Background::reason::lost_claim && ids(db).size() == 10,
+                "next unit detects claim replaced during actual settled callback");
+        const auto claim = db.query("SELECT value FROM _lattice_meta WHERE key='audit_prune_at'");
+        require(claim.size() == 1 && std::get<std::string>(claim[0].at("value")) == "newer-owner",
+                "old invocation never erases replacement claim");
+    } else {
+        require(result.reason == Background::reason::failed && result.last_unit_unconfirmed && ids(db).size() == 8,
+                "second actual commit with failing settled callback remains committed but unconfirmed");
+    }
+    require(sqlite3_get_autocommit(db.handle()) == 1, "all maintenance transactions settled");
+}
+void background_failure_cannot_erase_new_claim() {
+    OwnedFile file; lattice_db owner(config(file.path.string()));
+    seed(owner, false); Background::enable(owner);
+    const auto result = Background::tick(owner, tiny_budget(), [&](auto phase) {
+        if (phase != Background::phase::audit) return;
+        owner.db().execute("UPDATE _lattice_meta SET value='replacement-after-unit' WHERE key='audit_prune_at'");
+        throw std::runtime_error("post-unit-failure");
+    });
+    require(result.reason == Background::reason::failed && result.audit_rows == 2, "confirmed unit survives post-unit failure");
+    const auto claim = owner.db().query("SELECT value FROM _lattice_meta WHERE key='audit_prune_at'");
+    require(claim.size() == 1 && std::get<std::string>(claim[0].at("value")) == "replacement-after-unit",
+            "failure cleanup compares exact old stamp");
+}
+void background_rejects_caller_transaction() {
+    OwnedFile file; lattice_db owner(config(file.path.string()));
+    const auto original = seed(owner, false); Background::enable(owner);
+    owner.db().begin_transaction();
+    owner.db().execute("INSERT INTO _lattice_meta(key,value) VALUES('caller-transaction','kept')");
+    const auto result = Background::tick(owner, tiny_budget());
+    require(result.reason == Background::reason::failed && owner.db().is_in_transaction() && ids(owner.db()) == original,
+            "setup does not join or settle caller transaction");
+    require(raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_meta WHERE key='audit_prune_at'") == 0,
+            "rejected setup writes no claim into caller transaction");
+    owner.db().rollback();
+}
+void background_stop_joins_between_units() {
+    OwnedFile file; lattice_db owner(config(file.path.string()));
+    seed(owner, false); Background::enable(owner);
+    std::mutex mutex; std::condition_variable changed;
+    bool first = false, release = false; std::atomic<bool> stop_returned{false};
+    Background::progress result;
+    Background::start_worker(owner, tiny_budget(), [&](auto phase) {
+        if (phase != Background::phase::audit) return;
+        std::unique_lock<std::mutex> lock(mutex); first = true; changed.notify_all();
+        if (!changed.wait_for(lock, std::chrono::seconds(3), [&] { return release; }))
+            throw std::runtime_error("release current unit deadline");
+    }, result);
+    struct WorkerCleanup {
+        lattice_db& owner; std::mutex& mutex; std::condition_variable& changed; bool& release;
+        ~WorkerCleanup() {
+            { std::lock_guard<std::mutex> lock(mutex); release = true; changed.notify_all(); }
+            owner.stop_audit_maintenance();
+        }
+    } worker_cleanup{owner, mutex, changed, release};
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        require(changed.wait_for(lock, std::chrono::seconds(3), [&] { return first; }), "worker first unit arrived");
+    }
+    std::thread stopper([&] { owner.stop_audit_maintenance(); stop_returned.store(true); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!Background::stopping(owner) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool stopped_before_release = Background::stopping(owner) && !stop_returned.load();
+    { std::lock_guard<std::mutex> lock(mutex); release = true; changed.notify_all(); }
+    stopper.join();
+    require(stopped_before_release && stop_returned.load() && result.reason == Background::reason::stopped &&
+            result.audit_rows == 2 && result.audit_units == 1 && ids(owner.db()).size() == 10,
+            "stop joins the worker at the between-unit boundary and prevents every later unit");
+    require(raw_scalar(owner.db().handle(), "SELECT COUNT(*) FROM _lattice_meta WHERE key='audit_prune_at'") == 1,
+            "observed stop starts no trailing claim cleanup transaction");
+    expire_claim(owner); owner.run_audit_retention_tick();
+    require(ids(owner.db()).empty(), "public manual tick remains usable after worker stop");
+}
+
 void bounded(const std::function<void()>& body) {
     struct RestoreStyle {
         std::string previous = ::testing::FLAGS_gtest_death_test_style;
@@ -506,5 +729,18 @@ TEST(AuditMaintenanceOwnership, CloseFromFileCommitCallbackRemainsSettled) { bou
 TEST(AuditMaintenanceOwnership, SuccessfulFileCommitDoesNotRollBackObserverTransaction) {
     bounded(successful_commit_does_not_rollback_observer_transaction);
 }
+
+TEST(AuditMaintenanceOwnership, BackgroundCapsIDsAndKeepsPairedFanoutAtomic) { bounded(background_caps_and_pairs); }
+TEST(AuditMaintenanceOwnership, BackgroundRevalidatesNewWriterFloorBetweenUnits) { bounded([] { background_floor_and_cursor(false); }); }
+TEST(AuditMaintenanceOwnership, BackgroundRevalidatesCursorAndKeepsFiniteArrivalFrontier) { bounded([] { background_floor_and_cursor(true); }); }
+TEST(AuditMaintenanceOwnership, BackgroundDrainsCleanupAfterAuditBecomesEmpty) { bounded([] { background_cleanup_survives_empty_audit(false); }); }
+TEST(AuditMaintenanceOwnership, BackgroundCursorOnlyRemainderDoesNotStallCleanup) { bounded([] { background_cleanup_survives_empty_audit(true); }); }
+TEST(AuditMaintenanceOwnership, BackgroundSecondUnitFailurePreservesFirstCommit) { bounded(background_second_unit_failure); }
+TEST(AuditMaintenanceOwnership, BackgroundDetectsRevisionChangedBySettledCallback) { bounded([] { background_settled_interference(0); }); }
+TEST(AuditMaintenanceOwnership, BackgroundDetectsClaimChangedBySettledCallback) { bounded([] { background_settled_interference(1); }); }
+TEST(AuditMaintenanceOwnership, BackgroundReportsUnconfirmedCommitAfterSettledFailure) { bounded([] { background_settled_interference(2); }); }
+TEST(AuditMaintenanceOwnership, BackgroundFailureDoesNotEraseNewerClaim) { bounded(background_failure_cannot_erase_new_claim); }
+TEST(AuditMaintenanceOwnership, BackgroundSetupRejectsCallerOwnedTransaction) { bounded(background_rejects_caller_transaction); }
+TEST(AuditMaintenanceOwnership, BackgroundStopJoinsBetweenUnitsThenAllowsManualTick) { bounded(background_stop_joins_between_units); }
 
 #endif

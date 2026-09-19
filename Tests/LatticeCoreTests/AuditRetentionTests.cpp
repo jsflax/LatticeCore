@@ -6,6 +6,16 @@
 #include <string_view>
 #include <thread>
 
+// Keep the simultaneous start outside owned BEGIN. The old INSERT trace
+// barrier would now wait for a second writer while holding the first write txn.
+namespace lattice {
+struct retention_claim_test_access {
+    static void tick(lattice_db& owner, const std::function<void()>& before_setup) {
+        (void)owner.run_audit_retention_tick_(false, lattice_db::retention_tick_limits{}, {}, before_setup);
+    }
+};
+}
+
 // ============================================================================
 // Audit-history retention (1.5.0) — the "17 GB room store" red suite.
 //
@@ -310,17 +320,15 @@ struct RetentionTrace {
         const std::string_view sql(text);
         if (sql.find("SELECT MAX(CAST(value AS INTEGER)) AS m FROM _lattice_meta") == 0)
             ++state.prune_calls;
-        if (sql.find("INSERT") == 0 && sql.find("'audit_prune_at'") != sql.npos) {
-            // Both connections stop immediately before their stamp write.
-            // The former separate-read/unconditional-write implementation
-            // reaches this barrier after both have observed an expired stamp.
-            std::unique_lock<std::mutex> lock(state.mutex);
-            ++state.arrivals;
-            state.ready.notify_all();
-            if (!state.ready.wait_for(lock, std::chrono::seconds(3), [&] { return state.arrivals == 2; }))
-                state.expired = true;
-        }
         return 0;
+    }
+
+    void before_setup() {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++arrivals;
+        ready.notify_all();
+        if (!ready.wait_for(lock, std::chrono::seconds(3), [&] { return arrivals == 2; }))
+            expired = true;
     }
 };
 
@@ -352,8 +360,8 @@ TEST(AuditRetention, SimultaneousHandlesClaimOnlyOnePrunePass) {
     RetentionTraceRegistration trace_a{a.db().handle()}, trace_b{b.db().handle()};
     ASSERT_EQ(sqlite3_trace_v2(trace_a.handle, SQLITE_TRACE_STMT, &RetentionTrace::trace, &trace), SQLITE_OK);
     ASSERT_EQ(sqlite3_trace_v2(trace_b.handle, SQLITE_TRACE_STMT, &RetentionTrace::trace, &trace), SQLITE_OK);
-    std::thread first([&] { a.run_audit_retention_tick(); });
-    std::thread second([&] { b.run_audit_retention_tick(); });
+    std::thread first([&] { lattice::retention_claim_test_access::tick(a, [&] { trace.before_setup(); }); });
+    std::thread second([&] { lattice::retention_claim_test_access::tick(b, [&] { trace.before_setup(); }); });
     first.join();
     second.join();
 

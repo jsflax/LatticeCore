@@ -3778,15 +3778,18 @@ public:
         audit_maint_thread_ = std::thread([this] {
             const auto period = std::chrono::seconds(
                 std::max<int64_t>(1, config_.audit_retention_seconds / 2));
+            auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(period);
             std::unique_lock<std::mutex> lock(audit_maint_mutex_);
             for (;;) {
-                audit_maint_cv_.wait_for(lock, period, [this] { return audit_maint_stop_; });
+                audit_maint_cv_.wait_for(lock, delay, [this] { return audit_maint_stop_; });
                 if (audit_maint_stop_) return;
                 // DB work runs with the maintenance mutex RELEASED (the pacer's
                 // ABBA lesson: connection work under a wake-up mutex deadlocks
                 // against a writer whose change hook wants that mutex).
                 lock.unlock();
-                run_audit_retention_tick();
+                const auto progress = run_audit_retention_tick_(true, retention_tick_limits{});
+                delay = progress.fast_retry ? std::chrono::milliseconds(100)
+                    : std::chrono::duration_cast<std::chrono::milliseconds>(period);
                 lock.lock();
                 if (audit_maint_stop_) return;
             }
@@ -3802,50 +3805,319 @@ public:
         if (audit_maint_thread_.joinable()) audit_maint_thread_.join();
     }
 
-    /// One retention tick. N handles/processes on one file coordinate through
-    /// `_lattice_meta['audit_prune_at']`: one conditional write claims a half
-    /// window and prunes; everyone else just records a watermark
-    /// so sampling never starves. Busy/locked errors are ordinary here (a
-    /// writer mid-transaction) — logged at debug, retried next tick.
+    /// One bounded background-retention invocation. Explicit prune/compact
+    /// retain their existing atomic deletion semantics. A manual tick remains
+    /// usable after stopping the automatic worker.
     void run_audit_retention_tick() {
-        if (closed_.load(std::memory_order_acquire) || config_.read_only ||
-            config_.audit_retention_seconds <= 0) return;
-        std::string claim_stamp;
-        bool claimed = false;
-        try {
-            const double now = now_epoch_();
-            const double half = static_cast<double>(config_.audit_retention_seconds) / 2.0;
-            claim_stamp = std::to_string(now);
-            // A separate SELECT and unconditional stamp lets simultaneous
-            // handles both prune. SQLite serializes this test-and-write across
-            // connections and processes; only the winner receives a row.
-            const auto claim = db_->query(
-                "INSERT INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
-                "WHERE COALESCE(CAST(_lattice_meta.value AS REAL), 0) <= ? "
-                "RETURNING value", {claim_stamp, now - half});
-            if (claim.empty()) { record_audit_watermark_(now); return; }
-            claimed = true;
-            const int64_t removed = prune_audit_log(config_.audit_retention_seconds);
-            if (removed > 0) {
-                LOG_INFO("lattice_db", "audit retention: pruned %lld entries older than %llds (path=%s)",
-                         (long long)removed, (long long)config_.audit_retention_seconds,
-                         config_.path.c_str());
-            }
-        } catch (const std::exception& e) {
-            if (claimed) {
-                // A failed pass should be retried next tick. Compare the exact
-                // stamp so a slower failed owner cannot erase a newer claim.
-                // If cleanup is also busy, ordinary expiry remains the fallback.
-                try {
-                    db_->execute("DELETE FROM _lattice_meta WHERE key = 'audit_prune_at' AND value = ?",
-                                 {claim_stamp});
-                } catch (...) {}
-            }
-            LOG_DEBUG("lattice_db", "audit retention tick skipped: %s", e.what());
-        }
+        (void)run_audit_retention_tick_(false, retention_tick_limits{});
     }
 
+private:
+    friend struct retention_background_test_access;
+    friend struct retention_claim_test_access;
+    enum class retention_phase { setup, audit, orphan, receipt, watermark };
+    enum class retention_stop_reason {
+        drained, more_possible, floor_blocked, lost_claim, revision_changed,
+        stopped, failed, unavailable
+    };
+    struct retention_tick_limits {
+        int64_t audit_rows = 256;
+        size_t audit_units = 8;
+        int64_t cleanup_rows = 256;
+    };
+    struct retention_tick_progress {
+        int64_t audit_rows = 0, orphan_rows = 0, receipt_rows = 0, watermark_rows = 0;
+        size_t audit_units = 0;
+        retention_stop_reason reason = retention_stop_reason::drained;
+        bool fast_retry = false;
+        // An exception can follow COMMIT during settled delivery. Never call
+        // that a rollback of the whole invocation, or invent a committed count.
+        bool last_unit_unconfirmed = false;
+    };
+    struct retention_tick_plan {
+        std::string stamp, revision, watermark_anchor, watermark_frontier;
+        int64_t aged_bound = 0, audit_frontier = 0, receipt_cutoff = 0, orphan_frontier = 0;
+        double watermark_cutoff = 0;
+    };
+
+    bool retention_stop_requested_(bool worker_origin) {
+        if (closed_.load(std::memory_order_acquire)) return true;
+        if (!worker_origin) return false;
+        std::lock_guard<std::mutex> lock(audit_maint_mutex_);
+        return audit_maint_stop_;
+    }
+
+    int64_t retention_scalar_(const std::string& sql) {
+        const auto rows = db_->query(sql);
+        if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("n")))
+            throw db_error("background retention requires an integer scalar");
+        return std::get<int64_t>(rows[0].at("n"));
+    }
+
+    // Called only inside one owned write transaction; no setup-time floor is
+    // carried forward as deletion authority.
+    int64_t retention_safe_bound_(int64_t frontier) {
+        ensure_observer_column(*db_);
+        const auto rows = db_->query("SELECT COUNT(*) AS n, MIN(upload_floor) AS floor "
+                                     "FROM _lattice_replication_slots WHERE is_observer = 0");
+        if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("n")))
+            throw db_error("background retention requires a writer-slot count");
+        if (std::get<int64_t>(rows[0].at("n")) == 0) return frontier;
+        const auto* floor = std::get_if<int64_t>(&rows[0].at("floor"));
+        return std::min(frontier, floor ? *floor : int64_t{0});
+    }
+
+    std::optional<int64_t> retention_validate_unit_(const retention_tick_plan& plan,
+                                                   retention_tick_progress& progress) {
+        const auto claim = db_->query("SELECT value FROM _lattice_meta WHERE key = 'audit_prune_at'");
+        if (claim.size() != 1 || !std::holds_alternative<std::string>(claim[0].at("value")) ||
+            std::get<std::string>(claim[0].at("value")) != plan.stamp) {
+            progress.reason = retention_stop_reason::lost_claim;
+            return std::nullopt;
+        }
+        if (history_revision_in_transaction_() != plan.revision) {
+            progress.reason = retention_stop_reason::revision_changed;
+            return std::nullopt;
+        }
+        const auto bound = retention_safe_bound_(plan.aged_bound);
+        if (bound <= 0) {
+            progress.reason = retention_stop_reason::floor_blocked;
+            return std::nullopt;
+        }
+        return bound;
+    }
+
+    static std::string retention_placeholders_(size_t size) {
+        std::string result;
+        for (size_t i = 0; i < size; ++i) { if (i) result += ','; result += '?'; }
+        return result;
+    }
+
+    retention_tick_progress run_audit_retention_tick_(
+        bool worker_origin, const retention_tick_limits& limits,
+        const std::function<void(retention_phase)>& between_units = {},
+        const std::function<void()>& before_setup = {}) {
+        retention_tick_progress progress;
+        if (config_.read_only || config_.audit_retention_seconds <= 0) {
+            progress.reason = retention_stop_reason::unavailable;
+            return progress;
+        }
+        if (retention_stop_requested_(worker_origin)) {
+            progress.reason = retention_stop_reason::stopped;
+            return progress;
+        }
+        if (audit_retention_tick_active_.exchange(true, std::memory_order_acq_rel)) {
+            progress.reason = retention_stop_reason::unavailable;
+            return progress;
+        }
+        struct admission_release {
+            std::atomic<bool>& flag;
+            ~admission_release() { flag.store(false, std::memory_order_release); }
+        } admission{audit_retention_tick_active_};
+        retention_tick_plan plan;
+        bool claimed = false, ready = false, more = false;
+        const auto stopped = [&] {
+            if (!retention_stop_requested_(worker_origin)) return false;
+            progress.reason = retention_stop_reason::stopped;
+            return true;
+        };
+        const auto settled = [&](retention_phase phase) {
+            progress.last_unit_unconfirmed = false;
+            if (between_units) between_units(phase); // Never under ownership/store gate.
+        };
+        try {
+            // Fixed private production limits keep IN bindings below SQLite's
+            // supported minimum parameter limit. Tests can only reduce them.
+            if (limits.audit_rows <= 0 || limits.audit_rows > 256 ||
+                limits.cleanup_rows <= 0 || limits.cleanup_rows > 256 ||
+                limits.audit_units == 0 || limits.audit_units > 8)
+                throw db_error("invalid background retention limits");
+            if (before_setup) before_setup(); // Simultaneous-claim test barrier, before BEGIN.
+            if (stopped()) return progress;
+            progress.last_unit_unconfirmed = true;
+            with_audit_prune_transaction_([&]() -> int64_t {
+                const double now = now_epoch_();
+                const double retention = static_cast<double>(config_.audit_retention_seconds);
+                plan.stamp = std::to_string(now);
+                // The established conditional claim remains one SQL write.
+                const auto claim = db_->query(
+                    "INSERT INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+                    "WHERE COALESCE(CAST(_lattice_meta.value AS REAL), 0) <= ? "
+                    "RETURNING value", {plan.stamp, now - retention / 2.0});
+                record_audit_watermark_(now);
+                if (claim.empty()) {
+                    progress.reason = retention_stop_reason::unavailable;
+                    return 0;
+                }
+                claimed = true;
+                const auto aged = audit_watermark_before_(now - retention);
+                if (!aged || *aged <= 0) return 0;
+                plan.aged_bound = *aged;
+                plan.audit_frontier = std::min(*aged, retention_scalar_(
+                    "SELECT COALESCE(MAX(id), 0) AS n FROM AuditLog"));
+                if (retention_safe_bound_(plan.aged_bound) <= 0) {
+                    progress.reason = retention_stop_reason::floor_blocked;
+                    return 0;
+                }
+                plan.revision = history_revision_in_transaction_();
+                db_->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
+                             "  globalId TEXT PRIMARY KEY)");
+                plan.receipt_cutoff = retention_scalar_(
+                    "SELECT COALESCE(MAX(rowid), 0) AS n FROM _lattice_applied_receipts") - 500000;
+                plan.orphan_frontier = retention_scalar_(
+                    "SELECT COALESCE(MAX(rowid), 0) AS n FROM _lattice_sync_state");
+                plan.watermark_cutoff = now - 2.0 * retention;
+                const auto anchor = db_->query(
+                    "SELECT key FROM _lattice_meta WHERE key LIKE 'audit_wm:%' "
+                    "AND CAST(substr(key, 10) AS REAL) <= ? AND CAST(value AS INTEGER) = ? "
+                    "ORDER BY CAST(substr(key, 10) AS REAL) DESC, key DESC LIMIT 1", {now - retention, *aged});
+                if (anchor.size() != 1 || !std::holds_alternative<std::string>(anchor[0].at("key")))
+                    throw db_error("background retention requires an aged watermark anchor");
+                plan.watermark_anchor = std::get<std::string>(anchor[0].at("key"));
+                const auto frontier = db_->query(
+                    "SELECT MAX(key) AS key FROM _lattice_meta WHERE key LIKE 'audit_wm:%'");
+                plan.watermark_frontier = std::get<std::string>(frontier.at(0).at("key"));
+                ready = true;
+                return 0;
+            });
+            settled(retention_phase::setup);
+            if (!ready) return progress;
+
+            for (size_t unit = 0; unit < limits.audit_units; ++unit) {
+                if (stopped()) return progress;
+                int64_t selected = 0, removed = 0;
+                std::string next_revision = plan.revision;
+                progress.last_unit_unconfirmed = true;
+                with_audit_prune_transaction_([&]() -> int64_t {
+                    const auto bound = retention_validate_unit_(plan, progress);
+                    if (!bound) return 0;
+                    const bool preserve = audit_cursor_row_needed_();
+                    const auto audit_bound = std::min(*bound, plan.audit_frontier);
+                    const auto rows = db_->query(
+                        "SELECT id FROM AuditLog WHERE id <= ?" + std::string(preserve
+                            ? " AND id NOT IN (SELECT id FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1)"
+                            : "") + " ORDER BY id LIMIT ?", {audit_bound, limits.audit_rows});
+                    const auto disabled = history_sync_flag_in_transaction_();
+                    if (rows.empty()) {
+                        if (*bound < plan.audit_frontier)
+                            progress.reason = retention_stop_reason::floor_blocked;
+                        return 0;
+                    }
+                    std::vector<column_value_t> ids;
+                    for (const auto& row : rows) ids.emplace_back(std::get<int64_t>(row.at("id")));
+                    selected = static_cast<int64_t>(ids.size());
+                    const auto placeholders = retention_placeholders_(ids.size());
+                    db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+                    db_->execute("DELETE FROM AuditLog WHERE id IN (" + placeholders + ")", ids);
+                    removed = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+                    // All fanout for these IDs is indivisible with their audit
+                    // deletion. This caps audit IDs, not total rows or bytes.
+                    db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id IN (" + placeholders + ")", ids);
+                    if (removed > 0) next_revision = advance_history_revision_in_transaction_();
+                    db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {disabled});
+                    return removed;
+                });
+                plan.revision = next_revision; // Own body token, never a post-callback reread.
+                progress.audit_rows += removed;
+                ++progress.audit_units;
+                settled(retention_phase::audit);
+                if (progress.reason != retention_stop_reason::drained) break;
+                if (selected < limits.audit_rows) break;
+                if (unit + 1 == limits.audit_units) more = true;
+            }
+
+            for (const auto phase : {retention_phase::orphan, retention_phase::receipt, retention_phase::watermark}) {
+                if (progress.reason != retention_stop_reason::drained) break;
+                if (stopped()) return progress;
+                int64_t removed = 0, selected = 0;
+                progress.last_unit_unconfirmed = true;
+                with_audit_prune_transaction_([&]() -> int64_t {
+                    const auto bound = retention_validate_unit_(plan, progress);
+                    if (!bound) return 0;
+                    const auto disabled = history_sync_flag_in_transaction_();
+                    std::string table, key;
+                    std::vector<column_value_t> keys;
+                    if (phase == retention_phase::orphan) {
+                        table = "_lattice_sync_state"; key = "rowid";
+                        const auto rows = db_->query(
+                            "SELECT rowid AS k FROM _lattice_sync_state WHERE rowid <= ? AND audit_entry_id <= ? "
+                            "AND NOT EXISTS (SELECT 1 FROM AuditLog WHERE id = _lattice_sync_state.audit_entry_id) "
+                            "ORDER BY rowid LIMIT ?", {plan.orphan_frontier, *bound, limits.cleanup_rows});
+                        for (const auto& row : rows) keys.emplace_back(std::get<int64_t>(row.at("k")));
+                    } else if (phase == retention_phase::receipt) {
+                        table = "_lattice_applied_receipts"; key = "rowid";
+                        const auto cutoff = std::min(plan.receipt_cutoff, retention_scalar_(
+                            "SELECT COALESCE(MAX(rowid), 0) AS n FROM _lattice_applied_receipts") - 500000);
+                        const auto rows = db_->query("SELECT rowid AS k FROM _lattice_applied_receipts "
+                            "WHERE rowid <= ? ORDER BY rowid LIMIT ?", {cutoff, limits.cleanup_rows});
+                        for (const auto& row : rows) keys.emplace_back(std::get<int64_t>(row.at("k")));
+                    } else {
+                        table = "_lattice_meta"; key = "key";
+                        const auto rows = db_->query(
+                            "SELECT key AS k FROM _lattice_meta WHERE key LIKE 'audit_wm:%' AND key <= ? "
+                            "AND key != ? AND CAST(substr(key, 10) AS REAL) < ? ORDER BY key LIMIT ?",
+                            {plan.watermark_frontier, plan.watermark_anchor, plan.watermark_cutoff, limits.cleanup_rows});
+                        for (const auto& row : rows) keys.emplace_back(std::get<std::string>(row.at("k")));
+                    }
+                    selected = static_cast<int64_t>(keys.size());
+                    if (keys.empty()) return 0;
+                    db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+                    // Selection, orphan-parent check and deletion share this
+                    // writer transaction; never erase unselected live state.
+                    db_->execute("DELETE FROM " + table + " WHERE " + key + " IN (" + retention_placeholders_(keys.size()) + ")", keys);
+                    removed = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+                    db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {disabled});
+                    return removed;
+                });
+                if (phase == retention_phase::orphan) progress.orphan_rows += removed;
+                else if (phase == retention_phase::receipt) progress.receipt_rows += removed;
+                else progress.watermark_rows += removed;
+                if (selected == limits.cleanup_rows) more = true;
+                settled(phase);
+            }
+            if (progress.reason == retention_stop_reason::drained && more)
+                progress.reason = retention_stop_reason::more_possible;
+        } catch (const std::exception& error) {
+            progress.reason = retention_stop_reason::failed;
+            LOG_DEBUG("lattice_db", "audit retention tick failed after %lld confirmed deletions: %s",
+                      (long long)progress.audit_rows, error.what());
+        } catch (...) {
+            progress.reason = retention_stop_reason::failed;
+            LOG_DEBUG("lattice_db", "audit retention tick failed after %lld confirmed deletions (unknown error)",
+                      (long long)progress.audit_rows);
+        }
+
+        // No trailing database admission after observing stop. An ownership
+        // acquisition already started when stop races is the current unit;
+        // busy waits, COMMIT and callbacks are not preempted by this protocol.
+        if (retention_stop_requested_(worker_origin)) {
+            if (progress.reason != retention_stop_reason::failed) progress.reason = retention_stop_reason::stopped;
+            return progress;
+        }
+        if (claimed && (progress.reason == retention_stop_reason::more_possible ||
+                        progress.reason == retention_stop_reason::revision_changed ||
+                        progress.reason == retention_stop_reason::failed)) {
+            try {
+                const auto released = with_audit_prune_transaction_([&]() -> int64_t {
+                    db_->execute("DELETE FROM _lattice_meta WHERE key = 'audit_prune_at' AND value = ?", {plan.stamp});
+                    return static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+                });
+                progress.fast_retry = released == 1 && progress.reason == retention_stop_reason::more_possible;
+            } catch (const std::exception& error) {
+                LOG_DEBUG("lattice_db", "audit retention claim cleanup deferred to expiry: %s", error.what());
+            } catch (...) {
+                LOG_DEBUG("lattice_db", "audit retention claim cleanup deferred to expiry");
+            }
+        }
+        if (progress.audit_rows > 0)
+            LOG_INFO("lattice_db", "audit retention: %lld confirmed deletions in %zu units, partial=%d (path=%s)",
+                     (long long)progress.audit_rows, progress.audit_units,
+                     progress.reason != retention_stop_reason::drained, config_.path.c_str());
+        return progress;
+    }
+
+public:
     /// Backdate all replication slots' last_active_at by the given number of seconds.
     /// Test-only: allows deterministic stale-slot eviction without wall-clock sleeps.
     void backdate_replication_slots(int64_t seconds) {
@@ -6200,6 +6472,7 @@ private:
     // Audit-retention maintenance thread (see start_audit_maintenance()).
     std::thread audit_maint_thread_;
     std::atomic<bool> history_generation_active_{false};
+    std::atomic<bool> audit_retention_tick_active_{false};
     std::mutex audit_maint_mutex_;
     std::condition_variable audit_maint_cv_;
     bool audit_maint_stop_ = false;

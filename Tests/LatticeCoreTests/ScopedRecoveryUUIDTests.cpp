@@ -263,9 +263,12 @@ TEST_F(ScopedRecoveryUUID, IgnoredReceiptWriteRollsBackMappedModelsMembershipAnd
 TEST_F(ScopedRecoveryUUID, ReopenRetainsUUIDModeAndFiniteUnionRefusalLeavesPriorInstall) {
     TempDB path("uuid-reopen");owner=std::make_shared<UUIDOwner>(path.str());auto one=request();one.full_rows={person(person_id,upper_uuid(person_id))};
     ASSERT_EQ(run(one).transaction.state,state::committed);const auto pk=number("SELECT id FROM TestPerson");owner->close();owner.reset();
-    owner=std::make_shared<UUIDOwner>(path.str());auto two=next(one);two.full_rows={person(person_id,person_id,"updated"),person(other_id,other_id)};
-    limits.targets=1;refused(run(two),"target union limit exceeded");EXPECT_EQ(number("SELECT COUNT(*) FROM TestPerson"),1);EXPECT_EQ(number("SELECT id FROM TestPerson"),pk);
-    limits.targets=512;two.full_rows.resize(1);ASSERT_EQ(run(two).transaction.state,state::committed);
+    owner=std::make_shared<UUIDOwner>(path.str());auto two=next(one);
+    // Each input fits the two-target limit; the retained member plus two new
+    // source identities makes the actual planning union exceed it by one.
+    two.full_rows={person(other_id,other_id),person(dog_id,dog_id)};
+    limits.targets=2;refused(run(two),"target union limit exceeded");EXPECT_EQ(number("SELECT COUNT(*) FROM TestPerson"),1);EXPECT_EQ(number("SELECT id FROM TestPerson"),pk);
+    limits.targets=512;two.full_rows={person(person_id,person_id,"updated")};ASSERT_EQ(run(two).transaction.state,state::committed);
     EXPECT_EQ(number("SELECT id FROM TestPerson"),pk);EXPECT_EQ(text("SELECT globalId FROM TestPerson"),upper_uuid(person_id));
     EXPECT_EQ(text("SELECT name FROM TestPerson"),"updated");owner->close();owner.reset();
 }

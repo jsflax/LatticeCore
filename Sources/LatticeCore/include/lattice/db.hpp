@@ -272,10 +272,11 @@ public:
     /// before the keeper transaction can close (results spec §3.4).
     void interrupt();
 
-    /// Result of a wal_checkpoint() call. rc is the PRAGMA's SQLite result
+    /// Result of a wal_checkpoint() call. rc retains the PRAGMA-style result
     /// code; busy is 1 when the checkpoint could not complete because a
     /// reader/writer held the WAL; log_frames/checkpointed mirror the PRAGMA
-    /// row (-1 when unavailable).
+    /// row (-1 when unavailable). Native SQLITE_BUSY maps to rc=SQLITE_OK,
+    /// busy=1; other native errors retain rc=SQLITE_ERROR and unavailable frames.
     struct checkpoint_result {
         int rc = 0;
         int busy = 1;

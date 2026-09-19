@@ -1,6 +1,7 @@
 #include "lattice/db.hpp"
 #include "lattice/projection.hpp"
 #include "lattice/log.hpp"
+#include "checkpoint_test_probe.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
 #include <iostream>
@@ -1074,37 +1075,59 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
     if (closed_.load(std::memory_order_acquire) || mode_ != open_mode::read_write || !db_) {
         return result;
     }
-    // PRAGMA (not the C API) so the (busy, log, checkpointed) row comes back
-    // through the ordinary query path; same style as the Swift bridge's
-    // checkpoint(). Bound the wait: TRUNCATE holds the writer lock while
-    // waiting out readers, so a held snapshot must fail fast (retry next
-    // cycle) rather than stall every writer behind it.
-    sqlite3_busy_timeout(db_, truncate ? busy_budget_ms : 0);
-    try {
-        auto rows = query(truncate ? "PRAGMA wal_checkpoint(TRUNCATE)"
-                                   : "PRAGMA wal_checkpoint(PASSIVE)");
-        result.rc = SQLITE_OK;
-        if (!rows.empty()) {
-            auto get = [&](const char* key) -> int64_t {
-                auto it = rows[0].find(key);
-                if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    return std::get<int64_t>(it->second);
-                }
-                return -1;
-            };
-            result.busy = static_cast<int>(get("busy"));
-            result.log_frames = get("log");
-            result.checkpointed = get("checkpointed");
+    auto* connection = db_; // Owner lifetime/move contract is unchanged.
+    {
+        // FULLMUTEX alone serializes individual calls, not a PRAGMA's ROW →
+        // next-step/finalize gap. A paused checkpoint PRAGMA is a writing VM
+        // and makes a concurrent ACK COMMIT fail with "SQL statements in
+        // progress". Use the native operation, and own the timeout mutation
+        // through restoration too. db.cpp is compiled with SQLITE_CORE, so
+        // sqlite3ext.h does not replace this API with an extension thunk.
+        struct checkpoint_scope {
+            sqlite3* connection;
+            sqlite3_mutex* mutex;
+            int restore_timeout;
+            checkpoint_scope(sqlite3* db, int timeout) noexcept
+                : connection(db), mutex(sqlite3_db_mutex(db)), restore_timeout(timeout) {
+                sqlite3_mutex_enter(mutex);
+            }
+            ~checkpoint_scope() noexcept {
+                sqlite3_busy_timeout(connection, restore_timeout);
+                sqlite3_mutex_leave(mutex);
+            }
+        } scope(connection, busy_timeout_ms_);
+
+        record_statement(); // Preserve the prior one-PRAGMA accounting.
+        sqlite3_busy_timeout(connection, truncate ? busy_budget_ms : 0);
+        int log_frames = -1, checkpointed = -1;
+        // nullptr preserves the unqualified PRAGMA's all-attached-schema scope
+        // and first-schema frame counters; do not silently narrow to "main".
+        const int rc = sqlite3_wal_checkpoint_v2(connection, nullptr,
+            truncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE,
+            &log_frames, &checkpointed);
+        if (rc == SQLITE_OK || rc == SQLITE_BUSY) {
+            // PRAGMA represents BUSY as a successful result row with busy=1.
+            result.rc = SQLITE_OK;
+            result.busy = rc == SQLITE_BUSY ? 1 : 0;
+            result.log_frames = log_frames;
+            result.checkpointed = checkpointed;
+        } else {
+            // The old query path threw and left all frame values unavailable.
+            result.rc = SQLITE_ERROR;
+            LOG_DEBUG("db", "wal_checkpoint(%s) failed: rc=%d, path=%s",
+                      truncate ? "TRUNCATE" : "PASSIVE", rc, path_.c_str());
         }
-    } catch (const std::exception& e) {
-        result.rc = SQLITE_ERROR;
-        LOG_DEBUG("db", "wal_checkpoint(%s) failed: %s, path=%s",
-                  truncate ? "TRUNCATE" : "PASSIVE", e.what(), path_.c_str());
+        detail::checkpoint_test_probe::fire(connection,
+            detail::checkpoint_probe_stage::result_captured);
     }
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // restore statement-level timeout
     if (truncate && result.busy != 0) {
-        // Signal only after the checkpoint statement returned. This does not
-        // claim the current BUSY attempt succeeded; a later retry may truncate.
+        // Preserve the existing retirement request, after releasing this method's
+        // mutex ownership and restoring the timeout. A caller's pre-existing
+        // recursive mutex level/callback contract is unchanged. This is not a
+        // successful-checkpoint or authoritative history-epoch signal; a later
+        // retry may truncate.
+        detail::checkpoint_test_probe::fire(connection,
+            detail::checkpoint_probe_stage::before_generation_retirement);
         try { retire_projection_store(physical_identity()); } catch (...) {}
     }
     return result;

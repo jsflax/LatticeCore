@@ -58,6 +58,7 @@ struct recovery_writer_access;
 struct recovery_witness_access;
 struct recovery_refresh_access;
 class canonical_writer_adapter;
+class recovery_obligation_producer_store;
 void require_canonical_relation(database&, const std::string&);
 
 // One ordinary attached-field operation. Main/manual database fields keep
@@ -91,6 +92,7 @@ class database {
     friend struct detail::recovery_witness_access;
     friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
+    friend class detail::recovery_obligation_producer_store;
     friend void detail::require_canonical_relation(database&, const std::string&);
     // Private fixed-scope trigger qualification lacks upstream receipt settlement.
     bool canonical_trigger_only_ = false;

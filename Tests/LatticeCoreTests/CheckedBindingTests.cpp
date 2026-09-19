@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -115,15 +116,34 @@ struct Bulk {
     database& db = owner.db();
     sqlite3* raw = db.handle();
     Statement unrelated{raw, "SELECT 902"};
+    std::map<sqlite3_stmt*, std::string> expected_statements;
     Bulk() {
         auto seed = owner.add(CheckedBindingRow{"seed", std::nullopt});
         owner.remove(seed); // Create normal model schema/triggers before lowering limits.
+        capture_statement_baseline();
     }
     void failing_pair() {
         owner.add_bulk(std::vector<CheckedBindingRow>{{"first", std::nullopt}, {oversized_text(), std::string("second")}});
     }
     int64_t count() { return scalar(db, "SELECT count(*) AS n FROM CheckedBindingRow"); }
-    void clean_statement() { EXPECT_EQ(statements(raw), std::set<sqlite3_stmt*>{unrelated.value}); }
+    std::map<sqlite3_stmt*, std::string> statement_inventory() const {
+        std::map<sqlite3_stmt*, std::string> result;
+        for (auto* statement : statements(raw)) {
+            const char* sql = sqlite3_sql(statement);
+            result.emplace(statement, sql ? sql : "<unavailable SQL>");
+        }
+        return result;
+    }
+    // Registered geo schemas create R*Tree-owned prepared statements too.
+    // Capture only after fixture preparation, never after the operation tested.
+    void capture_statement_baseline() {
+        expected_statements = statement_inventory();
+        const auto found = expected_statements.find(unrelated.value);
+        if (found == expected_statements.end() || found->second != "SELECT 902")
+            throw std::runtime_error("fixture lost its unrelated prepared statement");
+    }
+    bool statement_inventory_unchanged() const { return statement_inventory() == expected_statements; }
+    void clean_statement() { EXPECT_EQ(statement_inventory(), expected_statements); }
 };
 struct DenyRollback {
     sqlite3* raw;
@@ -300,7 +320,7 @@ TEST(CheckedBinding, DeniedBulkRollbackCannotReplaceTheFirstBindErrorOrLeakItsSt
 TEST(CheckedBinding, BulkFinalizesBeforeSettledCallbackAndCallbackThrowDoesNotUndoCommit) {
     Bulk f; Hooks hooks(f.db); int settled = 0; bool statement_closed = false;
     f.db.set_txn_hooks([&] {
-        ++settled; statement_closed = statements(f.raw) == std::set<sqlite3_stmt*>{f.unrelated.value};
+        ++settled; statement_closed = f.statement_inventory_unchanged();
         throw std::runtime_error("checked-settled-sentinel");
     }, []() noexcept {});
     try {
@@ -321,6 +341,9 @@ TEST(CheckedBinding, BulkMissingPrimitiveAndExpandedGeoValuesRemainSqlNull) {
     f.db.execute("ALTER TABLE CheckedBindingRow ADD COLUMN absent TEXT");
     for (const auto* name : {"bounds_minLat", "bounds_maxLat", "bounds_minLon", "bounds_maxLon"})
         f.db.execute(std::string("ALTER TABLE CheckedBindingRow ADD COLUMN ") + name + " REAL");
+    // Intentional schema changes can release virtual-table cached statements.
+    // This is the prepared fixture baseline, before the bulk operation begins.
+    f.capture_statement_baseline();
     auto rows = f.owner.add_bulk_with_schema(std::vector<CheckedBindingRow>{{"one", std::nullopt}, {"two", std::string("note")}}, schema);
     ASSERT_EQ(rows.size(), 2u);
     const auto values = f.db.query("SELECT note,absent,bounds_minLat,bounds_maxLat,bounds_minLon,bounds_maxLon FROM CheckedBindingRow ORDER BY id");

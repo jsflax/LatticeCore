@@ -1,4 +1,5 @@
 #include "scoped_recovery_install.hpp"
+#include "recovery_witness.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
@@ -601,6 +602,10 @@ scoped_recovery_result install_scoped_recovery(std::shared_ptr<lattice_db> owner
         result.installation=state.apply_if_new(request.binding,request.identity,request.supersede,[&](database& actual) {
             require(&actual==&writer&&recovery_writer_access::active_writer(*owner)==&writer,"recovery physical writer changed");
             install_body(*owner,writer,request,limits);
+            // Only a newly applied installation reaches this body. Its witness
+            // commits/rolls back with model, membership and installed receipt;
+            // exact retries and generic writer-access reads do not advance it.
+            bump_recovery_witness(*owner);
         });
     });
     if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();

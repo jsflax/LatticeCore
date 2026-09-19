@@ -47,7 +47,7 @@ template<typename T> class results;
 class lattice_db;
 class synchronizer_base;
 class synchronizer;
-namespace detail { struct recovery_writer_access; class canonical_writer_adapter; }
+namespace detail { struct recovery_writer_access; class canonical_writer_adapter; struct recovery_refresh_state; struct recovery_refresh_access; }
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -2080,6 +2080,13 @@ public:
     // Observer ID type
     using observer_id = uint64_t;
 
+    // Additive payload-free recovery signal. Opt-in, coalescible and retried
+    // after callback failure; it never fabricates CollectionChange/AuditLog.
+    // Native file stores only in this private inactive integration slice.
+    observer_id add_recovery_refresh_observer(std::function<void()> callback);
+    void remove_recovery_refresh_observer(observer_id token);
+    void request_recovery_refresh() noexcept;
+
     // One row's worth of change metadata, batched into the observer
     // callback's vector. Same fields the per-row signature exposed
     // historically — table name, operation, row id, global row id,
@@ -2131,9 +2138,13 @@ public:
     /// Returns an ID that can be used to unregister
     observer_id add_object_observer(const std::string& table_name, int64_t row_id,
                                      std::function<void(const std::string&)> callback) {
-        std::lock_guard<std::mutex> lock(object_observers_mutex_);
         auto id = next_observer_id_.fetch_add(1, std::memory_order_relaxed);
-        object_observers_[table_name][row_id].emplace_back(id, std::move(callback));
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            object_observers_[table_name][row_id].emplace_back(id, std::move(callback));
+        }
+        try { recovery_subscriptions_changed(); }
+        catch (...) { remove_object_observer(table_name, row_id, id); throw; }
         return id;
     }
 
@@ -2319,6 +2330,9 @@ public:
         /// re-pin at the next access and the next checkpoint lands behind
         /// them.
         advance = 2,
+        /// Durable recovery content changed. Payload is empty/unknown; all
+        /// current shapes must invalidate content, not merely repin a reader.
+        recovery = 3,
     };
 
     using invalidation_hook_fn =
@@ -6039,6 +6053,7 @@ protected:
     // free and precedes the first DETACH side effect, including failed DETACH.
     friend class detail::managed_route_scope;
     friend struct detail::recovery_writer_access;
+    friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
     friend struct managed_attachment_test_access;
     struct managed_attachment_binding {
@@ -6143,6 +6158,8 @@ private:
     uint64_t connection_revision_ = 0;
     std::shared_ptr<database> db_;       // Write connection / fallback owner
     std::shared_ptr<database> read_db_;
+    std::shared_ptr<detail::recovery_refresh_state> recovery_refresh_;
+    void recovery_subscriptions_changed();
     // Thread that opened the current explicit transaction (see read_db()).
     std::atomic<std::thread::id> txn_owner_thread_{};  // Read-only connection for concurrent reads
     std::shared_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler

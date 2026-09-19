@@ -55,6 +55,8 @@ class database;
 namespace detail {
 struct exact_vector_rows_access;
 struct recovery_writer_access;
+struct recovery_witness_access;
+struct recovery_refresh_access;
 class canonical_writer_adapter;
 void require_canonical_relation(database&, const std::string&);
 
@@ -86,6 +88,8 @@ class database {
     friend class lattice_db;
     friend struct detail::exact_vector_rows_access;
     friend struct detail::recovery_writer_access;
+    friend struct detail::recovery_witness_access;
+    friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
     friend void detail::require_canonical_relation(database&, const std::string&);
     // Private fixed-scope trigger qualification lacks upstream receipt settlement.

@@ -502,7 +502,8 @@ void lattice_db::reopen_write_db() {
 }
 
 void lattice_db::reopen_read_db() {
-    if (config_.is_in_memory() || config_.read_only) return;
+    if (config_.is_in_memory()) return;
+    if (config_.read_only) { request_recovery_refresh(); return; }
     uint64_t revision;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -530,6 +531,10 @@ void lattice_db::reopen_read_db() {
         reader.swap(read_db_);
         xproc.swap(xproc_read_db_);
     }
+    attach_lock.unlock();
+    // Keep the prior acknowledged witness. Reopen must catch a missed install,
+    // never seed its local cursor to the latest generation without delivery.
+    request_recovery_refresh();
 }
 
 void lattice_db::setup_change_hook(database& connection) {
@@ -795,6 +800,10 @@ void lattice_db::handle_cross_process_notification() {
     // Used to diagnose whether xproc notifications cause main-thread stalls.
     static bool disabled = (std::getenv("LATTICE_DISABLE_XPROC") != nullptr);
     if (disabled) return;
+
+    // Recovery has a durable witness independent of outgoing AuditLog. Queue
+    // its private drain before the legacy empty-audit exit.
+    request_recovery_refresh();
 
     auto cursor = last_seen_audit_id_.load(std::memory_order_acquire);
     LOG_DEBUG("xproc", "Cross-process notification received, last_seen=%lld", (long long)cursor);

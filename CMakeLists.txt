@@ -66,6 +66,8 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/schema.cpp
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/scoped_recovery_install.cpp
+    Sources/LatticeCore/src/recovery_witness.cpp
+    Sources/LatticeCore/src/recovery_refresh.cpp
     Sources/LatticeCore/src/receive_install_state.cpp
     Sources/LatticeCore/src/receive_ledger.cpp
     Sources/LatticeCore/src/recovery_staging.cpp
@@ -216,6 +218,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
     Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp
     Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp
+    Tests/LatticeCoreTests/RecoveryWitnessTests.cpp
     Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp
     Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp

@@ -250,6 +250,16 @@ std::vector<std::string> database::query_attachment_text_metadata(
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
                    std::shared_ptr<database_read_control> read_control)
+    : database(path, mode, busy_timeout_ms, std::move(read_control), initialization_key(false)) {}
+
+std::shared_ptr<database> database::make_read_keeper(const std::string& path,
+                                                   int busy_timeout_ms) {
+    return std::make_shared<database>(path, open_mode::read_only, busy_timeout_ms,
+                                     std::shared_ptr<database_read_control>{}, initialization_key(true));
+}
+
+database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
+                   std::shared_ptr<database_read_control> read_control, initialization_key key)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
@@ -316,7 +326,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     if (mode == open_mode::read_write) {
         execute("PRAGMA journal_mode = DELETE");
     }
-    execute(read_control_ ? "PRAGMA cache_size = 2000" : "PRAGMA cache_size = 50000");       // Large cache for performance
+    execute((read_control_ || key.keeper_cache_) ? "PRAGMA cache_size = 2000" : "PRAGMA cache_size = 50000");
     execute(read_control_ ? "PRAGMA temp_store = FILE" : "PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #else
     // Native mode: Enable WAL mode for better concurrency (only on read-write connection)
@@ -325,7 +335,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     }
 
     // Performance optimizations (matching Lattice.swift)
-    execute(read_control_ ? "PRAGMA cache_size = 2000" : "PRAGMA cache_size = 50000");       // Large cache for performance
+    execute((read_control_ || key.keeper_cache_) ? "PRAGMA cache_size = 2000" : "PRAGMA cache_size = 50000");
     execute(read_control_ ? "PRAGMA mmap_size = 0" : "PRAGMA mmap_size = 300000000");    // Memory-mapped I/O (~300MB)
     execute(read_control_ ? "PRAGMA temp_store = FILE" : "PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #endif

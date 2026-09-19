@@ -52,6 +52,17 @@ struct physical_store_identity {
 
 class database {
     friend class lattice_db;
+    // Only database can construct this key. The keyed overload remains
+    // accessible to make_shared so keepers retain its single allocation.
+    class initialization_key {
+        friend class database;
+        const bool keeper_cache_;
+        explicit initialization_key(bool keeper_cache) : keeper_cache_(keeper_cache) {}
+    public:
+        initialization_key(const initialization_key&) = default;
+    };
+    static std::shared_ptr<database> make_read_keeper(const std::string& path,
+                                                    int busy_timeout_ms);
     template<typename T, typename Enable> friend struct managed;
     friend class swift_lattice;
     friend class projection_service;
@@ -111,6 +122,9 @@ public:
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
                       int busy_timeout_ms = kDefaultBusyTimeoutMs,
                       std::shared_ptr<database_read_control> read_control = {});
+    // Private construction capability; no caller can manufacture the key.
+    database(const std::string& path, open_mode mode, int busy_timeout_ms,
+             std::shared_ptr<database_read_control> read_control, initialization_key key);
     ~database();
 
     /// No SQL statements. Best-effort for legacy callers; nullptr means an

@@ -168,7 +168,14 @@ inline exact_vector_rows_plan build_exact_vector_rows_plan(
 // Unlike database::query this NEVER drains deferred observation callbacks.
 // No additional connection lock is acquired; the caller owns the read/topology
 // gate and database lifetime. It may reuse an already-held recursive gate.
-inline std::vector<database::row_t> collect_exact_vector_rows(
+// This friend owns the private-handle capability and returns only owned rows.
+// It never exposes a raw connection or changes its raw-escape state.
+struct exact_vector_rows_access {
+    static std::vector<database::row_t> collect(
+        database& db, const exact_vector_rows_plan& plan);
+};
+
+inline std::vector<database::row_t> exact_vector_rows_access::collect(
     database& db, const exact_vector_rows_plan& plan) {
     if (db.is_closed() || !db.internal_handle()) throw db_error("exact row connection is closed");
     if (plan.sql.find('\0') != std::string::npos ||
@@ -249,6 +256,11 @@ inline std::vector<database::row_t> collect_exact_vector_rows(
     }
     if (result != SQLITE_DONE) throw db_error(sqlite3_errmsg(db.internal_handle()));
     return rows;
+}
+
+inline std::vector<database::row_t> collect_exact_vector_rows(
+    database& db, const exact_vector_rows_plan& plan) {
+    return exact_vector_rows_access::collect(db, plan);
 }
 
 inline std::vector<exact_vector_row> select_exact_vector_rows(

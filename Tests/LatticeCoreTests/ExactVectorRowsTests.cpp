@@ -122,8 +122,8 @@ protected:
 
     std::set<sqlite3_stmt*> statements() {
         std::set<sqlite3_stmt*> result;
-        for (auto* statement = sqlite3_next_stmt(db.internal_handle(), nullptr); statement;
-             statement = sqlite3_next_stmt(db.internal_handle(), statement)) result.insert(statement);
+        for (auto* statement = sqlite3_next_stmt(db.handle(), nullptr); statement;
+             statement = sqlite3_next_stmt(db.handle(), statement)) result.insert(statement);
         return result;
     }
 };
@@ -326,9 +326,9 @@ TEST_F(ExactVectorRows, StrictCollectorRejectsTailWritesAliasesAndBindingErrorsW
     EXPECT_THROW(collect_exact_vector_rows(db,{"SELECT ?",{}}),lattice::db_error);
     EXPECT_THROW(collect_exact_vector_rows(db,{"SELECT ?1",{int64_t(1)}}),lattice::db_error);
     EXPECT_THROW(collect_exact_vector_rows(db,{std::string("SELECT 1\0;SELECT 2",18),{}}),std::invalid_argument);
-    const int old_limit=sqlite3_limit(db.internal_handle(),SQLITE_LIMIT_LENGTH,16);
+    const int old_limit=sqlite3_limit(db.handle(),SQLITE_LIMIT_LENGTH,16);
     EXPECT_THROW(collect_exact_vector_rows(db,{"SELECT ?",{std::string(32,'x')}}),lattice::db_error);
-    sqlite3_limit(db.internal_handle(),SQLITE_LIMIT_LENGTH,old_limit);
+    sqlite3_limit(db.handle(),SQLITE_LIMIT_LENGTH,old_limit);
     EXPECT_EQ(statements(),before);
     EXPECT_EQ(std::get<std::string>(select({arm()},{0,0,0,0},1)[0].row.at("payload")),"unchanged");
     db.execute("UPDATE Doc SET payload='' WHERE id=1");
@@ -345,11 +345,11 @@ TEST_F(ExactVectorRows, StrictCollectorRejectsTailWritesAliasesAndBindingErrorsW
 TEST_F(ExactVectorRows, AuthorizerFailureThrowsAndReadDoesNotDrainDeferredCallbacks) {
     create(); insert({1,"row",{1,0,0,0},"payload"});
     const auto before=statements();
-    ASSERT_EQ(sqlite3_set_authorizer(db.internal_handle(),[](void*,int action,const char*,const char*,const char*,const char*) {
+    ASSERT_EQ(sqlite3_set_authorizer(db.handle(),[](void*,int action,const char*,const char*,const char*,const char*) {
         return action==SQLITE_READ ? SQLITE_DENY : SQLITE_OK;
     },nullptr),SQLITE_OK);
     EXPECT_THROW(select({arm()},{0,0,0,0},1),lattice::db_error);
-    sqlite3_set_authorizer(db.internal_handle(),nullptr,nullptr);
+    sqlite3_set_authorizer(db.handle(),nullptr,nullptr);
     EXPECT_EQ(statements(),before);
     int drains=0;
     db.set_txn_hooks([&] { ++drains; },[] {});

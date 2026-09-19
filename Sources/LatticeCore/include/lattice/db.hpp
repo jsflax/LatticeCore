@@ -50,8 +50,11 @@ struct physical_store_identity {
     }
 };
 
+namespace detail { struct exact_vector_rows_access; }
+
 class database {
     friend class lattice_db;
+    friend struct detail::exact_vector_rows_access;
     // Only database can construct this key. The keyed overload remains
     // accessible to make_shared so keepers retain its single allocation.
     class initialization_key {

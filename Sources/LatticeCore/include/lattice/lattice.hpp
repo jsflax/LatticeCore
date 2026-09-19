@@ -5053,7 +5053,7 @@ protected:
 public:
     /// Ensure a vec0 virtual table exists for a vector column.
     /// Table name format: _{ModelTable}_{column}_vec
-    /// Dimensions are inferred from first insert.
+    /// Dimensions are inferred from first insert; 0 only upgrades an existing sidecar.
     /// Also creates triggers to keep vec0 in sync with main table.
     /// When ivf_nlist > 0, creates the table with IVF indexing.
     void ensure_vec0_table(const std::string& model_table,
@@ -5081,64 +5081,12 @@ private:
                 ? model_table.substr(dot + 1) : model_table;
             std::string vec_table = "_" + bare_table + "_" + column_name + "_vec";
 
-            // Check if table already exists
-            std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
-            auto results = writer.query(check_sql, {vec_table});
-            if (!results.empty()) {
-                // Table exists — check if triggers need updating
-                auto trig = writer.query(
-                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='"
-                    + vec_table + "_insert' LIMIT 1");
-                if (!trig.empty()) {
-                    auto& sql_val = trig[0].at("sql");
-                    auto& trig_sql = std::get<std::string>(sql_val);
-                    // Current trigger format uses UPDATE+INSERT NOT EXISTS pattern
-                    // (avoids DELETE on vec0 inside triggers, which is unreliable)
-                    if (trig_sql.find("NOT EXISTS") != std::string::npos) {
-                        return; // Trigger already has correct pattern
-                    }
-                    // Stale trigger — drop all vec0 triggers to recreate
-                    writer.execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
-                    writer.execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
-                    writer.execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
-                }
-                // Fall through to recreate triggers
-            }
-
-            // Create vec0 virtual table with globalId as primary key (if it doesn't exist)
-            if (results.empty()) {
-                std::ostringstream sql;
-                sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
-                    << "global_id TEXT PRIMARY KEY, "
-                    << "embedding float[" << dimensions << "]"
-                    << (ivf_nlist > 0
-                        ? " indexed by ivf(nlist=" + std::to_string(ivf_nlist)
-                          + (ivf_nprobe > 0 ? ", nprobe=" + std::to_string(ivf_nprobe) : "")
-                          + ")"
-                        : "")
-                    << ")";
-                LOG_INFO("ensure_vec0_table", "Creating IVF vec0 table: %s (dims=%d)", vec_table.c_str(), dimensions);
-                LOG_DEBUG("ensure_vec0_table", "SQL: %s", sql.str().c_str());
-                writer.execute(sql.str());
-            }
-
-            // Create triggers to keep vec0 in sync with main table.
-            // Use main.-qualified model_table in the ON clause so triggers work
-            // even when a TEMP UNION ALL view shadows the model table (from attach()).
-            // Note: SQLite forbids qualified names inside trigger bodies, but the
-            // vec table references resolve correctly because ATTACH excludes virtual tables.
-            //
-            // IMPORTANT: vec0's DELETE is unreliable inside triggers (the shadow table
-            // deletion can silently fail, leaving a stale entry that causes UNIQUE
-            // constraint errors on the subsequent INSERT). Instead we use:
-            //   1. UPDATE existing vec0 entry (no-op if row doesn't exist)
-            //   2. INSERT only if no entry exists (conditional via NOT EXISTS)
-            // This avoids DELETE on vec0 entirely within trigger bodies.
-
+            // Keep the established nonempty UPDATE + conditional INSERT
+            // programs intact. Empty/NULL updates have their own clear program.
             // INSERT trigger
             std::ostringstream insert_trigger;
             insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_insert "
-                           << "AFTER INSERT ON main." << model_table << " "
+                           << "AFTER INSERT ON main." << bare_table << " "
                            << "WHEN NEW." << column_name << " IS NOT NULL "
                            << "AND length(NEW." << column_name << ") > 0 "
                            << "BEGIN "
@@ -5149,12 +5097,11 @@ private:
                            << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
                            << " WHERE global_id = NEW.globalId); "
                            << "END";
-            writer.execute(insert_trigger.str());
 
             // UPDATE trigger
             std::ostringstream update_trigger;
             update_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_update "
-                           << "AFTER UPDATE OF " << column_name << " ON main." << model_table << " "
+                           << "AFTER UPDATE OF " << column_name << " ON main." << bare_table << " "
                            << "WHEN NEW." << column_name << " IS NOT NULL "
                            << "AND length(NEW." << column_name << ") > 0 "
                            << "BEGIN "
@@ -5165,16 +5112,102 @@ private:
                            << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
                            << " WHERE global_id = NEW.globalId); "
                            << "END";
-            writer.execute(update_trigger.str());
 
             // DELETE trigger
             std::ostringstream delete_trigger;
             delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_delete "
-                           << "AFTER DELETE ON main." << model_table << " "
+                           << "AFTER DELETE ON main." << bare_table << " "
                            << "BEGIN "
                            << "DELETE FROM " << vec_table << " WHERE global_id = OLD.globalId; "
                            << "END";
-            writer.execute(delete_trigger.str());
+
+            std::ostringstream clear_trigger;
+            clear_trigger << "CREATE TRIGGER IF NOT EXISTS " << vec_table << "_clear "
+                          << "AFTER UPDATE OF " << column_name << " ON main." << bare_table << " "
+                          << "WHEN NEW." << column_name << " IS NULL "
+                          << "OR length(NEW." << column_name << ") = 0 "
+                          << "BEGIN DELETE FROM " << vec_table
+                          << " WHERE global_id = OLD.globalId; END";
+            const std::array<std::string, 4> programs{
+                insert_trigger.str(), update_trigger.str(), delete_trigger.str(), clear_trigger.str()};
+            const std::array<std::string, 4> names{
+                vec_table + "_insert", vec_table + "_update", vec_table + "_delete", vec_table + "_clear"};
+            auto stored_sql = [](std::string sql) {
+                // SQLite removes IF NOT EXISTS from sqlite_schema.sql.
+                const std::string prefix = "CREATE TRIGGER IF NOT EXISTS ";
+                if (sql.compare(0, prefix.size(), prefix) == 0) sql.replace(0, prefix.size(), "CREATE TRIGGER ");
+                return sql;
+            };
+            size_t maximum_sql = 0;
+            for (const auto& sql : programs) maximum_sql = std::max(maximum_sql, sql.size());
+            if (maximum_sql > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+                throw db_error("vec0 generated trigger SQL is too large");
+            auto exists = [&] {
+                return !writer.query("SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?", {vec_table}).empty();
+            };
+            auto inspect = [&] {
+                // Inspect only reserved generated names, and bound stored SQL
+                // before the generic query copies it. An unrelated user trigger
+                // is preserved; a conflicting reserved definition is refused.
+                auto rows = writer.query(
+                    "SELECT name,CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))<=? "
+                    "THEN sql END AS sql FROM main.sqlite_schema WHERE type='trigger' "
+                    "AND name IN (?,?,?,?) LIMIT 5",
+                    {static_cast<int64_t>(maximum_sql), names[0], names[1], names[2], names[3]});
+                std::set<std::string> found;
+                for (const auto& row : rows) {
+                    const auto* name = std::get_if<std::string>(&row.at("name"));
+                    const auto* sql = std::get_if<std::string>(&row.at("sql"));
+                    if (!name || !sql) throw db_error("vec0 reserved trigger definition is invalid or oversized");
+                    const auto it = std::find(names.begin(), names.end(), *name);
+                    if (it == names.end() || *sql != stored_sql(programs[static_cast<size_t>(it - names.begin())]) ||
+                        !found.insert(*name).second)
+                        throw db_error("vec0 reserved trigger definition is not a supported generated program");
+                }
+                return found;
+            };
+            const bool present = exists();
+            const auto initial_programs = inspect();
+            // Zero dimensions is existing-sidecar-only admission. In particular
+            // an empty managed value cannot invent a dimension or a vec0 table.
+            if (!present && dimensions == 0) return;
+            if (!present && dimensions < 0) throw db_error("vec0 dimensions must be positive for creation");
+            if (initial_programs.size() == programs.size() && present) return;
+
+            // Recheck under a savepoint so an unknown reserved definition or
+            // failed DDL cannot leave a partial metadata upgrade. This nests
+            // inside normal schema setup or an already owned write transaction.
+            writer.execute("SAVEPOINT lattice_vec0_trigger_upgrade");
+            try {
+                const auto found = inspect();
+                if (!exists()) {
+                    if (dimensions <= 0) throw db_error("vec0 sidecar disappeared during trigger admission");
+                    std::ostringstream sql;
+                    sql << "CREATE VIRTUAL TABLE " << vec_table << " USING vec0("
+                        << "global_id TEXT PRIMARY KEY, embedding float[" << dimensions << "]"
+                        << (ivf_nlist > 0
+                            ? " indexed by ivf(nlist=" + std::to_string(ivf_nlist)
+                              + (ivf_nprobe > 0 ? ", nprobe=" + std::to_string(ivf_nprobe) : "") + ")"
+                            : "") << ")";
+                    writer.execute(sql.str());
+                }
+                for (size_t i = 0; i < programs.size(); ++i)
+                    if (!found.count(names[i])) writer.execute(programs[i]);
+                if (inspect().size() != programs.size()) throw db_error("vec0 generated trigger installation incomplete");
+                writer.execute("RELEASE lattice_vec0_trigger_upgrade");
+            } catch (...) {
+                const auto primary = std::current_exception();
+                try {
+                    writer.execute("ROLLBACK TO lattice_vec0_trigger_upgrade");
+                    writer.execute("RELEASE lattice_vec0_trigger_upgrade");
+                } catch (...) {
+                    // Do not expose a writer whose partial DDL could not unwind.
+                    writer.closed_.store(true, std::memory_order_release);
+                    try { std::rethrow_exception(primary); }
+                    catch (...) { std::throw_with_nested(db_error("vec0 trigger upgrade rollback failed; writer closed")); }
+                }
+                std::rethrow_exception(primary);
+            }
         }, &writer);
     }
 
@@ -5663,6 +5696,7 @@ public:
             db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
             db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
             db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_clear");
             db_->execute("DROP TABLE IF EXISTS " + vec_table);
         }
 
@@ -5875,6 +5909,7 @@ public:
                 db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
                 db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
                 db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_clear");
                 db_->execute("DROP TABLE IF EXISTS " + vec_table);
                 ensure_vec0_table(model_table, column_name, dimensions, nlist, nprobe);
 
@@ -6464,6 +6499,11 @@ private:
         // existing schema gains its index on the next slow-path open.
         for (const auto* schema : schema_registry::instance().all_schemas()) {
             ensure_unique_property_indexes(*schema);
+            // Metadata-only admission for registered existing vector sidecars.
+            // No inference, backfill, or creation from an empty model column.
+            for (const auto& prop : schema->properties)
+                if (prop.is_vector && prop.type == column_type::blob)
+                    ensure_vec0_table(schema->table_name, prop.name, 0);
         }
 
         store_fingerprint_marker(fp_key);
@@ -7421,7 +7461,10 @@ protected:
     /// snapshots; guarded ALTER in ensure_audit_log_table). Epoch 5 ships
     /// alone as Engram Groups increment 0; this train is increment 1.
     /// Renumbered from 5 by the same rebase.
-    static constexpr int kLatticeSchemaFormatEpoch = 6;
+    /// Epoch 7: generated vec0 programs gain empty/NULL update clearing.
+    /// Both Core and Swift fingerprint families must revalidate old sidecar
+    /// metadata. This does not backfill already-stale untouched index rows.
+    static constexpr int kLatticeSchemaFormatEpoch = 7;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as
@@ -9154,12 +9197,27 @@ inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler h
 inline void managed<std::vector<uint8_t>>::ensure_vec0_for_blob(
     lattice_db* lattice, const std::string& table,
     const std::string& column, const std::vector<uint8_t>& val) {
-    if (lattice && !val.empty()) {
-        int dimensions = static_cast<int>(val.size() / sizeof(float));
-        if (dimensions > 0) {
+    if (lattice) {
+        const int dimensions = static_cast<int>(val.size() / sizeof(float));
+        if (val.empty() || dimensions > 0)
             lattice->ensure_vec0_table(table, column, dimensions);
-        }
     }
+}
+
+// The optional wrapper has already admitted/pinned its route. Do not look up a
+// replacement writer or take another route admission while executing this body.
+inline void managed<std::vector<uint8_t>>::set_optional_value_on(
+    database& writer, lattice_db* lattice, const std::string& table,
+    const std::string& column, int64_t row,
+    const std::optional<std::vector<uint8_t>>& val, bool is_vector_column) {
+    if (is_vector_column && lattice) {
+        const int dimensions = val ? static_cast<int>(val->size() / sizeof(float)) : 0;
+        if (!val || val->empty() || dimensions > 0)
+            lattice->ensure_vec0_table_on(writer, table, column, dimensions);
+    }
+    column_value_t value = nullptr;
+    if (val) value = *val;
+    writer.update(managed_table_sql(table), row, {{column, std::move(value)}});
 }
 
 inline void managed<std::vector<uint8_t>>::set_value(const std::vector<uint8_t>& val) {
@@ -9172,7 +9230,7 @@ inline void managed<std::vector<uint8_t>>::set_value(const std::vector<uint8_t>&
     if (is_vector_column) {
         if (attachment_token > 0 && lattice) {
             const int dimensions = static_cast<int>(val.size() / sizeof(float));
-            if (dimensions > 0)
+            if (val.empty() || dimensions > 0)
                 lattice->ensure_vec0_table_on(*db, table_name, column_name, dimensions);
         } else {
             ensure_vec0_for_blob(lattice, table_name, column_name, val);

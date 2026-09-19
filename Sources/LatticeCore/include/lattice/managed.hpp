@@ -1374,8 +1374,15 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
     }
     managed& operator=(std::optional<T> v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
-            if (v) {
+            constexpr bool is_blob = std::is_same_v<T, std::vector<uint8_t>>;
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token,
+                                                    attachment_writer, is_blob && is_vector_column);
+            if constexpr (is_blob) {
+                // Blob optionals are scalar bytes, not a generic vector/list.
+                // Keep sidecar admission and SQL on this captured route writer.
+                managed<T>::set_optional_value_on(*db, lattice, table_name, column_name,
+                                                  row_id, v, is_vector_column);
+            } else if (v) {
                 if constexpr (is_vector<T>::value) {
                     
                 } else {
@@ -1392,22 +1399,11 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
     }
 
     managed& operator=(std::nullopt_t) {
-        if (is_bound()) {
-            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
-            db->update(managed_table_sql(table_name), row_id, {{column_name, nullptr}});
-        } else {
-            unmanaged_value = std::nullopt;
-        }
-        return *this;
+        return operator=(std::optional<T>{});
     }
 
     void set_nil() {
-        if (is_bound()) {
-            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
-            db->update(managed_table_sql(table_name), row_id, {{column_name, nullptr}});
-        } else {
-            unmanaged_value = std::nullopt;
-        }
+        operator=(std::optional<T>{});
     }
     
     [[nodiscard]] std::optional<T> detach() const {
@@ -1608,6 +1604,13 @@ struct CONFORMS_TO_MANAGED managed<std::vector<uint8_t>> : managed_base {
     // Implementation helper - defined in lattice.hpp
     static void ensure_vec0_for_blob(lattice_db* lattice, const std::string& table,
                                      const std::string& column, const std::vector<uint8_t>& val);
+
+    // Implementation helper: caller already retains this exact managed route.
+    // A NULL/empty vector uses existing-sidecar-only admission, never inference.
+    static void set_optional_value_on(database& writer, lattice_db* lattice,
+                                      const std::string& table, const std::string& column,
+                                      int64_t row, const std::optional<std::vector<uint8_t>>& val,
+                                      bool is_vector_column);
 
     // Assignment operator
     managed& operator=(const std::vector<uint8_t>& val) SWIFT_NAME(set(_:)) {

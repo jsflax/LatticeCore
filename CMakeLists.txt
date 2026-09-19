@@ -67,6 +67,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/receive_ledger.cpp
     Sources/LatticeCore/src/sync_recovery_protocol.cpp
+    Sources/LatticeCore/src/sync_recovery_values.cpp
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
@@ -200,6 +201,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncUnitTests.cpp
     Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp
     Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
     Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
     Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp

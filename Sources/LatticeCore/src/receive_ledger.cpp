@@ -1,5 +1,5 @@
 #include "receive_ledger.hpp"
-#include <lattice/lattice.hpp>
+#include "recovery_writer_access.hpp"
 #include <exception>
 #include <limits>
 #include <map>
@@ -81,13 +81,10 @@ receive_ledger::receive_ledger(lattice_db& owner, receive_ledger_limits limits)
     for (auto n : values) if (n < 0) fail(code::invalid_argument, "receive ledger limits must be nonnegative");
 }
 database& receive_ledger::connection() const {
-    if (owner_.is_closed() || !owner_.owns_write_transaction())
-        fail(code::transaction_required, "receive ledger requires this thread's owned active write transaction");
-    auto& db = owner_.db();
-    if (db.is_closed() || sqlite3_get_autocommit(db.handle()) != 0 ||
-        sqlite3_txn_state(db.handle(), "main") != SQLITE_TXN_WRITE)
-        fail(code::transaction_required, "receive ledger requires an active main write transaction");
-    return db;
+    auto* writer = recovery_writer_access::active_writer(owner_);
+    if (!writer)
+        fail(code::transaction_required, "receive ledger requires this thread's owned active main write transaction");
+    return *writer;
 }
 int64_t receive_ledger::check_schema() const {
     auto& db = connection();

@@ -47,6 +47,7 @@ template<typename T> class results;
 class lattice_db;
 class synchronizer_base;
 class synchronizer;
+namespace detail { struct recovery_writer_access; }
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -5956,6 +5957,7 @@ protected:
     // Topology changes publish under attach_mutex_; invalidation is allocation
     // free and precedes the first DETACH side effect, including failed DETACH.
     friend class detail::managed_route_scope;
+    friend struct detail::recovery_writer_access;
     friend struct managed_attachment_test_access;
     struct managed_attachment_binding {
         std::string alias, filename;

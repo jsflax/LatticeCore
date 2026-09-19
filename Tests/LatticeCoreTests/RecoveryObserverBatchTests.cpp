@@ -364,3 +364,54 @@ TEST(RecoveryObserverBatch, GeoQuartetAlsoRefreshesItsLogicalPropertyName) {
         owner->remove_object_observer("TestPlace", id, object);
     }
 }
+
+TEST(RecoveryObserverBatch, GeographicCursorSettlementCannotPublishBeforeOuterCommit) {
+    TempDB file{"recovery_geo_outer_commit"};
+    for (const auto& path : {std::string(":memory:"), file.str()}) {
+        auto owner = observer_store(path);
+        auto held = owner->add(TestPlace{"place", lattice::geo_bounds::point(0, 0)});
+        const auto id = physical_id(owner->db(), "TestPlace", held.global_id());
+        const auto before_model = owner->db().query("SELECT * FROM TestPlace");
+        const auto before_index = owner->db().query("SELECT * FROM _TestPlace_location_rtree");
+        const auto before_audits = owner->db().query("SELECT * FROM AuditLog ORDER BY id");
+        int calls = 0, commits = 0;
+        const auto observer = owner->add_object_observer("TestPlace", id, [&](const auto&) { ++calls; });
+        auto* handle = owner->db().handle();
+        ASSERT_EQ(sqlite3_set_authorizer(handle,
+            [](void* raw, int action, const char* first, const char*, const char*, const char*) noexcept {
+                if (action == SQLITE_TRANSACTION && first && std::strcmp(first, "COMMIT") == 0) {
+                    ++*static_cast<int*>(raw);
+                    return SQLITE_DENY;
+                }
+                return SQLITE_OK;
+            }, &commits), SQLITE_OK);
+        const auto change = [&](auto& writer) {
+            writer.execute("UPDATE _SyncControl SET disabled=1 WHERE id=1");
+            writer.execute("UPDATE TestPlace SET location_minLat=-1,location_maxLat=2,"
+                           "location_minLon=-3,location_maxLon=4 WHERE id=?", {id});
+            writer.execute("UPDATE _SyncControl SET disabled=0 WHERE id=1");
+            EXPECT_EQ(calls, 0);
+        };
+        const auto refused = access::install(owner, change);
+        ASSERT_EQ(sqlite3_set_authorizer(handle, nullptr, nullptr), SQLITE_OK);
+        EXPECT_EQ(commits, 1); // The original geographic refusal never got this far.
+        EXPECT_EQ(refused.state, state::rolled_back);
+        EXPECT_NE(refused.primary_error, nullptr);
+        EXPECT_EQ(refused.cleanup_error, nullptr);
+        EXPECT_EQ(refused.postcommit_error, nullptr);
+        EXPECT_EQ(calls, 0);
+        EXPECT_EQ(owner->db().query("SELECT * FROM TestPlace"), before_model);
+        EXPECT_EQ(owner->db().query("SELECT * FROM _TestPlace_location_rtree"), before_index);
+        EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"), before_audits);
+        EXPECT_DOUBLE_EQ(held.location.detach().min_lat, 0.0);
+        const auto accepted = access::install(owner, change);
+        EXPECT_EQ(accepted.state, state::committed);
+        EXPECT_EQ(accepted.primary_error, nullptr);
+        EXPECT_EQ(accepted.postcommit_error, nullptr);
+        EXPECT_EQ(calls, 1);
+        EXPECT_DOUBLE_EQ(held.location.detach().min_lat, -1.0);
+        EXPECT_NE(owner->db().query("SELECT * FROM _TestPlace_location_rtree"), before_index);
+        EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"), before_audits);
+        owner->remove_object_observer("TestPlace", id, observer);
+    }
+}

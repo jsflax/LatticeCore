@@ -113,6 +113,13 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                 body(*writer);
                 if (settlement.state != phase::active || sqlite3_get_autocommit(writer->internal_handle()) != 0)
                     throw db_error("recovery install body settled its owned transaction");
+                // R-tree holds an internal blob cursor until xSavepoint/xSync.
+                // Let SQLite ask each virtual table to settle its own resources
+                // before checking for escaped caller statements. Do not reset
+                // arbitrary statements, exempt SQL-less blobs, or commit early.
+                // This nested savepoint cannot commit the owned outer BEGIN.
+                writer->execute("SAVEPOINT _lattice_recovery_body_settled");
+                writer->execute("RELEASE _lattice_recovery_body_settled");
                 for (auto* stmt = sqlite3_next_stmt(writer->internal_handle(), nullptr); stmt;
                      stmt = sqlite3_next_stmt(writer->internal_handle(), stmt)) {
                     if (sqlite3_stmt_busy(stmt)) throw db_error("recovery install body left an active statement");

@@ -141,6 +141,112 @@ TEST(RecoveryInstallTransaction, BodyFailureRollsBackFileWithoutPhantomDelivery)
     rollback_case(file.str());
 }
 
+namespace {
+void escaped_statement_case(const std::string& sql) {
+    TempDB file{"recovery_escaped_statement"};
+    for (const auto& path : {std::string(":memory:"), file.str()}) {
+        auto owner = store(path);
+        observed observer(owner);
+        auto* handle = owner->db().handle();
+        sqlite3_stmt* escaped = nullptr;
+        const auto result = access::install(owner, [&](auto& writer) {
+            insert(writer, "before-escaped-statement");
+            ASSERT_EQ(sqlite3_prepare_v2(handle, sql.c_str(), -1, &escaped, nullptr), SQLITE_OK);
+            ASSERT_EQ(sqlite3_step(escaped), SQLITE_ROW);
+            ASSERT_TRUE(sqlite3_stmt_busy(escaped));
+        });
+        // The installer must refuse instead of consuming/resetting the caller's
+        // statement to manufacture an idle connection. Cleanup belongs here.
+        EXPECT_EQ(result.state, state::rolled_back);
+        EXPECT_NE(result.primary_error, nullptr);
+        EXPECT_EQ(result.cleanup_error, nullptr);
+        EXPECT_EQ(result.postcommit_error, nullptr);
+        EXPECT_TRUE(observer.batches.empty());
+        sqlite3_finalize(escaped);
+        EXPECT_EQ(count(owner->db(), "before-escaped-statement"), 0);
+        EXPECT_EQ(count(owner->db(), "escaped-write"), 0);
+        EXPECT_EQ(access::install(owner, [](auto& writer) { insert(writer, "valid-retry"); }).state,
+                  state::committed);
+        ASSERT_EQ(observer.batches.size(), 1u);
+        EXPECT_EQ(observer.batches[0], (std::vector<std::string>{"valid-retry"}));
+    }
+}
+}
+
+TEST(RecoveryInstallTransaction, EscapedReadStatementStillRefusesWithoutPhantomDelivery) {
+    escaped_statement_case("SELECT id FROM TestPerson ORDER BY id");
+}
+
+TEST(RecoveryInstallTransaction, EscapedReturningWriteStillRefusesWithoutPhantomDelivery) {
+    escaped_statement_case("INSERT INTO TestPerson(globalId,name,age) "
+                           "VALUES('escaped-write','escaped-write',3) RETURNING id");
+}
+
+TEST(RecoveryInstallTransaction, CallerBlobIsNotExemptedAsAnInternalCursor) {
+    TempDB file{"recovery_escaped_blob"};
+    for (const auto& path : {std::string(":memory:"), file.str()}) {
+        auto owner = store(path);
+        owner->db().execute("CREATE TABLE _CallerBlob(id INTEGER PRIMARY KEY,data BLOB)");
+        owner->db().execute("INSERT INTO _CallerBlob VALUES(1,zeroblob(8))");
+        observed observer(owner);
+        auto* handle = owner->db().handle();
+        sqlite3_blob* escaped = nullptr;
+        const auto result = access::install(owner, [&](auto& writer) {
+            insert(writer, "before-escaped-blob");
+            ASSERT_EQ(sqlite3_blob_open(handle, "main", "_CallerBlob", "data", 1, 0, &escaped), SQLITE_OK);
+        });
+        EXPECT_EQ(result.state, state::rolled_back);
+        EXPECT_NE(result.primary_error, nullptr);
+        EXPECT_EQ(result.cleanup_error, nullptr);
+        EXPECT_EQ(result.postcommit_error, nullptr);
+        EXPECT_TRUE(observer.batches.empty());
+        sqlite3_blob_close(escaped);
+        EXPECT_EQ(count(owner->db(), "before-escaped-blob"), 0);
+        EXPECT_EQ(access::install(owner, [](auto& writer) { insert(writer, "valid-retry"); }).state,
+                  state::committed);
+        ASSERT_EQ(observer.batches.size(), 1u);
+        EXPECT_EQ(observer.batches[0], (std::vector<std::string>{"valid-retry"}));
+    }
+}
+
+TEST(RecoveryInstallTransaction, VirtualTableSettlementBoundaryFailureRollsBackWholeInstall) {
+    for (const auto* denied : {"BEGIN", "RELEASE"}) {
+        TempDB file{"recovery_settlement_denied"};
+        for (const auto& path : {std::string(":memory:"), file.str()}) {
+            auto owner = store(path);
+            observed observer(owner);
+            auto* handle = owner->db().handle();
+            struct fault_state { const char* denied; bool armed = false; int hits = 0; } fault{denied};
+            ASSERT_EQ(sqlite3_set_authorizer(handle,
+                [](void* raw, int action, const char* first, const char*, const char*, const char*) noexcept {
+                    auto& fault = *static_cast<fault_state*>(raw);
+                    if (fault.armed && action == SQLITE_SAVEPOINT && first &&
+                        std::strcmp(first, fault.denied) == 0) {
+                        ++fault.hits;
+                        return SQLITE_DENY;
+                    }
+                    return SQLITE_OK;
+                }, &fault), SQLITE_OK);
+            const auto result = access::install(owner, [&](auto& writer) {
+                insert(writer, "before-settlement-refusal");
+                fault.armed = true;
+            });
+            ASSERT_EQ(sqlite3_set_authorizer(handle, nullptr, nullptr), SQLITE_OK);
+            EXPECT_EQ(fault.hits, 1);
+            EXPECT_EQ(result.state, state::rolled_back);
+            EXPECT_NE(result.primary_error, nullptr);
+            EXPECT_EQ(result.cleanup_error, nullptr);
+            EXPECT_EQ(result.postcommit_error, nullptr);
+            EXPECT_EQ(count(owner->db(), "before-settlement-refusal"), 0);
+            EXPECT_TRUE(observer.batches.empty());
+            EXPECT_EQ(access::install(owner, [](auto& writer) { insert(writer, "valid-retry"); }).state,
+                      state::committed);
+            ASSERT_EQ(observer.batches.size(), 1u);
+            EXPECT_EQ(observer.batches[0], (std::vector<std::string>{"valid-retry"}));
+        }
+    }
+}
+
 TEST(RecoveryInstallTransaction, ObserverThrowPreservesDurableCommitOnBothStorageKinds) {
     TempDB file{"recovery_observer_error"};
     for (const auto& path : {std::string(":memory:"), file.str()}) {

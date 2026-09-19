@@ -1,4 +1,5 @@
 #include "sync_immediate_scheduler.hpp"
+#include "canonical_writer_adapter.hpp"
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
 #include <nlohmann/json.hpp>
@@ -3454,10 +3455,17 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
     const std::vector<audit_log_entry>& entries,
     const std::optional<std::string>& receiving_sync_id)
 {
+    return apply_remote_changes_impl_(entries, receiving_sync_id, nullptr);
+}
+std::vector<std::string> lattice_db::apply_remote_changes_impl_(
+    const std::vector<audit_log_entry>& entries,
+    const std::optional<std::string>& receiving_sync_id,
+    detail::canonical_upstream_delivery* upstream)
+{
     auto& db = *this;
     std::vector<std::string> applied_ids;
     if (entries.empty()) return applied_ids;
-    if (db_->canonical_trigger_only_)
+    if (!upstream && db_->canonical_trigger_only_)
         throw db_error("canonical trigger-only scope refuses unadapted upstream apply");
 
     // Set only after owned admission. Restore even when preparation fails.
@@ -3473,6 +3481,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
     } applying_flag{applying_remote_changes_, std::nullopt};
     const size_t chunk_size = 50;
     bool cursor_column_ok = false;
+    bool legacy_receipts_available = !upstream;
     std::optional<std::string> cursor_candidate;
     bool cursor_halted = false;
 
@@ -3495,7 +3504,14 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
         // Pin the wrapper, retaining the existing parent-outlives-operation
         // contract. Owned admission rejects a transaction started elsewhere;
         // cleanup never guesses ownership from a later autocommit value.
-        auto writer = db_;
+        auto writer = upstream ? upstream->writer() : db_;
+        const auto execute = [&](const std::string& sql, const std::vector<column_value_t>& params = {}) {
+            if (upstream) upstream->execute(sql, params);
+            else writer->execute(sql, params);
+        };
+        const auto query = [&](const std::string& sql, const std::vector<column_value_t>& params = {}) {
+            return upstream ? upstream->query(sql, params) : writer->query(sql, params);
+        };
         bool cleanup_failed = false;
         bool committed_callback_failed = false;
         try {
@@ -3520,6 +3536,16 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                 writer->lattice_update_hook_context_->owner != this ||
                 writer->lattice_update_hook_context_->connection != writer->internal_handle())
                 throw db_error("sync apply requires its installed writer hook context");
+            if (upstream) {
+                std::lock_guard<std::mutex> publication(connection_ownership_mutex_);
+                const auto& context = *writer->lattice_update_hook_context_;
+                if (closed_.load() || connection_revision_ != upstream->revision() || db_ != writer ||
+                    context.sync_chunk || context.entry_cursor_active || context.recovery_delivery_deferred)
+                    throw db_error("canonical upstream physical admission invalidated");
+                upstream->validate_chunk(*this, *writer);
+                // Exact retained writer admission linearizes here. This does
+                // not grant fresh work after close or retarget to a successor.
+            }
             // At most one name per kind per entry. Allocate the journal's
             // slots before BEGIN; copy each name before that entry's effects.
             // No work proportional to all registered tables on each chunk.
@@ -3538,16 +3564,18 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
 
                 // Preparation participates in this known-owned transaction.
                 // No persistent flag read or receipt DDL precedes admission.
-                const auto flags = writer->query("SELECT disabled FROM _SyncControl WHERE id = 1");
+                const auto flags = query("SELECT disabled FROM _SyncControl WHERE id = 1");
                 if (flags.size() != 1 || !std::holds_alternative<int64_t>(flags[0].at("disabled")))
                     throw db_error("sync apply requires one integer sync control flag");
                 const int64_t prev_disabled = std::get<int64_t>(flags[0].at("disabled"));
                 if (chunk_start == 0) {
-                    writer->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
-                                    "globalId TEXT PRIMARY KEY)");
+                    if (!upstream)
+                        execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
+                                "globalId TEXT PRIMARY KEY)");
+                    else legacy_receipts_available = !query("SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='_lattice_applied_receipts'").empty();
                     cursor_column_ok = false;
                     if (receiving_sync_id) {
-                        for (const auto& row : writer->query("PRAGMA table_info(_lattice_replication_slots)")) {
+                        for (const auto& row : query("PRAGMA table_info(_lattice_replication_slots)")) {
                             const auto it = row.find("name");
                             if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
                                 std::get<std::string>(it->second) == "last_received_event_id")
@@ -3555,7 +3583,10 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         }
                     }
                 }
-                writer->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+                execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+                if (upstream && (writer->changes() != 1 ||
+                    query("SELECT disabled FROM _SyncControl WHERE id=1").at(0).at("disabled") != column_value_t(int64_t{1})))
+                    throw db_error("canonical upstream audit suppression was refused");
 
                 for (size_t i = chunk_start; i < chunk_end; ++i) {
                     const auto& entry = entries[i];
@@ -3566,7 +3597,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                     const size_t applied_before_entry = applied_ids.size();
                     const bool had_unknown_link = link_tables_unknown_target_.count(entry.table_name) != 0;
                     const bool had_virtual_link = virtual_link_tables_.count(entry.table_name) != 0;
-                    if (!entry.table_name.empty() && entry.table_name[0] == '_') {
+                    if (!upstream && !entry.table_name.empty() && entry.table_name[0] == '_') {
                         if (!had_unknown_link) new_unknown_links.push_back(entry.table_name);
                         if (!had_virtual_link) new_virtual_links.push_back(entry.table_name);
                     }
@@ -3576,7 +3607,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         buffered_before_entry = change_buffer_.size();
                     }
                     const bool dirty_before_entry = writer->txn_dirty_.load(std::memory_order_relaxed);
-                    writer->execute("SAVEPOINT lattice_sync_entry");
+                    execute("SAVEPOINT lattice_sync_entry");
                     hook.entry_cursor_active = true;
                     hook.entry_cursor_present = false;
                     std::exception_ptr entry_error;
@@ -3584,17 +3615,29 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         // A lambda keeps all successful early exits on the same
                         // RELEASE path (dedup, schema skew, no-op receipt).
                         [&] {
+                            std::optional<detail::canonical_upstream_delivery::entry_scope> canonical_entry;
+                            if (upstream) {
+                                canonical_entry.emplace(*upstream, entry);
+                                if (canonical_entry->duplicate()) {
+                                    applied_ids.push_back(entry.global_id);
+                                    return; // First retained result wins before payload semantics.
+                                }
+                                canonical_entry->validate_payload();
+                            }
+                            const auto accept = [&](detail::canonical_receipt_outcome outcome) {
+                                if (canonical_entry) canonical_entry->accept(outcome);
+                                applied_ids.push_back(entry.global_id);
+                            };
                             // Re-check inside transaction (entry may have been inserted
                             // concurrently). A hit in EITHER AuditLog or the receipts
                             // table means already-applied: ack and move on.
-                            auto existing = writer->query(
-                                "SELECT 1 FROM AuditLog WHERE globalId = ?1 "
-                                "UNION ALL "
-                                "SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?1 "
-                                "LIMIT 1",
-                                {entry.global_id}
-                            );
+                            const auto legacy_query = legacy_receipts_available
+                                ? "SELECT 1 FROM AuditLog WHERE globalId = ?1 UNION ALL "
+                                  "SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?1 LIMIT 1"
+                                : "SELECT 1 FROM AuditLog WHERE globalId = ?1 LIMIT 1";
+                            auto existing = query(legacy_query, {entry.global_id});
                             if (!existing.empty()) {
+                                if (upstream) throw db_error("canonical upstream duplicate lacks canonical acceptance evidence");
                                 applied_ids.push_back(entry.global_id);
                                 return;
                             }
@@ -3604,7 +3647,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                             // per-TABLE facts; running them per ENTRY cost ~3,000
                             // statements per 1000-entry frame, including two
                             // sqlite_master scans and a PRAGMA table_info each).
-                            if (!entry.table_name.empty() && entry.table_name[0] == '_') {
+                            if (!upstream && !entry.table_name.empty() && entry.table_name[0] == '_') {
                                 bool is_virtual = std::find(entry.changed_fields_names.begin(),
                                                             entry.changed_fields_names.end(),
                                                             "rhs_type") != entry.changed_fields_names.end();
@@ -3620,7 +3663,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                             // Ensure vec0 tables exist for vector columns BEFORE the INSERT,
                             // so triggers can populate the shadow tables — once per
                             // (table, prop) per delivery.
-                            if (!entry.table_name.empty() && entry.table_name[0] != '_') {
+                            if (!upstream && !entry.table_name.empty() && entry.table_name[0] != '_') {
                                 auto* model_schema = schema_registry::instance().get_schema(entry.table_name);
                                 if (model_schema) {
                                     for (const auto& prop : model_schema->properties) {
@@ -3661,7 +3704,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                             auto schema_it = schema_cache.find(entry.table_name);
                             if (schema_it == schema_cache.end()) {
                                 schema_it = schema_cache.emplace(
-                                    entry.table_name, db.get_table_schema(entry.table_name)).first;
+                                    entry.table_name, upstream ? upstream->schema(entry.table_name) : db.get_table_schema(entry.table_name)).first;
                             }
                             const auto& schema = schema_it->second;
                             bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
@@ -3723,7 +3766,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                             // and the failed entry would be re-sent forever (the same
                             // wedge the skew filter above closes). Drop the column and
                             // apply the rest; the value follows in a later entry.
-                            if (is_model_table &&
+                            if (!upstream && is_model_table &&
                                 (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
                                 std::vector<std::string> drop;
                                 for (const auto& col : no_history_columns(db.db(), entry.table_name)) {
@@ -3760,7 +3803,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
 
                             bool row_existed = false;
                             if (is_model_table && !entry.global_row_id.empty()) {
-                                auto pre_rows = writer->query(
+                                auto pre_rows = query(
                                     "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
                                     {entry.global_row_id}
                                 );
@@ -3783,14 +3826,19 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                             // an unconditional upsert would revert newer edits and
                             // resurrect tombstones. Bookkeeping + ack still run.
                             bool sql_executed = false;
+                            int64_t model_effects = 0;
                             if (entry.synthesized && row_existed) {
                                 LOG_DEBUG("apply_remote",
                                           "synthesized INSERT for existing row %s.%s — insert-if-absent skip",
                                           entry.table_name.c_str(), entry.global_row_id.c_str());
                             } else if (!sql.empty()) {
-                                writer->execute(sql, params);
+                                execute(sql, params);
+                                model_effects = writer->changes();
                                 sql_executed = true;
                             }
+                            if (upstream && entry.operation == "INSERT" &&
+                                query("SELECT 1 FROM " + entry.table_name + " WHERE globalId=?", {entry.global_row_id}).empty())
+                                throw db_error("canonical upstream required INSERT left no target row");
 
                             // NO-OP SUPPRESSION (per-sync/client mode only). With the
                             // value-guarded instructions, changes()==0 on an EXISTING
@@ -3812,16 +3860,16 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                             // the entry is still ACKED (the sender must retire it).
                             if (receiving_sync_id && is_model_table && row_existed &&
                                 sql_executed && writer->changes() == 0) {
-                                writer->execute(
+                                if (!upstream) execute(
                                     "INSERT OR IGNORE INTO _lattice_applied_receipts (globalId) VALUES (?)",
                                     {entry.global_id});
-                                applied_ids.push_back(entry.global_id);
+                                accept(detail::canonical_receipt_outcome::no_op);
                                 return;
                             }
 
                             // For genuine INSERTs (row didn't exist), get the new local rowId
                             if (is_model_table && !row_existed && entry.operation != "DELETE" && !entry.global_row_id.empty()) {
-                                auto post_rows = writer->query(
+                                auto post_rows = query(
                                     "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
                                     {entry.global_row_id}
                                 );
@@ -3854,7 +3902,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                                     changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized, synthesized)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                             )";
-                            writer->execute(insert_sql, {
+                            execute(insert_sql, {
                                 entry.global_id,
                                 entry.table_name,
                                 local_operation,
@@ -3866,25 +3914,35 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                                 static_cast<int64_t>(is_synchronized),
                                 static_cast<int64_t>(entry.synthesized ? 1 : 0)
                             });
+                            if (upstream && writer->changes() != 1)
+                                throw db_error("canonical upstream required audit insert was ignored");
 
                             // Per-sync mode: mark this entry as synced for the receiving sync_id (loop prevention).
                             if (receiving_sync_id) {
-                                auto audit_rows = writer->query(
+                                auto audit_rows = query(
                                     "SELECT id FROM AuditLog WHERE globalId = ?", {entry.global_id});
+                                if (upstream && (audit_rows.size() != 1 || !audit_rows[0].count("id") ||
+                                    !std::holds_alternative<int64_t>(audit_rows[0].at("id"))))
+                                    throw db_error("canonical upstream required audit identity is missing");
                                 if (!audit_rows.empty()) {
                                     auto id_it = audit_rows[0].find("id");
                                     if (id_it != audit_rows[0].end() && std::holds_alternative<int64_t>(id_it->second)) {
                                         int64_t audit_id = std::get<int64_t>(id_it->second);
-                                        writer->execute(R"(
+                                        execute(R"(
                                             INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized)
                                             VALUES (?, ?, 1)
                                             ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1
                                         )", {audit_id, *receiving_sync_id});
+                                        if (upstream && (writer->changes() != 1 ||
+                                            query("SELECT is_synchronized FROM _lattice_sync_state WHERE audit_entry_id=? AND sync_id=?",
+                                                {audit_id, *receiving_sync_id}).at(0).at("is_synchronized") != column_value_t(int64_t{1})))
+                                            throw db_error("canonical upstream receiving obligation write was ignored");
                                     }
                                 }
                             }
 
-                            applied_ids.push_back(entry.global_id);
+                            accept(model_effects > 0 ? detail::canonical_receipt_outcome::applied
+                                                     : detail::canonical_receipt_outcome::no_op);
                         }();
                     } catch (...) {
                         entry_error = std::current_exception();
@@ -3892,7 +3950,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                     if (!entry_error) {
                         // RELEASE failure is a chunk failure. Do not pretend the
                         // entry can be isolated when its SQL boundary is unknown.
-                        writer->execute("RELEASE lattice_sync_entry");
+                        execute("RELEASE lattice_sync_entry");
                         hook.entry_cursor_active = false;
                         const bool publish = hook.entry_cursor_present;
                         const int64_t last_id = hook.entry_cursor_last;
@@ -3913,8 +3971,8 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         std::rethrow_exception(entry_error);
                     // Either cleanup statement failing escapes to owned chunk
                     // rollback; neither error is swallowed as an entry failure.
-                    writer->execute("ROLLBACK TO lattice_sync_entry");
-                    writer->execute("RELEASE lattice_sync_entry");
+                    execute("ROLLBACK TO lattice_sync_entry");
+                    execute("RELEASE lattice_sync_entry");
                     {
                         std::lock_guard<std::mutex> lock(change_buffer_mutex_);
                         if (change_buffer_.size() < buffered_before_entry)
@@ -3958,7 +4016,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         cursor_candidate = entries[k].global_id;
                     }
                     if (cursor_candidate) {
-                        writer->execute(R"(
+                        execute(R"(
                             UPDATE _lattice_replication_slots
                             SET last_received_event_id = ?, last_active_at = datetime('now')
                             WHERE sync_id = ?
@@ -3967,7 +4025,10 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                 }
 
                 // Re-enable sync triggers (restore the pre-existing flag value)
-                writer->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+                execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+                if (upstream && (writer->changes() != 1 ||
+                    query("SELECT disabled FROM _SyncControl WHERE id=1").at(0).at("disabled") != column_value_t(prev_disabled)))
+                    throw db_error("canonical upstream audit flag restoration was refused");
 
                 writer->commit();
                 // Memory/DELETE-journal builds settle here; file WAL consumes

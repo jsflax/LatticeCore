@@ -6,6 +6,8 @@
 #include <map>
 #include <set>
 #include <utility>
+#include <cmath>
+#include <limits>
 
 namespace lattice::detail {
 namespace {
@@ -62,10 +64,12 @@ std::string normalized(std::string s) {
     if(s.starts_with(prefix))s.replace(0,prefix.size(),"CREATE TRIGGER ");
     return s;
 }
-std::string demand(const std::string& condition) {
+std::string demand(const std::string& condition, const std::string& entry_guard={}) {
+    if(!entry_guard.empty())return " SELECT lattice_canonical_require_v1(("+condition+") AND "+entry_guard+");";
     return " SELECT CASE WHEN ("+condition+") THEN 1 ELSE RAISE(ABORT,'canonical marker admission refused') END;";
 }
-std::string guard(const canonical_writer_profile& p) {
+std::string guard(const canonical_writer_profile& p, const std::string& entry_guard={}) {
+    const auto check=[&](const std::string& condition){return demand(condition,entry_guard);};
     const auto limits=" AND typeof(max_markers)='integer' AND typeof(max_marker_bytes)='integer'"
         " AND typeof(max_receipts)='integer' AND typeof(max_receipt_bytes)='integer'"
         " AND typeof(max_batch)='integer' AND typeof(max_identity)='integer' AND typeof(max_operation)='integer'"
@@ -73,9 +77,9 @@ std::string guard(const canonical_writer_profile& p) {
         " AND max_marker_bytes="+std::to_string(p.limits.marker_bytes)+" AND max_receipts="+std::to_string(p.limits.receipts)+
         " AND max_receipt_bytes="+std::to_string(p.limits.receipt_bytes)+" AND max_batch="+std::to_string(p.limits.batch_identities)+
         " AND max_identity="+std::to_string(p.limits.identity_bytes)+" AND max_operation="+std::to_string(p.limits.operation_bytes);
-    return demand("lattice_canonical_guard_v1("+literal(p.binding.source)+","+literal(p.binding.epoch)+","+
+    return check("lattice_canonical_guard_v1("+literal(p.binding.source)+","+literal(p.binding.epoch)+","+
         literal(p.binding.scope)+","+literal(p.binding.schema)+")=1")+
-        demand("(SELECT COUNT(*) FROM _lattice_canonical_store WHERE id=1 AND version=1 AND source="+
+        check("(SELECT COUNT(*) FROM _lattice_canonical_store WHERE id=1 AND version=1 AND source="+
         literal(p.binding.source)+" AND epoch="+literal(p.binding.epoch)+" AND scope="+literal(p.binding.scope)+
         " AND schema_id="+literal(p.binding.schema)+" AND typeof(head)='integer' AND typeof(floor)='integer' AND floor>=0 AND head>=floor"
         " AND typeof(markers)='integer' AND markers BETWEEN 0 AND max_markers"
@@ -88,35 +92,38 @@ std::string guard(const canonical_writer_profile& p) {
 // from a callback. Metadata is WITHOUT ROWID: last_insert_rowid remains the
 // generated AuditLog identity until its receipt tail finishes.
 std::string mutation(const canonical_writer_profile& p,const std::string& table,
-                     const std::string& identity,const std::string& original={}) {
+                     const std::string& identity,const std::string& original={},
+                     int64_t outcome=1, const std::string& entry_guard={}) {
+    const auto check=[&](const std::string& condition){return demand(condition,entry_guard);};
+    const auto runtime=entry_guard.empty()?std::string{}:" AND "+entry_guard;
     const auto relation=literal(table), key="lattice_canonical_uuid_v1("+identity+")";
     const auto where="relation="+relation+" AND identity="+key;
     const auto charge=std::to_string(24+table.size()+36);
-    auto sql=guard(p)+demand(key+" IS NOT NULL");
+    auto sql=guard(p,entry_guard)+check(key+" IS NOT NULL");
     if(original.empty()) {
         const auto fresh="(NOT EXISTS(SELECT 1 FROM _lattice_canonical_touch WHERE "+where+"))";
-        sql+=demand("NOT EXISTS(SELECT 1 FROM _lattice_canonical_touch WHERE "+where+
+        sql+=check("NOT EXISTS(SELECT 1 FROM _lattice_canonical_touch WHERE "+where+
           " AND (typeof(position)!='integer' OR position<=(SELECT floor FROM _lattice_canonical_store) OR position>(SELECT head FROM _lattice_canonical_store) OR typeof(charge)!='integer' OR charge!="+charge+"))");
         sql+=" UPDATE _lattice_canonical_store SET head=head+1,markers=markers+"+fresh+",marker_bytes=marker_bytes+"+fresh+"*"+charge+
           " WHERE id=1 AND head<9223372036854775807 AND "+fresh+"<=max_markers-markers AND "+fresh+"*"+charge+"<=max_marker_bytes-marker_bytes;";
-        sql+=demand("changes()=1");
+        sql+=check("changes()=1");
         sql+=" UPDATE _lattice_canonical_touch SET position=(SELECT head FROM _lattice_canonical_store) WHERE "+where+";";
         sql+=" INSERT INTO _lattice_canonical_touch(relation,identity,position,charge) SELECT "+relation+","+key+",head,"+charge+
           " FROM _lattice_canonical_store WHERE id=1 AND NOT EXISTS(SELECT 1 FROM _lattice_canonical_touch WHERE "+where+");";
-        sql+=demand("(SELECT COUNT(*) FROM _lattice_canonical_touch WHERE "+where+" AND position=(SELECT head FROM _lattice_canonical_store) AND charge="+charge+")=1");
+        sql+=check("(SELECT COUNT(*) FROM _lattice_canonical_touch WHERE "+where+" AND position=(SELECT head FROM _lattice_canonical_store) AND charge="+charge+")=1");
     } else {
         const auto op="lattice_canonical_uuid_v1("+original+")";
         const auto receipt_charge=std::to_string(32+36+table.size()+36);
         // Generated local UUIDs cannot dedup AFTER a second model effect. A
         // collision refuses that whole statement instead of keeping the effect.
-        sql+=demand(op+" IS NOT NULL AND NOT EXISTS(SELECT 1 FROM _lattice_canonical_receipt WHERE original_id="+op+")");
+        sql+=check(op+" IS NOT NULL AND NOT EXISTS(SELECT 1 FROM _lattice_canonical_receipt WHERE original_id="+op+")");
         sql+=" UPDATE _lattice_canonical_store SET head=head+1,receipts=receipts+1,receipt_bytes=receipt_bytes+"+receipt_charge+
-          " WHERE id=1 AND head<9223372036854775807 AND receipts<max_receipts AND "+receipt_charge+"<=max_receipt_bytes-receipt_bytes;";
-        sql+=demand("changes()=1");
-        sql+=" INSERT INTO _lattice_canonical_receipt(original_id,position,outcome,relation,identity,charge) SELECT "+op+",head,1,"+
-          relation+","+key+","+receipt_charge+" FROM _lattice_canonical_store WHERE id=1;";
-        sql+=demand("changes()=1")+demand("(SELECT COUNT(*) FROM _lattice_canonical_receipt WHERE original_id="+op+
-          " AND position=(SELECT head FROM _lattice_canonical_store) AND outcome=1 AND relation="+relation+" AND identity="+key+" AND charge="+receipt_charge+")=1");
+          " WHERE id=1 AND head<9223372036854775807 AND receipts<max_receipts AND "+receipt_charge+"<=max_receipt_bytes-receipt_bytes"+runtime+";";
+        sql+=check("changes()=1");
+        sql+=" INSERT INTO _lattice_canonical_receipt(original_id,position,outcome,relation,identity,charge) SELECT "+op+",head,"+std::to_string(outcome)+","+
+          relation+","+key+","+receipt_charge+" FROM _lattice_canonical_store WHERE id=1"+runtime+";";
+        sql+=check("changes()=1")+check("(SELECT COUNT(*) FROM _lattice_canonical_receipt WHERE original_id="+op+
+          " AND position=(SELECT head FROM _lattice_canonical_store) AND outcome="+std::to_string(outcome)+" AND relation="+relation+" AND identity="+key+" AND charge="+receipt_charge+")=1");
     }
     return sql;
 }
@@ -139,6 +146,30 @@ struct canonical_writer_adapter::context {
     canonical_store_binding binding;
     std::shared_ptr<std::atomic<bool>> active=std::make_shared<std::atomic<bool>>(false);
     std::set<std::string> programs, relations;
+    lattice_db* owner=nullptr; // identity only; upstream delivery holds the strong owner
+    canonical_writer_profile profile;
+    std::optional<canonical_upstream_limits> upstream;
+    std::map<std::string,std::unordered_map<std::string,column_type>> schemas;
+    std::map<std::string,std::set<std::string>> no_history;
+    static void require(sqlite3_context* sql,int count,sqlite3_value** values) noexcept {
+        if(count!=1 || sqlite3_value_type(values[0])!=SQLITE_INTEGER || sqlite3_value_int(values[0])!=1)
+            sqlite3_result_error(sql,"canonical upstream condition refused",-1);
+        else sqlite3_result_int(sql,1);
+    }
+    static void admit_entry(sqlite3_context* sql,int count,sqlite3_value** values) noexcept {
+        auto* d=canonical_upstream_delivery::current_;
+        bool ok=d && d->entry_ && d->context_->active->load(std::memory_order_acquire) &&
+            sqlite3_context_db_handle(sql)==d->context_->connection && count==3;
+        const std::string* fields[3]={ok?&d->original_:nullptr,ok?&d->entry_->table_name:nullptr,ok?&d->target_:nullptr};
+        for(int i=0;ok&&i<3;++i) {
+            const auto* data=sqlite3_value_blob(values[i]);
+            ok=sqlite3_value_type(values[i])==SQLITE_BLOB && data &&
+                sqlite3_value_bytes(values[i])==static_cast<int>(fields[i]->size()) &&
+                std::memcmp(data,fields[i]->data(),fields[i]->size())==0;
+        }
+        if(!ok)sqlite3_result_error(sql,"canonical upstream entry expired or mismatched",-1);
+        else sqlite3_result_int(sql,1);
+    }
     static void admit(sqlite3_context* sql,int count,sqlite3_value** values) noexcept {
         auto& self=**static_cast<std::shared_ptr<context>*>(sqlite3_user_data(sql));
         bool ok=count==4 && self.active->load(std::memory_order_acquire) && sqlite3_context_db_handle(sql)==self.connection;
@@ -153,6 +184,7 @@ struct canonical_writer_adapter::context {
     }
     static int authorize(void* opaque,int action,const char* one,const char* two,const char* schema,const char* origin) noexcept {
         auto& self=*static_cast<context*>(opaque);
+        const auto normal=[&]() noexcept -> int {
         // Context is connection-owned; no SQLite/SQL, allocations or callbacks.
         if(action==SQLITE_ATTACH || action==SQLITE_DETACH || action==SQLITE_ALTER_TABLE ||
            action==SQLITE_CREATE_TABLE || action==SQLITE_CREATE_TEMP_TABLE || action==SQLITE_CREATE_TRIGGER ||
@@ -165,10 +197,27 @@ struct canonical_writer_adapter::context {
            same_ascii(one,"writable_schema") || same_ascii(one,"schema_version")))return SQLITE_DENY;
         if((action==SQLITE_INSERT||action==SQLITE_UPDATE||action==SQLITE_DELETE) && one &&
            std::strncmp(one,"_lattice_canonical_",19)==0) {
-            if(!self.active->load(std::memory_order_acquire)||!schema||std::strcmp(schema,"main")||!origin)return SQLITE_DENY;
+            if(!self.active->load(std::memory_order_acquire)||!schema||std::strcmp(schema,"main"))return SQLITE_DENY;
+            if(!origin) {
+                auto* d=canonical_upstream_delivery::current_;
+                const bool phase=d && d->entry_ && d->finalizing_ && d->context_.get()==&self;
+                if(phase && action==SQLITE_INSERT && std::strcmp(one,"_lattice_canonical_receipt")==0)return SQLITE_OK;
+                if(phase && action==SQLITE_UPDATE && std::strcmp(one,"_lattice_canonical_store")==0 && two &&
+                    (std::strcmp(two,"head")==0 || std::strcmp(two,"receipts")==0 || std::strcmp(two,"receipt_bytes")==0))return SQLITE_OK;
+                return SQLITE_DENY;
+            }
             // Heterogeneous lookup avoids allocation from SQLite C frames.
             for(const auto& name:self.programs)if(name==origin)return SQLITE_OK;
             return SQLITE_DENY;
+        }
+        return SQLITE_OK;
+        };
+        const int admitted=normal();
+        if(admitted!=SQLITE_OK)return admitted;
+        const auto* fault=canonical_upstream_test_hooks::fault;
+        if(self.upstream && fault && fault->connection==self.connection && fault->restrict_action) {
+            const int restricted=fault->restrict_action(action,one,two,origin);
+            if(restricted==SQLITE_DENY || restricted==SQLITE_IGNORE)return restricted;
         }
         return SQLITE_OK;
     }
@@ -185,10 +234,11 @@ canonical_writer_adapter::~canonical_writer_adapter() {
         context_->active->store(false,std::memory_order_release);
     }
 }
-canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canonical_writer_profile& p) {
+canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canonical_writer_profile& p,
+    const canonical_upstream_limits* upstream) {
     // The attachment owns its setup transaction. It cannot attach during caller
     // work, on an active synchronizer, or claim adoption of another connection.
-    if(p.upstream_requested || owner.config_.is_sync_enabled() || owner.config_.is_ipc_enabled())
+    if((p.upstream_requested && !upstream) || owner.config_.is_sync_enabled() || owner.config_.is_ipc_enabled())
         refuse("canonical Slice A refuses upstream/transport activation");
     if(owner.is_closed() || owner.config_.read_only || owner.db_->is_closed() || owner.db_->is_in_transaction())
         refuse("canonical attachment requires an idle live writer");
@@ -204,6 +254,8 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     // No external callback may coexist on this private profile's writer.
     // The same attachment's revoked callback has connection-owned custody.
     context_=std::make_shared<context>();context_->connection=writer_->internal_handle();context_->binding=p.binding;
+    context_->owner=&owner;context_->profile=p;
+    if(upstream)context_->upstream=*upstream;
     const auto register_shared=[&] {
         auto* held=new std::shared_ptr<context>(context_);
         if(sqlite3_create_function_v2(context_->connection,"lattice_canonical_guard_v1",4,SQLITE_UTF8,held,
@@ -211,6 +263,11 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             refuse("canonical guard registration failed"); // SQLite owns/destructs userdata on failure.
         if(sqlite3_create_function_v2(context_->connection,"lattice_canonical_uuid_v1",1,SQLITE_UTF8|SQLITE_DETERMINISTIC,
               nullptr,uuid_sql,nullptr,nullptr,nullptr)!=SQLITE_OK)refuse("canonical UUID registration failed");
+        if(upstream && (sqlite3_create_function_v2(context_->connection,"lattice_canonical_require_v1",1,SQLITE_UTF8,
+                nullptr,context::require,nullptr,nullptr,nullptr)!=SQLITE_OK ||
+            sqlite3_create_function_v2(context_->connection,"lattice_canonical_entry_v1",3,SQLITE_UTF8,
+                nullptr,context::admit_entry,nullptr,nullptr,nullptr)!=SQLITE_OK))
+            refuse("canonical upstream guard registration failed");
     };
     bool began=false;
     try {
@@ -304,6 +361,9 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
                 }
             }
             if(got!=want)refuse("canonical durable columns differ from complete descriptor");
+            for(const auto& [column,type]:got)context_->schemas[name].emplace(column,
+                type=="INTEGER"?column_type::integer:type=="REAL"?column_type::real:type=="BLOB"?column_type::blob:column_type::text);
+            context_->no_history[name]=table.no_history;
             auto rows=writer_->query("SELECT CASE WHEN typeof(globalId)='text' AND length(CAST(globalId AS BLOB))=36 THEN globalId END AS gid FROM main."+name+" LIMIT 4097");
             if(rows.size()>max_existing_rows-existing)refuse("canonical bounded initial identity scan exceeded");
             existing+=rows.size();
@@ -400,4 +460,315 @@ void require_canonical_relation(database& db,const std::string& name) {
     if(!state->active->load(std::memory_order_acquire)||!state->relations.count(name))
         refuse("canonical relation is outside the complete admitted scope");
 }
+
+namespace {
+void bounded_add(size_t& used,size_t amount,size_t limit) {
+    if(used>limit || amount>limit-used)refuse("canonical upstream logical byte budget exceeded");
+    used+=amount;
+}
+size_t scalar_bytes(const any_property::value_type& value) {
+    return std::visit([](const auto& v)->size_t {
+        using T=std::decay_t<decltype(v)>;
+        if constexpr(std::is_same_v<T,std::string>||std::is_same_v<T,blob>)return v.size();
+        else return 8;
+    },value);
+}
+struct checked_statement {
+    sqlite3_stmt* value=nullptr;
+    ~checked_statement(){if(value)sqlite3_finalize(value);}
+    void finish() {
+        auto* statement=std::exchange(value,nullptr);
+        if(sqlite3_finalize(statement)!=SQLITE_OK)refuse("canonical upstream statement finalization failed");
+    }
+};
+void bind_checked(sqlite3_stmt* stmt,int index,const column_value_t& value) {
+    const int rc=std::visit([&](const auto& v)->int {
+        using T=std::decay_t<decltype(v)>;
+        if constexpr(std::is_same_v<T,std::nullptr_t>)return sqlite3_bind_null(stmt,index);
+        else if constexpr(std::is_same_v<T,int64_t>)return sqlite3_bind_int64(stmt,index,v);
+        else if constexpr(std::is_same_v<T,double>)return sqlite3_bind_double(stmt,index,v);
+        else if constexpr(std::is_same_v<T,std::string>)return sqlite3_bind_text64(stmt,index,v.data(),v.size(),SQLITE_TRANSIENT,SQLITE_UTF8);
+        else return v.empty()?sqlite3_bind_zeroblob(stmt,index,0):sqlite3_bind_blob64(stmt,index,v.data(),v.size(),SQLITE_TRANSIENT);
+    },value);
+    if(rc!=SQLITE_OK)refuse("canonical upstream parameter binding failed");
+}
+}
+thread_local canonical_upstream_delivery* canonical_upstream_delivery::current_=nullptr;
+thread_local const canonical_upstream_test_hooks::authorizer_fault* canonical_upstream_test_hooks::fault=nullptr;
+std::unique_ptr<canonical_writer_adapter> canonical_writer_adapter::attach_upstream_for_qualification(
+    std::shared_ptr<lattice_db> owner,const canonical_writer_profile& p,canonical_upstream_limits limits) {
+    if(!owner || !p.upstream_requested || !limits.entries || !limits.field_bytes || !limits.delivery_bytes ||
+        limits.field_bytes>limits.delivery_bytes || limits.delivery_bytes>static_cast<size_t>(std::numeric_limits<int>::max()/8))
+        refuse("canonical upstream qualification requires explicit bounded profile and retained owner");
+    return std::unique_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p,&limits));
+}
+bool canonical_writer_adapter::matches_connection(const database& writer,sqlite3* handle) noexcept {
+    return writer.internal_handle()==handle;
+}
+std::vector<std::string> canonical_writer_adapter::apply_upstream_owned(std::shared_ptr<lattice_db> owner,
+    const std::vector<audit_log_entry>& entries,const std::optional<std::string>& receiving_channel) {
+    // Copy all adapter custody before any SQL/callback. The caller may revoke
+    // and destroy this wrapper during a later observer without invalidating the
+    // delivery's context or retained actual owner.
+    auto state=context_;auto writer=writer_;
+    if(!owner || !state || !state->upstream || state->owner!=owner.get())
+        refuse("canonical upstream requires this attachment's retained actual owner");
+    uint64_t revision;
+    {
+        std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+        if(owner->closed_.load() || owner->db_!=writer || !state->active->load(std::memory_order_acquire))
+            refuse("canonical upstream attachment is retired");
+        revision=owner->connection_revision_;
+    }
+    canonical_upstream_delivery delivery(owner,std::move(writer),std::move(state),revision);
+    delivery.validate_envelope(entries,receiving_channel);
+    return owner->apply_remote_changes_impl_(entries,receiving_channel,&delivery);
+}
+canonical_upstream_delivery::canonical_upstream_delivery(std::shared_ptr<lattice_db> owner,
+    std::shared_ptr<database> writer,std::shared_ptr<canonical_writer_adapter::context> context,uint64_t revision)
+    :owner_(std::move(owner)),writer_(std::move(writer)),context_(std::move(context)),revision_(revision) {}
+void canonical_upstream_delivery::validate_chunk(lattice_db& owner,database& writer) const {
+    // Called only after the owning loop acquired its gate/SQLite maintenance
+    // locks and validated physical hook and publication revision. No raw handle
+    // from a caller can construct this capability.
+    if(&owner!=owner_.get() || &writer!=writer_.get() || !context_->upstream ||
+        !context_->active->load(std::memory_order_acquire) || writer.is_closed() ||
+        !canonical_writer_adapter::matches_connection(writer,context_->connection))
+        refuse("canonical upstream chunk capability is retired or mismatched");
+}
+void canonical_upstream_delivery::validate_envelope(const std::vector<audit_log_entry>& entries,
+    const std::optional<std::string>& channel) const {
+    const auto limits=*context_->upstream;
+    if(entries.size()>limits.entries)refuse("canonical upstream entry count budget exceeded");
+    size_t used=0;
+    if(channel) {
+        if(channel->empty() || channel->size()>64 || channel->find('\0')!=std::string::npos)
+            refuse("canonical upstream invalid bounded receiving channel");
+        bounded_add(used,channel->size(),limits.delivery_bytes);
+    }
+    for(const auto& e:entries) {
+        if(!identifier(e.table_name) || !context_->schemas.count(e.table_name) ||
+            e.operation.size()>16 || e.timestamp.size()>64 || e.global_id.size()!=36 || e.global_row_id.size()!=36 ||
+            e.changed_fields.size()>max_columns || e.changed_fields_names.size()>max_columns)
+            refuse("canonical upstream invalid bounded identity envelope");
+        (void)canonical_writer_adapter::uuid_key(e.global_id);
+        (void)canonical_writer_adapter::uuid_key(e.global_row_id);
+        for(const auto* value:{&e.table_name,&e.operation,&e.timestamp,&e.global_id,&e.global_row_id})
+            bounded_add(used,value->size(),limits.delivery_bytes);
+        for(const auto& name:e.changed_fields_names) {
+            if(name.size()>64)refuse("canonical upstream field name budget exceeded");
+            bounded_add(used,name.size(),limits.delivery_bytes);
+        }
+        for(const auto& [name,value]:e.changed_fields) {
+            if(name.size()>64)refuse("canonical upstream field name budget exceeded");
+            const auto size=scalar_bytes(value.value);
+            if(size>limits.field_bytes)refuse("canonical upstream field byte budget exceeded");
+            bounded_add(used,name.size(),limits.delivery_bytes);bounded_add(used,size,limits.delivery_bytes);
+        }
+    }
+}
+const std::unordered_map<std::string,column_type>& canonical_upstream_delivery::schema(const std::string& table) const {
+    auto it=context_->schemas.find(table);if(it==context_->schemas.end())refuse("canonical upstream unknown fixed relation");return it->second;
+}
+void canonical_upstream_delivery::execute(const std::string& sql,const std::vector<column_value_t>& params) {
+    if(sql.empty() || sql.size()>max_sql || params.size()>2*max_columns+16)
+        refuse("canonical upstream SQL/parameter budget exceeded");
+    checked_statement statement;const char* tail=nullptr;
+    database::record_statement();
+    if(sqlite3_prepare_v2(context_->connection,sql.data(),static_cast<int>(sql.size()),&statement.value,&tail)!=SQLITE_OK || !statement.value)
+        refuse("canonical upstream statement preparation failed");
+    for(const char* p=tail;p<sql.data()+sql.size();++p)if(*p!=' '&&*p!='\t'&&*p!='\r'&&*p!='\n')
+        refuse("canonical upstream executor requires one statement");
+    if(sqlite3_bind_parameter_count(statement.value)!=static_cast<int>(params.size()))
+        refuse("canonical upstream parameter count mismatch");
+    // Serialized AuditLog JSON can be six times the admitted raw scalar bytes.
+    // Check before SQLite copies it; the input envelope was checked before JSON
+    // serialization. This is a logical byte bound, not a total RSS guarantee.
+    size_t used=0;const size_t limit=context_->upstream->delivery_bytes*8;
+    for(size_t i=0;i<params.size();++i) {
+        const size_t size=std::visit([](const auto& v)->size_t {using T=std::decay_t<decltype(v)>;
+            if constexpr(std::is_same_v<T,std::string>||std::is_same_v<T,blob>)return v.size();else return 8;},params[i]);
+        bounded_add(used,size,limit);bind_checked(statement.value,static_cast<int>(i+1),params[i]);
+    }
+    if(sqlite3_step(statement.value)!=SQLITE_DONE)refuse("canonical upstream statement execution failed");
+    statement.finish();
+}
+std::vector<database::row_t> canonical_upstream_delivery::query(const std::string& sql,const std::vector<column_value_t>& params) {
+    if(sql.empty() || sql.size()>max_sql || params.size()>2*max_columns+16)
+        refuse("canonical upstream query budget exceeded");
+    checked_statement statement;const char* tail=nullptr;
+    database::record_statement();
+    if(sqlite3_prepare_v2(context_->connection,sql.data(),static_cast<int>(sql.size()),&statement.value,&tail)!=SQLITE_OK || !statement.value)
+        refuse("canonical upstream query preparation failed");
+    for(const char* p=tail;p<sql.data()+sql.size();++p)if(*p!=' '&&*p!='\t'&&*p!='\r'&&*p!='\n')
+        refuse("canonical upstream query requires one statement");
+    if(!sqlite3_stmt_readonly(statement.value) || sqlite3_bind_parameter_count(statement.value)!=static_cast<int>(params.size()))
+        refuse("canonical upstream query is not a bounded read");
+    size_t used=0;const size_t budget=context_->upstream->delivery_bytes*8;
+    for(size_t i=0;i<params.size();++i) {
+        const size_t size=std::visit([](const auto& v)->size_t {using T=std::decay_t<decltype(v)>;
+            if constexpr(std::is_same_v<T,std::string>||std::is_same_v<T,blob>)return v.size();else return 8;},params[i]);
+        bounded_add(used,size,budget);bind_checked(statement.value,static_cast<int>(i+1),params[i]);
+    }
+    const int columns=sqlite3_column_count(statement.value);
+    if(columns<1 || columns>static_cast<int>(max_columns))refuse("canonical upstream query column budget exceeded");
+    std::vector<database::row_t> rows;
+    for(;;) {
+        const int rc=sqlite3_step(statement.value);
+        if(rc==SQLITE_DONE)break;
+        if(rc!=SQLITE_ROW)refuse("canonical upstream query execution failed");
+        if(rows.size()>=64)refuse("canonical upstream query row budget exceeded");
+        database::row_t row;
+        for(int i=0;i<columns;++i) {
+            const char* label=sqlite3_column_name(statement.value,i);
+            if(!label || std::strlen(label)>64)refuse("canonical upstream query name budget exceeded");
+            bounded_add(used,std::strlen(label),budget);
+            column_value_t value=nullptr;
+            switch(sqlite3_column_type(statement.value,i)) {
+            case SQLITE_NULL:break;
+            case SQLITE_INTEGER:value=static_cast<int64_t>(sqlite3_column_int64(statement.value,i));bounded_add(used,8,budget);break;
+            case SQLITE_FLOAT:value=sqlite3_column_double(statement.value,i);bounded_add(used,8,budget);break;
+            case SQLITE_TEXT:case SQLITE_BLOB: {
+                const bool text=sqlite3_column_type(statement.value,i)==SQLITE_TEXT;
+                // SQLite metadata reports length before copying the value into
+                // C++ storage; each addressed value and the entire read are capped.
+                const int bytes=sqlite3_column_bytes(statement.value,i);
+                if(bytes<0 || static_cast<size_t>(bytes)>std::max<size_t>(128,context_->upstream->field_bytes))
+                    refuse("canonical upstream query field byte budget exceeded");
+                bounded_add(used,static_cast<size_t>(bytes),budget);
+                const void* data=text?static_cast<const void*>(sqlite3_column_text(statement.value,i)):sqlite3_column_blob(statement.value,i);
+                if(!data && (text||bytes))refuse("canonical upstream query value conversion failed");
+                if(text)value=std::string(static_cast<const char*>(data),static_cast<size_t>(bytes));
+                else if(bytes)value=blob(static_cast<const uint8_t*>(data),static_cast<const uint8_t*>(data)+bytes);
+                else value=blob{};
+                break;
+            }
+            default:refuse("canonical upstream unsupported query value");
+            }
+            if(!row.emplace(label,std::move(value)).second)refuse("canonical upstream duplicate result column");
+        }
+        rows.push_back(std::move(row));
+    }
+    statement.finish();return rows;
+}
+std::string canonical_upstream_delivery::entry_guard() const {
+    return "lattice_canonical_entry_v1("+literal(original_)+","+literal(entry_->table_name)+","+literal(target_)+")=1";
+}
+void canonical_upstream_delivery::script(const std::string& sql) {
+    if(sql.size()>max_sql)refuse("canonical upstream kernel budget exceeded");
+    const char* at=sql.data();const char* end=at+sql.size();
+    while(at<end) {
+        checked_statement statement;const char* next=nullptr;
+        database::record_statement();
+        if(sqlite3_prepare_v2(context_->connection,at,static_cast<int>(end-at),&statement.value,&next)!=SQLITE_OK || next<=at)
+            refuse("canonical upstream kernel preparation failed");
+        at=next;if(!statement.value)continue;
+        int rc;do {rc=sqlite3_step(statement.value);}while(rc==SQLITE_ROW);
+        if(rc!=SQLITE_DONE)refuse("canonical upstream kernel condition or mutation failed");
+        statement.finish();
+    }
+}
+void canonical_upstream_delivery::begin_entry(const audit_log_entry& entry) {
+    if(entry_ || current_==this || !context_->active->load(std::memory_order_acquire))
+        refuse("canonical upstream entry capability unavailable");
+    // The loop, not autocommit, establishes actual ownership. This check only
+    // detects lost transaction state after that admission.
+    if(sqlite3_get_autocommit(context_->connection)!=0 || sqlite3_txn_state(context_->connection,"main")!=SQLITE_TXN_WRITE)
+        refuse("canonical upstream owned entry transaction was lost");
+    original_=canonical_writer_adapter::uuid_key(entry.global_id);
+    target_=canonical_writer_adapter::uuid_key(entry.global_row_id);
+    entry_=&entry;previous_=current_;current_=this;
+    try {script(guard(context_->profile,entry_guard()));}
+    catch(...) {end_entry();throw;}
+}
+void canonical_upstream_delivery::end_entry() noexcept {
+    current_=previous_;previous_=nullptr;entry_=nullptr;finalizing_=false;
+    original_.clear();target_.clear();
+}
+bool canonical_upstream_delivery::entry_scope::duplicate() const {
+    auto& d=delivery_;
+    const auto rows=d.query("SELECT position,outcome,charge,"
+        "CASE WHEN typeof(relation)='blob' AND length(relation)<=64 THEN relation END AS relation,"
+        "CASE WHEN typeof(identity)='blob' AND length(identity)=36 THEN identity END AS identity "
+        "FROM main._lattice_canonical_receipt WHERE original_id=?",{bytes(d.original_)});
+    if(rows.empty())return false;
+    if(rows.size()!=1)refuse("canonical upstream duplicate receipt shape");
+    const auto& r=rows[0];const auto position=integer(r,"position"),outcome=integer(r,"outcome");
+    const auto head=d.query("SELECT head FROM main._lattice_canonical_store WHERE id=1");
+    if(head.size()!=1 || position<1 || position>integer(head[0],"head") || outcome<1 || outcome>3 ||
+        integer(r,"charge")!=static_cast<int64_t>(32+36+d.entry_->table_name.size()+36) ||
+        !std::holds_alternative<blob>(r.at("relation")) || std::get<blob>(r.at("relation"))!=bytes(d.entry_->table_name) ||
+        !std::holds_alternative<blob>(r.at("identity")) || std::get<blob>(r.at("identity"))!=bytes(d.target_))
+        refuse("canonical upstream retained receipt corrupt or different target");
+    return true; // First retained outcome wins; replacement payload is never interpreted.
+}
+void canonical_upstream_delivery::entry_scope::validate_payload() const {
+    const auto& d=delivery_;const auto& e=*d.entry_;const auto& columns=d.schema(e.table_name);
+    if(e.operation!="INSERT"&&e.operation!="UPDATE"&&e.operation!="DELETE")refuse("canonical upstream unsupported operation");
+    if(e.timestamp.find('\0')!=std::string::npos)refuse("canonical upstream malformed timestamp bytes");
+    if(e.synthesized && e.operation!="INSERT")refuse("canonical upstream unsupported synthesized operation");
+    std::set<std::string> names;
+    for(const auto& name:e.changed_fields_names) {
+        if(name=="id"||name=="globalId"||!columns.count(name)||!names.insert(name).second)
+            refuse("canonical upstream unknown/identity/duplicate changed field");
+        if(!e.changed_fields.count(name))refuse("canonical upstream missing changed value");
+    }
+    for(const auto& [name,value]:e.changed_fields) {
+        if(!columns.count(name)||name=="id"||name=="globalId")refuse("canonical upstream unknown payload field");
+        // Unchanged fields may carry the generated audit's null placeholders.
+        if(!names.count(name))continue;
+        const auto type=columns.at(name);bool valid=false;
+        switch(value.kind) {
+        case any_property_kind::null_kind: valid=std::holds_alternative<std::nullptr_t>(value.value);break;
+        case any_property_kind::int_kind:case any_property_kind::int64_kind:
+            valid=std::holds_alternative<int64_t>(value.value)&&(type==column_type::integer||type==column_type::real);break;
+        case any_property_kind::float_kind:case any_property_kind::double_kind:case any_property_kind::date_kind:
+            valid=std::holds_alternative<double>(value.value)&&std::isfinite(std::get<double>(value.value))&&type==column_type::real;break;
+        case any_property_kind::string_kind:
+            valid=std::holds_alternative<std::string>(value.value)&&type==column_type::text;
+            if(std::holds_alternative<std::string>(value.value)&&type==column_type::blob) {
+                const auto& hex=std::get<std::string>(value.value);valid=hex.size()%2==0;
+                for(char c:hex)if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F')))valid=false;
+            }
+            break;
+        case any_property_kind::data_kind:
+            valid=std::holds_alternative<blob>(value.value)&&type==column_type::blob;
+            if(std::holds_alternative<std::string>(value.value)&&type==column_type::blob) {
+                const auto& hex=std::get<std::string>(value.value);valid=hex.size()%2==0;
+                for(char c:hex)if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F')))valid=false;
+            }
+            break;
+        }
+        if(!valid)refuse("canonical upstream malformed or incompatible typed value");
+        if(e.operation!="DELETE" && value.is_null() && d.context_->no_history.at(e.table_name).count(name))
+            refuse("canonical upstream unresolved NoHistory value");
+        if(d.context_->relations.count(e.table_name) && (name=="lhs"||name=="rhs") && !value.is_null()) {
+            if(!std::holds_alternative<std::string>(value.value))refuse("canonical upstream invalid link target");
+            (void)canonical_writer_adapter::uuid_key(std::get<std::string>(value.value));
+        }
+    }
+}
+void canonical_upstream_delivery::entry_scope::accept(canonical_receipt_outcome outcome) {
+    auto& d=delivery_;
+    if(outcome!=canonical_receipt_outcome::applied && outcome!=canonical_receipt_outcome::no_op)
+        refuse("canonical upstream cannot create a policy-only acceptance");
+    if(d.finalizing_)refuse("canonical upstream duplicate finalizer");
+    const auto before=d.query("SELECT head,receipts,receipt_bytes FROM main._lattice_canonical_store WHERE id=1");
+    if(before.size()!=1)refuse("canonical upstream finalizer state missing");
+    const int64_t head=integer(before[0],"head"),receipts=integer(before[0],"receipts"),receipt_bytes=integer(before[0],"receipt_bytes");
+    const int64_t charge=static_cast<int64_t>(32+36+d.entry_->table_name.size()+36);
+    if(head==INT64_MAX || receipts==INT64_MAX || receipt_bytes>INT64_MAX-charge)
+        refuse("canonical upstream finalizer sequence/counter exhausted");
+    d.finalizing_=true;
+    try {
+        d.script(mutation(d.context_->profile,d.entry_->table_name,"CAST("+literal(d.target_)+" AS TEXT)",
+            "CAST("+literal(d.original_)+" AS TEXT)",static_cast<int64_t>(outcome),d.entry_guard()));
+        const auto after=d.query("SELECT head,receipts,receipt_bytes FROM main._lattice_canonical_store WHERE id=1");
+        if(after.size()!=1 || integer(after[0],"head")!=head+1 || integer(after[0],"receipts")!=receipts+1 ||
+            integer(after[0],"receipt_bytes")!=receipt_bytes+charge)
+            refuse("canonical upstream finalizer counter write was ignored");
+        d.finalizing_=false;
+    } catch(...) {d.finalizing_=false;throw;}
+}
+
 } // namespace lattice::detail

@@ -231,6 +231,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp
     Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp
     Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp
+    Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp
     Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp

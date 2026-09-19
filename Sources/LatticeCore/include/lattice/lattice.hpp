@@ -47,7 +47,7 @@ template<typename T> class results;
 class lattice_db;
 class synchronizer_base;
 class synchronizer;
-namespace detail { struct recovery_writer_access; class canonical_writer_adapter; struct recovery_refresh_state; struct recovery_refresh_access; }
+namespace detail { struct recovery_writer_access; class canonical_writer_adapter; struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -3778,6 +3778,9 @@ private:
         lattice_db&, const std::vector<audit_log_entry>&, const std::string&);
     std::vector<std::string> apply_remote_changes_impl_(
         const std::vector<audit_log_entry>&, const std::optional<std::string>&);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&, const std::optional<std::string>&,
+        detail::canonical_upstream_delivery*);
 
     void publish_local_audit_id_(int64_t row_id);
 

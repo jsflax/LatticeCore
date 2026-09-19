@@ -52,7 +52,7 @@ int64_t receiving_state_count(lattice::lattice_db& db, const std::string& id) {
 
 int64_t effect_count(lattice::lattice_db& db, const std::string& id) {
     return scalar(db.db(),
-        "SELECT COUNT(*) AS n FROM ProtocolUpdateEffects WHERE rowGlobalId = ?", {id});
+        "SELECT COUNT(*) AS n FROM _protocol_update_effects WHERE rowGlobalId = ?", {id});
 }
 
 std::optional<std::string> receive_cursor(lattice::lattice_db& db) {
@@ -126,11 +126,11 @@ void assert_entry_bookkeeping_atomicity(BookkeepingStage stage) {
 
     // A model trigger's side effects participate in the entry's atomic unit,
     // just as model-maintenance triggers must. Seed writes precede this trigger.
-    db.db().execute("CREATE TABLE ProtocolUpdateEffects(rowGlobalId TEXT NOT NULL, value TEXT NOT NULL)");
+    db.db().execute("CREATE TABLE _protocol_update_effects(rowGlobalId TEXT NOT NULL, value TEXT NOT NULL)");
     db.db().execute(R"(
         CREATE TRIGGER protocol_update_effect AFTER UPDATE ON TestPerson
         BEGIN
-            INSERT INTO ProtocolUpdateEffects(rowGlobalId, value) VALUES(NEW.globalId, NEW.name);
+            INSERT INTO _protocol_update_effects(rowGlobalId, value) VALUES(NEW.globalId, NEW.name);
         END
     )");
     FailureStageCounter failure(db.db());

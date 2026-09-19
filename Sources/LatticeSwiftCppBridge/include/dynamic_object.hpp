@@ -522,6 +522,14 @@ public:
         return _make(std::make_shared<dynamic_object>(table, props));
     }
 
+    // Copy a managed row directly into its final owning object. The row is
+    // borrowed only during this call; the resulting ref owns its managed copy.
+    static LATTICE_DOREF_RET wrap_managed(
+        const managed<swift_dynamic_object>& row)
+        SWIFT_NAME(wrapManaged(_:)) LATTICE_DOREF_UNRETAINED {
+        return _make(std::make_shared<dynamic_object>(row));
+    }
+
     static LATTICE_DOREF_RET wrap(std::shared_ptr<dynamic_object> obj) LATTICE_DOREF_UNRETAINED {
         return _make(obj);
     }

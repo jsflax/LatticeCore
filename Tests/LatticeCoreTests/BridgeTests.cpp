@@ -1957,3 +1957,188 @@ TEST(Bridge, UniqueIndexNameParityAcrossSwiftAndCapiSchemaShapes) {
 }
 
 #endif // !__linux__
+
+#ifndef __linux__
+namespace {
+std::unique_ptr<lattice::swift_lattice_ref> managed_row_factory_owner(
+    const std::string& path, const lattice::SchemaVector& schemas) {
+#if LATTICE_HAS_FRT
+    auto owner = std::unique_ptr<lattice::swift_lattice_ref>(
+        lattice::swift_lattice_ref::create_uncached(lattice::swift_configuration(path), schemas));
+#else
+    auto owner = std::make_unique<lattice::swift_lattice_ref>(
+        lattice::swift_lattice_ref::create_uncached(lattice::swift_configuration(path), schemas));
+#endif
+    owner->get()->stop_audit_maintenance();
+    return owner;
+}
+
+std::unique_ptr<lattice::dynamic_object_ref> managed_row_factory_box(
+    const lattice::managed<lattice::swift_dynamic_object>& row, bool legacy = false) {
+    auto result = legacy
+        ? lattice::dynamic_object_ref::wrap(lattice::dynamic_object(row).make_shared())
+        : lattice::dynamic_object_ref::wrap_managed(row);
+#if LATTICE_HAS_FRT
+    return std::unique_ptr<lattice::dynamic_object_ref>(result);
+#else
+    return std::make_unique<lattice::dynamic_object_ref>(std::move(result));
+#endif
+}
+}
+
+TEST(Bridge, ManagedRowFactoryPreservesGenerationImageAndLiveReads) {
+    TempDB path{"managed_row_factory_image"};
+    lattice::SchemaVector schemas = {make_schema("FactoryImage", {
+        {"age", int_prop("age")}, {"score", real_prop("score")},
+        {"name", text_prop("name")}, {"email", nullable_text_prop("email")},
+    })};
+    auto owner = managed_row_factory_owner(path.str(), schemas);
+    {
+        auto source = make_sdo("FactoryImage", schemas[0].properties);
+        source.values["age"] = int64_t(7);
+        source.values["score"] = 1.25;
+        source.values["name"] = std::string("before");
+        source.values["email"] = nullptr;
+        lattice::dynamic_object object(source);
+        owner->get()->add(object);
+    }
+    const auto generation = owner->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    std::unique_ptr<lattice::dynamic_object_ref> direct, legacy, sibling;
+    int64_t id = 0;
+    {
+        auto rows = owner->objects_at(generation, "FactoryImage");
+        ASSERT_FALSE(owner->last_generation_read_stale());
+        ASSERT_EQ(rows.size(), 1u);
+        id = rows[0].id();
+        const auto before_boxing = lattice::database::thread_statement_count();
+        direct = managed_row_factory_box(rows[0]);
+        legacy = managed_row_factory_box(rows[0], true);
+        sibling = managed_row_factory_box(rows[0]);
+        EXPECT_EQ(lattice::database::thread_statement_count() - before_boxing, 0u);
+    } // Destroy the input vector before inspecting either owning result.
+    owner->release_read_generation(generation);
+    ASSERT_NE(direct->get(), legacy->get());
+    ASSERT_NE(direct->get(), sibling->get());
+    owner->get()->db().execute("UPDATE FactoryImage SET age=99,score=2.5,name='after'");
+    const auto before_metadata = lattice::database::thread_statement_count();
+    for (auto* object : {direct.get(), legacy.get(), sibling.get()}) {
+        EXPECT_EQ(object->get()->lattice.get(), owner->get());
+        EXPECT_EQ(object->managed_primary_key(), id);
+        EXPECT_EQ(object->get_table_name(), "FactoryImage");
+        EXPECT_FALSE(object->is_row_cache_enabled());
+        ASSERT_TRUE(object->has_query_row_image());
+        ASSERT_EQ(object->query_row_value_type("age"), 1);
+        ASSERT_EQ(object->query_row_value_type("score"), 2);
+        ASSERT_EQ(object->query_row_value_type("name"), 3);
+        EXPECT_EQ(object->query_row_value_type("email"), 0);
+        EXPECT_EQ(object->query_row_value_type("missing"), -1);
+        EXPECT_EQ(std::get<int64_t>(object->query_row_value("age")), 7);
+        EXPECT_EQ(std::get<double>(object->query_row_value("score")), 1.25);
+        EXPECT_EQ(std::get<std::string>(object->query_row_value("name")), "before");
+        EXPECT_TRUE(lattice::column_value_is_null(object->query_row_value("email")));
+    }
+    direct->release_query_row_image();
+    EXPECT_FALSE(direct->has_query_row_image());
+    EXPECT_TRUE(legacy->has_query_row_image());
+    EXPECT_TRUE(sibling->has_query_row_image());
+    EXPECT_EQ(lattice::database::thread_statement_count() - before_metadata, 0u);
+    const auto before_live_reads = lattice::database::thread_statement_count();
+    for (auto* object : {direct.get(), legacy.get()}) {
+        EXPECT_EQ(object->get_int("age"), 99);
+        EXPECT_DOUBLE_EQ(object->get_double("score"), 2.5);
+        EXPECT_EQ(object->get_string("name"), "after");
+    }
+    EXPECT_EQ(lattice::database::thread_statement_count() - before_live_reads, 6u);
+}
+
+TEST(Bridge, ManagedRowFactoryOwnsRowAndLatticeAfterInputsAreDestroyed) {
+    std::unique_ptr<lattice::dynamic_object_ref> object;
+    std::weak_ptr<lattice::swift_lattice> weak_owner;
+    int64_t id = 0;
+    {
+        lattice::SchemaVector schemas = {make_schema("FactoryLifetime", {
+            {"age", int_prop("age")}, {"name", text_prop("name")},
+        })};
+        auto owner = managed_row_factory_owner(":memory:", schemas);
+        weak_owner = lattice::swift_lattice_ref::shared_for_lattice(owner->get());
+        ASSERT_FALSE(weak_owner.expired());
+        {
+            auto source = make_sdo("FactoryLifetime", schemas[0].properties);
+            source.values["age"] = int64_t(8);
+            source.values["name"] = std::string("owned");
+            lattice::dynamic_object inserted(source);
+            owner->get()->add(inserted);
+        }
+        auto rows = owner->get()->objects("FactoryLifetime");
+        ASSERT_EQ(rows.size(), 1u);
+        id = rows[0].id();
+        const auto before_boxing = lattice::database::thread_statement_count();
+        object = managed_row_factory_box(rows[0]);
+        EXPECT_EQ(object->get()->lattice.get(), owner->get());
+        EXPECT_EQ(lattice::database::thread_statement_count() - before_boxing, 0u);
+    } // Row vector, original schema, insertion object and owner ref are gone.
+    EXPECT_FALSE(weak_owner.expired());
+    EXPECT_EQ(object->managed_primary_key(), id);
+    EXPECT_EQ(object->get_table_name(), "FactoryLifetime");
+    EXPECT_EQ(object->get_string("name"), "owned");
+    object->set_int("age", 19);
+    EXPECT_TRUE(object->last_query_error_message().empty());
+    EXPECT_EQ(object->get_int("age"), 19);
+    // Serialization enumerates the retained schema after the source row and
+    // caller's schema have been destroyed, rather than only reading by name.
+    const auto json = object->to_json(0);
+    EXPECT_NE(json.find("\"age\":19"), std::string::npos);
+    EXPECT_NE(json.find("\"name\":\"owned\""), std::string::npos);
+    EXPECT_EQ(std::get<int64_t>(object->query_row_value("age")), 8);
+    object->release_query_row_image();
+    EXPECT_FALSE(object->is_row_cache_enabled());
+    object.reset();
+    EXPECT_TRUE(weak_owner.expired()) << "the final owning row must release its lattice";
+}
+
+TEST(Bridge, ManagedRowFactoryKeepsAttachedEqualIDsOnTheirPhysicalRoute) {
+    TempDB local_path{"factory_local"}, arm_path{"factory_arm_\"quote"};
+    lattice::SchemaVector schemas = {make_schema("FactoryArm", {{"age", int_prop("age")}})};
+    auto local = managed_row_factory_owner(local_path.str(), schemas);
+    auto arm = managed_row_factory_owner(arm_path.str(), schemas);
+    for (auto* owner : {local.get(), arm.get()}) {
+        auto source = make_sdo("FactoryArm", schemas[0].properties);
+        source.values["age"] = int64_t(owner == local.get() ? 10 : 20);
+        lattice::dynamic_object inserted(source);
+        owner->get()->add(inserted);
+    }
+    ASSERT_TRUE(local->get()->attach(*arm->get()));
+    std::unique_ptr<lattice::dynamic_object_ref> local_row, attached_row, legacy_attached;
+    {
+        auto rows = local->get()->objects("FactoryArm", std::nullopt, std::string("age ASC"));
+        ASSERT_EQ(rows.size(), 2u);
+        ASSERT_EQ(rows[0].id(), rows[1].id());
+        const auto before_boxing = lattice::database::thread_statement_count();
+        local_row = managed_row_factory_box(rows[0]);
+        attached_row = managed_row_factory_box(rows[1]);
+        legacy_attached = managed_row_factory_box(rows[1], true);
+        EXPECT_EQ(lattice::database::thread_statement_count() - before_boxing, 0u);
+    }
+    EXPECT_EQ(attached_row->get()->lattice.get(), local->get());
+    EXPECT_EQ(attached_row->get()->lattice.get(), legacy_attached->get()->lattice.get());
+    EXPECT_EQ(local_row->managed_primary_key(), attached_row->managed_primary_key());
+    EXPECT_EQ(attached_row->get_table_name(), legacy_attached->get_table_name());
+    EXPECT_NE(local_row->get_table_name(), attached_row->get_table_name());
+    ASSERT_EQ(attached_row->query_row_value_type("_source"), 3);
+    EXPECT_EQ(std::get<std::string>(attached_row->query_row_value("_source")),
+              std::get<std::string>(legacy_attached->query_row_value("_source")));
+    attached_row->set_int("age", 44);
+    EXPECT_TRUE(attached_row->last_query_error_message().empty());
+    EXPECT_EQ(legacy_attached->get_int("age"), 44);
+    EXPECT_EQ(local_row->get_int("age"), 10);
+    EXPECT_EQ(std::get<int64_t>(attached_row->query_row_value("age")), 20);
+    lattice::database local_check(local_path.str()), arm_check(arm_path.str());
+    auto local_values = local_check.query("SELECT age FROM FactoryArm");
+    auto arm_values = arm_check.query("SELECT age FROM FactoryArm");
+    ASSERT_EQ(local_values.size(), 1u);
+    ASSERT_EQ(arm_values.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(local_values[0].at("age")), 10);
+    EXPECT_EQ(std::get<int64_t>(arm_values[0].at("age")), 44);
+}
+#endif // !__linux__

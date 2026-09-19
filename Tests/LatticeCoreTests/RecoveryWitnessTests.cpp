@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "../../Sources/LatticeCore/src/recovery_witness.hpp"
+#include "../../Sources/LatticeCore/src/recovery_refresh.hpp"
 #include "../../Sources/LatticeCore/src/scoped_recovery_install.hpp"
 #include <deque>
 #include <limits>
@@ -31,6 +32,7 @@ protected:
     void SetUp() override {
         lattice::configuration c(path.str()); c.audit_retention_seconds=0;c.busy_timeout_ms=50;c.sched=scheduler;
         owner=std::make_shared<lattice::lattice_db>(c);
+        recovery_refresh_test_access::use_manual_preparation(*owner);
         owner->add(TestPerson{"seed",1,std::nullopt});
         owner->db().execute("DELETE FROM AuditLog");scheduler->drain();
         if(auto* notifier=lattice::instance_registry::instance().get_or_create_notifier(path.str()))notifier->stop_listening();
@@ -196,6 +198,7 @@ TEST_F(RecoveryWitness, ReadOnlyFacadeReopenSeesDurableWitnessWithoutSourceOwner
     auto r=request();row(r,"before");committed(install(r));scheduler->drain();owner->close();owner.reset();
     lattice::configuration c(path.str());c.read_only=true;c.sched=scheduler=std::make_shared<queued_refresh_scheduler>();
     owner=std::make_shared<lattice::lattice_db>(c);
+    recovery_refresh_test_access::use_manual_preparation(*owner);
     if(auto* notifier=lattice::instance_registry::instance().get_or_create_notifier(path.str()))notifier->stop_listening();
     int calls=0;owner->add_recovery_refresh_observer([&]{++calls;});drain_refresh();EXPECT_EQ(calls,1);
     raw_bump("after-exit");drain_refresh();EXPECT_EQ(calls,2);EXPECT_EQ(current_name(owner->read_db()),"after-exit");

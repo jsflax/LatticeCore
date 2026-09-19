@@ -1,8 +1,15 @@
 #include <lattice/lattice.hpp>
+#include "recovery_refresh.hpp"
 #include <atomic>
 #include <limits>
 
 namespace lattice::detail {
+namespace {
+void signal_interest(const std::shared_ptr<const managed_observation_state::interest_callback>& hook,
+                     uint64_t revision, bool active) noexcept {
+    if (hook) try { (*hook)(revision, active); } catch (...) {}
+}
+}
 struct managed_observation_state::state {
     struct slot {
         std::mutex mutex;
@@ -33,17 +40,25 @@ struct managed_observation_state::state {
     std::atomic<bool> retired{false};
     std::map<std::string, rows> tables;
     uint64_t next_id = 0;
+    uint64_t interest_revision = 0, active_count = 0;
+    std::weak_ptr<const interest_callback> interest_hook;
 
     void erase(const slot& target) {
         // The caller retains target, so erasure cannot release its captures.
-        std::lock_guard<std::mutex> lock(mutex);
-        const auto t = tables.find(target.table);
-        if (t == tables.end()) return;
-        const auto r = t->second.find(target.row);
-        if (r == t->second.end()) return;
-        r->second.erase(target.id);
-        if (r->second.empty()) t->second.erase(r);
-        if (t->second.empty()) tables.erase(t);
+        std::shared_ptr<const interest_callback> hook;
+        uint64_t revision; bool active;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto t = tables.find(target.table);
+            if (t == tables.end()) return;
+            const auto r = t->second.find(target.row);
+            if (r == t->second.end() || !r->second.erase(target.id)) return;
+            if (r->second.empty()) t->second.erase(r);
+            if (t->second.empty()) tables.erase(t);
+            --active_count; revision = ++interest_revision;
+            active = active_count != 0; hook = interest_hook.lock();
+        }
+        signal_interest(hook, revision, active);
     }
 };
 
@@ -59,19 +74,30 @@ notification_token managed_observation_state::observe(const std::string& table, 
     target->global_id = global_id;
     target->fallback = std::move(fallback);
     auto owner = state_;
+    std::shared_ptr<const interest_callback> hook;
+    uint64_t revision;
     {
         std::lock_guard<std::mutex> lock(owner->mutex);
         if (owner->retired.load(std::memory_order_acquire)) return {};
         if (owner->next_id == std::numeric_limits<uint64_t>::max())
             throw std::overflow_error("managed observer identifiers exhausted");
+        // Reserve one future removal tick per active slot, plus this add/remove
+        // pair. Cancellation never needs to throw or wrap its ordering counter.
+        const auto remaining = UINT64_MAX - owner->interest_revision;
+        if (remaining < 2 || owner->active_count > remaining - 2)
+            throw std::overflow_error("managed observer interest revision exhausted");
         target->id = ++owner->next_id;
         owner->tables[table][row].emplace(target->id, target);
+        ++owner->active_count; revision = ++owner->interest_revision;
+        hook = owner->interest_hook.lock();
     }
     try {
-        return notification_token([owner, target] {
+        auto token = notification_token([owner, target] {
             target->cancel();
             owner->erase(*target);
         });
+        signal_interest(hook, revision, true);
+        return token;
     } catch (...) {
         target->cancel();
         owner->erase(*target);
@@ -138,14 +164,40 @@ void managed_observation_state::append(const std::string& table, const std::stri
 void managed_observation_state::retire() {
     auto owner = state_;
     decltype(owner->tables) released;
+    std::shared_ptr<const interest_callback> hook;
+    uint64_t revision;
     {
         std::lock_guard<std::mutex> lock(owner->mutex);
-        owner->retired.store(true, std::memory_order_release);
+        if (owner->retired.exchange(true, std::memory_order_acq_rel)) return;
+        if (owner->active_count) ++owner->interest_revision;
+        owner->active_count = 0; revision = owner->interest_revision;
+        hook = owner->interest_hook.lock();
         released.swap(owner->tables);
     }
     for (const auto& [table, rows] : released)
         for (const auto& [row, slots] : rows)
             for (const auto& [id, target] : slots) target->cancel();
+    signal_interest(hook, revision, false);
+}
+
+void managed_observation_state::set_interest_observer(const std::shared_ptr<const interest_callback>& hook) {
+    auto owner = state_;
+    uint64_t revision; bool active;
+    {
+        std::lock_guard<std::mutex> lock(owner->mutex);
+        owner->interest_hook = hook;
+        revision = owner->interest_revision; active = owner->active_count != 0;
+    }
+    // Installation and the initial snapshot are one lock boundary. The caller
+    // orders this snapshot against later notifications by the same revision.
+    signal_interest(hook, revision, active);
+}
+std::set<std::string> managed_observation_state::observed_tables() const {
+    std::set<std::string> tables;
+    auto owner = state_;
+    std::lock_guard<std::mutex> lock(owner->mutex);
+    for (const auto& [table, rows] : owner->tables) if (!rows.empty()) tables.insert(table);
+    return tables;
 }
 } // namespace lattice::detail
 
@@ -195,6 +247,7 @@ notification_token model_base::observe_base(object_observer_t callback) {
         if (const auto* schema = schema_registry::instance().get_schema(route.table))
             for (const auto& property : schema->properties) fallback.push_back(property.name);
     }
-    return lattice_->managed_observers_.observe(route.table, id_, global_id_, std::move(fallback), std::move(callback));
+    return detail::recovery_refresh_access::observe_managed(*lattice_, route.table, id_, global_id_,
+        std::move(fallback), std::move(callback));
 }
 } // namespace lattice

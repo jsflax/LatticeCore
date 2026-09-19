@@ -1629,7 +1629,8 @@ public:
     // `reason` maps invalidation_reason: 0 = commit (payload = the batch's
     // changed table names, EMPTY for bookkeeping-only commits), 1 = rollback
     // (no change batch — re-capture at next access), 2 = advance (re-pin at
-    // next access; §3.3/§3.4). The pointer arrays are valid only for the
+    // next access; §3.3/§3.4), 3 = recovery (payload-free all-content dirty).
+    // The pointer arrays are valid only for the
     // duration of the callback.
     uint64_t add_invalidation_hook(void* context,
                                    void (*callback)(void* ctx,
@@ -1696,6 +1697,22 @@ public:
 
     void remove_invalidation_hook(uint64_t token) {
         lattice_db::remove_invalidation_hook(token);
+    }
+
+    /// Payload-free recovery wake. File owners opt into background witness
+    /// preparation and periodic retry; callback delivery uses their scheduler.
+    /// The context is consumed even when registration refuses (returns zero).
+    /// No AuditLog/CollectionChange history is manufactured by this signal.
+    uint64_t add_recovery_refresh_observer(void* context, void (*callback)(void*),
+                                           void (*destroy)(void*) = nullptr) noexcept {
+        try {
+            auto shared = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+            if (!callback) return 0;
+            return lattice_db::add_recovery_refresh_observer([shared, callback] { callback(shared.get()); });
+        } catch (...) { return 0; }
+    }
+    void remove_recovery_refresh_observer(uint64_t token) noexcept {
+        try { lattice_db::remove_recovery_refresh_observer(token); } catch (...) {}
     }
 
     // ---- Read-generation pool (§2.2/§3) ----
@@ -4055,6 +4072,14 @@ public:
     }
     void remove_object_observer(const std::string& table_name, int64_t row_id, uint64_t observer_id) const {
         impl().remove_object_observer(table_name, row_id, observer_id);
+    }
+
+    uint64_t add_recovery_refresh_observer(void* context, void (*callback)(void*),
+                                           void (*destroy)(void*) = nullptr) const {
+        return impl().add_recovery_refresh_observer(context, callback, destroy);
+    }
+    void remove_recovery_refresh_observer(uint64_t token) const {
+        impl().remove_recovery_refresh_observer(token);
     }
 
     int64_t pending_sync_entry_count() const { return impl().pending_sync_entry_count(); }

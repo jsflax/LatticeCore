@@ -2089,7 +2089,8 @@ public:
 
     // Additive payload-free recovery signal. Opt-in, coalescible and retried
     // after callback failure; it never fabricates CollectionChange/AuditLog.
-    // Native file stores only in this private inactive integration slice.
+    // Native file stores poll while these listeners or typed managed observers
+    // are registered. This does not activate a sync/recovery dispatcher.
     observer_id add_recovery_refresh_observer(std::function<void()> callback);
     void remove_recovery_refresh_observer(observer_id token);
     void request_recovery_refresh() noexcept;

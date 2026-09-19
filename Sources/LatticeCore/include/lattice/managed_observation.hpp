@@ -2,6 +2,7 @@
 #ifdef __cplusplus
 #include "observation.hpp"
 #include <cstdint>
+#include <set>
 
 namespace lattice::detail {
 // Independent custody: tokens and queued work never retain a raw lattice_db.
@@ -19,6 +20,12 @@ public:
         const std::string& global_id, const std::string& fields_json,
         std::vector<std::function<void()>>& callbacks);
     void retire();
+    // Private recovery interest seam. The hook is weak, immutable and invoked
+    // off all slot/state locks. Its internal callback must not throw or perform
+    // SQL; revision orders notifications that can arrive from different threads.
+    using interest_callback = std::function<void(uint64_t, bool)>;
+    void set_interest_observer(const std::shared_ptr<const interest_callback>&);
+    std::set<std::string> observed_tables() const;
 private:
     struct state;
     std::shared_ptr<state> state_;

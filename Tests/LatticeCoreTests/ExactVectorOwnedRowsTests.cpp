@@ -105,7 +105,7 @@ struct Store {
     std::unique_ptr<swift_lattice_ref> ref;
     explicit Store(const std::string& suffix, const SchemaVector& schemas = schema())
         : path("exact_owned_" + suffix), ref(open(path.str(), schemas)) {}
-    swift_lattice& core() { return *ref->get(); }
+    lattice::swift_lattice& core() { return *ref->get(); }
     database& db() { return core().db(); }
 };
 

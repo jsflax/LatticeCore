@@ -214,6 +214,10 @@ TEST_F(ReceiveInstallState, StaleRevisionEpochBaseSequenceAndChangedDigestRefuse
         changed=one; changed.manifest_digest="same-QEC-different-M";
         expect_error(err::stale,[&] { s.apply_if_new(binding,changed,std::nullopt,[](auto&) { FAIL()<<"changed manifest ran effects"; }); });
         auto next=successor(one,5); next.expected_revision=0; next.base={};
+        // A delta with no numeric base is structurally invalid before the CAS.
+        expect_error(err::invalid_argument,[&] { s.begin(binding,next); });
+        next.mode=receive_install_mode::full;
+        // A well-formed full request can carry an old uninitialized revision.
         expect_error(err::stale,[&] { s.begin(binding,next); });
         next=successor(one,5); next.base.position=3;
         expect_error(err::stale,[&] { s.begin(binding,next); });

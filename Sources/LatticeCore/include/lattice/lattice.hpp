@@ -47,7 +47,7 @@ template<typename T> class results;
 class lattice_db;
 class synchronizer_base;
 class synchronizer;
-namespace detail { struct recovery_writer_access; }
+namespace detail { struct recovery_writer_access; class canonical_writer_adapter; }
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -1613,6 +1613,22 @@ private:
                         if (it != gid_by_id.end()) global_id = it->second;
                     }
                 }
+                if (batch) {
+                    // ROLLBACK TO does not invoke SQLite's rollback hook. A
+                    // nested failed helper can leave a buffered audit row that
+                    // no longer exists, or whose rowid a later insert reused.
+                    // Only surviving addressed rows supply durable events and
+                    // cursor evidence, each once. The write view stays owned.
+                    std::unordered_set<int64_t> retained;
+                    changes.erase(std::remove_if(changes.begin(), changes.end(),
+                        [&](const auto& change) {
+                            if (std::get<0>(change) != "AuditLog" || std::get<1>(change) != "INSERT")
+                                return false;
+                            const auto row_id = std::get<2>(change);
+                            return gid_by_id.find(row_id) == gid_by_id.end() ||
+                                !retained.insert(row_id).second;
+                        }), changes.end());
+                }
             }
         }
 
@@ -1632,21 +1648,24 @@ private:
         // BEFORE notifying observers. This prevents any instance's
         // cross-process handler from re-dispatching entries that
         // flush_changes is about to (or just did) deliver.
-        if (batch || shared_xproc_notifier_) {
-            // The ordinary reader can have an older implicit snapshot held by
-            // another active SELECT. Reading its MAX here could rewind the
-            // cursor advanced by this commit's update hook, letting the xproc
-            // reader replay a locally delivered row. The committing writer
-            // sees this commit even when the ordinary reader is still pinned.
-            // WAL callbacks permit SQL after commit; memory delivery reaches
-            // this point only after its statement has settled.
-            auto max_rows = (recovery_writer ? recovery_writer : db_.get())->query("SELECT MAX(id) AS max_id FROM AuditLog");
+        if (batch) {
+            // Recovery buffers the actual inserted audit rows, including file
+            // stores. A suppressed model edit has no new audit frontier and
+            // must not adopt an unrelated historical MAX(id).
+            for (const auto& [table, op, row_id, global_id] : changes) {
+                if (table == "AuditLog" && op == "INSERT" && row_id > 0 &&
+                    (!batch->audit_frontier || row_id > *batch->audit_frontier))
+                    batch->audit_frontier = row_id;
+            }
+        } else if (shared_xproc_notifier_) {
+            // The committing writer sees this commit even if an ordinary
+            // reader still holds an older implicit snapshot.
+            auto max_rows = db_->query("SELECT MAX(id) AS max_id FROM AuditLog");
             if (!max_rows.empty()) {
                 auto it = max_rows[0].find("max_id");
                 if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    auto max_id = std::get<int64_t>(it->second);
-                    if (batch) batch->audit_frontier = max_id;
-                    else for_each_alive([max_id](lattice_db* inst) {
+                    const auto max_id = std::get<int64_t>(it->second);
+                    for_each_alive([max_id](lattice_db* inst) {
                         inst->last_seen_audit_id_.store(max_id, std::memory_order_release);
                     });
                 }
@@ -1685,6 +1704,44 @@ private:
         // observers as a single fire.
         std::vector<change_event> events;
         events.reserve(changes.size() * 2);   // roughly one model + one audit per change
+
+        // A recovery body may deliberately suppress AuditLog creation and
+        // overlay several fields. Historical changedFieldsNames cannot describe
+        // its final state. Read each physical model layout once while the owned
+        // writer still pins it, and conservatively refresh all model properties.
+        std::unordered_map<std::string, std::string> recovery_field_names;
+        const auto recovery_fields = [&](const std::string& table) -> const std::string& {
+            const auto found = recovery_field_names.find(table);
+            if (found != recovery_field_names.end()) return found->second;
+            const auto columns = batch_query(
+                "SELECT name FROM pragma_table_info(?, 'main') ORDER BY cid", {table});
+            if (columns.empty()) throw db_error("recovery notification model schema is unavailable");
+            auto names = nlohmann::json::array();
+            std::unordered_set<std::string> physical_names;
+            for (const auto& column : columns) {
+                const auto it = column.find("name");
+                if (it == column.end() || !std::holds_alternative<std::string>(it->second))
+                    throw db_error("recovery notification model column is invalid");
+                const auto& name = std::get<std::string>(it->second);
+                physical_names.insert(name);
+                if (name != "id" && name != "globalId") names.push_back(name);
+            }
+            // Core and Swift expand a geo property into this exact quartet,
+            // while object observers accept its logical property name. Add a
+            // conservative alias without dropping physical names or claiming a
+            // schema type. Coincidental scalar quartets merely refresh extra.
+            for (const auto& column : columns) {
+                const auto& name = std::get<std::string>(column.at("name"));
+                constexpr std::string_view suffix = "_minLat";
+                if (name.size() <= suffix.size() || !name.ends_with(suffix)) continue;
+                const auto prefix = name.substr(0, name.size() - suffix.size());
+                if (!physical_names.contains(prefix) &&
+                    physical_names.contains(prefix + "_maxLat") &&
+                    physical_names.contains(prefix + "_minLon") &&
+                    physical_names.contains(prefix + "_maxLon")) names.push_back(prefix);
+            }
+            return recovery_field_names.emplace(table, names.dump()).first->second;
+        };
 
         // Pass 1: model changes + internal-table → parent-UPDATE translation.
         for (const auto& [table, op, row_id, global_id] : changes) {
@@ -1738,7 +1795,10 @@ private:
                 // For local setter changes, changed_fields stays empty — the Swift setter
                 // already handles observation via withMutation.
                 std::string changed_fields;
-                if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
+                if (batch && row_id > 0 && table != "AuditLog" &&
+                    !table.empty() && table.front() != '_') {
+                    changed_fields = recovery_fields(table);
+                } else if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
                     && row_id > 0 && table != "AuditLog") {
                     auto cfn_rows = batch_query(
                         "SELECT changedFieldsNames FROM AuditLog "
@@ -1769,7 +1829,7 @@ private:
 #ifdef __EMSCRIPTEN__
         constexpr bool audit_inserts_buffered_directly = true;
 #else
-        const bool audit_inserts_buffered_directly = config_.is_in_memory();
+        const bool audit_inserts_buffered_directly = batch || config_.is_in_memory();
 #endif
         bool triggered_regular_audit = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
@@ -1881,7 +1941,9 @@ private:
                     update_only.push_back(1);
                     fields.emplace_back();
                 }
-                if (op != "UPDATE" || cfn.empty() ||
+                // The recovery list is conservative refresh information, not
+                // an exact changed-field proof for query-disjointness skips.
+                if (batch || op != "UPDATE" || cfn.empty() ||
                     !parse_changed_fields_names(cfn, fields[idx])) {
                     update_only[idx] = 0;  // fields unknown or membership may change
                 }
@@ -1919,7 +1981,9 @@ private:
         // already cause the synchronizer to pick up ALL unsynced entries including
         // internal ones). Dispatch via scheduler to avoid calling sync_now() from
         // within the WAL hook — synchronous calls race with WebSocket ACK handlers.
-        if (batch) batch->needs_upload_hint = had_internal_changes && !triggered_regular_audit;
+        // Recovery's genuine audit INSERT events already provide upload hints.
+        // Audit-suppressed canonical/link changes create no outgoing operation.
+        if (batch) batch->needs_upload_hint = false;
         else if (had_internal_changes && !triggered_regular_audit) {
             trigger_sync_upload();
         }
@@ -5975,6 +6039,7 @@ protected:
     // free and precedes the first DETACH side effect, including failed DETACH.
     friend class detail::managed_route_scope;
     friend struct detail::recovery_writer_access;
+    friend class detail::canonical_writer_adapter;
     friend struct managed_attachment_test_access;
     struct managed_attachment_binding {
         std::string alias, filename;
@@ -7513,7 +7578,9 @@ protected:
 
     void create_model_table_triggers(const std::string& table_name,
                                       const std::vector<std::pair<std::string, column_type>>& columns,
-                                      const std::set<std::string>& no_history = {}) {
+                                      const std::set<std::string>& no_history = {},
+                                      const std::string& canonical_receipt_tail = {},
+                                      std::vector<std::string>* emitted = nullptr) {
         // Skip if no columns to track
         if (columns.empty()) return;
 
@@ -7593,9 +7660,9 @@ protected:
             "       json_object(" + json_fields + "),"
             "       json_array(" + json_names + "),"
             "       unixepoch('subsec')"
-            "   );"
+            "   );" + canonical_receipt_tail +
             " END";
-        db_->execute(update_trigger);
+        if (emitted) emitted->push_back(update_trigger); else db_->execute(update_trigger);
 
         // INSERT trigger
         std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Insert"
@@ -7611,9 +7678,9 @@ protected:
             "       json_object(" + insert_json_fields + "),"
             "       json_array(" + insert_json_names + "),"
             "       unixepoch('subsec')"
-            "   );"
+            "   );" + canonical_receipt_tail +
             " END";
-        db_->execute(insert_trigger);
+        if (emitted) emitted->push_back(insert_trigger); else db_->execute(insert_trigger);
 
         // DELETE trigger
         std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Delete"
@@ -7629,12 +7696,18 @@ protected:
             "       json_object(" + delete_json_fields + "),"
             "       json_array(" + delete_json_names + "),"
             "       unixepoch('subsec')"
-            "   );"
+            "   );" + canonical_receipt_tail +
             " END";
-        db_->execute(delete_trigger);
+        if (emitted) emitted->push_back(delete_trigger); else db_->execute(delete_trigger);
     }
 
-    void create_link_table_triggers(const std::string& link_table_name) {
+    void create_link_table_triggers(const std::string& link_table_name,
+                                    const std::string& canonical_receipt_tail = {},
+                                    std::vector<std::string>* emitted = nullptr) {
+        if (!emitted && db_->canonical_trigger_only_) {
+            detail::require_canonical_relation(*db_, link_table_name);
+            return; // Exact fixed-scope programs were validated at attachment.
+        }
         // INSERT trigger for link table
         std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
             " AFTER INSERT ON " + link_table_name +
@@ -7649,9 +7722,9 @@ protected:
             "       json_object('lhs', NEW.lhs, 'rhs', NEW.rhs),"
             "       json_array('lhs', 'rhs'),"
             "       unixepoch('subsec')"
-            "   );"
+            "   );" + canonical_receipt_tail +
             " END";
-        db_->execute(insert_trigger);
+        if (emitted) emitted->push_back(insert_trigger); else db_->execute(insert_trigger);
 
         // DELETE trigger for link table
         std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
@@ -7667,9 +7740,9 @@ protected:
             "       json_object('lhs', OLD.lhs, 'rhs', OLD.rhs),"
             "       json_array('lhs', 'rhs'),"
             "       unixepoch('subsec')"
-            "   );"
+            "   );" + canonical_receipt_tail +
             " END";
-        db_->execute(delete_trigger);
+        if (emitted) emitted->push_back(delete_trigger); else db_->execute(delete_trigger);
     }
 
     void create_virtual_link_table_triggers(const std::string& link_table_name) {

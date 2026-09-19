@@ -55,6 +55,8 @@ class database;
 namespace detail {
 struct exact_vector_rows_access;
 struct recovery_writer_access;
+class canonical_writer_adapter;
+void require_canonical_relation(database&, const std::string&);
 
 // One ordinary attached-field operation. Main/manual database fields keep
 // their existing path. The implementation never acquires a topology mutex
@@ -84,6 +86,12 @@ class database {
     friend class lattice_db;
     friend struct detail::exact_vector_rows_access;
     friend struct detail::recovery_writer_access;
+    friend class detail::canonical_writer_adapter;
+    friend void detail::require_canonical_relation(database&, const std::string&);
+    // Private fixed-scope trigger qualification lacks upstream receipt settlement.
+    bool canonical_trigger_only_ = false;
+    std::shared_ptr<void> canonical_callback_custody_;
+    std::shared_ptr<std::atomic<bool>> canonical_write_allowed_;
     friend class detail::managed_route_scope;
     // Only database can construct this key. The keyed overload remains
     // accessible to make_shared so keepers retain its single allocation.

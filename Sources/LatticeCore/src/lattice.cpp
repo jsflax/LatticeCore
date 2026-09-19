@@ -596,7 +596,10 @@ void lattice_db::setup_change_hook(database& connection) {
 #else
                 const bool use_deferred_drain = self->config_.is_in_memory();
 #endif
-                if (use_deferred_drain) {
+                if (use_deferred_drain || context->recovery_delivery_deferred) {
+                    // Private recovery batches capture actual AuditLog INSERTs
+                    // on every storage kind. Deriving them later from a model
+                    // row would mistake an old audit for a suppressed write.
                     // Deferred delivery (docs/design-deferred-memory-delivery.md):
                     // buffer the AuditLog INSERT like any other row and let the
                     // post-statement drain deliver it once the transaction

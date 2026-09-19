@@ -70,7 +70,9 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/recovery_staging.cpp
     Sources/LatticeCore/src/recovery_install_transaction.cpp
     Sources/LatticeCore/src/canonical_change_store.cpp
+    Sources/LatticeCore/src/canonical_writer_adapter.cpp
     Sources/LatticeCore/src/sync_recovery_protocol.cpp
+    Sources/LatticeCore/src/sync_canonical_range.cpp
     Sources/LatticeCore/src/sync_recovery_values.cpp
     Sources/LatticeCore/src/sync_recovery_outbox.cpp
     Sources/LatticeCore/src/sync_snapshot_source.cpp
@@ -207,16 +209,19 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncUnitTests.cpp
     Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp
+    Tests/LatticeCoreTests/SyncCanonicalRangeTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp
     Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp
     Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
     Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp
+    Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp
     Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
     Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp
     Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp
     Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp
+    Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp
     Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp

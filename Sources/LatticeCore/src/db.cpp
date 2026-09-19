@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <exception>
+#include <utility>
 
 namespace lattice {
 
@@ -390,6 +391,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
 }
 
 database::~database() {
+    if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
     if (read_control_) read_control_->unpublish(db_);
     if (db_) {
         if (mode_ == open_mode::read_write) {
@@ -427,6 +429,7 @@ void database::close() {
     // a final query on the still-open connection. An already admitted private
     // maintenance scope likewise settles its complete transaction on its
     // owning thread; logical close never strands that transaction halfway.
+    if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
     closed_.store(true, std::memory_order_release);
 }
 
@@ -505,6 +508,9 @@ database::database(database&& other) noexcept
     : db_(other.db_), path_(std::move(other.path_)), mode_(other.mode_),
       busy_timeout_ms_(other.busy_timeout_ms_), read_control_(std::move(other.read_control_)),
       main_physical_identity_(std::atomic_load(&other.main_physical_identity_)) {
+    canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
+    canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
+    canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
     lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
     if (lattice_update_hook_context_) {
         txn_dirty_.store(other.txn_dirty_.exchange(false));
@@ -516,6 +522,7 @@ database::database(database&& other) noexcept
 
 database& database::operator=(database&& other) noexcept {
     if (this != &other) {
+        if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
         if (read_control_) read_control_->unpublish(db_);
         if (db_) {
             // Uninstall before replacing our old owned context. close_v2 can
@@ -527,6 +534,9 @@ database& database::operator=(database&& other) noexcept {
             }
             sqlite3_close_v2(db_);
         }
+        canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
+        canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
+        canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
         lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
         db_ = other.db_;
         if (lattice_update_hook_context_) {

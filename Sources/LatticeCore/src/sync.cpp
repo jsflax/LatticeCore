@@ -3457,6 +3457,8 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
     auto& db = *this;
     std::vector<std::string> applied_ids;
     if (entries.empty()) return applied_ids;
+    if (db_->canonical_trigger_only_)
+        throw db_error("canonical trigger-only scope refuses unadapted upstream apply");
 
     // Set only after owned admission. Restore even when preparation fails.
     struct applying_flag_restore {

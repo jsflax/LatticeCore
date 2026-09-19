@@ -193,6 +193,10 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
+    Tests/LatticeCoreTests/DatabaseTextTests.cpp
+    Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
+    Tests/LatticeCoreTests/KeeperInitializationTests.cpp
+    Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp

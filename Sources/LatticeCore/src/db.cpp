@@ -24,6 +24,16 @@ uint64_t database::thread_statement_count() {
 
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
+    : database(path, mode, busy_timeout_ms, initialization_key(false)) {}
+
+std::shared_ptr<database> database::make_read_keeper(const std::string& path,
+                                                   int busy_timeout_ms) {
+    return std::make_shared<database>(path, open_mode::read_only, busy_timeout_ms,
+                                     initialization_key(true));
+}
+
+database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
+                   initialization_key key)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms) {
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
@@ -75,7 +85,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     if (mode == open_mode::read_write) {
         execute("PRAGMA journal_mode = DELETE");
     }
-    execute("PRAGMA cache_size = 50000");       // Large cache for performance
+    execute(key.keeper_cache_ ? "PRAGMA cache_size = 2000"
+                              : "PRAGMA cache_size = 50000");
     execute("PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #else
     // Native mode: Enable WAL mode for better concurrency (only on read-write connection)
@@ -84,7 +95,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms)
     }
 
     // Performance optimizations (matching Lattice.swift)
-    execute("PRAGMA cache_size = 50000");       // Large cache for performance
+    execute(key.keeper_cache_ ? "PRAGMA cache_size = 2000"
+                              : "PRAGMA cache_size = 50000");
     execute("PRAGMA mmap_size = 300000000");    // Memory-mapped I/O (~300MB)
     execute("PRAGMA temp_store = MEMORY");      // Temp tables in RAM
 #endif
@@ -411,7 +423,11 @@ void database::bind_value(sqlite3_stmt* stmt, int index, const column_value_t& v
         } else if constexpr (std::is_same_v<T, double>) {
             sqlite3_bind_double(stmt, index, v);
         } else if constexpr (std::is_same_v<T, std::string>) {
-            sqlite3_bind_text(stmt, index, v.c_str(), -1, SQLITE_TRANSIENT);
+            // Preserve every UTF-8 byte, including embedded NULs. Keep the
+            // existing unchecked bind-return policy; error custody is separate.
+            sqlite3_bind_text64(stmt, index, v.c_str(),
+                                static_cast<sqlite3_uint64>(v.size()),
+                                SQLITE_TRANSIENT, SQLITE_UTF8);
         } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
             if (v.empty()) {
                 sqlite3_bind_zeroblob(stmt, index, 0);
@@ -431,7 +447,9 @@ column_value_t database::extract_column(sqlite3_stmt* stmt, int index) {
             return sqlite3_column_double(stmt, index);
         case SQLITE_TEXT: {
             const char* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, index));
-            return std::string(text ? text : "");
+            if (!text) return std::string{};  // Preserve conversion-failure fallback.
+            const int size = sqlite3_column_bytes(stmt, index);
+            return std::string(text, static_cast<size_t>(size));
         }
         case SQLITE_BLOB: {
             const void* data = sqlite3_column_blob(stmt, index);

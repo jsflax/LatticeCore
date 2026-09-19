@@ -23,6 +23,17 @@ public:
 
 class database {
     friend class lattice_db;
+    // Only database can create the key. The keyed overload is accessible to
+    // make_shared so a keeper retains its single allocation.
+    class initialization_key {
+        friend class database;
+        const bool keeper_cache_;
+        explicit initialization_key(bool keeper_cache) : keeper_cache_(keeper_cache) {}
+    public:
+        initialization_key(const initialization_key&) = default;
+    };
+    static std::shared_ptr<database> make_read_keeper(const std::string& path,
+                                                    int busy_timeout_ms);
     // The update hook may query globalId through database::query(). That
     // nested query must not drain a prior row's dirty state while the outer
     // SQLite statement still owns its connection mutex. Track the actual
@@ -76,6 +87,9 @@ public:
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
                       int busy_timeout_ms = kDefaultBusyTimeoutMs);
+    // Private construction capability; callers cannot manufacture the key.
+    database(const std::string& path, open_mode mode, int busy_timeout_ms,
+             initialization_key key);
     ~database();
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.

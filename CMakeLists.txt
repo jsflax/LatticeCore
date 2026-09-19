@@ -193,6 +193,7 @@ target_link_libraries(gtest_main PUBLIC gtest)
 add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0Tests.cpp
     Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp
+    Tests/LatticeCoreTests/ExactVectorRowsTests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp

@@ -469,6 +469,14 @@ private:
                           std::set<std::string>& visited, void* out_json);
     link_list list_backing(const std::string& name) const;
 
+    // Exact hydration already owns the parent through its ref. Avoid a cache
+    // lookup (and cache/SQLite lock edge) while the exact writer lease is held.
+    dynamic_object(const managed<swift_dynamic_object>& object,
+                   std::shared_ptr<swift_lattice> owner) : lattice(std::move(owner)) {
+        if (!lattice) throw db_error("exact managed object has no owning lattice");
+        new (&managed_) managed<swift_dynamic_object>(object);
+    }
+
     union {
         swift_dynamic_object unmanaged_;
         managed<swift_dynamic_object> managed_;
@@ -779,6 +787,7 @@ public:
 private:
     dynamic_object_ref() = default;
 
+    friend class exact_vector_live_result; // nonallocating legacy failure value
     friend struct dynamic_object;
     friend struct swift_lattice;
     friend struct link_list;

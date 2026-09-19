@@ -2,6 +2,7 @@
 // This file kept for potential non-template implementations
 
 #include "lattice/lattice.hpp"
+#include "lattice/exact_vector_rows.hpp"
 #include "lattice/ipc.hpp"
 #include <cstdlib>
 #include <set>
@@ -49,6 +50,38 @@ bool detail::managed_route_scope::active_for(const lattice_db* owner) noexcept {
     for (auto* frame = current_; frame; frame = frame->previous_)
         if (frame->owner_ == owner) return true;
     return false;
+}
+
+void detail::managed_route_scope::admit(database* db, lattice_db* owner,
+                                       sqlite3_mutex* mutex, bool drain) noexcept {
+    db_ = db;
+    owner_ = owner;
+    mutex_ = mutex;
+    drain_on_exit_ = drain;
+    exceptions_ = std::uncaught_exceptions();
+    previous_ = current_;
+    owner_->active_managed_attachment_operations_.fetch_add(1, std::memory_order_acq_rel);
+    current_ = this;
+}
+
+detail::managed_route_scope::managed_route_scope(lattice_db& owner,
+                                                std::shared_ptr<database> writer)
+    : writer_owner_(std::move(writer)) {
+    if (!writer_owner_ || !writer_owner_->internal_handle())
+        throw db_error("exact read writer unavailable");
+    auto* mutex = sqlite3_db_mutex(writer_owner_->internal_handle());
+#ifndef __EMSCRIPTEN__
+    if (!mutex) throw db_error("exact read requires a serialized writer");
+#endif
+    sqlite3_mutex_enter(mutex);
+    try {
+        if (owner.closed_.load() || writer_owner_->is_closed())
+            throw db_error("exact read writer is closed");
+        admit(writer_owner_.get(), &owner, mutex, false);
+    } catch (...) {
+        sqlite3_mutex_leave(mutex);
+        throw;
+    }
 }
 
 detail::managed_route_scope::managed_route_scope(database* db, lattice_db* owner,
@@ -117,13 +150,7 @@ detail::managed_route_scope::managed_route_scope(database* db, lattice_db* owner
             if (error || canonical.string() != current->filename)
                 throw db_error("managed field: attachment physical database changed");
         }
-        db_ = db;
-        owner_ = owner;
-        mutex_ = mutex;
-        exceptions_ = std::uncaught_exceptions();
-        previous_ = current_;
-        owner_->active_managed_attachment_operations_.fetch_add(1, std::memory_order_acq_rel);
-        current_ = this;
+        admit(db, owner, mutex, true);
     } catch (...) {
         sqlite3_mutex_leave(mutex);
         throw;
@@ -141,7 +168,90 @@ detail::managed_route_scope::~managed_route_scope() noexcept(false) {
     if (vector_gate_.owns_lock()) vector_gate_.unlock();
     // Nested scopes leave delivery to their outer successful scope. A failed
     // operation retains the existing query/update exception-tail behavior.
-    if (std::uncaught_exceptions() == exceptions_) db_->drain_if_settled();
+    if (drain_on_exit_ && std::uncaught_exceptions() == exceptions_) db_->drain_if_settled();
+}
+
+std::unique_ptr<detail::exact_vector_read_lease> lattice_db::acquire_exact_vector_read() {
+    std::shared_ptr<database> writer;
+    uint64_t revision;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        writer = db_;
+        revision = connection_revision_;
+    }
+    return std::unique_ptr<detail::exact_vector_read_lease>(
+        new detail::exact_vector_read_lease(*this, std::move(writer), revision));
+}
+
+detail::exact_vector_read_lease::exact_vector_read_lease(
+    lattice_db& owner, std::shared_ptr<database> writer, uint64_t revision)
+    : scope_(owner, std::move(writer)), owner_(&owner) {
+    {
+        // Attach takes topology then waits for SQLite. Never wait in the
+        // inverse direction; destruction unwinds the active frame on failure.
+        std::unique_lock<std::mutex> topology(owner.attach_mutex_, std::try_to_lock);
+        if (!topology.owns_lock()) throw exact_vector_busy("exact read attachment topology is busy");
+        {
+            std::lock_guard<std::mutex> publication(owner.connection_ownership_mutex_);
+            if (owner.connection_revision_ != revision || owner.db_ != scope_.writer_owner_)
+                throw exact_vector_busy("exact read writer was replaced before admission");
+        }
+        if (owner.closed_.load() || !owner.attachment_topology_valid_)
+            throw exact_vector_schema_error("exact read attachment topology is unavailable");
+        arms_.push_back({"main", 0, {}, {}});
+        auto view = std::atomic_load(&owner.managed_attachment_view_);
+        const std::weak_ptr<database> captured(scope_.writer_owner_);
+        for (const auto& [alias, path] : owner.attached_dbs_) {
+            auto token = owner.attached_route_tokens_.find(alias);
+            if (token == owner.attached_route_tokens_.end() || token->second <= 0)
+                throw exact_vector_schema_error("exact read attachment generation is unavailable");
+            const lattice_db::managed_attachment_binding* binding = nullptr;
+            if (view) for (const auto& candidate : *view) {
+                if (candidate->alias == alias && candidate->token == token->second &&
+                    candidate->valid.load(std::memory_order_acquire) &&
+                    !candidate->writer.owner_before(captured) && !captured.owner_before(candidate->writer)) {
+                    binding = candidate.get();
+                    break;
+                }
+            }
+            if (!binding) throw exact_vector_schema_error("exact read attachment binding is stale");
+            auto metadata = owner.attached_route_metadata_.find(token->second);
+            arms_.push_back({alias, token->second,
+                metadata == owner.attached_route_metadata_.end() ? nullptr : metadata->second,
+                binding->filename});
+        }
+    }
+    if (connection().is_in_transaction() &&
+        owner.txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id())
+        throw exact_vector_busy("exact read refuses a foreign or unowned writer transaction");
+    // No topology/publication lock crosses metadata SQL or authorizer calls.
+    // The writer prevents physical DDL/rebind on this connection until exit;
+    // typed detach may invalidate a token concurrently, making returned live
+    // fields stale without changing the admitted physical statement's target.
+    auto databases = exact_vector_rows_access::collect(connection(), {"PRAGMA database_list", {}});
+    std::set<std::string> actual;
+    for (const auto& row : databases) {
+        auto name = row.find("name");
+        if (name == row.end() || !std::holds_alternative<std::string>(name->second))
+            throw exact_vector_schema_error("exact read invalid database metadata");
+        const auto& schema = std::get<std::string>(name->second);
+        if (schema != "temp") actual.insert(schema);
+    }
+    if (actual.size() != arms_.size())
+        throw exact_vector_schema_error("exact read has untracked physical attachments");
+    for (const auto& arm : arms_) {
+        if (!actual.count(arm.schema))
+            throw exact_vector_schema_error("exact read attachment is missing");
+        if (arm.schema == "main") continue;
+        const char* filename = sqlite3_db_filename(connection().internal_handle(), arm.schema.c_str());
+        if (!filename) throw exact_vector_schema_error("exact read attachment is missing");
+        if (std::string(filename) != arm.filename) {
+            std::error_code error;
+            const auto canonical = *filename ? std::filesystem::weakly_canonical(filename, error) : std::filesystem::path{};
+            if (error || canonical.string() != arm.filename)
+                throw exact_vector_schema_error("exact read attachment physical database changed");
+        }
+    }
 }
 
 void lattice_db::publish_managed_attachment(const std::string& alias, const std::string& path,

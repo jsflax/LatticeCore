@@ -3,6 +3,7 @@
 #include "log.hpp"
 #include "types.hpp"
 #include "db.hpp"
+#include "exact_vector_owned.hpp"
 #include "projection.hpp"
 #include "schema.hpp"
 #include "managed.hpp"
@@ -5946,7 +5947,40 @@ protected:
     // Topology changes publish under attach_mutex_; invalidation is allocation
     // free and precedes the first DETACH side effect, including failed DETACH.
     friend class detail::managed_route_scope;
+    friend class detail::exact_vector_read_lease;
     friend struct managed_attachment_test_access;
+    friend struct exact_vector_owned_test_access;
+    std::unique_ptr<detail::exact_vector_read_lease> acquire_exact_vector_read();
+
+    template<typename T>
+    managed<T> hydrate_exact_row(const database::row_t& row,
+        const std::string& table_name, const detail::exact_vector_read_lease& lease) {
+        if (lease.owner_ != this) throw db_error("exact row belongs to another owner");
+        const auto id = row.find("id"), gid = row.find("globalId");
+        // Zero is the existing managed-wrapper sentinel for an unbound row.
+        // SQLite permits an explicit INTEGER PRIMARY KEY of zero, but turning
+        // it into a live handle would silently use the unmanaged value path.
+        if (id == row.end() || !std::holds_alternative<int64_t>(id->second) ||
+            std::get<int64_t>(id->second) == 0 || gid == row.end() ||
+            !std::holds_alternative<std::string>(gid->second))
+            throw db_error("exact row identity cannot be represented by a live managed handle");
+        const auto source = row.find("_source"), token = row.find("_lattice_attach_token");
+        if (source == row.end() || token == row.end() ||
+            !std::holds_alternative<std::string>(source->second) ||
+            !std::holds_alternative<int64_t>(token->second))
+            throw db_error("exact row has no physical provenance");
+        bool authentic = false;
+        for (const auto& arm : lease.arms()) {
+            const auto encoded = arm.schema == "main" ? arm.schema : managed_quote_identifier(arm.schema);
+            if (encoded == std::get<std::string>(source->second) &&
+                arm.attachment_token == std::get<int64_t>(token->second)) {
+                authentic = true;
+                break;
+            }
+        }
+        if (!authentic) throw db_error("exact row has unrecognized physical provenance");
+        return hydrate_bound<T>(row, table_name, &lease.writer());
+    }
     struct managed_attachment_binding {
         std::string alias, filename;
         int64_t token;
@@ -7725,6 +7759,15 @@ protected:
     // Hydrate with explicit table name (for dynamic objects like swift_dynamic_object)
     template<typename T>
     managed<T> hydrate(const database::row_t& row, const std::string& table_name) {
+        return hydrate_bound<T>(row, table_name, nullptr);
+    }
+
+private:
+    // The ordinary path retains its existing writer binding. Exact selection
+    // supplies its admitted writer explicitly; never re-read owner db_ there.
+    template<typename T>
+    managed<T> hydrate_bound(const database::row_t& row, const std::string& table_name,
+                            const std::shared_ptr<database>* exact_writer) {
         managed<T> obj;
 
         // Set base properties
@@ -7757,16 +7800,21 @@ protected:
                 // Capture pointer + weak identity from one writer publication.
                 // Include missing-token rows so access fails as an invalid
                 // managed route instead of silently becoming unmanaged.
-                std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-                auto writer = db_;
-                obj.db_ = writer.get();
-                obj.attachment_writer_ = writer;
+                if (exact_writer) {
+                    obj.db_ = exact_writer->get();
+                    obj.attachment_writer_ = *exact_writer;
+                } else {
+                    std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+                    auto writer = db_;
+                    obj.db_ = writer.get();
+                    obj.attachment_writer_ = writer;
+                }
             } else {
                 // Main hydration retains its existing inexpensive path.
-                obj.db_ = db_.get();
+                obj.db_ = exact_writer ? exact_writer->get() : db_.get();
             }
         } else {
-            obj.db_ = db_.get();
+            obj.db_ = exact_writer ? exact_writer->get() : db_.get();
             obj.table_name_ = table_name;
         }
 

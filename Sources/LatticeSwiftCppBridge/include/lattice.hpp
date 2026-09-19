@@ -17,6 +17,7 @@
 #include <dynamic_object.hpp>
 #include <bulk_mutation.hpp>
 #include <projection.hpp>
+#include <exact_vector.hpp>
 #include <list.hpp>
 #include <error.hpp>
 
@@ -675,6 +676,10 @@ private:
     /// snapshot existed. Enumerates user tables from sqlite_master, reads column
     /// types via PRAGMA table_info, and detects link / vec / fts / geo sidecars.
     SchemaVector reconstruct_swift_schema_fallback();
+    friend struct exact_vector_owned_test_access;
+    friend class swift_lattice_ref;
+    exact_vector_live_result exact_nearest_rows(const exact_vector_request&,
+        const std::shared_ptr<swift_lattice>& owner) noexcept;
     // Stored schemas for hydration
     std::unordered_map<std::string, SwiftSchema> schemas_;
     // Immutable source-only schemas, owned by one attachment lifetime.
@@ -3885,6 +3890,15 @@ public:
     int64_t apply_selected_mutations(const selected_mutation_batch& batch) const
         SWIFT_NAME(applySelectedMutations(_:)) {
         return sealed([&] { return impl().apply_selected_mutations(batch); });
+    }
+
+    exact_vector_live_result exact_nearest_rows(const exact_vector_request& request) const noexcept
+        SWIFT_NAME(exactNearestRows(_:)) {
+        const auto parent = impl_;
+        if (parent) return parent->exact_nearest_rows(request, parent);
+        exact_vector_live_result result;
+        result.fail(exact_vector_status::database_failure, "exact read has no lattice");
+        return result;
     }
 
     // Transactions — begin_transaction throws db_error when the busy

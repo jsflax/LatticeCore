@@ -54,11 +54,13 @@ class lattice_db;
 class database;
 namespace detail {
 struct exact_vector_rows_access;
+class exact_vector_read_lease;
 
 // One ordinary attached-field operation. Main/manual database fields keep
 // their existing path. The implementation never acquires a topology mutex
 // beneath SQLite; it validates the published generation while holding SQLite.
 class managed_route_scope {
+    friend class exact_vector_read_lease;
     database* db_ = nullptr;
     std::shared_ptr<database> writer_owner_;
     lattice_db* owner_ = nullptr;
@@ -66,7 +68,12 @@ class managed_route_scope {
     std::unique_lock<std::recursive_timed_mutex> vector_gate_;
     managed_route_scope* previous_ = nullptr;
     int exceptions_ = 0;
+    bool drain_on_exit_ = true;
     static thread_local managed_route_scope* current_;
+    void admit(database*, lattice_db*, sqlite3_mutex*, bool drain) noexcept;
+    // Owned exact reads share TLS/publication admission without draining a
+    // prior write's callbacks. Only the private read lease can use this path.
+    managed_route_scope(lattice_db&, std::shared_ptr<database>);
 public:
     managed_route_scope(database*, lattice_db*, const std::string& table,
                         int64_t token, const std::weak_ptr<database>& writer,
@@ -83,6 +90,7 @@ class database {
     friend class lattice_db;
     friend struct detail::exact_vector_rows_access;
     friend class detail::managed_route_scope;
+    friend class detail::exact_vector_read_lease;
     // Only database can construct this key. The keyed overload remains
     // accessible to make_shared so keepers retain its single allocation.
     class initialization_key {

@@ -95,6 +95,7 @@ add_library(LatticeSwiftCppBridge STATIC
     Sources/LatticeSwiftCppBridge/src/lattice.cpp
     Sources/LatticeSwiftCppBridge/src/bulk_mutation.cpp
     Sources/LatticeSwiftCppBridge/src/projection.cpp
+    Sources/LatticeSwiftCppBridge/src/exact_vector.cpp
     Sources/LatticeSwiftCppBridge/src/dynamic_object.cpp
     Sources/LatticeSwiftCppBridge/src/managed_object.cpp
     Sources/LatticeSwiftCppBridge/src/unmanaged_object.cpp
@@ -194,6 +195,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0Tests.cpp
     Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp
     Tests/LatticeCoreTests/ExactVectorRowsTests.cpp
+    Tests/LatticeCoreTests/ExactVectorOwnedRowsTests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp

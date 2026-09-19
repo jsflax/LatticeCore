@@ -1,4 +1,7 @@
 #include "TestHelpers.hpp"
+#include "ManagedAttachmentTestSupport.hpp"
+#include <chrono>
+#include <future>
 #include <lattice.hpp>
 #include <bulk_mutation.hpp>
 #include <limits>
@@ -398,6 +401,8 @@ TEST(BulkMutation, FailedDetachInvalidatesOldRouteAndRetryRestoresFreshRows) {
         }, nullptr);
     EXPECT_FALSE(main.core().detach(attached.core()));
     sqlite3_set_authorizer(main.core().db().handle(), nullptr, nullptr);
+    EXPECT_THROW(rows[0]->get()->get_int("count"), db_error);
+    EXPECT_THROW(rows[0]->get()->set_int("count", 99), db_error);
     main.core().begin_transaction();
     EXPECT_THROW(main.core().apply_selected_mutations(old_batch), std::runtime_error);
     main.core().rollback();
@@ -408,6 +413,255 @@ TEST(BulkMutation, FailedDetachInvalidatesOldRouteAndRetryRestoresFreshRows) {
     EXPECT_EQ(main.core().apply_selected_mutations(increment(*fresh[0])), 1);
     main.core().commit();
     EXPECT_EQ(attached.count(), 9);
+}
+
+TEST(ManagedAttachmentLifetime, AuthorizerCanReadButCannotChangeTopologyOrWriteVectors) {
+    BatchDB main("scalar_authorizer_main"), attached("scalar_authorizer_arm");
+    main.add(1);
+    auto local = main.rows();
+    attached.add(8);
+    ASSERT_TRUE(main.core().attach(attached.core()));
+    auto rows = main.rows();
+    ASSERT_EQ(rows.size(), 2u);
+    auto vector = managed_attachment_test_access::field<std::vector<uint8_t>>(*local[0], "count");
+    vector.is_vector_column = true; // A MAIN field on the same writer.
+    struct State {
+        BatchDB* main;
+        BatchDB* attached;
+        dynamic_object_ref* row;
+        managed<std::vector<uint8_t>>* vector;
+        bool entered = false, nested_read = false, topology_rejected = false;
+        bool vector_rejected = false, callback_failed = false;
+    } state{&main, &attached, rows[1].get(), &vector};
+    auto* raw = main.core().db().handle();
+    struct Reset { sqlite3* raw; ~Reset() { sqlite3_set_authorizer(raw, nullptr, nullptr); } } reset{raw};
+    ASSERT_EQ(sqlite3_set_authorizer(raw,
+        [](void* opaque, int action, const char*, const char*, const char*, const char*) noexcept {
+            auto& s = *static_cast<State*>(opaque);
+            if (action != SQLITE_READ || s.entered) return SQLITE_OK;
+            s.entered = true;
+            try {
+                s.nested_read = s.row->get()->get_int("count") == 8;
+                // The bridge seals the native rejection within this C frame.
+                s.topology_rejected = !s.main->core().detach(s.attached->core());
+                try { s.vector->set_value({0, 0, 0, 0}); }
+                catch (const db_error&) { s.vector_rejected = true; }
+            } catch (...) { s.callback_failed = true; return SQLITE_DENY; }
+            return SQLITE_OK;
+        }, &state), SQLITE_OK);
+    EXPECT_EQ(rows[1]->get_int("count"), 8);
+    EXPECT_TRUE(state.nested_read);
+    EXPECT_TRUE(state.topology_rejected);
+    EXPECT_TRUE(state.vector_rejected);
+    EXPECT_FALSE(state.callback_failed);
+    ASSERT_EQ(sqlite3_set_authorizer(raw, nullptr, nullptr), SQLITE_OK);
+    last_bridge_error().clear();
+    EXPECT_EQ(main.count(), 1);
+    EXPECT_EQ(attached.count(), 8);
+    ASSERT_TRUE(main.core().detach(attached.core()));
+}
+
+TEST(ManagedAttachmentLifetime, SettledTailReleasesWriterAndAllowsTopologyReentry) {
+    auto main = make_batch_ref(swift_configuration(":memory:"), batch_schemas());
+    main->get()->stop_audit_maintenance();
+    BatchDB attached("scalar_settled_arm");
+    attached.add(8);
+    ASSERT_TRUE(main->get()->attach(attached.core()));
+    auto values = main->get()->objects("BulkItem");
+    ASSERT_EQ(values.size(), 1u);
+    dynamic_object_ref held(values[0]);
+    auto& db = main->get()->db();
+    auto* raw = db.handle();
+    int callbacks = 0;
+    bool mutex_was_free = false, detached = false, maintenance_refused = false;
+    struct Clear { database& db; ~Clear() { db.set_txn_hooks({}, {}); } } clear{db};
+    db.set_txn_hooks([&] {
+        ++callbacks;
+        EXPECT_FALSE(detail::managed_route_scope::active_for(&db));
+        // Try from another thread: recursive same-thread acquisition would
+        // not prove the added writer hold was released before delivery.
+        std::thread check([&] {
+            auto* mutex = sqlite3_db_mutex(raw);
+            mutex_was_free = sqlite3_mutex_try(mutex) == SQLITE_OK;
+            if (mutex_was_free) sqlite3_mutex_leave(mutex);
+        });
+        check.join();
+        // The route TLS frame is gone but its deferred tail still reads owner
+        // hook state. Maintenance must not replace that owner mid-delivery.
+        try { main->get()->reopen_write_db(); }
+        catch (const db_error&) { maintenance_refused = true; }
+        detached = main->get()->detach(attached.core());
+    }, [] {});
+    db.mark_txn_dirty();
+    EXPECT_EQ(held.get_int("count"), 8);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_TRUE(mutex_was_free);
+    EXPECT_TRUE(maintenance_refused);
+    EXPECT_TRUE(detached);
+    EXPECT_THROW(held.get()->get_int("count"), db_error);
+}
+
+TEST(ManagedAttachmentLifetime, AdmittedWriteRefusesWriterPublicationUntilItsHooksFinish) {
+    BatchDB main("scalar_publish_main"), attached("scalar_publish_arm");
+    main.core().stop_audit_maintenance();
+    attached.core().stop_audit_maintenance();
+    attached.add(8);
+    ASSERT_TRUE(main.core().attach(attached.core()));
+    auto rows = main.rows();
+    ASSERT_EQ(rows.size(), 1u);
+    auto field = managed_attachment_test_access::field<int64_t>(*rows[0], "count");
+    struct State {
+        BatchDB* main;
+        bool entered = false, reopen_refused = false, close_refused = false, failed = false;
+    } state{&main};
+    auto* raw = main.core().db().handle();
+    struct Reset { sqlite3* raw; ~Reset() { if (raw) sqlite3_set_authorizer(raw, nullptr, nullptr); } } reset{raw};
+    ASSERT_EQ(sqlite3_set_authorizer(raw,
+        [](void* opaque, int action, const char*, const char*, const char*, const char*) noexcept {
+            auto& s = *static_cast<State*>(opaque);
+            if (action != SQLITE_UPDATE || s.entered) return SQLITE_OK;
+            s.entered = true;
+            try {
+                // Both attempts occur after admission and before the UPDATE's
+                // hooks. They must refuse before pause/staging, not block on us.
+                std::thread maintenance([&] {
+                    try { s.main->core().reopen_write_db(); }
+                    catch (const db_error&) { s.reopen_refused = true; }
+                    catch (...) { s.failed = true; }
+                    try { s.main->core().close_write_db(); }
+                    catch (const db_error&) { s.close_refused = true; }
+                    catch (...) { s.failed = true; }
+                });
+                maintenance.join();
+            } catch (...) { s.failed = true; return SQLITE_DENY; }
+            return SQLITE_OK;
+        }, &state), SQLITE_OK);
+    EXPECT_NO_THROW(field = int64_t(9));
+    ASSERT_EQ(sqlite3_set_authorizer(raw, nullptr, nullptr), SQLITE_OK);
+    reset.raw = nullptr; // A successful reopen below destroys this old SQLite handle.
+    EXPECT_TRUE(state.entered);
+    EXPECT_TRUE(state.reopen_refused);
+    EXPECT_TRUE(state.close_refused);
+    EXPECT_FALSE(state.failed);
+    EXPECT_EQ(main.core().db().handle(), raw);
+    EXPECT_EQ(attached.count(), 9);
+    EXPECT_EQ(field.detach(), 9);
+    // Publication is allowed after SQL and delivery have both completed.
+    main.core().reopen_write_db();
+    EXPECT_TRUE(field.attachment_writer.expired());
+    EXPECT_THROW(field.detach(), db_error);
+    auto fresh = main.rows();
+    ASSERT_EQ(fresh.size(), 1u);
+    EXPECT_EQ(fresh[0]->get_int("count"), 9);
+}
+
+TEST(ManagedAttachmentLifetime, ThrowingSettledTailReleasesPublicationAdmission) {
+    auto main = make_batch_ref(swift_configuration(":memory:"), batch_schemas());
+    main->get()->stop_audit_maintenance();
+    BatchDB attached("scalar_throwing_tail_arm");
+    attached.add(8);
+    ASSERT_TRUE(main->get()->attach(attached.core()));
+    auto values = main->get()->objects("BulkItem");
+    ASSERT_EQ(values.size(), 1u);
+    dynamic_object_ref held(values[0]);
+    auto& db = main->get()->db();
+    db.set_txn_hooks([] { throw std::runtime_error("test settled callback"); }, [] {});
+    db.mark_txn_dirty();
+    EXPECT_THROW(held.get()->get_int("count"), std::runtime_error);
+    db.set_txn_hooks({}, {});
+    EXPECT_FALSE(detail::managed_route_scope::active_for(&db));
+    // Expired field provenance is safe even though db's old raw address may
+    // later be reused; the captured weak control block never changes.
+    EXPECT_NO_THROW(main->get()->reopen_write_db());
+    EXPECT_THROW(held.get()->get_int("count"), db_error);
+}
+
+TEST(ManagedAttachmentLifetime, WriterContentionWaitsAndInvalidProvenanceFailsClosed) {
+    BatchDB main("scalar_wait_main"), attached("scalar_wait_arm");
+    attached.add(8);
+    ASSERT_TRUE(main.core().attach(attached.core()));
+    auto rows = main.rows();
+    ASSERT_EQ(rows.size(), 1u);
+    auto field = managed_attachment_test_access::field<int64_t>(*rows[0], "count");
+    auto* mutex = sqlite3_db_mutex(main.core().db().handle());
+    std::promise<void> started;
+    auto entered = started.get_future();
+    sqlite3_mutex_enter(mutex);
+    auto read = std::async(std::launch::async, [&] {
+        started.set_value();
+        return field.detach();
+    });
+    entered.wait();
+    // Give an incorrect try-lock/default implementation time to complete
+    // while contention is still held. This is bounded, not a scheduler proof.
+    const auto pending = read.wait_for(std::chrono::milliseconds(100));
+    sqlite3_mutex_leave(mutex);
+    EXPECT_EQ(pending, std::future_status::timeout);
+    EXPECT_EQ(read.get(), 8) << "valid contention must not become a busy/default result";
+    for (int64_t token : {int64_t(0), int64_t(-1)}) {
+        auto missing = field;
+        missing.attachment_token = token;
+        EXPECT_THROW(missing.detach(), db_error);
+    }
+    auto expired = field;
+    expired.attachment_writer.reset();
+    EXPECT_THROW(expired.detach(), db_error);
+    EXPECT_EQ(field.detach(), 8);
+}
+
+TEST(ManagedAttachmentLifetime, DetachInvalidationCannotRebindAnAdmittedRead) {
+    BatchDB main("scalar_interleave_main"), attached("scalar_interleave_arm");
+    attached.add(8);
+    ASSERT_TRUE(main.core().attach(attached.core()));
+    auto rows = main.rows();
+    ASSERT_EQ(rows.size(), 1u);
+    auto field = managed_attachment_test_access::field<int64_t>(*rows[0], "count");
+    struct State {
+        BatchDB* main;
+        BatchDB* attached;
+        int64_t token;
+        std::thread mutator;
+        bool entered = false, saw_invalidation = false, callback_failed = false;
+        bool detached = false, reattached = false;
+    } state{&main, &attached, field.attachment_token};
+    auto* raw = main.core().db().handle();
+    struct Reset {
+        sqlite3* raw; State& state;
+        ~Reset() {
+            sqlite3_set_authorizer(raw, nullptr, nullptr);
+            if (state.mutator.joinable()) state.mutator.join();
+        }
+    } reset{raw, state};
+    ASSERT_EQ(sqlite3_set_authorizer(raw,
+        [](void* opaque, int action, const char*, const char*, const char*, const char*) noexcept {
+            auto& s = *static_cast<State*>(opaque);
+            if (action != SQLITE_READ || s.entered) return SQLITE_OK;
+            s.entered = true;
+            try {
+                s.mutator = std::thread([&s] {
+                    s.detached = s.main->core().detach(s.attached->core());
+                    s.reattached = s.main->core().attach(s.attached->core());
+                });
+                // DETACH invalidates before waiting for this statement's
+                // writer mutex. Wait for that exact state, without a sleep.
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (managed_attachment_test_access::live(s.main->core(), s.token) &&
+                       std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+                s.saw_invalidation = !managed_attachment_test_access::live(s.main->core(), s.token);
+            } catch (...) { s.callback_failed = true; return SQLITE_DENY; }
+            return SQLITE_OK;
+        }, &state), SQLITE_OK);
+    EXPECT_EQ(field.detach(), 8) << "the admitted SQL finishes on A before physical detach";
+    ASSERT_EQ(sqlite3_set_authorizer(raw, nullptr, nullptr), SQLITE_OK);
+    if (state.mutator.joinable()) state.mutator.join();
+    EXPECT_TRUE(state.saw_invalidation);
+    EXPECT_FALSE(state.callback_failed);
+    EXPECT_TRUE(state.detached);
+    EXPECT_TRUE(state.reattached);
+    EXPECT_THROW(field.detach(), db_error);
+    auto fresh = main.rows();
+    ASSERT_EQ(fresh.size(), 1u);
+    EXPECT_EQ(fresh[0]->get_int("count"), 8);
 }
 
 TEST(BulkMutation, AttachmentRejectsReservedMetadataColumnsBeforeSideEffects) {

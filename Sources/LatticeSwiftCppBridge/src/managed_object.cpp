@@ -13,7 +13,7 @@ void managed<swift_dynamic_object>::set_nil(const std::string& name) {
         m.assign(this->db_,
                  this->lattice_,
                  this->table_name_,
-                 name, this->id_);
+                 name, this->id_, this->attachment_token_, this->attachment_writer_);
         auto base = static_cast<model_base>(*this);
         m.bind_to_parent(&base, property_desc);
         m = nullptr;
@@ -22,7 +22,7 @@ void managed<swift_dynamic_object>::set_nil(const std::string& name) {
         m.assign(this->db_,
                  this->lattice_,
                  this->table_name_,
-                 name, this->id_);
+                 name, this->id_, this->attachment_token_, this->attachment_writer_);
         m.set_nil();
     }
 }
@@ -51,7 +51,7 @@ swift_dynamic_object managed<swift_dynamic_object>::detach() const {
                     case column_type::integer:
                         if (desc.nullable) {
                             managed<std::optional<int64_t>> m;
-                            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+                            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
                             if (m.has_value()) {
                                 s.set_int(name, m.detach().value());
                             }
@@ -62,7 +62,7 @@ swift_dynamic_object managed<swift_dynamic_object>::detach() const {
                     case column_type::real:
                         if (desc.nullable) {
                             managed<std::optional<double>> m;
-                            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+                            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
                             if (m.has_value()) {
                                 s.set_double(name, m.detach().value());
                             }
@@ -73,7 +73,7 @@ swift_dynamic_object managed<swift_dynamic_object>::detach() const {
                     case column_type::text:
                         if (desc.nullable) {
                             managed<std::optional<std::string>> m;
-                            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+                            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
                             if (m.has_value()) {
                                 s.set_string(name, m.detach().value());
                             }
@@ -83,7 +83,7 @@ swift_dynamic_object managed<swift_dynamic_object>::detach() const {
                         break;
                     case column_type::blob: {
                         managed<std::optional<std::vector<uint8_t>>> m;
-                        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+                        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
                         if (m.has_value()) {
                             s.set_blob(name, m.detach().value());
                         }

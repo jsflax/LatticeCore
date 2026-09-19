@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "ManagedAttachmentTestSupport.hpp"
 #include <lattice.hpp>
 #include <geo_bounds.hpp>
 
@@ -73,6 +74,125 @@ int64_t physical_count(lattice::swift_lattice& owner, const std::string& table) 
     return std::get<int64_t>(owner.db().query("SELECT COUNT(*) AS n FROM " + table)[0].at("n"));
 }
 } // namespace
+
+TEST(ManagedAttachmentLifetime, AliasReplacementRejectsLiveScalarsAndHeldFieldCopies) {
+    TempDB main_path("scalar_lifetime_main"), arm_path("scalar_lifetime_\"arm");
+    auto main = route_ref(main_path.str()), arm = route_ref(arm_path.str());
+    main->get()->stop_audit_maintenance();
+    arm->get()->stop_audit_maintenance();
+    auto local = add_route_item(*main, "local", 60);
+    auto original = add_route_item(*arm, "original", 2);
+    ASSERT_TRUE(main->get()->attach(*arm->get()));
+    auto values = main->get()->objects("ManagedRouteItem", std::string("name = 'original'"));
+    ASSERT_EQ(values.size(), 1u);
+    dynamic_object_ref held(values[0]);
+    auto count = managed_attachment_test_access::field<int64_t>(held, "count");
+    auto optional = managed_attachment_test_access::field<std::optional<std::string>>(held, "optionalText");
+    auto bytes = managed_attachment_test_access::field<std::vector<uint8_t>>(held, "bytes");
+    auto bounds = managed_attachment_test_access::field<geo_bounds>(held, "location");
+    auto optional_bounds = managed_attachment_test_access::field<std::optional<geo_bounds>>(held, "location");
+    EXPECT_EQ(count.detach(), 1);
+    EXPECT_TRUE(optional.has_value());
+    EXPECT_EQ(bytes.detach(), (std::vector<uint8_t>{1}));
+    EXPECT_DOUBLE_EQ(bounds.detach().min_lat, 2);
+    EXPECT_TRUE(optional_bounds.detach().has_value());
+    held.enable_row_cache();
+    ASSERT_TRUE(main->get()->detach(*arm->get()));
+    struct Directory {
+        std::filesystem::path path;
+        explicit Directory(std::filesystem::path value) : path(std::move(value)) {
+            std::filesystem::create_directory(path);
+        }
+        ~Directory() { std::filesystem::remove_all(path); }
+    } directory(arm_path.str() + "-replacement");
+    auto replacement = route_ref((directory.path / arm_path.path.filename()).string());
+    auto remote = add_route_item(*replacement, "replacement", 9);
+    remote->set_int("count", 71);
+    ASSERT_TRUE(main->get()->attach(*replacement->get()));
+    ASSERT_EQ(held.managed_primary_key(), remote->managed_primary_key());
+    // Same UUID and row id do not revive the old attachment generation.
+    EXPECT_EQ(held.get_string("name"), "original") << "explicit cache hits remain snapshots";
+    EXPECT_THROW(held.get()->get_int("count + 0"), db_error) << "cache misses remain guarded live reads";
+    held.refresh_row_cache();
+    EXPECT_EQ(held.get_string("name"), "original") << "refresh must not import replacement values";
+    held.disable_row_cache();
+    EXPECT_THROW(held.get()->get_int("count"), db_error);
+    EXPECT_THROW(held.get()->get_string("name"), db_error);
+    EXPECT_THROW(held.get()->has_value("optionalText"), db_error);
+    EXPECT_THROW(held.get()->set_int("count", 99), db_error);
+    EXPECT_THROW(held.get()->set_nil("optionalText"), db_error);
+    EXPECT_THROW(held.get()->increment_int_field("count", 1), db_error);
+    EXPECT_THROW(count.detach(), db_error);
+    EXPECT_THROW(count = int64_t(99), db_error);
+    EXPECT_THROW(optional.has_value(), db_error);
+    EXPECT_THROW(optional.set_nil(), db_error);
+    EXPECT_THROW(bytes.detach(), db_error);
+    bytes.is_vector_column = true;
+    const auto tables_before = physical_count(*main->get(), "main.sqlite_master");
+    EXPECT_THROW(bytes.set_value(std::vector<uint8_t>{0, 0, 0, 0}), db_error);
+    EXPECT_EQ(physical_count(*main->get(), "main.sqlite_master"), tables_before)
+        << "stale vector route must fail before sidecar creation";
+    EXPECT_THROW(bounds.detach(), db_error);
+    EXPECT_THROW(optional_bounds.detach(), db_error);
+    auto fresh_values = main->get()->objects("ManagedRouteItem", std::string("name = 'replacement'"));
+    ASSERT_EQ(fresh_values.size(), 1u);
+    dynamic_object_ref fresh(fresh_values[0]);
+    EXPECT_EQ(fresh.get_int("count"), 71);
+    fresh.set_int("count", 72);
+    fresh.set_nil("optionalText");
+    fresh.set_data("bytes", {3, 4});
+    EXPECT_EQ(remote->get_int("count"), 72);
+    EXPECT_FALSE(remote->has_value("optionalText"));
+    EXPECT_EQ(remote->get_data("bytes"), (std::vector<uint8_t>{3, 4}));
+    EXPECT_EQ(original->get_int("count"), 1);
+    EXPECT_EQ(local->get_int("count"), 1);
+    local->set_int("count", 5);
+    EXPECT_EQ(local->get_int("count"), 5) << "pre-attach main fields stay live";
+    ASSERT_TRUE(main->get()->detach(*replacement->get()));
+}
+
+TEST(ManagedAttachmentLifetime, SameFileReattachAndWriterReopenNeverReviveFields) {
+    TempDB main_path("scalar_samefile_main"), arm_path("scalar_samefile_arm");
+    auto main = route_ref(main_path.str()), arm = route_ref(arm_path.str());
+    main->get()->stop_audit_maintenance();
+    arm->get()->stop_audit_maintenance();
+    auto original = add_route_item(*arm, "arm", 2);
+    ASSERT_TRUE(main->get()->attach(*arm->get()));
+    auto values = main->get()->objects("ManagedRouteItem");
+    ASSERT_EQ(values.size(), 1u);
+    dynamic_object_ref held(values[0]);
+    auto copy = managed_attachment_test_access::field<int64_t>(held, "count");
+    ASSERT_TRUE(main->get()->detach(*arm->get()));
+    ASSERT_TRUE(main->get()->attach(*arm->get()));
+    EXPECT_THROW(copy.detach(), db_error);
+    EXPECT_THROW(held.get()->get_int("count"), db_error);
+    auto fresh_values = main->get()->objects("ManagedRouteItem");
+    ASSERT_EQ(fresh_values.size(), 1u);
+    dynamic_object_ref fresh(fresh_values[0]);
+    auto fresh_copy = managed_attachment_test_access::field<int64_t>(fresh, "count");
+    EXPECT_EQ(fresh_copy.detach(), 1);
+    const auto old_writer = fresh_copy.attachment_writer;
+    main->get()->reopen_write_db();
+    EXPECT_TRUE(old_writer.expired()) << "held models/fields must not retain a retired SQLite connection";
+    EXPECT_THROW(fresh_copy.detach(), db_error);
+    auto reopened_values = main->get()->objects("ManagedRouteItem");
+    ASSERT_EQ(reopened_values.size(), 1u);
+    dynamic_object_ref reopened(reopened_values[0]);
+    EXPECT_EQ(reopened.get_int("count"), 1);
+    reopened.set_int("count", 4);
+    EXPECT_EQ(original->get_int("count"), 4);
+    auto retired = managed_attachment_test_access::field<int64_t>(reopened, "count");
+    main->get()->close_write_db();
+    EXPECT_TRUE(retired.attachment_writer.expired());
+    EXPECT_THROW(retired.detach(), db_error);
+    main->get()->reopen_write_db();
+    auto restored_values = main->get()->objects("ManagedRouteItem");
+    ASSERT_EQ(restored_values.size(), 1u);
+    dynamic_object_ref restored(restored_values[0]);
+    EXPECT_EQ(restored.get_int("count"), 4)
+        << "close_write/reopen must republish bindings from authoritative topology";
+    ASSERT_TRUE(main->get()->detach(*arm->get()));
+}
 
 TEST(ManagedPhysicalRoute, SQLRoutePreservesExplicitSchemasAndQuotesSidecars) {
     EXPECT_EQ(managed_table_sql("Item"), "main.\"Item\"");

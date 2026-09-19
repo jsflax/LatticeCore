@@ -4465,6 +4465,11 @@ public:
     /// same database again is a no-op; the same alias for a DIFFERENT path
     /// throws. Schema overlap is validated BEFORE any side effect — a
     /// mismatch throws with no dangling ATTACH and no half-created views.
+    /// Live scalar fields retain this typed attachment generation. Detach and
+    /// reattach never revive old fields, even for the same physical file.
+    /// Raw SQL topology changes do not participate in this lifetime contract.
+    /// SQLite callbacks must catch native exceptions; typed topology changes
+    /// and vector writes from an active attached scalar callback are rejected.
     /// Serialized against detach() by an internal mutex.
     void attach(lattice_db& lattice);
 
@@ -4863,8 +4868,8 @@ private:
     template<typename F>
     std::invoke_result_t<F> with_vec0_serialization(const char* operation,
                                                    bool allow_internal_nesting,
-                                                   F&& body) {
-        auto* connection = db_->internal_handle();
+                                                   F&& body, database* captured_writer = nullptr) {
+        auto* connection = (captured_writer ? captured_writer : db_.get())->internal_handle();
         if (!allow_internal_nesting) {
             for (auto* active = active_vec0_maintenance_; active; active = active->previous) {
                 if (active->connection == connection) {
@@ -4919,6 +4924,18 @@ public:
                            const std::string& column_name,
                            int dimensions,
                            int ivf_nlist = 0, int ivf_nprobe = 0) {
+        ensure_vec0_table_on(*db_, model_table, column_name, dimensions, ivf_nlist, ivf_nprobe);
+    }
+
+private:
+    friend struct managed<std::vector<uint8_t>>;
+    // Attached scalar admission pins this exact writer through sidecar SQL.
+    // Keep the existing serialization, maintenance frame and test hook phases;
+    // Preserve captured identity across writer maintenance; the route admission
+    // also excludes owner publication until SQL and deferred delivery complete.
+    void ensure_vec0_table_on(database& writer, const std::string& model_table,
+                             const std::string& column_name, int dimensions,
+                             int ivf_nlist = 0, int ivf_nprobe = 0) {
         with_vec0_serialization("ensure", true, [&] {
             // Strip schema prefix (e.g. "main.Memory" → "Memory") — vec0 tables
             // are always in the default schema, but hydrated objects from attached
@@ -4930,10 +4947,10 @@ public:
 
             // Check if table already exists
             std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
-            auto results = db_->query(check_sql, {vec_table});
+            auto results = writer.query(check_sql, {vec_table});
             if (!results.empty()) {
                 // Table exists — check if triggers need updating
-                auto trig = db_->query(
+                auto trig = writer.query(
                     "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='"
                     + vec_table + "_insert' LIMIT 1");
                 if (!trig.empty()) {
@@ -4945,9 +4962,9 @@ public:
                         return; // Trigger already has correct pattern
                     }
                     // Stale trigger — drop all vec0 triggers to recreate
-                    db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
-                    db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
-                    db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+                    writer.execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
+                    writer.execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
+                    writer.execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
                 }
                 // Fall through to recreate triggers
             }
@@ -4966,7 +4983,7 @@ public:
                     << ")";
                 LOG_INFO("ensure_vec0_table", "Creating IVF vec0 table: %s (dims=%d)", vec_table.c_str(), dimensions);
                 LOG_DEBUG("ensure_vec0_table", "SQL: %s", sql.str().c_str());
-                db_->execute(sql.str());
+                writer.execute(sql.str());
             }
 
             // Create triggers to keep vec0 in sync with main table.
@@ -4996,7 +5013,7 @@ public:
                            << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
                            << " WHERE global_id = NEW.globalId); "
                            << "END";
-            db_->execute(insert_trigger.str());
+            writer.execute(insert_trigger.str());
 
             // UPDATE trigger
             std::ostringstream update_trigger;
@@ -5012,7 +5029,7 @@ public:
                            << "WHERE NOT EXISTS (SELECT 1 FROM " << vec_table
                            << " WHERE global_id = NEW.globalId); "
                            << "END";
-            db_->execute(update_trigger.str());
+            writer.execute(update_trigger.str());
 
             // DELETE trigger
             std::ostringstream delete_trigger;
@@ -5021,10 +5038,11 @@ public:
                            << "BEGIN "
                            << "DELETE FROM " << vec_table << " WHERE global_id = OLD.globalId; "
                            << "END";
-            db_->execute(delete_trigger.str());
-        });
+            writer.execute(delete_trigger.str());
+        }, &writer);
     }
 
+public:
     /// Ensure an R*Tree virtual table exists for a geo_bounds column.
     /// Table name format: _{ModelTable}_{column}_rtree
     /// Also creates triggers to keep R*Tree in sync with main table.
@@ -5924,6 +5942,29 @@ protected:
     std::map<std::string, std::shared_ptr<const physical_store_identity>> attached_projection_identities_;
     bool attachment_topology_valid_ = true;
 
+    // Scalar admission reads this view only while holding its writer mutex.
+    // Topology changes publish under attach_mutex_; invalidation is allocation
+    // free and precedes the first DETACH side effect, including failed DETACH.
+    friend class detail::managed_route_scope;
+    friend struct managed_attachment_test_access;
+    struct managed_attachment_binding {
+        std::string alias, filename;
+        int64_t token;
+        std::weak_ptr<database> writer;
+        mutable std::atomic<bool> valid{true};
+        managed_attachment_binding(std::string a, std::string f, int64_t t, std::shared_ptr<database> w)
+            : alias(std::move(a)), filename(std::move(f)), token(t), writer(std::move(w)) {}
+    };
+    using managed_attachment_view = std::vector<std::shared_ptr<const managed_attachment_binding>>;
+    std::shared_ptr<const managed_attachment_view> managed_attachment_view_;
+    // Covers admitted SQL and its deferred tail. Writer maintenance refuses
+    // publication while nonzero; it never waits for callbacks under a mutex.
+    std::atomic<size_t> active_managed_attachment_operations_{0};
+    void publish_managed_attachment(const std::string& alias, const std::string& path,
+                                    int64_t token, const std::shared_ptr<database>& writer);
+    std::shared_ptr<const managed_attachment_view> managed_view_for_writer(
+        const std::shared_ptr<database>& writer) const;
+
     // Only these attachment helpers access database's private metadata funnel.
     static std::vector<std::string> attachment_column_names(
         database* db, const std::string& schema_sql, const std::string& table_name);
@@ -5945,6 +5986,10 @@ protected:
     void invalidate_attachment_route(const std::string& alias) noexcept {
         auto it = attached_route_tokens_.find(alias);
         if (it == attached_route_tokens_.end()) return;
+        if (auto view = std::atomic_load(&managed_attachment_view_)) {
+            for (const auto& route : *view)
+                if (route->token == it->second) route->valid.store(false, std::memory_order_release);
+        }
         attached_route_metadata_.erase(it->second);
         attached_route_tokens_.erase(it);
     }
@@ -7693,7 +7738,6 @@ protected:
             obj.global_id_ = std::get<std::string>(gid_it->second);
         }
 
-        obj.db_ = db_.get();
         obj.lattice_ = this;
 
         // If _source column present (from same-model UNION attach view),
@@ -7709,7 +7753,20 @@ protected:
                 std::get<int64_t>(token_it->second) > 0) {
                 obj.attachment_token_ = std::get<int64_t>(token_it->second);
             }
+            if (source_schema != "main") {
+                // Capture pointer + weak identity from one writer publication.
+                // Include missing-token rows so access fails as an invalid
+                // managed route instead of silently becoming unmanaged.
+                std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+                auto writer = db_;
+                obj.db_ = writer.get();
+                obj.attachment_writer_ = writer;
+            } else {
+                // Main hydration retains its existing inexpensive path.
+                obj.db_ = db_.get();
+            }
         } else {
+            obj.db_ = db_.get();
             obj.table_name_ = table_name;
         }
 
@@ -8939,11 +8996,18 @@ inline void managed<std::vector<uint8_t>>::ensure_vec0_for_blob(
 inline void managed<std::vector<uint8_t>>::set_value(const std::vector<uint8_t>& val) {
     unmanaged_value = val;
     if (!is_bound()) return;
+    detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer, is_vector_column);
 
     // If this is a vector column, ensure vec0 table + triggers exist
     // This handles the migration case where vec0 wasn't created initially
     if (is_vector_column) {
-        ensure_vec0_for_blob(lattice, table_name, column_name, val);
+        if (attachment_token > 0 && lattice) {
+            const int dimensions = static_cast<int>(val.size() / sizeof(float));
+            if (dimensions > 0)
+                lattice->ensure_vec0_table_on(*db, table_name, column_name, dimensions);
+        } else {
+            ensure_vec0_for_blob(lattice, table_name, column_name, val);
+        }
     }
 
     std::string sql = "UPDATE " + managed_table_sql(table_name) + " SET " + column_name + " = ? WHERE id = ?";

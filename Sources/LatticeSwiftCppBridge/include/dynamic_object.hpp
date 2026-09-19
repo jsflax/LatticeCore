@@ -335,10 +335,14 @@ public:
         if (lattice) {
             auto* db = managed_.db_;
             if (!db) return;
+            {
+            detail::managed_route_scope route_guard(db, managed_.lattice_, managed_.table_name_,
+                managed_.attachment_token_, managed_.attachment_writer_);
             db->execute(
                 "UPDATE " + managed_table_sql(managed_.table_name_) + " SET " + name + " = " + name +
                     " + ? WHERE id = ?",
                 {delta, managed_.id_});
+            }
             // New value unknown here — drop the cached key so the next
             // materialized read falls through live instead of going stale.
             managed_.source.values.erase(name);
@@ -476,6 +480,7 @@ private:
     friend class swift_lattice;
     friend struct link_list;
     friend class dynamic_object_ref;
+    friend struct managed_attachment_test_access;
 };
 
 

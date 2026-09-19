@@ -6,12 +6,179 @@
 #include <cstdlib>
 #include <set>
 #include <limits>
+#include <exception>
 #include <unordered_set>
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 namespace lattice {
+
+namespace {
+// Maintenance already refuses contended topology. Do the same for its old
+// writer rather than wait under topology behind a legacy SQLite callback.
+struct managed_writer_publication_hold {
+    sqlite3_mutex* mutex;
+    managed_writer_publication_hold(sqlite3* connection, const std::atomic<size_t>& active)
+        : mutex(connection ? sqlite3_db_mutex(connection) : nullptr) {
+#ifndef __EMSCRIPTEN__
+        if (connection && !mutex) throw db_error("writer maintenance requires a serialized connection");
+#endif
+        if (sqlite3_mutex_try(mutex) != SQLITE_OK)
+            throw db_error("writer maintenance refused while writer is busy");
+        if (active.load(std::memory_order_acquire) != 0) {
+            sqlite3_mutex_leave(mutex);
+            throw db_error("writer maintenance refused during managed scalar delivery");
+        }
+    }
+    ~managed_writer_publication_hold() { sqlite3_mutex_leave(mutex); }
+    managed_writer_publication_hold(const managed_writer_publication_hold&) = delete;
+    managed_writer_publication_hold& operator=(const managed_writer_publication_hold&) = delete;
+};
+}
+
+thread_local detail::managed_route_scope* detail::managed_route_scope::current_ = nullptr;
+
+bool detail::managed_route_scope::active_for(const database* db) noexcept {
+    for (auto* frame = current_; frame; frame = frame->previous_)
+        if (frame->db_ == db) return true;
+    return false;
+}
+
+bool detail::managed_route_scope::active_for(const lattice_db* owner) noexcept {
+    for (auto* frame = current_; frame; frame = frame->previous_)
+        if (frame->owner_ == owner) return true;
+    return false;
+}
+
+detail::managed_route_scope::managed_route_scope(database* db, lattice_db* owner,
+    const std::string& table, int64_t token, const std::weak_ptr<database>& captured_writer, bool vector_write) {
+    // Explicitly assigned ownerless fields retain their raw database contract.
+    if (!db || !owner) return;
+    if (vector_write && active_for(db))
+        throw db_error("managed field: reentrant vector mutation during scalar access");
+    // Keep the common main-model getter free of parsing, atomics and locks.
+    if (token == 0 && table.find('.') == std::string::npos &&
+        (table.empty() || table.front() != '"')) return;
+    const auto route = managed_route(table);
+    if (token == 0 && (route.schema_sql == "main" || route.schema_sql == "\"main\"")) return;
+    if (token <= 0) throw db_error("managed field: missing attachment generation");
+
+    // Lock the captured weak control block, not a current writer found by
+    // raw address. Expired old handles cannot revive after allocator reuse.
+    writer_owner_ = captured_writer.lock();
+    if (!writer_owner_ || writer_owner_.get() != db)
+        throw db_error("managed field: detached or retired attachment writer");
+
+    // Memory vec0 maintenance owns its existing store gate before SQLite.
+    // A SQLite callback already inside a scalar scope must not wait for it.
+#ifdef __EMSCRIPTEN__
+    const bool vector_gate_needed = vector_write;
+#else
+    const bool vector_gate_needed = vector_write && owner->config_.is_in_memory();
+#endif
+    if (vector_gate_needed) {
+        if (active_for(db))
+            throw db_error("managed field: reentrant vector mutation during scalar access");
+        auto& gate = owner->store_write_gate_ ? *owner->store_write_gate_ : owner->vec0_memory_maintenance_gate_;
+        vector_gate_ = std::unique_lock<std::recursive_timed_mutex>(gate);
+    }
+    auto* mutex = sqlite3_db_mutex(db->internal_handle());
+#ifndef __EMSCRIPTEN__
+    if (!mutex) throw db_error("managed field: attachment writer is not serialized");
+#endif
+    sqlite3_mutex_enter(mutex);
+    try {
+        if (owner->closed_.load() || db->is_closed())
+            throw db_error("managed field: attachment writer is closed");
+        auto view = std::atomic_load(&owner->managed_attachment_view_);
+        const lattice_db::managed_attachment_binding* current = nullptr;
+        if (view) for (const auto& binding : *view) {
+            if (binding->token == token && !binding->writer.owner_before(captured_writer) &&
+                !captured_writer.owner_before(binding->writer) &&
+                binding->valid.load(std::memory_order_acquire)) {
+                current = binding.get();
+                break;
+            }
+        }
+        if (!current || (route.schema_sql != managed_quote_identifier(current->alias) &&
+                         route.schema_sql != current->alias))
+            throw db_error("managed field: detached or stale attachment route");
+        // Like checked bulk mutation, detect an unbookkept different-file
+        // binding. No PRAGMA/authorizer action is added to a scalar read.
+        // Raw same-file detach/reattach cannot establish a new Core token.
+        const char* filename = sqlite3_db_filename(db->internal_handle(), current->alias.c_str());
+        if (!filename) throw db_error("managed field: attachment is missing");
+        std::string actual(filename);
+        if (actual != current->filename) {
+            std::error_code error;
+            const auto canonical = actual.empty() ? std::filesystem::path{} :
+                std::filesystem::weakly_canonical(actual, error);
+            if (error || canonical.string() != current->filename)
+                throw db_error("managed field: attachment physical database changed");
+        }
+        db_ = db;
+        owner_ = owner;
+        mutex_ = mutex;
+        exceptions_ = std::uncaught_exceptions();
+        previous_ = current_;
+        owner_->active_managed_attachment_operations_.fetch_add(1, std::memory_order_acq_rel);
+        current_ = this;
+    } catch (...) {
+        sqlite3_mutex_leave(mutex);
+        throw;
+    }
+}
+
+detail::managed_route_scope::~managed_route_scope() noexcept(false) {
+    if (!db_) return;
+    struct complete_operation {
+        std::atomic<size_t>& active;
+        ~complete_operation() { active.fetch_sub(1, std::memory_order_release); }
+    } complete{owner_->active_managed_attachment_operations_};
+    current_ = previous_;
+    sqlite3_mutex_leave(mutex_);
+    if (vector_gate_.owns_lock()) vector_gate_.unlock();
+    // Nested scopes leave delivery to their outer successful scope. A failed
+    // operation retains the existing query/update exception-tail behavior.
+    if (std::uncaught_exceptions() == exceptions_) db_->drain_if_settled();
+}
+
+void lattice_db::publish_managed_attachment(const std::string& alias, const std::string& path,
+    int64_t token, const std::shared_ptr<database>& writer) {
+    auto next = std::make_shared<managed_attachment_view>();
+    if (auto old = std::atomic_load(&managed_attachment_view_)) {
+        for (const auto& binding : *old)
+            if (binding->valid.load(std::memory_order_acquire)) next->push_back(binding);
+    }
+    std::string filename;
+    if (!configuration::path_is_memory(path)) {
+        std::error_code error;
+        filename = std::filesystem::weakly_canonical(path, error).string();
+        if (error) throw db_error("cannot capture managed attachment filename");
+    }
+    next->push_back(std::make_shared<managed_attachment_binding>(alias, filename, token, writer));
+    std::atomic_store(&managed_attachment_view_, std::shared_ptr<const managed_attachment_view>(std::move(next)));
+}
+
+std::shared_ptr<const lattice_db::managed_attachment_view> lattice_db::managed_view_for_writer(
+    const std::shared_ptr<database>& writer) const {
+    auto next = std::make_shared<managed_attachment_view>();
+    // Rebuild from authoritative topology, including close_write followed by
+    // reopen, when the retired writer's published view has already been cleared.
+    for (const auto& [alias, path] : attached_dbs_) {
+        auto token = attached_route_tokens_.find(alias);
+        if (token == attached_route_tokens_.end()) continue;
+        std::string filename;
+        if (!configuration::path_is_memory(path)) {
+            std::error_code error;
+            filename = std::filesystem::weakly_canonical(path, error).string();
+            if (error) throw db_error("cannot restore managed attachment filename");
+        }
+        next->push_back(std::make_shared<managed_attachment_binding>(alias, filename, token->second, writer));
+    }
+    return next;
+}
 
 // Single definition of the global log level (declared extern in log.hpp).
 // Seed from the LATTICE_LOG_LEVEL env var (0=off..4=debug) so logging can be
@@ -208,18 +375,35 @@ void lattice_db::close_read_db() {
 }
 
 void lattice_db::close_write_db() {
+    if (detail::managed_route_scope::active_for(this) ||
+        active_managed_attachment_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer close refused during managed scalar access or delivery");
     // Preserve broad projection cancellation/grace before retiring the writer.
     pause_projection_reads();
     retire_all_read_generations();
     deactivate_projection_pressure();
     std::shared_ptr<database> writer;
+    uint64_t revision;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        writer = db_;
+        revision = connection_revision_;
+    }
+    {
+        std::unique_lock<std::mutex> attach_lock(attach_mutex_, std::try_to_lock);
+        if (!attach_lock.owns_lock())
+            throw db_error("writer close refused while attachment topology is busy");
+        managed_writer_publication_hold publication(
+            writer ? writer->internal_handle() : nullptr, active_managed_attachment_operations_);
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        if (revision != connection_revision_ || db_ != writer)
+            throw db_error("writer close invalidated by concurrent maintenance");
         ++connection_revision_;
-        writer.swap(db_);
+        db_.reset();
+        std::atomic_store(&managed_attachment_view_, std::shared_ptr<const managed_attachment_view>{});
     }
     wal_eviction_pending_.store(false);
-    // No publication/attachment lock survives the retired owner's release.
+    // No publication/attachment/writer lock survives the retired owner's release.
 }
 
 std::vector<std::shared_ptr<database>> lattice_db::view_handles() {
@@ -252,14 +436,19 @@ void lattice_db::restore_attached_views(database& connection) {
 }
 
 void lattice_db::reopen_write_db() {
+    if (detail::managed_route_scope::active_for(this) ||
+        active_managed_attachment_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer reopen refused during managed scalar access or delivery");
     pause_projection_reads();
     retire_all_read_generations();
     uint64_t revision;
+    std::shared_ptr<database> previous_writer;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
         if (closed_.load(std::memory_order_seq_cst))
             throw db_error("cannot reopen a closed lattice");
         revision = connection_revision_;
+        previous_writer = db_;
     }
     auto staged = std::make_shared<database>(config_.path,
         database::open_mode::read_write, config_.busy_timeout_ms);
@@ -275,16 +464,23 @@ void lattice_db::reopen_write_db() {
         // This overload installs only hooks; pressure setup below runs after
         // publication and outside attachment admission, as on the broad base.
         setup_change_hook(*staged);
+        auto managed_view = managed_view_for_writer(staged);
+        managed_writer_publication_hold publication(
+            previous_writer ? previous_writer->internal_handle() : nullptr,
+            active_managed_attachment_operations_);
         {
             std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-            if (closed_.load(std::memory_order_seq_cst) || revision != connection_revision_)
+            if (closed_.load(std::memory_order_seq_cst) || revision != connection_revision_ ||
+                db_ != previous_writer)
                 throw db_error("write reopen invalidated by concurrent maintenance");
             ++connection_revision_;
             staged.swap(db_);
+            std::atomic_store(&managed_attachment_view_, std::move(managed_view));
         }
         wal_eviction_pending_.store(false);
     }
-    staged.reset(); // release the retired writer off both acquired locks
+    staged.reset();
+    previous_writer.reset(); // release the retired writer off all acquired locks
     setup_projection_pressure();
     {
         std::lock_guard<std::mutex> lock(attach_mutex_);
@@ -1172,6 +1368,8 @@ void lattice_db::attach(lattice_db &lattice) {
 }
 
 void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const void> metadata) {
+    if (detail::managed_route_scope::active_for(this))
+        throw db_error("attach: topology mutation during managed scalar access");
     std::shared_ptr<database> other, writer;
     {
         std::lock_guard<std::mutex> lock(lattice.connection_ownership_mutex_);
@@ -1300,6 +1498,7 @@ void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const
         attached_aliases_.push_back(alias);
         rebuild_attached_views(handles);
         if (metadata) attached_route_metadata_[token] = std::move(metadata);
+        publish_managed_attachment(alias, lattice.config_.path, token, writer);
         attachment_topology_valid_ = true;
     } catch (...) {
         // Existing attach is not cross-connection atomic. A partially changed
@@ -1312,6 +1511,8 @@ void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const
 }
 
 void lattice_db::detach(lattice_db &lattice) {
+    if (detail::managed_route_scope::active_for(this))
+        throw db_error("detach: topology mutation during managed scalar access");
     // Resolve by PATH, not by recomputed alias: alias derivation truncates at
     // the filename stem, so two different paths (or dotted memory names) can
     // share an alias — a never-attached path must be a clean no-op, never a
@@ -1337,6 +1538,8 @@ void lattice_db::detach_alias(const std::string& alias) {
 void lattice_db::detach_alias_if_current(const std::string& alias,
                                         const std::optional<std::string>& expected_path,
                                         std::optional<int64_t> expected_token) {
+    if (detail::managed_route_scope::active_for(this))
+        throw db_error("detach: topology mutation during managed scalar access");
     std::vector<std::shared_ptr<database>> handles;
     std::lock_guard<std::mutex> attach_lock(attach_mutex_);
     handles = view_handles();

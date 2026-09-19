@@ -50,11 +50,39 @@ struct physical_store_identity {
     }
 };
 
-namespace detail { struct exact_vector_rows_access; }
+class lattice_db;
+class database;
+namespace detail {
+struct exact_vector_rows_access;
+
+// One ordinary attached-field operation. Main/manual database fields keep
+// their existing path. The implementation never acquires a topology mutex
+// beneath SQLite; it validates the published generation while holding SQLite.
+class managed_route_scope {
+    database* db_ = nullptr;
+    std::shared_ptr<database> writer_owner_;
+    lattice_db* owner_ = nullptr;
+    sqlite3_mutex* mutex_ = nullptr;
+    std::unique_lock<std::recursive_timed_mutex> vector_gate_;
+    managed_route_scope* previous_ = nullptr;
+    int exceptions_ = 0;
+    static thread_local managed_route_scope* current_;
+public:
+    managed_route_scope(database*, lattice_db*, const std::string& table,
+                        int64_t token, const std::weak_ptr<database>& writer,
+                        bool vector_write = false);
+    ~managed_route_scope() noexcept(false);
+    managed_route_scope(const managed_route_scope&) = delete;
+    managed_route_scope& operator=(const managed_route_scope&) = delete;
+    static bool active_for(const database*) noexcept;
+    static bool active_for(const lattice_db*) noexcept;
+};
+}
 
 class database {
     friend class lattice_db;
     friend struct detail::exact_vector_rows_access;
+    friend class detail::managed_route_scope;
     // Only database can construct this key. The keyed overload remains
     // accessible to make_shared so keepers retain its single allocation.
     class initialization_key {

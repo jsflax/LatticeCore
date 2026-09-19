@@ -465,6 +465,9 @@ void database::drain_if_settled() {
     // The explicit maintenance tail delivers after releasing its outer
     // SQLite mutex and store gate. Keep dirty state pending until then.
     if (maintenance_scope::active_for(db_)) return;
+    // Attached scalar wrappers release their writer (and optional vector
+    // store gate) before delivering the outer successful statement's tail.
+    if (detail::managed_route_scope::active_for(this)) return;
     // Post-statement drain point (docs/design-deferred-memory-delivery.md):
     // after a successful statement, autocommit != 0 means the top-level
     // transaction just closed (implicit, or the explicit COMMIT that funnels

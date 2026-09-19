@@ -1,3 +1,4 @@
+#include "ManagedAttachmentTestSupport.hpp"
 #include "TestHelpers.hpp"
 #include <lattice.hpp>
 
@@ -227,9 +228,10 @@ std::unique_ptr<dynamic_object_ref> scalar_route_object(swift_lattice_ref& owner
 template <typename T>
 T scalar_route_legacy(swift_lattice_ref& owner, const dynamic_object_ref& object,
                       const std::string& name) {
-    managed<T> field;
-    field.assign(&owner.get()->db(), owner.get(), object.get_table_name(), name,
-                 object.managed_primary_key());
+    (void)owner;
+    // Exercise the actual bound wrapper, including its captured generation.
+    // Reconstructing from table/id alone would intentionally lack provenance.
+    auto field = managed_attachment_test_access::field<T>(object, name);
     return field.detach();
 }
 struct ScalarRouteAuthorization {

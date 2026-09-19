@@ -85,6 +85,7 @@ let package = Package(
             name: "LatticeCore",
             dependencies: ["SqliteVec"],
             path: "Sources/LatticeCore",
+            exclude: ["src/vendor/picosha2/LICENSE", "src/vendor/picosha2/README.md"],
             sources: ["src"],
             publicHeadersPath: "include",
             cxxSettings: [

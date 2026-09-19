@@ -923,6 +923,25 @@ synchronizer_base::~synchronizer_base() {
 }
 
 void synchronizer_base::connect() {
+    const bool enabled = !config_.websocket_url.empty() || ws_client_->supports_reconnect();
+    const auto lifecycle = advance_reconnect_lifecycle(enabled);
+    connect_for_lifecycle(lifecycle);
+}
+
+uint64_t synchronizer_base::advance_reconnect_lifecycle(bool enabled) {
+    auto prior = reconnect_lifecycle_.load();
+    uint64_t next;
+    do {
+        next = ((prior & ~uint64_t{1}) + 2) | (enabled ? uint64_t{1} : uint64_t{0});
+    } while (!reconnect_lifecycle_.compare_exchange_weak(prior, next));
+    return next;
+}
+
+void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
+    // This rejects obsolete QUEUED work before cursor lookup (which can seed a
+    // slot) or dialing. It does not preempt an already-admitted transport call,
+    // and the token is not an object-lifetime or platform-callback fence.
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
@@ -933,14 +952,12 @@ void synchronizer_base::connect() {
         // synchronizers never reconnect. (The old blanket `false` here left
         // IPC clients permanently dead after a peer restart: the claimed
         // "client retries via endpoint" path never existed.)
-        should_reconnect_ = ws_client_->supports_reconnect();
         LOG_INFO("synchronizer", "[%s] IPC connect: supports_reconnect=%d",
-                 log_id(), should_reconnect_ ? 1 : 0);
+                 log_id(), (lifecycle & 1) ? 1 : 0);
+        if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
         ws_client_->connect("", {});
         return;
     }
-
-    should_reconnect_ = true;  // Enable auto-reconnect for WSS
 
     std::string url = config_.websocket_url;
 
@@ -959,6 +976,9 @@ void synchronizer_base::connect() {
         headers["Authorization"] = "Bearer " + config_.authorization_token;
     }
 
+    // Cursor lookup may take time. Do not publish an old attempt after an
+    // explicit stop or replacement completed while its parameters were read.
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
     ws_client_->connect(url, headers);
 }
 
@@ -966,7 +986,7 @@ void synchronizer_base::disconnect() {
     LOG_INFO("synchronizer", "[%s] disconnect() (this=%p, is_connected=%d, db=%s)",
              log_id(), (void*)this, is_connected_ ? 1 : 0,
              db().config().path.c_str());
-    should_reconnect_ = false;  // Prevent auto-reconnect
+    advance_reconnect_lifecycle(false);  // Invalidate already-queued retries too.
     is_connected_ = false;
     reconnect_attempts_ = 0;
 
@@ -2575,13 +2595,15 @@ void synchronizer_base::maybe_reset_backoff_after_stable_connection(bool was_ope
 }
 
 void synchronizer_base::schedule_reconnect() {
+    const auto lifecycle = reconnect_lifecycle_.load();
+    const bool should_reconnect = (lifecycle & 1) != 0;
     bool within_limit = config_.max_reconnect_attempts == 0
         || reconnect_attempts_ < config_.max_reconnect_attempts;
-    if (!(should_reconnect_ && !is_connected_ && within_limit)) {
+    if (!(should_reconnect && !is_connected_ && within_limit)) {
         LOG_INFO("synchronizer", "[%s] schedule_reconnect: NOT reconnecting (should=%d connected=%d within_limit=%d)",
-                 log_id(), should_reconnect_ ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
+                 log_id(), should_reconnect ? 1 : 0, is_connected_ ? 1 : 0, within_limit ? 1 : 0);
     }
-    if (should_reconnect_ && !is_connected_ && within_limit) {
+    if (should_reconnect && !is_connected_ && within_limit) {
 #ifdef __EMSCRIPTEN__
         // The browser build is single-threaded (immediate_scheduler runs
         // inline on the main thread): the blocking backoff below would freeze
@@ -2600,18 +2622,20 @@ void synchronizer_base::schedule_reconnect() {
                  log_id(), reconnect_attempts_.load(), delay);
 
         // Schedule reconnection with an interruptible sleep.
-        // Short-sleep loop checks is_destroyed_ so that scheduler_->shutdown()
-        // in the destructor doesn't block for the full backoff delay.
-        scheduler_->invoke([this, delay] {
+        // Destruction, explicit stop, or a replacement connect invalidates this
+        // queued retry. Keep the existing backoff policy; a current retry must
+        // not call public connect(), which publishes fresh retry permission.
+        scheduler_->invoke([this, delay, lifecycle] {
+            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
             auto end = std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(static_cast<int>(delay * 1000));
             while (std::chrono::steady_clock::now() < end) {
-                if (is_destroyed_) return;
+                if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            if (is_destroyed_) return;
+            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
             if (!is_connected_) {
-                connect();
+                connect_for_lifecycle(lifecycle);
             }
         });
     }
@@ -3426,52 +3450,29 @@ static double wire_timestamp_to_epoch(const std::string& ts) {
 // Unified implementation for applying remote changes.
 // receiving_sync_id = nullopt → global mode (server path): isSynchronized=1, no _lattice_sync_state row.
 // receiving_sync_id = value   → per-sync mode (relay path): isSynchronized=0, insert _lattice_sync_state row.
-static std::vector<std::string> apply_remote_changes_impl(
-    lattice_db& db,
+std::vector<std::string> lattice_db::apply_remote_changes_impl_(
     const std::vector<audit_log_entry>& entries,
     const std::optional<std::string>& receiving_sync_id)
 {
+    auto& db = *this;
     std::vector<std::string> applied_ids;
     if (entries.empty()) return applied_ids;
+    if (db_->canonical_trigger_only_)
+        throw db_error("canonical trigger-only scope refuses unadapted upstream apply");
 
-    // Signal flush_changes to look up changedFieldsNames from AuditLog for
-    // object observers. Without this, IPC sync changes bypass Swift setters
-    // and the Observation registrar is never triggered.
-    db.applying_remote_changes_.store(true, std::memory_order_release);
-
-    // Process in chunks to avoid holding the write lock for too long.
-    const size_t chunk_size = 50;
-
-    // Restore the user's persistent disabled flag after each chunk rather
-    // than hardcoding 0 — deliberately disabled auditing must stay disabled.
-    const int64_t prev_disabled = db.read_sync_disabled_flag();
-
-    // Durable idempotency receipts for suppressed no-op applies: suppression
-    // (below) mints no AuditLog row, which is what the globalId dedup keys
-    // on — without a receipt, a suppressed entry re-delivered AFTER an
-    // intervening local edit would re-apply stale values and relay the
-    // reversion fleet-wide. Receipts are globalId-only (~tens of bytes vs a
-    // full audit row) and pruned by bounded rowid horizon in compaction.
-    db.db().execute(
-        "CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
-        "  globalId TEXT PRIMARY KEY)", {});
-
-    // Download-resume cursor (externalized): advanced per chunk to the last
-    // CONTIGUOUSLY-acked entry of the delivery. Only meaningful in per-sync
-    // mode (clients resuming a download stream); the column is added by
-    // register_replication_slot, so probe rather than assume.
-    bool cursor_column_ok = false;
-    if (receiving_sync_id) {
-        auto cols = db.db().query("PRAGMA table_info(_lattice_replication_slots)", {});
-        for (const auto& row : cols) {
-            auto it = row.find("name");
-            if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
-                std::get<std::string>(it->second) == "last_received_event_id") {
-                cursor_column_ok = true;
-                break;
-            }
+    // Set only after owned admission. Restore even when preparation fails.
+    struct applying_flag_restore {
+        std::atomic<bool>& flag;
+        std::optional<bool> previous;
+        void activate() {
+            if (!previous) previous = flag.exchange(true, std::memory_order_acq_rel);
         }
-    }
+        ~applying_flag_restore() {
+            if (previous) flag.store(*previous, std::memory_order_release);
+        }
+    } applying_flag{applying_remote_changes_, std::nullopt};
+    const size_t chunk_size = 50;
+    bool cursor_column_ok = false;
     std::optional<std::string> cursor_candidate;
     bool cursor_halted = false;
 
@@ -3491,385 +3492,513 @@ static std::vector<std::string> apply_remote_changes_impl(
         const auto cursor_candidate_before_chunk = cursor_candidate;
         const bool cursor_halted_before_chunk = cursor_halted;
 
-        // Per-store write gate (results spec §4.1): a chunked sync apply on
-        // a shared-cache store is THE canonical writer that generation
-        // captures must never interleave (a capture's statement-scope table
-        // read locks fail the writer's in-transaction statements with
-        // SQLITE_LOCKED mid-chunk, and the capture fails immediately in the
-        // reverse direction). Held per chunk, matching the transaction.
-        lattice_db::store_write_gate_hold write_gate(db);
-
+        // Pin the wrapper, retaining the existing parent-outlives-operation
+        // contract. Owned admission rejects a transaction started elsewhere;
+        // cleanup never guesses ownership from a later autocommit value.
+        auto writer = db_;
+        bool cleanup_failed = false;
+        bool committed_callback_failed = false;
         try {
-            if (test_hooks::apply_chunk_begin) test_hooks::apply_chunk_begin(chunk_start);
-            db.db().begin_transaction();
+#ifdef __EMSCRIPTEN__
+            constexpr bool post_statement_delivery = true;
+#else
+            const bool post_statement_delivery = config_.is_in_memory();
+#endif
+            if (store_write_gate_ || post_statement_delivery)
+                database::maintenance_scope::probe_before_store_gate(*writer);
+            store_write_gate_hold write_gate(db);
+            // Match ensure_vec0's gate -> SQLite order for isolated memory.
+            // Shared-cache memory already acquired its store gate above.
+            std::unique_lock<std::recursive_timed_mutex> vector_memory_gate;
+            if (post_statement_delivery && !store_write_gate_)
+                vector_memory_gate = std::unique_lock<std::recursive_timed_mutex>(vec0_memory_maintenance_gate_);
+            database::maintenance_scope ownership(*writer);
+            // Read-only facades never install writer hooks. Refuse before
+            // dereferencing the journal or beginning any transaction; also
+            // reject an unexpectedly replaced hook context on this wrapper.
+            if (!writer->lattice_update_hook_context_ ||
+                writer->lattice_update_hook_context_->owner != this ||
+                writer->lattice_update_hook_context_->connection != writer->internal_handle())
+                throw db_error("sync apply requires its installed writer hook context");
+            // At most one name per kind per entry. Allocate the journal's
+            // slots before BEGIN; copy each name before that entry's effects.
+            // No work proportional to all registered tables on each chunk.
+            std::vector<std::string> new_unknown_links, new_virtual_links;
+            new_unknown_links.reserve(chunk_end - chunk_start);
+            new_virtual_links.reserve(chunk_end - chunk_start);
+            using chunk_state = database::sync_apply_chunk_state;
+            chunk_state chunk;
+            auto& hook = *writer->lattice_update_hook_context_;
+            try {
+                if (test_hooks::apply_chunk_begin) test_hooks::apply_chunk_begin(chunk_start);
+                writer->begin_transaction();
+                chunk.state = chunk_state::phase::active;
+                hook.sync_chunk = &chunk;
+                applying_flag.activate();
 
-            // Disable sync triggers for this chunk
-            db.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-
-            for (size_t i = chunk_start; i < chunk_end; ++i) {
-                const auto& entry = entries[i];
-
-                // Per-entry error isolation — the contract the C ABI and the
-                // bridge document: an entry that fails to apply for ANY reason
-                // (unknown table from schema drift, instruction generation,
-                // bookkeeping inserts) is skipped — NOT acked, so the sender
-                // re-sends it — and the remaining entries still apply.
-                // Previously only the instruction EXECUTE was isolated: an
-                // unknown-table entry threw out of the pre-apply row lookup and
-                // aborted the whole batch, and entries applied in earlier
-                // committed chunks were never reported (the B-2 pathology at
-                // chunk granularity).
-                try {
-                    // Re-check inside transaction (entry may have been inserted
-                    // concurrently). A hit in EITHER AuditLog or the receipts
-                    // table means already-applied: ack and move on.
-                    auto existing = db.db().query(
-                        "SELECT 1 FROM AuditLog WHERE globalId = ?1 "
-                        "UNION ALL "
-                        "SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?1 "
-                        "LIMIT 1",
-                        {entry.global_id}
-                    );
-                    if (!existing.empty()) {
-                        applied_ids.push_back(entry.global_id);
-                        continue;
-                    }
-
-                    // If it's a link table (starts with _), ensure it exists —
-                    // once per (table, kind) per delivery (B3.4: these are
-                    // per-TABLE facts; running them per ENTRY cost ~3,000
-                    // statements per 1000-entry frame, including two
-                    // sqlite_master scans and a PRAGMA table_info each).
-                    if (!entry.table_name.empty() && entry.table_name[0] == '_') {
-                        bool is_virtual = std::find(entry.changed_fields_names.begin(),
-                                                    entry.changed_fields_names.end(),
-                                                    "rhs_type") != entry.changed_fields_names.end();
-                        if (tables_ensured.insert(entry.table_name + (is_virtual ? "|v" : "|l")).second) {
-                            if (is_virtual) {
-                                db.ensure_virtual_link_table(entry.table_name);
-                            } else {
-                                db.ensure_link_table(entry.table_name);
-                            }
+                // Preparation participates in this known-owned transaction.
+                // No persistent flag read or receipt DDL precedes admission.
+                const auto flags = writer->query("SELECT disabled FROM _SyncControl WHERE id = 1");
+                if (flags.size() != 1 || !std::holds_alternative<int64_t>(flags[0].at("disabled")))
+                    throw db_error("sync apply requires one integer sync control flag");
+                const int64_t prev_disabled = std::get<int64_t>(flags[0].at("disabled"));
+                if (chunk_start == 0) {
+                    writer->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
+                                    "globalId TEXT PRIMARY KEY)");
+                    cursor_column_ok = false;
+                    if (receiving_sync_id) {
+                        for (const auto& row : writer->query("PRAGMA table_info(_lattice_replication_slots)")) {
+                            const auto it = row.find("name");
+                            if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+                                std::get<std::string>(it->second) == "last_received_event_id")
+                                cursor_column_ok = true;
                         }
                     }
+                }
+                writer->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
 
-                    // Ensure vec0 tables exist for vector columns BEFORE the INSERT,
-                    // so triggers can populate the shadow tables — once per
-                    // (table, prop) per delivery.
-                    if (!entry.table_name.empty() && entry.table_name[0] != '_') {
-                        auto* model_schema = schema_registry::instance().get_schema(entry.table_name);
-                        if (model_schema) {
-                            for (const auto& prop : model_schema->properties) {
-                                if (prop.is_vector && prop.type == column_type::blob) {
-                                    auto it = entry.changed_fields.find(prop.name);
-                                    if (it != entry.changed_fields.end() &&
-                                        it->second.kind == any_property_kind::data_kind &&
-                                        std::holds_alternative<std::vector<uint8_t>>(it->second.value)) {
-                                        auto& vec_data = std::get<std::vector<uint8_t>>(it->second.value);
-                                        if (!vec_data.empty()) {
-                                            int dims = static_cast<int>(vec_data.size() / sizeof(float));
-                                            if (dims > 0 &&
-                                                vec0_ensured.insert(entry.table_name + "|" + prop.name).second) {
-                                                db.ensure_vec0_table(entry.table_name, prop.name, dims);
+                for (size_t i = chunk_start; i < chunk_end; ++i) {
+                    const auto& entry = entries[i];
+
+                    // The entry owns its SQL effects AND the deferred observer
+                    // tail. Bare sync ensures only add these two memberships;
+                    // their SQL metadata and DDL roll back with the savepoint.
+                    const size_t applied_before_entry = applied_ids.size();
+                    const bool had_unknown_link = link_tables_unknown_target_.count(entry.table_name) != 0;
+                    const bool had_virtual_link = virtual_link_tables_.count(entry.table_name) != 0;
+                    if (!entry.table_name.empty() && entry.table_name[0] == '_') {
+                        if (!had_unknown_link) new_unknown_links.push_back(entry.table_name);
+                        if (!had_virtual_link) new_virtual_links.push_back(entry.table_name);
+                    }
+                    size_t buffered_before_entry;
+                    {
+                        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+                        buffered_before_entry = change_buffer_.size();
+                    }
+                    const bool dirty_before_entry = writer->txn_dirty_.load(std::memory_order_relaxed);
+                    writer->execute("SAVEPOINT lattice_sync_entry");
+                    hook.entry_cursor_active = true;
+                    hook.entry_cursor_present = false;
+                    std::exception_ptr entry_error;
+                    try {
+                        // A lambda keeps all successful early exits on the same
+                        // RELEASE path (dedup, schema skew, no-op receipt).
+                        [&] {
+                            // Re-check inside transaction (entry may have been inserted
+                            // concurrently). A hit in EITHER AuditLog or the receipts
+                            // table means already-applied: ack and move on.
+                            auto existing = writer->query(
+                                "SELECT 1 FROM AuditLog WHERE globalId = ?1 "
+                                "UNION ALL "
+                                "SELECT 1 FROM _lattice_applied_receipts WHERE globalId = ?1 "
+                                "LIMIT 1",
+                                {entry.global_id}
+                            );
+                            if (!existing.empty()) {
+                                applied_ids.push_back(entry.global_id);
+                                return;
+                            }
+
+                            // If it's a link table (starts with _), ensure it exists —
+                            // once per (table, kind) per delivery (B3.4: these are
+                            // per-TABLE facts; running them per ENTRY cost ~3,000
+                            // statements per 1000-entry frame, including two
+                            // sqlite_master scans and a PRAGMA table_info each).
+                            if (!entry.table_name.empty() && entry.table_name[0] == '_') {
+                                bool is_virtual = std::find(entry.changed_fields_names.begin(),
+                                                            entry.changed_fields_names.end(),
+                                                            "rhs_type") != entry.changed_fields_names.end();
+                                if (tables_ensured.insert(entry.table_name + (is_virtual ? "|v" : "|l")).second) {
+                                    if (is_virtual) {
+                                        db.ensure_virtual_link_table(entry.table_name);
+                                    } else {
+                                        db.ensure_link_table(entry.table_name);
+                                    }
+                                }
+                            }
+
+                            // Ensure vec0 tables exist for vector columns BEFORE the INSERT,
+                            // so triggers can populate the shadow tables — once per
+                            // (table, prop) per delivery.
+                            if (!entry.table_name.empty() && entry.table_name[0] != '_') {
+                                auto* model_schema = schema_registry::instance().get_schema(entry.table_name);
+                                if (model_schema) {
+                                    for (const auto& prop : model_schema->properties) {
+                                        if (prop.is_vector && prop.type == column_type::blob) {
+                                            auto it = entry.changed_fields.find(prop.name);
+                                            if (it != entry.changed_fields.end() &&
+                                                it->second.kind == any_property_kind::data_kind &&
+                                                std::holds_alternative<std::vector<uint8_t>>(it->second.value)) {
+                                                auto& vec_data = std::get<std::vector<uint8_t>>(it->second.value);
+                                                if (!vec_data.empty()) {
+                                                    int dims = static_cast<int>(vec_data.size() / sizeof(float));
+                                                    if (dims > 0 &&
+                                                        vec0_ensured.insert(entry.table_name + "|" + prop.name).second) {
+                                                        db.ensure_vec0_table(entry.table_name, prop.name, dims);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                    }
 
-                    // Generate and execute the SQL instruction
-                    LOG_DEBUG("apply_remote", "entry[%zu]: table=%s op=%s globalRowId=%s changedFields=%zu changedFieldsNames=%zu",
-                             i, entry.table_name.c_str(), entry.operation.c_str(),
-                             entry.global_row_id.c_str(),
-                             entry.changed_fields.size(), entry.changed_fields_names.size());
-                    for (const auto& [key, val] : entry.changed_fields) {
-                        LOG_DEBUG("apply_remote", "  field: %s kind=%d", key.c_str(), static_cast<int>(val.kind));
-                    }
-                    for (const auto& name : entry.changed_fields_names) {
-                        LOG_DEBUG("apply_remote", "  fieldName: %s", name.c_str());
-                    }
-                    // Schema memo (B3.4): PRAGMA table_info once per table per
-                    // delivery, not per entry. Safe because the ensure_* calls
-                    // above run before the first fetch for a table, and tables
-                    // only ever gain existence within a delivery.
-                    auto schema_it = schema_cache.find(entry.table_name);
-                    if (schema_it == schema_cache.end()) {
-                        schema_it = schema_cache.emplace(
-                            entry.table_name, db.get_table_schema(entry.table_name)).first;
-                    }
-                    const auto& schema = schema_it->second;
-                    bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
+                            // Generate and execute the SQL instruction
+                            LOG_DEBUG("apply_remote", "entry[%zu]: table=%s op=%s globalRowId=%s changedFields=%zu changedFieldsNames=%zu",
+                                     i, entry.table_name.c_str(), entry.operation.c_str(),
+                                     entry.global_row_id.c_str(),
+                                     entry.changed_fields.size(), entry.changed_fields_names.size());
+                            for (const auto& [key, val] : entry.changed_fields) {
+                                LOG_DEBUG("apply_remote", "  field: %s kind=%d", key.c_str(), static_cast<int>(val.kind));
+                            }
+                            for (const auto& name : entry.changed_fields_names) {
+                                LOG_DEBUG("apply_remote", "  fieldName: %s", name.c_str());
+                            }
+                            // Schema memo (B3.4): PRAGMA table_info once per table per
+                            // delivery, not per entry. Safe because the ensure_* calls
+                            // above run before the first fetch for a table. A failed
+                            // entry clears this memo after rolling its DDL back.
+                            auto schema_it = schema_cache.find(entry.table_name);
+                            if (schema_it == schema_cache.end()) {
+                                schema_it = schema_cache.emplace(
+                                    entry.table_name, db.get_table_schema(entry.table_name)).first;
+                            }
+                            const auto& schema = schema_it->second;
+                            bool is_model_table = !entry.table_name.empty() && entry.table_name[0] != '_';
 
-                    // A3 — schema-skew tolerance. A NEWER peer's entries may
-                    // reference a table or columns this build doesn't have.
-                    // The old behavior generated SQL naming them; the execute
-                    // failed; the entry was skipped WITHOUT ack — the sender
-                    // re-sent the same page forever (a silent sync wedge) and
-                    // the receiver lost the entire row, not just the new column.
-                    //
-                    // Unknown TABLE: this build can never apply the entry —
-                    // skip it and ACK (loudly). The row appears after upgrade
-                    // via catch-up/reconcile; the schema handshake surfaces
-                    // the drift as a visible warning instead of a wedge.
-                    if (is_model_table && schema.empty()) {
-                        LOG_ERROR("apply_remote",
-                                  "unknown table '%s' (schema drift — newer peer); "
-                                  "acking entry %s as inapplicable no-op",
-                                  entry.table_name.c_str(), entry.global_id.c_str());
-                        applied_ids.push_back(entry.global_id);
-                        continue;
-                    }
+                            // A3 — schema-skew tolerance. A NEWER peer's entries may
+                            // reference a table or columns this build doesn't have.
+                            // The old behavior generated SQL naming them; the execute
+                            // failed; the entry was skipped WITHOUT ack — the sender
+                            // re-sent the same page forever (a silent sync wedge) and
+                            // the receiver lost the entire row, not just the new column.
+                            //
+                            // Unknown TABLE: this build can never apply the entry —
+                            // skip it and ACK (loudly). The row appears after upgrade
+                            // via catch-up/reconcile; the schema handshake surfaces
+                            // the drift as a visible warning instead of a wedge.
+                            if (is_model_table && schema.empty()) {
+                                LOG_ERROR("apply_remote",
+                                          "unknown table '%s' (schema drift — newer peer); "
+                                          "acking entry %s as inapplicable no-op",
+                                          entry.table_name.c_str(), entry.global_id.c_str());
+                                applied_ids.push_back(entry.global_id);
+                                return;
+                            }
 
-                    // Unknown COLUMNS: drop them (loudly) and apply the rest.
-                    // An UPDATE whose fields are ALL unknown becomes an acked
-                    // no-op — the accepted skew semantic (e.g. a v2 client
-                    // never sees v3 tombstone fields until it upgrades).
-                    audit_log_entry skew_filtered;
-                    const audit_log_entry* apply_entry = &entry;
-                    if (is_model_table &&
-                        (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
-                        bool has_unknown = false;
-                        for (const auto& name : entry.changed_fields_names) {
-                            if (schema.find(name) == schema.end()) { has_unknown = true; break; }
-                        }
-                        if (has_unknown) {
-                            skew_filtered = entry;
-                            auto& names = skew_filtered.changed_fields_names;
-                            for (auto it = names.begin(); it != names.end();) {
-                                if (schema.find(*it) == schema.end()) {
-                                    LOG_WARN("apply_remote",
-                                             "dropping unknown column '%s.%s' (schema drift — newer peer)",
-                                             entry.table_name.c_str(), it->c_str());
-                                    skew_filtered.changed_fields.erase(*it);
-                                    it = names.erase(it);
-                                } else {
-                                    ++it;
+                            // Unknown COLUMNS: drop them (loudly) and apply the rest.
+                            // An UPDATE whose fields are ALL unknown becomes an acked
+                            // no-op — the accepted skew semantic (e.g. a v2 client
+                            // never sees v3 tombstone fields until it upgrades).
+                            audit_log_entry skew_filtered;
+                            const audit_log_entry* apply_entry = &entry;
+                            if (is_model_table &&
+                                (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
+                                bool has_unknown = false;
+                                for (const auto& name : entry.changed_fields_names) {
+                                    if (schema.find(name) == schema.end()) { has_unknown = true; break; }
+                                }
+                                if (has_unknown) {
+                                    skew_filtered = entry;
+                                    auto& names = skew_filtered.changed_fields_names;
+                                    for (auto it = names.begin(); it != names.end();) {
+                                        if (schema.find(*it) == schema.end()) {
+                                            LOG_WARN("apply_remote",
+                                                     "dropping unknown column '%s.%s' (schema drift — newer peer)",
+                                                     entry.table_name.c_str(), it->c_str());
+                                            skew_filtered.changed_fields.erase(*it);
+                                            it = names.erase(it);
+                                        } else {
+                                            ++it;
+                                        }
+                                    }
+                                    apply_entry = &skew_filtered;
                                 }
                             }
-                            apply_entry = &skew_filtered;
-                        }
+
+                            // no_history receiver guard (1.5.0). A sender is supposed
+                            // to late-bind these columns before shipping; if one
+                            // arrives null anyway (older sender, a row deleted mid-
+                            // flight), binding NULL would violate a NOT NULL column
+                            // and the failed entry would be re-sent forever (the same
+                            // wedge the skew filter above closes). Drop the column and
+                            // apply the rest; the value follows in a later entry.
+                            if (is_model_table &&
+                                (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
+                                std::vector<std::string> drop;
+                                for (const auto& col : no_history_columns(db.db(), entry.table_name)) {
+                                    const auto& names = apply_entry->changed_fields_names;
+                                    if (std::find(names.begin(), names.end(), col) != names.end() &&
+                                        value_is_absent(*apply_entry, col)) {
+                                        drop.push_back(col);
+                                    }
+                                }
+                                if (!drop.empty()) {
+                                    if (apply_entry != &skew_filtered) skew_filtered = entry;
+                                    for (const auto& col : drop) {
+                                        skew_filtered.changed_fields.erase(col);
+                                        auto& names = skew_filtered.changed_fields_names;
+                                        names.erase(std::remove(names.begin(), names.end(), col), names.end());
+                                    }
+                                    apply_entry = &skew_filtered;
+                                }
+                            }
+
+                            auto [sql, params] = apply_entry->generate_instruction(schema);
+                            LOG_DEBUG("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
+
+                            // Resolve the local rowId and operation for this object.
+                            // flush_changes correlates model changes with AuditLog entries by
+                            // (tableName, rowId, operation). After compaction, the sender's
+                            // rowId and operation may differ from the receiver's:
+                            //   - rowId diverges when INSERT...ON CONFLICT DO UPDATE bumps
+                            //     the autoincrement counter
+                            //   - operation diverges when sender says INSERT but receiver
+                            //     already has the row (ON CONFLICT takes the UPDATE path)
+                            int64_t local_row_id = entry.row_id;
+                            std::string local_operation = entry.operation;
+
+                            bool row_existed = false;
+                            if (is_model_table && !entry.global_row_id.empty()) {
+                                auto pre_rows = writer->query(
+                                    "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                                    {entry.global_row_id}
+                                );
+                                if (!pre_rows.empty()) {
+                                    row_existed = true;
+                                    auto it = pre_rows[0].find("id");
+                                    if (it != pre_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                                        local_row_id = std::get<int64_t>(it->second);
+                                    }
+                                    if (entry.operation == "INSERT") {
+                                        local_operation = "UPDATE";
+                                    }
+                                }
+                            }
+
+                            // A5 — synthesized full-row snapshots are insert-if-absent:
+                            // the sender built them from ITS local state, which may be
+                            // stale relative to this copy (re-expose/re-join/nuclear-
+                            // compact). If the row already exists here, skip the SQL —
+                            // an unconditional upsert would revert newer edits and
+                            // resurrect tombstones. Bookkeeping + ack still run.
+                            bool sql_executed = false;
+                            if (entry.synthesized && row_existed) {
+                                LOG_DEBUG("apply_remote",
+                                          "synthesized INSERT for existing row %s.%s — insert-if-absent skip",
+                                          entry.table_name.c_str(), entry.global_row_id.c_str());
+                            } else if (!sql.empty()) {
+                                writer->execute(sql, params);
+                                sql_executed = true;
+                            }
+
+                            // NO-OP SUPPRESSION (per-sync/client mode only). With the
+                            // value-guarded instructions, changes()==0 on an EXISTING
+                            // row means every incoming value equals the stored value —
+                            // there is nothing to relay, so minting a full audit row
+                            // per redundant delivery (2.3M rows in 4h during the Aug
+                            // 2026 flood) is pure damage. Scope guards, each one
+                            // red-team-mandated:
+                            //   - per-sync mode only: the server's global-mode path
+                            //     must keep minting for every acked entry (fan-out +
+                            //     last-event-id resume depend on ack'd globalIds being
+                            //     checkpoint-resolvable server-side);
+                            //   - row_existed: an ABSENT row can be a filter-removal
+                            //     value-hole with the row live downstream — today's
+                            //     phantom mint is what relays the edit onward;
+                            //   - sql_executed: the A5 synthesized-skip branch never
+                            //     ran SQL, so changes() would be stale garbage there.
+                            // A durable receipt replaces the audit row for dedup, and
+                            // the entry is still ACKED (the sender must retire it).
+                            if (receiving_sync_id && is_model_table && row_existed &&
+                                sql_executed && writer->changes() == 0) {
+                                writer->execute(
+                                    "INSERT OR IGNORE INTO _lattice_applied_receipts (globalId) VALUES (?)",
+                                    {entry.global_id});
+                                applied_ids.push_back(entry.global_id);
+                                return;
+                            }
+
+                            // For genuine INSERTs (row didn't exist), get the new local rowId
+                            if (is_model_table && !row_existed && entry.operation != "DELETE" && !entry.global_row_id.empty()) {
+                                auto post_rows = writer->query(
+                                    "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
+                                    {entry.global_row_id}
+                                );
+                                if (!post_rows.empty()) {
+                                    auto it = post_rows[0].find("id");
+                                    if (it != post_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                                        local_row_id = std::get<int64_t>(it->second);
+                                    }
+                                }
+                            }
+
+                            // Record the audit entry as from remote.
+                            // Global mode: isSynchronized=1 (fully synced).
+                            // Per-sync mode: isSynchronized=0 (other sync_ids still need to relay it).
+                            //
+                            // A4 — marked filter-removal DELETEs never relay further:
+                            // recorded fully-synchronized so no other synchronizer on
+                            // this database ever enumerates them as pending. They
+                            // clear this mirror (one IPC hop) and stop dead — with
+                            // per-sync bookkeeping alone, an unfiltered uplink (the
+                            // spoke's WSS) would enumerate the entry as pending and
+                            // upload the DELETE to the shared server DB.
+                            bool is_filter_removal = entry.operation == "DELETE" &&
+                                std::find(entry.changed_fields_names.begin(),
+                                          entry.changed_fields_names.end(),
+                                          "__lattice_filter_removal") != entry.changed_fields_names.end();
+                            int is_synchronized = (receiving_sync_id && !is_filter_removal) ? 0 : 1;
+                            std::string insert_sql = R"(
+                                INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
+                                    changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized, synthesized)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                            )";
+                            writer->execute(insert_sql, {
+                                entry.global_id,
+                                entry.table_name,
+                                local_operation,
+                                local_row_id,
+                                entry.global_row_id,
+                                entry.changed_fields_to_json(),
+                                entry.changed_fields_names_to_json(),
+                                wire_timestamp_to_epoch(entry.timestamp),
+                                static_cast<int64_t>(is_synchronized),
+                                static_cast<int64_t>(entry.synthesized ? 1 : 0)
+                            });
+
+                            // Per-sync mode: mark this entry as synced for the receiving sync_id (loop prevention).
+                            if (receiving_sync_id) {
+                                auto audit_rows = writer->query(
+                                    "SELECT id FROM AuditLog WHERE globalId = ?", {entry.global_id});
+                                if (!audit_rows.empty()) {
+                                    auto id_it = audit_rows[0].find("id");
+                                    if (id_it != audit_rows[0].end() && std::holds_alternative<int64_t>(id_it->second)) {
+                                        int64_t audit_id = std::get<int64_t>(id_it->second);
+                                        writer->execute(R"(
+                                            INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized)
+                                            VALUES (?, ?, 1)
+                                            ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1
+                                        )", {audit_id, *receiving_sync_id});
+                                    }
+                                }
+                            }
+
+                            applied_ids.push_back(entry.global_id);
+                        }();
+                    } catch (...) {
+                        entry_error = std::current_exception();
+                    }
+                    if (!entry_error) {
+                        // RELEASE failure is a chunk failure. Do not pretend the
+                        // entry can be isolated when its SQL boundary is unknown.
+                        writer->execute("RELEASE lattice_sync_entry");
+                        hook.entry_cursor_active = false;
+                        const bool publish = hook.entry_cursor_present;
+                        const int64_t last_id = hook.entry_cursor_last;
+                        hook.entry_cursor_present = false;
+                        // The old path stored every inserted ID in order; its
+                        // final value is this exact last ID, not MAX(AuditLog).
+                        // Publication failure also escalates to chunk cleanup.
+                        if (publish) publish_local_audit_id_(last_id);
+                        continue;
                     }
 
-                    // no_history receiver guard (1.5.0). A sender is supposed
-                    // to late-bind these columns before shipping; if one
-                    // arrives null anyway (older sender, a row deleted mid-
-                    // flight), binding NULL would violate a NOT NULL column
-                    // and the failed entry would be re-sent forever (the same
-                    // wedge the skew filter above closes). Drop the column and
-                    // apply the rest; the value follows in a later entry.
-                    if (is_model_table &&
-                        (entry.operation == "INSERT" || entry.operation == "UPDATE")) {
-                        std::vector<std::string> drop;
-                        for (const auto& col : no_history_columns(db.db(), entry.table_name)) {
-                            const auto& names = apply_entry->changed_fields_names;
-                            if (std::find(names.begin(), names.end(), col) != names.end() &&
-                                value_is_absent(*apply_entry, col)) {
-                                drop.push_back(col);
-                            }
-                        }
-                        if (!drop.empty()) {
-                            if (apply_entry != &skew_filtered) skew_filtered = entry;
-                            for (const auto& col : drop) {
-                                skew_filtered.changed_fields.erase(col);
-                                auto& names = skew_filtered.changed_fields_names;
-                                names.erase(std::remove(names.begin(), names.end(), col), names.end());
-                            }
-                            apply_entry = &skew_filtered;
-                        }
+                    hook.entry_cursor_active = false;
+                    hook.entry_cursor_present = false;
+                    // RAISE(ROLLBACK) has already destroyed the entire chunk and
+                    // its buffer. Never RELEASE, restore a tail, or continue SQL
+                    // in autocommit mode after that rollback hook has fired.
+                    if (chunk.state != chunk_state::phase::active)
+                        std::rethrow_exception(entry_error);
+                    // Either cleanup statement failing escapes to owned chunk
+                    // rollback; neither error is swallowed as an entry failure.
+                    writer->execute("ROLLBACK TO lattice_sync_entry");
+                    writer->execute("RELEASE lattice_sync_entry");
+                    {
+                        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+                        if (change_buffer_.size() < buffered_before_entry)
+                            throw db_error("sync entry rollback lost its pre-entry observer buffer");
+                        change_buffer_.resize(buffered_before_entry);
                     }
-
-                    auto [sql, params] = apply_entry->generate_instruction(schema);
-                    LOG_DEBUG("apply_remote", "  SQL: %s (params=%zu)", sql.c_str(), params.size());
-
-                    // Resolve the local rowId and operation for this object.
-                    // flush_changes correlates model changes with AuditLog entries by
-                    // (tableName, rowId, operation). After compaction, the sender's
-                    // rowId and operation may differ from the receiver's:
-                    //   - rowId diverges when INSERT...ON CONFLICT DO UPDATE bumps
-                    //     the autoincrement counter
-                    //   - operation diverges when sender says INSERT but receiver
-                    //     already has the row (ON CONFLICT takes the UPDATE path)
-                    int64_t local_row_id = entry.row_id;
-                    std::string local_operation = entry.operation;
-
-                    bool row_existed = false;
-                    if (is_model_table && !entry.global_row_id.empty()) {
-                        auto pre_rows = db.db().query(
-                            "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
-                            {entry.global_row_id}
-                        );
-                        if (!pre_rows.empty()) {
-                            row_existed = true;
-                            auto it = pre_rows[0].find("id");
-                            if (it != pre_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                                local_row_id = std::get<int64_t>(it->second);
-                            }
-                            if (entry.operation == "INSERT") {
-                                local_operation = "UPDATE";
-                            }
-                        }
+                    writer->txn_dirty_.store(dirty_before_entry, std::memory_order_relaxed);
+                    if (!had_unknown_link) link_tables_unknown_target_.erase(entry.table_name);
+                    if (!had_virtual_link) virtual_link_tables_.erase(entry.table_name);
+                    tables_ensured.clear();
+                    vec0_ensured.clear();
+                    schema_cache.clear();
+                    applied_ids.resize(applied_before_entry);
+                    try {
+                        std::rethrow_exception(entry_error);
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("apply_remote", "entry[%zu] rolled back (table=%s, op=%s): %s",
+                                  i, entry.table_name.c_str(), entry.operation.c_str(), e.what());
+                    } catch (...) {
+                        throw; // Unknown failure retains the chunk containment policy.
                     }
+                }
 
-                    // A5 — synthesized full-row snapshots are insert-if-absent:
-                    // the sender built them from ITS local state, which may be
-                    // stale relative to this copy (re-expose/re-join/nuclear-
-                    // compact). If the row already exists here, skip the SQL —
-                    // an unconditional upsert would revert newer edits and
-                    // resurrect tombstones. Bookkeeping + ack still run.
-                    bool sql_succeeded = true;
-                    bool sql_executed = false;
-                    if (entry.synthesized && row_existed) {
-                        LOG_DEBUG("apply_remote",
-                                  "synthesized INSERT for existing row %s.%s — insert-if-absent skip",
-                                  entry.table_name.c_str(), entry.global_row_id.c_str());
-                    } else if (!sql.empty()) {
+                // Advance the download-resume cursor to the last CONTIGUOUSLY
+                // acked entry of this delivery, inside the same transaction as
+                // the applies it covers. Contiguous-prefix semantics: a failed
+                // (un-acked) entry halts the cursor so the server re-delivers
+                // from it on the next reconnect; suppressed no-ops DO advance it
+                // (they are acked and receipt-backed), which is what keeps a
+                // fully-suppressed chunk from stalling resume.
+                if (receiving_sync_id && cursor_column_ok && !cursor_halted) {
+                    std::unordered_set<std::string> chunk_acked;
+                    for (size_t k = applied_before_chunk; k < applied_ids.size(); ++k) {
+                        chunk_acked.insert(applied_ids[k]);
+                    }
+                    for (size_t k = chunk_start; k < chunk_end; ++k) {
+                        if (!chunk_acked.count(entries[k].global_id)) {
+                            cursor_halted = true;
+                            break;
+                        }
+                        cursor_candidate = entries[k].global_id;
+                    }
+                    if (cursor_candidate) {
+                        writer->execute(R"(
+                            UPDATE _lattice_replication_slots
+                            SET last_received_event_id = ?, last_active_at = datetime('now')
+                            WHERE sync_id = ?
+                        )", {*cursor_candidate, *receiving_sync_id});
+                    }
+                }
+
+                // Re-enable sync triggers (restore the pre-existing flag value)
+                writer->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+
+                writer->commit();
+                // Memory/DELETE-journal builds settle here; file WAL consumes
+                // the marker before synchronous observer callbacks run.
+                chunk.state = chunk_state::phase::committed;
+                hook.sync_chunk = nullptr;
+            } catch (...) {
+                hook.entry_cursor_active = false;
+                hook.entry_cursor_present = false;
+                if (chunk.state == chunk_state::phase::committed) {
+                    // Durable ACKs survive an observer exception. Its callback
+                    // may own a successor transaction; never roll that back.
+                    committed_callback_failed = true;
+                } else {
+                    if (chunk.state == chunk_state::phase::active) {
                         try {
-                            db.db().execute(sql, params);
-                            sql_executed = true;
-                        } catch (const std::exception& e) {
-                            LOG_ERROR("apply_remote", "Failed: %s (SQL: %s)", e.what(), sql.c_str());
-                            sql_succeeded = false;
+                            writer->rollback();
+                        } catch (...) {
+                            cleanup_failed = true;
                         }
+                        if (chunk.state != chunk_state::phase::rolled_back)
+                            cleanup_failed = true;
                     }
-
-                    if (!sql_succeeded) {
-                        continue;
+                    hook.sync_chunk = nullptr;
+                    if (chunk.state == chunk_state::phase::rolled_back) {
+                        for (const auto& name : new_unknown_links) link_tables_unknown_target_.erase(name);
+                        for (const auto& name : new_virtual_links) virtual_link_tables_.erase(name);
                     }
-
-                    // NO-OP SUPPRESSION (per-sync/client mode only). With the
-                    // value-guarded instructions, changes()==0 on an EXISTING
-                    // row means every incoming value equals the stored value —
-                    // there is nothing to relay, so minting a full audit row
-                    // per redundant delivery (2.3M rows in 4h during the Aug
-                    // 2026 flood) is pure damage. Scope guards, each one
-                    // red-team-mandated:
-                    //   - per-sync mode only: the server's global-mode path
-                    //     must keep minting for every acked entry (fan-out +
-                    //     last-event-id resume depend on ack'd globalIds being
-                    //     checkpoint-resolvable server-side);
-                    //   - row_existed: an ABSENT row can be a filter-removal
-                    //     value-hole with the row live downstream — today's
-                    //     phantom mint is what relays the edit onward;
-                    //   - sql_executed: the A5 synthesized-skip branch never
-                    //     ran SQL, so changes() would be stale garbage there.
-                    // A durable receipt replaces the audit row for dedup, and
-                    // the entry is still ACKED (the sender must retire it).
-                    if (receiving_sync_id && is_model_table && row_existed &&
-                        sql_executed && db.db().changes() == 0) {
-                        db.db().execute(
-                            "INSERT OR IGNORE INTO _lattice_applied_receipts (globalId) VALUES (?)",
-                            {entry.global_id});
-                        applied_ids.push_back(entry.global_id);
-                        continue;
-                    }
-
-                    // For genuine INSERTs (row didn't exist), get the new local rowId
-                    if (is_model_table && !row_existed && entry.operation != "DELETE" && !entry.global_row_id.empty()) {
-                        auto post_rows = db.db().query(
-                            "SELECT id FROM " + entry.table_name + " WHERE globalId = ?",
-                            {entry.global_row_id}
-                        );
-                        if (!post_rows.empty()) {
-                            auto it = post_rows[0].find("id");
-                            if (it != post_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                                local_row_id = std::get<int64_t>(it->second);
-                            }
-                        }
-                    }
-
-                    // Record the audit entry as from remote.
-                    // Global mode: isSynchronized=1 (fully synced).
-                    // Per-sync mode: isSynchronized=0 (other sync_ids still need to relay it).
-                    //
-                    // A4 — marked filter-removal DELETEs never relay further:
-                    // recorded fully-synchronized so no other synchronizer on
-                    // this database ever enumerates them as pending. They
-                    // clear this mirror (one IPC hop) and stop dead — with
-                    // per-sync bookkeeping alone, an unfiltered uplink (the
-                    // spoke's WSS) would enumerate the entry as pending and
-                    // upload the DELETE to the shared server DB.
-                    bool is_filter_removal = entry.operation == "DELETE" &&
-                        std::find(entry.changed_fields_names.begin(),
-                                  entry.changed_fields_names.end(),
-                                  "__lattice_filter_removal") != entry.changed_fields_names.end();
-                    int is_synchronized = (receiving_sync_id && !is_filter_removal) ? 0 : 1;
-                    std::string insert_sql = R"(
-                        INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId,
-                            changedFields, changedFieldsNames, timestamp, isFromRemote, isSynchronized, synthesized)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-                    )";
-                    db.db().execute(insert_sql, {
-                        entry.global_id,
-                        entry.table_name,
-                        local_operation,
-                        local_row_id,
-                        entry.global_row_id,
-                        entry.changed_fields_to_json(),
-                        entry.changed_fields_names_to_json(),
-                        wire_timestamp_to_epoch(entry.timestamp),
-                        static_cast<int64_t>(is_synchronized),
-                        static_cast<int64_t>(entry.synthesized ? 1 : 0)
-                    });
-
-                    // Per-sync mode: mark this entry as synced for the receiving sync_id (loop prevention).
-                    if (receiving_sync_id) {
-                        auto audit_rows = db.db().query(
-                            "SELECT id FROM AuditLog WHERE globalId = ?", {entry.global_id});
-                        if (!audit_rows.empty()) {
-                            auto id_it = audit_rows[0].find("id");
-                            if (id_it != audit_rows[0].end() && std::holds_alternative<int64_t>(id_it->second)) {
-                                int64_t audit_id = std::get<int64_t>(id_it->second);
-                                db.db().execute(R"(
-                                    INSERT INTO _lattice_sync_state (audit_entry_id, sync_id, is_synchronized)
-                                    VALUES (?, ?, 1)
-                                    ON CONFLICT(audit_entry_id, sync_id) DO UPDATE SET is_synchronized = 1
-                                )", {audit_id, *receiving_sync_id});
-                            }
-                        }
-                    }
-
-                    applied_ids.push_back(entry.global_id);
-                } catch (const std::exception& e) {
-                    LOG_ERROR("apply_remote", "entry[%zu] skipped (table=%s, op=%s): %s",
-                              i, entry.table_name.c_str(), entry.operation.c_str(), e.what());
-                    continue;
+                    throw;
                 }
             }
-
-            // Advance the download-resume cursor to the last CONTIGUOUSLY
-            // acked entry of this delivery, inside the same transaction as
-            // the applies it covers. Contiguous-prefix semantics: a failed
-            // (un-acked) entry halts the cursor so the server re-delivers
-            // from it on the next reconnect; suppressed no-ops DO advance it
-            // (they are acked and receipt-backed), which is what keeps a
-            // fully-suppressed chunk from stalling resume.
-            if (receiving_sync_id && cursor_column_ok && !cursor_halted) {
-                std::unordered_set<std::string> chunk_acked;
-                for (size_t k = applied_before_chunk; k < applied_ids.size(); ++k) {
-                    chunk_acked.insert(applied_ids[k]);
-                }
-                for (size_t k = chunk_start; k < chunk_end; ++k) {
-                    if (!chunk_acked.count(entries[k].global_id)) {
-                        cursor_halted = true;
-                        break;
-                    }
-                    cursor_candidate = entries[k].global_id;
-                }
-                if (cursor_candidate) {
-                    db.db().execute(R"(
-                        UPDATE _lattice_replication_slots
-                        SET last_received_event_id = ?, last_active_at = datetime('now')
-                        WHERE sync_id = ?
-                    )", {*cursor_candidate, *receiving_sync_id});
-                }
-            }
-
-            // Re-enable sync triggers (restore the pre-existing flag value)
-            db.db().execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-
-            db.db().commit();
         } catch (const std::exception& e) {
             // A CHUNK-level failure (BEGIN lock timeout, COMMIT busy, the
             // trigger-gate UPDATEs) rolls back this chunk only. It must
@@ -3881,7 +4010,6 @@ static std::vector<std::string> apply_remote_changes_impl(
             // their 300s backoff caps while committed work went unacked).
             // Policy: retry the chunk once, then stop the DELIVERY and
             // return what committed; the sender re-sends only the rest.
-            try { db.db().rollback(); } catch (...) {}
             applied_ids.resize(applied_before_chunk);
             cursor_candidate = cursor_candidate_before_chunk;
             cursor_halted = cursor_halted_before_chunk;
@@ -3889,7 +4017,7 @@ static std::vector<std::string> apply_remote_changes_impl(
             tables_ensured.clear();
             vec0_ensured.clear();
             schema_cache.clear();
-            if (!chunk_retried) {
+            if (!chunk_retried && !cleanup_failed) {
                 chunk_retried = true;
                 LOG_WARN("apply_remote", "chunk [%zu,%zu) failed (%s) — retrying once",
                          chunk_start, chunk_end, e.what());
@@ -3897,13 +4025,12 @@ static std::vector<std::string> apply_remote_changes_impl(
                 continue;
             }
             LOG_WARN("apply_remote",
-                     "chunk [%zu,%zu) failed twice (%s) — stopping this delivery; "
+                     "chunk [%zu,%zu) failed (%s; retry exhausted or cleanup unsettled) — stopping this delivery; "
                      "%zu already-committed entries will be acked, the sender re-sends the rest",
                      chunk_start, chunk_end, e.what(), applied_ids.size());
             break;
         } catch (...) {
             // Non-std throw: same containment policy, no retry (unknown cause).
-            try { db.db().rollback(); } catch (...) {}
             applied_ids.resize(applied_before_chunk);
             cursor_candidate = cursor_candidate_before_chunk;
             cursor_halted = cursor_halted_before_chunk;
@@ -3916,11 +4043,17 @@ static std::vector<std::string> apply_remote_changes_impl(
                      chunk_start, chunk_end, applied_ids.size());
             break;
         }
+        // Settled memory callbacks run without the owned SQLite/store gate.
+        // A failure here is post-commit and must preserve this chunk's ACKs.
+        try { writer->drain_if_settled(); }
+        catch (...) { committed_callback_failed = true; }
+        if (committed_callback_failed) {
+            LOG_WARN("apply_remote", "committed chunk observer failed; preserving ACKs and stopping delivery");
+            break;
+        }
         chunk_start = chunk_end;
         chunk_retried = false;
     }
-
-    db.applying_remote_changes_.store(false, std::memory_order_release);
 
     // vec0 INSERT/UPDATE/DELETE triggers fire inside the transaction above on
     // THIS connection, so the shadow table is already up-to-date. Other
@@ -3930,13 +4063,13 @@ static std::vector<std::string> apply_remote_changes_impl(
 }
 
 std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries) {
-    return apply_remote_changes_impl(db, entries, std::nullopt);
+    return db.apply_remote_changes_impl_(entries, std::nullopt);
 }
 
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
                               const std::string& sync_id) {
-    return apply_remote_changes_impl(db, entries, sync_id);
+    return db.apply_remote_changes_impl_(entries, sync_id);
 }
 
 } // namespace lattice

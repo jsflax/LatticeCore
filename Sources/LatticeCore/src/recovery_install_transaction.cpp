@@ -192,7 +192,7 @@ void recovery_writer_access::deliver(lattice_db& owner, const lattice_db::recove
     alive([&](lattice_db* target) {
         target->fire_invalidation_hooks_local(batch.invalidations, lattice_db::invalidation_reason::commit);
     });
-    if (!batch.events.empty()) alive([&](lattice_db* target) { target->notify_changes_batched(batch.events); });
+    if (!batch.events.empty()) alive([&](lattice_db* target) { target->notify_changes_batched_impl(batch.events, &batch.typed_event_indices); });
 
     // Protect existing source-side hint resources against concurrent close.
     // This is not raw synchronizer ownership and does not enable recovery sync.

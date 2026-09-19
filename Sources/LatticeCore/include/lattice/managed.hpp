@@ -5,6 +5,7 @@
 #include "types.hpp"
 #include "db.hpp"
 #include "observation.hpp"
+#include "managed_observation.hpp"
 #include "../nlohmann/json.hpp"
 #include <memory>
 #include <string>
@@ -315,7 +316,7 @@ public:
         }
         unmanaged_values_[name] = value;
         // Notify observers of property change
-        notify_property_change(name);
+        if (!lattice_) notify_property_change(name);
     }
 
     void set_schema(const std::string& table,
@@ -343,36 +344,19 @@ public:
 
     using object_observer_t = object_observer_registry::object_observer_t;
 
-    /// Register an observer for this object. Returns token that unregisters on destruction.
-    notification_token observe_base(object_observer_t callback) {
-        if (!is_managed() || global_id_.empty()) {
-            // Can't observe unmanaged objects
-            return notification_token();
-        }
-        auto key = std::make_pair(table_name_, global_id_);
-        auto observer_id = object_observer_registry::instance().add_observer(key, std::move(callback));
-        return notification_token([key, observer_id]() {
-            object_observer_registry::instance().remove_observer(key, observer_id);
-        });
-    }
+    /// Register committed changes on the owning store's scheduler. The observed
+    /// wrapper must remain alive and unmoved through admitted callbacks. Token
+    /// invalidation fences queued/new admission without waiting for callbacks
+    /// already running; it is safe after owner destruction. Attached routes are
+    /// currently refused because their physical generation is not in this API.
+    notification_token observe_base(object_observer_t callback);
 
-    /// Notify observers of a property change
-    void notify_property_change(const std::string& property_name) {
-        if (is_managed() && !global_id_.empty()) {
-            auto key = std::make_pair(table_name_, global_id_);
-            object_observer_registry::instance().notify(key, false, {property_name});
-        }
-    }
-
-    /// Notify observers of deletion
-    void notify_deleted() {
-        if (is_managed() && !global_id_.empty()) {
-            auto key = std::make_pair(table_name_, global_id_);
-            object_observer_registry::instance().notify_deleted(key);
-        }
-    }
+    /// Explicit typed notifications use the same owner and cancellation gate.
+    void notify_property_change(const std::string& property_name);
+    void notify_deleted();
 
 protected:
+    void notify_managed_observers(bool deleted, const std::vector<std::string>& fields);
     friend class lattice_db;
     friend class swift_lattice;
     friend struct managed_base;  // For bind_to_parent access

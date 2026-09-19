@@ -1491,9 +1491,9 @@ public:
 
     /// Append a change to the buffer (called from update hook)
     void append_to_change_buffer(const std::string& table, const std::string& op,
-                                  int64_t row_id, const std::string& global_id) {
+                                  int64_t row_id, const std::string& global_id, bool main_schema = true) {
         std::lock_guard<std::mutex> lock(change_buffer_mutex_);
-        change_buffer_.emplace_back(table, op, row_id, global_id);
+        change_buffer_.emplace_back(table, op, row_id, global_id, main_schema);
     }
 
     /// Discard buffered-but-undelivered changes (rollback path — wired as the
@@ -1544,7 +1544,7 @@ private:
     // delivery retains its historical queries, callbacks and bounded drain.
     bool flush_changes_once_impl(database* recovery_writer, recovery_commit_batch* batch) {
         LOG_DEBUG("flush_changes", "Called");
-        std::vector<std::tuple<std::string, std::string, int64_t, std::string>> changes;
+        std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> changes;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
@@ -1587,7 +1587,7 @@ private:
         // has settled and it is. One IN query covers the whole batch.
         {
             std::string audit_id_list;
-            for (const auto& [table, op, row_id, global_id] : changes) {
+            for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
                 if (table == "AuditLog" && op == "INSERT" && global_id.empty()) {
                     if (!audit_id_list.empty()) audit_id_list += ",";
                     audit_id_list += std::to_string(row_id);
@@ -1607,7 +1607,7 @@ private:
                             std::get<std::string>(gid_it->second);
                     }
                 }
-                for (auto& [table, op, row_id, global_id] : changes) {
+                for (auto& [table, op, row_id, global_id, main_schema] : changes) {
                     if (table == "AuditLog" && op == "INSERT" && global_id.empty()) {
                         auto it = gid_by_id.find(row_id);
                         if (it != gid_by_id.end()) global_id = it->second;
@@ -1652,7 +1652,7 @@ private:
             // Recovery buffers the actual inserted audit rows, including file
             // stores. A suppressed model edit has no new audit frontier and
             // must not adopt an unrelated historical MAX(id).
-            for (const auto& [table, op, row_id, global_id] : changes) {
+            for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
                 if (table == "AuditLog" && op == "INSERT" && row_id > 0 &&
                     (!batch->audit_frontier || row_id > *batch->audit_frontier))
                     batch->audit_frontier = row_id;
@@ -1679,7 +1679,7 @@ private:
         // Maps link table name → "parent_table:property_name"
         std::unordered_map<std::string, std::string> internal_table_parents;
         bool had_internal_changes = false;
-        for (const auto& [table, op, row_id, global_id] : changes) {
+        for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
             if (table == "AuditLog" || internal_table_parents.count(table)) continue;
             auto meta = batch_query(
                 "SELECT value FROM _lattice_meta WHERE key = ?",
@@ -1703,6 +1703,7 @@ private:
         // a multi-row transaction (and a cascade delete) reach
         // observers as a single fire.
         std::vector<change_event> events;
+        std::vector<size_t> typed_event_indices;
         events.reserve(changes.size() * 2);   // roughly one model + one audit per change
 
         // A recovery body may deliberately suppress AuditLog creation and
@@ -1744,7 +1745,7 @@ private:
         };
 
         // Pass 1: model changes + internal-table → parent-UPDATE translation.
-        for (const auto& [table, op, row_id, global_id] : changes) {
+        for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
             auto it = internal_table_parents.find(table);
             if (it != internal_table_parents.end() && !it->second.empty()) {
                 // Internal table — emit both the link table itself (for
@@ -1774,12 +1775,14 @@ private:
 
                     // Emit the internal table itself only once (on first parent iteration).
                     if (first_notify) {
+                        if (main_schema) typed_event_indices.push_back(events.size());
                         events.emplace_back(table, op, row_id, global_id, "");
                         first_notify = false;
                     }
                     // Parent-table UPDATE with row_id=0 + changed_fields = broadcast
                     // mode in notify_changes_batched (fires per-object observers on
                     // every live row of `parent_table`).
+                    if (main_schema) typed_event_indices.push_back(events.size());
                     events.emplace_back(parent_table, "UPDATE", 0, "", changed_fields);
 
                     pos = (semi == std::string::npos) ? meta_value.size() : semi + 1;
@@ -1815,6 +1818,7 @@ private:
                 }
                 LOG_DEBUG("flush_changes", "Buffering model change: table=%s op=%s changed_fields=%s",
                           table.c_str(), op.c_str(), changed_fields.c_str());
+                if (main_schema) typed_event_indices.push_back(events.size());
                 events.emplace_back(table, op, row_id, global_id, changed_fields);
             }
         }
@@ -1832,7 +1836,7 @@ private:
         const bool audit_inserts_buffered_directly = batch || config_.is_in_memory();
 #endif
         bool triggered_regular_audit = false;
-        for (const auto& [table, op, row_id, global_id] : changes) {
+        for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
             // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
             if (table == "AuditLog") continue;
             // Direct entries have already been included by pass 1.
@@ -1884,7 +1888,7 @@ private:
         // rowId (not local) for link tables, so we match by
         // tableName+operation only, not by rowId.
         if (had_internal_changes && !audit_inserts_buffered_directly) {
-            for (const auto& [table, op, row_id, global_id] : changes) {
+            for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
                 if (!internal_table_parents.count(table)) continue;
 
                 auto audit_rows = batch_query(
@@ -1969,10 +1973,13 @@ private:
         // (e.g. ClaudeCodeIRC's RoomSyncServer) one frame per logical
         // transaction even when that transaction spans the parent DELETE
         // plus its cascade link-table DELETEs.
-        if (batch) batch->events = std::move(events);
+        if (batch) {
+            batch->events = std::move(events);
+            batch->typed_event_indices = std::move(typed_event_indices);
+        }
         else if (!events.empty()) {
-            for_each_alive([&events](lattice_db* instance) {
-                instance->notify_changes_batched(events);
+            for_each_alive([&events, &typed_event_indices](lattice_db* instance) {
+                instance->notify_changes_batched_impl(events, &typed_event_indices);
             });
         }
 
@@ -2219,6 +2226,14 @@ public:
     // The earlier `notify_change` (singular) and `collect_observer_callbacks`
     // helper are gone — single-row events become one-element batches.
     void notify_changes_batched(const std::vector<change_event>& changes) {
+        notify_changes_batched_impl(changes, nullptr);
+    }
+
+private:
+    // nullptr denotes main-schema events produced by sync/xproc. Hook batches
+    // carry an explicit selection, so an attached row cannot alias a main row.
+    void notify_changes_batched_impl(const std::vector<change_event>& changes,
+                                    const std::vector<size_t>* typed_indices) {
         // Group by table (preserves intra-table order from input vector).
         std::unordered_map<std::string, std::vector<change_event>> by_table;
         by_table.reserve(changes.size());
@@ -2275,6 +2290,15 @@ public:
             }
         }
 
+        const auto append_typed = [&](const change_event& event) {
+            const auto& [table, op, row, gid, fields] = event;
+            managed_observers_.append(table, op, row, gid, fields, all_callbacks);
+        };
+        if (typed_indices) {
+            for (const auto index : *typed_indices) append_typed(changes.at(index));
+        } else {
+            for (const auto& event : changes) append_typed(event);
+        }
         if (all_callbacks.empty()) return;
         scheduler_->invoke([callbacks = std::move(all_callbacks)]() mutable {
             for (auto& cb : callbacks) {
@@ -2283,6 +2307,7 @@ public:
         });
     }
 
+public:
     // ========================================================================
     // Synchronous invalidation hooks — Live Results item A, spec §2.3
     // (lattice repo docs/design-results-item-A-SPEC.md; bridged in Commit 4)
@@ -3234,7 +3259,7 @@ public:
             throw;
         }
 
-        obj.notify_deleted();
+        if (!obj.lattice_) obj.notify_deleted();
         obj.db_ = nullptr;
         obj.id_ = 0;
     }
@@ -6052,6 +6077,7 @@ protected:
     // Topology changes publish under attach_mutex_; invalidation is allocation
     // free and precedes the first DETACH side effect, including failed DETACH.
     friend class detail::managed_route_scope;
+    friend class model_base;
     friend struct detail::recovery_writer_access;
     friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
@@ -6204,6 +6230,7 @@ private:
 
     struct recovery_commit_batch {
         std::vector<change_event> events;
+        std::vector<size_t> typed_event_indices;
         std::vector<invalidation_table_change> invalidations;
         std::optional<int64_t> audit_frontier;
         bool needs_upload_hint = false;
@@ -6219,7 +6246,7 @@ private:
 
     // Change buffering - accumulates changes until WAL hook fires
     std::mutex change_buffer_mutex_;
-    std::vector<std::tuple<std::string, std::string, int64_t, std::string>> change_buffer_;  // (table, op, rowId, globalId)
+    std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> change_buffer_;  // (table, op, rowId, globalId, mainSchema)
     bool is_flushing_ = false;
 
 public:
@@ -6276,6 +6303,7 @@ private:
 
     // Per-object observer storage (for individual model observation)
     // Maps: tableName -> rowId -> [observer callbacks]
+    detail::managed_observation_state managed_observers_;
     std::mutex object_observers_mutex_;
     std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void(const std::string&)>>>>> object_observers_;
 
@@ -8827,6 +8855,7 @@ inline void lattice_db::close() {
         ++connection_revision_;
         writer = db_; reader = read_db_; xproc = xproc_read_db_;
     }
+    managed_observers_.retire();
     shutdown_projection_reads();
     // 1. Mark as dying — prevents new notify_change() calls from starting.
     guard_->alive.store(false, std::memory_order_seq_cst);
@@ -8874,6 +8903,7 @@ inline void lattice_db::close() {
 }
 
 inline lattice_db::~lattice_db() {
+    managed_observers_.retire();
     deactivate_projection_pressure();
     closed_.store(true, std::memory_order_seq_cst);
     shutdown_projection_reads();

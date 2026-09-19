@@ -614,7 +614,7 @@ void lattice_db::setup_change_hook(database& connection) {
                     if (operation == SQLITE_INSERT) {
                         LOG_DEBUG("update_hook", "AuditLog change (in-memory), buffering for txn-settled drain");
                         self->append_to_change_buffer("AuditLog", "INSERT",
-                                                      static_cast<int64_t>(rowid), "");
+                                                      static_cast<int64_t>(rowid), "", db_name && std::strcmp(db_name, "main") == 0);
                         self->db_->mark_txn_dirty();
                     }
                 } else {
@@ -677,7 +677,8 @@ void lattice_db::setup_change_hook(database& connection) {
             // Buffer the change instead of notifying immediately
             LOG_DEBUG("update_hook", "Buffering change: table=%s op=%s rowid=%lld globalId=%s",
                    table.c_str(), op.c_str(), (long long)rowid, global_id.c_str());
-            self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id);
+            self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id,
+                db_name && std::strcmp(db_name, "main") == 0);
 
             // For in-memory databases the WAL hook won't fire, so mark the
             // connection dirty; the post-statement drain in db.cpp flushes at

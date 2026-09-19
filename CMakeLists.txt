@@ -63,6 +63,7 @@ target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
 # =============================================================================
 add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
+    Sources/LatticeCore/src/managed_observation.cpp
     Sources/LatticeCore/src/schema.cpp
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/scoped_recovery_install.cpp
@@ -239,6 +240,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
+    Tests/LatticeCoreTests/ManagedObservationTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp

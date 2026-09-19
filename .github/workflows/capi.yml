@@ -31,39 +31,78 @@ jobs:
     # 6.3-noble is the toolchain the V1 modulemap fix was verified against
     # (its stricter explicit-module handling is what surfaced the bug).
     container: swift:6.3-noble
+    env:
+      CORE_SOURCE_SHA: ${{ github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install dependencies
-        run: apt-get update && apt-get install -y libsqlite3-dev cmake
+        run: apt-get update && apt-get install -y git libsqlite3-dev cmake
+
+      - name: Fetch exact source into owned localdev directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CORE_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          CORE_JOB_ROOT="$HOME/localdev/lattice-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CORE_JOB_ROOT"
+          mkdir -p "$CORE_JOB_ROOT"/{tmp,swift-build,swift-cache,swift-config,swift-security,module-cache,symbols,test-logs}
+          export TMPDIR="$CORE_JOB_ROOT/tmp" TMP="$CORE_JOB_ROOT/tmp" TEMP="$CORE_JOB_ROOT/tmp"
+          {
+            echo "CORE_JOB_ROOT=$CORE_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+            echo "CLANG_MODULE_CACHE_PATH=$CORE_JOB_ROOT/module-cache"
+            echo "SWIFT_MODULECACHE_PATH=$CORE_JOB_ROOT/module-cache"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$CORE_JOB_ROOT/module-cache"
+            echo "LATTICE_TEST_LOG_PATH=$CORE_JOB_ROOT/test-logs/native.log"
+          } >> "$GITHUB_ENV"
+          git init "$CORE_JOB_ROOT/source"
+          git -C "$CORE_JOB_ROOT/source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$CORE_SOURCE_SHA"
+          git -C "$CORE_JOB_ROOT/source" checkout --detach "$CORE_SOURCE_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SOURCE_SHA"
 
       - name: swift build (ALL targets — audit V1 pin)
-        run: swift build
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: |
+          swift build --package-path "$CORE_JOB_ROOT/source" \
+            --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
+            --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security"
 
       - name: swift run LatticeCAPITests (SwiftPM leg)
-        run: swift run LatticeCAPITests
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: |
+          swift run --package-path "$CORE_JOB_ROOT/source" \
+            --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
+            --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
+            LatticeCAPITests
 
       - name: CMake build (shared LatticeCAPI + C-ABI tests)
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         # clang explicitly: match the Swift toolchain (the container's default
         # cc is gcc, which rejects sqlite-vec's NEON kernels on aarch64).
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+          cmake -S "$CORE_JOB_ROOT/source" -B "$CORE_JOB_ROOT/cmake-build" -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-          cmake --build build --target LatticeCAPI LatticeCAPITests -j "$(nproc)"
+          cmake --build "$CORE_JOB_ROOT/cmake-build" --target LatticeCAPI LatticeCAPITests -j "$(nproc)"
 
       - name: Symbols freeze gate (nm vs lattice_capi.symbols)
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
-          nm -gD --defined-only build/libLatticeCAPI.so \
+          nm -gD --defined-only "$CORE_JOB_ROOT/cmake-build/libLatticeCAPI.so" \
             | awk '$2=="T" && $3 ~ /^lattice_/ {print $3}' \
-            | LC_ALL=C sort -u > /tmp/exported.symbols
+            | LC_ALL=C sort -u > "$CORE_JOB_ROOT/symbols/exported.symbols"
           grep -v '^#' Sources/LatticeCAPI/lattice_capi.symbols \
-            | grep -v '^[[:space:]]*$' | LC_ALL=C sort -u > /tmp/declared.symbols
-          diff -u /tmp/declared.symbols /tmp/exported.symbols
+            | grep -v '^[[:space:]]*$' | LC_ALL=C sort -u > "$CORE_JOB_ROOT/symbols/declared.symbols"
+          diff -u "$CORE_JOB_ROOT/symbols/declared.symbols" "$CORE_JOB_ROOT/symbols/exported.symbols"
 
       - name: Run LatticeCAPITests (against the shared library)
-        run: ./build/LatticeCAPITests
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: '"$CORE_JOB_ROOT/cmake-build/LatticeCAPITests"'
 
       - name: lattice.h compiles as pure C11
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
           clang -std=c11 -fsyntax-only -I Sources/LatticeCAPI/include \
             -I Tests/LatticeCAPIHeaderCheck/include \
@@ -71,30 +110,65 @@ jobs:
 
   capi-macos:
     runs-on: macos-26
+    env:
+      CORE_SOURCE_SHA: ${{ github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Fetch exact source into owned localdev directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CORE_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          CORE_JOB_ROOT="$HOME/localdev/lattice-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CORE_JOB_ROOT"
+          mkdir -p "$CORE_JOB_ROOT"/{tmp,swift-build,swift-cache,swift-config,swift-security,module-cache,symbols,test-logs}
+          export TMPDIR="$CORE_JOB_ROOT/tmp" TMP="$CORE_JOB_ROOT/tmp" TEMP="$CORE_JOB_ROOT/tmp"
+          {
+            echo "CORE_JOB_ROOT=$CORE_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+            echo "CLANG_MODULE_CACHE_PATH=$CORE_JOB_ROOT/module-cache"
+            echo "SWIFT_MODULECACHE_PATH=$CORE_JOB_ROOT/module-cache"
+            echo "SWIFTPM_MODULECACHE_OVERRIDE=$CORE_JOB_ROOT/module-cache"
+            echo "LATTICE_TEST_LOG_PATH=$CORE_JOB_ROOT/test-logs/native.log"
+          } >> "$GITHUB_ENV"
+          git init "$CORE_JOB_ROOT/source"
+          git -C "$CORE_JOB_ROOT/source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$CORE_SOURCE_SHA"
+          git -C "$CORE_JOB_ROOT/source" checkout --detach "$CORE_SOURCE_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SOURCE_SHA"
 
       - name: swift run LatticeCAPITests (SwiftPM leg)
-        run: swift run LatticeCAPITests
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: |
+          swift run --package-path "$CORE_JOB_ROOT/source" \
+            --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
+            --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
+            LatticeCAPITests
 
       - name: CMake build (shared LatticeCAPI + C-ABI tests)
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target LatticeCAPI LatticeCAPITests -j "$(sysctl -n hw.ncpu)"
+          cmake -S "$CORE_JOB_ROOT/source" -B "$CORE_JOB_ROOT/cmake-build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$CORE_JOB_ROOT/cmake-build" --target LatticeCAPI LatticeCAPITests -j "$(sysctl -n hw.ncpu)"
 
       - name: Symbols freeze gate (nm vs lattice_capi.symbols)
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
-          nm -gU build/libLatticeCAPI.dylib \
+          nm -gU "$CORE_JOB_ROOT/cmake-build/libLatticeCAPI.dylib" \
             | awk '$2=="T" && $3 ~ /^_lattice_/ {sub(/^_/,"",$3); print $3}' \
-            | LC_ALL=C sort -u > /tmp/exported.symbols
+            | LC_ALL=C sort -u > "$CORE_JOB_ROOT/symbols/exported.symbols"
           grep -v '^#' Sources/LatticeCAPI/lattice_capi.symbols \
-            | grep -v '^[[:space:]]*$' | LC_ALL=C sort -u > /tmp/declared.symbols
-          diff -u /tmp/declared.symbols /tmp/exported.symbols
+            | grep -v '^[[:space:]]*$' | LC_ALL=C sort -u > "$CORE_JOB_ROOT/symbols/declared.symbols"
+          diff -u "$CORE_JOB_ROOT/symbols/declared.symbols" "$CORE_JOB_ROOT/symbols/exported.symbols"
 
       - name: Run LatticeCAPITests (against the shared library)
-        run: ./build/LatticeCAPITests
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        run: '"$CORE_JOB_ROOT/cmake-build/LatticeCAPITests"'
 
       - name: lattice.h compiles as pure C11
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
           clang -std=c11 -fsyntax-only -I Sources/LatticeCAPI/include \
             -I Tests/LatticeCAPIHeaderCheck/include \

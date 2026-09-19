@@ -14,11 +14,35 @@ permissions:
 jobs:
   protocol:
     runs-on: ubuntu-latest
+    env:
+      CORE_SOURCE_SHA: ${{ github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Fetch exact source into owned localdev directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CORE_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          CORE_JOB_ROOT="$HOME/localdev/lattice-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          test ! -e "$CORE_JOB_ROOT"
+          mkdir -p "$CORE_JOB_ROOT/tmp"
+          export TMPDIR="$CORE_JOB_ROOT/tmp" TMP="$CORE_JOB_ROOT/tmp" TEMP="$CORE_JOB_ROOT/tmp"
+          {
+            echo "CORE_JOB_ROOT=$CORE_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+          } >> "$GITHUB_ENV"
+          git init "$CORE_JOB_ROOT/source"
+          git -C "$CORE_JOB_ROOT/source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$CORE_SOURCE_SHA"
+          git -C "$CORE_JOB_ROOT/source" checkout --detach "$CORE_SOURCE_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SOURCE_SHA"
       - name: Release protocol regression tests (no native build)
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: python3 -m unittest discover -s release-train -p 'test_*.py'
       - name: Python syntax and policy
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
           python3 -m py_compile release-train/release_train.py
           python3 -m json.tool release-train/policy.json > /dev/null

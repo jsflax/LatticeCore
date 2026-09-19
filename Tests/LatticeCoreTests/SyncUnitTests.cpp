@@ -448,6 +448,22 @@ TEST(Sync, GenerateInstructionDelete) {
 // Synchronizer with Mock WebSocket
 // ----------------------------------------------------------------------------
 
+TEST(Sync, LegacyNetworkFactoryAcceptsSchedulerContext) {
+    // mock_network_factory implements only the original no-argument virtual.
+    // The scheduler-aware entry point must preserve that implementation.
+    lattice::mock_network_factory legacy_factory;
+    lattice::network_factory& factory = legacy_factory;
+    auto scheduler = std::make_shared<lattice::immediate_scheduler>();
+    auto transport = factory.create_sync_transport(scheduler);
+    ASSERT_NE(transport, nullptr);
+    EXPECT_EQ(transport.get(), legacy_factory.last_websocket());
+    EXPECT_EQ(transport->state(), lattice::transport_state::closed);
+
+    transport->connect("ws://test.invalid/scheduler-fallback");
+    EXPECT_EQ(transport->state(), lattice::transport_state::open);
+    transport->disconnect();
+}
+
 TEST(Sync, SynchronizerConnectAndUpload) {
     auto mock_factory = std::make_shared<lattice::mock_network_factory>();
     lattice::set_network_factory(mock_factory);

@@ -73,6 +73,20 @@
   compatibility remain release gates. No benchmark speedup is claimed;
   native memory projection and durable cursor-backed observation remain open.
 
+## [2.0.5] - 2026-09-19
+
+### Fixed
+- Deliver each audit row once for persistent Emscripten stores, including link
+  table changes. These stores already buffer audit inserts directly; avoid
+  deriving a second notification from the same committed model change.
+- Pass the synchronizer's actual scheduler to transport factories, including
+  lazy connection setup and handoff to another owner. Browser bindings can now
+  retire queued transport callbacks with their database owner. Existing
+  factories retain their behavior through the original no-argument method.
+- This adds a C++ virtual overload. Rebuild Core and C++ transport implementations
+  together; prebuilt C++ factory binaries are not interchangeable across this
+  change. The C ABI, database schema and sync wire format are unchanged.
+
 ## [2.0.4] - 2026-09-18
 
 ### Fixed

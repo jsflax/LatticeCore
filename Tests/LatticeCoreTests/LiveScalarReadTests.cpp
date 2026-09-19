@@ -375,7 +375,7 @@ TEST(ScalarGetterRoute, OwningTransactionAndExternalWritesKeepPhysicalVisibility
     EXPECT_EQ(scalar_route_statements(db.handle()), statements);
     // Bypass the ref factory's same-path cache so this is a second physical
     // connection with the normal audit UDFs and triggers installed.
-    swift_lattice other(swift_configuration(path.str()), scalar_schemas());
+    lattice::swift_lattice other(swift_configuration(path.str()), scalar_schemas());
     other.stop_audit_maintenance();
     ASSERT_NE(other.db().handle(), db.handle());
     const auto other_statements = scalar_route_statements(other.db().handle());

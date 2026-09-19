@@ -941,42 +941,35 @@ public:
     /// forever. Safe by construction: only touches entries every live slot
     /// has acknowledged.
     void heal_collapsed_sync_state() {
-        if (!db().table_exists("_lattice_sync_state") ||
-            !db().table_exists("_lattice_replication_slots")) {
-            return;
-        }
         try {
-            auto slot_rows = db().query(
-                "SELECT COUNT(*) AS cnt FROM _lattice_replication_slots", {});
-            int64_t slots = 0;
-            if (!slot_rows.empty()) {
-                auto it = slot_rows[0].find("cnt");
-                if (it != slot_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    slots = std::get<int64_t>(it->second);
-                }
-            }
-            if (slots < 1) return;
+            // The live slot inventory and both bookkeeping writes must use
+            // the same owned transaction. A stale count from before BEGIN can
+            // otherwise erase work for a channel registered in between.
+            with_audit_prune_transaction_([&]() -> int64_t {
+                if (!db_->table_exists("_lattice_sync_state") ||
+                    !db_->table_exists("_lattice_replication_slots")) return 0;
+                const auto rows = db_->query(
+                    "SELECT COUNT(*) AS cnt FROM _lattice_replication_slots");
+                if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("cnt")))
+                    throw db_error("sync healing requires an exact live slot count");
+                const auto slots = std::get<int64_t>(rows[0].at("cnt"));
+                if (slots < 1) return 0;
 
-            db().begin_transaction();
-            db().execute(
-                "UPDATE AuditLog SET isSynchronized = 1 WHERE id IN ("
-                "  SELECT st.audit_entry_id FROM _lattice_sync_state st"
-                "  WHERE st.is_synchronized = 1"
-                "  GROUP BY st.audit_entry_id"
-                "  HAVING COUNT(DISTINCT st.sync_id) >= ?)",
-                {slots});
-            db().execute(
-                "DELETE FROM _lattice_sync_state WHERE audit_entry_id IN ("
-                "  SELECT audit_entry_id FROM _lattice_sync_state"
-                "  WHERE is_synchronized = 1"
-                "  GROUP BY audit_entry_id"
-                "  HAVING COUNT(DISTINCT sync_id) >= ?)",
-                {slots});
-            db().commit();
+                // A retired channel's retained ACK must never stand in for a
+                // missing ACK from a live channel. Once every live slot has
+                // confirmed, all state rows for that original can collapse.
+                const std::string confirmed =
+                    "SELECT st.audit_entry_id FROM _lattice_sync_state st "
+                    "WHERE st.is_synchronized = 1 AND EXISTS ("
+                    "  SELECT 1 FROM _lattice_replication_slots rs WHERE rs.sync_id = st.sync_id) "
+                    "GROUP BY st.audit_entry_id HAVING COUNT(DISTINCT st.sync_id) >= ?";
+                db_->execute("UPDATE AuditLog SET isSynchronized = 1 WHERE id IN (" + confirmed + ")", {slots});
+                db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id IN (" + confirmed + ")", {slots});
+                return 0;
+            });
         } catch (...) {
-            if (db().is_in_transaction()) {
-                try { db().rollback(); } catch (...) {}
-            }
+            // The owned helper settles only its own transaction. A caller's
+            // already-open transaction is refused and remains untouched.
             LOG_WARN("lattice_db", "heal_collapsed_sync_state failed (non-fatal)");
         }
     }

@@ -224,11 +224,20 @@ inline std::vector<database::row_t> collect_exact_vector_rows(
                 case SQLITE_TEXT: {
                     const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(statement, i));
                     if (!text) throw db_error("exact row text allocation failed");
-                    value = std::string(text, sqlite3_column_bytes(statement, i)); break;
+                    const int length = sqlite3_column_bytes(statement, i);
+                    if (!length && sqlite3_errcode(db.internal_handle()) == SQLITE_NOMEM)
+                        throw db_error("exact row text size allocation failed");
+                    value = std::string(text, length); break;
                 }
                 case SQLITE_BLOB: {
                     const auto* blob = static_cast<const uint8_t*>(sqlite3_column_blob(statement, i));
+                    // SQLite requires this check BEFORE column_bytes (or any
+                    // other SQLite call). NULL can be an OOM, not an empty BLOB.
+                    if (!blob && sqlite3_errcode(db.internal_handle()) == SQLITE_NOMEM)
+                        throw db_error("exact row blob allocation failed");
                     const int length = sqlite3_column_bytes(statement, i);
+                    if (!length && sqlite3_errcode(db.internal_handle()) == SQLITE_NOMEM)
+                        throw db_error("exact row blob size allocation failed");
                     if (length && !blob) throw db_error("exact row blob allocation failed");
                     value = length ? std::vector<uint8_t>(blob, blob + length) : std::vector<uint8_t>{}; break;
                 }

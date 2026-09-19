@@ -331,6 +331,15 @@ TEST_F(ExactVectorRows, StrictCollectorRejectsTailWritesAliasesAndBindingErrorsW
     sqlite3_limit(db.internal_handle(),SQLITE_LIMIT_LENGTH,old_limit);
     EXPECT_EQ(statements(),before);
     EXPECT_EQ(std::get<std::string>(select({arm()},{0,0,0,0},1)[0].row.at("payload")),"unchanged");
+    db.execute("UPDATE Doc SET payload='' WHERE id=1");
+    const auto empty=select({arm()},{0,0,0,0},1);
+    ASSERT_EQ(empty.size(),1u);
+    const auto& image=empty[0].row;
+    ASSERT_TRUE(std::holds_alternative<std::vector<uint8_t>>(image.at("tag")));
+    EXPECT_TRUE(std::get<std::vector<uint8_t>>(image.at("tag")).empty());
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(image.at("note")));
+    ASSERT_TRUE(std::holds_alternative<std::string>(image.at("payload")));
+    EXPECT_TRUE(std::get<std::string>(image.at("payload")).empty());
 }
 
 TEST_F(ExactVectorRows, AuthorizerFailureThrowsAndReadDoesNotDrainDeferredCallbacks) {

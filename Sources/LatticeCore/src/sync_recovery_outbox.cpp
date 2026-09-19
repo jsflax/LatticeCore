@@ -312,8 +312,9 @@ recovery_outbox_current_row current(sqlite3* db, size_t table_index,
 }
 } // namespace
 
-recovery_outbox_capture capture_pending_outbox(lattice_db& owner,
-    const std::string& sync_id, const recovery_outbox_limits& limits) {
+static recovery_outbox_capture capture_pending_impl(lattice_db& owner,
+    const std::string& sync_id, const recovery_outbox_limits& limits,
+    const std::vector<recovery_row_key>* targets) {
     if (sync_id.empty()) fail(code::invalid_argument, "outbox requires a channel identity");
     auto* writer = recovery_writer_access::active_writer(owner);
     if (!writer) fail(code::transaction_required, "outbox requires this thread's owned main write transaction");
@@ -328,6 +329,24 @@ recovery_outbox_capture capture_pending_outbox(lattice_db& owner,
         "(typeof(ss.is_synchronized)!='integer' OR ss.is_synchronized!=1) AND a.id IS NULL LIMIT 1");
     orphan.text(1,sync_id);
     if (orphan.next()) fail(code::corrupt_state, "outbox pending receipt has no retained audit record");
+    std::string target_predicate;
+    if (targets) {
+        const auto variables = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+        if (variables < 3 || targets->size() > static_cast<size_t>((variables - 2) / 2) ||
+            targets->size() > limits.current_rows)
+            fail(code::budget_exceeded, "outbox target predicate exceeds finite limits");
+        std::set<recovery_row_key> unique;
+        for (size_t i=0; i<targets->size(); ++i) {
+            const auto& key=targets->at(i);
+            if (key.table.empty() || key.global_id.empty() || !unique.insert(key).second)
+                fail(code::invalid_argument, "outbox duplicate or empty target");
+            b.charge(key.table.size()); b.charge(key.global_id.size());
+            if (i) target_predicate += " OR ";
+            target_predicate += "(a.tableName=?" + std::to_string(3+2*i) +
+                " AND a.globalRowId=?" + std::to_string(4+2*i) + " COLLATE NOCASE)";
+        }
+        target_predicate = " AND (" + (target_predicate.empty() ? "0" : target_predicate) + ") ";
+    }
     std::map<std::string,size_t> tables;
     std::set<std::pair<size_t,std::string>> rows;
     int64_t after = 0;
@@ -342,8 +361,12 @@ recovery_outbox_capture capture_pending_outbox(lattice_db& owner,
             "((ss.audit_entry_id IS NOT NULL AND "
             "(typeof(ss.is_synchronized)!='integer' OR ss.is_synchronized!=1)) OR "
             "(ss.audit_entry_id IS NULL AND (typeof(a.isSynchronized)!='integer' OR a.isSynchronized!=1))) "
-            "ORDER BY a.id LIMIT 1");
+            + target_predicate + "ORDER BY a.id LIMIT 1");
         s.text(1,sync_id); if (after) s.integer(2,after);
+        if (targets) for (size_t i=0;i<targets->size();++i) {
+            s.text(static_cast<int>(3+2*i),targets->at(i).table);
+            s.text(static_cast<int>(4+2*i),targets->at(i).global_id);
+        }
         if (!s.next()) break;
         b.count(result.audit.size(),limits.audit_records,"outbox audit record limit exceeded");
         recovery_outbox_audit a;
@@ -387,6 +410,38 @@ recovery_outbox_capture capture_pending_outbox(lattice_db& owner,
     if (recovery_writer_access::active_writer(owner) != writer)
         fail(code::transaction_required, "outbox writer admission changed during capture");
     result.charged_fields = b.fields; result.charged_logical_bytes = b.bytes;
+    return result;
+}
+recovery_outbox_capture capture_pending_outbox(lattice_db& owner,
+    const std::string& sync_id, const recovery_outbox_limits& limits) {
+    return capture_pending_impl(owner,sync_id,limits,nullptr);
+}
+recovery_outbox_capture capture_pending_outbox_for_targets(lattice_db& owner,
+    const std::string& sync_id, const std::vector<recovery_row_key>& targets,
+    const recovery_outbox_limits& limits) {
+    return capture_pending_impl(owner,sync_id,limits,&targets);
+}
+recovery_outbox_capture capture_recovery_rows(lattice_db& owner,
+    const std::map<std::string,std::vector<std::string>>& requested,
+    const recovery_outbox_limits& limits) {
+    auto* writer=recovery_writer_access::active_writer(owner);
+    if (!writer) fail(code::transaction_required,"row capture requires an owned main writer");
+    budget b{limits}; recovery_outbox_capture result;
+    for (const auto& [name,keys]:requested) {
+        b.count(result.tables.size(),limits.tables,"row capture table limit exceeded");
+        const auto index=result.tables.size();
+        result.tables.push_back(table(writer->handle(),name,b));
+        std::set<std::string> seen;
+        for (const auto& key:keys) {
+            if (key.empty() || !seen.insert(key).second)
+                fail(code::invalid_argument,"row capture empty or duplicate key");
+            b.count(result.current_rows.size(),limits.current_rows,"row capture row limit exceeded");
+            result.current_rows.push_back(current(writer->handle(),index,result.tables.back(),key,b));
+        }
+    }
+    if (recovery_writer_access::active_writer(owner)!=writer)
+        fail(code::transaction_required,"row capture writer changed");
+    result.charged_fields=b.fields; result.charged_logical_bytes=b.bytes;
     return result;
 }
 } // namespace lattice::detail

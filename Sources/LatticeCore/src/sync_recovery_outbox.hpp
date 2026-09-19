@@ -1,7 +1,9 @@
 #pragma once
 #include <cstddef>
+#include <compare>
 #include <cstdint>
 #include <optional>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -82,6 +84,23 @@ struct recovery_outbox_capture {
 // replacement ID or infer a winner from this local bookkeeping.
 recovery_outbox_capture capture_pending_outbox(lattice_db& owner,
     const std::string& sync_id, const recovery_outbox_limits& limits);
+
+struct recovery_row_key {
+    std::string table, global_id;
+    auto operator<=>(const recovery_row_key&) const = default;
+};
+// Private bounded reuse of the same strict schema/current-value reader. Empty
+// key lists still read the requested table's schema. No SQL writes occur.
+recovery_outbox_capture capture_recovery_rows(lattice_db& owner,
+    const std::map<std::string, std::vector<std::string>>& tables_and_keys,
+    const recovery_outbox_limits& limits);
+// The predicate is bound into SQL BEFORE copying audit bodies or inspecting
+// their model tables. Unrelated pending targets remain outside this capture.
+// An orphan obligation without its audit body remains unclassifiable/refused.
+// SQLite's finite bind-variable/SQL limits additionally bound this first slice.
+recovery_outbox_capture capture_pending_outbox_for_targets(lattice_db& owner,
+    const std::string& sync_id, const std::vector<recovery_row_key>& targets,
+    const recovery_outbox_limits& limits);
 
 } // namespace detail
 } // namespace lattice

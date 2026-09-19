@@ -1745,18 +1745,23 @@ public:
         }
 
         // Pass 2: AuditLog INSERT events for each non-internal model change.
-        // For in-memory DBs, skip this — the update hook buffers the AuditLog
-        // INSERT itself (delivered verbatim by pass 1 above), so deriving it
-        // again here would double-deliver.
-        // For file-based DBs, flush_changes() runs at WAL commit (after triggers), so the entry exists.
+        // Skip derivation whenever the update hook buffers AuditLog INSERTs
+        // directly (pass 1): native memory stores and every Emscripten store.
+        // Emscripten persistent paths also use DELETE journal + deferred drain;
+        // classifying only by path would deliver each audit row twice.
+        // Native file stores derive entries after their WAL commit as before.
         // Internal table AuditLog entries are skipped — handled in pass 3.
-        bool is_in_memory = config_.is_in_memory();
+#ifdef __EMSCRIPTEN__
+        constexpr bool audit_inserts_buffered_directly = true;
+#else
+        const bool audit_inserts_buffered_directly = config_.is_in_memory();
+#endif
         bool triggered_regular_audit = false;
         for (const auto& [table, op, row_id, global_id] : changes) {
             // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
             if (table == "AuditLog") continue;
-            // In-memory DBs: AuditLog notification handled by update_hook directly
-            if (is_in_memory) continue;
+            // Direct entries have already been included by pass 1.
+            if (audit_inserts_buffered_directly) continue;
             // Internal tables — AuditLog entries handled in pass 3 below
             if (internal_table_parents.count(table)) continue;
             // Sync bookkeeping tables (_lattice_sync_state, _SyncControl,
@@ -1803,7 +1808,7 @@ public:
         // dispatches in SwiftUI). apply_remote_changes stores the SOURCE
         // rowId (not local) for link tables, so we match by
         // tableName+operation only, not by rowId.
-        if (had_internal_changes && !is_in_memory) {
+        if (had_internal_changes && !audit_inserts_buffered_directly) {
             for (const auto& [table, op, row_id, global_id] : changes) {
                 if (!internal_table_parents.count(table)) continue;
 

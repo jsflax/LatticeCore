@@ -1,4 +1,5 @@
 #include "sync_snapshot_source.hpp"
+#include "sync_recovery_values.hpp"
 #include <lattice/lattice.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -198,7 +199,7 @@ row copy_row(view& v, const source_layout& table, const std::string& id, const s
     select += " FROM main." + quoted(table.table) + " WHERE \"globalId\"=? COLLATE " + table.identity_collation + " LIMIT 2";
     const auto values = v.query(select, {id});
     check(values.size() == 1, "source row identity changed");
-    audit_log_entry payload;
+    row_values payload;
     for (size_t i = 0; i < columns.size(); ++i) {
         const auto& name = columns[i];
         const auto it = values.front().find(name); check(it != values.front().end(), "source field absent");
@@ -207,15 +208,16 @@ row copy_row(view& v, const source_layout& table, const std::string& id, const s
             check(bytes != nullptr, "source text byte extraction failed");
             const auto text = bytes->empty() ? std::string() :
                 std::string(reinterpret_cast<const char*>(bytes->data()), bytes->size());
-            payload.changed_fields.emplace(name, any_property(text));
+            payload.emplace(name, text);
             continue;
         }
         if (const auto* real = std::get_if<double>(&it->second)) check(std::isfinite(*real), "nonfinite source value refused");
-        payload.changed_fields.emplace(name, any_property::from_column_value(it->second));
+        payload.emplace(name, it->second);
     }
     row result{table.table, id, {}};
-    try { result.payload = payload.changed_fields_to_json(); }
-    catch (const nlohmann::json::type_error&) { throw protocol_error("source text is not UTF-8"); }
+    const auto maximum = static_cast<size_t>(payload_limit);
+    result.payload = encode_values(payload,
+        {maximum, b.columns_per_table, 256, maximum, maximum});
     check(result.payload.size() <= payload_limit, "source payload exceeds budget"); return result;
 }
 

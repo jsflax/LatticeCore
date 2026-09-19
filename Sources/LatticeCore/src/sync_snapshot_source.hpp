@@ -52,8 +52,8 @@ struct unsealed_materialization {
 // view. Input batches use indexed keysets. The capped materialization is then
 // sorted once in byte order and moved into bounded content pages.
 // No source spool, cryptographic digest, receipt or installation is produced.
-// Payload bytes use audit_log_entry's AnyProperty JSON map: ordered property
-// names, its existing numeric spelling and lowercase hexadecimal BLOB values.
+// Payload bytes use the strict recovery scalar codec: ordered property names,
+// exact SQLite scalar types and lowercase hexadecimal BLOB values.
 // id/globalId are omitted from that map; globalId is the separate row identity.
 // Byte preflight is conservative and may refuse a row whose final JSON fits.
 unsealed_materialization materialize_source(

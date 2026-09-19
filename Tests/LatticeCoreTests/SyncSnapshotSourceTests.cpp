@@ -2,6 +2,7 @@
 #include <lattice.hpp>
 #include <nlohmann/json.hpp>
 #include "../../Sources/LatticeCore/src/sync_snapshot_source.hpp"
+#include "../../Sources/LatticeCore/src/sync_recovery_values.hpp"
 
 namespace sr = lattice::detail::sync_recovery;
 namespace {
@@ -107,6 +108,28 @@ TEST(SyncSnapshotSource, PreservesEmbeddedNulTextBlobAndScalarTypesWithStableByt
     ASSERT_EQ(integer_rows.size(), 1u);
     const auto whole = json::parse(integer_rows.front().payload).at("extra");
     EXPECT_EQ(whole.at("kind"), 1); EXPECT_EQ(whole.at("value").get<int64_t>(), INT64_MAX);
+    EXPECT_EQ(db.local_read_generations_outstanding(), 0u);
+}
+
+TEST(SyncSnapshotSource, MaterializedPayloadUsesStrictInstallerScalarGrammar) {
+    TempDB temp{"source_installer_values"}; lattice_db db{configuration(temp.str())}; create_raw(db);
+    db.db().execute("INSERT INTO _source_rows(globalId,body,amount,bytes,extra) "
+                    "VALUES('a',CAST(X'c3a9007461696c00' AS TEXT),1.25,X'00ff00',9223372036854775807),"
+                    "('b','',-1.25,X'',NULL)");
+    const auto captured = flatten(sr::materialize_source(db, raw_scope(), source_budget()));
+    ASSERT_EQ(captured.size(), 2u);
+    const sr::value_limits budget{8192, 16, 256, 8192, 8192};
+    const sr::row_values first{{"body", std::string("\xc3\xa9\0tail\0", 8)},
+        {"amount", 1.25}, {"bytes", std::vector<uint8_t>{0,255,0}}, {"extra", int64_t{INT64_MAX}}};
+    const sr::row_values second{{"body", std::string{}}, {"amount", -1.25},
+        {"bytes", std::vector<uint8_t>{}}, {"extra", nullptr}};
+    EXPECT_EQ(sr::decode_values(captured[0].payload, budget), first);
+    EXPECT_EQ(sr::decode_values(captured[1].payload, budget), second);
+    EXPECT_EQ(captured[0].payload, sr::encode_values(first, budget));
+    EXPECT_EQ(captured[1].payload, sr::encode_values(second, budget));
+
+    db.db().execute("UPDATE _source_rows SET body=CAST(X'ff' AS TEXT) WHERE globalId='a'");
+    EXPECT_THROW((void)sr::materialize_source(db, raw_scope(), source_budget()), sr::protocol_error);
     EXPECT_EQ(db.local_read_generations_outstanding(), 0u);
 }
 

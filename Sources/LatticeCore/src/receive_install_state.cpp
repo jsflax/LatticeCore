@@ -159,8 +159,10 @@ void valid_row(const receive_install_snapshot& s, const receive_install_limits& 
         if (i.sequence!=s.last_sequence || i.expected_revision!=s.revision || i.base!=s.frontier ||
             (s.last_installed && i.sequence<=s.last_installed->sequence))
             fail(code::corrupt_state,"receiver installation invalid active attempt");
-    } else if (s.last_sequence!=(s.last_installed ? s.last_installed->sequence : 0))
-        fail(code::corrupt_state,"receiver installation unexplained sequence high water");
+    }
+    // Explicitly abandoned committed attempts leave no active record but do
+    // consume sequence numbers. High water is never an installed-result proof;
+    // only exact last_installed equality can support the retained retry path.
 }
 void changed(database& db) {
     if (db.changes()!=1) throw db_error("receiver installation write did not change its expected row");
@@ -386,6 +388,17 @@ receive_install_receipt receive_install_store::complete(const receive_install_bi
         auto next=*current; next.frontier={receive_frontier_kind::position,i.head};
         ++next.revision; next.last_installed=i; next.active.reset(); write_row(next,&*current);
         return receive_install_receipt{receive_install_disposition::installed,next.revision,i.head};
+    });
+}
+void receive_install_store::abandon_active(const receive_install_binding& b,const receive_install_identity& i) {
+    binding_size(b,limits_);identity(i,limits_);const auto u=configuration();auto& db=connection();
+    atomic(db,[&] {
+        const auto current=row(b.channel);covered(current,u,limits_);
+        if(!current)fail(code::binding_mismatch,"receiver installation channel is not bound");
+        bound(*current,b);
+        if(current->active!=std::optional<receive_install_identity>{i} || current->revision!=i.expected_revision || current->frontier!=i.base)
+            fail(code::stale,"receiver abandonment requires exact active identity");
+        auto next=*current;next.active.reset();write_row(next,&*current);return true;
     });
 }
 receive_install_receipt receive_install_store::apply_if_new(const receive_install_binding& b,const receive_install_identity& i,

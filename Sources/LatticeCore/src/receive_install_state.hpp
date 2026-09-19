@@ -107,6 +107,11 @@ public:
     // to support an exact ACK; high-water sequence still refuses stale attempts.
     receive_install_receipt complete(const receive_install_binding&, const receive_install_identity&,
         const std::optional<receive_install_identity>& supersede = std::nullopt);
+    // Explicit controller-fenced abandonment of this exact active identity.
+    // Clears active only; preserves frontier/revision/last result and committed
+    // sequence high water. Missing/installed/different identities refuse. This
+    // does not abandon model/outbox work or authorize a stale callback.
+    void abandon_active(const receive_install_binding&, const receive_install_identity&);
     // Convenience storage boundary: trusted SQL effects and state settle in one
     // savepoint. Exact last retry bypasses effects. Effects must not settle the
     // outer transaction, replace hooks/writer, reenter this binding's storage or

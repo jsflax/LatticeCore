@@ -390,15 +390,64 @@ uint64_t content_record_bytes(const content_item& x,const limits& b){budgets(b);
 uint64_t receipt_record_bytes(const receipt_item& x,const limits& b){budgets(b);receipt_shape(x,b);return receipt_size(x);}
 std::string page_sha256(const content_page& p,const limits& b){page_shape(p,b);return page_hash(p);}
 std::string page_sha256(const receipt_page& p,const limits& b){page_shape(p,b);return page_hash(p);}
-std::string content_sha256(const manifest& m,const std::vector<content_item>& rows,const limits& b){
-    manifest_shape(m,b);check(rows.size()==m.counts.identities,"whole content count mismatch");hash_writer h("content");h.d(anchor(m));h.u(rows.size());uint64_t bytes=0,presents=0;
-    for(size_t i=0;i<rows.size();++i){content_shape(rows[i],b);check(i==0||less(rows[i-1].key,rows[i].key),"whole content duplicate or unordered identity");bytes=add(bytes,content_size(rows[i]));check(bytes<=m.counts.content_bytes,"whole content bytes exceed manifest");presents+=std::holds_alternative<present>(rows[i].value);write(h,rows[i]);}
-    check(bytes==m.counts.content_bytes&&presents==m.counts.present&&rows.size()-presents==m.counts.tombstones,"whole content totals mismatch");return h.finish();
+struct stream_hasher::state {
+    manifest offer;
+    limits budget;
+    stream_kind kind;
+    hash_writer hash;
+    uint64_t count=0, bytes=0, present_count=0;
+    std::optional<identity> last_identity;
+    std::optional<std::string> last_original;
+    bool finished=false;
+    state(const manifest& m,stream_kind k,const limits& b)
+        : offer(m),budget(b),kind(k),hash(k==stream_kind::content?"content":"receipts") {
+        check(k==stream_kind::content||k==stream_kind::receipts,"invalid canonical stream kind");
+        const uint64_t declared=k==stream_kind::content?m.counts.content_bytes:m.counts.receipt_bytes;
+        // Prefix: S(domain), H(anchor), U(record count). Reserve the exact
+        // prefix as well as record bytes in SHA's 64-bit bit-length bound.
+        const auto label=k==stream_kind::content?"content":"receipts";
+        const uint64_t prefix=8+std::string_view("lattice.canonical-range.v2/").size()+std::string_view(label).size()+32+8;
+        check(declared<=std::numeric_limits<uint64_t>::max()/8-prefix,"canonical SHA length overflow");
+        hash.d(anchor(m));hash.u(k==stream_kind::content?m.counts.identities:m.counts.receipts);
+    }
+};
+stream_hasher::stream_hasher(const manifest& m,stream_kind k,const limits& b) {
+    manifest_shape(m,b);state_=std::make_unique<state>(m,k,b);
 }
-std::string receipts_sha256(const manifest& m,const std::vector<receipt_item>& rows,const limits& b){
-    manifest_shape(m,b);check(rows.size()==m.counts.receipts,"whole receipt count mismatch");hash_writer h("receipts");h.d(anchor(m));h.u(rows.size());uint64_t bytes=0;
-    for(size_t i=0;i<rows.size();++i){receipt_shape(rows[i],b);check(i==0||bytes_less(rows[i-1].original_id,rows[i].original_id),"whole receipt duplicate or unordered identity");if(const auto* c=std::get_if<committed>(&rows[i].value))check(c->position<=m.head,"receipt accepted after captured head");bytes=add(bytes,receipt_size(rows[i]));check(bytes<=m.counts.receipt_bytes,"whole receipt bytes exceed manifest");write(h,rows[i]);}
-    check(bytes==m.counts.receipt_bytes,"whole receipt totals mismatch");return h.finish();
+stream_hasher::~stream_hasher()=default;
+stream_hasher::stream_hasher(stream_hasher&&) noexcept=default;
+stream_hasher& stream_hasher::operator=(stream_hasher&&) noexcept=default;
+void stream_hasher::append(const content_item& item) {
+    check(state_&&!state_->finished&&state_->kind==stream_kind::content,"canonical content hasher is not active");
+    auto& s=*state_;content_shape(item,s.budget);
+    check(!s.last_identity||less(*s.last_identity,item.key),"whole content duplicate or unordered identity");
+    const auto next_bytes=add(s.bytes,content_size(item));
+    check(s.count<s.offer.counts.identities&&next_bytes<=s.offer.counts.content_bytes,"whole content exceeds manifest");
+    write(s.hash,item);++s.count;s.bytes=next_bytes;s.present_count+=std::holds_alternative<present>(item.value);s.last_identity=item.key;
+}
+void stream_hasher::append(const receipt_item& item) {
+    check(state_&&!state_->finished&&state_->kind==stream_kind::receipts,"canonical receipt hasher is not active");
+    auto& s=*state_;receipt_shape(item,s.budget);
+    check(!s.last_original||bytes_less(*s.last_original,item.original_id),"whole receipt duplicate or unordered identity");
+    if(const auto* c=std::get_if<committed>(&item.value))check(c->position<=s.offer.head,"receipt accepted after captured head");
+    const auto next_bytes=add(s.bytes,receipt_size(item));
+    check(s.count<s.offer.counts.receipts&&next_bytes<=s.offer.counts.receipt_bytes,"whole receipts exceed manifest");
+    write(s.hash,item);++s.count;s.bytes=next_bytes;s.last_original=item.original_id;
+}
+std::string stream_hasher::finish() {
+    check(state_&&!state_->finished,"canonical hasher already finished");auto& s=*state_;
+    if(s.kind==stream_kind::content)
+        check(s.count==s.offer.counts.identities&&s.bytes==s.offer.counts.content_bytes&&s.present_count==s.offer.counts.present&&s.count-s.present_count==s.offer.counts.tombstones,"whole content totals mismatch");
+    else check(s.count==s.offer.counts.receipts&&s.bytes==s.offer.counts.receipt_bytes,"whole receipt totals mismatch");
+    s.finished=true;return s.hash.finish();
+}
+std::string content_sha256(const manifest& m,const std::vector<content_item>& rows,const limits& b) {
+    stream_hasher hash(m,stream_kind::content,b);check(rows.size()==m.counts.identities,"whole content count mismatch");
+    for(const auto& row:rows)hash.append(row);return hash.finish();
+}
+std::string receipts_sha256(const manifest& m,const std::vector<receipt_item>& rows,const limits& b) {
+    stream_hasher hash(m,stream_kind::receipts,b);check(rows.size()==m.counts.receipts,"whole receipt count mismatch");
+    for(const auto& row:rows)hash.append(row);return hash.finish();
 }
 frame decode(std::string_view raw,const limits& b){
     const auto root=parse(raw,b,b.maximum.frame_bytes);keys(root,{"latticeCanonicalRange"});const auto& j=root.at("latticeCanonicalRange");keys(j,{"version","attempt","route_generation","kind","body"});version(j.at("version"));

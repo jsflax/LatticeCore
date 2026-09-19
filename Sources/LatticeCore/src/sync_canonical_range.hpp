@@ -1,6 +1,7 @@
 #pragma once
 #include "sync_recovery_values.hpp"
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -159,6 +160,24 @@ uint64_t content_record_bytes(const content_item&, const limits&);
 uint64_t receipt_record_bytes(const receipt_item&, const limits&);
 std::string page_sha256(const content_page&, const limits&);
 std::string page_sha256(const receipt_page&, const limits&);
+enum class stream_kind { content, receipts };
+// Bounded streaming form of the same canonical encoding used by whole helpers.
+// Retains only manifest/limits, counters and the last key, never prior records.
+// Discard after any append/finish refusal. A digest is integrity, not authority.
+class stream_hasher {
+    struct state;
+    std::unique_ptr<state> state_;
+public:
+    stream_hasher(const manifest&, stream_kind, const limits&);
+    ~stream_hasher();
+    stream_hasher(stream_hasher&&) noexcept;
+    stream_hasher& operator=(stream_hasher&&) noexcept;
+    stream_hasher(const stream_hasher&) = delete;
+    stream_hasher& operator=(const stream_hasher&) = delete;
+    void append(const content_item&);
+    void append(const receipt_item&);
+    std::string finish();
+};
 // Whole-stream helpers consume caller-owned bounded vectors; never issue SQL.
 // M binds page counts, not boundaries for an equal page count. Exact retained
 // page bytes/page hashes, not M alone, enforce immutable retransmission.

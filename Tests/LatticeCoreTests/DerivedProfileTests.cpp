@@ -29,7 +29,14 @@ std::vector<derived_spec> profile_specs() {
             {model,"embedding",derived_kind::vec0_flat_f32_v1,2}};
 }
 derived_descriptor descriptor() {return describe_derived({profile_schema()},profile_specs());}
-void create(lattice_db& owner) {
+// Test-only access to the same dynamic schema constructor used by Swift.
+// Production visibility and generated schema contents remain unchanged.
+class ProfileOwner : public lattice_db {
+public:
+    using lattice_db::lattice_db;
+    using lattice_db::create_model_table_public;
+};
+void create(ProfileOwner& owner) {
     owner.create_model_table_public(profile_schema());
     owner.ensure_fts5_table(model,"content");owner.ensure_vec0_table(model,"embedding",2);
 }
@@ -74,7 +81,7 @@ void error_is(const std::function<void()>& operation,const std::string& expected
     catch(const derived_profile_error& error) {EXPECT_EQ(std::string(error.what()),expected);}
 }
 void generated_case(bool file) {
-    TempDB disk("derived_profile");lattice_db owner(profile_config(file?disk.str():":memory:"));create(owner);
+    TempDB disk("derived_profile");ProfileOwner owner(profile_config(file?disk.str():":memory:"));create(owner);
     insert(owner,-1,std::string("violet\0orchid",13),pack_floats({1,2}));
     insert(owner,0,std::string{},Blob{});insert(owner,7,nullptr,nullptr);
     const auto expected=descriptor();const auto before=image(owner.db());
@@ -142,7 +149,7 @@ TEST(DerivedProfile, OwnedFinalValuesPreserveNullEmptyAndFiniteFloat32WithAtomic
 }
 
 TEST(DerivedProfile, RequiredTriggerMismatchAndMissingProgramRefuseWithoutRepair) {
-    lattice_db owner(profile_config(":memory:"));create(owner);insert(owner,1,std::string("one"),pack_floats({1,2}));
+    ProfileOwner owner(profile_config(":memory:"));create(owner);insert(owner,1,std::string("one"),pack_floats({1,2}));
     const auto expected=descriptor();const auto before=image(owner.db());
     for(bool missing:{true,false}) {
         owner.begin_transaction();const auto& t=expected.fields()[1].triggers[3];owner.db().execute("DROP TRIGGER "+t.name);
@@ -154,7 +161,7 @@ TEST(DerivedProfile, RequiredTriggerMismatchAndMissingProgramRefuseWithoutRepair
 }
 
 TEST(DerivedProfile, ExtraFamilyObjectsAndShadowIndexesRefuseWhileUnrelatedObjectsRemainPermitted) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     owner.db().execute("CREATE TABLE _unrelated_derived_notes(value TEXT)");
     EXPECT_NO_THROW(metadata(owner.db(),expected));
     for(const auto& sql:std::vector<std::string>{
@@ -168,7 +175,7 @@ TEST(DerivedProfile, ExtraFamilyObjectsAndShadowIndexesRefuseWhileUnrelatedObjec
 }
 
 TEST(DerivedProfile, ExplicitDimensionAndNullabilityMismatchRefuseActualStore) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto before=image(owner.db());
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto before=image(owner.db());
     auto specs=profile_specs();specs[1].dimensions=3;const auto wrong=describe_derived({profile_schema()},specs);
     error_is([&]{metadata(owner.db(),wrong);},"derived module/options/dimensions mismatch");
     auto schema=profile_schema();schema.properties[0].nullable=false;const auto nonnull=describe_derived({schema},profile_specs());
@@ -177,7 +184,7 @@ TEST(DerivedProfile, ExplicitDimensionAndNullabilityMismatchRefuseActualStore) {
 }
 
 TEST(DerivedProfile, ExactMetadataCapsAndWholeInventoryAdmissionBeforeScopedQueries) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     const auto facts=metadata(owner.db(),expected);
     derived_limits exact;exact.metadata_rows=facts.inspected_rows;exact.metadata_bytes=facts.copied_bytes;
     exact.sql_bytes=std::min(exact.sql_bytes,exact.metadata_bytes);
@@ -197,7 +204,7 @@ TEST(DerivedProfile, ExactMetadataCapsAndWholeInventoryAdmissionBeforeScopedQuer
 }
 
 TEST(DerivedProfile, OversizedUnrelatedSchemaIsRefusedBeforeCopyOrScopedLookup) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     derived_limits cap;
     ASSERT_NO_THROW(metadata(owner.db(),expected,cap));
     owner.db().execute("CREATE VIEW _oversized_derived_inventory AS SELECT '"+std::string(cap.sql_bytes+1024,'x')+"' AS value");
@@ -215,7 +222,7 @@ TEST(DerivedProfile, OversizedUnrelatedSchemaIsRefusedBeforeCopyOrScopedLookup) 
 }
 
 TEST(DerivedProfile, ActualVersionMetadataTypeAndLengthPreflightAvoidsCorruptValueCopy) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     for(int variant=0;variant<4;++variant) {
         owner.begin_transaction();
         if(variant==0)owner.db().execute("UPDATE "+vec+"_info SET value=? WHERE key='CREATE_VERSION_PATCH'",{std::string(64*1024,'x')});
@@ -240,7 +247,7 @@ TEST(DerivedProfile, ActualVersionMetadataTypeAndLengthPreflightAvoidsCorruptVal
 }
 
 TEST(DerivedProfile, WrongFtsFormatOrExtraVectorVersionMetadataRefusesWithoutEffects) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     for(const auto& sql:std::vector<std::string>{"UPDATE "+fts+"_config SET v=99 WHERE k='version'",
         "INSERT INTO "+vec+"_info(key,value) VALUES('UNSUPPORTED_EXTRA',1)"}) {
         owner.begin_transaction();owner.db().execute(sql);const auto before=image(owner.db());
@@ -250,7 +257,7 @@ TEST(DerivedProfile, WrongFtsFormatOrExtraVectorVersionMetadataRefusesWithoutEff
 }
 
 TEST(DerivedProfile, InitialRowAndValueBudgetsRefuseBeforeOversizedPayloadCopy) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     insert(owner,-9,std::string("iris"),pack_floats({1,2}));insert(owner,0,nullptr,Blob{});
     derived_limits rows;rows.initial_rows=2;
     EXPECT_EQ(initial(owner.db(),expected,rows).rows,2u);
@@ -270,9 +277,9 @@ TEST(DerivedProfile, InitialRowAndValueBudgetsRefuseBeforeOversizedPayloadCopy) 
 
 TEST(DerivedProfile, ReopenMetadataDoesNotTurnLegitimateGrowthIntoImplicitValueRescan) {
     TempDB disk("derived_profile_growth");const auto expected=descriptor();
-    {lattice_db owner(profile_config(disk.str()));create(owner);
+    {ProfileOwner owner(profile_config(disk.str()));create(owner);
      for(int i=0;i<4;++i)insert(owner,i,std::string("iris"),pack_floats({float(i),0}));}
-    lattice_db reopened(profile_config(disk.str()));derived_limits budget;budget.initial_rows=1;
+    ProfileOwner reopened(profile_config(disk.str()));derived_limits budget;budget.initial_rows=1;
     int model_reads=0;derived_query query=[&](const std::string& sql,const std::vector<column_value_t>& params) {
         if(sql.find("FROM main.\""+model+"\"")!=std::string::npos)++model_reads;
         return reopened.db().query(sql,params);
@@ -283,7 +290,7 @@ TEST(DerivedProfile, ReopenMetadataDoesNotTurnLegitimateGrowthIntoImplicitValueR
 }
 
 TEST(DerivedProfile, RetainedReadViewKeepsSnapshotAndExistingCancellationHandler) {
-    TempDB disk("derived_profile_read_control");lattice_db owner(profile_config(disk.str()));create(owner);
+    TempDB disk("derived_profile_read_control");ProfileOwner owner(profile_config(disk.str()));create(owner);
     insert(owner,1,std::string("old"),pack_floats({1,2}));const auto expected=descriptor();
     auto control=std::make_shared<database_read_control>();
     control->deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
@@ -300,7 +307,7 @@ TEST(DerivedProfile, RetainedReadViewKeepsSnapshotAndExistingCancellationHandler
 }
 
 TEST(DerivedProfile, QueryFailuresPropagateAndCannotBecomeEmptySuccessfulAdmission) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     struct cancelled : std::runtime_error {cancelled():std::runtime_error("retained read cancelled") {}};
     int calls=0;derived_query query=[&](const std::string& sql,const std::vector<column_value_t>& params)->Rows {
         if(++calls==3)throw cancelled();return owner.db().query(sql,params);
@@ -310,7 +317,7 @@ TEST(DerivedProfile, QueryFailuresPropagateAndCannotBecomeEmptySuccessfulAdmissi
 }
 
 TEST(DerivedProfile, WrongVectorChunkRowidDeclarationAndMissingShadowRefuseBeforeAnyRepair) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     const auto original=image(owner.db());
     for(bool missing:{false,true}) {
         owner.begin_transaction();owner.db().execute("DROP TABLE "+vec+"_vector_chunks00");
@@ -323,7 +330,7 @@ TEST(DerivedProfile, WrongVectorChunkRowidDeclarationAndMissingShadowRefuseBefor
 }
 
 TEST(DerivedProfile, MixedCaseExtraFamilyNamesCannotBypassAsciiInsensitiveReservation) {
-    lattice_db owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
+    ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     owner.db().execute("CREATE TABLE _unrelated_case_target(value TEXT)");
     const auto original=image(owner.db());
     for(const auto& sql:std::vector<std::string>{

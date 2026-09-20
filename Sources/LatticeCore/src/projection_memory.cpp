@@ -296,6 +296,9 @@ database_projection_capture::database_projection_capture(
         check();
         if (database_.raw_handle_escaped_.load(std::memory_order_acquire))
             capture_fail(projection_status::unsupported, "raw SQLite handle escaped; capture policies are unowned");
+        if (database_.canonical_custody_bootstrap_ || database_.canonical_callback_custody_ ||
+            std::atomic_load(&database_.local_producer_callback_custody_))
+            capture_fail(projection_status::unsupported, "recovery writer owns connection policies; borrowed capture refused");
         if (!sqlite3_get_autocommit(handle_))
             capture_fail(projection_status::admission_rejected, "memory capture requires committed state");
         for (auto* existing = sqlite3_next_stmt(handle_, nullptr); existing; existing = sqlite3_next_stmt(handle_, existing))

@@ -255,6 +255,25 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     for(const auto& name:p.models)if(!identifier(name))refuse("canonical invalid bounded model name");
     canonical_change_store store(owner,p.binding,p.limits); // Validates before copying/registration.
     writer_=owner.db_;
+    {
+        auto* mutex=sqlite3_db_mutex(writer_->internal_handle());sqlite3_mutex_enter(mutex);
+        struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+        if(writer_->canonical_custody_bootstrap_ || writer_->raw_handle_escaped_.load(std::memory_order_acquire) ||
+           writer_->txn_hooks_external_ || writer_->read_control_ ||
+           std::atomic_load(&writer_->local_producer_callback_custody_))
+            refuse("canonical attachment requires unescaped engine connection policy");
+        for(auto* statement=sqlite3_next_stmt(writer_->internal_handle(),nullptr);statement;
+            statement=sqlite3_next_stmt(writer_->internal_handle(),statement))
+            if(sqlite3_stmt_busy(statement))refuse("canonical attachment requires no active statements");
+        writer_->canonical_custody_bootstrap_=true;
+    }
+    // Public raw/hook/capture entry cannot replace policy between initial
+    // admission and context publication, including callbacks during COMMIT.
+    const auto end_bootstrap=[](database* writer) {
+        auto* mutex=sqlite3_db_mutex(writer->internal_handle());sqlite3_mutex_enter(mutex);
+        writer->canonical_custody_bootstrap_=false;sqlite3_mutex_leave(mutex);
+    };
+    const std::unique_ptr<database,decltype(end_bootstrap)> bootstrap(writer_.get(),end_bootstrap);
     if(writer_->canonical_callback_custody_) {
         auto old=std::static_pointer_cast<context>(writer_->canonical_callback_custody_);
         if(old->active->load(std::memory_order_acquire))refuse("canonical writer already attached");
@@ -460,6 +479,8 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         }
         store.audit();
         owner.commit();began=false;
+        auto* mutex=sqlite3_db_mutex(context_->connection);sqlite3_mutex_enter(mutex);
+        struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
         writer_->canonical_trigger_only_=true;
         writer_->canonical_callback_custody_=context_;
         writer_->canonical_write_allowed_=context_->active;
@@ -472,6 +493,8 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         std::exception_ptr cleanup;
         if(began)try {owner.rollback();}catch(...) {cleanup=std::current_exception();}
         // Keep callback userdata alive and failed persistent attachments closed.
+        auto* mutex=sqlite3_db_mutex(context_->connection);sqlite3_mutex_enter(mutex);
+        struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
         writer_->canonical_callback_custody_=context_;
         writer_->canonical_write_allowed_=context_->active;
         sqlite3_set_authorizer(context_->connection,context::authorize,context_.get());

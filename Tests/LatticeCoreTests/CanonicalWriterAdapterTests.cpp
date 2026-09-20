@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "CanonicalWriterTestAccess.hpp"
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 
@@ -201,14 +202,14 @@ TEST_F(CanonicalWriterAdapter, IgnoredCounterWriteRollsBackOriginatingStatement)
     attach();const auto before=inspect(db,p);
     // Deliberate post-admission fault injection outside supported callback/DDL
     // custody. The SQL postcondition must still catch a silently ignored write.
-    auto* raw=db.db().handle();ASSERT_EQ(sqlite3_set_authorizer(raw,nullptr,nullptr),SQLITE_OK);
+    auto* raw=canonical_writer_custody_test_access::fault_handle(db.db());ASSERT_EQ(sqlite3_set_authorizer(raw,nullptr,nullptr),SQLITE_OK);
     db.db().execute("CREATE TRIGGER _fault_ignore BEFORE UPDATE ON _lattice_canonical_store BEGIN SELECT RAISE(IGNORE); END");
     EXPECT_THROW(db.add(WriterMarkerNode{"blocked","body"}),lattice::db_error);
     EXPECT_EQ(inspect(db,p),before);EXPECT_EQ(scalar(db.db(),"SELECT COUNT(*) FROM WriterMarkerNode"),0);
 }
 
 TEST_F(CanonicalWriterAdapter, RevocationFailsCachedStatementsAndExactReattachmentRestoresWrites) {
-    attach();sqlite3_stmt* statement=nullptr;auto* raw=db.db().handle();
+    attach();sqlite3_stmt* statement=nullptr;auto* raw=canonical_writer_custody_test_access::fault_handle(db.db());
     ASSERT_EQ(sqlite3_prepare_v2(raw,"INSERT INTO WriterMarkerNode(name,body) VALUES('prepared','body')",-1,&statement,nullptr),SQLITE_OK);
     attachment.reset();EXPECT_NE(sqlite3_step(statement),SQLITE_DONE);sqlite3_finalize(statement);
     EXPECT_EQ(scalar(db.db(),"SELECT COUNT(*) FROM WriterMarkerNode"),0);
@@ -246,14 +247,14 @@ TEST_F(CanonicalWriterAdapter, AuditProgramAndTemporaryShadowRefuseWholeAdmissio
 
 TEST_F(CanonicalWriterAdapter, IgnoredAuditInsertCannotAttestPreviousRow) {
     attach();auto kept=db.add(WriterMarkerNode{"kept","body"});const auto before=inspect(db,p);
-    auto* raw=db.db().handle();ASSERT_EQ(sqlite3_set_authorizer(raw,nullptr,nullptr),SQLITE_OK);
+    auto* raw=canonical_writer_custody_test_access::fault_handle(db.db());ASSERT_EQ(sqlite3_set_authorizer(raw,nullptr,nullptr),SQLITE_OK);
     db.db().execute("CREATE TRIGGER _fault_audit BEFORE INSERT ON AuditLog BEGIN SELECT RAISE(IGNORE); END");
     EXPECT_THROW(db.add(WriterMarkerNode{"blocked","body"}),lattice::db_error);
     EXPECT_EQ(inspect(db,p),before);EXPECT_EQ(scalar(db.db(),"SELECT COUNT(*) FROM WriterMarkerNode"),1);
 }
 
 TEST_F(CanonicalWriterAdapter, LogicalCloseRevokesAlreadyPreparedRawStatement) {
-    attach();auto* raw=db.db().handle();sqlite3_stmt* statement=nullptr;
+    attach();auto* raw=canonical_writer_custody_test_access::fault_handle(db.db());sqlite3_stmt* statement=nullptr;
     ASSERT_EQ(sqlite3_prepare_v2(raw,"INSERT INTO WriterMarkerNode(name,body) VALUES('closed','body')",-1,&statement,nullptr),SQLITE_OK);
     db.db().close();EXPECT_NE(sqlite3_step(statement),SQLITE_DONE);sqlite3_finalize(statement);
     // Query via the still-owned physical handle only to prove the refused raw

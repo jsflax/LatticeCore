@@ -59,6 +59,7 @@ struct recovery_witness_access;
 struct recovery_refresh_access;
 struct receive_delivery_guard_access;
 class canonical_writer_adapter;
+struct canonical_writer_custody_test_access;
 class recovery_local_producer_adapter;
 class recovery_obligation_producer_store;
 void require_canonical_relation(database&, const std::string&);
@@ -103,6 +104,7 @@ class database {
     friend struct detail::recovery_refresh_access;
     friend struct detail::receive_delivery_guard_access;
     friend class detail::canonical_writer_adapter;
+    friend struct detail::canonical_writer_custody_test_access;
     friend class detail::recovery_local_producer_adapter;
     friend class detail::recovery_obligation_producer_store;
     friend void detail::require_canonical_relation(database&, const std::string&);
@@ -112,6 +114,11 @@ class database {
     bool canonical_trigger_only_ = false;
     std::shared_ptr<void> canonical_callback_custody_;
     std::shared_ptr<std::atomic<bool>> canonical_write_allowed_;
+    // Physical policy custody, serialized by SQLite's connection mutex.
+    // Bootstrap closes the interval before the canonical context is published.
+    bool canonical_custody_bootstrap_ = false;
+    bool txn_hooks_external_ = false;
+    void set_txn_hooks_owned_(std::function<void()>, std::function<void()>);
     // Private receiver producer admission. Heap custody follows the physical
     // connection across wrapper moves; no all-route capability is implied.
     std::shared_ptr<void> local_producer_callback_custody_;
@@ -379,6 +386,9 @@ public:
     /// failed statements whose implicit transaction already rolled back.
     void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back);
 
+    /// Raw access retires canonical admission before pointer publication and
+    /// refuses during its bootstrap, transaction or active statement. Public
+    /// transaction-hook replacement likewise refuses attached policy custody.
     /// Raw access permanently opts this connection out of strict borrowed
     /// memory projection capture: external SQLite handlers cannot be restored
     /// or proven read-only. Waits behind an active capture before exposing it.

@@ -805,7 +805,7 @@ void lattice_db::setup_change_hook(database& connection) {
     // sqlite3_rollback_hook's C frame: hook bodies are atomics-only by
     // contract, and every lock on this path (change_buffer_mutex_, the
     // hook-list and registry mutexes) is a leaf lock never held across SQL.
-    connection.set_txn_hooks(
+    connection.set_txn_hooks_owned_(
         [this] { flush_changes(); },
         [this, context = connection.lattice_update_hook_context_.get()] {
 #if defined(LATTICE_SYNC_COMMIT_PROBE)

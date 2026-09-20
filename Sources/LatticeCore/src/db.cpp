@@ -445,15 +445,42 @@ sqlite3* database::handle() const {
     if (!db_) return nullptr;
     auto* mutex = sqlite3_db_mutex(db_);
     sqlite3_mutex_enter(mutex);
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    if (canonical_custody_bootstrap_)
+        throw db_error("canonical attachment owns connection policy");
+    if (canonical_callback_custody_) {
+        if (!sqlite3_get_autocommit(db_) || update_hook_scope::active_for(db_))
+            throw db_error("canonical work is active; raw handle refused");
+        for (auto* statement=sqlite3_next_stmt(db_,nullptr);statement;statement=sqlite3_next_stmt(db_,statement))
+            if (sqlite3_stmt_busy(statement))
+                throw db_error("canonical statement is active; raw handle refused");
+        if (canonical_write_allowed_) canonical_write_allowed_->store(false,std::memory_order_release);
+    }
     raw_handle_escaped_.store(true, std::memory_order_release);
     // A known raw escape ends future producer admission. There is no SQLite
     // getter that could establish which external authorizer a caller installs.
     if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
-    sqlite3_mutex_leave(mutex);
     return db_;
 }
 
 void database::set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back) {
+    if (!db_) throw db_error("transaction hooks require a physical connection");
+    // Retire user-owned captures only after releasing SQLite's mutex.
+    std::function<void()> prior_settled,prior_rolled_back;
+    {
+    auto* mutex=sqlite3_db_mutex(db_);sqlite3_mutex_enter(mutex);
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    if (canonical_custody_bootstrap_ || canonical_callback_custody_ ||
+        std::atomic_load(&local_producer_callback_custody_))
+        throw db_error("transaction hooks belong to attached recovery policy");
+    // Clearing public hooks cannot recreate the original engine callbacks.
+    txn_hooks_external_=true;
+    prior_settled.swap(on_txn_settled_);prior_rolled_back.swap(on_txn_rolled_back_);
+    set_txn_hooks_owned_(std::move(settled),std::move(rolled_back));
+    }
+}
+
+void database::set_txn_hooks_owned_(std::function<void()> settled, std::function<void()> rolled_back) {
     on_txn_settled_ = std::move(settled);
     on_txn_rolled_back_ = std::move(rolled_back);
     // Rollback hook: fires inside SQLite's C frames, so the trampoline only
@@ -520,13 +547,14 @@ database::database(database&& other) noexcept
     canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
     canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
     canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
+    txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
     local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
     local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
     channel_reset_unsettled_.store(other.channel_reset_unsettled_.exchange(false));
     lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
     if (lattice_update_hook_context_) {
         txn_dirty_.store(other.txn_dirty_.exchange(false));
-        set_txn_hooks(std::move(other.on_txn_settled_), std::move(other.on_txn_rolled_back_));
+        set_txn_hooks_owned_(std::move(other.on_txn_settled_), std::move(other.on_txn_rolled_back_));
     }
     raw_handle_escaped_.store(other.raw_handle_escaped_.load(std::memory_order_acquire));
     other.db_ = nullptr;
@@ -551,6 +579,7 @@ database& database::operator=(database&& other) noexcept {
         canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
         canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
         canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
+        txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
         local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
         local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
         channel_reset_unsettled_.store(other.channel_reset_unsettled_.exchange(false));
@@ -560,7 +589,7 @@ database& database::operator=(database&& other) noexcept {
             txn_dirty_.store(other.txn_dirty_.exchange(false));
             // The SQLite update/WAL userdata address has not changed. The
             // rollback trampoline uses database*, so explicitly rebind it.
-            set_txn_hooks(std::move(other.on_txn_settled_), std::move(other.on_txn_rolled_back_));
+            set_txn_hooks_owned_(std::move(other.on_txn_settled_), std::move(other.on_txn_rolled_back_));
         } else {
             // Replacing a hooked writer with an unhooked wrapper must not
             // retain callbacks whose old connection context was just freed.

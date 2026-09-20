@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include <cstdio>
 
@@ -68,7 +69,7 @@ struct Fault {
     canonical_upstream_test_hooks::authorizer_fault probe;
     const canonical_upstream_test_hooks::authorizer_fault* previous;
     Fault* prior;
-    Fault(database& db,Kind k,bool one=true):kind(k),once(one),probe{db.handle(),restrict_action},
+    Fault(database& db,Kind k,bool one=true):kind(k),once(one),probe{canonical_writer_custody_test_access::fault_handle(db),restrict_action},
         previous(canonical_upstream_test_hooks::fault),prior(active){active=this;canonical_upstream_test_hooks::fault=&probe;}
     ~Fault(){canonical_upstream_test_hooks::fault=previous;active=prior;}
     static int restrict_action(int action,const char* one,const char* two,const char* origin) noexcept {
@@ -221,7 +222,7 @@ TEST_F(CanonicalUpstream, CommitRefusalRollsBackWholeChunkAndAllowsSuccessor) {
 TEST_F(CanonicalUpstream, BindingLengthFailureCannotBecomeNoopAcceptance) {
     attach();auto bad=entry(101,1),good=entry(102,2);bad.changed_fields["body"]=any_property(std::string(8192,'x'));
     struct Limit {sqlite3* db;int old;explicit Limit(sqlite3* h):db(h),old(sqlite3_limit(h,SQLITE_LIMIT_LENGTH,2048)){}~Limit(){sqlite3_limit(db,SQLITE_LIMIT_LENGTH,old);}};
-    {Limit limited(owner->db().handle());EXPECT_EQ(apply({bad,good}),std::vector<std::string>{good.global_id});}
+    {Limit limited(canonical_writer_custody_test_access::fault_handle(owner->db()));EXPECT_EQ(apply({bad,good}),std::vector<std::string>{good.global_id});}
     EXPECT_FALSE(receipt(*owner,p,bad.global_id));EXPECT_TRUE(receipt(*owner,p,good.global_id));
     EXPECT_EQ(scalar(owner->db(),"SELECT COUNT(*) FROM UpstreamNode"),1);EXPECT_EQ(state(*owner,p).head,2);
 }
@@ -294,7 +295,7 @@ TEST_F(CanonicalUpstream, UuidComparisonNormalizesWithoutRewritingStoredRowOrAud
 TEST_F(CanonicalUpstream, PreparedRuntimeGuardCannotBeReusedAfterEntryUnwind) {
     attach();auto e=entry(101,1);sqlite3_stmt* statement=nullptr;
     const char* sql="SELECT lattice_canonical_entry_v1(X'30303030303030302d303030302d343030302d383030302d303030303030303030313031',X'557073747265616d4e6f6465',X'30303030303030302d303030302d343030302d383030302d303030303030303030303031')";
-    ASSERT_EQ(sqlite3_prepare_v2(owner->db().handle(),sql,-1,&statement,nullptr),SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(canonical_writer_custody_test_access::fault_handle(owner->db()),sql,-1,&statement,nullptr),SQLITE_OK);
     struct Finalize {sqlite3_stmt* statement;~Finalize(){sqlite3_finalize(statement);}} cleanup{statement};
     EXPECT_EQ(apply({e}),std::vector<std::string>{e.global_id});
     EXPECT_EQ(sqlite3_step(statement),SQLITE_ERROR) << "prepare-time function visibility is not an entry capability";

@@ -3766,6 +3766,7 @@ public:
 private:
     friend struct audit_maintenance_test_access;
     friend struct sync_entry_rollback_test_access;
+    friend struct detail::receive_delivery_guard_access;
     friend std::vector<std::string> apply_remote_changes(
         lattice_db&, const std::vector<audit_log_entry>&);
     friend std::vector<std::string> apply_remote_changes_for(
@@ -3793,6 +3794,7 @@ private:
                 // Recheck durable enrollment after BEGIN excludes sibling
                 // enrollment; an earlier context-only check is insufficient.
                 detail::require_recovery_local_producer_maintenance_absent(*db_);
+                detail::require_receive_guard_history_unblocked(*db_);
                 result = std::forward<F>(body)();
                 db_->commit();
                 // COMMIT actually executes even after logical close. A WAL
@@ -6454,6 +6456,13 @@ private:
             return;
         }
 
+        // A missing guard family in an already populated schema is an upgrade,
+        // not proof that prior receive history was complete. Capture this under
+        // the owned bootstrap transaction before creating any internal table.
+        const bool receive_legacy_origin = !db_->query(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").empty();
+        detail::initialize_receive_guard_schema(*db_, receive_legacy_origin);
+
         // First create sync control table
         ensure_sync_control_table();
 
@@ -7281,6 +7290,7 @@ private:
             CREATE TABLE IF NOT EXISTS _lattice_replication_slots (
                 sync_id TEXT PRIMARY KEY,
                 confirmed_audit_id INTEGER NOT NULL DEFAULT 0,
+                last_received_event_id TEXT,
                 last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         )");
@@ -7305,6 +7315,7 @@ private:
         // reads it. Reaching this on existing DBs requires the
         // kLatticeSchemaFormatEpoch bump (same contract as the ALTER above).
         migrate_sync_set_to_per_sync_id();
+        ensure_cursor_column(*db_);
     }
 
     /// One-time rebuild of _lattice_sync_set from the pre-per-sync_id shape
@@ -7473,7 +7484,9 @@ protected:
     /// Epoch 7: generated vec0 programs gain empty/NULL update clearing.
     /// Both Core and Swift fingerprint families must revalidate old sidecar
     /// metadata. This does not backfill already-stale untouched index rows.
-    static constexpr int kLatticeSchemaFormatEpoch = 7;
+    // Epoch 8 adds the durable receive-delivery guard before producer/schema
+    // admission. Legacy origins remain explicitly unverified until recovery.
+    static constexpr int kLatticeSchemaFormatEpoch = 8;
 
 public:
     /// Public accessor for the schema-format epoch (exposed on the C ABI as

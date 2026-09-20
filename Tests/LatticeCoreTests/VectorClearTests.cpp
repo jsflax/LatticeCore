@@ -242,7 +242,7 @@ TEST(VectorClear, EpochSevenOpenUpgradesLegacyMetadataButDoesNotClaimHistoricalB
     }
     {lattice::database raw(path.str());EXPECT_EQ(programs(raw),old_programs);same_image(raw,stale);}
     {
-        ClearStore reopened(path.str());EXPECT_EQ(lattice::lattice_db::schema_format_epoch(),7);
+        ClearStore reopened(path.str());EXPECT_EQ(lattice::lattice_db::schema_format_epoch(),8);
         EXPECT_EQ(programs(reopened.db()).size(),old_programs.size()+1);same_image(reopened.db(),stale);
         // No explicit ensure or vector setter after reopen: the generated NULL
         // path must already be admitted before the first ordinary SQL UPDATE.

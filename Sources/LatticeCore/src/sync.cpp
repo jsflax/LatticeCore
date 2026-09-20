@@ -1,5 +1,6 @@
 #include "sync_immediate_scheduler.hpp"
 #include "canonical_writer_adapter.hpp"
+#include "receive_delivery_guard.hpp"
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
 #include <nlohmann/json.hpp>
@@ -942,7 +943,7 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
     // This rejects obsolete QUEUED work before cursor lookup (which can seed a
     // slot) or dialing. It does not preempt an already-admitted transport call,
     // and the token is not an object-lifetime or platform-callback fence.
-    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
@@ -955,7 +956,7 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
         // "client retries via endpoint" path never existed.)
         LOG_INFO("synchronizer", "[%s] IPC connect: supports_reconnect=%d",
                  log_id(), (lifecycle & 1) ? 1 : 0);
-        if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
+        if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
         ws_client_->connect("", {});
         return;
     }
@@ -979,7 +980,7 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
 
     // Cursor lookup may take time. Do not publish an old attempt after an
     // explicit stop or replacement completed while its parameters were read.
-    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
     ws_client_->connect(url, headers);
 }
 
@@ -1173,16 +1174,31 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 }
             }
             auto entry_count = entries.size();
+            const auto receive_lifecycle = reconnect_lifecycle_.load();
             scheduler_->invoke([this, entries = std::move(entries), entry_count,
+                                receive_lifecycle,
                                 skipped_filter_removals = std::move(skipped_filter_removals)] {
-                if (is_destroyed_) {
+                if (is_destroyed_ || receive_lifecycle_stopped(receive_lifecycle) ||
+                    reconnect_lifecycle_.load() != receive_lifecycle) {
                     LOG_INFO("synchronizer", "[%s] scheduler lambda: is_destroyed_, skipping apply of %zu entries",
                              log_id(), entry_count);
                     return;
                 }
                 LOG_INFO("synchronizer", "[%s] scheduler lambda: applying %zu entries (db=%s)",
                          log_id(), entries.size(), db().config().path.c_str());
-                auto applied_ids = apply_remote_changes(entries);
+                std::vector<std::string> applied_ids;
+                try { applied_ids = apply_remote_changes(entries); }
+                catch (const detail::receive_admission_error&) {
+                    // No effects from this frame were admitted. Fence later
+                    // queued callbacks and automatic retries; do not append
+                    // policy ACKs for stripped filter-removal entries either.
+                    const auto stopped_through = (receive_lifecycle >> 1) + 1;
+                    auto previous = receive_stop_generation_.load(std::memory_order_acquire);
+                    while (previous < stopped_through && !receive_stop_generation_.compare_exchange_weak(
+                        previous, stopped_through, std::memory_order_acq_rel)) {}
+                    LOG_WARN("synchronizer", "receive intake refused; route stopped until explicit replay connection");
+                    return;
+                }
                 // Ack skipped filter-removals as if applied (see above).
                 applied_ids.insert(applied_ids.end(),
                                    skipped_filter_removals.begin(),
@@ -2597,7 +2613,7 @@ void synchronizer_base::maybe_reset_backoff_after_stable_connection(bool was_ope
 
 void synchronizer_base::schedule_reconnect() {
     const auto lifecycle = reconnect_lifecycle_.load();
-    const bool should_reconnect = (lifecycle & 1) != 0;
+    const bool should_reconnect = (lifecycle & 1) != 0 && !receive_lifecycle_stopped(lifecycle);
     bool within_limit = config_.max_reconnect_attempts == 0
         || reconnect_attempts_ < config_.max_reconnect_attempts;
     if (!(should_reconnect && !is_connected_ && within_limit)) {
@@ -2627,14 +2643,14 @@ void synchronizer_base::schedule_reconnect() {
         // queued retry. Keep the existing backoff policy; a current retry must
         // not call public connect(), which publishes fresh retry permission.
         scheduler_->invoke([this, delay, lifecycle] {
-            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
+            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
             auto end = std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(static_cast<int>(delay * 1000));
             while (std::chrono::steady_clock::now() < end) {
-                if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
+                if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle) return;
+            if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
             if (!is_connected_) {
                 connect_for_lifecycle(lifecycle);
             }
@@ -2643,37 +2659,11 @@ void synchronizer_base::schedule_reconnect() {
 }
 
 std::optional<std::string> synchronizer_base::get_last_received_event_id() {
-    // Slot cursor first (written per applied chunk; survives no-op-suppressed
-    // deliveries and compaction). NULL slot → legacy newest-isFromRemote scan,
-    // self-seeding the slot so the fallback is only ever taken once per
-    // channel and repairs can eventually drop their cursor-row preservation.
-    ensure_cursor_column(db().db());
-    auto slot = db().db().query(
-        "SELECT last_received_event_id FROM _lattice_replication_slots "
-        "WHERE sync_id = ? AND last_received_event_id IS NOT NULL",
-        {config_.sync_id});
-    if (!slot.empty()) {
-        auto it = slot[0].find("last_received_event_id");
-        if (it != slot[0].end() && std::holds_alternative<std::string>(it->second)) {
-            return std::get<std::string>(it->second);
-        }
-    }
-    auto rows = db().db().query(
-        "SELECT globalId FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1"
-    );
-    if (!rows.empty()) {
-        auto it = rows[0].find("globalId");
-        if (it != rows[0].end() && std::holds_alternative<std::string>(it->second)) {
-            const auto& gid = std::get<std::string>(it->second);
-            db().db().execute(R"(
-                UPDATE _lattice_replication_slots
-                SET last_received_event_id = ?
-                WHERE sync_id = ? AND last_received_event_id IS NULL
-            )", {gid, config_.sync_id});
-            return gid;
-        }
-    }
-    return std::nullopt;
+    // Epoch-8 writers always have the guard family. A missing/corrupt family
+    // is a refusal, never permission to reconstruct a cursor from unrelated
+    // remote AuditLog rows. Absent per-channel state starts at beginning;
+    // initialized NULL and legacy-unverified state also retain that boundary.
+    return detail::receive_delivery_guard_access::read(db(), config_.sync_id).checkpoint;
 }
 
 // ============================================================================
@@ -3340,6 +3330,7 @@ void ensure_cursor_column(database& db) {
     try {
         db.execute("ALTER TABLE _lattice_replication_slots "
                    "ADD COLUMN last_received_event_id TEXT", {});
+        if (detail::receive_guard_manages_cursor(db)) return;
         db.execute(R"(
             UPDATE _lattice_replication_slots
             SET last_received_event_id =
@@ -3484,6 +3475,71 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
     bool legacy_receipts_available = !upstream;
     std::optional<std::string> cursor_candidate;
     bool cursor_halted = false;
+    std::optional<detail::receive_guard_token> receive_token;
+    std::shared_ptr<database> receive_writer;
+    if (receiving_sync_id && !upstream) {
+        // The fixed guard is committed BEFORE any entry effect. A later chunk
+        // rollback cannot erase the fact that this delivery was admitted.
+        using phase = database::sync_apply_chunk_state::phase;
+        database::sync_apply_chunk_state intake;
+        bool committed = false;
+        try {
+            const detail::receive_guard_limits limits;
+            if (receiving_sync_id->empty() || receiving_sync_id->size() > static_cast<uint64_t>(limits.key_bytes))
+                throw db_error("receive channel exceeds qualification key bound");
+            for (const auto& entry : entries) {
+                if (entry.global_id.empty() || entry.global_id.size() > static_cast<uint64_t>(limits.checkpoint_bytes))
+                    throw db_error("receive identity exceeds qualification checkpoint bound");
+            }
+            {
+                std::lock_guard<std::mutex> publication(connection_ownership_mutex_);
+                if (closed_.load()) throw db_error("receive intake owner closed");
+                receive_writer = db_;
+            }
+            if (!receive_writer) throw db_error("receive intake writer unavailable");
+            database::maintenance_scope::probe_before_store_gate(*receive_writer);
+            {
+                store_write_gate_hold gate(*this);
+                std::unique_lock<std::recursive_timed_mutex> memory_gate;
+#ifdef __EMSCRIPTEN__
+                constexpr bool memory = true;
+#else
+                const bool memory = config_.is_in_memory();
+#endif
+                if (memory && !store_write_gate_) memory_gate = std::unique_lock<std::recursive_timed_mutex>(vec0_memory_maintenance_gate_);
+                database::maintenance_scope ownership(*receive_writer);
+                auto* hook = receive_writer->lattice_update_hook_context_.get();
+                {
+                    std::lock_guard<std::mutex> publication(connection_ownership_mutex_);
+                    if (closed_.load() || db_ != receive_writer || !hook || hook->owner != this ||
+                        hook->connection != receive_writer->internal_handle() || hook->sync_chunk)
+                        throw db_error("receive intake physical admission changed");
+                }
+                struct detach { database::lattice_update_hook_context* hook; database::sync_apply_chunk_state* state;
+                    ~detach() { if (hook->sync_chunk == state) hook->sync_chunk = nullptr; }
+                } detach_marker{hook, &intake};
+                try {
+                    receive_writer->begin_transaction(); intake.state = phase::active; hook->sync_chunk = &intake;
+                    receive_token = detail::receive_delivery_guard_access::begin(*this, *receive_writer, *receiving_sync_id);
+                    receive_writer->commit();
+                    intake.state = phase::committed; committed = true;
+                } catch (...) {
+                    if (intake.state == phase::committed) committed = true;
+                    else if (intake.state == phase::active) {
+                        try { receive_writer->rollback(); }
+                        catch (...) { receive_writer->closed_.store(true, std::memory_order_release); }
+                        if (intake.state != phase::rolled_back) receive_writer->closed_.store(true, std::memory_order_release);
+                    }
+                    throw;
+                }
+            }
+            receive_writer->drain_if_settled();
+            if (receive_token->capacity_refused) throw db_error("receive qualification capacity refused durably");
+            if (detail::receive_guard_test_hooks::after_intake_commit) detail::receive_guard_test_hooks::after_intake_commit();
+        } catch (...) {
+            throw detail::receive_admission_error(std::current_exception(), committed);
+        }
+    }
 
     // B3.4 per-delivery memos: table ensures and schema lookups are per-TABLE
     // facts hoisted out of the per-entry loop.
@@ -3504,7 +3560,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
         // Pin the wrapper, retaining the existing parent-outlives-operation
         // contract. Owned admission rejects a transaction started elsewhere;
         // cleanup never guesses ownership from a later autocommit value.
-        auto writer = upstream ? upstream->writer() : db_;
+        auto writer = upstream ? upstream->writer() : (receive_writer ? receive_writer : db_);
         const auto execute = [&](const std::string& sql, const std::vector<column_value_t>& params = {}) {
             if (upstream) upstream->execute(sql, params);
             else writer->execute(sql, params);
@@ -3536,6 +3592,11 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                 writer->lattice_update_hook_context_->owner != this ||
                 writer->lattice_update_hook_context_->connection != writer->internal_handle())
                 throw db_error("sync apply requires its installed writer hook context");
+            if (receive_token) {
+                std::lock_guard<std::mutex> publication(connection_ownership_mutex_);
+                if (closed_.load() || db_ != writer || writer->lattice_update_hook_context_->sync_chunk)
+                    throw db_error("receive chunk physical admission changed");
+            }
             if (upstream) {
                 std::lock_guard<std::mutex> publication(connection_ownership_mutex_);
                 const auto& context = *writer->lattice_update_hook_context_;
@@ -3560,6 +3621,9 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                 writer->begin_transaction();
                 chunk.state = chunk_state::phase::active;
                 hook.sync_chunk = &chunk;
+                std::optional<detail::receive_guard_snapshot> receive_chunk_start;
+                if (receive_token)
+                    receive_chunk_start = detail::receive_delivery_guard_access::require_current(*this, *writer, *receive_token);
                 applying_flag.activate();
 
                 // Preparation participates in this known-owned transaction.
@@ -3584,9 +3648,9 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                     }
                 }
                 execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-                if (upstream && (writer->changes() != 1 ||
+                if ((upstream || receive_token) && (writer->changes() != 1 ||
                     query("SELECT disabled FROM _SyncControl WHERE id=1").at(0).at("disabled") != column_value_t(int64_t{1})))
-                    throw db_error("canonical upstream audit suppression was refused");
+                    throw db_error("owned sync audit suppression was refused");
 
                 for (size_t i = chunk_start; i < chunk_end; ++i) {
                     const auto& entry = entries[i];
@@ -4015,7 +4079,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         }
                         cursor_candidate = entries[k].global_id;
                     }
-                    if (cursor_candidate) {
+                    if (cursor_candidate && !receive_token) {
                         execute(R"(
                             UPDATE _lattice_replication_slots
                             SET last_received_event_id = ?, last_active_at = datetime('now')
@@ -4024,11 +4088,25 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                     }
                 }
 
+                std::optional<detail::receive_guard_snapshot> receive_postimage;
+                if (receive_token) {
+                    receive_postimage = detail::receive_delivery_guard_access::finish(*this, *writer,
+                        *receive_token, *receive_chunk_start, cursor_candidate, cursor_halted, chunk_end == entries.size());
+                }
+
                 // Re-enable sync triggers (restore the pre-existing flag value)
                 execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
                 if (upstream && (writer->changes() != 1 ||
                     query("SELECT disabled FROM _SyncControl WHERE id=1").at(0).at("disabled") != column_value_t(prev_disabled)))
                     throw db_error("canonical upstream audit flag restoration was refused");
+                if (receive_postimage) {
+                    // Restore-trigger side effects cannot silently undo the
+                    // guard/slot writes that this COMMIT is about to certify.
+                    detail::receive_delivery_guard_access::verify_owned(*this, *writer, *receive_postimage);
+                    const auto restored = query("SELECT disabled FROM _SyncControl WHERE id=1");
+                    if (restored.size() != 1 || restored[0].at("disabled") != column_value_t(prev_disabled))
+                        throw db_error("receive audit flag restoration postimage mismatch");
+                }
 
                 writer->commit();
                 // Memory/DELETE-journal builds settle here; file WAL consumes

@@ -406,6 +406,13 @@ protected:
     // cannot pair its permission with a newer lifecycle's generation. A retry
     // only borrows its captured token; it never enables reconnect itself.
     std::atomic<uint64_t> reconnect_lifecycle_{1};
+    // One plus the latest stopped generation (lifecycle >> 1), or zero. Old
+    // refusal cannot stop a newer explicit connect; concurrent old refusals
+    // cannot erase a newer stop. This is not a durable source/lifetime token.
+    std::atomic<uint64_t> receive_stop_generation_{0};
+    bool receive_lifecycle_stopped(uint64_t lifecycle) const noexcept {
+        return (lifecycle >> 1) < receive_stop_generation_.load(std::memory_order_acquire);
+    }
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before

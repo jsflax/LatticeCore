@@ -1,4 +1,5 @@
 #include "recovery_writer_access.hpp"
+#include "receive_delivery_guard.hpp"
 
 namespace lattice::detail {
 namespace recovery_channel_reset_test_hooks {
@@ -95,6 +96,7 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
         return true;
     };
     const auto mutate=[&] {
+        const auto receive_before = receive_delivery_guard_access::read_owned(owner,*writer,channel);
         const bool had_slot=exists("SELECT 1 FROM _lattice_replication_slots WHERE sync_id=? LIMIT 2");
         run("DELETE FROM _lattice_sync_state WHERE sync_id=?",&channel);
         run("DELETE FROM _lattice_sync_set WHERE sync_id=?",&channel);
@@ -110,6 +112,11 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
         } else if(rc!=SQLITE_ROW||sqlite3_column_type(slot.get(),0)!=SQLITE_INTEGER||sqlite3_column_int64(slot.get(),0)!=0||
                   sqlite3_column_type(slot.get(),1)!=SQLITE_INTEGER||sqlite3_column_int64(slot.get(),1)!=0||sqlite3_step(slot.get())!=SQLITE_DONE)
             throw db_error("channel reset postimage mismatch: slot floors not zero integers");
+        const auto receive_after = retire
+            ? receive_delivery_guard_access::retire(owner,*writer,receive_before) : receive_before;
+        // Upload/filter reset cannot erase receive ambiguity. Permanent remove
+        // retains a tombstone and invalidates old delivery tokens atomically.
+        receive_delivery_guard_access::verify_owned(owner,*writer,receive_after);
     };
     auto* active=active_writer(owner);
     if(active) {

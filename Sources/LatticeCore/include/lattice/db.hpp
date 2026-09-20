@@ -57,6 +57,7 @@ struct exact_vector_rows_access;
 struct recovery_writer_access;
 struct recovery_witness_access;
 struct recovery_refresh_access;
+struct receive_delivery_guard_access;
 class canonical_writer_adapter;
 class recovery_local_producer_adapter;
 class recovery_obligation_producer_store;
@@ -66,6 +67,9 @@ void publish_recovery_local_producer(lattice_db&, database&) noexcept;
 bool preserve_recovery_local_producer_relation(database&, const std::string&);
 void require_recovery_local_producer_maintenance_absent(database&);
 void reset_sync_channel_with_producer_fence(lattice_db&, const std::string&, bool retire);
+void initialize_receive_guard_schema(database&, bool legacy_origin);
+bool receive_guard_manages_cursor(database&);
+void require_receive_guard_history_unblocked(database&);
 
 // One ordinary attached-field operation. Main/manual database fields keep
 // their existing path. The implementation never acquires a topology mutex
@@ -97,6 +101,7 @@ class database {
     friend struct detail::recovery_writer_access;
     friend struct detail::recovery_witness_access;
     friend struct detail::recovery_refresh_access;
+    friend struct detail::receive_delivery_guard_access;
     friend class detail::canonical_writer_adapter;
     friend class detail::recovery_local_producer_adapter;
     friend class detail::recovery_obligation_producer_store;

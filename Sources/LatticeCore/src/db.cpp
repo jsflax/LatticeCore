@@ -319,6 +319,19 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         sqlite3_busy_timeout(db_, busy_timeout_ms_);
     }
 
+    // Register vec0 before any SQL can load an existing schema. SQLite marks
+    // shadow tables while parsing that schema using the modules registered at
+    // that moment; registering vec0 later does not reclassify those tables.
+    // Busy/cancellation handlers above must still precede extension setup.
+    int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
+    if (vec_rc != SQLITE_OK) {
+        if (read_control_) read_control_->unpublish(db_);
+        sqlite3_close_v2(db_);
+        db_ = nullptr;
+        LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
+        throw db_error("Failed to initialize sqlite-vec extension");
+    }
+
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
 
@@ -373,15 +386,6 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     sqlite3_db_config(db_, SQLITE_DBCONFIG_STMT_SCANSTATUS, 0, nullptr);
 #endif
 
-    // Initialize sqlite-vec extension for vector search
-    int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
-    if (vec_rc != SQLITE_OK) {
-        if (read_control_) read_control_->unpublish(db_);
-        sqlite3_close_v2(db_);
-        db_ = nullptr;
-        LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
-        throw db_error("Failed to initialize sqlite-vec extension");
-    }
     } catch (...) {
         if (read_control_) read_control_->unpublish(db_);
         if (db_) sqlite3_close_v2(db_);

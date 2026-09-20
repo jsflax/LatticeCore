@@ -80,6 +80,34 @@ void error_is(const std::function<void()>& operation,const std::string& expected
     try {operation();FAIL()<<"expected derived refusal: "<<expected;}
     catch(const derived_profile_error& error) {EXPECT_EQ(std::string(error.what()),expected);}
 }
+// Corrupt real shadow metadata only while constructing the fault. Restore the
+// host's original defensive setting before the validator or rollback runs.
+// This helper never changes production connection policy.
+void corrupt_shadow(database& db,const std::function<void()>& corruption) {
+    auto* handle=db.handle();int previous=-1;
+    if(sqlite3_db_config(handle,SQLITE_DBCONFIG_DEFENSIVE,-1,&previous)!=SQLITE_OK)
+        throw db_error("cannot inspect fixture defensive policy");
+    struct restore_policy {
+        sqlite3* handle;int previous;bool restored=false;
+        void restore() {
+            int current=-1;
+            if(sqlite3_db_config(handle,SQLITE_DBCONFIG_DEFENSIVE,previous,&current)!=SQLITE_OK || current!=previous)
+                throw db_error("cannot restore fixture defensive policy");
+            restored=true;
+        }
+        ~restore_policy() {
+            if(!restored) {
+                int current=-1;
+                EXPECT_EQ(sqlite3_db_config(handle,SQLITE_DBCONFIG_DEFENSIVE,previous,&current),SQLITE_OK);
+                EXPECT_EQ(current,previous);
+            }
+        }
+    } guard{handle,previous};
+    int current=-1;
+    if(sqlite3_db_config(handle,SQLITE_DBCONFIG_DEFENSIVE,0,&current)!=SQLITE_OK || current!=0)
+        throw db_error("cannot admit deliberate fixture shadow corruption");
+    corruption();guard.restore();
+}
 void generated_case(bool file) {
     TempDB disk("derived_profile");ProfileOwner owner(profile_config(file?disk.str():":memory:"));create(owner);
     insert(owner,-1,std::string("violet\0orchid",13),pack_floats({1,2}));
@@ -225,10 +253,12 @@ TEST(DerivedProfile, ActualVersionMetadataTypeAndLengthPreflightAvoidsCorruptVal
     ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     for(int variant=0;variant<4;++variant) {
         owner.begin_transaction();
+        corrupt_shadow(owner.db(),[&] {
         if(variant==0)owner.db().execute("UPDATE "+vec+"_info SET value=? WHERE key='CREATE_VERSION_PATCH'",{std::string(64*1024,'x')});
         if(variant==1)owner.db().execute("UPDATE "+vec+"_info SET value=? WHERE key='CREATE_VERSION_PATCH'",{Blob(64*1024,1)});
         if(variant==2)owner.db().execute("DELETE FROM "+vec+"_info WHERE key='CREATE_VERSION_MAJOR'");
         if(variant==3)owner.db().execute("UPDATE "+vec+"_info SET value=-1 WHERE key='CREATE_VERSION_PATCH'");
+        });
         bool saw_guarded=false;size_t largest_dynamic=0;
         derived_query query=[&](const std::string& sql,const std::vector<column_value_t>& params) {
             auto rows=owner.db().query(sql,params);
@@ -250,7 +280,7 @@ TEST(DerivedProfile, WrongFtsFormatOrExtraVectorVersionMetadataRefusesWithoutEff
     ProfileOwner owner(profile_config(":memory:"));create(owner);const auto expected=descriptor();
     for(const auto& sql:std::vector<std::string>{"UPDATE "+fts+"_config SET v=99 WHERE k='version'",
         "INSERT INTO "+vec+"_info(key,value) VALUES('UNSUPPORTED_EXTRA',1)"}) {
-        owner.begin_transaction();owner.db().execute(sql);const auto before=image(owner.db());
+        owner.begin_transaction();corrupt_shadow(owner.db(),[&]{owner.db().execute(sql);});const auto before=image(owner.db());
         EXPECT_THROW(metadata(owner.db(),expected),derived_profile_error);EXPECT_EQ(image(owner.db()),before);
         owner.rollback();EXPECT_NO_THROW(metadata(owner.db(),expected));
     }
@@ -287,6 +317,25 @@ TEST(DerivedProfile, ReopenMetadataDoesNotTurnLegitimateGrowthIntoImplicitValueR
     EXPECT_NO_THROW(metadata(reopened.db(),query,expected,budget));EXPECT_EQ(model_reads,0);
     EXPECT_THROW(initial(reopened.db(),query,expected,budget),derived_profile_error);EXPECT_GT(model_reads,0);
     EXPECT_EQ(number(reopened.db(),"SELECT count(*) AS n FROM "+model),4);
+}
+
+TEST(DerivedProfile, ReopenedShadowKindsAreReadyBeforeAnyExplicitVirtualTableQuery) {
+    TempDB disk("derived_profile_shadow_reopen");
+    {ProfileOwner owner(profile_config(disk.str()));create(owner);}
+    for(auto mode:{database::open_mode::read_write,database::open_mode::read_only}) {
+        database reopened(disk.str(),mode,100);
+        const auto kinds=reopened.query("SELECT name,type FROM pragma_table_list WHERE schema='main'");
+        const auto kind=[&](const std::string& name) {
+            for(const auto& row:kinds)if(std::get<std::string>(row.at("name"))==name)
+                return std::get<std::string>(row.at("type"));
+            return std::string("missing");
+        };
+        EXPECT_EQ(kind(fts+"_config"),"shadow");EXPECT_EQ(kind(vec+"_info"),"shadow");
+        EXPECT_EQ(kind(vec+"_chunks"),"shadow");EXPECT_EQ(kind(vec+"_rowids"),"shadow");
+        // sqlite-vec deliberately does not name this table in xShadowName.
+        EXPECT_EQ(kind(vec+"_vector_chunks00"),"table");
+        EXPECT_NO_THROW(metadata(reopened,descriptor()));
+    }
 }
 
 TEST(DerivedProfile, RetainedReadViewKeepsSnapshotAndExistingCancellationHandler) {

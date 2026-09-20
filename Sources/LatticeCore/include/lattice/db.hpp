@@ -171,6 +171,14 @@ class database {
         // prevents an admitted reset from following COMMIT into a successor,
         // including memory and no-write transactions with no WAL callback.
         bool commit_attempted = false;
+        // Only self-owned private maintenance uses this restriction. Sync and
+        // caller-owned reset markers remain observational by default.
+        enum class commit_policy { observational, owner_body, owner_finalizing };
+        commit_policy policy = commit_policy::observational;
+        bool premature_commit = false;
+        // A rollback consumes this reservation before a successor can write.
+        // The operation's separate owner-lifetime hold lasts through unwind.
+        bool owns_recovery_reservation = false;
     };
     struct lattice_update_hook_context {
         lattice_db* owner = nullptr;
@@ -182,6 +190,14 @@ class database {
         bool entry_cursor_active = false;
         bool entry_cursor_present = false;
         int64_t entry_cursor_last = 0;
+        bool consume_recovery_reservation(sync_apply_chunk_state* settlement) noexcept {
+            if (!settlement || !settlement->owns_recovery_reservation) return false;
+            settlement->owns_recovery_reservation = false;
+            entry_cursor_active = false;
+            entry_cursor_present = false;
+            recovery_delivery_deferred = false;
+            return true;
+        }
         void note_settled(bool committed) noexcept {
             if (!sync_chunk) return;
             sync_chunk->state = committed ? sync_apply_chunk_state::phase::committed

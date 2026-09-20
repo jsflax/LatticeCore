@@ -43,8 +43,12 @@ bool recovery_writer_access::active_channel_reset_for(const lattice_db& owner,co
 
 bool recovery_writer_access::active_install_for(const lattice_db* owner, sqlite3* connection) noexcept {
     for (auto* f = current_; f; f = f->previous) {
-        if (&f->owner == owner && f->writer.internal_handle() == connection)
-            return f->settlement.state == database::sync_apply_chunk_state::phase::active;
+        if (&f->owner != owner) continue;
+        auto* hook = f->writer.lattice_update_hook_context_.get();
+        return f->writer.internal_handle() == connection && hook &&
+            hook->owner == owner && hook->connection == connection && hook->sync_chunk == &f->settlement &&
+            f->settlement.state == database::sync_apply_chunk_state::phase::active &&
+            !f->settlement.commit_attempted && !f->settlement.premature_commit;
     }
     return false;
 }
@@ -55,8 +59,11 @@ database* recovery_writer_access::active_writer(lattice_db& owner) {
         // A consumed scope must not fall through to public ownership of a
         // successor. Logical close does not revoke this admitted physical turn.
         auto* h = f->writer.internal_handle();
+        auto* hook = f->writer.lattice_update_hook_context_.get();
         if (f->writer.channel_reset_unsettled_.load(std::memory_order_acquire) ||
+            !hook || hook->owner != &owner || hook->connection != h || hook->sync_chunk != &f->settlement ||
             f->settlement.state != database::sync_apply_chunk_state::phase::active ||
+            f->settlement.commit_attempted || f->settlement.premature_commit ||
             sqlite3_get_autocommit(h) != 0 || sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE)
             return nullptr;
         return &f->writer;
@@ -362,7 +369,9 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
         return; // Never COMMIT or ROLLBACK caller-owned work.
     }
     database::maintenance_scope::probe_before_store_gate(*writer);
-    {
+    std::exception_ptr failure;
+    bool owned_started = false;
+    try {
         lattice_db::store_write_gate_hold gate(owner);
         database::maintenance_scope maintenance(*writer);
         auto* hook=writer->lattice_update_hook_context_.get();
@@ -372,22 +381,40 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
                 throw db_error("channel reset: writer admission changed");
         }
         database::sync_apply_chunk_state settlement;
+        settlement.policy = database::sync_apply_chunk_state::commit_policy::owner_body;
         hook->sync_chunk=&settlement;
         struct detach {
             database::lattice_update_hook_context& hook;database::sync_apply_chunk_state& settlement;
             ~detach(){if(hook.sync_chunk==&settlement)hook.sync_chunk=nullptr;}
         } detach_marker{*hook,settlement};
+        const auto current_body = [&] {
+            return hook->owner == &owner && hook->connection == writer->internal_handle() &&
+                hook->sync_chunk == &settlement && settlement.state == phase::active &&
+                !settlement.commit_attempted && !settlement.premature_commit &&
+                sqlite3_get_autocommit(writer->internal_handle()) == 0 &&
+                sqlite3_txn_state(writer->internal_handle(), "main") == SQLITE_TXN_WRITE;
+        };
+        bool own_commit_started = false;
         try {
-            writer->begin_transaction();settlement.state=phase::active;
+            writer->begin_transaction();settlement.state=phase::active;owned_started=true;
             require_recovery_local_producer_maintenance_absent(*writer);
             if(recovery_channel_reset_test_hooks::after_write_admission)recovery_channel_reset_test_hooks::after_write_admission();
-            mutate();writer->commit();
-            if(settlement.state==phase::active)hook->note_settled(true);
+            if (!current_body()) throw db_error("channel reset: owned admission was consumed before effects");
+            mutate();
+            if (!current_body()) throw db_error("channel reset: owned transaction changed before finalization");
+            settlement.policy = database::sync_apply_chunk_state::commit_policy::owner_finalizing;
+            own_commit_started = true;
+            writer->commit();
+            if(settlement.state==phase::active && hook->sync_chunk == &settlement &&
+               sqlite3_get_autocommit(writer->internal_handle()) != 0) hook->note_settled(true);
+            if (settlement.state != phase::committed)
+                throw db_error("channel reset: final COMMIT did not settle the owned transaction");
         } catch(...) {
             const auto original=std::current_exception();
             // WAL marks the real COMMIT before observers. Do not infer our
             // ownership from a successor transaction opened by a callback.
-            if(settlement.state==phase::active) {
+            if(settlement.state==phase::active && hook->sync_chunk == &settlement &&
+               (!settlement.commit_attempted || own_commit_started)) {
                 try {writer->rollback();}
                 catch(...) {
                     writer->channel_reset_unsettled_.store(true,std::memory_order_release);
@@ -396,8 +423,17 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
             }
             std::rethrow_exception(original);
         }
+    } catch (...) { failure = std::current_exception(); }
+    // A consumed admission may have committed an ordinary successor before
+    // returning/throwing. Memory delivery was deferred by the outer scope;
+    // drain only now, with the original error still retained. An open successor
+    // remains pending because drain_if_settled checks actual autocommit.
+    try { if (owned_started) writer->drain_if_settled(); }
+    catch (...) {
+        if (failure) throw recovery_channel_reset_notification_error(failure, std::current_exception());
+        throw;
     }
-    writer->drain_if_settled();
+    if (failure) std::rethrow_exception(failure);
 }
 
 void reset_sync_channel_with_producer_fence(lattice_db& owner,const std::string& channel,bool retire) {
@@ -412,6 +448,8 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
     lattice_db::recovery_commit_batch batch;
     using phase = database::sync_apply_chunk_state::phase;
     database::sync_apply_chunk_state settlement;
+    settlement.policy = database::sync_apply_chunk_state::commit_policy::owner_body;
+    bool own_commit_started = false;
     try {
         if (!owner || !body) throw db_error("recovery install requires an owning store and body");
         {
@@ -457,6 +495,7 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                 if (owner->is_flushing_ || owner->recovery_change_buffer_reserved_ || !owner->change_buffer_.empty())
                     throw db_error("recovery install: existing notification delivery is unsettled");
                 owner->recovery_change_buffer_reserved_ = true;
+                settlement.owns_recovery_reservation = true;
                 owner->active_recovery_install_operations_.fetch_add(1, std::memory_order_acq_rel);
             }
             struct release_reservation {
@@ -466,12 +505,13 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                 database::sync_apply_chunk_state& settlement;
                 ~release_reservation() {
                     if (context.sync_chunk == &settlement) context.sync_chunk = nullptr;
-                    context.entry_cursor_active = false;
-                    context.entry_cursor_present = false;
-                    context.recovery_delivery_deferred = false;
-                    writer.txn_dirty_.store(false, std::memory_order_relaxed);
-                    std::lock_guard<std::mutex> lock(owner.change_buffer_mutex_);
-                    owner.recovery_change_buffer_reserved_ = false;
+                    // Rollback may already have consumed this reservation.
+                    // Its successor now owns any buffered rows and dirty flag.
+                    if (context.consume_recovery_reservation(&settlement)) {
+                        writer.txn_dirty_.store(false, std::memory_order_relaxed);
+                        std::lock_guard<std::mutex> lock(owner.change_buffer_mutex_);
+                        owner.recovery_change_buffer_reserved_ = false;
+                    }
                     owner.active_recovery_install_operations_.fetch_sub(1, std::memory_order_release);
                 }
             } release{*owner, *writer, *context, settlement};
@@ -480,11 +520,19 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
             context->entry_cursor_present = false;
             context->recovery_delivery_deferred = true;
             frame authority(*owner, *writer, settlement);
+            const auto current_body = [&] {
+                return context->owner == owner.get() && context->connection == writer->internal_handle() &&
+                    context->sync_chunk == &settlement && settlement.state == phase::active &&
+                    !settlement.commit_attempted && !settlement.premature_commit &&
+                    settlement.owns_recovery_reservation && context->recovery_delivery_deferred &&
+                    sqlite3_get_autocommit(writer->internal_handle()) == 0 &&
+                    sqlite3_txn_state(writer->internal_handle(), "main") == SQLITE_TXN_WRITE;
+            };
             try {
                 writer->begin_transaction();
                 settlement.state = phase::active;
                 body(*writer);
-                if (settlement.state != phase::active || sqlite3_get_autocommit(writer->internal_handle()) != 0)
+                if (!current_body())
                     throw db_error("recovery install body settled its owned transaction");
                 // R-tree holds an internal blob cursor until xSavepoint/xSync.
                 // Let SQLite ask each virtual table to settle its own resources
@@ -493,6 +541,7 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                 // This nested savepoint cannot commit the owned outer BEGIN.
                 writer->execute("SAVEPOINT _lattice_recovery_body_settled");
                 writer->execute("RELEASE _lattice_recovery_body_settled");
+                if (!current_body()) throw db_error("recovery install lost ownership at body settlement");
                 for (auto* stmt = sqlite3_next_stmt(writer->internal_handle(), nullptr); stmt;
                      stmt = sqlite3_next_stmt(writer->internal_handle(), stmt)) {
                     if (sqlite3_stmt_busy(stmt)) throw db_error("recovery install body left an active statement");
@@ -500,15 +549,20 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                 // Derive exact audit/model events while this write transaction
                 // still pins its view. After COMMIT another handle may write.
                 owner->flush_changes_once_impl(writer.get(), &batch);
+                if (!current_body()) throw db_error("recovery install lost body ownership before finalization");
+                settlement.policy = database::sync_apply_chunk_state::commit_policy::owner_finalizing;
+                own_commit_started = true;
                 writer->commit();
                 // Memory / DELETE-journal paths have no WAL callback. Their
                 // successful COMMIT return is still before any deferred observer.
-                if (settlement.state == phase::active) context->note_settled(true);
+                if (settlement.state == phase::active && context->sync_chunk == &settlement &&
+                    sqlite3_get_autocommit(writer->internal_handle()) != 0) context->note_settled(true);
                 if (settlement.state != phase::committed)
                     throw db_error("recovery install commit did not settle the owned transaction");
             } catch (...) {
                 result.primary_error = std::current_exception();
-                if (settlement.state == phase::active) {
+                if (settlement.state == phase::active && context->sync_chunk == &settlement &&
+                    (!settlement.commit_attempted || own_commit_started)) {
                     try {
                         writer->rollback();
                         if (settlement.state != phase::rolled_back)
@@ -521,7 +575,7 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                     }
                 }
             }
-            if (settlement.state == phase::committed) {
+            if (settlement.state == phase::committed && own_commit_started) {
                 result.state = recovery_install_state::committed;
                 if (batch.audit_frontier) {
                     const auto frontier = *batch.audit_frontier;
@@ -534,12 +588,18 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                         instance_registry::instance().for_each_alive(owner->config_.path, advance);
                     else advance(owner.get());
                 }
+            } else if (settlement.state == phase::committed) {
+                result.state = recovery_install_state::ownership_lost;
+                result.unexpected_commit_observed = true;
             } else if (settlement.state == phase::rolled_back) result.state = recovery_install_state::rolled_back;
             else if (settlement.state == phase::active) result.state = recovery_install_state::unsettled;
         }
     } catch (...) {
         if (!result.primary_error) result.primary_error = std::current_exception();
-        if (settlement.state == phase::committed) result.state = recovery_install_state::committed;
+        if (settlement.state == phase::committed) {
+            result.state = own_commit_started ? recovery_install_state::committed : recovery_install_state::ownership_lost;
+            result.unexpected_commit_observed = !own_commit_started;
+        }
     }
     // All owned SQLite/store scopes and private helper authority ended above.
     // Payloads and callback copies likewise die outside those scopes.
@@ -548,6 +608,11 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
             if (after_unlock) after_unlock(); // private deterministic test rendezvous only
             deliver(*owner, batch);
         } catch (...) { result.postcommit_error = std::current_exception(); }
+    } else if (writer && settlement.state != phase::not_started) {
+        // This belongs to a possible ordinary successor, never to the failed
+        // install. Preserve both failures and never run its activation tail.
+        try { writer->drain_if_settled(); }
+        catch (...) { result.notification_error = std::current_exception(); }
     }
     return result;
 }

@@ -714,8 +714,16 @@ void lattice_db::setup_change_hook(database& connection) {
     sqlite3_commit_hook(connection.internal_handle(),
         [](void* user_data) -> int {
             auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
-            if (context->sync_chunk)
-                context->sync_chunk->commit_attempted = true;
+            if (auto* settlement = context->sync_chunk) {
+                settlement->commit_attempted = true;
+                if (settlement->policy == database::sync_apply_chunk_state::commit_policy::owner_body) {
+                    // Enforce the private body's existing no-settlement
+                    // contract. SQLite invokes rollback after this veto.
+                    // No SQL, allocation, or application callback here.
+                    settlement->premature_commit = true;
+                    return 1;
+                }
+            }
             return 0;
         },
         connection.lattice_update_hook_context_.get());
@@ -728,8 +736,22 @@ void lattice_db::setup_change_hook(database& connection) {
 #if defined(LATTICE_SYNC_COMMIT_PROBE)
             sync_commit_probe_detail::record(self, connection, schema);
 #endif
-            if (context->connection == connection && schema && std::strcmp(schema, "main") == 0)
+            bool unexpected_owned_commit = false;
+            if (context->connection == connection && schema && std::strcmp(schema, "main") == 0) {
+                auto* settlement = context->sync_chunk;
+                unexpected_owned_commit = settlement && settlement->policy ==
+                    database::sync_apply_chunk_state::commit_policy::owner_body;
                 context->note_settled(true);
+                // An unsupported replaced commit hook may have bypassed the
+                // veto. Record only the physical outcome; never publish an
+                // unvalidated private batch or retain its reservation across
+                // a later successor. No general hook-replacement guarantee.
+                if (unexpected_owned_commit && context->consume_recovery_reservation(settlement)) {
+                    std::lock_guard<std::mutex> lock(self->change_buffer_mutex_);
+                    self->change_buffer_.clear();
+                    self->recovery_change_buffer_reserved_ = false;
+                }
+            }
 
             // WAL-threshold keeper eviction (results spec §3.4): nframes is
             // the log's total frame count after this commit. Crossing the
@@ -748,7 +770,7 @@ void lattice_db::setup_change_hook(database& connection) {
 
             // The private recovery call owns this commit's detached tail.
             // Generic dirty-state drain must never consume that batch.
-            if (context->recovery_delivery_deferred) return SQLITE_OK;
+            if (context->recovery_delivery_deferred || unexpected_owned_commit) return SQLITE_OK;
 
             const bool delivered = self->flush_changes();
             if (!delivered) {
@@ -789,8 +811,16 @@ void lattice_db::setup_change_hook(database& connection) {
 #if defined(LATTICE_SYNC_COMMIT_PROBE)
             sync_commit_probe_detail::rolled_back(this, context->connection);
 #endif
+            auto* settlement = context->sync_chunk;
             context->note_settled(false);
-            discard_change_buffer();
+            // Retire the original transaction's event/cursor reservation in
+            // the rollback callback, BEFORE any subsequent body statement can
+            // begin a successor. Teardown may no longer clear its dirty state.
+            if (context->consume_recovery_reservation(settlement)) {
+                std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+                change_buffer_.clear();
+                recovery_change_buffer_reserved_ = false;
+            } else discard_change_buffer();
             fire_invalidation_hooks({}, invalidation_reason::rollback);
         });
 }

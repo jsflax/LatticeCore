@@ -5,16 +5,28 @@
 #include <memory>
 
 namespace lattice::detail {
-enum class recovery_install_state { refused, rolled_back, committed, unsettled };
+enum class recovery_install_state { refused, rolled_back, committed, unsettled, ownership_lost };
 struct recovery_install_result {
     recovery_install_state state = recovery_install_state::refused;
     std::exception_ptr primary_error, cleanup_error, postcommit_error;
+    // An ordinary successor may have committed inside a contract-violating
+    // body. Its off-lock drain is not this failed install's postcommit tail.
+    std::exception_ptr notification_error;
+    // An observed physical COMMIT before validated owner finalization is not
+    // a completed install. False does not assert rollback or durable absence.
+    bool unexpected_commit_observed = false;
 };
 struct recovery_channel_reset_error : db_error {
     std::exception_ptr primary_error, cleanup_error;
     recovery_channel_reset_error(std::exception_ptr primary,std::exception_ptr cleanup)
         :db_error("channel reset cleanup failed; writer fenced until explicit rollback"),
          primary_error(std::move(primary)),cleanup_error(std::move(cleanup)) {}
+};
+struct recovery_channel_reset_notification_error : db_error {
+    std::exception_ptr primary_error, notification_error;
+    recovery_channel_reset_notification_error(std::exception_ptr primary, std::exception_ptr notification)
+        : db_error("channel reset failed; ordinary successor notification also failed"),
+          primary_error(std::move(primary)), notification_error(std::move(notification)) {}
 };
 struct legacy_sync_write_error : db_error {
     std::exception_ptr primary_error, cleanup_error;
@@ -61,7 +73,9 @@ struct recovery_writer_access {
     static void legacy_sync_write(database&, const std::function<void(database&)>&);
     // Private installer only. The actual owning shared_ptr is retained through
     // all callbacks and unwind. The body must not settle/replace the transaction,
-    // replace hooks, or return a live SQLite statement. No borrowed overload.
+    // replace hooks, or return a live SQLite statement. A premature COMMIT is
+    // vetoed by the retained engine hook; consumed frames cannot follow a
+    // successor. No hook-replacement guarantee and no borrowed overload.
     static recovery_install_result install(std::shared_ptr<lattice_db> owner,
                                            const std::function<void(database&)>& body);
 private:

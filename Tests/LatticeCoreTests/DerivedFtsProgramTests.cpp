@@ -19,7 +19,7 @@ void create_model(lattice_db& owner) {
 
 void insert(lattice_db& owner, int64_t id, const column_value_t& value) {
     owner.db().execute("INSERT INTO DerivedFtsProgramRow(id,globalId,content) VALUES(?,?,?)",
-                       {id, uuid_t::generate().to_string(), value});
+                       {id, lattice::uuid_t::generate().to_string(), value});
 }
 
 std::vector<int64_t> hits(lattice_db& owner, const std::string& term) {

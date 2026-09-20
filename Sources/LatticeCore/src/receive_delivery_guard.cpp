@@ -164,7 +164,9 @@ sqlite3* receive_delivery_guard_access::owned(lattice_db& owner, database& write
     if (!h || writer.channel_reset_unsettled_.load() || !hook || hook->owner != &owner || hook->connection != h ||
         !hook->sync_chunk || hook->sync_chunk->state != database::sync_apply_chunk_state::phase::active ||
         sqlite3_get_autocommit(h) != 0 || sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE ||
-        (!database::maintenance_scope::active_for(h) && recovery_writer_access::active_writer(owner) != &writer))
+        (!database::maintenance_scope::active_for(h) &&
+         !recovery_writer_access::active_channel_reset_for(owner,writer) &&
+         recovery_writer_access::active_writer(owner) != &writer))
         refuse("requires the actual owned sync/reset transaction");
     return h;
 }

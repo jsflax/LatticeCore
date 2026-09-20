@@ -539,6 +539,7 @@ database& database::operator=(database&& other) noexcept {
             if (lattice_update_hook_context_) {
                 sqlite3_update_hook(db_, nullptr, nullptr);
                 sqlite3_wal_hook(db_, nullptr, nullptr);
+                sqlite3_commit_hook(db_, nullptr, nullptr);
                 sqlite3_rollback_hook(db_, nullptr, nullptr);
             }
             sqlite3_close_v2(db_);

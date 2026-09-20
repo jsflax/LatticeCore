@@ -707,6 +707,19 @@ void lattice_db::setup_change_hook(database& connection) {
         connection.lattice_update_hook_context_.get()
     );
 
+    // Revoke continuation admission before COMMIT can open a successor. This
+    // hook runs for every actual write transaction, including BEGIN IMMEDIATE
+    // with no changed pages. It deliberately does not mark a commit successful:
+    // SQLite can still fail after this point. WAL/rollback retain that role.
+    sqlite3_commit_hook(connection.internal_handle(),
+        [](void* user_data) -> int {
+            auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
+            if (context->sync_chunk)
+                context->sync_chunk->commit_attempted = true;
+            return 0;
+        },
+        connection.lattice_update_hook_context_.get());
+
     // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
     sqlite3_wal_hook(connection.internal_handle(),
         [](void* user_data, sqlite3* connection, const char* schema, int nframes) -> int {

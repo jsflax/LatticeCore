@@ -43,6 +43,12 @@ struct recovery_writer_access {
 private:
     struct frame;
     static thread_local frame* current_;
+    // A previously admitted caller reset may finish after logical close. This
+    // separate frame grants only receive-guard access, never install suppression
+    // or general ownership of a callback's successor transaction.
+    struct channel_reset_frame;
+    static thread_local channel_reset_frame* reset_current_;
+    static bool active_channel_reset_for(const lattice_db&,const database&) noexcept;
     // Nonwriting trigger phase check. The frame already owns this physical
     // transaction; no SQLite call or fabricated public owner state is needed.
     static bool active_install_for(const lattice_db*, sqlite3*) noexcept;
@@ -53,5 +59,6 @@ private:
     friend struct recovery_install_test_access;
     friend struct recovery_install_admission_test_access;
     friend class recovery_local_producer_adapter;
+    friend struct receive_delivery_guard_access;
 };
 } // namespace lattice::detail

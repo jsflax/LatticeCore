@@ -18,6 +18,29 @@ struct recovery_writer_access::frame {
 };
 thread_local recovery_writer_access::frame* recovery_writer_access::current_ = nullptr;
 
+struct recovery_writer_access::channel_reset_frame {
+    lattice_db& owner;
+    database& writer;
+    database::sync_apply_chunk_state& settlement;
+    channel_reset_frame* previous;
+    channel_reset_frame(lattice_db& o,database& w,database::sync_apply_chunk_state& s)
+        :owner(o),writer(w),settlement(s),previous(reset_current_){reset_current_=this;}
+    ~channel_reset_frame(){reset_current_=previous;}
+    channel_reset_frame(const channel_reset_frame&)=delete;
+};
+thread_local recovery_writer_access::channel_reset_frame* recovery_writer_access::reset_current_=nullptr;
+
+bool recovery_writer_access::active_channel_reset_for(const lattice_db& owner,const database& writer) noexcept {
+    for(auto* f=reset_current_;f;f=f->previous) {
+        if(&f->owner!=&owner)continue;
+        const auto* hook=writer.lattice_update_hook_context_.get();
+        return &f->writer==&writer&&hook&&hook->sync_chunk==&f->settlement&&
+            f->settlement.state==database::sync_apply_chunk_state::phase::active&&
+            !f->settlement.commit_attempted;
+    }
+    return false;
+}
+
 bool recovery_writer_access::active_install_for(const lattice_db* owner, sqlite3* connection) noexcept {
     for (auto* f = current_; f; f = f->previous) {
         if (&f->owner == owner && f->writer.internal_handle() == connection)
@@ -128,15 +151,20 @@ void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& 
         auto* hook=writer->lattice_update_hook_context_.get();
         if(!hook||hook->owner!=&owner||hook->connection!=h)throw db_error("channel reset: hook identity unavailable");
         require_recovery_local_producer_maintenance_absent(*writer);
-        if(recovery_channel_reset_test_hooks::after_write_admission)recovery_channel_reset_test_hooks::after_write_admission();
         database::sync_apply_chunk_state local;local.state=phase::active;
         auto* settlement=hook->sync_chunk?hook->sync_chunk:&local;
-        if(settlement->state!=phase::active)throw db_error("channel reset: caller transaction is settled");
+        if(settlement->state!=phase::active||settlement->commit_attempted)
+            throw db_error("channel reset: caller transaction is settled or attempted commit");
         if(!hook->sync_chunk)hook->sync_chunk=&local;
         struct detach {
             database::lattice_update_hook_context& hook;database::sync_apply_chunk_state& local;
             ~detach(){if(hook.sync_chunk==&local)hook.sync_chunk=nullptr;}
         } detach_marker{*hook,local};
+        channel_reset_frame admitted(owner,*writer,*settlement);
+        if(recovery_channel_reset_test_hooks::after_write_admission)recovery_channel_reset_test_hooks::after_write_admission();
+        if(settlement->state!=phase::active||settlement->commit_attempted||hook->sync_chunk!=settlement||
+           sqlite3_get_autocommit(h)!=0||sqlite3_txn_state(h,"main")!=SQLITE_TXN_WRITE)
+            throw db_error("channel reset: admitted caller transaction settled before effects");
         bool opened=false;
         try {
             run("SAVEPOINT _lattice_producer_channel_reset");opened=true;

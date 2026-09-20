@@ -167,6 +167,10 @@ class database {
     struct sync_apply_chunk_state {
         enum class phase { not_started, active, committed, rolled_back };
         phase state = phase::not_started;
+        // A pre-commit callback is not proof of durable settlement. It only
+        // prevents an admitted reset from following COMMIT into a successor,
+        // including memory and no-write transactions with no WAL callback.
+        bool commit_attempted = false;
     };
     struct lattice_update_hook_context {
         lattice_db* owner = nullptr;

@@ -18,9 +18,12 @@ extern thread_local void (*after_claim_commit)();
 }
 class recovery_export_adapter;
 class recovery_export_route;
+class recovery_server_export_endpoint;
+class recovery_server_export_page;
 class committed_export_frame {
     friend class recovery_export_adapter;
     friend class recovery_export_route;
+    friend class recovery_server_export_page;
     std::shared_ptr<lattice_db> owner_;
     std::vector<recovery_obligation_export_ticket> claims_;
     std::vector<recovery_local_export_scope> scopes_;
@@ -71,6 +74,11 @@ struct recovery_export_preparation {
     std::optional<committed_export_frame> frame;
 };
 class recovery_export_adapter {
+    friend class recovery_export_route;
+    friend class recovery_server_export_endpoint;
+    friend class recovery_server_export_page;
+    static void validate_server_limits(const recovery_export_limits&);
+    static void revalidate_claimed_frame(const committed_export_frame&);
     static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
         const recovery_export_limits&,std::optional<int64_t> history_after);

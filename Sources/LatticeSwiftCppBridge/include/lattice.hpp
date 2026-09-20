@@ -17,6 +17,7 @@
 #include <dynamic_object.hpp>
 #include <bulk_mutation.hpp>
 #include <projection.hpp>
+#include <recovery_export.hpp>
 #include <list.hpp>
 #include <error.hpp>
 
@@ -3758,6 +3759,16 @@ public:
         return impl_->sync_commit_probe_finish(operation, attempt);
     }
 #endif
+
+    // Mechanical qualification only. Retains THIS ref's actual impl_ on both
+    // FRT/value paths. A valid nonthrowing destroy callback is the context
+    // transfer precondition: null destroy refuses and leaves caller custody;
+    // otherwise context is consumed on every outcome. Native handles
+    // must be prepared/consumed/closed/released on the caller's IO lane.
+    server_export_endpoint make_server_export_endpoint_for_qualification(
+        void* context,int32_t(*enqueue)(void*,const uint8_t*,size_t,uint64_t),
+        void(*destroy)(void*),const server_export_limits& limits) const noexcept
+        SWIFT_NAME(makeServerExportEndpointForQualification(context:enqueue:destroy:limits:));
 
     // CRUD
     void add(const dynamic_object_ref& ref, cxx_error& err) const { impl().add(ref, err); }

@@ -69,6 +69,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/sync_commit_probe.cpp
     Sources/LatticeCore/src/recovery_export_adapter.cpp
+    Sources/LatticeCore/src/recovery_server_export.cpp
     Sources/LatticeCore/src/sync_callback_lifetime.cpp
     Sources/LatticeCore/src/scoped_recovery_install.cpp
     Sources/LatticeCore/src/recovery_witness.cpp
@@ -121,6 +122,7 @@ add_library(LatticeSwiftCppBridge STATIC
     Sources/LatticeSwiftCppBridge/src/lattice.cpp
     Sources/LatticeSwiftCppBridge/src/bulk_mutation.cpp
     Sources/LatticeSwiftCppBridge/src/projection.cpp
+    Sources/LatticeSwiftCppBridge/src/recovery_export.cpp
     Sources/LatticeSwiftCppBridge/src/dynamic_object.cpp
     Sources/LatticeSwiftCppBridge/src/managed_object.cpp
     Sources/LatticeSwiftCppBridge/src/unmanaged_object.cpp
@@ -257,6 +259,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp
     Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp
     Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp
+    Tests/LatticeCoreTests/RecoveryServerExportTests.cpp
     Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp
     Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp
     Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp

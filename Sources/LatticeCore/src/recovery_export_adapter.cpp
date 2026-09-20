@@ -398,6 +398,14 @@ void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> own
     });
     require_committed(result);
 }
+void recovery_export_adapter::validate_server_limits(const recovery_export_limits& limits){limits_ok(limits,limits.entries,{});}
+void recovery_export_adapter::revalidate_claimed_frame(const committed_export_frame& frame){
+    const auto result=recovery_writer_access::install(frame.owner_,[&](database&){
+        check_scopes(recovery_local_producer_adapter::export_inventory_for_owned_write(frame.owner_),frame.scopes_);
+        recovery_obligation_store journal(frame.owner_,frame.limits_.obligations,frame.limits_.installations);check_claims(journal,frame.claims_,frame.entries_);
+    });
+    recovery_export_adapter::require_committed(result);
+}
 recovery_export_route::recovery_export_route(std::shared_ptr<sync_transport> transport,std::shared_ptr<sync_callback_lifetime> lifetime):transport_(std::move(transport)),lifetime_(std::move(lifetime)){}
 void recovery_export_route::prepare_protected(uint64_t generation){
 #ifdef __EMSCRIPTEN__
@@ -428,11 +436,7 @@ bool recovery_export_route::current(uint64_t generation) noexcept{std::lock_guar
 bool recovery_export_route::handoff(committed_export_frame frame){
     if(frame.consumed_||!frame.owner_||frame.entries_.empty()||frame.claims_.empty())refuse("export permit already consumed or missing custody");frame.consumed_=true;
     if(!current(frame.physical_generation_)||frame.owner_->is_closed())return false;
-    const auto result=recovery_writer_access::install(frame.owner_,[&](database&){
-        check_scopes(recovery_local_producer_adapter::export_inventory_for_owned_write(frame.owner_),frame.scopes_);
-        recovery_obligation_store journal(frame.owner_,frame.limits_.obligations,frame.limits_.installations);check_claims(journal,frame.claims_,frame.entries_);
-    });
-    recovery_export_adapter::require_committed(result);
+    recovery_export_adapter::revalidate_claimed_frame(frame);
     if(frame.owner_->is_closed()||!lifetime_->protected_current(frame.physical_generation_))return false;
     std::shared_ptr<sync_transport> transport;
     {std::lock_guard<std::mutex> lock(mutex_);if(retired_||!open_||generation_!=frame.physical_generation_)return false;transport=transport_;}

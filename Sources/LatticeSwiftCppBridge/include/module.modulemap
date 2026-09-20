@@ -24,6 +24,7 @@ module LatticeSwiftCppBridge {
     textual header "list.hpp"
     textual header "managed_object.hpp"
     textual header "projection.hpp"
+    textual header "recovery_export.hpp"
     textual header "unmanaged_object.hpp"
     textual header "util.hpp"
     export *

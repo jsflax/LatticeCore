@@ -3744,6 +3744,21 @@ public:
     //      non-const swift_lattice methods through the shared_ptr member is
     //      legal in a const method). ----
 
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+    // Opt-in harness adapter only; absent from ordinary modules and binaries.
+    int32_t sync_commit_probe_arm(uint64_t operation, uint64_t attempt) const noexcept
+        SWIFT_NAME(syncCommitProbeArm(operation:attempt:)) {
+        if (!impl_) return 3;
+        return impl_->sync_commit_probe_arm(operation, attempt);
+    }
+    sync_commit_probe_receipt sync_commit_probe_finish(uint64_t operation,
+                                                       uint64_t attempt) const noexcept
+        SWIFT_NAME(syncCommitProbeFinish(operation:attempt:)) {
+        if (!impl_) return {};
+        return impl_->sync_commit_probe_finish(operation, attempt);
+    }
+#endif
+
     // CRUD
     void add(const dynamic_object_ref& ref, cxx_error& err) const { impl().add(ref, err); }
     void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id) const {

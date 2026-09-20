@@ -725,6 +725,9 @@ void lattice_db::setup_change_hook(database& connection) {
         [](void* user_data, sqlite3* connection, const char* schema, int nframes) -> int {
             auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
             auto* self = context->owner;
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+            sync_commit_probe_detail::record(self, connection, schema);
+#endif
             if (context->connection == connection && schema && std::strcmp(schema, "main") == 0)
                 context->note_settled(true);
 
@@ -783,6 +786,9 @@ void lattice_db::setup_change_hook(database& connection) {
     connection.set_txn_hooks(
         [this] { flush_changes(); },
         [this, context = connection.lattice_update_hook_context_.get()] {
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+            sync_commit_probe_detail::rolled_back(this, context->connection);
+#endif
             context->note_settled(false);
             discard_change_buffer();
             fire_invalidation_hooks({}, invalidation_reason::rollback);

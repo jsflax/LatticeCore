@@ -280,13 +280,13 @@ void recovery_export_adapter::require_committed(const recovery_install_result& r
     refuse("export owned operation did not commit");
 }
 bool recovery_export_adapter::protected_store(std::shared_ptr<lattice_db> owner){
-    bool protected_owner=false;
-    const auto result=recovery_writer_access::install(owner,[&](database&){protected_owner=!recovery_local_producer_adapter::export_inventory_for_owned_write(owner).scopes.empty();});
-    require_committed(result);return protected_owner;
+    return recovery_local_producer_adapter::export_protection_required(std::move(owner));
 }
 recovery_export_preparation recovery_export_adapter::prepare_pending(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits){
-    recovery_export_preparation output;committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;
+    recovery_export_preparation output;
+    if(!recovery_local_producer_adapter::export_protection_required(owner))return output;
+    committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;
     const auto result=recovery_writer_access::install(owner,[&](database& writer){
         auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);if(inventory.scopes.empty())return;
         limits_ok(limits,count,in_flight);if(sync_id.empty()||sync_id.size()>4096)refuse("export invalid route channel");

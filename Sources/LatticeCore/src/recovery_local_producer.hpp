@@ -70,6 +70,11 @@ public:
     // Absence is not evidence that no legacy or external export route exists.
     static std::vector<recovery_obligation_producer_profile> profiles_for_owned_write(
         std::shared_ptr<lattice_db>, const recovery_obligation_producer_discovery_limits&);
+    // Fresh read-only classification, including owners opened before a sibling
+    // enrolled. Never reserves/drains notification delivery or grants write,
+    // send, origin, or all-route authority. Stale READ snapshots refuse; false
+    // must be rechecked inside the actual transaction before legacy mutations.
+    static bool export_protection_required(std::shared_ptr<lattice_db>);
     // Actual owned WRITE; indexed fixed-profile checks only. Enrollment/open
     // performed the full audit. Does not copy manifests or scan retained rows.
     static recovery_local_export_inventory export_inventory_for_owned_write(std::shared_ptr<lattice_db>);

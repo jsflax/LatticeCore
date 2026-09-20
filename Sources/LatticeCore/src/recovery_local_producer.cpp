@@ -133,6 +133,96 @@ bool durable_producer_present(database& db) {
     if(family.size()!=3)refuse("local producer incomplete durable family");
     return !db.query("SELECT 1 FROM main._lattice_obligation_producer_profile LIMIT 1").empty();
 }
+// Read-only discovery deliberately avoids database::query(): its settled drain
+// may deliver the very legacy notification whose callback is asking this
+// question. All returned values below are scalars or exact, bounded schema
+// literals; no stored manifest, row payload, or unbounded metadata is copied.
+struct discovery_statement {
+    sqlite3_stmt* value=nullptr;
+    explicit discovery_statement(sqlite3* db,const char* sql) {
+        database::record_statement();
+        if(sqlite3_prepare_v2(db,sql,-1,&value,nullptr)!=SQLITE_OK) {
+            sqlite3_finalize(value);value=nullptr;
+            refuse("export discovery could not prepare read-only metadata");
+        }
+        if(!value||!sqlite3_stmt_readonly(value)) {
+            sqlite3_finalize(value);value=nullptr;
+            refuse("export discovery requires read-only metadata statements");
+        }
+    }
+    ~discovery_statement(){sqlite3_finalize(value);}
+    discovery_statement(const discovery_statement&)=delete;
+    discovery_statement& operator=(const discovery_statement&)=delete;
+    bool row() {
+        const int rc=sqlite3_step(value);
+        if(rc==SQLITE_ROW)return true;
+        if(rc!=SQLITE_DONE)refuse("export discovery could not read current metadata");
+        return false;
+    }
+    bool text_is(int column,const char* expected) const {
+        if(sqlite3_column_type(value,column)!=SQLITE_TEXT)return false;
+        const auto size=std::strlen(expected);
+        if(sqlite3_column_bytes(value,column)!=static_cast<int>(size))return false;
+        const auto* bytes=sqlite3_column_text(value,column);
+        return bytes&&std::memcmp(bytes,expected,size)==0;
+    }
+    int64_t number(int column) const {
+        if(sqlite3_column_type(value,column)!=SQLITE_INTEGER)
+            refuse("export discovery has malformed integer metadata");
+        return sqlite3_column_int64(value,column);
+    }
+};
+// This classifier recognizes exactly producer storage v1, without obtaining a
+// storage writer capability. Keep these bounded read-only definitions equal to
+// recovery_obligation_store.cpp's producer_definitions (SQLite omits main.).
+constexpr std::pair<const char*,const char*> discovery_definitions[]={
+ {"_lattice_obligation_producer_store","CREATE TABLE _lattice_obligation_producer_store(id INTEGER PRIMARY KEY,version INTEGER NOT NULL,max_profiles INTEGER NOT NULL,max_stamps INTEGER NOT NULL,max_field INTEGER NOT NULL,max_manifest INTEGER NOT NULL,max_bytes INTEGER NOT NULL,profiles INTEGER NOT NULL,stamps INTEGER NOT NULL,bytes INTEGER NOT NULL) WITHOUT ROWID"},
+ {"_lattice_obligation_producer_profile","CREATE TABLE _lattice_obligation_producer_profile(channel BLOB PRIMARY KEY,incarnation INTEGER NOT NULL UNIQUE,program_revision INTEGER NOT NULL,program_digest BLOB NOT NULL,manifest BLOB NOT NULL,bytes INTEGER NOT NULL) WITHOUT ROWID"},
+ {"_lattice_obligation_producer_stamp","CREATE TABLE _lattice_obligation_producer_stamp(channel BLOB NOT NULL,original BLOB NOT NULL,incarnation INTEGER NOT NULL,program_revision INTEGER NOT NULL,audit_id INTEGER NOT NULL,record_sequence INTEGER NOT NULL UNIQUE,generation INTEGER NOT NULL,scope_revision INTEGER NOT NULL,base_scopes INTEGER NOT NULL,base_records INTEGER NOT NULL,base_bytes INTEGER NOT NULL,base_incarnation INTEGER NOT NULL,base_export INTEGER NOT NULL,producer_profiles INTEGER NOT NULL,producer_stamps INTEGER NOT NULL,producer_bytes INTEGER NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(channel,original),UNIQUE(channel,audit_id)) WITHOUT ROWID"}
+};
+bool discovery_family_present(sqlite3* db,bool admitted_profiles) {
+    discovery_statement family(db,"SELECT type,name,sql FROM main.sqlite_schema WHERE name IN ('_lattice_obligation_producer_store','_lattice_obligation_producer_profile','_lattice_obligation_producer_stamp') LIMIT 4");
+    unsigned seen=0;
+    while(family.row()) {
+        unsigned match=0;
+        for(unsigned i=0;i<3;++i)if(family.text_is(1,discovery_definitions[i].first)) {
+            match=1u<<i;
+            if(!family.text_is(0,"table")||!family.text_is(2,discovery_definitions[i].second))
+                refuse("export discovery producer schema differs");
+            break;
+        }
+        if(!match||(seen&match))refuse("export discovery duplicate or unknown producer schema");
+        seen|=match;
+    }
+    if(!seen) {
+        if(admitted_profiles)refuse("export admitted producer family disappeared");
+        return false;
+    }
+    if(seen!=7)refuse("export discovery incomplete durable producer family");
+    discovery_statement config(db,"SELECT id,version,max_profiles,max_stamps,max_field,max_manifest,max_bytes,profiles,stamps,bytes FROM main._lattice_obligation_producer_store LIMIT 2");
+    if(!config.row())refuse("export discovery missing producer metadata");
+    std::array<int64_t,10> values{};
+    for(int i=0;i<10;++i)values[i]=config.number(i);
+    if(config.row()||values[0]!=1||values[1]!=1)
+        refuse("export discovery unsupported producer metadata");
+    const auto& cap=discovery_caps.producers;
+    if(values[2]<0||values[2]>cap.profiles||values[3]<0||values[3]>cap.stamps||
+       values[4]<=0||values[4]>cap.field_bytes||values[5]<0||values[5]>cap.manifest_bytes||
+       values[6]<0||values[6]>cap.encoded_bytes||values[7]<0||values[7]>values[2]||
+       values[8]<0||values[8]>values[3]||values[9]<0||values[9]>values[6])
+        refuse("export discovery producer limits or counters are invalid");
+    discovery_statement profiles(db,"SELECT COUNT(*) FROM (SELECT 1 FROM main._lattice_obligation_producer_profile LIMIT 17)");
+    if(!profiles.row())refuse("export discovery missing profile count");
+    const auto count=profiles.number(0);
+    if(profiles.row()||count!=values[7]||count>cap.profiles)
+        refuse("export discovery producer profile count differs");
+    if(count)return true; // Classification only; strict preparation rereads admission.
+    if(admitted_profiles)refuse("export admitted producer profiles disappeared");
+    discovery_statement stamps(db,"SELECT 1 FROM main._lattice_obligation_producer_stamp LIMIT 1");
+    if(values[8]!=0||values[9]!=0||stamps.row())
+        refuse("export discovery dormant producer family is not empty");
+    return false;
+}
 void validate_retention_programs(database& db,bool required) {
     const auto actual=actual_programs(db,"AuditLog");
     if(actual.empty()&&!required)return;
@@ -587,6 +677,50 @@ std::vector<recovery_obligation_producer_profile> recovery_local_producer_adapte
         if(!found)refuse("local producer stored/admitted profile mismatch");
     }
     return stored;
+}
+bool recovery_local_producer_adapter::export_protection_required(std::shared_ptr<lattice_db> owner) {
+    if(!owner)refuse("export discovery requires a retained owner");
+    std::shared_ptr<database> writer;
+    {
+        std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+        if(owner->closed_.load())refuse("export discovery owner is closed");
+        writer=owner->db_;
+    }
+    if(!writer)refuse("export discovery has no published writer");
+    auto* db=writer->internal_handle();auto* mutex=db?sqlite3_db_mutex(db):nullptr;
+#ifndef __EMSCRIPTEN__
+    if(!mutex)refuse("export discovery requires a serialized connection");
+#endif
+    if(sqlite3_mutex_try(mutex)!=SQLITE_OK)refuse("export discovery writer is busy");
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    const auto validate_owner=[&] {
+        const auto* hook=writer->lattice_update_hook_context_.get();
+        std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+        if(!db||writer->is_closed()||owner->closed_.load()||owner->db_!=writer||
+           !hook||hook->owner!=owner.get()||hook->connection!=db||
+           writer->channel_reset_unsettled_.load(std::memory_order_acquire)||
+           database::update_hook_scope::active_for(db))
+            refuse("export discovery captured writer is unavailable");
+    };
+    validate_owner();
+    // A preexisting read snapshot may predate sibling enrollment. Only an
+    // idle connection or the actual current owned WRITE can classify absence.
+    const bool idle=sqlite3_get_autocommit(db)!=0&&sqlite3_txn_state(db,"main")==SQLITE_TXN_NONE;
+    if(!idle&&(sqlite3_txn_state(db,"main")!=SQLITE_TXN_WRITE||
+               recovery_writer_access::active_writer(*owner)!=writer.get()))
+        refuse("export discovery requires a fresh view or actual owned WRITE");
+    const auto root=std::static_pointer_cast<context>(std::atomic_load(&writer->local_producer_callback_custody_));
+    const auto* admitted=root?root->effective():nullptr;
+    const bool has_admitted=admitted&&!admitted->profiles.empty();
+    // Leave this VM at ROW until every dependent metadata read has finished.
+    // It pins one fresh main snapshot without beginning/settling a transaction
+    // or entering the notification-draining database query funnel.
+    discovery_statement anchor(db,"SELECT 1 FROM main.sqlite_schema LIMIT 1");
+    const bool schema_present=anchor.row();
+    if(!schema_present&&has_admitted)refuse("export admitted producer schema disappeared");
+    const bool result=schema_present&&discovery_family_present(db,has_admitted);
+    validate_owner();
+    return result;
 }
 recovery_local_export_inventory recovery_local_producer_adapter::export_inventory_for_owned_write(std::shared_ptr<lattice_db> owner) {
     if(!owner)refuse("export inventory requires retained owner");

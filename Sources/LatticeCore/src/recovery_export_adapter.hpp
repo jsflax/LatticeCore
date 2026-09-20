@@ -35,6 +35,13 @@ public:
     committed_export_frame& operator=(committed_export_frame&&) noexcept;
     committed_export_frame(const committed_export_frame&)=delete;
     const std::vector<audit_log_entry>& entries()const noexcept{return entries_;}
+    // Exact last selected local PK, not a source frontier or delivery receipt.
+    // A moved-from/empty permit has no cursor. Only successful preparation
+    // publishes a nonempty frame; the caller advances after its own handoff.
+    std::optional<int64_t> last_audit_id()const noexcept {
+        if(consumed_||entries_.empty())return std::nullopt;
+        return entries_.back().id;
+    }
 };
 // Retains the exact physical transport through a reentrant handoff. The gate
 // never runs SQLite, callbacks, sends or teardown while holding its leaf lock.
@@ -64,6 +71,9 @@ struct recovery_export_preparation {
     std::optional<committed_export_frame> frame;
 };
 class recovery_export_adapter {
+    static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
+        const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
+        const recovery_export_limits&,std::optional<int64_t> history_after);
 public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.
@@ -71,6 +81,14 @@ public:
     static recovery_export_preparation prepare_pending(std::shared_ptr<lattice_db>,
         const std::string& sync_id,uint64_t physical_generation,size_t maximum_entries,
         const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& = {});
+    // Inactive, resolved-PK history selection: no pending/ACK/filter/floor
+    // exclusions. Every selected row must have a genuine generated stamp and
+    // current open obligation, or the entire page refuses. A protected result
+    // with no frame means an empty sampled view, never frontier authority. No mount
+    // authorization is implied; a future SDK route must authorize every row.
+    static recovery_export_preparation prepare_history_page(std::shared_ptr<lattice_db>,
+        uint64_t physical_generation,int64_t after_audit_id,size_t maximum_entries,
+        const recovery_export_limits& = {});
     // Compatibility bookkeeping for currently sent IDs only. Leaves every
     // journal obligation open/pinned; never calls canonical acknowledge.
     static void acknowledge_legacy(std::shared_ptr<lattice_db>,const std::string&,const std::vector<std::string>&);

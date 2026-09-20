@@ -260,6 +260,31 @@ std::vector<int64_t> covered_pending(sqlite3* db,const std::string& channel,
     }
     return {pending.begin(),pending.end()};
 }
+// Unlike pending coverage, this selector does not exclude any addressed row.
+// The integer PK range + LIMIT bounds materialization to the requested page;
+// larger retained history is paged, not silently treated as unsupported/empty.
+std::vector<int64_t> history_page(sqlite3* db,int64_t after,size_t count){
+    statement query(db,"SELECT id FROM main.AuditLog WHERE id>? ORDER BY id LIMIT ?");
+    query.integer(1,after);query.integer(2,static_cast<int64_t>(count));
+    std::vector<int64_t> ids;int64_t previous=after;
+    while(query.next()){
+        const auto id=integer(query,0);
+        if(ids.size()==count||id<=previous)refuse("export history invalid ordered identity");
+        ids.push_back(id);previous=id;
+    }
+    return ids;
+}
+void history_original(sqlite3* db,const recovery_local_export_inventory& inventory,
+    const recovery_local_export_scope& scope,recovery_obligation_store& journal,const audit_log_entry& row){
+    // find() checks normalized UUID identity and the actual persisted original;
+    // comparisons preserve its exact AuditLog spelling/body rather than rewrite.
+    const auto entry=journal.find(scope.contribution.address,row.global_id);
+    if(!entry||entry->record.audit_id!=row.id||entry->record.original_id!=row.global_id||
+       entry->record.table!=row.table_name||entry->record.target_id!=row.global_row_id||
+       entry->record.origin!=recovery_obligation_origin::local_candidate||entry->stage!=recovery_obligation_stage::open)
+        refuse("export history original lacks current open obligation");
+    coverage_stamp(db,inventory,scope,*entry);
+}
 } // namespace
 
 committed_export_frame::committed_export_frame(committed_export_frame&& other) noexcept {
@@ -284,25 +309,40 @@ bool recovery_export_adapter::protected_store(std::shared_ptr<lattice_db> owner)
 }
 recovery_export_preparation recovery_export_adapter::prepare_pending(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits){
+    return prepare(std::move(owner),sync_id,generation,count,in_flight,filtered,limits,std::nullopt);
+}
+recovery_export_preparation recovery_export_adapter::prepare_history_page(std::shared_ptr<lattice_db> owner,
+    uint64_t generation,int64_t after,size_t count,const recovery_export_limits& limits){
+    if(after<0)refuse("export history cursor must be a resolved nonnegative PK");
+    return prepare(std::move(owner),{},generation,count,{},false,limits,after);
+}
+recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
+    uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits,
+    std::optional<int64_t> history_after){
     recovery_export_preparation output;
     if(!recovery_local_producer_adapter::export_protection_required(owner))return output;
     committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;
     const auto result=recovery_writer_access::install(owner,[&](database& writer){
         auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);if(inventory.scopes.empty())return;
-        limits_ok(limits,count,in_flight);if(sync_id.empty()||sync_id.size()>4096)refuse("export invalid route channel");
+        limits_ok(limits,count,in_flight);if(!history_after&&(sync_id.empty()||sync_id.size()>4096))refuse("export invalid route channel");
         output.protected_store=true;if(filtered)refuse("protected export refuses legacy filter synthesis");
         for(const auto& scope:inventory.scopes)if(scope.contribution.mode!=recovery_obligation_mode::recording)refuse("protected export contribution is frozen or installed");
         frame.scopes_=inventory.scopes;frame.limits_=inventory.limits;
         auto* db=recovery_writer_access::active_handle(*owner,writer);
         recovery_obligation_store journal(owner,inventory.limits.obligations,inventory.limits.installations);
-        const auto pending=covered_pending(db,sync_id,inventory,journal,limits.coverage_candidates);
-        const std::set<int64_t> sending(in_flight.begin(),in_flight.end());std::vector<int64_t> ids;
-        for(const auto id:pending)if(!sending.count(id)){ids.push_back(id);if(ids.size()==count)break;}
+        std::vector<int64_t> pending,ids;
+        if(history_after)ids=history_page(db,*history_after,count);
+        else {
+            pending=covered_pending(db,sync_id,inventory,journal,limits.coverage_candidates);
+            const std::set<int64_t> sending(in_flight.begin(),in_flight.end());
+            for(const auto id:pending)if(!sending.count(id)){ids.push_back(id);if(ids.size()==count)break;}
+        }
         budget raw{limits};std::vector<raw_audit> originals;std::vector<std::vector<std::string>> by_scope(inventory.scopes.size());
         std::string encoded="{\"auditLog\":[";
         for(const auto id:ids){auto row=read_audit(db,id,raw);const recovery_local_export_table* table=nullptr;size_t scope_index=0;
             for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& t:inventory.scopes[i].tables)if(t.name==row.entry.table_name){if(table)refuse("export ambiguous contribution table");table=&t;scope_index=i;}
             if(!table)refuse("export original has no admitted whole-model contribution");
+            if(history_after)history_original(db,inventory,inventory.scopes[scope_index],journal,row.entry);
             decode_generated(db,row,*table,raw);wire_bound(row.entry,limits.wire_bytes-encoded.size()-2);
             const auto json=row.entry.to_json();if(json.size()+3>limits.wire_bytes-encoded.size())refuse("export encoded frame exceeds budget");
             if(!frame.entries_.empty())encoded+=',';encoded+=json;by_scope[scope_index].push_back(row.entry.global_id);frame.entries_.push_back(row.entry);originals.push_back(std::move(row));
@@ -322,7 +362,12 @@ recovery_export_preparation recovery_export_adapter::prepare_pending(std::shared
         for(const auto& [address,expected]:expected_entries)if(journal.find(address,expected.record.original_id)!=std::optional<recovery_obligation_entry>(expected))refuse("export cross-contribution final entry changed");
         for(const auto& expected:expected_scopes)if(journal.read(expected.address.channel)!=std::optional<recovery_obligation_scope>(expected))refuse("export cross-contribution final scope changed");
         budget verify{limits};for(const auto& before:originals)if(!same_original(before,read_audit(db,before.entry.id,verify)))refuse("export original changed after claims");
-        if(covered_pending(db,sync_id,final_inventory,journal,limits.coverage_candidates)!=pending)
+        if(history_after){
+            if(history_page(db,*history_after,count)!=ids)refuse("export history page changed during claims");
+            for(const auto& scope:final_inventory.scopes)for(const auto& table:scope.tables)
+                for(const auto& entry:frame.entries_)if(entry.table_name==table.name)
+                    history_original(db,final_inventory,scope,journal,entry);
+        }else if(covered_pending(db,sync_id,final_inventory,journal,limits.coverage_candidates)!=pending)
             refuse("export coverage pending inventory changed during claims");
         frame.message_=transport_message::from_binary({encoded.begin(),encoded.end()});
     });

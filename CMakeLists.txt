@@ -234,6 +234,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp
     Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp
     Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp
+    Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp
     Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
     Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp
     Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp

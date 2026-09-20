@@ -1,5 +1,6 @@
 #pragma once
 #include "canonical_change_store.hpp"
+#include "canonical_source_capture.hpp"
 #include "lattice/sync.hpp"
 #include <memory>
 #include <string>
@@ -7,6 +8,7 @@
 
 namespace lattice::detail {
 class canonical_upstream_delivery;
+struct canonical_source_session_test_access;
 namespace canonical_upstream_test_hooks {
 // Private failure injection only. Restricts an already admitted authorizer
 // action; never installs/replaces a raw hook. The callback must not run SQL,
@@ -39,6 +41,14 @@ class canonical_writer_adapter {
     std::shared_ptr<context> context_;
     explicit canonical_writer_adapter(lattice_db&, const canonical_writer_profile&,
                                       const canonical_upstream_limits* = nullptr);
+    friend struct canonical_source_session_test_access;
+    sync_recovery::owned_canonical_capture capture_recovery_impl(std::shared_ptr<lattice_db>,
+        const canonical_store_binding&, std::optional<int64_t>,
+        const std::vector<sync_recovery::canonical_capture_request>&,
+        const sync_recovery::canonical_capture_limits&,
+        const std::function<void(size_t,uint64_t)>&,
+        const std::function<void()>&, const std::function<void()>&);
+
 public:
     static std::unique_ptr<canonical_writer_adapter> attach(lattice_db&, const canonical_writer_profile&);
     // Inactive qualification only. Requires upstream_requested and an idle,
@@ -47,6 +57,18 @@ public:
         std::shared_ptr<lattice_db>, const canonical_writer_profile&, canonical_upstream_limits);
     std::vector<std::string> apply_upstream_owned(std::shared_ptr<lattice_db>,
         const std::vector<audit_log_entry>&, const std::optional<std::string>& receiving_channel = std::nullopt);
+    // Private, synchronous, file-WAL-only source qualification. Scope and
+    // descriptor come from this admitted adapter, never a caller table vector.
+    // Null base explicitly requests full; retired numeric base returns a
+    // requires_full_request result with no capture. No frozen Q is rewritten.
+    // Actual owner/writer/context are retained through the final decision.
+    // Retirement/replacement observed before that decision refuses; later
+    // close does not retroactively invalidate these UNSEALED facts. No serving,
+    // authentication, negative receipt, spool, lease or transport authority.
+    sync_recovery::owned_canonical_capture capture_recovery_owned(std::shared_ptr<lattice_db>,
+        const canonical_store_binding& declared_binding, std::optional<int64_t> declared_base,
+        const std::vector<sync_recovery::canonical_capture_request>&,
+        const sync_recovery::canonical_capture_limits&);
     ~canonical_writer_adapter();
     canonical_writer_adapter(const canonical_writer_adapter&) = delete;
     canonical_writer_adapter& operator=(const canonical_writer_adapter&) = delete;

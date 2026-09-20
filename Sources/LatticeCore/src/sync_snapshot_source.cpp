@@ -335,7 +335,8 @@ std::string source_integer_column(const std::string& name) {
 unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     const canonical_store_binding& binding,const std::vector<source_relation>& scope,
     std::optional<int64_t> base,const std::vector<canonical_capture_request>& requests,
-    const canonical_capture_limits& b,const std::function<void(size_t,uint64_t)>& after_batch) {
+    const canonical_capture_limits& b,const std::function<void(size_t,uint64_t)>& after_batch,
+    source_capture_selection* selection=nullptr, const std::function<void(uint64_t)>& verify_generation={}) {
     validate_budget(b.rows);
     check(!scope.empty()&&scope.size()<=b.rows.tables&&b.requests>0&&b.requests<=4096&&
         b.requested_targets>0&&b.requested_targets<=4096&&b.marker_batch>0&&b.marker_batch<=4096&&
@@ -367,6 +368,7 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
         }
     }
     view held(owner);unsealed_canonical_capture result;
+    if(verify_generation)verify_generation(held.generation);
     std::string state_sql="SELECT ";
     for(const char* name:{"id","version","head","floor","markers","marker_bytes","receipts","receipt_bytes",
         "max_markers","max_marker_bytes","max_receipts","max_receipt_bytes","max_batch","max_identity","max_operation"})
@@ -390,7 +392,12 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     for(const auto& field:{std::pair{"markers",l.markers},std::pair{"marker_bytes",l.marker_bytes},
                           std::pair{"receipts",l.receipts},std::pair{"receipt_bytes",l.receipt_bytes}})
         check(integer(metadata,field.first)>=0&&integer(metadata,field.first)<=field.second,"canonical source counter is corrupt");
-    if(base)check(*base>=result.floor&&*base<=result.head,"canonical source base retired or ahead");
+    if(base) {
+        check(*base>=0 && *base<=result.head,"canonical source base invalid or ahead");
+        if(!selection)check(*base>=result.floor,"canonical source base retired or ahead");
+    }
+    if(selection)*selection=!base?source_capture_selection::full:
+        (*base<result.floor?source_capture_selection::requires_full_request:source_capture_selection::delta);
     // Validate the entire retained metadata set BEFORE filtering by (B,H]. A
     // bad SQLite storage class or an ahead-of-head position must not disappear
     // behind the range predicate and turn a partial delta into a claimed H.
@@ -425,6 +432,13 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     for(const auto& relation:sorted) {
         layouts.emplace(relation.table,result.layouts.size());result.layouts.push_back(layout(held,relation,b.rows));
         check(result.layouts.back().identity_collation=="NOCASE","canonical source requires indexed NOCASE identities");
+    }
+    if(selection)for(const auto& request:requests)for(const auto& target:request.targets)
+        check(layouts.count(target.table),"canonical requested target is outside complete declared scope");
+    if(selection && *selection==source_capture_selection::requires_full_request) {
+        // Corrupt source metadata/layout still refuses; retirement never masks
+        // a failed integrity check. No requested receipt/body is published.
+        (void)held.query("SELECT 1 AS live");held.finish();return result;
     }
     auto charge=[&](uint64_t bytes) {
         check(bytes<=b.rows.wire.total_bytes-result.copied_logical_bytes,"canonical capture logical-byte budget exceeded");
@@ -546,6 +560,18 @@ unsealed_canonical_capture capture_canonical_source(lattice_db& owner,const cano
     const std::vector<source_relation>& scope,std::optional<int64_t> base,
     const std::vector<canonical_capture_request>& requests,const canonical_capture_limits& budget) {
     return capture_canonical_impl(owner,binding,scope,base,requests,budget,{});
+}
+owned_canonical_capture canonical_source_session_access::capture(lattice_db& owner,
+    const canonical_store_binding& binding,const std::vector<source_relation>& scope,
+    std::optional<int64_t> base,const std::vector<canonical_capture_request>& requests,
+    const canonical_capture_limits& limits,const std::function<void(uint64_t)>& verify_generation,
+    const std::function<void(size_t,uint64_t)>& after_batch) {
+    owned_canonical_capture result;result.binding=binding;result.requested_base=base;
+    auto captured=capture_canonical_impl(owner,binding,scope,base,requests,limits,after_batch,
+        &result.selection,verify_generation);
+    result.head=captured.head;result.floor=captured.floor;
+    if(result.selection!=source_capture_selection::requires_full_request)result.capture=std::move(captured);
+    return result;
 }
 namespace source_test_hooks {
 unsealed_canonical_capture capture_canonical(lattice_db& owner,const canonical_store_binding& binding,

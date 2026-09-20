@@ -1,5 +1,6 @@
 #include "canonical_writer_adapter.hpp"
 #include "recovery_writer_access.hpp"
+#include "vendor/picosha2/picosha2.h"
 #include <atomic>
 #include <array>
 #include <cstring>
@@ -148,6 +149,11 @@ struct canonical_writer_adapter::context {
     std::set<std::string> programs, relations;
     lattice_db* owner=nullptr; // identity only; upstream delivery holds the strong owner
     canonical_writer_profile profile;
+    // Built once from the exact table/index/program bytes validated at attach.
+    // Immutable after publication; capture never accepts replacement scope.
+    std::vector<sync_recovery::source_relation> source_relations;
+    std::map<std::string,std::map<std::pair<std::string,std::string>,std::string>> source_objects;
+    std::string source_manifest, source_descriptor_digest;
     std::optional<canonical_upstream_limits> upstream;
     std::map<std::string,std::unordered_map<std::string,column_type>> schemas;
     std::map<std::string,std::set<std::string>> no_history;
@@ -342,6 +348,9 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             auto ddl=writer_->query("SELECT CASE WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='table' AND name=?",{name});
             if(ddl.size()!=1)refuse("canonical missing table");
             table.table_sql=string(ddl[0],"sql");
+            context_->source_relations.push_back({name,table.link?sync_recovery::relation_kind::link:
+                sync_recovery::relation_kind::model,true});
+            context_->source_objects[name].emplace(std::pair{"table",name},table.table_sql);
             if(table.table_sql.find("globalId TEXT UNIQUE COLLATE NOCASE")==std::string::npos ||
                table.table_sql.find("CREATE VIRTUAL")!=std::string::npos || table.table_sql.find("WITHOUT ROWID")!=std::string::npos)
                 refuse("canonical unsupported identity/table shape");
@@ -401,6 +410,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
                 if(index_name.size()>128 || index_sql.size()>max_sql || definitions.size()>max_sql-index_sql.size())
                     refuse("canonical index descriptor budget exceeded");
                 definitions+=index_name+"\n"+index_sql+"\n";
+                context_->source_objects[name].emplace(std::pair{std::string("index"),index_name},index_sql);
             }
             if(definitions.size()>max_sql || manifest.size()>max_sql-definitions.size())refuse("canonical descriptor budget exceeded");
             manifest+=definitions;
@@ -409,8 +419,12 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             if(program.sql.size()>max_sql || manifest.size()>max_sql-program.sql.size())refuse("canonical generated SQL budget exceeded");
             manifest+=normalized(program.sql)+"\n";
             context_->programs.insert(program.name);
+            for(const auto& [name,table]:tables)if(program.sql.find(" ON "+name+" ")!=std::string::npos)
+                context_->source_objects[name].emplace(std::pair{std::string("trigger"),program.name},normalized(program.sql));
         }
         if(manifest.size()>max_sql)refuse("canonical manifest budget exceeded");
+        context_->source_manifest=manifest;
+        context_->source_descriptor_digest=picosha2::hash256_hex_string(manifest);
         const bool reopen=writer_->table_exists("_lattice_canonical_coverage");
         if(reopen) {
             const auto shape=writer_->query("SELECT wr FROM pragma_table_list WHERE schema='main' AND name='_lattice_canonical_coverage'");
@@ -453,6 +467,83 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             "canonical attachment rollback failed; writer remains refused",primary,cleanup);
         std::rethrow_exception(primary);
     }
+}
+sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recovery_owned(
+    std::shared_ptr<lattice_db> owner,const canonical_store_binding& binding,std::optional<int64_t> base,
+    const std::vector<sync_recovery::canonical_capture_request>& requests,
+    const sync_recovery::canonical_capture_limits& limits) {
+    return capture_recovery_impl(std::move(owner),binding,base,requests,limits,{},{},{});
+}
+sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recovery_impl(
+    std::shared_ptr<lattice_db> owner,const canonical_store_binding& binding,std::optional<int64_t> base,
+    const std::vector<sync_recovery::canonical_capture_request>& requests,
+    const sync_recovery::canonical_capture_limits& limits,
+    const std::function<void(size_t,uint64_t)>& after_batch,
+    const std::function<void()>& before_decision,const std::function<void()>& after_decision) {
+    // No access to this after these copies: qualification callbacks may retire
+    // the wrapper. They cannot release our actual owner/writer/context custody.
+    auto state=context_;auto writer=writer_;
+    if(!owner || !state || state->owner!=owner.get() || binding!=state->binding)
+        refuse("canonical source requires this admitted owner and exact binding");
+    uint64_t revision;bool admitted;
+    {
+        std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+        admitted=!owner->closed_.load() && owner->db_==writer && state->active->load(std::memory_order_acquire);
+        revision=owner->connection_revision_;
+    }
+    if(!admitted)refuse("canonical source attachment is retired");
+    const auto decide=[&] {
+        // Final validity linearizes at the active load while publication is
+        // locked. No SQL, callback, allocation or teardown occurs under it.
+        bool valid;
+        {
+            std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+            valid=!owner->closed_.load() && owner->db_==writer && owner->connection_revision_==revision &&
+                !writer->is_closed() && matches_connection(*writer,state->connection) &&
+                state->active->load(std::memory_order_acquire);
+        }
+        if(!valid)refuse("canonical source owner, writer or attachment changed");
+    };
+    const auto verify_generation=[&](uint64_t generation) {
+        decide(); // after the actual keeper pin, not an earlier guessed view
+        const auto query=[&](const std::string& sql,const std::vector<column_value_t>& args={}) {
+            auto result=owner->query_at_generation(generation,sql,args);
+            if(!result)refuse("canonical source descriptor view retired");return std::move(*result);
+        };
+        const auto coverage=query("SELECT CASE WHEN typeof(id)='integer' THEN id END AS id,typeof(manifest)='blob' AND length(manifest)<=262144 AND manifest=? AS exact "
+            "FROM main._lattice_canonical_coverage LIMIT 2",{bytes(state->source_manifest)});
+        if(coverage.size()!=1 || integer(coverage[0],"id")!=1 || integer(coverage[0],"exact")!=1)
+            refuse("canonical source coverage descriptor changed");
+        size_t copied=0;
+        for(const auto& [table,expected]:state->source_objects) {
+            // Inspect lengths before copying DDL; aggregate allocation is
+            // bounded independently of corrupt stored metadata lengths.
+            const auto shape=query("SELECT type,CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,"
+                "CASE WHEN sql IS NULL THEN 0 WHEN typeof(sql)='text' THEN length(CAST(sql AS BLOB)) ELSE -1 END AS n "
+                "FROM main.sqlite_master WHERE tbl_name=? AND type IN ('table','index','trigger') ORDER BY type,name LIMIT 51",{table});
+            if(shape.size()!=expected.size() || shape.size()>50)refuse("canonical source object inventory changed");
+            for(const auto& row:shape) {
+                const auto key=std::pair{string(row,"type"),string(row,"name")};const auto n=integer(row,"n");
+                if(!expected.count(key) || n<0 || static_cast<uint64_t>(n)>max_sql-copied)
+                    refuse("canonical source descriptor shape or byte budget changed");
+                copied+=static_cast<size_t>(n);
+            }
+            const auto actual=query("SELECT type,name,COALESCE(sql,'') AS sql FROM main.sqlite_master "
+                "WHERE tbl_name=? AND type IN ('table','index','trigger') ORDER BY type,name LIMIT 51",{table});
+            std::map<std::pair<std::string,std::string>,std::string> objects;
+            for(const auto& row:actual)objects.emplace(std::pair{string(row,"type"),string(row,"name")},normalized(string(row,"sql")));
+            if(objects!=expected)refuse("canonical source schema or generated programs changed");
+        }
+    };
+    auto result=sync_recovery::canonical_source_session_access::capture(*owner,state->binding,state->source_relations,
+        base,requests,limits,verify_generation,after_batch);
+    result.descriptor_digest=state->source_descriptor_digest;
+    if(before_decision)before_decision();
+    decide();
+    // No mutable validity reread after this decision: later close cannot
+    // retroactively change the decided, unsealed facts. There is no send here.
+    if(after_decision)after_decision();
+    return result;
 }
 void require_canonical_relation(database& db,const std::string& name) {
     if(!db.canonical_callback_custody_)refuse("canonical relation has no admitted callback custody");

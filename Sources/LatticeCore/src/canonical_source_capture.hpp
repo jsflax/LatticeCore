@@ -2,6 +2,7 @@
 #include "canonical_change_store.hpp"
 #include "sync_snapshot_source.hpp"
 
+namespace lattice::detail { class canonical_writer_adapter; }
 namespace lattice::detail::sync_recovery {
 struct canonical_capture_request {
     std::string original_id; // normalized UUID comparison key
@@ -30,6 +31,29 @@ struct unsealed_canonical_capture {
     std::vector<canonical_source_row> rows;
     std::vector<canonical_source_receipt> receipts;
     uint64_t copied_logical_bytes=0;
+};
+// A declared numeric base is a receiver claim, not evidence of installation.
+// No authority/receipt namespace is inferred from these source binding bytes.
+enum class source_capture_selection { full, delta, requires_full_request };
+struct owned_canonical_capture {
+    canonical_store_binding binding;
+    std::string descriptor_digest;
+    source_capture_selection selection = source_capture_selection::full;
+    std::optional<int64_t> requested_base;
+    int64_t head=0, floor=0;
+    // Absent for a retired delta base: only a NEW explicit full request may
+    // obtain rows. H/F alone never authorize a frontier, send or installation.
+    std::optional<unsealed_canonical_capture> capture;
+};
+// Internal factoring, callable only by the actual adapter. It does not mint
+// source authority and does not replace the explicitly trusted legacy helper.
+class canonical_source_session_access {
+    friend class lattice::detail::canonical_writer_adapter;
+    static owned_canonical_capture capture(lattice_db&, const canonical_store_binding&,
+        const std::vector<source_relation>&, std::optional<int64_t>,
+        const std::vector<canonical_capture_request>&, const canonical_capture_limits&,
+        const std::function<void(uint64_t)>& verify_generation,
+        const std::function<void(size_t,uint64_t)>& after_batch);
 };
 // Private read-only, synchronous, file-WAL-only storage capture. The caller
 // retains the actual owner throughout. Source admission/complete schema,

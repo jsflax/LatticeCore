@@ -6,6 +6,7 @@
 #include <util.hpp>
 #include <LatticeBridge.hpp>
 #include <nlohmann/json.hpp>  // bundled in ../LatticeCore/include (header search path)
+#include <vendor/picosha2/picosha2.h>
 
 // Thread-local state for migration lookup functions
 static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;
@@ -169,7 +170,7 @@ void dynamic_object::manage(managed<swift_dynamic_object> o) {
 // MARK: Swift Lattice
 // Construct with swift_configuration (includes row migration callback)
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
-    : lattice_db(config, /*defer_sync=*/true), swift_config_(config) {
+    : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_config_(config) {
     LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
     if (!config.read_only) {
         LOG_DEBUG("swift_lattice", "ensure_swift_tables");
@@ -189,7 +190,7 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
 }
 
 swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& schemas)
-    : lattice_db(config, /*defer_sync=*/true), swift_config_(std::move(config)) {
+    : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_config_(std::move(config)) {
     if (!swift_config_.read_only) {
         ensure_swift_tables(schemas);
         lattice_db::setup_sync_if_configured();
@@ -484,6 +485,18 @@ void swift_lattice::persist_union_values(swift_dynamic_object& unmanaged_obj,
 }
 
 void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
+    if(recovery_producer_bootstrapped()) {
+        // Base bootstrap has already compared complete declared schema and
+        // exact enrolled programs in its retained view. Never enter ordinary
+        // migration/trigger recreation for this admitted physical connection.
+        if(schemas.empty()&&recovery_declarations().swift_digest.empty())return;
+        const auto fp=compute_swift_fingerprint_key(schemas);
+        if(fp!=recovery_declarations().swift_fingerprint||
+           !fingerprint_marker_valid(fp)||get_schema_version()!=swift_config_.target_schema_version)
+            throw db_error("local producer Swift schema requires explicit migration");
+        populate_swift_in_memory_state(schemas);
+        return;
+    }
     // FAST PATH: when the fingerprint marker matches the schema cookie AND the
     // stored schema version equals this binary's target, every DDL statement
     // below is provably a no-op — populate in-memory state only and return
@@ -1157,10 +1170,13 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
 }
 
 std::string swift_lattice::compute_swift_fingerprint_key(const SchemaVector& schemas) const {
+    return compute_swift_fingerprint_key_for(swift_config_.target_schema_version,schemas);
+}
+std::string swift_lattice::compute_swift_fingerprint_key_for(int32_t target_version,const SchemaVector& schemas) {
     std::ostringstream out;
     out << "swift\n"
         << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
-        << "target_schema_version:" << swift_config_.target_schema_version << '\n';
+        << "target_schema_version:" << target_version << '\n';
     // Sort tables and property names: SchemaVector order follows the Swift
     // call site and SwiftSchema is an unordered_map — neither is stable.
     std::vector<const swift_schema_entry*> sorted;
@@ -1340,6 +1356,52 @@ property_descriptor descriptor_from_json(const std::string& name, const nlohmann
 }
 
 } // anonymous namespace
+
+detail::recovery_owner_schema swift_lattice::recovery_catalog(const swift_configuration& config,const SchemaVector& schemas) {
+    auto result=detail::recovery_owner_schema::capture_native();
+    if(!result.valid()||schemas.size()>detail::recovery_owner_schema::max_models-result.models.size()) {
+        result.refuse();return result;
+    }
+    if(schemas.empty())return result; // native-only bridge retains its original profile bytes
+    // Check every nested count and field before copying or serializing it.
+    // Retain full descriptors even for currently unsupported recovery kinds.
+    for(const auto& entry:schemas) {
+        if(result.models.count(entry.table_name)||entry.properties.size()>256||
+           !result.admit_field(entry.table_name)||!result.admit_count(entry.constraints.size(),64,32)) {
+            result.refuse();return result;
+        }
+        for(const auto& [name,p]:entry.properties)
+            if(name!=p.name||!result.admit_field(name)||!result.admit_property(p)) {
+                result.refuse();return result;
+            }
+        for(const auto& constraint:entry.constraints) {
+            if(!result.admit_count(constraint.columns.size(),64,16))return result;
+            for(const auto& name:constraint.columns)if(!result.admit_field(name))return result;
+        }
+        model_schema model;model.table_name=entry.table_name;model.properties.reserve(entry.properties.size());
+        for(const auto& [name,p]:entry.properties)model.properties.push_back(p);
+        result.models.emplace(entry.table_name,std::move(model));result.swift_models.insert(entry.table_name);
+    }
+    // Stable complete declaration digest includes constraints, unsupported
+    // property flags, relationships and the target version. A schema cookie or
+    // the ordinary noncryptographic fast-open fingerprint is not this identity.
+    nlohmann::json root;root["format"]="swift-recovery-declarations-v1";root["version"]=config.target_schema_version;
+    auto tables=nlohmann::json::object();
+    for(const auto& entry:schemas) {
+        auto props=nlohmann::json::object();
+        for(const auto& [name,p]:entry.properties) {
+            props[name]=descriptor_to_json(p);
+            props[name]["no_history"]=p.no_history;
+        }
+        auto constraints=nlohmann::json::array();
+        for(const auto& c:entry.constraints)constraints.push_back({{"columns",c.columns},{"allows_upsert",c.allows_upsert}});
+        tables[entry.table_name]={{"properties",std::move(props)},{"constraints",std::move(constraints)}};
+    }
+    root["tables"]=std::move(tables);
+    result.swift_digest=picosha2::hash256_hex_string(root.dump());
+    result.swift_fingerprint=compute_swift_fingerprint_key_for(config.target_schema_version,schemas);
+    return result;
+}
 
 void swift_lattice::store_swift_schema_snapshot(const SchemaVector& schemas) {
     nlohmann::json root;

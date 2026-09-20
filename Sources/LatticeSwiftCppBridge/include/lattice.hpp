@@ -699,6 +699,8 @@ private:
     /// Fingerprint of the Swift-declared schemas covering every DDL-driving
     /// attribute (properties, constraints, unions). See kLatticeSchemaFormatEpoch.
     std::string compute_swift_fingerprint_key(const SchemaVector& schemas) const;
+    static std::string compute_swift_fingerprint_key_for(int32_t target_version,const SchemaVector& schemas);
+    static detail::recovery_owner_schema recovery_catalog(const swift_configuration&,const SchemaVector&);
     /// Populate schemas_/constraints_/union_schemas_ and the core link-table
     /// registries with zero SQL writes (write-free fast path).
     void populate_swift_in_memory_state(const SchemaVector& schemas);

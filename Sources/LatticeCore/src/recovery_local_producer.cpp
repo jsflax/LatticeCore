@@ -20,6 +20,7 @@ constexpr size_t max_manifest=1048576, max_receipt=65536, max_existing=4096;
 constexpr recovery_obligation_producer_discovery_limits discovery_caps{
     {16,100000,4096,67108864},{16,4096,1048576},{16,100000,4096,1048576,67108864}};
 constexpr const char* template_version="lattice-local-original-v1/uuid-nocase/schema-v1";
+constexpr const char* swift_template_version="lattice-local-original-v1/uuid-nocase/swift-owner-schema-v1";
 [[noreturn]] void refuse(const char* s) { throw db_error(s); }
 bool identifier(const std::string& s) {
     if(s.empty() || s.size()>64 || (s[0]>='0'&&s[0]<='9')) return false;
@@ -77,7 +78,10 @@ struct reader {
 recovery_local_producer_grant grant_from(const recovery_obligation_producer_profile& p) {
     if(p.grant_manifest.size()>max_manifest)refuse("local producer oversized stored grant");
     reader in{p.grant_manifest};
-    if(in.field(128)!=template_version)refuse("local producer unsupported template revision");
+    const auto version=in.field(128);
+    if(version==swift_template_version) {
+        if(in.field(64).size()!=64)refuse("local producer invalid owner declaration digest");
+    } else if(version!=template_version)refuse("local producer unsupported template revision");
     auto receipt=in.field(max_receipt); if(receipt.empty())refuse("local producer missing incoming grant claim");
     recovery_local_producer_grant out;out.address={p.contribution.binding.channel,p.contribution_incarnation,0};
     out.incoming_grant_receipt={receipt.begin(),receipt.end()};
@@ -357,16 +361,20 @@ std::shared_ptr<database> recovery_local_producer_adapter::retained_writer_for_t
 }
 recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::describe(
     lattice_db& owner,database& db,const recovery_local_producer_grant& grant,bool initial_inventory) {
+    const auto& catalog=owner.recovery_schemas_;
+    if(!catalog.valid())refuse("local producer owner schema catalog outside bounds or ambiguous");
     if(grant.models.empty()||grant.models.size()>max_models||grant.incoming_grant_receipt.empty()||grant.incoming_grant_receipt.size()>max_receipt)
         refuse("local producer requires bounded explicit whole-model incoming grant");
     for(const auto& name:grant.models)if(!identifier(name)||name[0]=='_')refuse("local producer unsupported model identifier");
     const std::set<std::string> models(grant.models.begin(),grant.models.end());
     if(models.size()!=grant.models.size())refuse("local producer duplicate model grant");
     descriptor d;
-    field(d.manifest,std::string(template_version));field(d.manifest,grant.incoming_grant_receipt);number(d.manifest,models.size());
+    field(d.manifest,std::string(catalog.swift_digest.empty()?template_version:swift_template_version));
+    if(!catalog.swift_digest.empty())field(d.manifest,catalog.swift_digest);
+    field(d.manifest,grant.incoming_grant_receipt);number(d.manifest,models.size());
     for(const auto& name:models) {
         if(!identifier(name)||name[0]=='_')refuse("local producer unsupported model identifier");field(d.manifest,name);
-        auto* schema=schema_registry::instance().get_schema(name);
+        const auto* schema=catalog.find(name);
         if(!schema || schema->properties.empty() || schema->properties.size()>max_columns)refuse("local producer unknown/oversized complete schema");
         table_plan t;t.name=name;
         for(const auto& p:schema->properties) {
@@ -374,20 +382,20 @@ recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::des
                (!p.column_name.empty()&&p.column_name!=p.name)||
                (p.kind!=property_kind::primitive&&p.kind!=property_kind::link&&p.kind!=property_kind::list))
                 refuse("local producer unsupported complete schema property");
-            if(p.kind!=property_kind::list)t.columns.emplace_back(p.name,p.type);
-            if(p.no_history)t.no_history.insert(p.name);
+            const bool swift=catalog.swift_models.count(name);
+            const bool physical=swift?p.kind==property_kind::primitive:p.kind!=property_kind::list;
+            if(physical)t.columns.emplace_back(p.name,p.type);
+            if(p.no_history&&(!swift||physical))t.no_history.insert(p.name);
         }
         if(t.columns.empty())refuse("local producer model has no generated audit program");
         d.tables.emplace(name,std::move(t));
     }
-    const auto schemas=schema_registry::instance().all_schemas();
-    if(schemas.size()>256)refuse("local producer registered schema inventory bound");
-    for(const auto* s:schemas)for(const auto& p:s->properties) {
+    for(const auto& [schema_name,s]:catalog.models)for(const auto& p:s.properties) {
         if(p.kind!=property_kind::link&&p.kind!=property_kind::list)continue;
-        if(!models.count(s->table_name)&&!models.count(p.target_table))continue;
-        if(p.is_geo_bounds||p.target_table.empty()||!models.count(s->table_name)||!models.count(p.target_table))
+        if(!models.count(s.table_name)&&!models.count(p.target_table))continue;
+        if(p.is_geo_bounds||p.target_table.empty()||!models.count(s.table_name)||!models.count(p.target_table))
             refuse("local producer incomplete regular-link incoming/outgoing closure");
-        table_plan t;t.name="_"+s->table_name+"_"+p.target_table+"_"+p.name;t.link=true;
+        table_plan t;t.name="_"+s.table_name+"_"+p.target_table+"_"+p.name;t.link=true;
         if(!identifier(t.name))refuse("local producer oversized relation");d.tables.emplace(t.name,std::move(t));
     }
     if(d.tables.size()>max_relations)refuse("local producer physical relation budget");
@@ -400,7 +408,7 @@ recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::des
         if(ddl.size()!=1)refuse("local producer missing durable model/link relation");t.ddl=text(ddl[0],"sql");
         if(t.ddl.find("globalId TEXT UNIQUE COLLATE NOCASE")==std::string::npos || t.ddl.find("CREATE VIRTUAL")!=std::string::npos || t.ddl.find("WITHOUT ROWID")!=std::string::npos)
             refuse("local producer unsupported durable UUID relation");
-        const auto columns=db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name END AS name,CASE WHEN length(CAST(type AS BLOB))<=16 THEN type END AS type,CASE WHEN typeof(hidden)='integer' THEN hidden END AS hidden FROM pragma_table_xinfo(?) LIMIT 35",{name});
+        const auto columns=db.query("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name END AS name,CASE WHEN length(CAST(type AS BLOB))<=16 THEN type END AS type,CASE WHEN typeof(hidden)='integer' THEN hidden END AS hidden FROM pragma_table_xinfo(?) ORDER BY cid LIMIT 35",{name});
         if(columns.size()>34)refuse("local producer durable column count");
         std::map<std::string,std::string> actual,want;
         for(const auto& c:columns) {if(integer(c,"hidden")!=0)refuse("local producer hidden/generated columns");actual.emplace(text(c,"name"),text(c,"type"));}
@@ -410,6 +418,18 @@ recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::des
             for(const auto& [column,type]:t.columns)want.emplace(column,type==column_type::integer?"INTEGER":type==column_type::real?"REAL":type==column_type::blob?"BLOB":"TEXT");
         }
         if(actual!=want)refuse("local producer durable/registered schema disagreement");
+        if(catalog.swift_models.count(name)) {
+            // SwiftSchema is unordered. Installed generated SQL follows the
+            // physical creation order; a later process may enumerate the same
+            // declaration differently. Set agreement above precedes this use.
+            std::vector<std::pair<std::string,column_type>> ordered;
+            for(const auto& c:columns) {
+                const auto column=text(c,"name");
+                for(const auto& declared:t.columns)if(declared.first==column){ordered.push_back(declared);break;}
+            }
+            if(ordered.size()!=t.columns.size())refuse("local producer incomplete physical column order");
+            t.columns=std::move(ordered);
+        }
         // Only first enrollment scans the bounded initial identity inventory.
         // Admitted programs guard later UUID writes. Reconstructing their exact
         // schema/program descriptor must not add a lower row-growth ceiling.
@@ -538,7 +558,7 @@ recovery_install_result recovery_local_producer_adapter::enroll_for_qualificatio
             for(const auto& old:t.ordinary)db.execute("DROP TRIGGER "+old.first);
             for(const auto& installed:t.enrolled)db.execute(installed.second);
         }
-        owner->store_fingerprint_marker(owner->compute_core_fingerprint_key());
+        owner->store_recovery_fingerprints();
     },[&] {
         // Monotonic revocation flag is untouched. A concurrent logical close
         // still fences phase 1; pre-admitted phase 2 uses its retained frame.
@@ -572,7 +592,7 @@ recovery_install_result recovery_local_producer_adapter::retire_for_qualificatio
             for(const auto& installed:t.enrolled)db.execute("DROP TRIGGER "+installed.first);
             for(const auto& ordinary:t.ordinary)db.execute(ordinary.second);
         }
-        owner->store_fingerprint_marker(owner->compute_core_fingerprint_key());
+        owner->store_recovery_fingerprints();
     },[&]{candidate->status.store(1,std::memory_order_release);candidate->previous.reset();});
     if(candidate && result.state!=recovery_install_state::committed)candidate->status.store(2,std::memory_order_release);
     return result;

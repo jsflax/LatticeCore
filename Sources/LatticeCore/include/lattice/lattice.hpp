@@ -8,6 +8,7 @@
 #endif
 #include "projection.hpp"
 #include "schema.hpp"
+#include "recovery_schema.hpp"
 #include "derived_program.hpp"
 #include "managed.hpp"
 #include "scheduler.hpp"
@@ -897,6 +898,12 @@ public:
     }
 
     explicit lattice_db(const configuration& config, bool defer_sync = false)
+        : lattice_db(config,defer_sync,detail::recovery_owner_schema::capture_native()) {}
+
+protected:
+    // Swift supplies complete immutable declarations before base-constructor
+    // bootstrap. A virtual getter here would see only the base subobject.
+    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas)
         : config_(config)
         , db_(std::make_shared<database>(resolve_path(config),
               config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
@@ -905,7 +912,8 @@ public:
                    (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
                          std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
-        , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
+        , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>())
+        , recovery_schemas_(std::move(recovery_schemas)) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
         config_.path = resolve_path(config);
@@ -936,6 +944,11 @@ public:
         start_audit_maintenance();   // no-op unless audit_retention_seconds > 0
         LOG_DEBUG("lattice_db", "ctor done");
     }
+
+    bool recovery_producer_bootstrapped()const noexcept{return recovery_producer_bootstrapped_;}
+    const detail::recovery_owner_schema& recovery_declarations()const noexcept{return recovery_schemas_;}
+
+public:
 
     /// One-time repair at open: collapse audit entries whose per-sync state
     /// rows already cover every registered replication slot. Historic
@@ -6044,6 +6057,8 @@ protected:
     friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
     friend class detail::recovery_local_producer_adapter;
+    const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
+    bool recovery_producer_bootstrapped_=false;
     friend struct managed_attachment_test_access;
     struct managed_attachment_binding {
         std::string alias, filename;
@@ -6350,6 +6365,7 @@ private:
             if (!fingerprint_marker_valid(compute_core_fingerprint_key()))
                 throw db_error("local producer enrolled schema requires explicit migration");
             note_tables_for_all_schemas();
+            recovery_producer_bootstrapped_=true;
             return;
         }
 
@@ -7470,7 +7486,15 @@ protected:
         std::ostringstream out;
         out << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
             << "target_schema_version:" << config_.target_schema_version << '\n';
-        auto schemas = schema_registry::instance().all_schemas();
+        std::vector<const model_schema*> schemas;
+        if(recovery_schemas_.valid()) {
+            for(const auto& [name,schema]:recovery_schemas_.models)
+                if(!recovery_schemas_.swift_models.count(name))schemas.push_back(&schema);
+        } else {
+            // Outside the private recovery bounds, ordinary opening retains
+            // its existing schema behavior. Recovery admission refuses first.
+            schemas=schema_registry::instance().all_schemas();
+        }
         std::sort(schemas.begin(), schemas.end(),
                   [](const model_schema* a, const model_schema* b) {
                       return a->table_name < b->table_name;
@@ -7541,6 +7565,12 @@ protected:
             "DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' "
             "AND key <> ? AND value <> ?",
             {key, cookie_str});
+    }
+
+    void store_recovery_fingerprints() {
+        store_fingerprint_marker(compute_core_fingerprint_key());
+        if(!recovery_schemas_.swift_fingerprint.empty())
+            store_fingerprint_marker(recovery_schemas_.swift_fingerprint);
     }
 
     /// Register a table as internal. Its AuditLog entries will be used for sync

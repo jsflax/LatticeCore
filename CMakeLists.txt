@@ -264,6 +264,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp
     Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp
     Tests/LatticeCoreTests/RecoveryServerExportTests.cpp
+    Tests/LatticeCoreTests/RecoveryOwnerSchemaTests.cpp
     Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp
     Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp
     Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp

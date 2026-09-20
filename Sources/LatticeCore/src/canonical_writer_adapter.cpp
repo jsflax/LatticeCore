@@ -242,6 +242,8 @@ canonical_writer_adapter::~canonical_writer_adapter() {
 }
 canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canonical_writer_profile& p,
     const canonical_upstream_limits* upstream) {
+    const auto& catalog=owner.recovery_schemas_;
+    if(!catalog.valid())refuse("canonical owner schema catalog outside bounds or ambiguous");
     // The attachment owns its setup transaction. It cannot attach during caller
     // work, on an active synchronizer, or claim adoption of another connection.
     if((p.upstream_requested && !upstream) || owner.config_.is_sync_enabled() || owner.config_.is_ipc_enabled())
@@ -303,7 +305,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         if(models.size()!=p.models.size())refuse("canonical duplicate scoped model");
         for(const auto& name:models) {
             if(!identifier(name) || name[0]=='_')refuse("canonical unsupported model name");
-            auto* schema=schema_registry::instance().get_schema(name);
+            const auto* schema=catalog.find(name);
             if(!schema || schema->properties.empty() || schema->properties.size()>max_columns)
                 refuse("canonical unknown/oversized scalar model schema");
             table_plan plan;plan.name=name;
@@ -315,20 +317,20 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
                    (!prop.column_name.empty()&&prop.column_name!=prop.name)||
                    (prop.kind!=property_kind::primitive&&prop.kind!=property_kind::link&&prop.kind!=property_kind::list))
                     refuse("canonical unsupported complete-table property");
-                if(prop.kind!=property_kind::list)plan.columns.emplace_back(prop.name,prop.type);
-                if(prop.no_history)plan.no_history.insert(prop.name);
+                const bool swift=catalog.swift_models.count(name);
+                const bool physical=swift?prop.kind==property_kind::primitive:prop.kind!=property_kind::list;
+                if(physical)plan.columns.emplace_back(prop.name,prop.type);
+                if(prop.no_history&&(!swift||physical))plan.no_history.insert(prop.name);
             }
             tables.emplace(name,std::move(plan));
         }
         // Complete connected regular-link closure, including incoming links.
-        const auto all_schemas=schema_registry::instance().all_schemas();
-        if(all_schemas.size()>256)refuse("canonical schema inventory budget exceeded");
-        for(auto* schema:all_schemas)for(const auto& prop:schema->properties) {
+        for(const auto& [schema_name,schema]:catalog.models)for(const auto& prop:schema.properties) {
             if(prop.kind!=property_kind::link&&prop.kind!=property_kind::list)continue;
-            if(!models.count(schema->table_name)&&!models.count(prop.target_table))continue;
-            if(prop.is_geo_bounds || prop.target_table.empty() || !models.count(schema->table_name)||!models.count(prop.target_table))
+            if(!models.count(schema.table_name)&&!models.count(prop.target_table))continue;
+            if(prop.is_geo_bounds || prop.target_table.empty() || !models.count(schema.table_name)||!models.count(prop.target_table))
                 refuse("canonical incomplete/unsupported relationship closure");
-            const auto name="_"+schema->table_name+"_"+prop.target_table+"_"+prop.name;
+            const auto name="_"+schema.table_name+"_"+prop.target_table+"_"+prop.name;
             if(!identifier(name))refuse("canonical oversized relation name");
             table_plan link;link.name=name;link.link=true;tables.emplace(name,std::move(link));
             context_->relations.insert(name);
@@ -343,6 +345,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             refuse("canonical prior keys do not match fixed UUID/scope profile");
         std::vector<program> originals,installed;
         std::string manifest="canonical-fixed-local-v1\nuuid-ascii-nocase-v1\n";
+        if(!catalog.swift_digest.empty())manifest+="swift-owner-schema-v1:"+catalog.swift_digest+"\n";
         size_t existing=0;
         for(auto& [name,table]:tables) {
             auto ddl=writer_->query("SELECT CASE WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='table' AND name=?",{name});
@@ -354,7 +357,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             if(table.table_sql.find("globalId TEXT UNIQUE COLLATE NOCASE")==std::string::npos ||
                table.table_sql.find("CREATE VIRTUAL")!=std::string::npos || table.table_sql.find("WITHOUT ROWID")!=std::string::npos)
                 refuse("canonical unsupported identity/table shape");
-            auto cols=writer_->query("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name END AS name,CASE WHEN length(CAST(type AS BLOB))<=16 THEN type END AS type,hidden FROM pragma_table_xinfo(?) LIMIT 35",{name});
+            auto cols=writer_->query("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name END AS name,CASE WHEN length(CAST(type AS BLOB))<=16 THEN type END AS type,hidden FROM pragma_table_xinfo(?) ORDER BY cid LIMIT 35",{name});
             std::map<std::string,std::string> got;
             for(const auto& row:cols) {
                 if(integer(row,"hidden")!=0)refuse("canonical generated/hidden source column");
@@ -370,6 +373,15 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
                 }
             }
             if(got!=want)refuse("canonical durable columns differ from complete descriptor");
+            if(catalog.swift_models.count(name)) {
+                std::vector<std::pair<std::string,column_type>> ordered;
+                for(const auto& c:cols) {
+                    const auto column=string(c,"name");
+                    for(const auto& declared:table.columns)if(declared.first==column){ordered.push_back(declared);break;}
+                }
+                if(ordered.size()!=table.columns.size())refuse("canonical incomplete physical column order");
+                table.columns=std::move(ordered);
+            }
             for(const auto& [column,type]:got)context_->schemas[name].emplace(column,
                 type=="INTEGER"?column_type::integer:type=="REAL"?column_type::real:type=="BLOB"?column_type::blob:column_type::text);
             context_->no_history[name]=table.no_history;

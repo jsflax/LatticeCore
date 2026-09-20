@@ -267,6 +267,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp
     Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
     Tests/LatticeCoreTests/VectorClearTests.cpp
+    Tests/LatticeCoreTests/DerivedFtsProgramTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp

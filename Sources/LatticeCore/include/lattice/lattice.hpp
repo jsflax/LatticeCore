@@ -8,6 +8,7 @@
 #endif
 #include "projection.hpp"
 #include "schema.hpp"
+#include "derived_program.hpp"
 #include "managed.hpp"
 #include "scheduler.hpp"
 #include "observation.hpp"
@@ -5361,74 +5362,22 @@ public:
     /// Creates external content FTS5 table + INSERT/UPDATE/DELETE triggers.
     void ensure_fts5_table(const std::string& model_table,
                            const std::string& column_name) {
-        std::string fts_table = "_" + model_table + "_" + column_name + "_fts";
+        const auto fts_table = detail::fts5_porter_table_name(model_table, column_name);
 
-        // Check if table already exists
-        bool table_exists = db_->table_exists(fts_table);
+        // Preserve ordinary lazy setup behavior. Recovery admission must
+        // independently validate the complete descriptor; this existence
+        // shortcut is not a proof that all derived programs are intact.
+        const bool table_exists = db_->table_exists(fts_table);
         if (table_exists) {
-            // Table exists — verify sync triggers are intact (rebuild_table can drop them)
             auto trig = db_->query(
                 "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='"
                 + fts_table + "_insert' LIMIT 1");
             if (!trig.empty()) return;
-            // Fall through to recreate triggers only
         }
-
-        // Create external content FTS5 virtual table (if it doesn't exist)
-        if (!table_exists) {
-            std::ostringstream sql;
-            sql << "CREATE VIRTUAL TABLE " << fts_table << " USING fts5("
-                << column_name << ", "
-                << "content='" << model_table << "', "
-                << "content_rowid='id', "
-                << "tokenize='porter'"
-                << ")";
-            db_->execute(sql.str());
-        }
-
-        // INSERT trigger - copy text to FTS on insert.
-        // Use main.-qualified model_table in ON clause so triggers work even when
-        // a TEMP UNION ALL view shadows the model table (from attach()).
-        // Note: SQLite forbids qualified names inside trigger bodies.
-        std::ostringstream insert_trigger;
-        insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_insert "
-                       << "AFTER INSERT ON main." << model_table << " "
-                       << "BEGIN "
-                       << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
-                       << "VALUES (NEW.id, NEW." << column_name << "); "
-                       << "END";
-        db_->execute(insert_trigger.str());
-
-        // UPDATE trigger - FTS5 delete-then-insert
-        std::ostringstream update_trigger;
-        update_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_update "
-                       << "AFTER UPDATE OF " << column_name << " ON main." << model_table << " "
-                       << "BEGIN "
-                       << "INSERT INTO " << fts_table << "(" << fts_table << ", rowid, " << column_name << ") "
-                       << "VALUES ('delete', OLD.id, OLD." << column_name << "); "
-                       << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
-                       << "VALUES (NEW.id, NEW." << column_name << "); "
-                       << "END";
-        db_->execute(update_trigger.str());
-
-        // DELETE trigger - BEFORE DELETE to use OLD values
-        std::ostringstream delete_trigger;
-        delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << fts_table << "_delete "
-                       << "BEFORE DELETE ON main." << model_table << " "
-                       << "BEGIN "
-                       << "INSERT INTO " << fts_table << "(" << fts_table << ", rowid, " << column_name << ") "
-                       << "VALUES ('delete', OLD.id, OLD." << column_name << "); "
-                       << "END";
-        db_->execute(delete_trigger.str());
-
-        // Populate FTS from existing data (only on first creation)
-        if (!table_exists) {
-            std::ostringstream populate_sql;
-            populate_sql << "INSERT INTO " << fts_table << "(rowid, " << column_name << ") "
-                         << "SELECT id, " << column_name << " FROM main." << model_table
-                         << " WHERE " << column_name << " IS NOT NULL";
-            db_->execute(populate_sql.str());
-        }
+        const auto program = detail::fts5_porter_program(model_table, column_name);
+        if (!table_exists) db_->execute(program.create_table);
+        for (const auto& trigger : program.triggers) db_->execute(trigger.sql);
+        if (!table_exists) db_->execute(program.populate);
     }
 
     /// Ensure all FTS5 tables exist for a set of model schemas.

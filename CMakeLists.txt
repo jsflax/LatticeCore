@@ -66,6 +66,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
     Sources/LatticeCore/src/managed_observation.cpp
     Sources/LatticeCore/src/schema.cpp
+    Sources/LatticeCore/src/derived_profile.cpp
     Sources/LatticeCore/src/sync.cpp
     Sources/LatticeCore/src/sync_commit_probe.cpp
     Sources/LatticeCore/src/recovery_export_adapter.cpp
@@ -272,6 +273,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
     Tests/LatticeCoreTests/VectorClearTests.cpp
     Tests/LatticeCoreTests/DerivedFtsProgramTests.cpp
+    Tests/LatticeCoreTests/DerivedProfileTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp

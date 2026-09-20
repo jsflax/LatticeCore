@@ -1,4 +1,5 @@
 #include "sync_canonical_range.hpp"
+#include "canonical_range_package.hpp"
 #include "vendor/picosha2/picosha2.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -502,5 +503,163 @@ sequence_state decode_state(std::string_view bytes,const attempt& expected,const
     s.next_content_page=number(j.at("next_content_page"));s.next_receipt_page=number(j.at("next_receipt_page"));s.identities=number(j.at("identities"));s.present_count=number(j.at("present"));s.tombstone_count=number(j.at("tombstones"));s.content_bytes=number(j.at("content_bytes"));s.receipt_count=number(j.at("receipts"));s.receipt_bytes=number(j.at("receipt_bytes"));if(!j.at("last_identity").is_null())s.last_identity=read_identity(j.at("last_identity"));
     const auto bitmap=text(j.at("rebase_seen"));check(bitmap.size()<=b.request_targets,"restart bitmap exceeds budget");for(char c:bitmap){check(c=='0'||c=='1',"invalid restart bitmap");s.rebase_seen.push_back(c-'0');}
     state_valid(s,b);return s;
+}
+namespace {
+// Count the codec's actual compact JSON representation without first dumping
+// an escaped payload. DTOs produce only bounded, shallow JSON shapes here.
+struct package_json_size { uint64_t bytes=0, nodes=0, depth=0; };
+uint64_t package_string_bytes(const std::string& text) {
+    uint64_t n=2;
+    for(unsigned char c:text) {
+        const uint64_t width=(c=='"'||c=='\\'||c=='\b'||c=='\f'||c=='\n'||c=='\r'||c=='\t')?2:(c<32?6:1);
+        n=add(n,width);
+    }
+    return n;
+}
+package_json_size package_size(const json& value) {
+    package_json_size result;result.nodes=1;
+    if(value.is_string())result.bytes=package_string_bytes(value.get_ref<const std::string&>());
+    else if(value.is_null())result.bytes=4;
+    else if(value.is_boolean())result.bytes=value.get<bool>()?4:5;
+    else if(value.is_number_integer()||value.is_number_unsigned())result.bytes=value.dump().size();
+    else {
+        check(value.is_structured(),"unsupported package JSON scalar");
+        result.bytes=2;result.depth=1;bool first=true;
+        for(auto it=value.begin();it!=value.end();++it) {
+            if(!first)result.bytes=add(result.bytes,1);first=false;
+            if(value.is_object()) {
+                result.bytes=add(result.bytes,add(package_string_bytes(it.key()),1));
+                result.nodes=add(result.nodes,1);
+            }
+            const auto child=package_size(it.value());
+            result.bytes=add(result.bytes,child.bytes);result.nodes=add(result.nodes,child.nodes);
+            result.depth=std::max(result.depth,add(child.depth,1));
+        }
+    }
+    return result;
+}
+struct package_slice { size_t first=0,count=0;uint64_t logical_bytes=0; };
+template<class Page,class Item>
+std::vector<package_slice> package_partition(const attempt& a,uint64_t route,
+    const std::vector<Item>& items,const limits& b,uint64_t maximum_pages) {
+    Page envelope;envelope.manifest_digest=envelope.digest=std::string(64,'0');
+    // The longest valid decimal spelling reserves overhead independent of the
+    // final page/whole digests. Digests have fixed-width lowercase hex spelling.
+    envelope.index=envelope.count=envelope.bytes=maximum;
+    const auto overhead=package_size(frame_json({a,route,envelope}));
+    std::vector<package_slice> result;
+    if(items.empty())return result;
+    check(overhead.bytes<b.maximum.frame_bytes&&overhead.nodes<b.nodes,
+          "package page envelope exceeds budget");
+    package_slice current;uint64_t bytes=overhead.bytes,nodes=overhead.nodes;
+    for(size_t i=0;i<items.size();++i) {
+        const auto item_size=package_size(item_json(items[i]));
+        // root -> latticeCanonicalRange -> body -> items -> record.
+        check(add(4,item_size.depth)<=b.depth,"package item depth exceeds budget");
+        check(item_size.bytes<=b.maximum.frame_bytes-overhead.bytes&&item_size.nodes<=b.nodes-overhead.nodes,
+              "package single item exceeds frame budget");
+        const auto comma=current.count?1u:0u;
+        if(current.count&&(current.count==b.maximum.items_per_page||
+            add(item_size.bytes,comma)>b.maximum.frame_bytes-bytes||item_size.nodes>b.nodes-nodes)) {
+            check(result.size()<maximum_pages,"package page count exceeds budget");
+            result.push_back(current);current={i,0,0};bytes=overhead.bytes;nodes=overhead.nodes;
+        }
+        if(current.count)bytes=add(bytes,1);
+        bytes=add(bytes,item_size.bytes);nodes=add(nodes,item_size.nodes);++current.count;
+        if constexpr(std::is_same_v<Item,content_item>)current.logical_bytes=add(current.logical_bytes,content_size(items[i]));
+        else current.logical_bytes=add(current.logical_bytes,receipt_size(items[i]));
+    }
+    if(current.count) {
+        check(result.size()<maximum_pages,"package page count exceeds budget");
+        result.push_back(current);
+    }
+    return result;
+}
+template<class Page,class Item>
+Page package_page(const std::vector<Item>& items,const package_slice& slice,
+                  uint64_t index,const std::string& manifest_digest,const limits& b) {
+    Page result;result.manifest_digest=manifest_digest;result.index=index;
+    result.count=slice.count;result.bytes=slice.logical_bytes;
+    result.items.assign(items.begin()+slice.first,items.begin()+slice.first+slice.count);
+    result.digest=page_sha256(result,b);return result;
+}
+} // namespace
+
+encoded_package assemble_package(const attempt& a,uint64_t route,const request& r,
+    uint64_t head,const lease& protection,const std::vector<content_item>& rows,
+    const std::vector<receipt_item>& receipts,const package_limits& policy) {
+    check(policy.retained_wire_bytes>0&&policy.retained_wire_bytes<=512u*1024u*1024u&&
+          policy.frames>=2&&policy.frames<=65536,"invalid package output policy");
+    const auto& local=policy.codec;
+    request_valid(a,r,local);
+    // Also validate route spelling and the complete incoming request's actual
+    // wire/parser shape. Do not change its digest or narrow/rewrite frozen Q.
+    (void)encode({a,route,r},local);
+    const auto b=narrowed(local,r.budget);
+    check(rows.size()<=b.maximum.content_identities&&receipts.size()==r.receipts.size(),
+          "package input counts exceed request");
+    check(add(rows.size(),receipts.size())<=policy.retained_wire_bytes,
+          "package input count cannot fit retained output");
+    encoded_package result;auto& m=result.offer_;
+    m.request_digest=r.request_digest;m.source=r.source;m.selection=r.selection;m.base=r.base;
+    m.head=head;m.protection=protection;
+    selection(m.selection,m.base,m.head);name(protection.id,b);
+    check(protection.duration_ms>0&&protection.duration_ms<=b.lease_ms,"invalid package lease spelling");
+    m.content_digest=m.receipt_digest=m.rebase_digest=std::string(64,'0');
+    m.counts.identities=rows.size();m.counts.receipts=receipts.size();
+    const identity* previous=nullptr;
+    for(const auto& row:rows) {
+        content_shape(row,b);check(!previous||less(*previous,row.key),"package content duplicate or unordered identity");previous=&row.key;
+        m.counts.content_bytes=add(m.counts.content_bytes,content_size(row));
+        check(m.counts.content_bytes<=b.maximum.content_bytes,"package content bytes exceeded");
+        if(std::holds_alternative<present>(row.value))++m.counts.present;else ++m.counts.tombstones;
+    }
+    for(size_t i=0;i<receipts.size();++i) {
+        receipt_shape(receipts[i],b);receipt_binding(receipts[i],r.receipts[i],head);
+        m.counts.receipt_bytes=add(m.counts.receipt_bytes,receipt_size(receipts[i]));
+        check(m.counts.receipt_bytes<=b.maximum.receipt_bytes,"package receipt bytes exceeded");
+    }
+    const auto targets=rebase(r);m.counts.rebase_identities=targets.size();
+    for(const auto& target:targets) {
+        m.counts.rebase_bytes=add(m.counts.rebase_bytes,identity_bytes(target));
+        const auto found=std::lower_bound(rows.begin(),rows.end(),target,
+            [](const content_item& row,const identity& key){return less(row.key,key);});
+        check(found!=rows.end()&&found->key==target,"package missing receipt-rebase target");
+    }
+    const auto content_pages=package_partition<content_page>(a,route,rows,b,
+        std::min<uint64_t>(b.maximum.content_pages,policy.frames-2));
+    const auto receipt_pages=package_partition<receipt_page>(a,route,receipts,b,
+        std::min<uint64_t>(b.maximum.receipt_pages,policy.frames-2));
+    m.counts.content_pages=content_pages.size();m.counts.receipt_pages=receipt_pages.size();
+    check(add(add(content_pages.size(),receipt_pages.size()),2)<=policy.frames,"package total frames exceeded");
+    m.rebase_digest=rebase_sha256(a,r,b);
+    m.content_digest=content_sha256(m,rows,b);m.receipt_digest=receipts_sha256(m,receipts,b);
+    m.manifest_digest=manifest_sha256(m,b);
+    auto sequence=begin(a,r,m,local);
+    const auto retain=[&](frame value) {
+        // Check exact wire length BEFORE allocating the retained encoding.
+        // At most one page DTO/JSON tree and codec temporaries exist beside
+        // input vectors and retained output. Container/allocator costs excluded.
+        const auto predicted=package_size(frame_json(value));
+        check(predicted.bytes<=b.maximum.frame_bytes&&predicted.bytes<=policy.retained_wire_bytes-result.bytes_,
+              "package retained wire bytes exceeded");
+        check(result.frames_.size()<policy.frames,"package retained frame count exceeded");
+        auto encoded=encode(value,b);
+        check(encoded.size()==predicted.bytes,"package JSON size preflight disagrees with encoder");
+        result.bytes_+=encoded.size();result.frames_.push_back(std::move(encoded));
+    };
+    retain({a,route,m});
+    for(size_t i=0;i<content_pages.size();++i) {
+        frame value{a,route,package_page<content_page>(rows,content_pages[i],i,m.manifest_digest,b)};
+        sequence=propose(sequence,value,local);retain(std::move(value));
+    }
+    for(size_t i=0;i<receipt_pages.size();++i) {
+        frame value{a,route,package_page<receipt_page>(receipts,receipt_pages[i],i,m.manifest_digest,b)};
+        sequence=propose(sequence,value,local);retain(std::move(value));
+    }
+    frame terminal{a,route,end{m.manifest_digest}};
+    sequence=propose(sequence,terminal,local);retain(std::move(terminal));
+    check(sequence.status==phase::sequence_complete_unverified,"package sequence incomplete");
+    return result;
 }
 } // namespace lattice::detail::canonical_range

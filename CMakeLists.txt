@@ -231,6 +231,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/StartupSyncHealingTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp
     Tests/LatticeCoreTests/SyncCanonicalRangeTests.cpp
+    Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp
     Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp
     Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp

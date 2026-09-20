@@ -182,6 +182,7 @@ struct recovery_local_producer_adapter::context {
     struct profile {recovery_obligation_producer_profile stored; descriptor schema;};
     sqlite3* connection=nullptr; lattice_db* owner=nullptr; // identity, never lifetime ownership
     std::shared_ptr<instance_guard> lifetime;
+    recovery_obligation_producer_discovery_limits admitted_limits{};
     // Revocation is monotonic. Settlement only changes configuration status,
     // never writes true over a concurrent close/raw-escape revocation.
     std::shared_ptr<std::atomic<bool>> active=std::make_shared<std::atomic<bool>>(true);
@@ -412,7 +413,7 @@ recovery_install_result recovery_local_producer_adapter::enroll_for_qualificatio
         management changing(db.internal_handle());
         auto prior=std::static_pointer_cast<context>(std::atomic_load(&db.local_producer_callback_custody_));
         while(prior && prior->status.load(std::memory_order_acquire)==2)prior=prior->previous;
-        candidate=std::make_shared<context>();candidate->connection=db.internal_handle();candidate->owner=owner.get();candidate->lifetime=owner->guard_;candidate->previous=prior;
+        candidate=std::make_shared<context>();candidate->connection=db.internal_handle();candidate->owner=owner.get();candidate->lifetime=owner->guard_;candidate->previous=prior;candidate->admitted_limits=limits;
         recovery_obligation_store obligations(owner,limits.obligations,limits.installations);
         obligations.audit();const auto scope=obligations.read(grant.address.channel);
         if(!scope || scope->address!=grant.address)refuse("local producer stale or unbound contribution address");
@@ -466,7 +467,7 @@ recovery_install_result recovery_local_producer_adapter::retire_for_qualificatio
         auto prior=std::static_pointer_cast<context>(std::atomic_load(&db.local_producer_callback_custody_));
         while(prior && prior->status.load(std::memory_order_acquire)==2)prior=prior->previous;
         if(!prior || prior->status.load(std::memory_order_acquire)!=1)refuse("local producer retirement requires admitted connection");
-        candidate=std::make_shared<context>();candidate->connection=db.internal_handle();candidate->owner=owner.get();candidate->lifetime=owner->guard_;candidate->previous=prior;
+        candidate=std::make_shared<context>();candidate->connection=db.internal_handle();candidate->owner=owner.get();candidate->lifetime=owner->guard_;candidate->previous=prior;candidate->admitted_limits=limits;
         const context::profile* removed=nullptr;
         for(const auto& p:prior->profiles) {
             for(const auto& [name,t]:p.schema.tables)if(actual_programs(db,name)!=t.enrolled)refuse("local producer retirement program mismatch");
@@ -501,6 +502,7 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
             validate_custody(owner,view);
             if(recovery_local_producer_test_hooks::after_inventory)recovery_local_producer_test_hooks::after_inventory();
             c=std::make_shared<context>();c->connection=view.internal_handle();c->owner=&owner;c->lifetime=owner.guard_;
+            c->admitted_limits={inventory.stored_obligation_limits,inventory.stored_installation_limits,inventory.stored_producer_limits};
             std::set<std::string> relations;
             for(const auto& p:inventory.profiles) {
                 auto d=describe(owner,view,grant_from(p),false);
@@ -585,5 +587,48 @@ std::vector<recovery_obligation_producer_profile> recovery_local_producer_adapte
         if(!found)refuse("local producer stored/admitted profile mismatch");
     }
     return stored;
+}
+recovery_local_export_inventory recovery_local_producer_adapter::export_inventory_for_owned_write(std::shared_ptr<lattice_db> owner) {
+    if(!owner)refuse("export inventory requires retained owner");
+    auto* writer=recovery_writer_access::active_writer(*owner);
+    if(!writer)refuse("export inventory requires actual owned WRITE");
+    const auto context_root=std::static_pointer_cast<context>(std::atomic_load(&writer->local_producer_callback_custody_));
+    const auto* admitted=context_root?context_root->effective():nullptr;
+    const auto family=writer->query("SELECT name FROM main.sqlite_schema WHERE name IN ('_lattice_obligation_producer_store','_lattice_obligation_producer_profile','_lattice_obligation_producer_stamp') LIMIT 4");
+    if(family.empty()) {
+        if(admitted&&!admitted->profiles.empty())refuse("export admitted producer family disappeared");
+        return {};
+    }
+    if(family.size()!=3)refuse("export incomplete durable producer family");
+    const auto count=writer->query("SELECT COUNT(*) AS n FROM (SELECT 1 FROM main._lattice_obligation_producer_profile LIMIT 17)");
+    const auto n=integer(count.at(0),"n");
+    if(n<0||n>16)refuse("export producer inventory bound");
+    if(n==0 && (!admitted||admitted->profiles.empty()))return {};
+    if(!admitted || admitted->status.load(std::memory_order_acquire)!=1 ||
+       !context_root->active->load(std::memory_order_acquire)||!admitted->active->load(std::memory_order_acquire)||
+       !admitted->lifetime->alive.load(std::memory_order_acquire)||owner->is_closed()||
+       admitted->owner!=owner.get()||admitted->connection!=writer->internal_handle()||
+       writer->raw_handle_escaped_.load(std::memory_order_acquire)||static_cast<size_t>(n)!=admitted->profiles.size())
+        refuse("export producer inventory lacks current physical admission");
+    validate_limits(admitted->admitted_limits);
+    recovery_local_export_inventory result;result.limits=admitted->admitted_limits;
+    recovery_obligation_store journal(owner,result.limits.obligations,result.limits.installations);
+    for(const auto& profile:admitted->profiles) {
+        const auto& p=profile.stored;
+        // Full manifest/program validation belongs to enrollment/bootstrap.
+        // Engine-owned profile mutation is forbidden while admitted. This hot
+        // addressed check deliberately neither copies nor compares its bytes.
+        const auto rows=writer->query("SELECT 1 AS ok FROM main._lattice_obligation_producer_profile WHERE channel=? AND typeof(channel)='blob' AND typeof(incarnation)='integer' AND incarnation=? AND typeof(program_revision)='integer' AND program_revision=? AND typeof(program_digest)='blob' AND program_digest=? AND typeof(manifest)='blob' AND length(manifest)=? LIMIT 2",
+            {blob(p.contribution.binding.channel.begin(),p.contribution.binding.channel.end()),p.contribution_incarnation,p.program_revision,
+             blob(p.program_digest.begin(),p.program_digest.end()),static_cast<int64_t>(p.grant_manifest.size())});
+        const auto scope=journal.read(p.contribution.binding.channel);
+        if(rows.size()!=1||!scope||scope->profile!=p.contribution||scope->address.incarnation!=p.contribution_incarnation)
+            refuse("export durable producer binding changed");
+        recovery_local_export_scope item;item.contribution=*scope;item.program_revision=p.program_revision;item.program_digest=p.program_digest;
+        for(const auto& [name,table]:profile.schema.tables)
+            item.tables.push_back({name,table.columns,table.no_history,table.link});
+        result.scopes.push_back(std::move(item));
+    }
+    return result;
 }
 } // namespace lattice::detail

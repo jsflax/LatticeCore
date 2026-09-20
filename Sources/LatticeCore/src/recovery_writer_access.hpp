@@ -16,6 +16,16 @@ struct recovery_channel_reset_error : db_error {
         :db_error("channel reset cleanup failed; writer fenced until explicit rollback"),
          primary_error(std::move(primary)),cleanup_error(std::move(cleanup)) {}
 };
+struct legacy_sync_write_error : db_error {
+    std::exception_ptr primary_error, cleanup_error;
+    legacy_sync_write_error(std::exception_ptr primary,std::exception_ptr cleanup)
+        :db_error("legacy sync cleanup failed; writer fenced until explicit rollback"),
+         primary_error(std::move(primary)),cleanup_error(std::move(cleanup)) {}
+};
+namespace legacy_sync_write_test_hooks {
+extern thread_local void (*after_writer_capture)();
+extern thread_local void (*after_write_admission)();
+}
 struct recovery_install_test_access;
 struct recovery_install_admission_test_access;
 class recovery_local_producer_adapter;
@@ -35,12 +45,29 @@ struct recovery_writer_access {
     // Common reset/remove path: preserve an exact caller-owned WRITE via a
     // savepoint, or retain/admit a new maintenance transaction before fencing.
     static void reset_channel(lattice_db&, const std::string&, bool retire);
+    // Private legacy bookkeeping unit. The owner overload retains the actual
+    // physical writer; the database overload borrows its caller-held lifetime.
+    // Existing caller-owned explicit transactions (including raw deferred/
+    // READ turns) retain their legacy commit/rollback responsibility. The
+    // durable absence read pins their main snapshot; stale upgrades refuse.
+    // No public ownership, install frame, or producer authority is created.
+    // Trusted bodies/hooks must not settle caller turns; read-only COMMIT need
+    // not fire the engine commit hook, so it cannot prove successor detection.
+    // Standalone databases must not install external transaction callbacks;
+    // their hooks are never replaced. Errors in caller turns simply propagate.
+    // Only helper-owned turns get whole cleanup. Requires the engine's exact
+    // commit-attempt marker before following COMMIT into any successor.
+    static void legacy_sync_write(lattice_db&, const std::function<void(database&)>&);
+    static void legacy_sync_write(database&, const std::function<void(database&)>&);
     // Private installer only. The actual owning shared_ptr is retained through
     // all callbacks and unwind. The body must not settle/replace the transaction,
     // replace hooks, or return a live SQLite statement. No borrowed overload.
     static recovery_install_result install(std::shared_ptr<lattice_db> owner,
                                            const std::function<void(database&)>& body);
 private:
+    static void legacy_sync_write_impl(database&, lattice_db*, const std::function<void(database&)>&);
+    struct legacy_frame;
+    static thread_local legacy_frame* legacy_current_;
     struct frame;
     static thread_local frame* current_;
     // A previously admitted caller reset may finish after logical close. This

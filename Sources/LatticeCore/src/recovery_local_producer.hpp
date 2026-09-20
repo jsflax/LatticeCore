@@ -24,6 +24,24 @@ extern thread_local const authorizer_fault* fault;
 extern thread_local void (*after_inventory)();
 }
 struct recovery_local_producer_test_access;
+// Private, bounded export facts from an already admitted immutable descriptor.
+// No source authority, origin upgrade or all-route completeness is conferred.
+struct recovery_local_export_table {
+    std::string name;
+    std::vector<std::pair<std::string,column_type>> columns;
+    std::set<std::string> no_history;
+    bool regular_link=false;
+};
+struct recovery_local_export_scope {
+    recovery_obligation_scope contribution;
+    int64_t program_revision=0;
+    std::string program_digest;
+    std::vector<recovery_local_export_table> tables;
+};
+struct recovery_local_export_inventory {
+    recovery_obligation_producer_discovery_limits limits{};
+    std::vector<recovery_local_export_scope> scopes;
+};
 class recovery_local_producer_adapter {
     struct context;
     struct descriptor;
@@ -52,6 +70,9 @@ public:
     // Absence is not evidence that no legacy or external export route exists.
     static std::vector<recovery_obligation_producer_profile> profiles_for_owned_write(
         std::shared_ptr<lattice_db>, const recovery_obligation_producer_discovery_limits&);
+    // Actual owned WRITE; indexed fixed-profile checks only. Enrollment/open
+    // performed the full audit. Does not copy manifests or scan retained rows.
+    static recovery_local_export_inventory export_inventory_for_owned_write(std::shared_ptr<lattice_db>);
     static constexpr bool all_route_capability = false;
 };
 } // namespace lattice::detail

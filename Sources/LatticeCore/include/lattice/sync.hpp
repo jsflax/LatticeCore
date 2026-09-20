@@ -26,6 +26,7 @@ namespace lattice {
 
 // Forward declaration
 class lattice_db;
+namespace detail {class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -380,7 +381,7 @@ protected:
     /// Owned database (native only). Stored in the base class so it outlives
     /// ~synchronizer_base() — base members are destroyed after the base
     /// destructor body, avoiding use-after-free on db_ptr_.
-    std::unique_ptr<lattice_db> owned_db_;
+    std::shared_ptr<lattice_db> owned_db_;
 
     /// Common init — call from subclass constructors after db is set up.
     void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched);
@@ -389,7 +390,12 @@ protected:
 
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
-    std::unique_ptr<sync_transport> ws_client_;
+    std::shared_ptr<sync_transport> ws_client_;
+    std::shared_ptr<detail::sync_callback_lifetime> callback_lifetime_;
+    std::shared_ptr<detail::sync_pacer_state> pacer_state_;
+    std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
+    bool owns_inline_scheduler_adapter_=false;
+    friend struct detail::recovery_export_test_access;
 
     /// Log-line identity: config_.log_label when set, else sync_id. Cached
     /// so LOG_ macros can take a stable c_str(). Set by init_sync.
@@ -431,7 +437,11 @@ protected:
     /// sync_now). Leading edge dispatches inline; in-window requests are
     /// absorbed by the pacer thread's single trailing-edge tick. Thread-safe;
     /// no-op after destruction begins.
-    void request_upload();
+    void request_upload(bool background=false);
+    void dispatch_upload(bool background,bool consume_request);
+    void background_upload() noexcept;
+    void background_operation(const char* stage,const std::function<void()>& work) noexcept;
+    void schedule_background(const char* stage,std::function<void()> work);
 
     /// Consecutive ack-timeout failures (no ACK before the resend deadline).
     /// Grows the resend deadline (10s, 20s, 40s… capped) so a stalled server
@@ -453,14 +463,10 @@ protected:
 
 #ifndef __EMSCRIPTEN__
     // Pacer thread: owns trailing-edge coalescing and periodic WAL
-    // maintenance. Started by init_sync when upload_coalesce_ms > 0; joined
-    // in the destructor BEFORE scheduler shutdown (it only ever enqueues to
-    // the scheduler, never blocks on it).
+    // maintenance. Its waiting state is retained independently, and every
+    // owner access uses callback admission. Protected retirement transfers
+    // the existing thread into its reserved off-callback cleanup slot.
     std::thread pacer_thread_;
-    std::mutex pacer_mutex_;
-    std::condition_variable pacer_cv_;
-    bool pacer_stop_ = false;
-    std::chrono::steady_clock::time_point next_allowed_tick_{};
     std::chrono::steady_clock::time_point last_passive_ckpt_{};
     std::chrono::steady_clock::time_point last_truncate_ckpt_{};
     void start_pacer();
@@ -470,7 +476,10 @@ protected:
     /// TRUNCATE only when idle (in-flight empty — pending mirrors it).
     void maybe_checkpoint();
 #endif
-    std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
+    // Protected retirement moves its existing pacer into the already reserved
+    // transport slot before the first cleanup publication, including error,
+    // close and explicit disconnect. No per-close executor is created.
+    bool retire_protected_transport() noexcept;
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
 
     // In-flight tracking: entries sent but not yet ACK'd, mapping the entry's
@@ -556,6 +565,10 @@ protected:
     void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
     void send_entries(std::vector<audit_log_entry>& entries);
+    void send_entries(detail::committed_export_frame);
+    bool upload_protected_entries();
+    bool has_export_protection();
+    void schedule_ack_retry(const std::vector<audit_log_entry>&);
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")

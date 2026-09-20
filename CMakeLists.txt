@@ -66,6 +66,8 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/managed_observation.cpp
     Sources/LatticeCore/src/schema.cpp
     Sources/LatticeCore/src/sync.cpp
+    Sources/LatticeCore/src/recovery_export_adapter.cpp
+    Sources/LatticeCore/src/sync_callback_lifetime.cpp
     Sources/LatticeCore/src/scoped_recovery_install.cpp
     Sources/LatticeCore/src/recovery_witness.cpp
     Sources/LatticeCore/src/recovery_refresh.cpp
@@ -240,6 +242,14 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp
     Tests/LatticeCoreTests/ReceiveDeliveryGuardTests.cpp
     Tests/LatticeCoreTests/ReceiveResetAdmissionTests.cpp
+    Tests/LatticeCoreTests/SyncCallbackLifetimeTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp
+    Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp
     Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp
     Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp

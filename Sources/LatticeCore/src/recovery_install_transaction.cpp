@@ -83,6 +83,180 @@ sqlite3* recovery_writer_access::active_handle(lattice_db& owner, database& expe
     return expected_writer.internal_handle();
 }
 
+namespace legacy_sync_write_test_hooks {
+thread_local void (*after_writer_capture)()=nullptr;
+thread_local void (*after_write_admission)()=nullptr;
+}
+struct recovery_writer_access::legacy_frame {
+    database& writer;
+    database::sync_apply_chunk_state& settlement;
+    legacy_frame* previous;
+    legacy_frame(database& w,database::sync_apply_chunk_state& s)
+        :writer(w),settlement(s),previous(legacy_current_){legacy_current_=this;}
+    ~legacy_frame(){legacy_current_=previous;}
+};
+thread_local recovery_writer_access::legacy_frame* recovery_writer_access::legacy_current_=nullptr;
+
+void recovery_writer_access::legacy_sync_write(lattice_db& owner,const std::function<void(database&)>& body) {
+    std::shared_ptr<database> writer;
+    {
+        std::lock_guard<std::mutex> lock(owner.connection_ownership_mutex_);
+        if(owner.closed_.load())throw db_error("legacy sync: owner closed");
+        writer=owner.db_;
+    }
+    if(!writer)throw db_error("legacy sync: no writer");
+    if(legacy_sync_write_test_hooks::after_writer_capture)legacy_sync_write_test_hooks::after_writer_capture();
+    // Probe before the shared-cache gate without requiring idle: exact
+    // caller-owned transactions are admitted below under the physical mutex.
+    auto* mutex=sqlite3_db_mutex(writer->internal_handle());
+    if(sqlite3_mutex_try(mutex)!=SQLITE_OK)throw db_error("legacy sync: writer busy");
+    const bool in_callback=database::update_hook_scope::active_for(writer->internal_handle());
+    sqlite3_mutex_leave(mutex);
+    if(in_callback)throw db_error("legacy sync: update callback reentry");
+    {
+        lattice_db::store_write_gate_hold gate(owner);
+        legacy_sync_write_impl(*writer,&owner,body);
+    }
+    writer->drain_if_settled();
+}
+void recovery_writer_access::legacy_sync_write(database& writer,const std::function<void(database&)>& body) {
+    // Borrowed database API: the caller retains the physical wrapper/parent.
+    // Do not obtain a replacement writer through the parent during this unit.
+    legacy_sync_write_impl(writer,nullptr,body);
+    writer.drain_if_settled();
+}
+void recovery_writer_access::legacy_sync_write_impl(database& writer,lattice_db* expected_owner,
+    const std::function<void(database&)>& body) {
+    using phase=database::sync_apply_chunk_state::phase;
+    auto* h=writer.internal_handle();auto* mutex=h?sqlite3_db_mutex(h):nullptr;
+#ifndef __EMSCRIPTEN__
+    if(!mutex)throw db_error("legacy sync requires a serialized connection");
+#endif
+    if(sqlite3_mutex_try(mutex)!=SQLITE_OK)throw db_error("legacy sync: writer busy");
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    if(!body||!h||writer.is_closed()||writer.channel_reset_unsettled_.load(std::memory_order_acquire)||
+       database::update_hook_scope::active_for(h))throw db_error("legacy sync: unavailable writer");
+    auto* hook=writer.lattice_update_hook_context_.get();
+    if(hook&&hook->connection!=h)throw db_error("legacy sync: hook connection mismatch");
+    if(expected_owner) {
+        std::lock_guard<std::mutex> lock(expected_owner->connection_ownership_mutex_);
+        if(expected_owner->closed_.load()||expected_owner->db_.get()!=&writer||!hook||hook->owner!=expected_owner)
+            throw db_error("legacy sync: captured writer changed");
+    }
+    database::sync_apply_chunk_state local;
+    auto* settlement=&local;
+    const bool nested=sqlite3_get_autocommit(h)==0;
+    if(nested) {
+        bool admitted=false,has_frame=false;
+        for(auto* f=legacy_current_;f;f=f->previous)if(&f->writer==&writer) {
+            has_frame=true;settlement=&f->settlement;
+            admitted=settlement->state==phase::active&&!settlement->commit_attempted;break;
+        }
+        if(!has_frame&&hook&&hook->owner) {
+            for(auto* f=current_;f;f=f->previous)if(&f->owner==hook->owner) {
+                has_frame=true;
+                if(&f->writer==&writer&&hook->sync_chunk==&f->settlement) {
+                    settlement=&f->settlement;
+                    admitted=settlement->state==phase::active&&!settlement->commit_attempted;
+                }
+                break;
+            }
+        }
+        if(!has_frame) {
+            // Preserve the legacy raw/database::begin_transaction caller
+            // contract. This borrows its explicit transaction; it never creates an
+            // install frame, producer phase, or public active_writer authority.
+            // Known foreign Core transactions and an unrelated installed
+            // settlement frame are not this caller's raw turn.
+            if(hook&&(hook->sync_chunk||
+               (hook->owner&&hook->owner->txn_owner_thread_.load(std::memory_order_acquire)!=std::thread::id{}&&
+                hook->owner->txn_owner_thread_.load(std::memory_order_acquire)!=std::this_thread::get_id())))
+                throw db_error("legacy sync refuses foreign transaction custody");
+            local.state=phase::active;admitted=true;
+        }
+        if(!admitted||(hook&&hook->connection!=h)||
+           (hook&&hook->sync_chunk&&hook->sync_chunk!=settlement))
+            throw db_error("legacy sync requires the caller's current explicit transaction");
+    } else if(sqlite3_txn_state(h,nullptr)!=SQLITE_TXN_NONE)
+        throw db_error("legacy sync requires an idle transaction state");
+    if(hook&&!hook->sync_chunk)hook->sync_chunk=settlement;
+    struct detach {
+        database::lattice_update_hook_context* hook;database::sync_apply_chunk_state* local;
+        ~detach(){if(hook&&hook->sync_chunk==local)hook->sync_chunk=nullptr;}
+    } detach_marker{hook,&local};
+    // Fixed transaction statements use the retained handle even if a user
+    // logically closes its owner after this unit has been admitted.
+    const auto run=[&](const char* sql) {
+        database::record_statement();sqlite3_stmt* raw=nullptr;
+        const int prepared=sqlite3_prepare_v2(h,sql,-1,&raw,nullptr);
+        std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw,&sqlite3_finalize);
+        if(prepared!=SQLITE_OK||!raw||sqlite3_step(raw)!=SQLITE_DONE)
+            throw db_error(std::string("SQL execution failed: ")+sqlite3_errmsg(h)+" (SQL: "+sql+")");
+    };
+    // The physical mutex, not a new busy-statement policy, owns this unit.
+    // In particular an escaped PRAGMA ROW retains the legacy COMMIT failure
+    // and rollback oracle. Raw COMMIT below does not run the memory drain;
+    // the public overload drains only after marker classification/unlocking.
+    legacy_frame frame(writer,*settlement);
+    bool opened=false,own_commit_started=false;
+    const auto current_turn=[&] {
+        const int main_state=sqlite3_txn_state(h,"main");
+        return settlement->state==phase::active&&!settlement->commit_attempted&&
+            (!hook||hook->sync_chunk==settlement)&&sqlite3_get_autocommit(h)==0&&
+            (main_state==SQLITE_TXN_WRITE||(nested&&main_state==SQLITE_TXN_READ));
+    };
+    try {
+        if(!nested){writer.begin_transaction();local.state=phase::active;opened=true;}
+        // Helper-owned turns already hold WRITE. For a borrowed deferred/read
+        // turn, this real main-schema/profile read pins that same transaction's
+        // snapshot. Its first mutation either upgrades that snapshot or SQLite
+        // refuses a stale upgrade; a newer enrollment cannot be overwritten.
+        // Trusted body/test hooks must not settle a borrowed turn: read-only
+        // COMMIT need not fire the commit hook, so the marker is not proof
+        // against a forbidden read-only COMMIT -> successor sequence.
+        require_recovery_local_producer_maintenance_absent(writer);
+        if(legacy_sync_write_test_hooks::after_write_admission)legacy_sync_write_test_hooks::after_write_admission();
+        if(!current_turn()||writer.is_closed())throw db_error("legacy sync admission consumed before effects");
+        body(writer);
+        if(!current_turn()||writer.is_closed())
+            throw db_error("legacy sync body settled or closed its admitted writer");
+        if(!nested) {
+            own_commit_started=true;
+            run("COMMIT");
+            // Memory/no-WAL success has no hook notification. File WAL marks
+            // commit BEFORE callbacks, so a callback-opened successor is never
+            // mistaken for this unit, including when the callback throws.
+            if(local.state==phase::active) {
+                if(hook)hook->note_settled(true);else local.state=phase::committed;
+            }
+        }
+    } catch(...) {
+        const auto primary=std::current_exception();
+        // Standalone databases have no engine hooks and no supported external
+        // transaction callbacks. Here only SQLite itself can consume the turn
+        // (e.g. RAISE(ROLLBACK)); never use this fallback for a Core writer.
+        if(!hook&&local.state==phase::active&&sqlite3_get_autocommit(h)!=0)local.state=phase::rolled_back;
+        // A body/admission callback's COMMIT attempt consumes our permission
+        // even when memory/no-page commits produce no WAL settlement. Only
+        // our own final COMMIT may be cleaned up after an attempted commit:
+        // the retained engine commit hook cannot run SQL, and a successful
+        // file COMMIT marks the phase before any user callback.
+        const bool cleanup_owned=settlement->state==phase::active&&
+            (!settlement->commit_attempted||own_commit_started)&&(!hook||hook->sync_chunk==settlement);
+        if(opened&&cleanup_owned) {
+            try {
+                run("ROLLBACK");if(!hook)local.state=phase::rolled_back;
+            } catch(...) {
+                writer.channel_reset_unsettled_.store(true,std::memory_order_release);
+                throw legacy_sync_write_error(primary,std::current_exception());
+            }
+        }
+        // Caller-owned failures remain the caller's responsibility. Do not
+        // roll back their turn, reset buffers, or touch a successor transaction.
+        std::rethrow_exception(primary);
+    }
+}
+
 void recovery_writer_access::reset_channel(lattice_db& owner,const std::string& channel,bool retire) {
     std::shared_ptr<database> writer;
     {

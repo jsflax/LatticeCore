@@ -95,8 +95,9 @@ protected:
         if(result.primary_error)try{std::rethrow_exception(result.primary_error);}catch(const std::exception& e){throw std::runtime_error(std::string("fixture owned frame: ")+e.what());}
         if(result.state!=state::committed || result.cleanup_error || result.postcommit_error)throw std::runtime_error("fixture owned frame did not cleanly commit");
     }
-    void reset(const std::string& path=":memory:") {
+    void reset(const std::string& path=":memory:",uint64_t page_items=2) {
         owner=std::make_shared<StagedOwner>(path);limits=caps();contract={{"TestPerson"},{},{},{}};x=Bundle{};
+        limits.codec.maximum.items_per_page=x.q.budget.items_per_page=page_items;
         profile={x.binding(),"profile","namespace"};
         owned([&](auto&){receiver().initialize();receiver().bind(profile.binding);auto j=journal();j.initialize();address=j.bind(profile).address;stage().initialize();});
     }
@@ -172,9 +173,9 @@ TEST_F(CanonicalScopedInstall, ActualRetainedUnverifiedPagesInstallAndCommitAllS
     EXPECT_EQ(number("SELECT is_synchronized FROM _lattice_sync_state WHERE sync_id='staged-channel'"),1);
 }
 TEST_F(CanonicalScopedInstall, DeltaOmissionKeepsRowsPKMembershipAndFullOmissionDeletes) {
-    baseline();const auto row_b=owner->db().query("SELECT * FROM TestPerson WHERE globalId=?",{B});next();x.content={person(A,"changed")};staged();ASSERT_TRUE(committed(run()));
+    baseline();const auto row_b=owner->db().query("SELECT * FROM TestPerson WHERE globalId=?",{B});next();++x.m.head;x.content={person(A,"changed")};staged();ASSERT_TRUE(committed(run()));
     EXPECT_EQ(owner->db().query("SELECT * FROM TestPerson WHERE globalId=?",{B}),row_b);EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_recovery_member"),2);
-    next(cr::mode::full);x.content={person(A,"full")};staged();ASSERT_TRUE(committed(run()));EXPECT_EQ(number("SELECT COUNT(*) FROM TestPerson"),1);
+    next(cr::mode::full);++x.m.head;x.content={person(A,"full")};staged();ASSERT_TRUE(committed(run()));EXPECT_EQ(number("SELECT COUNT(*) FROM TestPerson"),1);
 }
 TEST_F(CanonicalScopedInstall, CoveredNegativeReplaysOnlyOriginalFieldsAndPreservesOtherChannel) {
     baseline();next();auto e=edit(A,"local-name");requested(e);x.content={person(A,"source-name",81)};
@@ -201,7 +202,7 @@ TEST_F(CanonicalScopedInstall, SameHeadEmptyDeltaIsANewInstallationNotAnExactRet
     EXPECT_NE(now.last_installed,old.last_installed);EXPECT_EQ(scope().installed_sequence,2);
 }
 TEST_F(CanonicalScopedInstall, LateNonQOriginalRefusesEvenWithLocalCandidateAndNoExportClaim) {
-    baseline();next();x.content={person(A,"remote")};staged();auto late=add(D);const auto before=snapshot();
+    baseline();next();++x.m.head;x.content={person(A,"remote")};staged();auto late=add(D);const auto before=snapshot();
     EXPECT_FALSE(late.first_export_claim);EXPECT_EQ(late.record.origin,recovery_obligation_origin::local_candidate);
     refused(run(),"absent from frozen Q");EXPECT_EQ(snapshot(),before);
 }
@@ -234,14 +235,14 @@ TEST_F(CanonicalScopedInstall, StalePhysicalRouteAndJournalGenerationRefuse) {
     refused(install_staged_canonical_range(token),"journal binding");EXPECT_EQ(snapshot(),newer);
 }
 TEST_F(CanonicalScopedInstall, ModelTriggerCannotChangeRetainedRouteOrJournalDuringEffects) {
-    for(const bool journal_change:{false,true}){reset();baseline();next();x.content={person(A,"new")};staged();
+    for(const bool journal_change:{false,true}){reset();baseline();next();++x.m.head;x.content={person(A,"new")};staged();
         owner->db().execute(journal_change?
             "CREATE TRIGGER _staged_mutation AFTER UPDATE ON TestPerson BEGIN UPDATE _lattice_obligation_scope SET revision=revision+1; END":
             "CREATE TRIGGER _staged_mutation AFTER UPDATE ON TestPerson BEGIN UPDATE _lattice_range_attempt SET route=2; END");
         const auto before=snapshot();refused(run());EXPECT_EQ(snapshot(),before);owner->db().execute("DROP TRIGGER _staged_mutation");ASSERT_TRUE(committed(run()));}
 }
 TEST_F(CanonicalScopedInstall, JournalSettlementTriggerCannotChangeFinalModelOrMembership) {
-    for(const bool member_change:{false,true}){reset();baseline();next();x.content={person(A,"new")};staged();
+    for(const bool member_change:{false,true}){reset();baseline();next();++x.m.head;x.content={person(A,"new")};staged();
         owner->db().execute(member_change?
             "CREATE TRIGGER _staged_settle AFTER UPDATE ON _lattice_obligation_scope WHEN NEW.mode=2 BEGIN DELETE FROM _lattice_recovery_member; END":
             "CREATE TRIGGER _staged_settle AFTER UPDATE ON _lattice_obligation_scope WHEN NEW.mode=2 BEGIN UPDATE TestPerson SET name='corrupt'; END");
@@ -291,8 +292,8 @@ TEST_F(CanonicalScopedInstall, OmittedOrdinaryLinkSurvivesAndExplicitTombstonesR
     contract.relations={{"_StagedLink","TestPerson","TestDog"}};contract.scoped_link_tables={"_StagedLink"};
     x.content={person(upper(A)),{{"TestDog",upper(D)},cr::present{sync_recovery::encode_values({{"globalId",upper(D)},{"name",std::string("dog")},{"weight",4.5},{"is_good_boy",int64_t{1}}},limits.codec.values)}},
         {{"_StagedLink",upper(L)},cr::present{sync_recovery::encode_values({{"globalId",upper(L)},{"lhs",A},{"rhs",D}},limits.codec.values)}}};
-    staged();ASSERT_TRUE(committed(run()));const auto links=table("_StagedLink");next();x.content={person(A,"updated")};staged();ASSERT_TRUE(committed(run()));EXPECT_EQ(table("_StagedLink"),links);
-    next();x.content={tombstone("TestPerson",A)};staged();const auto before=snapshot();refused(run());EXPECT_EQ(snapshot(),before);EXPECT_EQ(table("_StagedLink"),links);
+    staged();ASSERT_TRUE(committed(run()));const auto links=table("_StagedLink");next();++x.m.head;x.content={person(A,"updated")};staged();ASSERT_TRUE(committed(run()));EXPECT_EQ(table("_StagedLink"),links);
+    next();++x.m.head;x.content={tombstone("TestPerson",A)};staged();const auto before=snapshot();refused(run());EXPECT_EQ(snapshot(),before);EXPECT_EQ(table("_StagedLink"),links);
     owned([&](auto&){stage().abandon_active(x.a,x.m.manifest_digest,1);});++x.a.sequence;x.content.push_back(tombstone("_StagedLink",L));
     staged();ASSERT_TRUE(committed(run()));EXPECT_EQ(number("SELECT COUNT(*) FROM TestPerson"),0);EXPECT_EQ(number("SELECT COUNT(*) FROM _StagedLink"),0);EXPECT_EQ(number("SELECT COUNT(*) FROM TestDog"),1);
 }
@@ -344,7 +345,9 @@ TEST_F(CanonicalScopedInstall, RetainedFirstAckAndAlreadySettledOriginalStillReq
 }
 
 TEST_F(CanonicalScopedInstall, EqualWholeHashesCannotHideChangedConsumedPagePartition) {
-    baseline();next();x.q.budget.items_per_page=3;x.content={person(A,"mutate"),person(B),person(D),person(L)};staged();
+    // This fixture needs both valid 3+1 and 2+2 partitions of the same stream.
+    // Set its matching local/request page cap before durable initialization.
+    reset(":memory:",3);baseline();next();++x.m.head;x.content={person(A,"mutate"),person(B),person(D),person(L)};staged();
     ASSERT_EQ(x.m.counts.content_pages,2u);auto first=std::get<cr::content_page>(x.page(false,0,limits.codec).body);
     auto second=std::get<cr::content_page>(x.page(false,1,limits.codec).body);
     second.items.insert(second.items.begin(),first.items.back());first.items.pop_back();
@@ -397,7 +400,7 @@ TEST_F(CanonicalScopedInstall, AlreadySettledPositiveQStillRequiresItsExactFinal
 }
 TEST_F(CanonicalScopedInstall, OriginalSyncControlSurvivesReceiverAndJournalCompletion) {
     for(const int64_t prior:{int64_t{0},int64_t{1}})for(const bool receiver_trigger:{false,true}) {
-        reset();baseline();next();x.content={person(A,"source-final")};staged();
+        reset();baseline();next();++x.m.head;x.content={person(A,"source-final")};staged();
         owner->db().execute("UPDATE _SyncControl SET disabled=? WHERE id=1",{prior});
         const std::string boundary=receiver_trigger?
             "AFTER UPDATE ON _lattice_install_channel WHEN NEW.revision>OLD.revision":
@@ -412,7 +415,7 @@ TEST_F(CanonicalScopedInstall, OriginalSyncControlSurvivesReceiverAndJournalComp
 }
 TEST_F(CanonicalScopedInstall, ExactBumpedWitnessSurvivesFinalJournalTriggers) {
     for(const bool change_incarnation:{false,true}) {
-        reset();baseline();next();x.content={person(A,"source-final")};staged();
+        reset();baseline();next();++x.m.head;x.content={person(A,"source-final")};staged();
         const auto old=table("_lattice_recovery_witness");const auto generation=number("SELECT generation FROM _lattice_recovery_witness");
         const auto incarnation=std::get<blob>(old.at(0).at("incarnation"));ASSERT_EQ(incarnation.size(),16u);
         auto altered=incarnation;altered[0]^=0xff;const char* digits="0123456789abcdef";std::string hex;

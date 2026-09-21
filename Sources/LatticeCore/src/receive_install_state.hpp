@@ -79,6 +79,7 @@ struct receive_install_usage {
 };
 
 class receive_install_store {
+    friend class recovery_obligation_store;
     // Caller must supply the actual owning shared_ptr, never a no-op-deleter
     // alias for a borrowed/stack object. Every call retains this owner.
     std::shared_ptr<lattice_db> owner_;
@@ -87,6 +88,9 @@ class receive_install_store {
     receive_install_usage configuration() const;
     std::optional<receive_install_snapshot> row(const std::string&) const;
     void write_row(const receive_install_snapshot&, const receive_install_snapshot* prior);
+    // Only the journal's exact frozen-attempt cancellation may consume an
+    // unstarted next sequence. No installation, frontier or ACK is created.
+    receive_install_snapshot retire_unstarted_for_journal(const receive_install_snapshot&,int64_t);
 public:
     receive_install_store(std::shared_ptr<lattice_db>, receive_install_limits);
     // Every method, including reads, requires this thread's actual owned main

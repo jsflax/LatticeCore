@@ -509,3 +509,223 @@ TEST_F(RecoveryObligationStore, AddressedPointUpdateWorkDoesNotScanRetainedLedge
         { vm_budget bound(db.handle()); EXPECT_TRUE(s.pins_audit(last.record.audit_id,last.record.original_id)); EXPECT_LE(bound.steps,20000); }
     });
 }
+
+TEST_F(RecoveryObligationStore, CancelFrozenPreservesAllOriginalsClaimsAndHighWaters) {
+    const auto open=add(301),claimed=add(302),acked=add(303);
+    committed([&](auto&) {
+        auto s=storage();
+        s.claim_export(address,{claimed.record.original_id,acked.record.original_id});
+        s.acknowledge(address,positive(acked));
+    });
+    freeze();
+    const auto frozen=scope();
+    committed([&](auto& db) {
+        auto s=storage();
+        const auto before=s.snapshot_for_install(address,1);
+        const auto usage=s.usage();
+        const auto audit=db.query("SELECT * FROM AuditLog ORDER BY id");
+        const auto canceled=s.cancel_frozen_for_retry(address,1,frozen.revision);
+        EXPECT_EQ(canceled.mode,mode::recording);
+        EXPECT_EQ(canceled.last_attempt,frozen.last_attempt);
+        EXPECT_EQ(canceled.freeze_revision,frozen.freeze_revision);
+        EXPECT_EQ(canceled.freeze_record_high_water,frozen.freeze_record_high_water);
+        EXPECT_EQ(canceled.freeze_export_high_water,frozen.freeze_export_high_water);
+        EXPECT_GT(canceled.address.generation,address.generation);
+        EXPECT_GT(canceled.revision,frozen.revision);
+        for (const auto& e:before.entries) {
+            EXPECT_EQ(s.find(canceled.address,e.record.original_id),e);
+            EXPECT_TRUE(s.pins_audit(e.record.audit_id,e.record.original_id));
+        }
+        EXPECT_EQ(s.usage(),usage);
+        EXPECT_EQ(db.query("SELECT * FROM AuditLog ORDER BY id"),audit);
+        const auto receiver=installs().read(profile.binding.channel);
+        ASSERT_TRUE(receiver);
+        EXPECT_EQ(receiver->last_sequence,1);
+        EXPECT_EQ(receiver->revision,0);
+        EXPECT_FALSE(receiver->active);
+        EXPECT_FALSE(receiver->last_installed);
+        EXPECT_EQ(receiver->frontier,receive_install_frontier{});
+        expect(error::stale,[&]{s.snapshot_for_install(address,1);});
+        expect(error::stale,[&]{s.claim_export(address,{open.record.original_id});});
+        address=canceled.address;
+        expect(error::stale,[&]{s.freeze(address,1);});
+    });
+}
+
+TEST_F(RecoveryObligationStore, CancelBeforeManifestAllowsNextRealInstallationWithoutSequenceReuse) {
+    const auto kept=add(304);
+    freeze();
+    const auto frozen=scope();
+    committed([&](auto&) {address=storage().cancel_frozen_for_retry(address,1,frozen.revision).address;});
+    freeze(2);
+    auto actual=first();
+    actual.sequence=2; // Cancellation consumed sequence 1, not a revision/head.
+    install(actual,{positive(kept)});
+    committed([&](auto&) {
+        const auto receiver=installs().read(profile.binding.channel);
+        ASSERT_TRUE(receiver);
+        EXPECT_EQ(receiver->last_installed,actual);
+        EXPECT_EQ(receiver->revision,1);
+        EXPECT_EQ(receiver->last_sequence,2);
+        address=storage().resume(address,actual).address;
+        EXPECT_EQ(storage().find(address,kept.record.original_id)->stage,stage::settled);
+    });
+}
+
+TEST_F(RecoveryObligationStore, CancelRequiresCurrentFrozenAddressAttemptAndRevision) {
+    const auto recording=scope();
+    committed([&](auto&) {
+        expect(error::stale,[&]{storage().cancel_frozen_for_retry(address,1,recording.revision);});
+    });
+    freeze();
+    const auto old=scope();
+    add(305); // Existing frozen mode still records local candidates.
+    const auto current=scope();
+    ASSERT_GT(current.revision,old.revision);
+    committed([&](auto&) {
+        auto s=storage();
+        const auto receiver=installs().read(profile.binding.channel);
+        expect(error::invalid_argument,[&]{s.cancel_frozen_for_retry(address,0,current.revision);});
+        expect(error::stale,[&]{s.cancel_frozen_for_retry(address,2,current.revision);});
+        expect(error::stale,[&]{s.cancel_frozen_for_retry(address,1,old.revision);});
+        auto stale=address;
+        --stale.generation;
+        expect(error::stale,[&]{s.cancel_frozen_for_retry(stale,1,current.revision);});
+        EXPECT_EQ(s.read(profile.binding.channel),current);
+        EXPECT_EQ(installs().read(profile.binding.channel),receiver);
+    });
+}
+
+TEST_F(RecoveryObligationStore, CancelRefusesActiveReceiverUntilExactExplicitAbandonment) {
+    freeze();
+    const auto frozen=scope();
+    const auto identity=first();
+    committed([&](auto&) {
+        installs().begin(profile.binding,identity);
+        expect(error::stale,[&]{storage().cancel_frozen_for_retry(address,1,frozen.revision);});
+        EXPECT_EQ(installs().read(profile.binding.channel)->active,identity);
+        EXPECT_EQ(storage().read(profile.binding.channel),frozen);
+    });
+    committed([&](auto&) {
+        installs().abandon_active(profile.binding,identity);
+        address=storage().cancel_frozen_for_retry(address,1,frozen.revision).address;
+        EXPECT_EQ(installs().read(profile.binding.channel)->last_sequence,1);
+        EXPECT_FALSE(installs().read(profile.binding.channel)->last_installed);
+    });
+}
+
+TEST_F(RecoveryObligationStore, CancelNeverReopensAfterActualInstallEvenWithoutJournalSettlement) {
+    const auto kept=add(306);
+    freeze();
+    const auto frozen=scope();
+    const auto identity=first();
+    committed([&](auto&) {
+        installs().apply_if_new(profile.binding,identity,{},[](auto&){});
+        expect(error::stale,[&]{storage().cancel_frozen_for_retry(address,1,frozen.revision);});
+        EXPECT_EQ(storage().read(profile.binding.channel),frozen);
+        storage().settle_install(address,frozen.revision,identity,{positive(kept)});
+    });
+    const auto installed_scope=scope();
+    committed([&](auto&) {
+        expect(error::stale,[&]{storage().cancel_frozen_for_retry(address,1,installed_scope.revision);});
+        EXPECT_EQ(storage().read(profile.binding.channel),installed_scope);
+        EXPECT_EQ(installs().read(profile.binding.channel)->last_installed,identity);
+    });
+}
+
+TEST_F(RecoveryObligationStore, CancelAfterPriorInstallPreservesItsExactResultAndFrontier) {
+    const auto kept=add(307);
+    freeze();
+    const auto prior=first();
+    install(prior,{positive(kept)});
+    committed([&](auto&){address=storage().resume(address,prior).address;});
+    freeze(2);
+    const auto frozen=scope();
+    committed([&](auto&) {
+        const auto before=installs().read(profile.binding.channel);
+        address=storage().cancel_frozen_for_retry(address,2,frozen.revision).address;
+        const auto after=installs().read(profile.binding.channel);
+        ASSERT_TRUE(before);
+        ASSERT_TRUE(after);
+        EXPECT_EQ(after->last_sequence,2);
+        EXPECT_EQ(after->last_installed,before->last_installed);
+        EXPECT_EQ(after->frontier,before->frontier);
+        EXPECT_EQ(after->revision,before->revision);
+        EXPECT_EQ(storage().find(address,kept.record.original_id)->stage,stage::settled);
+    });
+}
+
+TEST_F(RecoveryObligationStore, CancelOuterRollbackRestoresFrozenJournalAndReceiverSequence) {
+    add(308);
+    freeze();
+    const auto frozen=scope();
+    std::optional<receive_install_snapshot> before;
+    committed([&](auto&){before=installs().read(profile.binding.channel);});
+    const auto failed=recovery_writer_access::install(owner,[&](auto&) {
+        storage().cancel_frozen_for_retry(address,1,frozen.revision);
+        throw std::runtime_error("cancel outer rollback");
+    });
+    EXPECT_EQ(failed.state,outcome::rolled_back);
+    EXPECT_EQ(scope(),frozen);
+    committed([&](auto&) {
+        EXPECT_EQ(installs().read(profile.binding.channel),before);
+        EXPECT_EQ(storage().snapshot_for_install(address,1).entries.size(),1u);
+    });
+}
+
+TEST_F(RecoveryObligationStore, IgnoredCancelJournalWriteRollsBackItsReceiverRetirement) {
+    freeze();
+    const auto frozen=scope();
+    committed([&](auto& db) {
+        db.execute("CREATE TRIGGER reject_cancel BEFORE UPDATE ON _lattice_obligation_scope WHEN NEW.mode=0 BEGIN SELECT RAISE(IGNORE); END");
+        EXPECT_THROW(storage().cancel_frozen_for_retry(address,1,frozen.revision),lattice::db_error);
+        EXPECT_EQ(storage().read(profile.binding.channel),frozen);
+        EXPECT_EQ(installs().read(profile.binding.channel)->last_sequence,0);
+        db.execute("DROP TRIGGER reject_cancel");
+        address=storage().cancel_frozen_for_retry(address,1,frozen.revision).address;
+    });
+}
+
+TEST(RecoveryObligationStoreFile, CanceledAttemptAndPinnedOriginalSurvivePhysicalReopen) {
+    TempDB file{"recovery_obligation_cancel_reopen"};
+    const recovery_obligation_limits l{2,32,128,16384};
+    const receive_install_limits il{2,128,4096};
+    const recovery_obligation_profile p{{"c","a","s","e","scope","schema"},"profile","receipts"};
+    recovery_obligation_address address;
+    recovery_obligation_entry kept;
+    {
+        auto owner=owner_at(file.str());
+        EXPECT_EQ(recovery_writer_access::install(owner,[&](auto& db) {
+            receive_install_store receiver(owner,il);
+            receiver.initialize();
+            receiver.bind(p.binding);
+            recovery_obligation_store s(owner,l,il);
+            s.initialize();
+            address=s.bind(p).address;
+            kept=s.record(address,insert(db,309));
+            s.claim_export(address,{kept.record.original_id});
+            kept=*s.find(address,kept.record.original_id);
+            const auto frozen=s.freeze(address,1);
+            address=s.cancel_frozen_for_retry(frozen.address,1,frozen.revision).address;
+        }).state,outcome::committed);
+    }
+    {
+        auto owner=owner_at(file.str());
+        EXPECT_EQ(recovery_writer_access::install(owner,[&](auto&) {
+            recovery_obligation_store s(owner,l,il);
+            s.initialize();
+            const auto current=s.read(p.binding.channel);
+            ASSERT_TRUE(current);
+            EXPECT_EQ(current->address,address);
+            EXPECT_EQ(current->mode,mode::recording);
+            EXPECT_EQ(current->last_attempt,1);
+            EXPECT_EQ(s.find(address,kept.record.original_id),kept);
+            EXPECT_TRUE(s.pins_audit(kept.record.audit_id,kept.record.original_id));
+            receive_install_store receiver(owner,il);
+            receiver.initialize();
+            EXPECT_EQ(receiver.read(p.binding.channel)->last_sequence,1);
+            EXPECT_FALSE(receiver.read(p.binding.channel)->last_installed);
+            EXPECT_EQ(s.freeze(address,2).last_attempt,2);
+        }).state,outcome::committed);
+    }
+}

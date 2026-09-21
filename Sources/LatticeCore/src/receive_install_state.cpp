@@ -390,6 +390,26 @@ receive_install_receipt receive_install_store::complete(const receive_install_bi
         return receive_install_receipt{receive_install_disposition::installed,next.revision,i.head};
     });
 }
+receive_install_snapshot receive_install_store::retire_unstarted_for_journal(
+    const receive_install_snapshot& expected,int64_t sequence) {
+    auto& db=connection();
+    return atomic(db,[&] {
+        const auto current=read(expected.binding.channel);
+        if (!current || *current!=expected || current->active || sequence<=0 ||
+            (current->last_installed && current->last_installed->sequence>=sequence))
+            fail(code::stale,"receiver journal cancellation baseline differs or attempt installed");
+        // An explicitly abandoned active identity already consumed this number.
+        if (sequence==current->last_sequence) return *current;
+        if (current->last_sequence==maximum)
+            fail(code::sequence_exhausted,"receiver journal cancellation sequence exhausted");
+        if (sequence!=current->last_sequence+1)
+            fail(code::stale,"receiver journal cancellation must retire the exact next sequence");
+        auto next=*current;
+        next.last_sequence=sequence;
+        write_row(next,&*current);
+        return next;
+    });
+}
 void receive_install_store::abandon_active(const receive_install_binding& b,const receive_install_identity& i) {
     binding_size(b,limits_);identity(i,limits_);const auto u=configuration();auto& db=connection();
     atomic(db,[&] {

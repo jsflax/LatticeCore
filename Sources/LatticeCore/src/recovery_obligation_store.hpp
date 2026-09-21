@@ -118,6 +118,15 @@ public:
     std::optional<recovery_obligation_entry> find(const recovery_obligation_address&,const std::string& original_id) const;
     recovery_obligation_export_ticket claim_export(const recovery_obligation_address&,const std::vector<std::string>& original_ids);
     recovery_obligation_scope freeze(const recovery_obligation_address&,int64_t logical_attempt);
+    // Cancel only this exact, known-uninstalled frozen journal attempt in the
+    // actual owned writer transaction. Refuses active/newer receiver state;
+    // preserves originals and claims, and retires an unstarted exact next
+    // receiver sequence without fabricating a manifest/install. The generation and
+    // revision advance fences a previously issued installer. This is not a
+    // transport/producer-barrier cancellation or proof that callbacks stopped.
+    // Result is provisional until the outer owned COMMIT is known successful.
+    recovery_obligation_scope cancel_frozen_for_retry(const recovery_obligation_address&,
+        int64_t logical_attempt,int64_t expected_journal_revision);
     recovery_obligation_snapshot snapshot_for_install(const recovery_obligation_address&,int64_t logical_attempt) const;
     recovery_obligation_scope acknowledge(const recovery_obligation_address&,const recovery_obligation_receipt_claim&);
     // AFTER actual same-owner apply_if_new returned installed, BEFORE its outer

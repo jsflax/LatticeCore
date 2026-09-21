@@ -441,6 +441,48 @@ scope_t recovery_obligation_store::freeze(const recovery_obligation_address& a,i
         b.put_scope(prior,s); return s;
     });
 }
+scope_t recovery_obligation_store::cancel_frozen_for_retry(const recovery_obligation_address& a,
+    int64_t attempt,int64_t revision) {
+    backend b{writer(),limits_};
+    if (attempt<=0 || revision<=0) fail(code::invalid_argument,"obligation cancellation requires positive attempt and revision");
+    return atomic(b.db,[&] {
+        auto s=b.current(a);
+        if (s.mode!=mode::frozen || s.last_attempt!=attempt || s.revision!=revision)
+            fail(code::stale,"obligation cancellation requires the exact frozen journal revision");
+        receive_install_store installs(owner_,install_limits_);
+        const auto receiver=installs.read(s.address.channel);
+        if (!receiver || receiver->binding!=s.profile.binding || receiver->active ||
+            receiver->last_sequence>s.last_attempt || receiver->revision!=s.installed_revision)
+            fail(code::stale,"obligation cancellation receiver is active, changed or unavailable");
+        if (s.installed_sequence==0) {
+            if (receiver->last_installed || receiver->frontier!=receive_install_frontier{})
+                fail(code::stale,"obligation cancellation receiver no longer has its initial baseline");
+        } else if (!receiver->last_installed ||
+                   receiver->last_installed->sequence!=s.installed_sequence ||
+                   receiver->last_installed->head!=s.installed_head ||
+                   receiver->last_installed->manifest_digest!=s.installed_manifest ||
+                   receiver->frontier!=receive_install_frontier{receive_frontier_kind::position,s.installed_head}) {
+            fail(code::stale,"obligation cancellation receiver differs from the retained installed baseline");
+        }
+        b.full_audit();
+        // Freeze can precede receipt of a manifest, so begin() may never have
+        // consumed this sequence. Retire its number without inventing an I;
+        // otherwise next-attempt monotonicity and receiver next-sequence
+        // admission would disagree forever after a pre-manifest timeout.
+        const auto retired=installs.retire_unstarted_for_journal(*receiver,attempt);
+        auto prior=s;
+        s.mode=mode::recording;
+        s.address.generation=next(s.address.generation);
+        s.revision=next(s.revision);
+        b.put_scope(prior,s);
+        // A metadata trigger/error cannot turn cancellation into adoption of a
+        // changed receiver. Any failure rolls this savepoint back, retaining Q.
+        if (installs.read(s.address.channel)!=std::optional<receive_install_snapshot>{retired})
+            fail(code::stale,"obligation cancellation receiver changed during settlement");
+        b.full_audit();
+        return s;
+    });
+}
 recovery_obligation_snapshot recovery_obligation_store::snapshot_for_install(const recovery_obligation_address& a,int64_t attempt) const {
     backend b{writer(),limits_}; auto s=b.current(a);
     if (s.mode!=mode::frozen || s.last_attempt!=attempt) fail(code::stale,"obligation final snapshot requires current frozen attempt");

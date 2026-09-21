@@ -231,7 +231,8 @@ TEST_F(SyncDiscoveryContention, InitialUploadFirstProbeDefersBeforeSlotAndOpenSe
 TEST_F(SyncDiscoveryContention, ForegroundAndDrainCannotReportDeferredUploadAsComplete) {
     change("unused-remote","upload");sync_discovery_test_access::connected(*sync);
     held_writer_mutex held(*owner);sync_discovery_test_access::background(*sync);EXPECT_TRUE(pending());
-    EXPECT_THROW(sync->sync_now(),db_error);EXPECT_THROW(sync->drain(std::chrono::steady_clock::now()+100ms),db_error);
+    EXPECT_THROW(sync->sync_now(),db_error);
+    EXPECT_THROW(sync->drain(std::chrono::steady_clock::now()+100ms),db_error);
     EXPECT_EQ(wire->count(),0u);held.allow();ASSERT_TRUE(wire->await(1));
 }
 TEST_F(SyncDiscoveryContention, LateBusyRetainsExactRealVectorAndDoesNotReenumerate) {

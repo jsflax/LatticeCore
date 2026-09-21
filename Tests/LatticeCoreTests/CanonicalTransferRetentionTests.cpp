@@ -126,7 +126,8 @@ TEST_F(CanonicalTransferRetention, PreopenedSiblingAndOrdinaryOwnedCallbacksCann
     attach();owner->add(RetentionRow{"covered"});auto ticket=reserve(0);
     for(const auto* sql:{"DELETE FROM _lattice_canonical_attempt","UPDATE _lattice_canonical_retention SET incarnation=99",
         "UPDATE _lattice_canonical_store SET floor=head","DELETE FROM _lattice_canonical_touch"}) {
-        EXPECT_THROW(sibling->db().execute(sql),db_error);EXPECT_THROW(owner->db().execute(sql),db_error);
+        EXPECT_THROW(sibling->db().execute(sql),db_error);
+        EXPECT_THROW(owner->db().execute(sql),db_error);
     }
     sibling->begin_transaction();canonical_change_store primitive(*sibling,p.binding,p.limits);
     EXPECT_THROW(primitive.advance_floor(head(),head()),db_error);sibling->rollback();
@@ -496,7 +497,8 @@ TEST_F(CanonicalRetainedUpstream, PreopenedSiblingAndLegacyDeliveryCannotBorrowC
     const auto store=snapshot("_lattice_canonical_store"),attempts=snapshot("_lattice_canonical_attempt"),receipts=snapshot("_lattice_canonical_receipt");
     for(const auto* sql:{"DELETE FROM _lattice_canonical_attempt","UPDATE _lattice_canonical_retention SET incarnation=99",
         "UPDATE _lattice_canonical_store SET floor=head","DELETE FROM _lattice_canonical_touch","DELETE FROM _lattice_canonical_receipt"}) {
-        EXPECT_THROW(sibling->db().execute(sql),db_error);EXPECT_THROW(owner->db().execute(sql),db_error);
+        EXPECT_THROW(sibling->db().execute(sql),db_error);
+        EXPECT_THROW(owner->db().execute(sql),db_error);
     }
     EXPECT_THROW(adapter->apply_upstream_owned(sibling,{imported(102,2)}),db_error);
     EXPECT_THROW(apply_remote_changes(*owner,{imported(102,2)}),db_error);

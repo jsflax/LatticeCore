@@ -225,10 +225,18 @@ TEST(RecoveryOwnerSchemaReopen, FreshProcessReopensProtectedSwiftStoreAndPreserv
     const auto size=readlink("/proc/self/exe",executable,sizeof(executable)-1);
     ASSERT_GT(size,0);ASSERT_LT(size,static_cast<ssize_t>(sizeof(executable)-1));executable[size]=0;
 #endif
+    // Child test setup opens its native log with "w"; never inherit the parent's.
+    constexpr const char* native_log_variable="LATTICE_TEST_LOG_PATH=";
+    const auto* parent_native_log=std::getenv("LATTICE_TEST_LOG_PATH");
+    const auto child_native_log=parent_native_log&&*parent_native_log
+        ? std::string(parent_native_log)+"."+file.path.filename().string()+".peer.native.log"
+        : file.str()+".peer.native.log";
     std::vector<std::string> values;
     for(char** entry=environ;*entry;++entry)
-        if(std::strncmp(*entry,variable,std::strlen(variable))!=0)values.emplace_back(*entry);
-    values.push_back(std::string(variable)+file.str());std::vector<char*> environment;
+        if(std::strncmp(*entry,variable,std::strlen(variable))!=0&&
+           std::strncmp(*entry,native_log_variable,std::strlen(native_log_variable))!=0)values.emplace_back(*entry);
+    values.push_back(std::string(variable)+file.str());
+    values.push_back(std::string(native_log_variable)+child_native_log);std::vector<char*> environment;
     for(auto& value:values)environment.push_back(value.data());environment.push_back(nullptr);
     std::string filter="--gtest_filter=RecoveryOwnerSchemaReopen.FreshProcessReopensProtectedSwiftStoreAndPreservesPendingChanges";
     std::string color="--gtest_color=no",repeat="--gtest_repeat=1",output="--gtest_output=";

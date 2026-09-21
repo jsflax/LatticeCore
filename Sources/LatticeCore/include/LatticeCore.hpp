@@ -30,6 +30,8 @@
 #include "lattice/log.hpp"
 #include "lattice/types.hpp"
 #include "lattice/db.hpp"
+#include "lattice/projection.hpp"
+#include "lattice/spatial_query.hpp"
 #include "lattice/managed.hpp"
 #include "lattice/schema.hpp"
 #include "lattice/scheduler.hpp"

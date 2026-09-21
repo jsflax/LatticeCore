@@ -81,6 +81,13 @@ public:
     // No public callback, caller transaction or caller-supplied protected base.
     static std::unique_ptr<canonical_writer_adapter> attach_retention_for_qualification(
         std::shared_ptr<lattice_db>, const canonical_writer_profile&, canonical_retention_limits);
+    // Same actual source combines canonical imported-entry settlement and
+    // committed tail reservations. Both existing admissions remain required;
+    // this does not authenticate a peer, issue negative receipts, persist a
+    // transfer, advertise READY or activate a network route.
+    static std::unique_ptr<canonical_writer_adapter> attach_retained_upstream_for_qualification(
+        std::shared_ptr<lattice_db>, const canonical_writer_profile&,
+        canonical_upstream_limits, canonical_retention_limits);
     canonical_retention_result reserve_recovery_owned(std::shared_ptr<lattice_db>,
         std::optional<int64_t> base, int64_t duration_ms);
     recovery_install_result release_recovery_owned(std::shared_ptr<lattice_db>, const canonical_retention_ticket&);

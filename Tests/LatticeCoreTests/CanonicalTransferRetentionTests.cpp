@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
+#include <algorithm>
+#include <map>
 #if defined(__APPLE__) || defined(__linux__)
 #include <spawn.h>
 #include <sys/wait.h>
@@ -26,6 +29,13 @@ struct canonical_retention_test_access {
         std::shared_ptr<lattice_db> owner,const canonical_retention_ticket& ticket,
         const sync_recovery::canonical_capture_limits& limits,const std::function<void(size_t,uint64_t)>& after) {
         return adapter.capture_reserved_impl(std::move(owner),ticket,{},limits,after);
+    }
+    // Combined-source tests reuse this one friend definition in this TU.
+    static sync_recovery::owned_canonical_capture capture_requested(canonical_writer_adapter& adapter,
+        std::shared_ptr<lattice_db> owner,const canonical_retention_ticket& ticket,
+        const std::vector<sync_recovery::canonical_capture_request>& requests,
+        const sync_recovery::canonical_capture_limits& limits,const std::function<void(size_t,uint64_t)>& after) {
+        return adapter.capture_reserved_impl(std::move(owner),ticket,requests,limits,after);
     }
 };
 }
@@ -321,4 +331,269 @@ TEST(CanonicalTransferRetentionRestart, FreshProcessesFencePriorUnadvertisedInca
         ASSERT_TRUE(WIFEXITED(status))<<log;ASSERT_EQ(WEXITSTATUS(status),0)<<log;
     }
 }
+
+// Retained imported-original integration: same file, admitted owner and registry.
+namespace {
+class CanonicalRetainedUpstream:public CanonicalTransferRetention {
+protected:
+    canonical_upstream_limits upstream{16,65536,1048576};
+    CanonicalRetainedUpstream(){p.upstream_requested=true;}
+    void attach(){adapter=canonical_writer_adapter::attach_retained_upstream_for_qualification(owner,p,upstream,retention);}
+    static std::string id(unsigned n){char out[37];std::snprintf(out,sizeof(out),"00000000-0000-4000-8000-%012u",n);return out;}
+    static audit_log_entry imported(unsigned original,unsigned target,const std::string& operation="INSERT",const std::string& body="remote") {
+        audit_log_entry e;e.global_id=id(original);e.global_row_id=id(target);e.table_name="RetentionRow";
+        e.operation=operation;e.timestamp="1789819200.0";
+        if(operation!="DELETE"){e.changed_fields_names={"body"};e.changed_fields={{"body",any_property(body)}};}
+        return e;
+    }
+    static canonical_identity key(unsigned target){return {"RetentionRow",id(target)};}
+    static std::vector<sr::canonical_capture_request> requests(const std::vector<audit_log_entry>& entries) {
+        std::vector<sr::canonical_capture_request> result;
+        for(const auto& e:entries)result.push_back({e.global_id,{{e.table_name,e.global_row_id}}});
+        std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return a.original_id<b.original_id;});
+        return result;
+    }
+    std::vector<std::string> apply(const std::vector<audit_log_entry>& entries){return adapter->apply_upstream_owned(owner,entries);}
+    sr::owned_canonical_capture capture(const canonical_retention_ticket& ticket,const std::vector<audit_log_entry>& entries) {
+        return adapter->capture_reserved_owned(owner,ticket,requests(entries),limits);
+    }
+    static const sr::canonical_source_row& row(const sr::owned_canonical_capture& captured,unsigned target) {
+        if(!captured.capture)throw std::runtime_error("missing complete reserved capture");
+        const auto& rows=captured.capture->rows;
+        const auto found=std::find_if(rows.begin(),rows.end(),[&](const auto& r){return r.key==key(target);});
+        if(found==rows.end())throw std::runtime_error("missing requested target");return *found;
+    }
+    static std::string body(const sr::canonical_source_row& r) {
+        if(!r.payload)throw std::runtime_error("missing captured payload");
+        return std::get<std::string>(sr::decode_values(*r.payload,{8192,16,256,8192,8192}).at("body"));
+    }
+    static void positive_receipt(const sr::owned_canonical_capture& captured,const audit_log_entry& entry,int64_t position) {
+        ASSERT_TRUE(captured.capture);const auto& receipts=captured.capture->receipts;
+        const auto found=std::find_if(receipts.begin(),receipts.end(),[&](const auto& r){return r.original_id==entry.global_id;});
+        ASSERT_NE(found,receipts.end());ASSERT_TRUE(found->stored);
+        EXPECT_EQ(found->stored->original.original_id,entry.global_id);
+        EXPECT_EQ(found->stored->original.outcome,canonical_receipt_outcome::applied);
+        EXPECT_EQ(found->stored->original.target,(canonical_identity{entry.table_name,entry.global_row_id}));
+        EXPECT_EQ(found->stored->position,position);EXPECT_LE(position,captured.head);
+        EXPECT_EQ(captured.capture->head,captured.head);EXPECT_EQ(captured.capture->floor,captured.floor);
+    }
+    std::vector<database::row_t> snapshot(const std::string& table){return owner->db().query("SELECT * FROM "+table);}
+};
+// The existing restriction-only seam also applies when both admissions are
+// present. It cannot admit a write or revoke/replace the physical authorizer.
+struct RetainedImportFault {
+    enum kind {receipt_ignore,receipt_deny,commit_deny};
+    static thread_local RetainedImportFault* active;
+    kind value;int hits=0;
+    canonical_upstream_test_hooks::authorizer_fault probe;
+    const canonical_upstream_test_hooks::authorizer_fault* previous;
+    RetainedImportFault* prior;
+    RetainedImportFault(database& db,kind k):value(k),probe{canonical_writer_custody_test_access::fault_handle(db),restrict_action},
+        previous(canonical_upstream_test_hooks::fault),prior(active){active=this;canonical_upstream_test_hooks::fault=&probe;}
+    ~RetainedImportFault(){canonical_upstream_test_hooks::fault=previous;active=prior;}
+    static int restrict_action(int action,const char* one,const char*,const char* origin) noexcept {
+        auto& f=*active;if(origin)return SQLITE_OK;
+        if(f.value==commit_deny&&action==SQLITE_TRANSACTION&&one&&std::strcmp(one,"COMMIT")==0){++f.hits;return SQLITE_DENY;}
+        if(!f.hits&&action==SQLITE_INSERT&&one&&std::strcmp(one,"_lattice_canonical_receipt")==0&&f.value!=commit_deny){
+            ++f.hits;return f.value==receipt_ignore?SQLITE_IGNORE:SQLITE_DENY;
+        }
+        return SQLITE_OK;
+    }
+};
+thread_local RetainedImportFault* RetainedImportFault::active=nullptr;
+}
+
+TEST_F(CanonicalRetainedUpstream, ImportedInsertUpdateDeleteHavePositiveReceiptsInReservedViews) {
+    attach();auto ticket=reserve(0);EXPECT_EQ(count(),1);
+    const auto inserted=imported(101,1),updated=imported(102,1,"UPDATE","updated"),deleted=imported(103,1,"DELETE");
+    ASSERT_EQ(apply({inserted}),std::vector<std::string>{inserted.global_id});
+    auto first=capture(ticket,{inserted});EXPECT_EQ(first.head,2);EXPECT_EQ(body(row(first,1)),"remote");positive_receipt(first,inserted,2);
+    ASSERT_EQ(apply({updated}),std::vector<std::string>{updated.global_id});
+    auto second=capture(ticket,{inserted,updated});EXPECT_EQ(second.head,4);EXPECT_EQ(body(row(second,1)),"updated");
+    positive_receipt(second,inserted,2);positive_receipt(second,updated,4);
+    ASSERT_EQ(apply({deleted}),std::vector<std::string>{deleted.global_id});
+    auto final=capture(ticket,{inserted,updated,deleted});ASSERT_TRUE(final.capture);EXPECT_EQ(final.head,6);
+    ASSERT_EQ(final.capture->rows.size(),1u);EXPECT_FALSE(row(final,1).payload);
+    positive_receipt(final,inserted,2);positive_receipt(final,updated,4);positive_receipt(final,deleted,6);
+    EXPECT_EQ(scalar(owner->db(),"SELECT COUNT(*) FROM AuditLog WHERE tableName='RetentionRow' AND isFromRemote=1 AND isSynchronized=1"),3);
+    EXPECT_FALSE(owner->db().table_exists("_lattice_applied_receipts"));
+    EXPECT_NE(adapter->prune_recovery_owned(owner,final.head).state,phase::committed);EXPECT_EQ(floor(),0);
+    committed(adapter->release_recovery_owned(owner,ticket));committed(adapter->prune_recovery_owned(owner,final.head));
+    EXPECT_EQ(scalar(owner->db(),"SELECT COUNT(*) FROM _lattice_canonical_touch"),0);
+    auto refresh=reserve(final.head);auto retained=capture(refresh,{inserted,updated,deleted});
+    EXPECT_FALSE(row(retained,1).payload);positive_receipt(retained,inserted,2);positive_receipt(retained,updated,4);positive_receipt(retained,deleted,6);
+    committed(adapter->release_recovery_owned(owner,refresh));static_assert(!canonical_writer_adapter::serving_capability);
+}
+
+TEST_F(CanonicalRetainedUpstream, ConcurrentImportAfterSnapshotLeavesStableCaptureAndProtectedTail) {
+    watchdog bounded;attach();const auto one=imported(101,1,"INSERT","one"),two=imported(102,2,"INSERT","two");
+    ASSERT_EQ(apply({one,two}),(std::vector<std::string>{one.global_id,two.global_id}));
+    auto ticket=reserve();const auto pinned=ticket.protected_base();ASSERT_EQ(pinned,4);EXPECT_EQ(count(),1);
+    const auto update=imported(103,1,"UPDATE","after pin"),remove=imported(104,2,"DELETE"),insert=imported(105,3,"INSERT","new");
+    bool changed=false;std::vector<std::string> accepted;std::exception_ptr failure;
+    const auto before=canonical_retention_test_access::capture_requested(*adapter,owner,ticket,requests({one,two}),limits,
+        [&](size_t batch,uint64_t){if(batch!=0||changed)return;changed=true;
+            std::thread importer([&]{try{accepted=apply({update,remove,insert});}catch(...){failure=std::current_exception();}});importer.join();
+        });
+    if(failure)std::rethrow_exception(failure);ASSERT_TRUE(changed);
+    EXPECT_EQ(accepted,(std::vector<std::string>{update.global_id,remove.global_id,insert.global_id}));
+    ASSERT_TRUE(before.capture);EXPECT_EQ(before.head,pinned);ASSERT_EQ(before.capture->rows.size(),2u);
+    EXPECT_EQ(body(row(before,1)),"one");EXPECT_EQ(body(row(before,2)),"two");positive_receipt(before,one,2);positive_receipt(before,two,4);
+    EXPECT_EQ(head(),10);EXPECT_EQ(owner->local_read_generations_outstanding(),0u);
+    EXPECT_NE(adapter->prune_recovery_owned(owner,head()).state,phase::committed);EXPECT_EQ(floor(),0);
+    committed(adapter->prune_recovery_owned(owner,pinned));EXPECT_EQ(floor(),pinned);
+    auto tail_ticket=reserve(pinned);auto tail=capture(tail_ticket,{update,remove,insert});ASSERT_TRUE(tail.capture);
+    EXPECT_EQ(tail.selection,sr::source_capture_selection::delta);EXPECT_EQ(tail.head,10);ASSERT_EQ(tail.capture->rows.size(),3u);
+    EXPECT_EQ(body(row(tail,1)),"after pin");EXPECT_FALSE(row(tail,2).payload);EXPECT_EQ(body(row(tail,3)),"new");
+    positive_receipt(tail,update,6);positive_receipt(tail,remove,8);positive_receipt(tail,insert,10);
+    committed(adapter->release_recovery_owned(owner,ticket));
+    EXPECT_NE(adapter->prune_recovery_owned(owner,head()).state,phase::committed);
+    committed(adapter->release_recovery_owned(owner,tail_ticket));committed(adapter->prune_recovery_owned(owner,head()));
+    EXPECT_EQ(count(),0);EXPECT_EQ(scalar(owner->db(),"SELECT COUNT(*) FROM _lattice_canonical_receipt"),5);
+}
+
+TEST_F(CanonicalRetainedUpstream, IgnoredAndDeniedReceiptWritesRollbackOnlyTheirEntryAndDuplicateHasNoSecondEffect) {
+    attach();auto ticket=reserve(0);std::vector<std::string> observed;
+    const auto token=owner->add_table_observer("RetentionRow",[&](const auto& rows){for(const auto& r:rows)observed.push_back(std::get<3>(r));});
+    unsigned index=0;
+    for(auto kind:{RetainedImportFault::receipt_ignore,RetainedImportFault::receipt_deny}) {
+        const auto bad=imported(101+index*2,1+index*2,"INSERT","retry"),good=imported(102+index*2,2+index*2,"INSERT","good");
+        const auto initial_head=head();const auto attempts=snapshot("_lattice_canonical_attempt");observed.clear();
+        {RetainedImportFault fault(owner->db(),kind);EXPECT_EQ(apply({bad,good}),std::vector<std::string>{good.global_id});EXPECT_EQ(fault.hits,1);}
+        EXPECT_EQ(observed,std::vector<std::string>{good.global_row_id});EXPECT_EQ(head(),initial_head+2);
+        EXPECT_TRUE(owner->db().query("SELECT 1 FROM RetentionRow WHERE globalId=?",{bad.global_row_id}).empty());
+        EXPECT_TRUE(owner->db().query("SELECT 1 FROM AuditLog WHERE globalId=?",{bad.global_id}).empty());
+        const auto key_bytes=std::vector<uint8_t>(bad.global_id.begin(),bad.global_id.end());
+        EXPECT_TRUE(owner->db().query("SELECT 1 FROM _lattice_canonical_receipt WHERE original_id=?",{key_bytes}).empty());
+        EXPECT_EQ(snapshot("_lattice_canonical_attempt"),attempts);EXPECT_EQ(floor(),0);
+        ASSERT_EQ(apply({bad}),std::vector<std::string>{bad.global_id});auto captured=capture(ticket,{bad,good});
+        positive_receipt(captured,good,initial_head+2);positive_receipt(captured,bad,initial_head+4);
+        const auto store=snapshot("_lattice_canonical_store"),audit=snapshot("AuditLog"),receipts=snapshot("_lattice_canonical_receipt"),touch=snapshot("_lattice_canonical_touch");
+        auto duplicate=bad;duplicate.changed_fields["body"]=any_property("must not replace");observed.clear();
+        EXPECT_EQ(apply({duplicate}),std::vector<std::string>{bad.global_id});EXPECT_TRUE(observed.empty());
+        EXPECT_EQ(snapshot("_lattice_canonical_store"),store);EXPECT_EQ(snapshot("AuditLog"),audit);
+        EXPECT_EQ(snapshot("_lattice_canonical_receipt"),receipts);EXPECT_EQ(snapshot("_lattice_canonical_touch"),touch);
+        EXPECT_EQ(body(row(capture(ticket,{bad}),1+index*2)),"retry");++index;
+    }
+    owner->remove_table_observer("RetentionRow",token);committed(adapter->release_recovery_owned(owner,ticket));
+}
+
+TEST_F(CanonicalRetainedUpstream, FailedImportCommitPreservesReservationAndAllPreimages) {
+    attach();auto ticket=reserve(0);const auto entry=imported(101,1);
+    std::map<std::string,std::vector<database::row_t>> before;
+    for(const auto* table:{"RetentionRow","AuditLog","_SyncControl","_lattice_canonical_store","_lattice_canonical_touch","_lattice_canonical_receipt","_lattice_canonical_retention","_lattice_canonical_attempt"})before.emplace(table,snapshot(table));
+    size_t notifications=0;const auto token=owner->add_table_observer("RetentionRow",[&](const auto&){++notifications;});
+    {RetainedImportFault fault(owner->db(),RetainedImportFault::commit_deny);EXPECT_TRUE(apply({entry}).empty());EXPECT_EQ(fault.hits,2);}
+    owner->remove_table_observer("RetentionRow",token);EXPECT_EQ(notifications,0u);EXPECT_FALSE(owner->db().is_in_transaction());
+    for(const auto& [table,rows]:before)EXPECT_EQ(snapshot(table),rows)<<table;
+    auto empty=capture(ticket,{});ASSERT_TRUE(empty.capture);EXPECT_EQ(empty.head,0);EXPECT_TRUE(empty.capture->rows.empty());
+    ASSERT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});positive_receipt(capture(ticket,{entry}),entry,2);
+    committed(adapter->release_recovery_owned(owner,ticket));
+}
+
+TEST_F(CanonicalRetainedUpstream, PreopenedSiblingAndLegacyDeliveryCannotBorrowCombinedAdmission) {
+    attach();const auto entry=imported(101,1);ASSERT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});auto ticket=reserve(0);
+    const auto store=snapshot("_lattice_canonical_store"),attempts=snapshot("_lattice_canonical_attempt"),receipts=snapshot("_lattice_canonical_receipt");
+    for(const auto* sql:{"DELETE FROM _lattice_canonical_attempt","UPDATE _lattice_canonical_retention SET incarnation=99",
+        "UPDATE _lattice_canonical_store SET floor=head","DELETE FROM _lattice_canonical_touch","DELETE FROM _lattice_canonical_receipt"}) {
+        EXPECT_THROW(sibling->db().execute(sql),db_error);EXPECT_THROW(owner->db().execute(sql),db_error);
+    }
+    EXPECT_THROW(adapter->apply_upstream_owned(sibling,{imported(102,2)}),db_error);
+    EXPECT_THROW(apply_remote_changes(*owner,{imported(102,2)}),db_error);
+    EXPECT_THROW(adapter->capture_recovery_owned(owner,p.binding,{},requests({entry}),limits),db_error);
+    EXPECT_THROW(adapter->capture_reserved_owned(sibling,ticket,requests({entry}),limits),db_error);
+    EXPECT_EQ(adapter->reserve_recovery_owned(sibling,0,10000).settlement.state,phase::refused);
+    EXPECT_THROW(canonical_writer_adapter::attach_retained_upstream_for_qualification(sibling,p,upstream,retention),db_error);
+    EXPECT_EQ(snapshot("_lattice_canonical_store"),store);EXPECT_EQ(snapshot("_lattice_canonical_attempt"),attempts);
+    EXPECT_EQ(snapshot("_lattice_canonical_receipt"),receipts);positive_receipt(capture(ticket,{entry}),entry,2);
+    committed(adapter->release_recovery_owned(owner,ticket));
+}
+
+TEST_F(CanonicalRetainedUpstream, RetirementDuringCaptureHoldsCustodyUntilGenerationEnds) {
+    watchdog bounded;attach();const auto entry=imported(101,1);ASSERT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});
+    auto ticket=reserve(0);auto* entered=adapter.get();bool retired=false;const auto incarnation=scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention");
+    EXPECT_THROW(canonical_retention_test_access::capture_requested(*entered,owner,ticket,requests({entry}),limits,[&](size_t,uint64_t){
+        if(retired)return;retired=true;adapter.reset();
+        EXPECT_THROW(canonical_writer_adapter::attach_retained_upstream_for_qualification(sibling,p,upstream,retention),db_error);
+        EXPECT_EQ(scalar(sibling->db(),"SELECT COUNT(*) FROM _lattice_canonical_attempt"),1);
+        EXPECT_EQ(scalar(sibling->db(),"SELECT incarnation FROM _lattice_canonical_retention"),incarnation);
+    }),db_error);
+    ASSERT_TRUE(retired);EXPECT_EQ(owner->local_read_generations_outstanding(),0u);attach();EXPECT_EQ(count(),0);
+    EXPECT_EQ(scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    EXPECT_THROW(capture(ticket,{entry}),db_error);EXPECT_EQ(adapter->release_recovery_owned(owner,ticket).state,phase::rolled_back);
+    auto successor=reserve(0);positive_receipt(capture(successor,{entry}),entry,2);EXPECT_EQ(head(),2);
+    committed(adapter->release_recovery_owned(owner,successor));
+}
+
+TEST_F(CanonicalRetainedUpstream, FileReopenFencesOldAttemptPreservesReceiptAndExpiryReleasesOnlyTailProtection) {
+    attach();const auto original=imported(101,1);ASSERT_EQ(apply({original}),std::vector<std::string>{original.global_id});
+    auto old=reserve(0);const auto incarnation=scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention");
+    adapter.reset();owner->close();sibling->close();owner.reset();sibling.reset();owner=open_owner(file.str());sibling=open_owner(file.str());attach();
+    EXPECT_EQ(count(),0);EXPECT_EQ(scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    EXPECT_THROW(capture(old,{original}),db_error);EXPECT_EQ(adapter->release_recovery_owned(owner,old).state,phase::rolled_back);
+    auto replacement=original;replacement.changed_fields["body"]=any_property("replacement");
+    EXPECT_EQ(apply({replacement}),std::vector<std::string>{original.global_id});EXPECT_EQ(head(),2);
+    auto current=reserve();positive_receipt(capture(current,{original}),original,2);EXPECT_EQ(body(row(capture(current,{original}),1)),"remote");
+    committed(adapter->release_recovery_owned(owner,current));
+    auto expiring=reserve({},1);const auto later=imported(102,1,"UPDATE","after reopen");ASSERT_EQ(apply({later}),std::vector<std::string>{later.global_id});
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));EXPECT_THROW(capture(expiring,{original,later}),db_error);EXPECT_EQ(count(),1);
+    committed(adapter->expire_recovery_owned(owner));EXPECT_EQ(count(),0);EXPECT_EQ(floor(),0);
+    committed(adapter->prune_recovery_owned(owner,head()));auto refresh=reserve(head());
+    auto final=capture(refresh,{original,later});EXPECT_EQ(body(row(final,1)),"after reopen");positive_receipt(final,original,2);positive_receipt(final,later,4);
+    committed(adapter->release_recovery_owned(owner,refresh));
+}
+
+TEST_F(CanonicalRetainedUpstream, ReopenCannotDowngradeAndLegacyUpstreamCannotSilentlyGainRetention) {
+    attach();const auto entry=imported(101,1);ASSERT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});auto ticket=reserve(0);adapter.reset();
+    const auto store=snapshot("_lattice_canonical_store"),attempts=snapshot("_lattice_canonical_attempt"),retained=snapshot("_lattice_canonical_retention");
+    auto local=p;local.upstream_requested=false;
+    EXPECT_THROW(canonical_writer_adapter::attach(*owner,local),db_error);
+    EXPECT_THROW(canonical_writer_adapter::attach_upstream_for_qualification(owner,p,upstream),db_error);
+    EXPECT_THROW(canonical_writer_adapter::attach_retention_for_qualification(owner,p,retention),db_error);
+    EXPECT_THROW(canonical_writer_adapter::attach_retained_upstream_for_qualification(owner,local,upstream,retention),db_error);
+    EXPECT_EQ(snapshot("_lattice_canonical_store"),store);EXPECT_EQ(snapshot("_lattice_canonical_attempt"),attempts);EXPECT_EQ(snapshot("_lattice_canonical_retention"),retained);
+    attach();EXPECT_EQ(count(),0);EXPECT_THROW(capture(ticket,{entry}),db_error);
+    TempDB legacy_file{"canonical-retained-upstream-legacy"};auto legacy_owner=open_owner(legacy_file.str());
+    auto legacy=canonical_writer_adapter::attach_upstream_for_qualification(legacy_owner,p,upstream);
+    ASSERT_EQ(legacy->apply_upstream_owned(legacy_owner,{entry}),std::vector<std::string>{entry.global_id});legacy.reset();
+    const auto legacy_before=legacy_owner->db().query("SELECT * FROM _lattice_canonical_store");
+    EXPECT_THROW(canonical_writer_adapter::attach_retained_upstream_for_qualification(legacy_owner,p,upstream,retention),db_error);
+    EXPECT_FALSE(legacy_owner->db().table_exists("_lattice_canonical_retention"));
+    EXPECT_EQ(legacy_owner->db().query("SELECT * FROM _lattice_canonical_store"),legacy_before);
+}
+
+TEST_F(CanonicalRetainedUpstream, CommittedImportObserverFailureKeepsReceiptAndReservation) {
+    attach();auto ticket=reserve(0);const auto entry=imported(101,1);const auto attempts=snapshot("_lattice_canonical_attempt");
+    size_t notifications=0;const auto token=owner->add_table_observer("RetentionRow",[&](const auto&){++notifications;throw std::runtime_error("committed retained import");});
+    EXPECT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});owner->remove_table_observer("RetentionRow",token);
+    EXPECT_EQ(notifications,1u);EXPECT_EQ(snapshot("_lattice_canonical_attempt"),attempts);EXPECT_FALSE(owner->db().is_in_transaction());
+    positive_receipt(capture(ticket,{entry}),entry,2);EXPECT_NE(adapter->prune_recovery_owned(owner,head()).state,phase::committed);
+    EXPECT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});EXPECT_EQ(head(),2);
+    committed(adapter->release_recovery_owned(owner,ticket));
+}
+
+TEST_F(CanonicalRetainedUpstream, RetirementFromCommittedImportCallbackPreservesReceiptAndFencesOldTicket) {
+    attach();auto ticket=reserve(0);const auto entry=imported(101,1);bool retired=false;
+    const auto token=owner->add_table_observer("RetentionRow",[&](const auto&){adapter.reset();retired=true;});
+    EXPECT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});owner->remove_table_observer("RetentionRow",token);
+    ASSERT_TRUE(retired);EXPECT_EQ(count(),1);EXPECT_EQ(head(),2);
+    EXPECT_THROW(owner->db().execute("UPDATE RetentionRow SET body='after retirement'"),db_error);
+    attach();EXPECT_EQ(count(),0);EXPECT_THROW(capture(ticket,{entry}),db_error);
+    auto current=reserve(0);positive_receipt(capture(current,{entry}),entry,2);EXPECT_EQ(body(row(capture(current,{entry}),1)),"remote");
+    committed(adapter->release_recovery_owned(owner,current));
+}
+
+TEST_F(CanonicalRetainedUpstream, ExplicitProtectedV2ReopenAddsImportAdmissionWithoutChangingInventory) {
+    auto local=p;local.upstream_requested=false;
+    auto prior=canonical_writer_adapter::attach_retention_for_qualification(owner,local,retention);
+    const auto schema=owner->db().query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name");
+    const auto binding=owner->db().query("SELECT version,max_attempts,max_duration_ms,main_device,main_inode,parent_device,parent_inode,custody_device,custody_inode FROM _lattice_canonical_retention");
+    const auto incarnation=scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention");prior.reset();attach();
+    EXPECT_EQ(owner->db().query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"),schema);
+    EXPECT_EQ(owner->db().query("SELECT version,max_attempts,max_duration_ms,main_device,main_inode,parent_device,parent_inode,custody_device,custody_inode FROM _lattice_canonical_retention"),binding);
+    EXPECT_EQ(scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    auto ticket=reserve(0);const auto entry=imported(101,1);EXPECT_EQ(apply({entry}),std::vector<std::string>{entry.global_id});
+    positive_receipt(capture(ticket,{entry}),entry,2);committed(adapter->release_recovery_owned(owner,ticket));
+}
+// End retained imported-original integration.
 #endif

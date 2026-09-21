@@ -1,4 +1,5 @@
 #include "sync_immediate_scheduler.hpp"
+#include "sync_discovery_deferral.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "receive_delivery_guard.hpp"
 #include "recovery_export_adapter.hpp"
@@ -591,6 +592,46 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
     return std::nullopt;
 }
 
+namespace detail {
+thread_local std::function<void()> sync_background_test_hooks::before_late_discovery;
+struct sync_upload_continuation {
+    bool sending=false,enumeration_hit_limit=false,late_replay_owned=false;
+    size_t skipped=0;
+    uint64_t generation=0,policy_revision=0;
+    std::string channel;
+    std::vector<audit_log_entry> entries;
+};
+}
+namespace {
+// Bound owned payload capacity, including parsed string/blob/map storage. The
+// fixed cell limit separately bounds closure/control metadata; this is not an
+// allocator RSS promise. Saturation makes every oversized input a refusal.
+struct discovery_charge {
+    size_t bytes=1024;
+    void add(size_t count,size_t width=1) {
+        constexpr auto cap=detail::sync_discovery_deferral::byte_limit;
+        if(bytes>cap||count>(cap-bytes)/width)bytes=cap+1;else bytes+=count*width;
+    }
+    void strings(const std::vector<std::string>& values) {
+        add(values.capacity(),sizeof(std::string));for(const auto& value:values)add(value.capacity()+1);
+    }
+    void entries(const std::vector<audit_log_entry>& values) {
+        add(values.capacity(),sizeof(audit_log_entry));
+        for(const auto& e:values) {
+            for(const auto* value:{&e.global_id,&e.table_name,&e.operation,&e.global_row_id,&e.timestamp})add(value->capacity()+1);
+            strings(e.changed_fields_names);
+            add(e.changed_fields.bucket_count(),sizeof(void*));
+            add(e.changed_fields.size(),sizeof(decltype(e.changed_fields)::value_type)+4*sizeof(void*));
+            for(const auto& [key,value]:e.changed_fields) {
+                add(key.capacity()+1);
+                if(const auto* str=std::get_if<std::string>(&value.value))add(str->capacity()+1);
+                if(const auto* blob=std::get_if<std::vector<uint8_t>>(&value.value))add(blob->capacity());
+            }
+        }
+    }
+};
+}
+
 // ============================================================================
 // synchronizer implementation
 // ============================================================================
@@ -612,6 +653,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 #endif
     callback_lifetime_=std::make_shared<detail::sync_callback_lifetime>(this,owned_db_);
     pacer_state_=std::make_shared<detail::sync_pacer_state>();
+    discovery_deferral_=std::make_shared<detail::sync_discovery_deferral>();
 #ifndef __EMSCRIPTEN__
     owns_inline_scheduler_adapter_=dynamic_cast<detail::sync_immediate_scheduler*>(scheduler_.get())!=nullptr;
 #endif
@@ -643,6 +685,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 #endif
     callback_lifetime_=std::make_shared<detail::sync_callback_lifetime>(this,owned_db_);
     pacer_state_=std::make_shared<detail::sync_pacer_state>();
+    discovery_deferral_=std::make_shared<detail::sync_discovery_deferral>();
 #ifndef __EMSCRIPTEN__
     owns_inline_scheduler_adapter_=dynamic_cast<detail::sync_immediate_scheduler*>(scheduler_.get())!=nullptr;
 #endif
@@ -739,7 +782,106 @@ void synchronizer_base::schedule_background(const char* stage,std::function<void
     scheduled->invoke([this,stage,work=std::move(work)] {background_operation(stage,work);});
 }
 void synchronizer_base::background_upload() noexcept {
-    background_operation("background upload",[this]{upload_pending_changes();});
+    background_operation("background upload",[this] {
+        const auto continuation=std::make_shared<detail::sync_upload_continuation>();
+        enqueue_discovery(detail::sync_discovery_kind::upload,"background upload",1024,
+            [this,continuation](detail::sync_discovery_operation& work) {
+                return upload_pending_changes_step(*continuation,&work);
+            });
+    });
+}
+
+void synchronizer_base::enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
+        std::function<bool(detail::sync_discovery_operation&)> step) {
+    const auto queue=discovery_deferral_;const auto state=pacer_state_;
+    const auto generation=callback_lifetime_->dispatch_generation();
+    auto work=std::make_shared<detail::sync_discovery_operation>();
+    work->type=kind;work->label=stage;work->generation=generation;work->charge=charge;work->step=std::move(step);
+#ifdef __EMSCRIPTEN__
+    // Browser builds have no native pacer and no owned-writer discovery probe.
+    // Preserve their existing scheduled, single-pass behavior.
+    schedule_background(stage,[work] {
+        if(!work->step(*work))throw db_error("browser discovery deferral is unavailable");
+    });
+    return;
+#else
+    const auto admitted=queue->push(std::move(work));
+    if(admitted==detail::sync_discovery_deferral::admission::obsolete)return;
+    // Overflow never acknowledges the rejected frame or evicts the queue head.
+    // The failed generation remains fenced until explicit connect/disconnect.
+    if(admitted==detail::sync_discovery_deferral::admission::exhausted) {
+        if(queue->take_failure(generation))throw db_error("sync discovery deferral capacity exhausted; route stopped; explicit replay required (one-shot senders have no replay guarantee)");
+        return;
+    }
+    state->ready.notify_one();
+    pump_discovery(); // All dependencies after this potentially reentrant call are retained.
+#endif
+}
+
+void synchronizer_base::pump_discovery() {
+    const auto queue=discovery_deferral_;const auto state=pacer_state_;
+    const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;const auto error=on_error_;
+    // Construct allocating ownership before reserving the sole dispatch.
+    // Destruction settles dropped work without calling back into a scheduler
+    // that may be destroying its queue under its own lock. The pacer reports
+    // the terminal state after this wake, outside that destruction stack.
+    struct dispatch_owner {
+        std::shared_ptr<detail::sync_discovery_deferral> queue;
+        std::shared_ptr<detail::sync_pacer_state> state;
+        detail::sync_discovery_deferral::ticket addressed;
+        bool reject() noexcept {
+            if(!queue->reject_unbegun(addressed))return false;
+            state->ready.notify_one();
+            return true;
+        }
+        ~dispatch_owner(){reject();}
+    };
+    const auto abandoned=std::make_exception_ptr(db_error("sync discovery scheduler admission failed; route stopped; explicit replay required"));
+    const auto reservation=std::make_shared<dispatch_owner>();
+    reservation->queue=queue;reservation->state=state;
+    const auto addressed=queue->dispatch(detail::sync_discovery_deferral::clock::now());
+    reservation->addressed=addressed;
+    if(!addressed) {
+        // Includes exhausted reservation identities; no integer wrap can
+        // resurrect an old callback's authority.
+        const auto generation=lifetime->dispatch_generation();
+        if(queue->take_failure(generation))
+            detail::report_sync_background_error(scheduled,lifetime,generation,error,abandoned,"discovery scheduler admission");
+        return;
+    }
+    try {scheduled->invoke([queue,state,lifetime,scheduled,error,addressed,reservation] {
+        // The wrapper scheduler may have captured a newer lifecycle at timer
+        // dispatch. This explicit ORIGINAL ticket is the authority to execute.
+        lifetime->queued(addressed.generation,[queue,state,lifetime,scheduled,error,addressed] {
+            auto ticket=addressed;
+            for(unsigned turn=0;turn<detail::sync_discovery_deferral::turn_limit;++turn) {
+                const auto work=queue->begin(ticket,detail::sync_discovery_deferral::clock::now());
+                if(!work)break;
+                bool done=true;std::exception_ptr failure;
+                try {done=work->step(*work);}catch(...) {failure=std::current_exception();}
+                queue->finish(ticket,work,done,detail::sync_discovery_deferral::clock::now());
+                if(failure)detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,work->label);
+                if(!lifetime->current(addressed.generation)||!done)break;
+                // Do not reserve a dispatch ticket beyond this bounded turn.
+                if(turn+1==detail::sync_discovery_deferral::turn_limit)break;
+                ticket=queue->dispatch(detail::sync_discovery_deferral::clock::now());
+                if(!ticket)break;
+            }
+            if(queue->take_failure(addressed.generation))
+                detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,
+                    std::make_exception_ptr(db_error("sync discovery deferral exhausted; route stopped; explicit replay required (one-shot senders have no replay guarantee)")),"discovery deferral");
+            state->ready.notify_one();
+        });
+    });}catch(...) {
+        const auto failure=std::current_exception();
+        if(reservation->reject()) {
+            if(queue->take_failure(addressed.generation))
+                detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,
+                    "discovery scheduler admission (route stopped; explicit replay required)");
+        } else
+            detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,
+                "discovery scheduler invocation after admission");
+    }
 }
 
 #ifndef __EMSCRIPTEN__
@@ -809,46 +951,51 @@ void synchronizer_base::maybe_checkpoint() {
 }
 
 void synchronizer_base::start_pacer() {
-    if (config_.upload_coalesce_ms <= 0 && config_.checkpoint_passive_interval_ms <= 0) return;
+    // Also owns transient-discovery wakeups when coalescing/checkpoints are off.
+    // Tests and callers that reconfigure pacing must never replace a live thread.
+    pacer_state_->coalesce_milliseconds.store(std::max(config_.upload_coalesce_ms,0),std::memory_order_release);
+    if(pacer_thread_.joinable()){pacer_state_->ready.notify_one();return;}
     const auto state=pacer_state_;const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;
+    const auto queue=discovery_deferral_;
     const auto heartbeat=std::chrono::milliseconds(config_.checkpoint_passive_interval_ms > 0
         ? std::min(config_.checkpoint_passive_interval_ms,60'000) : 60'000);
-    const auto coalesce=std::chrono::milliseconds(config_.upload_coalesce_ms);
     last_passive_ckpt_=std::chrono::steady_clock::now();last_truncate_ckpt_=last_passive_ckpt_;
-    pacer_thread_=std::thread([this,state,lifetime,scheduled,heartbeat,coalesce] {
-        // Everything used while waiting and after invoke returns is retained
-        // independently. An inline send may destroy the synchronizer itself.
+    pacer_thread_=std::thread([this,state,lifetime,scheduled,queue,heartbeat] {
         try {
+        auto maintenance_at=std::chrono::steady_clock::now()+heartbeat;
         std::unique_lock<std::mutex> lock(state->mutex);
         for (;;) {
-            state->ready.wait_for(lock,heartbeat,[&]{return state->stop||state->requested.load(std::memory_order_acquire);});
+            const auto revision=queue->revision();
+            const bool requested=state->requested.load(std::memory_order_acquire);
+            const auto coalesce=std::chrono::milliseconds(state->coalesce_milliseconds.load(std::memory_order_acquire));
+            auto wake=std::min(maintenance_at,queue->wake_at());
+            if(coalesce.count()>0&&requested)wake=std::min(wake,state->next_allowed_tick);
+            state->ready.wait_until(lock,wake,[&]{return state->stop||queue->revision()!=revision||
+                state->requested.load(std::memory_order_acquire)!=requested||
+                state->coalesce_milliseconds.load(std::memory_order_acquire)!=coalesce.count();});
             if(state->stop)return;
+            const auto now=std::chrono::steady_clock::now();
+            const bool maintenance=now>=maintenance_at;
+            if(maintenance)maintenance_at=now+heartbeat;
+            const bool upload=coalesce.count()>0&&now>=state->next_allowed_tick&&state->requested.exchange(false,std::memory_order_acq_rel);
+            if(upload)state->next_allowed_tick=now+coalesce;
             lock.unlock();
             const auto generation=lifetime->dispatch_generation();
-            lifetime->queued(generation,[this,lifetime,scheduled,generation] {
+            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload] {
                 on_error_handler error;
                 try {
-                    error=on_error_;maybe_checkpoint();
+                    error=on_error_;
+                    if(maintenance) {
+                        maybe_checkpoint();if(!lifetime->current(generation))return;
+                        db().run_read_pool_maintenance_all_instances();
+                    }
                     if(!lifetime->current(generation))return;
-                    db().run_read_pool_maintenance_all_instances();
-                }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,std::move(error),std::current_exception(),"pacer maintenance");}
-                // No owner access after the possible callback/error delivery.
+                    if(upload)background_upload();
+                    if(!lifetime->current(generation))return;
+                    pump_discovery();
+                }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,std::move(error),std::current_exception(),"pacer maintenance/discovery");}
             });
-            lock.lock();
-            if(state->stop)return;
-            if(!state->requested.load(std::memory_order_acquire))continue;
-            while(!state->stop&&std::chrono::steady_clock::now()<state->next_allowed_tick)
-                state->ready.wait_until(lock,state->next_allowed_tick);
-            if(state->stop)return;
-            if(state->requested.exchange(false,std::memory_order_acq_rel)) {
-                state->next_allowed_tick=std::chrono::steady_clock::now()+coalesce;
-                lock.unlock();
-                scheduled->invoke([this] {
-                    if(is_destroyed_)return;
-                    background_upload();
-                });
-                lock.lock(); // Only retained state; the owner may be gone.
-            }
+            lock.lock(); // Only independently retained state after owner callbacks.
         }
         }catch(...) {detail::report_sync_background_error(scheduled,lifetime,lifetime->dispatch_generation(),{},std::current_exception(),"pacer worker");}
     });
@@ -863,7 +1010,13 @@ void synchronizer_base::stop_pacer() {
         state->stop=true;thread=std::move(pacer_thread_);
     }
     state->ready.notify_all();
-    if(thread.joinable())thread.join(); // Legacy path retains its existing self-close limit.
+    if(thread.joinable()) {
+        // A retry error/send callback may retire an ordinary owner on its own
+        // pacer. The loop has only retained state after callback return and
+        // observes stop before any next owner admission; no self-join is legal.
+        if(thread.get_id()==std::this_thread::get_id())thread.detach();
+        else thread.join();
+    }
 }
 
 #endif  // !__EMSCRIPTEN__
@@ -939,6 +1092,7 @@ synchronizer_base::~synchronizer_base() {
     // FIRST retire callback/queued admission. Request off-callback transport
     // teardown before waiting, then drain foreign turns before member teardown.
     if(callback_lifetime_)callback_lifetime_->retire();
+    if(discovery_deferral_)discovery_deferral_->cancel(reconnect_lifecycle_.load(),true);
     is_destroyed_=true;
     if(!retire_protected_transport()) {
         if(recovery_export_route_)recovery_export_route_->retire();
@@ -992,8 +1146,14 @@ uint64_t synchronizer_base::advance_reconnect_lifecycle(bool enabled) {
         next = ((prior & ~uint64_t{1}) + 2) | (enabled ? uint64_t{1} : uint64_t{0});
     } while (!reconnect_lifecycle_.compare_exchange_weak(prior, next));
     if(callback_lifetime_)callback_lifetime_->publish_generation(next);
+    if(discovery_deferral_)discovery_deferral_->cancel(next);
     if(recovery_export_route_)recovery_export_route_->publish(next,false);
     return next;
+}
+
+bool synchronizer_base::receive_lifecycle_stopped(uint64_t lifecycle) const noexcept {
+    return (lifecycle >> 1)<receive_stop_generation_.load(std::memory_order_acquire)||
+        (discovery_deferral_&&discovery_deferral_->failed(lifecycle));
 }
 
 void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
@@ -1086,12 +1246,14 @@ void synchronizer_base::sync_now() {
 }
 
 void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
+    const auto queue=discovery_deferral_;
     const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;
     const auto generation=lifetime->dispatch_generation();
     bool should_dispatch=false;
-    lifetime->queued(generation,[this,&should_dispatch] {
+    lifetime->queued(generation,[this,queue,generation,&should_dispatch] {
         if(!is_connected_||is_destroyed_)return;
-        bool pending=progress_pending_upload_.load(std::memory_order_relaxed)>0;
+        if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
+        bool pending=queue->pending(generation)||progress_pending_upload_.load(std::memory_order_relaxed)>0;
         if(!pending){std::lock_guard<std::mutex> lock(in_flight_mutex_);pending=!in_flight_ids_.empty();}
         if(!pending)pending=!db().db().query("SELECT 1 FROM AuditLog WHERE isSynchronized=0 LIMIT 1").empty();
         should_dispatch=pending;
@@ -1116,7 +1278,8 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
             pending=progress_pending_upload_.load(std::memory_order_relaxed);
             if(expired)label=log_id();
         });
-        if(!admitted||!connected||(done&&pending<=0))return;
+        if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
+        if(!admitted||!connected||(done&&pending<=0&&!queue->pending(generation)))return;
         if(expired){LOG_INFO("synchronizer","[%s] drain: deadline reached with pending=%lld — disconnecting anyway",label.c_str(),static_cast<long long>(pending));return;}
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -1144,10 +1307,13 @@ void synchronizer_base::on_websocket_open() {
     // Dispatch to scheduler — on_open may fire synchronously on the calling
     // thread (e.g., IPC accept on the main thread). Reconciliation and the
     // initial upload must not block the caller.
-    schedule_background("initial upload",[this,generation] {
-        if (is_destroyed_) return;
-        recovery_export_route_->publish(generation,true);
-        if(upload_protected_entries())return;
+    recovery_export_route_->publish(generation,true);
+    enqueue_discovery(detail::sync_discovery_kind::initial_upload,"initial upload",1024,[this,generation,lifetime](detail::sync_discovery_operation&) {
+        if (is_destroyed_||!is_connected_||!lifetime->current(generation)) return true;
+        bool busy=false;
+        if(upload_protected_entries(&busy))return true;
+        if(busy)return false;
+        if(!lifetime->current(generation))return true;
         register_replication_slot(db().db(), config_.sync_id, config_.is_observer);
 
         // Fresh floor-bookkeeping baseline for this connection: unresolved
@@ -1171,16 +1337,20 @@ void synchronizer_base::on_websocket_open() {
             LOG_INFO("synchronizer", "[%s] fresh peer (no applied remote entries) — sending replay request",
                      log_id());
             auto req = server_sent_event::make_replay_request().to_json();
-            ws_client_->send(transport_message::from_binary({req.begin(), req.end()}));
+            const auto transport=ws_client_;
+            transport->send(transport_message::from_binary({req.begin(), req.end()}));
+            if(!lifetime->current(generation))return true;
         }
 
         if (config_.sync_filter) {
             LOG_DEBUG("synchronizer", "Reconciling sync filter on connect...");
             reconcile_sync_filter();
+            if(!lifetime->current(generation))return true;
         }
 
         LOG_DEBUG("synchronizer", "Calling upload_pending_changes...");
-        upload_pending_changes();
+        background_upload();
+        return true;
     });
 }
 
@@ -1240,18 +1410,22 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             }
             auto entry_count = entries.size();
             const auto receive_lifecycle = reconnect_lifecycle_.load();
-            schedule_background("remote intake",[this, entries = std::move(entries), entry_count,
+            discovery_charge charge;charge.entries(entries);charge.strings(skipped_filter_removals);
+            enqueue_discovery(detail::sync_discovery_kind::intake,"remote intake",charge.bytes,[this, entries = std::move(entries), entry_count,
                                 receive_lifecycle,
-                                skipped_filter_removals = std::move(skipped_filter_removals)] {
+                                skipped_filter_removals = std::move(skipped_filter_removals)](detail::sync_discovery_operation&) {
                 if (is_destroyed_ || receive_lifecycle_stopped(receive_lifecycle) ||
                     reconnect_lifecycle_.load() != receive_lifecycle) {
                     LOG_INFO("synchronizer", "[%s] scheduler lambda: is_destroyed_, skipping apply of %zu entries",
                              log_id(), entry_count);
-                    return;
+                    return true;
                 }
-                if(has_export_protection())throw db_error("protected export route refuses unadapted remote intake");
+                const auto protected_store=try_has_export_protection();
+                if(!protected_store)return false;
+                if(*protected_store)throw db_error("protected export route refuses unadapted remote intake");
                 LOG_INFO("synchronizer", "[%s] scheduler lambda: applying %zu entries (db=%s)",
                          log_id(), entries.size(), db().config().path.c_str());
+                const auto intake_lifetime=callback_lifetime_;
                 std::vector<std::string> applied_ids;
                 try { applied_ids = apply_remote_changes(entries); }
                 catch (const detail::receive_admission_error&) {
@@ -1263,8 +1437,9 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     while (previous < stopped_through && !receive_stop_generation_.compare_exchange_weak(
                         previous, stopped_through, std::memory_order_acq_rel)) {}
                     LOG_WARN("synchronizer", "receive intake refused; route stopped until explicit replay connection");
-                    return;
+                    return true;
                 }
+                if(!intake_lifetime->current(receive_lifecycle))return true;
                 // Ack skipped filter-removals as if applied (see above).
                 applied_ids.insert(applied_ids.end(),
                                    skipped_filter_removals.begin(),
@@ -1281,7 +1456,9 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                              log_id(), applied_ids.size(),
                              static_cast<int>(ws_client_->state()),
                              db().config().path.c_str());
-                    ws_client_->send(transport_message::from_binary({json_ack.begin(), json_ack.end()}));
+                    const auto transport=ws_client_;
+                    transport->send(transport_message::from_binary({json_ack.begin(), json_ack.end()}));
+                    if(!intake_lifetime->current(receive_lifecycle))return true;
                 }
 
                 // If some entries failed, schedule a retry so the sender re-uploads them
@@ -1290,6 +1467,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                              applied_ids.size(), entries.size(),
                              entries.size() - applied_ids.size());
                 }
+                return true;
             });
 
         } else if (event->event_type == server_sent_event::type::ack) {
@@ -1297,14 +1475,18 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             auto ids = std::move(event->acked_ids);
             const auto generation=reconnect_lifecycle_.load();
             auto route=recovery_export_route_;
-            schedule_background("transport ACK",[this, ids = std::move(ids),generation,route] {
-                if (is_destroyed_||reconnect_lifecycle_.load()!=generation) return;
-                if(callback_lifetime_->protected_route()&&!route->current(generation))return;
-                mark_as_synced(ids);
-                if(!route->current(generation))return;
+            discovery_charge charge;charge.strings(ids);
+            enqueue_discovery(detail::sync_discovery_kind::ack,"transport ACK",charge.bytes,[this, ids = std::move(ids),generation,route](detail::sync_discovery_operation&) {
+                if (is_destroyed_||reconnect_lifecycle_.load()!=generation) return true;
+                if(callback_lifetime_->protected_route()&&!route->current(generation))return true;
+                const auto protected_store=try_has_export_protection();
+                if(!protected_store)return false;
+                mark_as_synced_after_discovery(ids,*protected_store);
+                if(!route->current(generation))return true;
                 if (on_sync_complete_) {
                     on_sync_complete_(ids);
                 }
+                return true;
             });
 
         } else if (event->event_type == server_sent_event::type::replay_request) {
@@ -1335,7 +1517,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                     stall_min_open_ = -1;
                 }
                 reconcile_sync_filter();
-                upload_pending_changes();
+                background_upload();
             });
         }
     } catch (const std::exception& e) {
@@ -1605,6 +1787,15 @@ bool synchronizer_base::sync_set_contains(const std::string& table_name, const s
 // Sync filter update / clear
 // ============================================================================
 
+void synchronizer_base::advance_upload_policy_revision() {
+    auto current=upload_policy_revision_.load(std::memory_order_acquire);
+    for(;;) {
+        if(current==std::numeric_limits<uint64_t>::max())
+            throw db_error("sync filter policy revision exhausted; mutation refused");
+        if(upload_policy_revision_.compare_exchange_weak(current,current+1,std::memory_order_acq_rel))return;
+    }
+}
+
 void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter) {
     // Bump version BEFORE scheduling — if another update arrives before this
     // lambda runs, the version will have advanced and we skip the stale reconcile.
@@ -1613,6 +1804,7 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
     auto version = filter_version_.fetch_add(1, std::memory_order_acq_rel) + 1;
     schedule_background("filter update",[this, filter = std::move(filter), version]() mutable {
         if(has_export_protection())throw db_error("protected export route refuses legacy filter mutation");
+        advance_upload_policy_revision();
         if (filter_version_.load(std::memory_order_acquire) != version) {
             LOG_DEBUG("synchronizer", "Skipping stale filter reconcile (version %llu, current %llu)",
                       (unsigned long long)version,
@@ -1665,13 +1857,14 @@ void synchronizer_base::update_sync_filter(std::vector<sync_filter_entry> filter
         // whose INSERT entries are still pending). Reconcile only uploads when
         // it synthesized something, so kick the pipeline unconditionally —
         // a no-op when nothing is pending.
-        upload_pending_changes();
+        background_upload();
     });
 }
 
 void synchronizer_base::clear_sync_filter() {
     schedule_background("filter clear",[this] {
         if(has_export_protection())throw db_error("protected export route refuses legacy filter mutation");
+        advance_upload_policy_revision();
         config_.sync_filter = std::nullopt;
         // Clear THIS channel's sync set — without a filter, everything syncs
         // via the normal path. Other channels' membership is untouched.
@@ -1873,7 +2066,7 @@ void synchronizer_base::reconcile_sync_filter() {
     // Trigger normal upload pipeline — entries get in-flight tracking,
     // chunked sending, ACK confirmation, and retry on reconnect.
     if (has_changes) {
-        upload_pending_changes();
+        background_upload();
     }
 }
 
@@ -2338,7 +2531,13 @@ void synchronizer_base::reconcile_open_with_db() {
 
 void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     if(has_export_protection())throw db_error("protected export requires a committed prepared frame");
+    send_entries_after_discovery(entries);
+}
+
+void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry>& entries) {
     if (entries.empty()) return;
+    const auto lifetime=callback_lifetime_;const auto generation=reconnect_lifecycle_.load();
+    const auto transport=ws_client_;
 
     // Flow control: send at most a small window of chunks per invocation.
     // Blasting the whole backlog (25 x 1MB frames in one burst) overran the
@@ -2382,6 +2581,7 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
     progress_total_upload_.fetch_add(
         static_cast<int64_t>(window_end), std::memory_order_relaxed);
     fire_progress();
+    if(!lifetime->current(generation))return;
     if (window_end < entries.size()) {
         LOG_INFO("synchronizer", "[%s] send window: %zu of %zu entries (rest pend on ACKs)",
                  log_id(), window_end, entries.size());
@@ -2403,7 +2603,8 @@ void synchronizer_base::send_entries(std::vector<audit_log_entry>& entries) {
         auto json_str = event.to_json();
         LOG_DEBUG("synchronizer", "Sending %zu entries to server: %s",
                   chunk.size(), json_str.substr(0, 200).c_str());
-        ws_client_->send(transport_message::from_binary({json_str.begin(), json_str.end()}));
+        transport->send(transport_message::from_binary({json_str.begin(), json_str.end()}));
+        if(!lifetime->current(generation))return;
     }
     entries.resize(window_end);
 
@@ -2519,7 +2720,15 @@ bool synchronizer_base::has_export_protection() {
 #endif
 }
 
-bool synchronizer_base::upload_protected_entries() {
+std::optional<bool> synchronizer_base::try_has_export_protection() {
+#ifdef __EMSCRIPTEN__
+    return false;
+#else
+    return detail::recovery_export_adapter::try_protected_store(owned_db_);
+#endif
+}
+
+bool synchronizer_base::upload_protected_entries(bool* discovery_busy) {
 #ifdef __EMSCRIPTEN__
     return false;
 #else
@@ -2529,9 +2738,18 @@ bool synchronizer_base::upload_protected_entries() {
     const size_t chunk=std::min<size_t>(config_.chunk_size,1000);
     std::vector<int64_t> in_flight;
     {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& [id,n]:in_flight_ids_)in_flight.push_back(n);}
-    if(in_flight.size()>=2000)return has_export_protection();
+    if(in_flight.size()>=2000) {
+        if(!discovery_busy)return has_export_protection();
+        const auto protected_store=try_has_export_protection();
+        if(!protected_store){*discovery_busy=true;return false;}
+        return *protected_store;
+    }
     const size_t count=std::min(chunk,2000-in_flight.size());
-    auto prepared=detail::recovery_export_adapter::prepare_pending(owner,channel,generation,count,in_flight,filtered);
+    std::optional<detail::recovery_export_preparation> result;
+    if(discovery_busy)result=detail::recovery_export_adapter::try_prepare_pending(owner,channel,generation,count,in_flight,filtered);
+    else result=detail::recovery_export_adapter::prepare_pending(owner,channel,generation,count,in_flight,filtered);
+    if(!result){*discovery_busy=true;return false;}
+    auto& prepared=*result;
     // The owned operation can deliver callbacks. Only independent retained
     // route state is touched before deciding whether owner access is still live.
     if(!lifetime->current(generation)||!route->current(generation))return true;
@@ -2560,70 +2778,136 @@ void synchronizer_base::send_entries(detail::committed_export_frame frame) {
 }
 
 void synchronizer_base::upload_pending_changes() {
+    if(discovery_deferral_->failed(reconnect_lifecycle_.load()))
+        throw db_error("sync discovery deferral failed; explicit replay required");
+    if(discovery_deferral_->pending(reconnect_lifecycle_.load()))
+        throw db_error("sync upload is pending discovery deferral");
+    detail::sync_upload_continuation continuation;
+    (void)upload_pending_changes_step(continuation,nullptr);
+}
+
+bool synchronizer_base::upload_pending_changes_step(detail::sync_upload_continuation& continuation,
+                                                   detail::sync_discovery_operation* work) {
     LOG_DEBUG("synchronizer", "upload_pending_changes called");
     if (!is_connected_) {
         LOG_DEBUG("synchronizer", "upload_pending_changes: not connected, skipping");
-        return;
+        return true;
     }
-    if(upload_protected_entries())return;
-    // DB-truth belt for the floor (runs before the horizon read so a swept
-    // prefix can advance the floor this same pass).
-    reconcile_open_with_db();
-    // Horizon BEFORE the scan: if the pass then enumerates nothing, no
-    // entry <= horizon is pending for this channel (writes that land after
-    // the horizon read are past it and unaffected).
-    int64_t scan_horizon = 0;
-    if (config_.use_upload_floor) {
-        auto h = db().db().query("SELECT COALESCE(MAX(id), 0) AS m FROM AuditLog", {});
-        if (!h.empty() && std::holds_alternative<int64_t>(h[0].at("m"))) {
-            scan_horizon = std::get<int64_t>(h[0].at("m"));
-        }
-    }
-    bool enumeration_hit_limit = false;
-    auto entries = query_pending_entries(enumeration_hit_limit);
-    if (entries.empty()) {
-        // A channel whose filter matches nothing NEVER enumerates a row, so
-        // its floor never advances and its slot pins compaction at 0 forever
-        // (production: two filtered-to-nothing group slots vetoed collapse
-        // of 4.67M rows). An empty pass with nothing open/in-flight proves
-        // everything <= horizon is resolved for this channel — advance the
-        // floor so compaction can pass it. Safe on filter WIDENING: newly
-        // matching rows are re-delivered via reconcile Phase-2 full-row
-        // snapshots, never by audit replay.
-        if (config_.use_upload_floor && scan_horizon > 0) {
-            bool nothing_open;
-            {
-                std::lock_guard<std::mutex> lock(in_flight_mutex_);
-                nothing_open = open_audit_ids_.empty() && in_flight_ids_.empty();
-            }
-            if (nothing_open) {
-                detail::recovery_writer_access::legacy_sync_write(db(), [&](database& writer) {
-                    writer.execute(R"(
-                        INSERT INTO _lattice_replication_slots (sync_id, upload_floor, last_active_at)
-                        VALUES (?, ?, datetime('now'))
-                        ON CONFLICT(sync_id) DO UPDATE SET
-                            upload_floor = MAX(upload_floor, excluded.upload_floor),
-                            last_active_at = excluded.last_active_at
-                    )", {config_.sync_id, scan_horizon});
-                });
+    const auto lifetime=callback_lifetime_;const auto generation=reconnect_lifecycle_.load();
+    const auto queue=discovery_deferral_;
+    if(work&&work->generation!=generation)return true;
+    if(!continuation.sending) {
+        bool busy=false;
+        if(upload_protected_entries(work?&busy:nullptr))return true;
+        if(busy)return false;
+        if(!lifetime->current(generation))return true;
+        continuation.policy_revision=upload_policy_revision_.load(std::memory_order_acquire);
+        // DB-truth belt for the floor (runs before the horizon read so a swept
+        // prefix can advance the floor this same pass).
+        reconcile_open_with_db();
+        // Horizon BEFORE the scan: if the pass then enumerates nothing, no
+        // entry <= horizon is pending for this channel (writes that land after
+        // the horizon read are past it and unaffected).
+        int64_t scan_horizon = 0;
+        if (config_.use_upload_floor) {
+            auto h = db().db().query("SELECT COALESCE(MAX(id), 0) AS m FROM AuditLog", {});
+            if (!h.empty() && std::holds_alternative<int64_t>(h[0].at("m"))) {
+                scan_horizon = std::get<int64_t>(h[0].at("m"));
             }
         }
-        return;
+        bool enumeration_hit_limit = false;
+        auto entries = query_pending_entries(enumeration_hit_limit);
+        if (entries.empty()) {
+            // A channel whose filter matches nothing NEVER enumerates a row, so
+            // its floor never advances and its slot pins compaction at 0 forever
+            // (production: two filtered-to-nothing group slots vetoed collapse
+            // of 4.67M rows). An empty pass with nothing open/in-flight proves
+            // everything <= horizon is resolved for this channel — advance the
+            // floor so compaction can pass it. Safe on filter WIDENING: newly
+            // matching rows are re-delivered via reconcile Phase-2 full-row
+            // snapshots, never by audit replay.
+            if (config_.use_upload_floor && scan_horizon > 0) {
+                bool nothing_open;
+                {
+                    std::lock_guard<std::mutex> lock(in_flight_mutex_);
+                    nothing_open = open_audit_ids_.empty() && in_flight_ids_.empty();
+                }
+                if (nothing_open) {
+                    detail::recovery_writer_access::legacy_sync_write(db(), [&](database& writer) {
+                        writer.execute(R"(
+                            INSERT INTO _lattice_replication_slots (sync_id, upload_floor, last_active_at)
+                            VALUES (?, ?, datetime('now'))
+                            ON CONFLICT(sync_id) DO UPDATE SET
+                                upload_floor = MAX(upload_floor, excluded.upload_floor),
+                                last_active_at = excluded.last_active_at
+                        )", {config_.sync_id, scan_horizon});
+                    });
+                }
+            }
+            return true;
+        }
+        auto classified = classify_entries(entries);
+
+        // Progress accounting happens in send_entries AFTER windowing: counting
+        // the full classified backlog here (pre-window) meant `pending` never
+        // returned to 0 during a multi-window catch-up — every pass re-counted
+        // the un-sent remainder, inflating pending/total unboundedly (observed
+        // 180MB "pending"), permanently blocking drain()'s pending==0 exit and
+        // any idle-gated work. The invariant is now: pending == in-flight
+        // (sent-but-unACKed) exactly; total counts only entries actually sent.
+
+        continuation.skipped=classified.to_mark_synced.size();
+        // Only an unfiltered floor-tracked pass has a proved real pending-row
+        // owner here. No synthetic or already globally synchronized row is parked.
+        // Skipped IDs must be empty (hence disjoint); no sync-set/skip effects may
+        // have changed replay ownership. The original vector is retained exactly.
+        continuation.late_replay_owned=!config_.sync_filter&&config_.use_upload_floor&&
+            classified.to_mark_synced.empty()&&std::all_of(classified.to_send.begin(),classified.to_send.end(),
+                [](const auto& e){return e.id>0&&!e.is_synchronized&&!e.synthesized;});
+        if(continuation.late_replay_owned) {
+            std::lock_guard<std::mutex> lock(in_flight_mutex_);
+            for(const auto& e:classified.to_send)
+                if(!open_audit_ids_.count(e.id))continuation.late_replay_owned=false;
+        }
+        mark_skipped_synced(classified.to_mark_synced);
+        continuation.entries=std::move(classified.to_send);
+        continuation.enumeration_hit_limit=enumeration_hit_limit;
+        continuation.channel=config_.sync_id;continuation.generation=generation;
+        continuation.sending=true; // Never repeat enumeration/classification/skips.
+        if(work)work->coalescible.store(false,std::memory_order_release);
+        const auto before_late=detail::sync_background_test_hooks::before_late_discovery;
+        if(before_late)before_late();
+        if(!lifetime->current(generation))return true;
     }
-    auto classified = classify_entries(entries);
-
-    // Progress accounting happens in send_entries AFTER windowing: counting
-    // the full classified backlog here (pre-window) meant `pending` never
-    // returned to 0 during a multi-window catch-up — every pass re-counted
-    // the un-sent remainder, inflating pending/total unboundedly (observed
-    // 180MB "pending"), permanently blocking drain()'s pending==0 exit and
-    // any idle-gated work. The invariant is now: pending == in-flight
-    // (sent-but-unACKed) exactly; total counts only entries actually sent.
-
-    const size_t skipped = classified.to_mark_synced.size();
-    mark_skipped_synced(classified.to_mark_synced);
-    send_entries(classified.to_send);
-    const size_t sent = classified.to_send.size();  // resized to the window by send_entries
+    if(continuation.generation!=generation||continuation.channel!=config_.sync_id)return true;
+    if(continuation.policy_revision!=upload_policy_revision_.load(std::memory_order_acquire)) {
+        // No byte of this retained vector was sent. Its old classification is
+        // no longer authorized, even if update+clear returned to an unfiltered
+        // configuration. Leave committed bookkeeping alone and retain a NEW
+        // demand for the real pending rows under the current policy.
+        if(!work)throw db_error("sync upload policy changed before send; explicit new pass required");
+        background_upload();
+        return true; // No owner access after possibly reentrant admission.
+    }
+    if(!work)send_entries(continuation.entries);
+    else {
+        const auto protected_store=try_has_export_protection();
+        if(!protected_store) {
+            if(!continuation.late_replay_owned)
+                throw db_error("late send discovery busy: filtered/synthetic or unowned replay is not supported");
+            discovery_charge charge;charge.entries(continuation.entries);charge.add(continuation.channel.capacity());
+            if(!queue->resize(work,charge.bytes))
+                throw db_error("late send discovery payload exceeds retention budget; real audit rows remain pending");
+            return false;
+        }
+        if(*protected_store)throw db_error("protected export requires a committed prepared frame");
+        if(!lifetime->current(generation))return true;
+        send_entries_after_discovery(continuation.entries);
+    }
+    const size_t sent=continuation.entries.size();
+    const size_t skipped=continuation.skipped;
+    const bool enumeration_hit_limit=continuation.enumeration_hit_limit;
+    if(!lifetime->current(generation))return true;
 
     // Catch-up continuation: a full enumeration window with real progress
     // (something sent or skipped-resolved) means more backlog waits beyond
@@ -2638,24 +2922,31 @@ void synchronizer_base::upload_pending_changes() {
     if (enumeration_hit_limit && (sent > 0 || skipped > 0)) {
         schedule_background("upload continuation",[this] {
             if (is_destroyed_) return;
-            upload_pending_changes();
+            background_upload();
         });
     }
+    return true;
 }
 
 std::vector<std::string> synchronizer_base::apply_remote_changes(const std::vector<audit_log_entry>& entries) {
+    const auto lifetime=callback_lifetime_;const auto generation=reconnect_lifecycle_.load();
     auto applied = lattice::apply_remote_changes_for(db(), entries, config_.sync_id);
+    if(!lifetime->current(generation))return applied;
     progress_received_.fetch_add(static_cast<int64_t>(applied.size()), std::memory_order_relaxed);
     fire_progress();
     return applied;
 }
 
 void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_ids) {
+    const bool protected_store=has_export_protection();
+    mark_as_synced_after_discovery(global_ids,protected_store);
+}
+
+void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::string>& global_ids,bool protected_store) {
     LOG_INFO("synchronizer", "[%s] mark_as_synced: %zu entries ACK'd (progress_acked was %lld)",
              log_id(), global_ids.size(),
              (long long)progress_acked_.load(std::memory_order_relaxed));
     const auto owner=owned_db_;const auto route=recovery_export_route_;const auto lifetime=callback_lifetime_;const auto generation=reconnect_lifecycle_.load();
-    const auto protected_store=has_export_protection();
     if(!lifetime->current(generation))return;
     if(protected_store) {
         std::vector<std::string> matched;std::set<std::string> seen;
@@ -2665,10 +2956,11 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
         if(!route->current(generation))return;
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:matched)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
         progress_acked_.fetch_add(static_cast<int64_t>(matched.size()));ack_resend_failures_.store(0);
-        schedule_background("ACK continuation",[this,route,generation]{if(!route->current(generation))return;upload_pending_changes();});
+        schedule_background("ACK continuation",[this,route,generation]{if(!route->current(generation))return;background_upload();});
         return; // No canonical receipt, floor advance or eager audit cleanup.
     }
     mark_audit_entries_synced_for(db(), global_ids, config_.sync_id, config_.all_active_sync_ids);
+    if(!lifetime->current(generation))return;
 
     // Remove ACK'd entries from in-flight set; pending mirrors the set size
     // (store, not fetch_sub — an ACK straddling a reconnect clear must not
@@ -2746,6 +3038,7 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
 
     progress_acked_.fetch_add(static_cast<int64_t>(global_ids.size()), std::memory_order_relaxed);
     fire_progress();
+    if(!lifetime->current(generation))return;
 
     // After processing ACKs, check if more pending entries exist that aren't
     // already in-flight. Without this, entries created during sync (e.g. from
@@ -2770,7 +3063,7 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
         // to one window per coalesce interval.
         schedule_background("upload continuation",[this] {
             if (is_destroyed_) return;
-            upload_pending_changes();
+            background_upload();
         });
     }
 }

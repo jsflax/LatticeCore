@@ -81,11 +81,17 @@ class recovery_export_adapter {
     static void revalidate_claimed_frame(const committed_export_frame&);
     static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
-        const recovery_export_limits&,std::optional<int64_t> history_after);
+        const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr);
 public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.
     static bool protected_store(std::shared_ptr<lattice_db>);
+    // Nullopt is exclusively the first no-effect mutex probe being busy.
+    // Every other classifier/preparation failure still throws unchanged.
+    static std::optional<bool> try_protected_store(std::shared_ptr<lattice_db>);
+    static std::optional<recovery_export_preparation> try_prepare_pending(std::shared_ptr<lattice_db>,
+        const std::string& sync_id,uint64_t physical_generation,size_t maximum_entries,
+        const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& = {});
     static recovery_export_preparation prepare_pending(std::shared_ptr<lattice_db>,
         const std::string& sync_id,uint64_t physical_generation,size_t maximum_entries,
         const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& = {});

@@ -657,6 +657,14 @@ std::unique_ptr<canonical_writer_adapter> canonical_writer_adapter::attach_upstr
         refuse("canonical upstream qualification requires explicit bounded profile and retained owner");
     return std::unique_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p,&limits));
 }
+std::unique_ptr<canonical_writer_adapter> canonical_writer_adapter::attach_retained_upstream_for_qualification(
+    std::shared_ptr<lattice_db> owner,const canonical_writer_profile& p,
+    canonical_upstream_limits upstream,canonical_retention_limits retention) {
+    if(!owner || !p.upstream_requested || !upstream.entries || !upstream.field_bytes || !upstream.delivery_bytes ||
+        upstream.field_bytes>upstream.delivery_bytes || upstream.delivery_bytes>static_cast<size_t>(std::numeric_limits<int>::max()/8))
+        refuse("canonical retained upstream requires explicit bounded profile and retained owner");
+    return std::unique_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p,&upstream,&retention));
+}
 bool canonical_writer_adapter::matches_connection(const database& writer,sqlite3* handle) noexcept {
     return writer.internal_handle()==handle;
 }

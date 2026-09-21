@@ -14,6 +14,8 @@ namespace sync_background_test_hooks {
 // Callbacks may only coordinate a test; completion must not throw.
 struct ack_schedule {std::function<void()> before_expiry,completed;};
 extern thread_local std::shared_ptr<const ack_schedule> ack;
+// Source fixture rendezvous immediately before the late no-effect probe.
+extern thread_local std::function<void()> before_late_discovery;
 }
 
 // The pacer may wake after its synchronizer has retired. Waiting, coalescing
@@ -24,6 +26,7 @@ struct sync_pacer_state {
     std::condition_variable ready;
     bool stop=false;
     std::atomic<bool> requested{false};
+    std::atomic<int> coalesce_milliseconds{0};
     std::chrono::steady_clock::time_point next_allowed_tick{};
 };
 // Admission fences physical C++ owner teardown. A shared cell alone is not an

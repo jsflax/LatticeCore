@@ -307,6 +307,18 @@ void recovery_export_adapter::require_committed(const recovery_install_result& r
 bool recovery_export_adapter::protected_store(std::shared_ptr<lattice_db> owner){
     return recovery_local_producer_adapter::export_protection_required(std::move(owner));
 }
+std::optional<bool> recovery_export_adapter::try_protected_store(std::shared_ptr<lattice_db> owner){
+    try{return recovery_local_producer_adapter::export_protection_required(std::move(owner));}
+    catch(const export_discovery_busy&){return std::nullopt;}
+}
+std::optional<recovery_export_preparation> recovery_export_adapter::try_prepare_pending(std::shared_ptr<lattice_db> owner,
+    const std::string& sync_id,uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,
+    bool filtered,const recovery_export_limits& limits){
+    bool busy=false;
+    auto prepared=prepare(std::move(owner),sync_id,generation,count,in_flight,filtered,limits,std::nullopt,&busy);
+    if(busy)return std::nullopt;
+    return prepared;
+}
 recovery_export_preparation recovery_export_adapter::prepare_pending(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits){
     return prepare(std::move(owner),sync_id,generation,count,in_flight,filtered,limits,std::nullopt);
@@ -318,9 +330,15 @@ recovery_export_preparation recovery_export_adapter::prepare_history_page(std::s
 }
 recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits,
-    std::optional<int64_t> history_after){
+    std::optional<int64_t> history_after,bool* discovery_busy){
     recovery_export_preparation output;
-    if(!recovery_local_producer_adapter::export_protection_required(owner))return output;
+    // Catch only this first no-effect classifier. A busy exception arising
+    // later from reentrant work must never replay a claim or mutation stage.
+    try {if(!recovery_local_producer_adapter::export_protection_required(owner))return output;}
+    catch(const export_discovery_busy&){
+        if(!discovery_busy)throw;
+        *discovery_busy=true;return output;
+    }
     committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;
     const auto result=recovery_writer_access::install(owner,[&](database& writer){
         auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);if(inventory.scopes.empty())return;

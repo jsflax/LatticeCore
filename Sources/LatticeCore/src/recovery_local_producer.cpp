@@ -721,7 +721,9 @@ bool recovery_local_producer_adapter::export_protection_required(std::shared_ptr
 #ifndef __EMSCRIPTEN__
     if(!mutex)refuse("export discovery requires a serialized connection");
 #endif
-    if(sqlite3_mutex_try(mutex)!=SQLITE_OK)refuse("export discovery writer is busy");
+    const auto probe=sqlite3_mutex_try(mutex);
+    if(probe==SQLITE_BUSY)throw export_discovery_busy();
+    if(probe!=SQLITE_OK)refuse("export discovery writer mutex failed");
     struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
     const auto validate_owner=[&] {
         const auto* hook=writer->lattice_update_hook_context_.get();

@@ -42,6 +42,14 @@ struct recovery_local_export_inventory {
     recovery_obligation_producer_discovery_limits limits{};
     std::vector<recovery_local_export_scope> scopes;
 };
+// Only the first nonblocking SQLite mutex probe can construct this outcome.
+// It says nothing about durable absence, profile validity, or later effects.
+class export_discovery_busy final : public db_error {
+    friend class recovery_local_producer_adapter;
+    export_discovery_busy():db_error("export discovery writer is busy"){}
+public:
+    export_discovery_busy(const export_discovery_busy&)=default;
+};
 class recovery_local_producer_adapter {
     struct context;
     struct descriptor;

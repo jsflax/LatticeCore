@@ -26,7 +26,7 @@ namespace lattice {
 
 // Forward declaration
 class lattice_db;
-namespace detail {class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;}
+namespace detail {class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;enum class sync_discovery_kind;struct sync_discovery_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -393,9 +393,12 @@ protected:
     std::shared_ptr<sync_transport> ws_client_;
     std::shared_ptr<detail::sync_callback_lifetime> callback_lifetime_;
     std::shared_ptr<detail::sync_pacer_state> pacer_state_;
+    std::shared_ptr<detail::sync_discovery_deferral> discovery_deferral_;
     std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
     bool owns_inline_scheduler_adapter_=false;
     friend struct detail::recovery_export_test_access;
+    friend struct detail::sync_discovery_test_access;
+    friend struct sync_discovery_admission_test_access;
 
     /// Log-line identity: config_.log_label when set, else sync_id. Cached
     /// so LOG_ macros can take a stable c_str(). Set by init_sync.
@@ -416,9 +419,8 @@ protected:
     // refusal cannot stop a newer explicit connect; concurrent old refusals
     // cannot erase a newer stop. This is not a durable source/lifetime token.
     std::atomic<uint64_t> receive_stop_generation_{0};
-    bool receive_lifecycle_stopped(uint64_t lifecycle) const noexcept {
-        return (lifecycle >> 1) < receive_stop_generation_.load(std::memory_order_acquire);
-    }
+    bool receive_lifecycle_stopped(uint64_t lifecycle) const noexcept;
+
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before
@@ -440,6 +442,9 @@ protected:
     void request_upload(bool background=false);
     void dispatch_upload(bool background,bool consume_request);
     void background_upload() noexcept;
+    void enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
+                           std::function<bool(detail::sync_discovery_operation&)> work);
+    void pump_discovery();
     void background_operation(const char* stage,const std::function<void()>& work) noexcept;
     void schedule_background(const char* stage,std::function<void()> work);
 
@@ -481,6 +486,10 @@ protected:
     // close and explicit disconnect. No per-close executor is created.
     bool retire_protected_transport() noexcept;
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
+    // Actual policy mutations invalidate parked exact vectors independently of
+    // update request coalescing. Clear also changes this revision.
+    std::atomic<uint64_t> upload_policy_revision_{0};
+    void advance_upload_policy_revision();
 
     // In-flight tracking: entries sent but not yet ACK'd, mapping the entry's
     // global_id to its AuditLog id (0 for synthetic entries, which have no
@@ -550,8 +559,10 @@ protected:
 
     // Sync operations
     void upload_pending_changes();
+    bool upload_pending_changes_step(detail::sync_upload_continuation&,detail::sync_discovery_operation*);
     std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
+    void mark_as_synced_after_discovery(const std::vector<std::string>&,bool protected_store);
 
     // upload_pending_changes decomposed phases
     struct classified_entries {
@@ -565,8 +576,10 @@ protected:
     void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
     void send_entries(std::vector<audit_log_entry>& entries);
+    void send_entries_after_discovery(std::vector<audit_log_entry>& entries);
     void send_entries(detail::committed_export_frame);
-    bool upload_protected_entries();
+    bool upload_protected_entries(bool* discovery_busy=nullptr);
+    std::optional<bool> try_has_export_protection();
     bool has_export_protection();
     void schedule_ack_retry(const std::vector<audit_log_entry>&);
 

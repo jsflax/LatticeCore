@@ -600,6 +600,12 @@ recovery_install_result recovery_local_producer_adapter::retire_for_qualificatio
 
 std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_producer_adapter::bootstrap(
     lattice_db& owner,const std::shared_ptr<database>& writer) {
+    // Set before any bootstrap metadata read: even a refused read can make
+    // SQLite's optional close-time optimize decide to ANALYZE. A refusal must
+    // leave the durable schema/cookie intact for the original valid owner.
+    // Only success restores the prior policy; an earlier refusal stays fenced.
+    const bool prior_suppression=writer && writer->suppress_destructor_optimize_;
+    if(writer)writer->suppress_destructor_optimize_=true;
     std::shared_ptr<context> c;
     recovery_obligation_producer_store::bootstrap_profiles(writer,discovery_caps,
         [&](database& view,const recovery_obligation_producer_inventory& inventory) {
@@ -625,7 +631,10 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
                 c->profiles.push_back({p,std::move(d)});
             }
         });
-    if(!c)return {};
+    if(!c) {
+        writer->suppress_destructor_optimize_=prior_suppression;
+        return {};
+    }
     // Inventory, descriptor and exact trigger bytes were read in ONE owned
     // snapshot. A later sibling retirement is still a separate lifetime event;
     // final owned profile discovery rereads storage and refuses stale custody.
@@ -633,6 +642,7 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
     register_context(*writer,c);
     {management changing(c->connection);writer->execute("PRAGMA recursive_triggers=ON");}
     if(integer(writer->query("PRAGMA recursive_triggers").at(0),"recursive_triggers")!=1)refuse("local producer recursive-trigger setup failed");
+    writer->suppress_destructor_optimize_=prior_suppression;
     return c;
 }
 

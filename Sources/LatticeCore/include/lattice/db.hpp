@@ -117,6 +117,10 @@ class database {
     // Physical policy custody, serialized by SQLite's connection mutex.
     // Bootstrap closes the interval before the canonical context is published.
     bool canonical_custody_bootstrap_ = false;
+    // Failed producer bootstrap must not let optional close-time ANALYZE
+    // mutate the schema it just refused. This policy follows the physical
+    // handle through moves, even before producer callback custody exists.
+    bool suppress_destructor_optimize_ = false;
     bool txn_hooks_external_ = false;
     void set_txn_hooks_owned_(std::function<void()>, std::function<void()>);
     void rebind_txn_hooks_owned_() noexcept;

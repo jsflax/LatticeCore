@@ -50,3 +50,16 @@ jobs:
             --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
             --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
             LatticeCoreTests
+
+      - name: Preserve parent and fresh-process test logs
+        if: always() && env.CORE_JOB_ROOT != ''
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-native-linux-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CORE_JOB_ROOT }}/test-logs/*.log
+            ${{ env.CORE_JOB_ROOT }}/tmp/**/*.log
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

@@ -410,9 +410,13 @@ database::~database() {
             // Best-effort incremental stats refresh (bounded by analysis_limit).
             // Only re-analyzes tables this connection queried whose stats are
             // missing or stale. Never throw from a destructor.
-            int orc = sqlite3_exec(db_, "PRAGMA optimize", nullptr, nullptr, nullptr);
-            if (orc != SQLITE_OK) {
-                LOG_DEBUG("db", "~database optimize skipped: rc=%d, path=%s", orc, path_.c_str());
+            // An unresolved/failed producer bootstrap preserves its refused
+            // schema. Hook detachment, passive checkpoint and close still run.
+            if (!suppress_destructor_optimize_) {
+                int orc = sqlite3_exec(db_, "PRAGMA optimize", nullptr, nullptr, nullptr);
+                if (orc != SQLITE_OK) {
+                    LOG_DEBUG("db", "~database optimize skipped: rc=%d, path=%s", orc, path_.c_str());
+                }
             }
             int nLog = 0, nCkpt = 0;
             int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
@@ -571,6 +575,7 @@ database::database(database&& other) noexcept
     canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
     canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
     canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
+    suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
     txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
     local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
     local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
@@ -605,6 +610,7 @@ database& database::operator=(database&& other) noexcept {
         canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
         canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
         canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
+        suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
         txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
         local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
         local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);

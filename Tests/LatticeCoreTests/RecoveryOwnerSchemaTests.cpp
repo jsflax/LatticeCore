@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <iostream>
+#include <map>
+#include <utility>
 #include <thread>
 #if defined(__APPLE__) || defined(__linux__)
 #include <fcntl.h>
@@ -91,6 +94,123 @@ struct owner_sink {
 std::vector<database::row_t> durable_programs(database& db) {
     return db.query("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name");
 }
+// Independent read-only snapshots cannot run database's close-time optimize.
+// Bound retained rows/bytes before copying a cell, and bound SQL VM work/time.
+struct owner_snapshot_reader {
+    std::unique_ptr<sqlite3,decltype(&sqlite3_close_v2)> connection{nullptr,&sqlite3_close_v2};
+    size_t rows=0,bytes=0;
+    int progress_calls=0;
+    const std::chrono::steady_clock::time_point deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    explicit owner_snapshot_reader(const std::string& path) {
+        sqlite3* opened=nullptr;
+        const int rc=sqlite3_open_v2(path.c_str(),&opened,SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX,nullptr);
+        connection.reset(opened);
+        if(rc!=SQLITE_OK)throw std::runtime_error("owner snapshot read-only open failed");
+        sqlite3_busy_timeout(opened,100);
+        sqlite3_limit(opened,SQLITE_LIMIT_LENGTH,16*1024*1024);
+        sqlite3_progress_handler(opened,1000,[](void* raw) noexcept -> int {
+            auto& reader=*static_cast<owner_snapshot_reader*>(raw);
+            return ++reader.progress_calls>10000 || std::chrono::steady_clock::now()>=reader.deadline;
+        },this);
+        if(sqlite3_exec(opened,"BEGIN",nullptr,nullptr,nullptr)!=SQLITE_OK)
+            throw std::runtime_error("owner snapshot BEGIN failed");
+    }
+    ~owner_snapshot_reader() {
+        sqlite3_progress_handler(connection.get(),0,nullptr,nullptr);
+        sqlite3_exec(connection.get(),"ROLLBACK",nullptr,nullptr,nullptr);
+    }
+    void charge(size_t size) {
+        constexpr size_t limit=16*1024*1024;
+        if(size>limit-bytes)throw std::runtime_error("owner snapshot byte bound exceeded");
+        bytes+=size;
+    }
+    std::vector<database::row_t> query(const std::string& sql) {
+        sqlite3_stmt* prepared=nullptr;
+        const int rc=sqlite3_prepare_v2(connection.get(),sql.c_str(),-1,&prepared,nullptr);
+        std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(prepared,&sqlite3_finalize);
+        if(rc!=SQLITE_OK || !prepared || !sqlite3_stmt_readonly(prepared))
+            throw std::runtime_error("owner snapshot expected a read-only statement");
+        const int columns=sqlite3_column_count(prepared);
+        if(columns<=0 || columns>128)throw std::runtime_error("owner snapshot column bound exceeded");
+        std::vector<database::row_t> result;
+        int step=SQLITE_OK;
+        while((step=sqlite3_step(prepared))==SQLITE_ROW) {
+            if(++rows>8192)throw std::runtime_error("owner snapshot row bound exceeded");
+            database::row_t row;
+            for(int column=0;column<columns;++column) {
+                const char* name=sqlite3_column_name(prepared,column);
+                if(!name || std::strlen(name)>256)throw std::runtime_error("owner snapshot column name bound exceeded");
+                charge(std::strlen(name)+sizeof(column_value_t));
+                column_value_t value=nullptr;
+                switch(sqlite3_column_type(prepared,column)) {
+                    case SQLITE_NULL:break;
+                    case SQLITE_INTEGER:value=static_cast<int64_t>(sqlite3_column_int64(prepared,column));break;
+                    case SQLITE_FLOAT:value=sqlite3_column_double(prepared,column);break;
+                    case SQLITE_TEXT: {
+                        const auto* data=sqlite3_column_text(prepared,column);
+                        const int size=sqlite3_column_bytes(prepared,column);charge(static_cast<size_t>(size));
+                        if(!data)throw std::runtime_error("owner snapshot text conversion failed");
+                        value=std::string(reinterpret_cast<const char*>(data),static_cast<size_t>(size));break;
+                    }
+                    case SQLITE_BLOB: {
+                        const auto* data=static_cast<const uint8_t*>(sqlite3_column_blob(prepared,column));
+                        const int size=sqlite3_column_bytes(prepared,column);charge(static_cast<size_t>(size));
+                        if(size && !data)throw std::runtime_error("owner snapshot blob conversion failed");
+                        value=size?std::vector<uint8_t>(data,data+size):std::vector<uint8_t>{};break;
+                    }
+                    default:throw std::runtime_error("owner snapshot unknown storage class");
+                }
+                row.emplace(name,std::move(value));
+            }
+            result.push_back(std::move(row));
+        }
+        if(step!=SQLITE_DONE)throw std::runtime_error("owner snapshot read failed or exceeded its work bound");
+        return result;
+    }
+};
+struct owner_durable_snapshot {
+    std::vector<database::row_t> cookie,schema;
+    std::map<std::string,std::vector<database::row_t>> content;
+    size_t bytes=0;
+};
+owner_durable_snapshot durable_snapshot(const std::string& path) {
+    owner_snapshot_reader reader(path);owner_durable_snapshot result;
+    result.cookie=reader.query("PRAGMA main.schema_version");
+    // Include internal statistics/sequence tables and root pages, unlike the
+    // existing generated-program assertion which excludes sqlite_% names.
+    result.schema=reader.query("SELECT type,name,tbl_name,rootpage,sql FROM main.sqlite_schema ORDER BY type,name");
+    const std::pair<const char*,const char*> relations[]={
+        {"_lattice_meta","key"},{"RecoverySwiftOwnerRow","id"},{"AuditLog","id"},
+        {"_lattice_install_store","id"},{"_lattice_install_channel","channel"},
+        {"_lattice_obligation_store","id"},{"_lattice_obligation_scope","channel"},
+        {"_lattice_obligation_entry","channel,original"},{"_lattice_obligation_producer_store","id"},
+        {"_lattice_obligation_producer_profile","channel"},{"_lattice_obligation_producer_stamp","channel,original"}
+    };
+    for(const auto& relation:relations)
+        result.content.emplace(relation.first,reader.query(std::string("SELECT * FROM main.")+relation.first+" ORDER BY "+relation.second));
+    for(const auto& row:result.schema) {
+        const auto& name=std::get<std::string>(row.at("name"));
+        if(name=="sqlite_stat1" || name=="sqlite_stat4" || name=="sqlite_sequence")
+            result.content.emplace(name,reader.query("SELECT * FROM main."+name+" ORDER BY rowid"));
+    }
+    result.bytes=reader.bytes;return result;
+}
+struct optimize_trace {
+    int calls=0;
+    void attach(database& db) {
+        const int rc=sqlite3_trace_v2(db.handle(),SQLITE_TRACE_STMT,[](unsigned,void* raw,void*,void* sql) noexcept {
+            if(sql && std::strcmp(static_cast<const char*>(sql),"PRAGMA optimize")==0)
+                ++static_cast<optimize_trace*>(raw)->calls;
+            return 0;
+        },this);
+        if(rc!=SQLITE_OK)throw std::runtime_error("could not trace optional destructor optimize");
+    }
+};
+void refuse_partial_producer_bootstrap(lattice_db& owner,const std::shared_ptr<database>& writer) {
+    writer->execute("CREATE TABLE _lattice_obligation_producer_store(id INTEGER PRIMARY KEY)");
+    EXPECT_ANY_THROW(prepare_recovery_local_producer(owner,writer));
+    writer->execute("DROP TABLE _lattice_obligation_producer_store");
+}
 class RecoveryOwnerSchema:public ::testing::TestWithParam<bool> {
 protected:
     TempDB file{"recovery_swift_owner"};
@@ -173,10 +293,50 @@ TEST(RecoveryOwnerSchemaReopen, FreshOwnerKeepsProgramsPendingOriginalsAndCanWri
 TEST(RecoveryOwnerSchemaReopen, ChangedNoHistoryDeclarationRefusesBeforeRewritingDurablePrograms) {
     TempDB file("recovery_owner_schema_mismatch");std::vector<database::row_t> programs;
     {owner_fixture first(file.str(),SchemaVector{owner_schema()});first.enroll();first.insert();programs=durable_programs(first.owner->db());}
+    const auto before=durable_snapshot(file.str());
     EXPECT_ANY_THROW(owner_fixture bad(file.str(),SchemaVector{owner_schema(false)}));
+    const auto after=durable_snapshot(file.str());
+    std::cout<<"[ OWNER SNAPSHOT ] before_cookie="<<std::get<int64_t>(before.cookie.at(0).at("schema_version"))
+             <<" after_cookie="<<std::get<int64_t>(after.cookie.at(0).at("schema_version"))
+             <<" before_schema_rows="<<before.schema.size()<<" after_schema_rows="<<after.schema.size()
+             <<" before_bytes="<<before.bytes<<" after_bytes="<<after.bytes<<std::endl;
+    EXPECT_EQ(after.cookie,before.cookie);
+    EXPECT_TRUE(after.schema==before.schema)<<"rejected open changed durable schema (including internal statistics)";
+    EXPECT_TRUE(after.content==before.content)<<"rejected open changed fingerprints, model/history, or protected producer/receiver rows";
     owner_fixture valid(file.str(),SchemaVector{owner_schema()});
     EXPECT_EQ(durable_programs(valid.owner->db()),programs);
     EXPECT_EQ(valid.count("AuditLog"),1);EXPECT_EQ(valid.count("_lattice_obligation_producer_stamp"),1);
+}
+
+TEST(RecoveryOwnerSchemaCleanup, FailedBootstrapSuppressionFollowsMovedPhysicalHandleAndSurvivesLaterSuccess) {
+    owner_fixture owner(":memory:",SchemaVector{owner_schema()});optimize_trace trace;
+    {
+        auto writer=std::make_shared<database>(":memory:");
+        refuse_partial_producer_bootstrap(*owner.owner,writer);
+        // A later successful empty inventory restores true, not an assumed
+        // default false. The prior failed admission still owns teardown policy.
+        EXPECT_FALSE(prepare_recovery_local_producer(*owner.owner,writer));
+        trace.attach(*writer);
+        database moved(std::move(*writer));
+        database assigned(":memory:");assigned=std::move(moved);
+    }
+    EXPECT_EQ(trace.calls,0);
+}
+
+TEST(RecoveryOwnerSchemaCleanup, SuccessfulLegacyBootstrapRestoresOptimizeAcrossMovesAndReplacesOldPolicy) {
+    owner_fixture owner(":memory:",SchemaVector{owner_schema()});optimize_trace trace;
+    {
+        auto writer=std::make_shared<database>(":memory:");
+        EXPECT_FALSE(prepare_recovery_local_producer(*owner.owner,writer));
+        trace.attach(*writer);
+        database moved(std::move(*writer));
+        auto assigned=std::make_shared<database>(":memory:");
+        refuse_partial_producer_bootstrap(*owner.owner,assigned);
+        // Replacing a suppressed handle must adopt the incoming successful
+        // handle's policy, rather than retaining the displaced wrapper's flag.
+        *assigned=std::move(moved);
+    }
+    EXPECT_EQ(trace.calls,1);
 }
 
 TEST(RecoveryOwnerSchemaReopen, SameModelNameInTwoOwnersKeepsIndependentDeclarations) {

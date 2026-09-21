@@ -4,6 +4,7 @@ project(LatticeCore VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+option(LATTICE_SYNC_COMMIT_PROBE "Opt-in tagged WAL probe and qualification tests" OFF)
 
 # For Android, we need to bundle SQLite3
 if(ANDROID)
@@ -63,11 +64,38 @@ target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
 # =============================================================================
 add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
+    Sources/LatticeCore/src/managed_observation.cpp
     Sources/LatticeCore/src/schema.cpp
+    Sources/LatticeCore/src/derived_profile.cpp
     Sources/LatticeCore/src/sync.cpp
+    Sources/LatticeCore/src/sync_commit_probe.cpp
+    Sources/LatticeCore/src/recovery_export_adapter.cpp
+    Sources/LatticeCore/src/recovery_server_export.cpp
+    Sources/LatticeCore/src/sync_callback_lifetime.cpp
+    Sources/LatticeCore/src/scoped_recovery_install.cpp
+    Sources/LatticeCore/src/recovery_witness.cpp
+    Sources/LatticeCore/src/recovery_refresh.cpp
+    Sources/LatticeCore/src/receive_install_state.cpp
+    Sources/LatticeCore/src/recovery_obligation_store.cpp
+    Sources/LatticeCore/src/recovery_local_producer.cpp
+    Sources/LatticeCore/src/receive_ledger.cpp
+    Sources/LatticeCore/src/receive_delivery_guard.cpp
+    Sources/LatticeCore/src/recovery_staging.cpp
+    Sources/LatticeCore/src/recovery_install_transaction.cpp
+    Sources/LatticeCore/src/canonical_change_store.cpp
+    Sources/LatticeCore/src/canonical_writer_adapter.cpp
+    Sources/LatticeCore/src/sync_recovery_protocol.cpp
+    Sources/LatticeCore/src/sync_canonical_range.cpp
+    Sources/LatticeCore/src/canonical_range_staging.cpp
+    Sources/LatticeCore/src/sync_recovery_values.cpp
+    Sources/LatticeCore/src/sync_recovery_outbox.cpp
+    Sources/LatticeCore/src/sync_snapshot_source.cpp
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
+    Sources/LatticeCore/src/projection.cpp
+    Sources/LatticeCore/src/projection_memory.cpp
+    Sources/LatticeCore/src/projection_capture_policy.cpp
     Sources/LatticeCore/src/cross_process_notifier_darwin.cpp
     Sources/LatticeCore/src/cross_process_notifier_linux.cpp
     Sources/LatticeCore/src/cross_process_notifier_noop.cpp
@@ -80,6 +108,9 @@ target_include_directories(LatticeCore PUBLIC
 # and every sqlite3_* call expands to the undefined sqlite3_api thunk table
 # (bites on Linux, where libsqlite3-dev ships sqlite3ext.h).
 target_compile_definitions(LatticeCore PRIVATE SQLITE_CORE)
+if(LATTICE_SYNC_COMMIT_PROBE)
+    target_compile_definitions(LatticeCore PUBLIC LATTICE_SYNC_COMMIT_PROBE)
+endif()
 target_link_libraries(LatticeCore PUBLIC
     SqliteVec
     SQLite::SQLite3
@@ -90,6 +121,9 @@ target_link_libraries(LatticeCore PUBLIC
 # =============================================================================
 add_library(LatticeSwiftCppBridge STATIC
     Sources/LatticeSwiftCppBridge/src/lattice.cpp
+    Sources/LatticeSwiftCppBridge/src/bulk_mutation.cpp
+    Sources/LatticeSwiftCppBridge/src/projection.cpp
+    Sources/LatticeSwiftCppBridge/src/recovery_export.cpp
     Sources/LatticeSwiftCppBridge/src/dynamic_object.cpp
     Sources/LatticeSwiftCppBridge/src/managed_object.cpp
     Sources/LatticeSwiftCppBridge/src/unmanaged_object.cpp
@@ -187,23 +221,95 @@ target_link_libraries(gtest_main PUBLIC gtest)
 # =============================================================================
 add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0Tests.cpp
+    Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp
+    Tests/LatticeCoreTests/ExactVectorRowsTests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/SyncCommitProbeTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
+    Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp
+    Tests/LatticeCoreTests/StartupSyncHealingTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp
+    Tests/LatticeCoreTests/SyncCanonicalRangeTests.cpp
+    Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp
+    Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp
+    Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp
+    Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp
+    Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp
+    Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp
+    Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp
+    Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
+    Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp
+    Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp
+    Tests/LatticeCoreTests/RecoveryWitnessTests.cpp
+    Tests/LatticeCoreTests/RecoveryRefreshWorkerTests.cpp
+    Tests/LatticeCoreTests/RecoveryRefreshBridgeTests.cpp
+    Tests/LatticeCoreTests/RecoveryRefreshAdmissionTests.cpp
+    Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
+    Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp
+    Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp
+    Tests/LatticeCoreTests/ScopedRecoveryDeltaTests.cpp
+    Tests/LatticeCoreTests/CanonicalScopedInstallTests.cpp
+    Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp
+    Tests/LatticeCoreTests/RecoveryObligationStoreTests.cpp
+    Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp
+    Tests/LatticeCoreTests/ReceiveDeliveryGuardTests.cpp
+    Tests/LatticeCoreTests/ReceiveResetAdmissionTests.cpp
+    Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp
+    Tests/LatticeCoreTests/SyncCallbackLifetimeTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp
+    Tests/LatticeCoreTests/RecoveryServerExportTests.cpp
+    Tests/LatticeCoreTests/RecoveryOwnerSchemaTests.cpp
+    Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp
+    Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp
+    Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp
+    Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp
+    Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp
+    Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp
+    Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp
+    Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
+    Tests/LatticeCoreTests/VectorClearTests.cpp
+    Tests/LatticeCoreTests/DerivedFtsProgramTests.cpp
+    Tests/LatticeCoreTests/DerivedProfileTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
+    Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
-    Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
+    Tests/LatticeCoreTests/ManagedObservationTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp
     Tests/LatticeCoreTests/ReaderLifetimeTests.cpp
+    Tests/LatticeCoreTests/ReadGenerationTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
+    Tests/LatticeCoreTests/IPCFramingRegressionTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
+    Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp
+    Tests/LatticeCoreTests/BulkMutationTests.cpp
+    Tests/LatticeCoreTests/ProjectionReadTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryServiceTests.cpp
+    Tests/LatticeCoreTests/SpatialShapeBridgeTests.cpp
+    Tests/LatticeCoreTests/ManagedPhysicalRouteTests.cpp
+    Tests/LatticeCoreTests/VirtualUnionRouteTests.cpp
+    Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
+    Tests/LatticeCoreTests/UnmanagedConstructionTests.cpp
+    Tests/LatticeCoreTests/LiveScalarReadTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp

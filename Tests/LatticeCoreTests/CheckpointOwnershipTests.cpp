@@ -1,0 +1,305 @@
+#include "TestHelpers.hpp"
+#include "../../Sources/LatticeCore/src/checkpoint_test_probe.hpp"
+#include <chrono>
+#include <exception>
+#include <memory>
+#include <mutex>
+
+using namespace std::chrono_literals;
+
+#ifndef __EMSCRIPTEN__
+namespace {
+using probe_stage = lattice::detail::checkpoint_probe_stage;
+using probe_scope = lattice::detail::checkpoint_test_probe;
+using statement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
+
+int64_t scalar(lattice::database& db, const std::string& sql) {
+    auto rows = db.query(sql);
+    if (rows.size() != 1 || rows[0].size() != 1)
+        throw std::runtime_error("expected one integer cell");
+    return std::get<int64_t>(rows[0].begin()->second);
+}
+
+std::string seed_ack(lattice::lattice_db& owner) {
+    auto model = owner.add(TestPerson{"checkpoint-ack", 42, std::nullopt});
+    auto rows = owner.db().query(
+        "SELECT globalId FROM AuditLog WHERE globalRowId = ?", {model.global_id()});
+    if (rows.size() != 1) throw std::runtime_error("expected one real local audit entry");
+    return std::get<std::string>(rows[0].at("globalId"));
+}
+
+int64_t synchronized(lattice::database& db, const std::string& gid) {
+    auto rows = db.query("SELECT isSynchronized FROM AuditLog WHERE globalId = ?", {gid});
+    if (rows.size() != 1) throw std::runtime_error("audit entry missing");
+    return std::get<int64_t>(rows[0].at("isSynchronized"));
+}
+
+// The probe never runs SQL. The observing thread uses mutex_try, so neither
+// side waits for the other's SQLite operation. Timeout always releases the
+// checkpoint thread; the test joins before asserting or destroying the owner.
+struct bounded_pause {
+    probe_stage wanted;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    bool timed_out = false;
+    int calls = 0;
+
+    static void callback(probe_stage stage, void* opaque) noexcept {
+        auto& self = *static_cast<bounded_pause*>(opaque);
+        if (stage != self.wanted) return;
+        std::unique_lock<std::mutex> lock(self.mutex);
+        ++self.calls;
+        self.entered = true;
+        self.cv.notify_all();
+        if (!self.cv.wait_for(lock, 3s, [&] { return self.release; })) self.timed_out = true;
+    }
+
+    bool wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, 3s, [&] { return entered; });
+    }
+    void resume() {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+        cv.notify_all();
+    }
+};
+
+struct observed_checkpoint {
+    lattice::database::checkpoint_result result;
+    int mutex_try_result = -1;
+    bool reached = false;
+    bool pause_timed_out = false;
+    int calls = 0;
+    int64_t timeout_while_paused = -1;
+    std::exception_ptr error;
+};
+
+observed_checkpoint inspect_boundary(lattice::database& db, bool truncate,
+                                    probe_stage stage, int budget = 0) {
+    auto* handle = db.handle();
+    bounded_pause pause{stage};
+    observed_checkpoint observed;
+    std::exception_ptr observer_error;
+    std::thread worker([&] {
+        probe_scope scope(handle, bounded_pause::callback, &pause);
+        try { observed.result = db.wal_checkpoint(truncate, budget); }
+        catch (...) { observed.error = std::current_exception(); }
+    });
+    observed.reached = pause.wait();
+    if (observed.reached) {
+        auto* mutex = sqlite3_db_mutex(handle);
+        observed.mutex_try_result = sqlite3_mutex_try(mutex);
+        if (observed.mutex_try_result == SQLITE_OK) {
+            sqlite3_mutex_leave(mutex);
+            // Read after releasing our try-lock, while the checkpoint is still
+            // paused. This witnesses restore-before-publication, not merely
+            // eventual restoration after the worker has returned.
+            if (stage == probe_stage::before_generation_retirement) {
+                try { observed.timeout_while_paused = scalar(db, "PRAGMA busy_timeout"); }
+                catch (...) { observer_error = std::current_exception(); }
+            }
+        }
+    }
+    pause.resume();
+    worker.join();
+    if (observer_error) observed.error = observer_error;
+    observed.pause_timed_out = pause.timed_out;
+    observed.calls = pause.calls;
+    return observed;
+}
+
+void expect_boundary(const observed_checkpoint& observed, int mutex_result) {
+    EXPECT_TRUE(observed.reached);
+    EXPECT_FALSE(observed.pause_timed_out);
+    EXPECT_EQ(observed.calls, 1);
+    EXPECT_FALSE(observed.error);
+    EXPECT_EQ(observed.mutex_try_result, mutex_result);
+}
+
+struct count_probe {
+    int captured = 0;
+    int retirement = 0;
+    static void callback(probe_stage stage, void* opaque) noexcept {
+        auto& self = *static_cast<count_probe*>(opaque);
+        if (stage == probe_stage::result_captured) ++self.captured;
+        else ++self.retirement;
+    }
+};
+} // namespace
+
+// A mechanism witness, not a claim that the failing baseline is correct:
+// pin the exact PRAGMA-ROW → real ACK COMMIT refusal, rollback, and retry.
+TEST(CheckpointOwnership, RawPragmaRowReproducesAckCommitFailureAndRetry) {
+    TempDB file{"checkpoint_raw_row"};
+    lattice::lattice_db owner{lattice::configuration(file.str())};
+    const auto gid = seed_ack(owner);
+    auto* handle = owner.db().handle();
+    sqlite3_stmt* raw = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(handle, "PRAGMA wal_checkpoint(PASSIVE)", -1, &raw, nullptr), SQLITE_OK);
+    statement held(raw, sqlite3_finalize);
+    ASSERT_EQ(sqlite3_stmt_readonly(held.get()), 0);
+    ASSERT_EQ(sqlite3_step(held.get()), SQLITE_ROW);
+    ASSERT_NE(sqlite3_stmt_busy(held.get()), 0);
+
+    std::string failure;
+    try { lattice::mark_audit_entries_synced(owner, {gid}); }
+    catch (const lattice::db_error& error) { failure = error.what(); }
+    EXPECT_NE(failure.find("cannot commit transaction - SQL statements in progress (SQL: COMMIT)"),
+              std::string::npos);
+    EXPECT_FALSE(owner.db().is_in_transaction()); // Actual marker's containment.
+    held.reset();
+    EXPECT_EQ(synchronized(owner.db(), gid), 0);
+    ASSERT_NO_THROW(lattice::mark_audit_entries_synced(owner, {gid}));
+    EXPECT_EQ(synchronized(owner.db(), gid), 1);
+    lattice::database reopened(file.str());
+    EXPECT_EQ(synchronized(reopened, gid), 1);
+}
+
+TEST(CheckpointOwnership, BoundedCheckpointOwnsConnectionUntilTimeoutRestoredThenAckPersists) {
+    TempDB file{"checkpoint_owned"};
+    lattice::configuration config(file.str());
+    config.busy_timeout_ms = 173;
+    lattice::lattice_db owner(config);
+    const auto gid = seed_ack(owner);
+    ASSERT_NE(sqlite3_db_mutex(owner.db().handle()), nullptr);
+    for (bool truncate : {false, true}) {
+        const auto observed = inspect_boundary(owner.db(), truncate, probe_stage::result_captured, 7);
+        expect_boundary(observed, SQLITE_BUSY);
+        EXPECT_EQ(observed.result.rc, SQLITE_OK);
+        EXPECT_EQ(observed.result.busy, 0);
+        EXPECT_EQ(scalar(owner.db(), "PRAGMA busy_timeout"), 173);
+        EXPECT_FALSE(owner.db().is_in_transaction());
+    }
+    ASSERT_NO_THROW(lattice::mark_audit_entries_synced(owner, {gid}));
+    lattice::database reopened(file.str());
+    EXPECT_EQ(synchronized(reopened, gid), 1);
+}
+
+TEST(CheckpointOwnership, BusyReaderMapsLikePragmaAndRetiresOnlyAfterUnlockAndRestore) {
+    TempDB file{"checkpoint_busy"};
+    lattice::database writer(file.str(), lattice::database::open_mode::read_write, 191);
+    writer.execute("CREATE TABLE sample (value INTEGER)");
+    writer.execute("INSERT INTO sample VALUES (1)");
+    lattice::database reader(file.str(), lattice::database::open_mode::read_only);
+    reader.execute("BEGIN");
+    ASSERT_EQ(scalar(reader, "SELECT count(*) FROM sample"), 1);
+    writer.execute("INSERT INTO sample VALUES (2)");
+
+    auto owned = inspect_boundary(writer, true, probe_stage::result_captured);
+    expect_boundary(owned, SQLITE_BUSY);
+    EXPECT_EQ(owned.result.rc, SQLITE_OK); // A PRAGMA busy row is not an SQL error.
+    EXPECT_EQ(owned.result.busy, 1);
+    EXPECT_GT(owned.result.log_frames, owned.result.checkpointed);
+    EXPECT_EQ(scalar(writer, "PRAGMA busy_timeout"), 191);
+    auto released = inspect_boundary(writer, true, probe_stage::before_generation_retirement);
+    expect_boundary(released, SQLITE_OK);
+    EXPECT_EQ(released.result.rc, SQLITE_OK);
+    EXPECT_EQ(released.result.busy, 1);
+    EXPECT_EQ(released.timeout_while_paused, 191);
+    EXPECT_EQ(scalar(writer, "PRAGMA busy_timeout"), 191);
+    EXPECT_TRUE(reader.is_in_transaction());
+    EXPECT_EQ(scalar(reader, "SELECT count(*) FROM sample"), 1);
+
+    count_probe passive;
+    {
+        probe_scope probe(writer.handle(), count_probe::callback, &passive);
+        const auto result = writer.wal_checkpoint(false);
+        EXPECT_EQ(result.rc, SQLITE_OK);
+        EXPECT_EQ(result.busy, 0);
+        EXPECT_GT(result.log_frames, result.checkpointed);
+    }
+    EXPECT_EQ(passive.captured, 1);
+    EXPECT_EQ(passive.retirement, 0); // Partial PASSIVE does not claim retirement.
+    reader.rollback();
+    const auto settled = writer.wal_checkpoint(true, 0);
+    EXPECT_EQ(settled.rc, SQLITE_OK);
+    EXPECT_EQ(settled.busy, 0);
+    EXPECT_EQ(settled.log_frames, 0);
+    EXPECT_EQ(settled.checkpointed, 0);
+}
+
+TEST(CheckpointOwnership, OpenCallerTransactionRefusedWithoutCommitRollbackOrTimeoutLeak) {
+    TempDB file{"checkpoint_caller_transaction"};
+    lattice::database db(file.str(), lattice::database::open_mode::read_write, 211);
+    db.execute("CREATE TABLE sample (value INTEGER)");
+    db.begin_transaction();
+    db.execute("INSERT INTO sample VALUES (3)");
+    for (bool truncate : {false, true}) {
+        const auto observed = inspect_boundary(db, truncate, probe_stage::result_captured, 1);
+        expect_boundary(observed, SQLITE_BUSY);
+        EXPECT_EQ(observed.result.rc, SQLITE_ERROR);
+        EXPECT_EQ(observed.result.busy, 1);
+        EXPECT_EQ(observed.result.log_frames, -1);
+        EXPECT_EQ(observed.result.checkpointed, -1);
+        EXPECT_TRUE(db.is_in_transaction());
+        EXPECT_EQ(scalar(db, "PRAGMA busy_timeout"), 211);
+        EXPECT_EQ(scalar(db, "SELECT count(*) FROM sample"), 1);
+    }
+    db.rollback();
+    EXPECT_EQ(scalar(db, "SELECT count(*) FROM sample"), 0);
+}
+
+TEST(CheckpointOwnership, UnqualifiedScopeIncludesAttachedWalAndPreservesMainFrameCounters) {
+    TempDB main{"checkpoint_main"}, attached{"checkpoint_attached"};
+    lattice::database db(main.str());
+    db.execute("CREATE TABLE sample (value INTEGER)");
+    db.execute("INSERT INTO sample VALUES (1)");
+    db.execute("ATTACH DATABASE ? AS other", {attached.str()});
+    (void)db.query("PRAGMA other.journal_mode=WAL");
+    db.execute("CREATE TABLE other.sample (value INTEGER)");
+    db.execute("INSERT INTO other.sample VALUES (2)");
+    lattice::database reader(attached.str(), lattice::database::open_mode::read_only);
+    reader.execute("BEGIN");
+    ASSERT_EQ(scalar(reader, "SELECT count(*) FROM sample"), 1);
+    db.execute("INSERT INTO other.sample VALUES (3)");
+    ASSERT_GT(std::filesystem::file_size(attached.str() + "-wal"), 0u);
+    const auto blocked = db.wal_checkpoint(true, 0);
+    EXPECT_EQ(blocked.rc, SQLITE_OK);
+    EXPECT_EQ(blocked.busy, 1); // Attached reader contributes to overall BUSY.
+    EXPECT_EQ(blocked.log_frames, 0); // Counters still describe first/main schema.
+    EXPECT_EQ(blocked.checkpointed, 0);
+    EXPECT_GT(std::filesystem::file_size(attached.str() + "-wal"), 0u);
+    EXPECT_TRUE(reader.is_in_transaction());
+    reader.rollback();
+    const auto result = db.wal_checkpoint(true, 0);
+    EXPECT_EQ(result.rc, SQLITE_OK);
+    EXPECT_EQ(result.busy, 0);
+    EXPECT_EQ(result.log_frames, 0);
+    EXPECT_EQ(result.checkpointed, 0);
+    EXPECT_EQ(std::filesystem::file_size(main.str() + "-wal"), 0u);
+    EXPECT_EQ(std::filesystem::file_size(attached.str() + "-wal"), 0u);
+    EXPECT_EQ(scalar(db, "SELECT sum(value) FROM other.sample"), 5);
+}
+
+TEST(CheckpointOwnership, ReadOnlyAndClosedAreNoOpsWithoutProbeOrTimeoutMutation) {
+    TempDB file{"checkpoint_noops"};
+    lattice::database writer(file.str());
+    writer.execute("CREATE TABLE sample (value INTEGER)");
+    lattice::database reader(file.str(), lattice::database::open_mode::read_only, 223);
+    count_probe calls;
+    {
+        probe_scope probe(reader.handle(), count_probe::callback, &calls);
+        const auto result = reader.wal_checkpoint(true, 1);
+        EXPECT_EQ(result.rc, SQLITE_OK);
+        EXPECT_EQ(result.busy, 1);
+        EXPECT_EQ(result.log_frames, -1);
+        EXPECT_EQ(result.checkpointed, -1);
+    }
+    EXPECT_EQ(scalar(reader, "PRAGMA busy_timeout"), 223);
+    auto* handle = writer.handle();
+    writer.close();
+    {
+        probe_scope probe(handle, count_probe::callback, &calls);
+        const auto result = writer.wal_checkpoint(false);
+        EXPECT_EQ(result.rc, SQLITE_OK);
+        EXPECT_EQ(result.busy, 1);
+        EXPECT_EQ(result.log_frames, -1);
+        EXPECT_EQ(result.checkpointed, -1);
+    }
+    EXPECT_EQ(calls.captured, 0);
+    EXPECT_EQ(calls.retirement, 0);
+}
+#endif // !__EMSCRIPTEN__: production keeps the existing DELETE-mode no-op.

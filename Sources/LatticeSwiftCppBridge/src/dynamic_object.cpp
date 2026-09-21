@@ -506,8 +506,10 @@ void lattice::dynamic_object::refresh_row_cache() {
     // no handler on this path and would terminate the process.
     std::vector<lattice::database::row_t> rows;
     try {
+        detail::managed_route_scope route_guard(db, managed_.lattice_, managed_.table_name_,
+            managed_.attachment_token_, managed_.attachment_writer_);
         rows = db->query(
-            "SELECT * FROM " + managed_.table_name_ + " WHERE id = ?",
+            "SELECT * FROM " + managed_table_sql(managed_.table_name_) + " WHERE id = ?",
             {managed_.id_});
     } catch (const std::exception& e) {
         fprintf(stderr,

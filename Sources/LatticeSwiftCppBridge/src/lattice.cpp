@@ -6,7 +6,7 @@
 #include <util.hpp>
 #include <LatticeBridge.hpp>
 #include <nlohmann/json.hpp>  // bundled in ../LatticeCore/include (header search path)
-#include <vendor/picosha2/picosha2.h>
+#include "../../LatticeCore/src/vendor/picosha2/picosha2.h"
 
 // Thread-local state for migration lookup functions
 static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;

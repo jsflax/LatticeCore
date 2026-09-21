@@ -9,6 +9,14 @@
 #include <utility>
 #include <cmath>
 #include <limits>
+#include <filesystem>
+#include <cerrno>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
 
 namespace lattice::detail {
 namespace {
@@ -157,6 +165,9 @@ struct canonical_writer_adapter::context {
     std::optional<canonical_upstream_limits> upstream;
     std::map<std::string,std::unordered_map<std::string,column_type>> schemas;
     std::map<std::string,std::set<std::string>> no_history;
+    std::weak_ptr<retention_session> retention;
+    static void admit_retention(sqlite3_context*,int,sqlite3_value**) noexcept;
+    static bool authorize_retention(context&,int,const char*,const char*) noexcept;
     static void require(sqlite3_context* sql,int count,sqlite3_value** values) noexcept {
         if(count!=1 || sqlite3_value_type(values[0])!=SQLITE_INTEGER || sqlite3_value_int(values[0])!=1)
             sqlite3_result_error(sql,"canonical upstream condition refused",-1);
@@ -205,6 +216,7 @@ struct canonical_writer_adapter::context {
            std::strncmp(one,"_lattice_canonical_",19)==0) {
             if(!self.active->load(std::memory_order_acquire)||!schema||std::strcmp(schema,"main"))return SQLITE_DENY;
             if(!origin) {
+                if(authorize_retention(self,action,one,two))return SQLITE_OK;
                 auto* d=canonical_upstream_delivery::current_;
                 const bool phase=d && d->entry_ && d->finalizing_ && d->context_.get()==&self;
                 if(phase && action==SQLITE_INSERT && std::strcmp(one,"_lattice_canonical_receipt")==0)return SQLITE_OK;
@@ -225,9 +237,15 @@ struct canonical_writer_adapter::context {
             const int restricted=fault->restrict_action(action,one,two,origin);
             if(restricted==SQLITE_DENY || restricted==SQLITE_IGNORE)return restricted;
         }
+        const auto* retention_fault=canonical_retention_test_hooks::fault;
+        if(!self.retention.expired() && retention_fault && retention_fault->connection==self.connection && retention_fault->restrict_action) {
+            const int restricted=retention_fault->restrict_action(action,one,two,origin);
+            if(restricted==SQLITE_DENY || restricted==SQLITE_IGNORE)return restricted;
+        }
         return SQLITE_OK;
     }
 };
+#include "canonical_transfer_retention.inc"
 std::string canonical_writer_adapter::uuid_key(const std::string& value) {
     if(value.size()!=36)refuse("canonical requires UUID identity");
     char out[36];if(!uuid(reinterpret_cast<const unsigned char*>(value.data()),static_cast<int>(value.size()),out))refuse("canonical requires UUID identity");return {out,36};
@@ -241,7 +259,7 @@ canonical_writer_adapter::~canonical_writer_adapter() {
     }
 }
 canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canonical_writer_profile& p,
-    const canonical_upstream_limits* upstream) {
+    const canonical_upstream_limits* upstream,const canonical_retention_limits* retention) {
     const auto& catalog=owner.recovery_schemas_;
     if(!catalog.valid())refuse("canonical owner schema catalog outside bounds or ambiguous");
     // The attachment owns its setup transaction. It cannot attach during caller
@@ -283,6 +301,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     context_=std::make_shared<context>();context_->connection=writer_->internal_handle();context_->binding=p.binding;
     context_->owner=&owner;context_->profile=p;
     if(upstream)context_->upstream=*upstream;
+    if(retention)prepare_retention(owner,*retention);
     const auto register_shared=[&] {
         auto* held=new std::shared_ptr<context>(context_);
         if(sqlite3_create_function_v2(context_->connection,"lattice_canonical_guard_v1",4,SQLITE_UTF8,held,
@@ -300,6 +319,12 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     try {
         if(writer_->canonical_callback_custody_)sqlite3_set_authorizer(writer_->internal_handle(),nullptr,nullptr);
         register_shared();
+        if(retention) {
+            auto* held=new std::shared_ptr<context>(context_);
+            if(sqlite3_create_function_v2(context_->connection,"lattice_canonical_retention_guard_v1",0,SQLITE_UTF8,
+                held,context::admit_retention,nullptr,nullptr,[](void* value){delete static_cast<std::shared_ptr<context>*>(value);})!=SQLITE_OK)
+                refuse("canonical retention guard registration failed");
+        }
         writer_->execute("PRAGMA recursive_triggers=ON");
         if(integer(writer_->query("PRAGMA recursive_triggers").at(0),"recursive_triggers")!=1)
             refuse("canonical REPLACE coverage needs recursive triggers");
@@ -317,7 +342,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         if(!writer_->query("SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND tbl_name='AuditLog' LIMIT 1").empty())
             refuse("canonical AuditLog has unapproved triggers");
         store.initialize();
-        if(!writer_->query("SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND substr(tbl_name,1,19)='_lattice_canonical_' LIMIT 1").empty())
+        if(!retention && !writer_->query("SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND substr(tbl_name,1,19)='_lattice_canonical_' LIMIT 1").empty())
             refuse("canonical metadata has unapproved triggers");
         std::map<std::string,table_plan> tables;
         std::set<std::string> models(p.models.begin(),p.models.end());
@@ -477,6 +502,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             writer_->execute("CREATE TABLE main._lattice_canonical_coverage(id INTEGER PRIMARY KEY CHECK(id=1),manifest BLOB NOT NULL) WITHOUT ROWID");
             writer_->execute("INSERT INTO main._lattice_canonical_coverage VALUES(1,?)",{bytes(manifest)});
         }
+        if(retention)enroll_retention(owner,reopen);
         store.audit();
         owner.commit();began=false;
         auto* mutex=sqlite3_db_mutex(context_->connection);sqlite3_mutex_enter(mutex);
@@ -507,6 +533,7 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
     std::shared_ptr<lattice_db> owner,const canonical_store_binding& binding,std::optional<int64_t> base,
     const std::vector<sync_recovery::canonical_capture_request>& requests,
     const sync_recovery::canonical_capture_limits& limits) {
+    if(retention_)refuse("canonical retention profile requires capture through a committed reservation");
     return capture_recovery_impl(std::move(owner),binding,base,requests,limits,{},{},{});
 }
 sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recovery_impl(
@@ -514,7 +541,8 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
     const std::vector<sync_recovery::canonical_capture_request>& requests,
     const sync_recovery::canonical_capture_limits& limits,
     const std::function<void(size_t,uint64_t)>& after_batch,
-    const std::function<void()>& before_decision,const std::function<void()>& after_decision) {
+    const std::function<void()>& before_decision,const std::function<void()>& after_decision,
+    const std::function<void(uint64_t)>& verify_retention_generation) {
     // No access to this after these copies: qualification callbacks may retire
     // the wrapper. They cannot release our actual owner/writer/context custody.
     auto state=context_;auto writer=writer_;
@@ -541,6 +569,7 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
     };
     const auto verify_generation=[&](uint64_t generation) {
         decide(); // after the actual keeper pin, not an earlier guessed view
+        if(verify_retention_generation)verify_retention_generation(generation);
         const auto query=[&](const std::string& sql,const std::vector<column_value_t>& args={}) {
             auto result=owner->query_at_generation(generation,sql,args);
             if(!result)refuse("canonical source descriptor view retired");return std::move(*result);

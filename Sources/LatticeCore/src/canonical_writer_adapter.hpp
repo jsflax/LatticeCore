@@ -1,6 +1,7 @@
 #pragma once
 #include "canonical_change_store.hpp"
 #include "canonical_source_capture.hpp"
+#include "canonical_transfer_retention.hpp"
 #include "lattice/sync.hpp"
 #include <memory>
 #include <string>
@@ -9,6 +10,7 @@
 namespace lattice::detail {
 class canonical_upstream_delivery;
 struct canonical_source_session_test_access;
+struct canonical_retention_test_access;
 namespace canonical_upstream_test_hooks {
 // Private failure injection only. Restricts an already admitted authorizer
 // action; never installs/replaces a raw hook. The callback must not run SQL,
@@ -18,6 +20,10 @@ struct authorizer_fault {
     int (*restrict_action)(int,const char*,const char*,const char*) noexcept;
 };
 extern thread_local const authorizer_fault* fault;
+}
+namespace canonical_retention_test_hooks {
+// Restriction-only faults; neither a clock override nor writable authority.
+extern thread_local const canonical_upstream_test_hooks::authorizer_fault* fault;
 }
 // Private fixed source qualification, not serving/epoch authority. The legacy
 // attachment borrows its owner. Every upstream call separately retains the
@@ -36,18 +42,33 @@ class canonical_writer_adapter {
     friend void require_canonical_relation(database&, const std::string&);
     friend class canonical_upstream_delivery;
     struct context;
+    struct retention_session;
+    struct retention_frame;
+    std::shared_ptr<retention_session> retention_;
     static bool matches_connection(const database&, sqlite3*) noexcept;
     std::shared_ptr<database> writer_;
     std::shared_ptr<context> context_;
     explicit canonical_writer_adapter(lattice_db&, const canonical_writer_profile&,
-                                      const canonical_upstream_limits* = nullptr);
+                                      const canonical_upstream_limits* = nullptr,
+                                      const canonical_retention_limits* = nullptr);
+    void prepare_retention(lattice_db&, const canonical_retention_limits&);
+    void enroll_retention(lattice_db&, bool);
+    static void verify_retention(database&, const context&, const retention_session&);
+    static recovery_install_result retention_owned(std::shared_ptr<lattice_db>,
+        std::shared_ptr<database>, std::shared_ptr<context>, std::shared_ptr<retention_session>,
+        int, const std::function<void(database&,retention_session&)>&);
     friend struct canonical_source_session_test_access;
+    friend struct canonical_retention_test_access;
+    sync_recovery::owned_canonical_capture capture_reserved_impl(std::shared_ptr<lattice_db>,
+        const canonical_retention_ticket&,const std::vector<sync_recovery::canonical_capture_request>&,
+        const sync_recovery::canonical_capture_limits&,const std::function<void(size_t,uint64_t)>&);
     sync_recovery::owned_canonical_capture capture_recovery_impl(std::shared_ptr<lattice_db>,
         const canonical_store_binding&, std::optional<int64_t>,
         const std::vector<sync_recovery::canonical_capture_request>&,
         const sync_recovery::canonical_capture_limits&,
         const std::function<void(size_t,uint64_t)>&,
-        const std::function<void()>&, const std::function<void()>&);
+        const std::function<void()>&, const std::function<void()>&,
+        const std::function<void(uint64_t)>& = {});
 
 public:
     static std::unique_ptr<canonical_writer_adapter> attach(lattice_db&, const canonical_writer_profile&);
@@ -55,6 +76,23 @@ public:
     // retained owner with no configured sync/IPC. No borrowed upstream route.
     static std::unique_ptr<canonical_writer_adapter> attach_upstream_for_qualification(
         std::shared_ptr<lattice_db>, const canonical_writer_profile&, canonical_upstream_limits);
+    // Explicit profile v2 enrollment; refuses upgrading a legacy attached
+    // canonical store. One file-WAL session holds bound directory custody.
+    // No public callback, caller transaction or caller-supplied protected base.
+    static std::unique_ptr<canonical_writer_adapter> attach_retention_for_qualification(
+        std::shared_ptr<lattice_db>, const canonical_writer_profile&, canonical_retention_limits);
+    canonical_retention_result reserve_recovery_owned(std::shared_ptr<lattice_db>,
+        std::optional<int64_t> base, int64_t duration_ms);
+    recovery_install_result release_recovery_owned(std::shared_ptr<lattice_db>, const canonical_retention_ticket&);
+    recovery_install_result expire_recovery_owned(std::shared_ptr<lattice_db>);
+    recovery_install_result prune_recovery_owned(std::shared_ptr<lattice_db>, int64_t floor);
+    // Caller keeps the returned reservation through later bounded preparation;
+    // failure retains it until explicit release or source-owned expiry. No
+    // read custody survives return/throw; no READY/spool proof is manufactured.
+    sync_recovery::owned_canonical_capture capture_reserved_owned(std::shared_ptr<lattice_db>,
+        const canonical_retention_ticket&,
+        const std::vector<sync_recovery::canonical_capture_request>&,
+        const sync_recovery::canonical_capture_limits&);
     std::vector<std::string> apply_upstream_owned(std::shared_ptr<lattice_db>,
         const std::vector<audit_log_entry>&, const std::optional<std::string>& receiving_channel = std::nullopt);
     // Private, synchronous, file-WAL-only source qualification. Scope and

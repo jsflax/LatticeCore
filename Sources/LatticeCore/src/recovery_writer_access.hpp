@@ -100,6 +100,7 @@ private:
     friend struct recovery_install_test_access;
     friend struct recovery_install_admission_test_access;
     friend class recovery_local_producer_adapter;
+    friend class canonical_writer_adapter;
     friend struct receive_delivery_guard_access;
 };
 } // namespace lattice::detail

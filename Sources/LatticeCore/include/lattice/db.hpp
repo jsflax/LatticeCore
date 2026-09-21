@@ -119,6 +119,7 @@ class database {
     bool canonical_custody_bootstrap_ = false;
     bool txn_hooks_external_ = false;
     void set_txn_hooks_owned_(std::function<void()>, std::function<void()>);
+    void rebind_txn_hooks_owned_() noexcept;
     // Private receiver producer admission. Heap custody follows the physical
     // connection across wrapper moves; no all-route capability is implied.
     std::shared_ptr<void> local_producer_callback_custody_;
@@ -417,8 +418,14 @@ private:
     // update hook via mark_txn_dirty(); consumed by drain_if_settled() at the
     // success tail of every statement wrapper; cleared by the rollback hook.
     std::atomic<bool> txn_dirty_{false};
-    std::function<void()> on_txn_settled_;
-    std::function<void()> on_txn_rolled_back_;
+    struct txn_hook_callbacks {
+        std::function<void()> settled, rolled_back;
+        txn_hook_callbacks(std::function<void()>&& success, std::function<void()>&& rollback)
+            : settled(std::move(success)), rolled_back(std::move(rollback)) {}
+    };
+    // Construct/destroy callable targets outside SQLite. Under its mutex only
+    // shared_ptr ownership moves; std::function moves/swaps may run user code.
+    std::shared_ptr<txn_hook_callbacks> txn_hooks_;
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
     // Internal live primitive getter path. Preserve query()'s first-row/name
     // and stored-type conventions without building generic result containers.

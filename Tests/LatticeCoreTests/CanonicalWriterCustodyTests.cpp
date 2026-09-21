@@ -3,6 +3,10 @@
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include "../../Sources/LatticeCore/src/projection_memory.hpp"
 #include "../../Sources/LatticeCore/src/recovery_local_producer.hpp"
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 struct CustodyRecord {std::string name;std::string body;};
 LATTICE_SCHEMA(CustodyRecord,name,body);
@@ -27,6 +31,76 @@ void capture_refused(database& db) {
     }
     EXPECT_EQ(statement,nullptr);EXPECT_EQ(control->target,nullptr);
 }
+struct scoped_trace_reset {
+    sqlite3* connection;
+    explicit scoped_trace_reset(sqlite3* connection) noexcept:connection(connection) {}
+    scoped_trace_reset(const scoped_trace_reset&)=delete;
+    scoped_trace_reset& operator=(const scoped_trace_reset&)=delete;
+    ~scoped_trace_reset() {sqlite3_trace_v2(connection,0,nullptr,nullptr);}
+};
+
+// A lifecycle callback never waits for SQLite. A separate thread tries the
+// physical mutex once, reports the result, and releases it immediately. The
+// caller's response wait has a deadline, including when the code under test
+// accidentally owns that mutex. No detached thread borrows the test frame.
+class callback_mutex_probe {
+public:
+    struct sample {size_t requests,completed,busy,timeouts;bool failed;};
+    void start(sqlite3* connection) {
+        connection_mutex_=sqlite3_db_mutex(connection);
+        inspector_=std::thread([this] {inspect();});
+    }
+    ~callback_mutex_probe() {stop();}
+    void stop() {
+        enabled_.store(false);
+        {std::lock_guard<std::mutex> lock(mutex_);stopping_=true;}
+        requests_changed_.notify_all();
+        if(inspector_.joinable())inspector_.join();
+    }
+    void observe() noexcept {
+        if(!enabled_.load())return;
+        try {
+            std::unique_lock<std::mutex> lock(mutex_);
+            const auto serial=++requests_;
+            requests_changed_.notify_one();
+            if(!responses_changed_.wait_for(lock,std::chrono::seconds(5),[&]{return completed_>=serial;}))++timeouts_;
+        }catch(...){failed_.store(true);}
+    }
+    sample read() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {requests_,completed_,busy_,timeouts_,failed_.load()};
+    }
+private:
+    void inspect() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for(;;) {
+            requests_changed_.wait(lock,[&]{return stopping_||completed_<requests_;});
+            if(stopping_)return;
+            const auto serial=requests_;
+            lock.unlock();
+            const auto status=sqlite3_mutex_try(connection_mutex_);
+            if(status==SQLITE_OK)sqlite3_mutex_leave(connection_mutex_);
+            lock.lock();
+            if(status!=SQLITE_OK)++busy_;
+            completed_=serial;responses_changed_.notify_one();
+        }
+    }
+    sqlite3_mutex* connection_mutex_=nullptr;
+    std::mutex mutex_;
+    std::condition_variable requests_changed_,responses_changed_;
+    size_t requests_=0,completed_=0,busy_=0,timeouts_=0;
+    bool stopping_=false;
+    std::atomic<bool> enabled_{true},failed_{false};
+    std::thread inspector_;
+};
+struct small_lifecycle_hook {
+    callback_mutex_probe* probe;
+    int* calls;
+    small_lifecycle_hook(callback_mutex_probe& p,int& count) noexcept:probe(&p),calls(&count) {}
+    small_lifecycle_hook(const small_lifecycle_hook& other) noexcept:probe(other.probe),calls(other.calls) {probe->observe();}
+    ~small_lifecycle_hook() {probe->observe();}
+    void operator()() const noexcept {++*calls;}
+};
 class CanonicalWriterCustody:public ::testing::TestWithParam<bool> {
 protected:
     TempDB path{"canonical_custody"};
@@ -142,6 +216,7 @@ TEST_P(CanonicalWriterCustody, AssignmentMovePreservesRawRetirementAcrossPhysica
 TEST_P(CanonicalWriterCustody, BootstrapOwnsPolicyBeforeTheContextIsPublished) {
     struct attempt {database* db;bool visited=false;int refused=0,published=0;bool unexpected=false;} state{&owner->db()};
     auto* trusted=canonical_writer_custody_test_access::fault_handle(owner->db());
+    scoped_trace_reset trace_cleanup{trusted};
     ASSERT_EQ(sqlite3_trace_v2(trusted,SQLITE_TRACE_STMT,
         [](unsigned,void* data,void*,void*) -> int {
             auto& value=*static_cast<attempt*>(data);if(value.visited)return 0;value.visited=true;
@@ -153,6 +228,95 @@ TEST_P(CanonicalWriterCustody, BootstrapOwnsPolicyBeforeTheContextIsPublished) {
     attach();ASSERT_EQ(sqlite3_trace_v2(trusted,0,nullptr,nullptr),SQLITE_OK);
     EXPECT_TRUE(state.visited);EXPECT_EQ(state.refused,2);EXPECT_EQ(state.published,0);EXPECT_FALSE(state.unexpected);
     owner->add(CustodyRecord{"after bootstrap","body"});EXPECT_EQ(rows(),1);EXPECT_EQ(receipts(),1);
+}
+
+TEST_P(CanonicalWriterCustody, FailedBootstrapUnregistersTraceBeforeFixtureTeardown) {
+    owner->db().execute("CREATE TEMP TABLE custody_forced_failure(value INTEGER)");
+    struct attempt {int calls=0;} state;
+    auto* trusted=canonical_writer_custody_test_access::fault_handle(owner->db());
+    {
+        scoped_trace_reset trace_cleanup{trusted};
+        ASSERT_EQ(sqlite3_trace_v2(trusted,SQLITE_TRACE_STMT,
+            [](unsigned,void* data,void*,void*) -> int {
+                ++static_cast<attempt*>(data)->calls;return 0;
+            },&state),SQLITE_OK);
+        EXPECT_THROW(attach(),db_error);
+        EXPECT_GT(state.calls,0);
+    }
+    // Retain the userdata while testing cleanup, so a missing unregister is
+    // observed as a count failure instead of intentionally dereferencing UAF.
+    const auto before=state.calls;
+    EXPECT_EQ(owner->db().query("SELECT 1 AS value").size(),1u);
+    EXPECT_EQ(state.calls,before);
+    owner.reset(); // Includes database's destructor SQL, with state still live.
+    EXPECT_EQ(state.calls,before);
+}
+
+TEST_P(CanonicalWriterCustody, PublicHookLifecycleRunsOutsideTheConnectionMutex) {
+    // The probe state outlives the writer even if hook cleanup throws; stopping
+    // its inspector before writer destruction removes every physical borrow.
+    callback_mutex_probe probe;
+    TempDB file{"canonical_callback_lifecycle"};
+    database writer(GetParam()?file.str():":memory:");
+    writer.execute("CREATE TABLE callback_lifecycle(value INTEGER)");
+    auto* trusted=canonical_writer_custody_test_access::fault_handle(writer);
+    ASSERT_NE(sqlite3_db_mutex(trusted),nullptr);
+    probe.start(trusted);
+    struct clear_before_probe {
+        database& writer;callback_mutex_probe& probe;
+        ~clear_before_probe() {
+            try {writer.set_txn_hooks({},{});}catch(...){ADD_FAILURE()<<"hook cleanup failed";}
+            probe.stop();
+        }
+    } cleanup{writer,probe};
+    const auto checked=[&](callback_mutex_probe::sample before) {
+        const auto after=probe.read();
+        EXPECT_GT(after.requests,before.requests);
+        EXPECT_EQ(after.completed,after.requests);
+        EXPECT_EQ(after.busy,0u);EXPECT_EQ(after.timeouts,0u);EXPECT_FALSE(after.failed);
+    };
+    int first_settled=0,first_rollback=0,second_settled=0,second_rollback=0;
+    auto before=probe.read();
+    writer.set_txn_hooks(small_lifecycle_hook{probe,first_settled},small_lifecycle_hook{probe,first_rollback});
+    checked(before);
+    writer.mark_txn_dirty();writer.execute("SELECT 1");EXPECT_EQ(first_settled,1);
+    writer.begin_transaction();writer.execute("INSERT INTO callback_lifecycle VALUES(1)");
+    writer.mark_txn_dirty();writer.rollback();EXPECT_EQ(first_rollback,1);
+    writer.execute("SELECT 1");EXPECT_EQ(first_settled,1);
+
+    before=probe.read();
+    writer.set_txn_hooks(small_lifecycle_hook{probe,second_settled},small_lifecycle_hook{probe,second_rollback});
+    checked(before);
+    writer.mark_txn_dirty();writer.execute("SELECT 1");EXPECT_EQ(second_settled,1);EXPECT_EQ(first_settled,1);
+    writer.begin_transaction();writer.execute("INSERT INTO callback_lifecycle VALUES(2)");
+    writer.mark_txn_dirty();writer.rollback();EXPECT_EQ(second_rollback,1);EXPECT_EQ(first_rollback,1);
+
+    before=probe.read();writer.set_txn_hooks({},{});checked(before);
+    writer.mark_txn_dirty();writer.execute("SELECT 1");EXPECT_EQ(second_settled,1);
+}
+
+TEST_P(CanonicalWriterCustody, PublicHookBundleSurvivesSelfReplacementAndPhysicalMoves) {
+    int first=0,successor=0,rolled_back=0;bool retired=false;
+    TempDB file{"canonical_callback_moves"};
+    database writer(GetParam()?file.str():":memory:");
+    writer.execute("CREATE TABLE callback_moves(value INTEGER)");
+    struct lifetime {bool& retired;explicit lifetime(bool& flag):retired(flag) {}~lifetime(){retired=true;}};
+    auto held=std::make_shared<lifetime>(retired);
+    writer.set_txn_hooks([&,held] {
+        ++first;EXPECT_FALSE(retired);
+        writer.set_txn_hooks([&]{++successor;},[&]{++rolled_back;});
+        EXPECT_FALSE(retired) << "the executing callback must survive its replacement";
+    },[]{});
+    held.reset();writer.mark_txn_dirty();writer.execute("SELECT 1");
+    EXPECT_EQ(first,1);EXPECT_TRUE(retired);
+    database moved(std::move(writer));
+    moved.mark_txn_dirty();moved.execute("SELECT 1");EXPECT_EQ(successor,1);
+    database destination(":memory:");destination=std::move(moved);
+    destination.begin_transaction();destination.execute("INSERT INTO callback_moves VALUES(1)");
+    destination.mark_txn_dirty();destination.rollback();EXPECT_EQ(rolled_back,1);
+    destination.execute("SELECT 1");EXPECT_EQ(successor,1);
+    destination.mark_txn_dirty();destination.execute("SELECT 1");EXPECT_EQ(successor,2);
+    destination.set_txn_hooks({},{});
 }
 
 TEST_P(CanonicalWriterCustody, LocalProducerPolicyAlsoSurvivesBorrowerAndPublicHookRefusal) {

@@ -43,7 +43,7 @@ swift_schema_entry owner_schema(bool no_history=true,bool reverse=false) {
 }
 struct owner_fixture {
     std::unique_ptr<swift_lattice_ref> ref;
-    std::shared_ptr<swift_lattice> owner;
+    std::shared_ptr<lattice::swift_lattice> owner;
     owner_fixture(const std::string& path,const SchemaVector& schemas) {
         swift_configuration config(path,std::make_shared<immediate_scheduler>());
         config.audit_retention_seconds=0;config.busy_timeout_ms=100;

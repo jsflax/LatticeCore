@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.0.7] - 2026-09-21
+
+### Fixed
+- Serialize concurrent access to the shared global row-ID random generator.
+  Concurrent writers in separate database instances could race while drawing
+  random values. Initialization and both draws now use one shared mutex;
+  UUID formatting occurs after releasing the mutex.
+- Preserve the existing random algorithm and UUID representation. This prevents
+  the shared-generator data race in future writes; it does not repair earlier
+  duplicate identities or restore overwritten values.
+
+### Compatibility
+- No persistent schema, sync wire format, or public C ABI change is intended.
+- Automatic recovery and the broader performance work remain in development.
+  This maintenance release does not claim a measured latency improvement.
+
 ## [2.0.6] - 2026-09-19
 
 ### Fixed

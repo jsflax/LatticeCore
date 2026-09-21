@@ -8,6 +8,7 @@
 #include <vector>
 #include <optional>
 #include <atomic>
+#include <error.hpp>
 
 namespace lattice {
 class geo_bounds_ref;
@@ -156,8 +157,8 @@ struct geo_bounds_list {
 #endif
 
         geo_bounds value;
-        size_t idx;
-        geo_bounds_list* list;
+        size_t idx = 0;
+        geo_bounds_list* list = nullptr;
 
         // Assignment updates the list
         element_proxy& operator=(const geo_bounds& bounds);
@@ -290,52 +291,52 @@ public:
         return impl_->get_link_table_name();
     }
 
-    size_t size() const { return impl_->size(); }
-    bool empty() const { return impl_->empty(); }
+    size_t size() const { return sealed([&] { return impl_->size(); }); }
+    bool empty() const { return sealed([&] { return impl_->empty(); }); }
 
     geo_bounds_list::element_proxy operator[](size_t idx) const {
-        return (*impl_)[idx];
+        return sealed([&] { return (*impl_)[idx]; });
     }
 
     // const (shallow): these mutate the pointee through the shared_ptr, so on
     // the value path they import non-mutating and are callable on a `let`.
     void push_back(const geo_bounds& bounds) const {
-        impl_->push_back(bounds);
+        sealed([&] { impl_->push_back(bounds); });
     }
 
 #if LATTICE_HAS_FRT
     void push_back(geo_bounds_ref* ref) const SWIFT_NAME(pushBack(_:)) {
-        impl_->push_back(ref);
+        sealed([&] { impl_->push_back(ref); });
     }
 #else
     void push_back(const geo_bounds_ref& ref) const SWIFT_NAME(pushBack(_:)) {
-        impl_->push_back(*ref.get());
+        sealed([&] { impl_->push_back(*ref.get()); });
     }
 #endif
 
     void erase(size_t idx) const {
-        impl_->erase(idx);
+        sealed([&] { impl_->erase(idx); });
     }
 
     void clear() const {
-        impl_->clear();
+        sealed([&] { impl_->clear(); });
     }
 
     void set(size_t idx, const geo_bounds& bounds) const {
-        impl_->set(idx, bounds);
+        sealed([&] { impl_->set(idx, bounds); });
     }
 
     // Find index by coordinate comparison
     std::optional<size_t> find_index(const geo_bounds_ref& ref) const SWIFT_NAME(findIndex(_:)) {
         if (ref.get()) {
-            return impl_->find_index(*ref.get());
+            return sealed([&] { return impl_->find_index(*ref.get()); });
         }
         return std::nullopt;
     }
 
     // Find all elements matching SQL predicate (managed lists only)
     std::vector<size_t> find_where(const std::string& sql_predicate) const SWIFT_NAME(findWhere(_:)) {
-        return impl_->find_where(sql_predicate);
+        return sealed([&] { return impl_->find_where(sql_predicate); });
     }
 
 private:

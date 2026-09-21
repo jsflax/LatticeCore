@@ -81,7 +81,8 @@ class recovery_export_adapter {
     static void revalidate_claimed_frame(const committed_export_frame&);
     static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
-        const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr);
+        const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr,
+        bool retained_delete_page=false);
 public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.
@@ -101,6 +102,16 @@ public:
     // with no frame means an empty sampled view, never frontier authority. No mount
     // authorization is implied; a future SDK route must authorize every row.
     static recovery_export_preparation prepare_history_page(std::shared_ptr<lattice_db>,
+        uint64_t physical_generation,int64_t after_audit_id,size_t maximum_entries,
+        const recovery_export_limits& = {});
+    // Inactive retained-original continuation. Same bounded ordered PK page and
+    // genuine generated/open-obligation checks as history preparation. Only
+    // this entry may omit unavailable UPDATE NoHistory fields, and only when
+    // this page contains a later generated DELETE of the exact target and the
+    // same owned view proves final absence. All selected originals are claimed
+    // together. A page ending before DELETE refuses; no unbounded lookahead,
+    // skipped original, UNSENT/receipt inference or controller activation.
+    static recovery_export_preparation prepare_retained_page(std::shared_ptr<lattice_db>,
         uint64_t physical_generation,int64_t after_audit_id,size_t maximum_entries,
         const recovery_export_limits& = {});
     // Compatibility bookkeeping for currently sent IDs only. Leaves every

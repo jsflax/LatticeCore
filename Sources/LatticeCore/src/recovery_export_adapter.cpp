@@ -1,5 +1,6 @@
 #include "recovery_export_adapter.hpp"
 #include <cmath>
+#include <algorithm>
 #include <array>
 #include <utility>
 #include <iomanip>
@@ -103,7 +104,8 @@ bool has_column(const recovery_local_export_table& table,const std::string& name
     for(const auto& c:table.columns)if(c.first==name)return true;
     return false;
 }
-void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_table& table,budget& b){
+void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_table& table,budget& b,
+    bool retained_later_delete=false){
     auto& e=row.entry;
     {statement valid(db,"SELECT json_valid(?1),json_valid(?2),CASE WHEN json_valid(?1) THEN json_type(?1) END,CASE WHEN json_valid(?2) THEN json_type(?2) END");
      valid.text(1,row.fields);valid.text(2,row.names);
@@ -125,7 +127,15 @@ void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_tab
     if(e.operation=="UPDATE")for(const auto& column:table.no_history){
         if(!changed.count(column))continue;
         statement current(db,"SELECT "+quote_identifier(column)+" FROM main."+quote_identifier(table.name)+" WHERE globalId=? LIMIT 2");current.text(1,e.global_row_id);
-        if(!current.next())refuse("export NoHistory current row is absent");e.changed_fields[column]=any_property::from_column_value(scalar(current,0,b));
+        if(!current.next()){
+            if(!retained_later_delete)refuse("export NoHistory current row is absent");
+            // Only the wire projection changes. The original names/fields and
+            // generated stamp remain intact and are verified again precommit.
+            e.changed_fields.erase(column);
+            e.changed_fields_names.erase(std::remove(e.changed_fields_names.begin(),e.changed_fields_names.end(),column),e.changed_fields_names.end());
+            continue;
+        }
+        e.changed_fields[column]=any_property::from_column_value(scalar(current,0,b));
         if(current.next())refuse("export NoHistory target is ambiguous");
     }
 }
@@ -328,9 +338,14 @@ recovery_export_preparation recovery_export_adapter::prepare_history_page(std::s
     if(after<0)refuse("export history cursor must be a resolved nonnegative PK");
     return prepare(std::move(owner),{},generation,count,{},false,limits,after);
 }
+recovery_export_preparation recovery_export_adapter::prepare_retained_page(std::shared_ptr<lattice_db> owner,
+    uint64_t generation,int64_t after,size_t count,const recovery_export_limits& limits){
+    if(after<0)refuse("export retained cursor must be a resolved nonnegative PK");
+    return prepare(std::move(owner),{},generation,count,{},false,limits,after,nullptr,true);
+}
 recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits,
-    std::optional<int64_t> history_after,bool* discovery_busy){
+    std::optional<int64_t> history_after,bool* discovery_busy,bool retained_delete_page){
     recovery_export_preparation output;
     // Catch only this first no-effect classifier. A busy exception arising
     // later from reentrant work must never replay a claim or mutation stage.
@@ -356,14 +371,32 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
             for(const auto id:pending)if(!sending.count(id)){ids.push_back(id);if(ids.size()==count)break;}
         }
         budget raw{limits};std::vector<raw_audit> originals;std::vector<std::vector<std::string>> by_scope(inventory.scopes.size());
-        std::string encoded="{\"auditLog\":[";
+        // Validate the entire finite page's provenance before any later row
+        // can justify an earlier UPDATE projection. No caller-provided flag,
+        // operation text alone or unselected DELETE is generated evidence.
+        std::vector<const recovery_local_export_table*> tables;
+        std::vector<size_t> scope_indexes;
         for(const auto id:ids){auto row=read_audit(db,id,raw);const recovery_local_export_table* table=nullptr;size_t scope_index=0;
             for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& t:inventory.scopes[i].tables)if(t.name==row.entry.table_name){if(table)refuse("export ambiguous contribution table");table=&t;scope_index=i;}
             if(!table)refuse("export original has no admitted whole-model contribution");
             if(history_after)history_original(db,inventory,inventory.scopes[scope_index],journal,row.entry);
-            decode_generated(db,row,*table,raw);wire_bound(row.entry,limits.wire_bytes-encoded.size()-2);
+            tables.push_back(table);scope_indexes.push_back(scope_index);originals.push_back(std::move(row));
+        }
+        const auto later_delete=[&](size_t index){
+            if(!retained_delete_page)return false;
+            const auto& current=originals[index].entry;
+            if(current.operation!="UPDATE")return false;
+            for(size_t next=index+1;next<originals.size();++next){const auto& candidate=originals[next].entry;
+                if(candidate.operation=="DELETE"&&candidate.id>current.id&&candidate.table_name==current.table_name&&
+                   candidate.global_row_id==current.global_row_id)return true;
+            }
+            return false;
+        };
+        std::string encoded="{\"auditLog\":[";
+        for(size_t i=0;i<originals.size();++i){auto& row=originals[i];
+            decode_generated(db,row,*tables[i],raw,later_delete(i));wire_bound(row.entry,limits.wire_bytes-encoded.size()-2);
             const auto json=row.entry.to_json();if(json.size()+3>limits.wire_bytes-encoded.size())refuse("export encoded frame exceeds budget");
-            if(!frame.entries_.empty())encoded+=',';encoded+=json;by_scope[scope_index].push_back(row.entry.global_id);frame.entries_.push_back(row.entry);originals.push_back(std::move(row));
+            if(!frame.entries_.empty())encoded+=',';encoded+=json;by_scope[scope_indexes[i]].push_back(row.entry.global_id);frame.entries_.push_back(row.entry);
         }
         encoded+="]}";if(frame.entries_.empty())return;
         std::vector<std::pair<recovery_obligation_address,recovery_obligation_entry>> expected_entries;
@@ -379,7 +412,22 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         check_scopes(final_inventory,frame.scopes_);check_claims(journal,frame.claims_,frame.entries_);
         for(const auto& [address,expected]:expected_entries)if(journal.find(address,expected.record.original_id)!=std::optional<recovery_obligation_entry>(expected))refuse("export cross-contribution final entry changed");
         for(const auto& expected:expected_scopes)if(journal.read(expected.address.channel)!=std::optional<recovery_obligation_scope>(expected))refuse("export cross-contribution final scope changed");
-        budget verify{limits};for(const auto& before:originals)if(!same_original(before,read_audit(db,before.entry.id,verify)))refuse("export original changed after claims");
+        budget verify{limits};
+        for(size_t i=0;i<originals.size();++i){const auto& before=originals[i];auto after=read_audit(db,before.entry.id,verify);
+            if(!same_original(before,after))refuse("export original changed after claims");
+            if(retained_delete_page){
+                // Recheck both actual row absence/value and exact projection
+                // after reentrant claim hooks; read errors never prove absence.
+                decode_generated(db,after,*tables[i],verify,later_delete(i));
+                const auto& projected=frame.entries_[i];
+                if(after.entry.changed_fields_names!=projected.changed_fields_names||after.entry.changed_fields.size()!=projected.changed_fields.size())
+                    refuse("export retained projection changed after claims");
+                for(const auto& [name,value]:after.entry.changed_fields){const auto found=projected.changed_fields.find(name);
+                    if(found==projected.changed_fields.end()||found->second.kind!=value.kind||found->second.value!=value.value)
+                        refuse("export retained projection changed after claims");
+                }
+            }
+        }
         if(history_after){
             if(history_page(db,*history_after,count)!=ids)refuse("export history page changed during claims");
             for(const auto& scope:final_inventory.scopes)for(const auto& table:scope.tables)

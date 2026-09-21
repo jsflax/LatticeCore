@@ -1,6 +1,7 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
+#include "../../Sources/LatticeCore/src/sync_recovery_values.hpp"
 #include <chrono>
 #include <cstring>
 #include <atomic>

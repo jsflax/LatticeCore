@@ -390,6 +390,30 @@ receive_install_receipt receive_install_store::complete(const receive_install_bi
         return receive_install_receipt{receive_install_disposition::installed,next.revision,i.head};
     });
 }
+receive_install_store::journal_snapshot receive_install_store::snapshot_for_journal() const {
+    audit();
+    journal_snapshot result{configuration(),{}};
+    receive_install_usage observed;
+    std::optional<std::string> after;
+    for(;;){
+        const auto sql="SELECT "+bounded_projection("channel",limits_.field_bytes)+" FROM main._lattice_install_channel"+
+            (after?" WHERE channel>?":"")+" ORDER BY channel LIMIT 1";
+        const auto keys=after?connection().query(sql,{bytes(*after)}):connection().query(sql);
+        if(keys.empty())break;
+        if(observed.channels>=limits_.channels)fail(code::corrupt_state,"receiver cancellation snapshot channel cap exceeded");
+        auto key=bounded_string(keys[0],"channel",limits_.field_bytes);
+        auto current=row(key);
+        if(!current)fail(code::corrupt_state,"receiver cancellation snapshot channel disappeared");
+        const auto charge=row_size(*current,limits_);
+        if(!fits(observed.encoded_bytes,charge,limits_.encoded_bytes))
+            fail(code::corrupt_state,"receiver cancellation snapshot byte cap exceeded");
+        ++observed.channels;observed.encoded_bytes+=charge;
+        result.channels.push_back(std::move(*current));after=std::move(key);
+    }
+    if(observed!=result.usage||configuration()!=result.usage)
+        fail(code::corrupt_state,"receiver cancellation snapshot usage changed");
+    return result;
+}
 receive_install_snapshot receive_install_store::retire_unstarted_for_journal(
     const receive_install_snapshot& expected,int64_t sequence) {
     auto& db=connection();

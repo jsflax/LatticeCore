@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <set>
+#include <utility>
 
 namespace lattice::detail {
 namespace {
@@ -100,6 +101,14 @@ struct global {
     recovery_obligation_usage usage;
     int64_t incarnation=0,record=0,export_claim=0;
     bool operator==(const global&) const=default;
+};
+// Exact cancellation preservation, not a completeness/dispatch capability.
+// All retained entries include settled tombstones; aggregate budgets are the
+// same limits enforced by the full audit that constructs each snapshot.
+struct cancellation_journal_state {
+    global store;
+    std::vector<std::pair<scope_t,std::vector<entry_t>>> scopes;
+    bool operator==(const cancellation_journal_state&) const=default;
 };
 struct schema_definition { const char* name; const char* sql; };
 constexpr schema_definition definitions[]={
@@ -272,7 +281,7 @@ struct backend {
         if (active_only) result.erase(std::remove_if(result.begin(),result.end(),[](const auto& e){return e.stage==stage::settled;}),result.end());
         return result;
     }
-    void full_audit() const {
+    void full_audit(cancellation_journal_state* preserved=nullptr) const {
         // Private versioned schema: no adoption of another PK/index layout.
         // SQLite stores these exact CREATE statements with only the schema
         // qualifier removed. Copy at most each compiled definition's size.
@@ -292,6 +301,7 @@ struct backend {
                 fail(code::corrupt_state,"obligation internal table shape differs");
         }
         const auto g=config(); recovery_obligation_usage observed;
+        if(preserved){preserved->store=g;preserved->scopes.clear();}
         std::string after; bool first=true;
         for (;;) {
             auto rows=db.query("SELECT "+blobs({"channel"},l).substr(1)+" FROM main._lattice_obligation_scope "+
@@ -301,10 +311,13 @@ struct backend {
             after=string(rows[0],"channel"); first=false;
             auto s=scope(after); if (!s) fail(code::corrupt_state,"obligation scope disappeared");
             current(s->address); ++observed.scopes; observed.encoded_bytes=add(observed.encoded_bytes,scope_size(*s,l));
-            for (const auto& e:entries(*s,false,true)) {
+            if(observed.encoded_bytes>l.encoded_bytes)fail(code::corrupt_state,"obligation total exceeds explicit cap");
+            auto retained=entries(*s,false,true);
+            for (const auto& e:retained) {
                 observed.records=add(observed.records,1); observed.encoded_bytes=add(observed.encoded_bytes,entry_size(e,l,s->address.channel));
                 if (observed.records>l.records || observed.encoded_bytes>l.encoded_bytes) fail(code::corrupt_state,"obligation total exceeds explicit cap");
             }
+            if(preserved)preserved->scopes.emplace_back(*s,std::move(retained));
         }
         // Orphan/corrupt rows also obey the audit work cap. Refuse a saturated
         // INT64_MAX boundary rather than overflow cap+1 or silently undercount.
@@ -464,7 +477,11 @@ scope_t recovery_obligation_store::cancel_frozen_for_retry(const recovery_obliga
                    receiver->frontier!=receive_install_frontier{receive_frontier_kind::position,s.installed_head}) {
             fail(code::stale,"obligation cancellation receiver differs from the retained installed baseline");
         }
-        b.full_audit();
+        // Capture before EITHER write: receiver retirement can invoke a
+        // metadata trigger before put_scope samples its own expected_global.
+        cancellation_journal_state expected_journal;
+        b.full_audit(&expected_journal);
+        auto expected_receivers=installs.snapshot_for_journal();
         // Freeze can precede receipt of a manifest, so begin() may never have
         // consumed this sequence. Retire its number without inventing an I;
         // otherwise next-attempt monotonicity and receiver next-sequence
@@ -479,7 +496,22 @@ scope_t recovery_obligation_store::cancel_frozen_for_retry(const recovery_obliga
         // changed receiver. Any failure rolls this savepoint back, retaining Q.
         if (installs.read(s.address.channel)!=std::optional<receive_install_snapshot>{retired})
             fail(code::stale,"obligation cancellation receiver changed during settlement");
-        b.full_audit();
+        bool journal_found=false,receiver_found=false;
+        for(auto& retained:expected_journal.scopes)if(retained.first.address.channel==prior.address.channel){
+            if(retained.first!=prior)fail(code::stale,"obligation cancellation initial scope changed");
+            retained.first=s;journal_found=true;
+        }
+        for(auto& channel:expected_receivers.channels)if(channel.binding.channel==receiver->binding.channel){
+            if(channel!=*receiver)fail(code::stale,"obligation cancellation initial receiver changed");
+            channel=retired;receiver_found=true;
+        }
+        if(!journal_found||!receiver_found)fail(code::corrupt_state,"obligation cancellation missing preservation baseline");
+        cancellation_journal_state actual_journal;
+        b.full_audit(&actual_journal);
+        if(actual_journal!=expected_journal)
+            fail(code::corrupt_state,"obligation cancellation changed retained journal evidence");
+        if(installs.snapshot_for_journal()!=expected_receivers)
+            fail(code::stale,"obligation cancellation changed retained receiver evidence");
         return s;
     });
 }

@@ -124,6 +124,10 @@ public:
     // receiver sequence without fabricating a manifest/install. The generation and
     // revision advance fences a previously issued installer. This is not a
     // transport/producer-barrier cancellation or proof that callbacks stopped.
+    // Exact bounded pre/post snapshots preserve all journal entries (including
+    // settled), other scopes, allocator high waters and receiver channels. Only
+    // this scope's mode/generation/revision and its unstarted receiver sequence
+    // may change; structurally valid trigger rewrites still roll back.
     // Result is provisional until the outer owned COMMIT is known successful.
     recovery_obligation_scope cancel_frozen_for_retry(const recovery_obligation_address&,
         int64_t logical_attempt,int64_t expected_journal_revision);

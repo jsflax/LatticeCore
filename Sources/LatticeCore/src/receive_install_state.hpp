@@ -6,6 +6,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace lattice {
 class lattice_db;
@@ -91,6 +92,14 @@ class receive_install_store {
     // Only the journal's exact frozen-attempt cancellation may consume an
     // unstarted next sequence. No installation, frontier or ACK is created.
     receive_install_snapshot retire_unstarted_for_journal(const receive_install_snapshot&,int64_t);
+    struct journal_snapshot {
+        receive_install_usage usage;
+        std::vector<receive_install_snapshot> channels;
+        bool operator==(const journal_snapshot&) const=default;
+    };
+    // Bounded exact preservation for cancellation, including unrelated receiver
+    // channels/high waters. Private to the already-friended journal helper.
+    journal_snapshot snapshot_for_journal() const;
 public:
     receive_install_store(std::shared_ptr<lattice_db>, receive_install_limits);
     // Every method, including reads, requires this thread's actual owned main

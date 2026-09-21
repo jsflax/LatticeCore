@@ -729,3 +729,140 @@ TEST(RecoveryObligationStoreFile, CanceledAttemptAndPinnedOriginalSurvivePhysica
         }).state,outcome::committed);
     }
 }
+
+namespace {
+class RecoveryCancelPreservation : public RecoveryObligationStore {
+protected:
+    static auto all_rows(lattice::database& db) {
+        std::vector<std::vector<lattice::database::row_t>> rows;
+        for(const auto* table:{"_lattice_obligation_store","_lattice_obligation_scope","_lattice_obligation_entry",
+            "_lattice_install_store","_lattice_install_channel","AuditLog","TestPerson"})
+            rows.push_back(db.query(std::string("SELECT * FROM ")+table+" ORDER BY 1,2"));
+        return rows;
+    }
+    recovery_obligation_address sibling(const std::string& channel="other") {
+        auto p=profile;p.binding.channel=channel;p.binding.scope=channel;
+        recovery_obligation_address result;
+        committed([&](auto&){installs().bind(p.binding);result=storage().bind(p).address;});return result;
+    }
+    void claimed(const recovery_obligation_entry& e,bool acknowledged=false) {
+        committed([&](auto&){auto s=storage();s.claim_export(address,{e.record.original_id});if(acknowledged)s.acknowledge(address,positive(e));});
+    }
+    // Faults deliberately produce structurally valid metadata. First fire the
+    // same trigger inside a savepoint and prove both audits still accept it;
+    // then roll that control back and require cancellation to reject its exact
+    // evidence rewrite. The original fault recipe therefore fails the old API.
+    template<class F> void fault(const std::string& body,F&& verify,bool receiver_write=false,
+                                error expected=error::corrupt_state) {
+        const auto frozen=scope();
+        committed([&](auto& db){
+            const auto before=all_rows(db);const auto audit=db.query("SELECT * FROM AuditLog ORDER BY id");
+            const std::string on=receiver_write
+                ? "AFTER UPDATE OF last_sequence ON _lattice_install_channel WHEN NEW.channel=CAST('channel' AS BLOB) AND NEW.last_sequence>OLD.last_sequence"
+                : "AFTER UPDATE OF mode ON _lattice_obligation_scope WHEN NEW.channel=CAST('channel' AS BLOB) AND NEW.mode=0";
+            db.execute("CREATE TRIGGER cancel_preservation_fault "+on+" BEGIN "+body+" END");
+            db.execute("SAVEPOINT cancel_fault_valid_control");
+            if(receiver_write)db.execute("UPDATE _lattice_install_channel SET last_sequence=last_sequence+1 WHERE channel=CAST('channel' AS BLOB)");
+            else db.execute("UPDATE _lattice_obligation_scope SET mode=0 WHERE channel=CAST('channel' AS BLOB)");
+            storage().audit();installs().audit();verify(db);
+            EXPECT_EQ(db.query("SELECT * FROM AuditLog ORDER BY id"),audit);
+            db.execute("ROLLBACK TO cancel_fault_valid_control");db.execute("RELEASE cancel_fault_valid_control");
+            EXPECT_EQ(all_rows(db),before);
+            expect(expected,[&]{storage().cancel_frozen_for_retry(address,frozen.last_attempt,frozen.revision);});
+            EXPECT_TRUE(db.is_in_transaction());EXPECT_EQ(all_rows(db),before);
+            storage().audit();installs().audit();
+            db.execute("DROP TRIGGER cancel_preservation_fault");
+            address=storage().cancel_frozen_for_retry(address,frozen.last_attempt,frozen.revision).address;
+            EXPECT_EQ(storage().read(profile.binding.channel)->mode,mode::recording);
+            EXPECT_EQ(db.query("SELECT * FROM AuditLog ORDER BY id"),audit);
+        });
+    }
+};
+}
+
+TEST_F(RecoveryCancelPreservation, ValidClaimClearingTriggerRefusesAndRollsBackReceiverRetirement) {
+    const auto e=add(401);claimed(e);freeze();
+    fault("UPDATE _lattice_obligation_entry SET first_export=NULL WHERE channel=NEW.channel AND stage=0;",[&](auto&){
+        EXPECT_FALSE(storage().find(address,e.record.original_id)->first_export_claim);
+    });
+    committed([&](auto&){ASSERT_TRUE(storage().find(address,e.record.original_id)->first_export_claim);});
+}
+TEST_F(RecoveryCancelPreservation, ValidAcknowledgmentDowngradeCannotErasePositiveEvidence) {
+    const auto e=add(402);claimed(e,true);freeze();
+    fault("UPDATE _lattice_obligation_entry SET stage=0,ack_position=NULL,ack_outcome=NULL,first_export=NULL WHERE channel=NEW.channel AND stage=1;",[&](auto&){
+        const auto value=storage().find(address,e.record.original_id);ASSERT_TRUE(value);
+        EXPECT_EQ(value->stage,stage::open);EXPECT_FALSE(value->acknowledged);EXPECT_FALSE(value->first_export_claim);
+    });
+    committed([&](auto&){const auto value=storage().find(address,e.record.original_id);ASSERT_TRUE(value);
+        EXPECT_EQ(value->stage,stage::acknowledged_awaiting_install);EXPECT_TRUE(value->acknowledged);EXPECT_TRUE(value->first_export_claim);});
+}
+TEST_F(RecoveryCancelPreservation, SettledTombstoneClaimIsIncludedInExactPreservation) {
+    const auto e=add(403);claimed(e);freeze();const auto prior=first();install(prior,{positive(e)});
+    committed([&](auto&){address=storage().resume(address,prior).address;});freeze(2);
+    fault("UPDATE _lattice_obligation_entry SET first_export=NULL WHERE channel=NEW.channel AND stage=2;",[&](auto&){
+        const auto value=storage().find(address,e.record.original_id);ASSERT_TRUE(value);
+        EXPECT_EQ(value->stage,stage::settled);EXPECT_FALSE(value->first_export_claim);EXPECT_TRUE(value->acknowledged);
+    });
+    committed([&](auto&){const auto value=storage().find(address,e.record.original_id);ASSERT_TRUE(value);
+        EXPECT_EQ(value->stage,stage::settled);EXPECT_TRUE(value->first_export_claim);EXPECT_EQ(value->settled_install_sequence,1);});
+}
+TEST_F(RecoveryCancelPreservation, UnrelatedScopeEntryCannotLoseItsExportClaim) {
+    const auto other=sibling();recovery_obligation_entry e;
+    committed([&](auto& db){auto s=storage();e=s.record(other,insert(db,404));s.claim_export(other,{e.record.original_id});e=*s.find(other,e.record.original_id);});
+    add(405);freeze();
+    fault("UPDATE _lattice_obligation_entry SET first_export=NULL WHERE channel=CAST('other' AS BLOB);",[&](auto&){
+        EXPECT_FALSE(storage().find(other,e.record.original_id)->first_export_claim);
+    });
+    committed([&](auto&){EXPECT_EQ(storage().find(other,e.record.original_id),e);});
+}
+TEST_F(RecoveryCancelPreservation, UnrelatedScopeRevisionAndAttemptHighWaterArePreserved) {
+    sibling();add(406);freeze();
+    fault("UPDATE _lattice_obligation_scope SET revision=revision+1,last_attempt=last_attempt+3 WHERE channel=CAST('other' AS BLOB);",[&](auto&){
+        const auto other=storage().read("other");ASSERT_TRUE(other);EXPECT_EQ(other->last_attempt,3);
+    });
+    committed([&](auto&){EXPECT_EQ(storage().read("other")->last_attempt,0);});
+}
+TEST_F(RecoveryCancelPreservation, ReceiverTriggerCannotAdvanceJournalGlobalAllocatorHighWaters) {
+    const auto e=add(407);claimed(e);freeze();
+    std::vector<lattice::database::row_t> original_global;
+    committed([&](auto& db){original_global=db.query("SELECT * FROM _lattice_obligation_store");});
+    fault("UPDATE _lattice_obligation_store SET incarnation=incarnation+7,record_sequence=record_sequence+7,export_sequence=export_sequence+7 WHERE id=1;",[&](auto& db){
+        const auto changed=db.query("SELECT * FROM _lattice_obligation_store");ASSERT_EQ(changed.size(),1u);
+        for(const auto* column:{"incarnation","record_sequence","export_sequence"})
+            EXPECT_EQ(std::get<int64_t>(changed[0].at(column)),std::get<int64_t>(original_global[0].at(column))+7);
+    },true);
+    committed([&](auto& db){EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_store"),original_global);});
+}
+TEST_F(RecoveryCancelPreservation, ReceiverOnlyChannelHighWaterCannotChangeAsCollateralEffect) {
+    auto receiver_only=profile.binding;receiver_only.channel="receiver-only";receiver_only.scope="receiver-only";
+    committed([&](auto&){installs().bind(receiver_only);});add(408);freeze();
+    fault("UPDATE _lattice_install_channel SET last_sequence=last_sequence+5 WHERE channel=CAST('receiver-only' AS BLOB);",[&](auto&){
+        EXPECT_EQ(installs().read("receiver-only")->last_sequence,5);
+    },false,error::stale);
+    committed([&](auto&){EXPECT_EQ(installs().read("receiver-only")->last_sequence,0);});
+}
+TEST_F(RecoveryCancelPreservation, ValidNewReceiverAndUsageRewriteRollBackTogether) {
+    add(409);freeze();
+    fault("INSERT INTO _lattice_install_channel(channel,authority,source,epoch,scope,schema_digest,frontier_kind,frontier,revision,last_sequence,active,last_install,bytes) "
+          "SELECT CAST('extra' AS BLOB),authority,source,epoch,CAST('extra' AS BLOB),schema_digest,0,NULL,0,0,NULL,NULL,bytes-2 "
+          "FROM _lattice_install_channel WHERE channel=CAST('channel' AS BLOB); "
+          "UPDATE _lattice_install_store SET channels=channels+1,bytes=bytes+(SELECT bytes FROM _lattice_install_channel WHERE channel=CAST('extra' AS BLOB)) WHERE id=1;",
+          [&](auto&){EXPECT_TRUE(installs().read("extra"));EXPECT_EQ(installs().usage().channels,2);},false,error::stale);
+    committed([&](auto&){EXPECT_FALSE(installs().read("extra"));EXPECT_EQ(installs().usage().channels,1);});
+}
+TEST_F(RecoveryCancelPreservation, SuccessfulCancellationPreservesSettledAndOtherScopeEntriesExactly) {
+    const auto settled=add(410);claimed(settled);freeze();const auto prior=first();install(prior,{positive(settled)});
+    committed([&](auto&){address=storage().resume(address,prior).address;});const auto other=sibling();
+    recovery_obligation_entry sibling_entry;
+    committed([&](auto& db){auto s=storage();sibling_entry=s.record(other,insert(db,411));s.claim_export(other,{sibling_entry.record.original_id});});
+    const auto pending=add(412);claimed(pending,true);freeze(2);const auto frozen=scope();
+    committed([&](auto& db){const auto entries=db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original");
+        const auto global=db.query("SELECT * FROM _lattice_obligation_store");const auto other_scope=storage().read(other.channel);
+        const auto other_receiver=installs().read(other.channel);const auto audit=db.query("SELECT * FROM AuditLog ORDER BY id");
+        address=storage().cancel_frozen_for_retry(address,2,frozen.revision).address;
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original"),entries);
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_store"),global);EXPECT_EQ(storage().read(other.channel),other_scope);
+        EXPECT_EQ(installs().read(other.channel),other_receiver);EXPECT_EQ(db.query("SELECT * FROM AuditLog ORDER BY id"),audit);
+        EXPECT_EQ(installs().read(profile.binding.channel)->last_installed,prior);EXPECT_EQ(installs().read(profile.binding.channel)->last_sequence,2);
+    });
+}

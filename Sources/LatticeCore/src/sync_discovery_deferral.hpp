@@ -33,6 +33,7 @@ public:
     using operation=sync_discovery_operation;
     enum class admission { accepted,coalesced,obsolete,exhausted };
     struct ticket {uint64_t generation=0,serial=0;explicit operator bool()const{return serial!=0;}};
+    struct admission_result {admission state;ticket reserved;};
     static constexpr size_t capacity=64,byte_limit=16*1024*1024;
     static constexpr unsigned attempt_limit=32,turn_limit=4;
 private:
@@ -44,12 +45,7 @@ private:
     clock::time_point next_{};
     std::atomic<uint64_t> revision_{0};
     void changed()noexcept{revision_.fetch_add(1,std::memory_order_release);}
-public:
-    uint64_t revision()const noexcept{return revision_.load(std::memory_order_acquire);}
-    admission push(std::shared_ptr<operation> work) {
-        // All captures are constructed before this leaf. Rejected work is
-        // destroyed after the lock guard, never under the queue mutex.
-        std::lock_guard<std::mutex> lock(mutex_);
+    admission push_locked(std::shared_ptr<operation>& work,clock::time_point now) {
         if(closed_||work->generation!=generation_)return admission::obsolete;
         if(failed_)return admission::exhausted;
         if(work->type==kind::upload)for(size_t i=active_?1:0;i<count_;++i)
@@ -59,16 +55,32 @@ public:
             failed_=true;changed();return admission::exhausted;
         }
         bytes_+=work->charge;slots_[(head_+count_)%capacity]=std::move(work);++count_;
-        if(count_==1)next_=clock::now();changed();return admission::accepted;
+        if(count_==1)next_=now;changed();return admission::accepted;
     }
-    ticket dispatch(clock::time_point now) {
-        std::lock_guard<std::mutex> lock(mutex_);
+    ticket dispatch_locked(clock::time_point now) {
         if(closed_||failed_||active_||dispatched_||!count_||now<next_)return {};
         if(serial_==std::numeric_limits<uint64_t>::max()){failed_=true;changed();return {};}
         // Each admission has its own identity, including successive dispatches
         // in one generation. A throwing inline scheduler can have completed an
         // older callback while another reservation is already outstanding.
         ++serial_;dispatched_=true;return {generation_,serial_};
+    }
+public:
+    uint64_t revision()const noexcept{return revision_.load(std::memory_order_acquire);}
+    admission push(std::shared_ptr<operation> work) {
+        std::lock_guard<std::mutex> lock(mutex_);return push_locked(work,clock::now());
+    }
+    admission_result push_and_dispatch(std::shared_ptr<operation> work,clock::time_point now) {
+        // Publish and reserve one eligible idle head in the same leaf turn.
+        // The timer cannot steal this caller's initial scheduler admission.
+        // Rejected/coalesced captures are destroyed after the leaf unlocks.
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto state=push_locked(work,now);
+        if(state==admission::obsolete||state==admission::exhausted)return {state,{}};
+        return {state,dispatch_locked(now)};
+    }
+    ticket dispatch(clock::time_point now) {
+        std::lock_guard<std::mutex> lock(mutex_);return dispatch_locked(now);
     }
     bool reject_unbegun(ticket addressed) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -95,10 +107,13 @@ public:
         if(charge>byte_limit-other)return false;
         bytes_=other+charge;work->charge=charge;return true;
     }
-    bool finish(ticket addressed,const std::shared_ptr<operation>& work,bool done,clock::time_point now) {
+private:
+    struct settlement {bool failed=false;ticket continuation;};
+    settlement settle(ticket addressed,const std::shared_ptr<operation>& work,bool done,
+                      clock::time_point now,bool retain_dispatch) {
         std::shared_ptr<operation> released;
         std::lock_guard<std::mutex> lock(mutex_);
-        if(addressed.generation!=generation_||addressed.serial!=serial_||!active_||!count_||slots_[head_]!=work)return false;
+        if(addressed.generation!=generation_||addressed.serial!=serial_||!active_||!count_||slots_[head_]!=work)return {};
         active_=false;
         if(done) {
             bytes_-=work->charge;released=std::move(slots_[head_]);head_=(head_+1)%capacity;--count_;next_=now;
@@ -111,7 +126,20 @@ public:
                 next_=std::min(work->deadline,now+std::chrono::milliseconds(delay));
             }
         }
-        changed();return failed_;
+        // This is the same already-admitted scheduler callback, not a new
+        // dispatch. Its immutable RAII ticket owns at most four FIFO turns.
+        // A BUSY result, terminal failure or quantum boundary releases it.
+        const bool continued=done&&retain_dispatch&&count_&&!failed_&&!closed_;
+        if(continued)dispatched_=true;
+        changed();return {failed_,continued?addressed:ticket{}};
+    }
+public:
+    bool finish(ticket addressed,const std::shared_ptr<operation>& work,bool done,clock::time_point now) {
+        return settle(addressed,work,done,now,false).failed;
+    }
+    ticket finish_and_continue(ticket addressed,const std::shared_ptr<operation>& work,bool done,
+                               clock::time_point now,bool within_quantum) {
+        return settle(addressed,work,done,now,within_quantum).continuation;
     }
     clock::time_point wake_at()const {
         std::lock_guard<std::mutex> lock(mutex_);

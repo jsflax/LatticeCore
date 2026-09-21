@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
+#include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
 #include <cstring>
 #include <deque>
 #include <future>
@@ -18,6 +19,10 @@ struct recovery_export_test_access {
          state->next_allowed_tick=std::chrono::steady_clock::now();state->requested=true;}
         state->ready.notify_one();
     }
+    static bool discovery_settled(synchronizer_base& sync){
+        const auto generation=sync.reconnect_lifecycle_.load();
+        return !sync.discovery_deferral_->pending(generation)&&!sync.discovery_deferral_->failed(generation);
+    }
     static void next_ack_timeout(synchronizer_base& sync,int milliseconds){sync.config_.ack_timeout_base_ms=milliseconds;}
 };
 }
@@ -34,6 +39,7 @@ struct controlled_inline_scheduler final:scheduler {
         current=this;work();
     }
     void pause(bool value){std::lock_guard<std::mutex> lock(mutex);paused=value;}
+    size_t pending_count(){std::lock_guard<std::mutex> lock(mutex);return pending.size();}
     bool is_on_thread()const noexcept override{return current==this;}
     bool is_same_as(const scheduler* other)const noexcept override{return other==this;}
     bool can_invoke()const noexcept override{return true;}
@@ -168,7 +174,15 @@ TEST_F(RecoveryExportAdmission, DrainPreservesThrowAfterSendDestroysOwner) {
 }
 
 TEST_F(RecoveryExportAdmission, PacerFreezeRefusalIsReportedWithoutBytesOrProcessFailure) {
-    open_empty();add_while_dispatch_paused();freeze();std::promise<std::string> error;auto reported=error.get_future();
+    open_empty();
+    // The actual initial discovery must finish before observer suppression.
+    // Atomic first-turn admission makes this caller's inline completion a
+    // deterministic boundary; zero sent bytes alone was not that proof.
+    ASSERT_TRUE(recovery_export_test_access::discovery_settled(*sync));
+    ASSERT_EQ(scheduler->pending_count(),0u);
+    add_while_dispatch_paused();
+    ASSERT_TRUE(recovery_export_test_access::discovery_settled(*sync));
+    freeze();std::promise<std::string> error;auto reported=error.get_future();
     sync->set_on_error([&](const std::string& message){error.set_value(message);throw std::runtime_error("error callback itself failed");});
     recovery_export_test_access::start_and_wake_pacer(*sync);
     const bool ready=reported.wait_for(5s)==std::future_status::ready;EXPECT_TRUE(ready);
@@ -176,6 +190,9 @@ TEST_F(RecoveryExportAdmission, PacerFreezeRefusalIsReportedWithoutBytesOrProces
     retire();EXPECT_EQ(transport->count(),0u);EXPECT_FALSE(first_claim());
     EXPECT_NO_THROW(owner->add(ExportFailureRow{"local successor remains admitted"}));
     EXPECT_EQ(transport->destruction.wait_for(5s),std::future_status::ready);
+    // Only intentionally suppressed observer callbacks remain. Retire first,
+    // then settle their capture ownership without executing a stale upload.
+    scheduler->shutdown();EXPECT_EQ(scheduler->pending_count(),0u);
 }
 
 TEST_F(RecoveryExportAdmission, PacerSendExceptionReportsFailureAndKeepsCommittedClaim) {

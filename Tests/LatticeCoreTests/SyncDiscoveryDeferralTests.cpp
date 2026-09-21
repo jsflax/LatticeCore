@@ -4,6 +4,7 @@
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include "../../Sources/LatticeCore/src/receive_delivery_guard.hpp"
 #include <future>
+#include <deque>
 
 namespace {
 using namespace lattice;
@@ -152,13 +153,53 @@ struct late_probe_hook {
     explicit late_probe_hook(std::function<void()> work){sync_background_test_hooks::before_late_discovery=std::move(work);}
     ~late_probe_hook(){sync_background_test_hooks::before_late_discovery=std::move(prior);}
 };
+// Explicit test-thread execution keeps the scoped late-stage fault installed
+// until the actual continuation reaches it, regardless of which thread admits
+// the ticket. The production pacer still owns all due retry admissions.
+class discovery_stage_scheduler final:public scheduler {
+    mutable std::mutex mutex_;std::condition_variable ready_;
+    std::deque<std::function<void()>> pending_;bool closed_=false;
+public:
+    void invoke(std::function<void()>&& work)override {
+        {std::lock_guard<std::mutex> lock(mutex_);if(closed_)return;pending_.push_back(std::move(work));}
+        ready_.notify_all();
+    }
+    bool is_on_thread()const noexcept override{return false;}
+    bool is_same_as(const scheduler* other)const noexcept override{return other==this;}
+    bool can_invoke()const noexcept override{std::lock_guard<std::mutex> lock(mutex_);return !closed_;}
+    void shutdown()override {
+        std::deque<std::function<void()>> released;
+        {std::lock_guard<std::mutex> lock(mutex_);closed_=true;released.swap(pending_);}
+        ready_.notify_all(); // Capture destructors execute outside this leaf.
+    }
+    bool run_until(const std::function<bool()>& settled) {
+        const auto deadline=std::chrono::steady_clock::now()+5s;
+        for(unsigned turn=0;turn<128&&!settled();++turn) {
+            std::function<void()> work;
+            {std::unique_lock<std::mutex> lock(mutex_);
+             if(!ready_.wait_until(lock,deadline,[&]{return closed_||!pending_.empty();}))return false;
+             if(closed_)return false;
+             work=std::move(pending_.front());pending_.pop_front();}
+            work();if(std::chrono::steady_clock::now()>=deadline)return settled();
+        }
+        return settled();
+    }
+    bool drain_current() {
+        for(unsigned turn=0;turn<128;++turn) {
+            std::function<void()> work;
+            {std::lock_guard<std::mutex> lock(mutex_);if(pending_.empty())return true;work=std::move(pending_.front());pending_.pop_front();}
+            work();
+        }
+        return false;
+    }
+};
 class SyncDiscoveryContention : public ::testing::Test {
 protected:
     std::shared_ptr<sync_wire_state> wire=std::make_shared<sync_wire_state>();
     std::unique_ptr<synchronizer> sync;
     std::shared_ptr<lattice_db> owner;
-    void open(const std::string& path=":memory:") {
-        configuration cfg(path);cfg.audit_retention_seconds=0;cfg.busy_timeout_ms=100;cfg.sched=std::make_shared<immediate_scheduler>();
+    void open(const std::string& path=":memory:",std::shared_ptr<scheduler> scheduled={}) {
+        configuration cfg(path);cfg.audit_retention_seconds=0;cfg.busy_timeout_ms=100;cfg.sched=scheduled?std::move(scheduled):std::make_shared<immediate_scheduler>();
         sync_config config;config.sync_id="wss:discovery-test";config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;config.chunk_size=10;
         sync=std::make_unique<synchronizer>(std::make_unique<lattice_db>(cfg),config,std::make_unique<sync_wire>(wire));
         owner=sync_discovery_test_access::owner(*sync);
@@ -256,11 +297,18 @@ TEST_F(SyncDiscoveryContention, LateBusyCancelLeavesRealAuditRowsUnsynchronizedA
     EXPECT_EQ(read_upload_floor(owner->db(),"wss:discovery-test"),0);
 }
 TEST_F(SyncDiscoveryContention, FilteredLateBusyIsExplicitUnsupportedRefusal) {
-    change("unused-remote","filtered");sync_discovery_test_access::filter(*sync);sync_discovery_test_access::connected(*sync);
+    sync.reset();owner.reset();const auto scheduled=std::make_shared<discovery_stage_scheduler>();open(":memory:",scheduled);
+    change("unused-remote","filtered");ASSERT_TRUE(scheduled->drain_current());ASSERT_FALSE(pending());
+    sync_discovery_test_access::filter(*sync);sync_discovery_test_access::connected(*sync);
     std::unique_ptr<held_writer_mutex> held;
-    {late_probe_hook hook([&]{held=std::make_unique<held_writer_mutex>(*owner);});sync_discovery_test_access::background(*sync);}
-    ASSERT_TRUE(held);held->allow();ASSERT_TRUE(wire->await(0,1));EXPECT_FALSE(pending());EXPECT_EQ(wire->count(),0u);
+    {late_probe_hook hook([&]{held=std::make_unique<held_writer_mutex>(*owner);});
+     sync_discovery_test_access::background(*sync);
+     EXPECT_TRUE(scheduled->run_until([&]{return bool(held);}));}
+    ASSERT_TRUE(held);held->allow();
+    EXPECT_TRUE(scheduled->run_until([&]{std::lock_guard<std::mutex> lock(wire->mutex);return !wire->errors.empty();}));
+    ASSERT_TRUE(wire->await(0,1));EXPECT_FALSE(pending());EXPECT_EQ(wire->count(),0u);
     {std::lock_guard<std::mutex> lock(wire->mutex);EXPECT_NE(wire->errors[0].find("not supported"),std::string::npos);}
+    sync.reset();scheduled->shutdown(); // No queued capture outlives the fault locals.
 }
 TEST_F(SyncDiscoveryContention, DisconnectAndCloseAccountForBusyPayloadWithoutAckOrEffects) {
     const auto e=change("old-generation","before");const auto queue=sync_discovery_test_access::queue(*sync);

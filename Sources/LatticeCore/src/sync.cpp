@@ -793,7 +793,6 @@ void synchronizer_base::background_upload() noexcept {
 
 void synchronizer_base::enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
         std::function<bool(detail::sync_discovery_operation&)> step) {
-    const auto queue=discovery_deferral_;const auto state=pacer_state_;
     const auto generation=callback_lifetime_->dispatch_generation();
     auto work=std::make_shared<detail::sync_discovery_operation>();
     work->type=kind;work->label=stage;work->generation=generation;work->charge=charge;work->step=std::move(step);
@@ -805,20 +804,11 @@ void synchronizer_base::enqueue_discovery(detail::sync_discovery_kind kind,const
     });
     return;
 #else
-    const auto admitted=queue->push(std::move(work));
-    if(admitted==detail::sync_discovery_deferral::admission::obsolete)return;
-    // Overflow never acknowledges the rejected frame or evicts the queue head.
-    // The failed generation remains fenced until explicit connect/disconnect.
-    if(admitted==detail::sync_discovery_deferral::admission::exhausted) {
-        if(queue->take_failure(generation))throw db_error("sync discovery deferral capacity exhausted; route stopped; explicit replay required (one-shot senders have no replay guarantee)");
-        return;
-    }
-    state->ready.notify_one();
-    pump_discovery(); // All dependencies after this potentially reentrant call are retained.
+    pump_discovery(std::move(work)); // May retire the owner; no later owner access.
 #endif
 }
 
-void synchronizer_base::pump_discovery() {
+void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_operation> initial) {
     const auto queue=discovery_deferral_;const auto state=pacer_state_;
     const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;const auto error=on_error_;
     // Construct allocating ownership before reserving the sole dispatch.
@@ -839,8 +829,20 @@ void synchronizer_base::pump_discovery() {
     const auto abandoned=std::make_exception_ptr(db_error("sync discovery scheduler admission failed; route stopped; explicit replay required"));
     const auto reservation=std::make_shared<dispatch_owner>();
     reservation->queue=queue;reservation->state=state;
-    const auto addressed=queue->dispatch(detail::sync_discovery_deferral::clock::now());
+    detail::sync_discovery_deferral::ticket addressed;
+    if(initial) {
+        const auto generation=initial->generation;
+        const auto admitted=queue->push_and_dispatch(std::move(initial),detail::sync_discovery_deferral::clock::now());
+        if(admitted.state==detail::sync_discovery_deferral::admission::obsolete)return;
+        if(admitted.state==detail::sync_discovery_deferral::admission::exhausted) {
+            if(queue->take_failure(generation))throw db_error("sync discovery deferral capacity exhausted; route stopped; explicit replay required (one-shot senders have no replay guarantee)");
+            return;
+        }
+        addressed=admitted.reserved;
+    } else addressed=queue->dispatch(detail::sync_discovery_deferral::clock::now());
     reservation->addressed=addressed;
+    state->ready.notify_one(); // Reservation ownership is published before wake.
+
     if(!addressed) {
         // Includes exhausted reservation identities; no integer wrap can
         // resurrect an old callback's authority.
@@ -859,13 +861,11 @@ void synchronizer_base::pump_discovery() {
                 if(!work)break;
                 bool done=true;std::exception_ptr failure;
                 try {done=work->step(*work);}catch(...) {failure=std::current_exception();}
-                queue->finish(ticket,work,done,detail::sync_discovery_deferral::clock::now());
+                const auto next=queue->finish_and_continue(ticket,work,done,
+                    detail::sync_discovery_deferral::clock::now(),turn+1<detail::sync_discovery_deferral::turn_limit);
                 if(failure)detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,work->label);
-                if(!lifetime->current(addressed.generation)||!done)break;
-                // Do not reserve a dispatch ticket beyond this bounded turn.
-                if(turn+1==detail::sync_discovery_deferral::turn_limit)break;
-                ticket=queue->dispatch(detail::sync_discovery_deferral::clock::now());
-                if(!ticket)break;
+                if(!lifetime->current(addressed.generation)||!next)break;
+                ticket=next;
             }
             if(queue->take_failure(addressed.generation))
                 detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,

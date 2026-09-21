@@ -49,6 +49,63 @@ TEST(SyncDiscoveryAdmission, CancelledTicketCannotRejectReplacementGeneration) {
     EXPECT_FALSE(queue.pending(3));
 }
 
+
+TEST(SyncDiscoveryAdmission, PublishedIdleHeadAlreadyBelongsToItsSubmittingTurn) {
+    discovery_queue queue;auto first=admission_unit();const auto now=discovery_queue::clock::now();
+    const auto admitted=queue.push_and_dispatch(first,now);
+    ASSERT_EQ(admitted.state,discovery_queue::admission::accepted);ASSERT_TRUE(admitted.reserved);
+    // Force the rival timer to probe after publication but before any scheduler
+    // callback begins. No timing assumption or sleep decides this interleaving.
+    EXPECT_FALSE(queue.dispatch(now+1s));EXPECT_TRUE(queue.pending(1));
+    ASSERT_EQ(queue.begin(admitted.reserved,now),first);
+    EXPECT_FALSE(queue.finish_and_continue(admitted.reserved,first,true,now,true));
+    EXPECT_FALSE(queue.pending(1));EXPECT_FALSE(queue.failed(1));
+}
+TEST(SyncDiscoveryAdmission, SameDispatchOwnsFourFifoTurnsThenYieldsWithoutLoss) {
+    discovery_queue queue;std::vector<std::shared_ptr<discovery_queue::operation>> work;
+    const auto now=discovery_queue::clock::now();work.push_back(admission_unit());
+    auto ticket=queue.push_and_dispatch(work[0],now).reserved;ASSERT_TRUE(ticket);
+    for(unsigned i=1;i<discovery_queue::turn_limit+1;++i) {
+        work.push_back(admission_unit());const auto added=queue.push_and_dispatch(work.back(),now);
+        EXPECT_EQ(added.state,discovery_queue::admission::accepted);EXPECT_FALSE(added.reserved);
+    }
+    const auto original=ticket;
+    for(unsigned turn=0;turn<discovery_queue::turn_limit;++turn) {
+        ASSERT_EQ(queue.begin(ticket,now),work[turn]);
+        ticket=queue.finish_and_continue(ticket,work[turn],true,now,turn+1<discovery_queue::turn_limit);
+        if(turn+1<discovery_queue::turn_limit) {
+            ASSERT_TRUE(ticket);EXPECT_EQ(ticket.serial,original.serial);
+            EXPECT_FALSE(queue.dispatch(now+1s)); // Rival cannot steal continuation.
+        } else EXPECT_FALSE(ticket);
+    }
+    EXPECT_TRUE(queue.pending(1));const auto next=queue.dispatch(now);ASSERT_TRUE(next);
+    EXPECT_NE(next.serial,original.serial);EXPECT_FALSE(queue.reject_unbegun(original));
+    ASSERT_EQ(queue.begin(next,now),work.back());queue.finish(next,work.back(),true,now);
+    EXPECT_FALSE(queue.pending(1));
+}
+TEST(SyncDiscoveryAdmission, BusyReleasesSubmittingTicketToTheBoundedTimerRetry) {
+    discovery_queue queue;auto work=admission_unit();const auto now=discovery_queue::clock::now();
+    const auto ticket=queue.push_and_dispatch(work,now).reserved;ASSERT_TRUE(ticket);
+    ASSERT_EQ(queue.begin(ticket,now),work);
+    EXPECT_FALSE(queue.finish_and_continue(ticket,work,false,now,true));
+    EXPECT_EQ(work->attempts,1u);EXPECT_EQ(work->deadline,now+5s);
+    EXPECT_FALSE(queue.dispatch(now+4ms));const auto retry=queue.dispatch(now+5ms);ASSERT_TRUE(retry);
+    EXPECT_NE(retry.serial,ticket.serial);EXPECT_FALSE(queue.reject_unbegun(ticket));
+    ASSERT_EQ(queue.begin(retry,now+5ms),work);queue.finish(retry,work,true,now+5ms);
+    EXPECT_FALSE(queue.pending(1));
+}
+TEST(SyncDiscoveryAdmission, ReservedContinuationRejectionAndCancellationKeepExactPayloads) {
+    discovery_queue queue;auto first=admission_unit(),later=admission_unit();const auto now=discovery_queue::clock::now();
+    const auto ticket=queue.push_and_dispatch(first,now).reserved;queue.push(later);
+    ASSERT_EQ(queue.begin(ticket,now),first);
+    const auto next=queue.finish_and_continue(ticket,first,true,now,true);ASSERT_TRUE(next);
+    EXPECT_TRUE(queue.reject_unbegun(next));EXPECT_EQ(first.use_count(),1);EXPECT_EQ(later.use_count(),2);
+    EXPECT_TRUE(queue.failed(1));EXPECT_TRUE(queue.take_failure(1));EXPECT_FALSE(queue.take_failure(1));
+    queue.cancel(3);EXPECT_EQ(later.use_count(),1);EXPECT_FALSE(queue.begin(next,now));
+    const auto replacement=queue.push_and_dispatch(admission_unit(3),now);ASSERT_TRUE(replacement.reserved);
+    EXPECT_FALSE(queue.reject_unbegun(next));EXPECT_FALSE(queue.failed(3));
+}
+
 #ifndef __EMSCRIPTEN__
 namespace lattice {
 struct sync_discovery_admission_test_access {
@@ -242,6 +299,30 @@ TEST_F(SyncDiscoveryAdmissionRuntime, RetryRejectionIsTerminalWithoutReplayingTh
     EXPECT_NE(retained->deadline,discovery_queue::clock::time_point::max());
     ASSERT_TRUE(await([&]{return !errors.empty();}));EXPECT_TRUE(failed());EXPECT_TRUE(pending());EXPECT_EQ(probes,1);
     EXPECT_EQ(errors.size(),1u);
+}
+TEST_F(SyncDiscoveryAdmissionRuntime, ReservedFirstCallbackCannotBeStolenWhileSchedulerRetainsIt) {
+    int effects=0;access::enqueue(*sync,[&](auto&){++effects;return true;});
+    ASSERT_TRUE(scheduled->await_queued());
+    const auto queue=access::queue(*sync);const auto generation=access::generation(*sync);
+    EXPECT_FALSE(queue->dispatch(discovery_queue::clock::now()+1s));
+    EXPECT_TRUE(queue->pending(generation));EXPECT_EQ(effects,0);
+    ASSERT_TRUE(scheduled->run_one(5s));EXPECT_EQ(effects,1);
+    EXPECT_FALSE(pending());EXPECT_FALSE(failed());EXPECT_TRUE(errors.empty());
+}
+TEST_F(SyncDiscoveryAdmissionRuntime, ActualWriterBusyStillRetriesThroughTheLivePacer) {
+    owner->add(TestPerson{"first-busy-live-pacer",1,std::nullopt});flush();
+    register_replication_slot(owner->db(),"wss:admission-fix");flush();access::connected(*sync);
+    admission_held_writer held(*owner);access::background(*sync);
+    const bool first=scheduled->run_one(5s);EXPECT_TRUE(first);
+    EXPECT_TRUE(pending());EXPECT_TRUE(wire->frames.empty());EXPECT_TRUE(errors.empty());
+    held.allow(); // Release on every exit before any assertion can return.
+    // No manual pump: only the production pacer can admit the due retry.
+    ASSERT_TRUE(await([&]{return !wire->frames.empty()||!errors.empty();}));
+    ASSERT_EQ(wire->frames.size(),1u);EXPECT_TRUE(errors.empty());EXPECT_FALSE(pending());EXPECT_FALSE(failed());
+    const auto frame=server_sent_event::from_json(wire->frames[0]);ASSERT_TRUE(frame);
+    ASSERT_EQ(frame->audit_logs.size(),1u);EXPECT_EQ(frame->audit_logs[0].table_name,"TestPerson");
+    EXPECT_EQ(frame->audit_logs[0].operation,"INSERT");
+    EXPECT_NE(frame->audit_logs[0].changed_fields_to_json().find("first-busy-live-pacer"),std::string::npos);
 }
 TEST_F(SyncDiscoveryAdmissionRuntime, ExcludingFilterInvalidatesParkedUnfilteredVector) {
     prepare_local_row();std::unique_ptr<admission_held_writer> held;int stages=0;park_real_vector(held,stages);

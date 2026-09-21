@@ -444,7 +444,7 @@ protected:
     void background_upload() noexcept;
     void enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
                            std::function<bool(detail::sync_discovery_operation&)> work);
-    void pump_discovery();
+    void pump_discovery(std::shared_ptr<detail::sync_discovery_operation> initial = {});
     void background_operation(const char* stage,const std::function<void()>& work) noexcept;
     void schedule_background(const char* stage,std::function<void()> work);
 

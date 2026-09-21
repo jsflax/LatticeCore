@@ -103,7 +103,7 @@ bool managed<swift_dynamic_object>::has_value(const std::string& name) const {
         const auto& property_desc = this->properties_.at(name);
         if (property_desc.kind == property_kind::link) {
             managed<swift_dynamic_object *> m;
-            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+            m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
             auto base = static_cast<model_base>(*this);
             m.bind_to_parent(&base, property_desc);
             return m.has_value();
@@ -112,7 +112,7 @@ bool managed<swift_dynamic_object>::has_value(const std::string& name) const {
     // Fall through to DB check for non-link properties (or properties
     // not in the schema, e.g. AuditLog queried without being in init)
     managed<std::optional<std::string>> m;
-    m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+    m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
     return m.has_value();
 }
 
@@ -1692,7 +1692,11 @@ bool lattice::swift_lattice::attach(swift_lattice &lattice) {
     // (same contract as receive_sync_data/last_receive_error).
     { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_.reset(); }
     try {
-        lattice_db::attach(lattice);
+        // Capture only the source store's own schema before topology changes.
+        // Core binds this immutable metadata to the attachment token under its
+        // topology lock and erases it whenever that token is invalidated.
+        auto metadata = std::make_shared<const attached_schema_map>(lattice.schemas_);
+        attach_with_metadata(lattice, std::move(metadata));
         return true;
     } catch (const std::exception& e) {
         { std::lock_guard<std::mutex> lock(attach_error_mutex_); last_attach_error_ = std::string(e.what()); }

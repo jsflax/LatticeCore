@@ -49,6 +49,8 @@ let package = Package(
             name: "LatticeSwiftCppBridge",
             targets: ["LatticeSwiftCppBridge"]
         ),
+        // Explicit test support only; no ordinary library/runtime target depends on it.
+        .library(name: "LatticeServerExportTestSupport", targets: ["LatticeServerExportTestSupport"]),
         .library(
             name: "LatticeSwiftModule",
             targets: ["LatticeSwiftModule"]
@@ -85,6 +87,7 @@ let package = Package(
             name: "LatticeCore",
             dependencies: ["SqliteVec"],
             path: "Sources/LatticeCore",
+            exclude: ["src/vendor/picosha2/LICENSE", "src/vendor/picosha2/README.md"],
             sources: ["src"],
             publicHeadersPath: "include",
             cxxSettings: [
@@ -114,6 +117,23 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
+            ]
+        ),
+        // SDK qualification tests use genuine producer enrollment through the
+        // actual retained ref. Never a production route or authority issuer.
+        .target(
+            name: "LatticeServerExportTestSupport",
+            dependencies: ["LatticeSwiftCppBridge"],
+            path: "Sources/LatticeServerExportTestSupport",
+            sources: ["src"],
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("include"),
+                .headerSearchPath("../LatticeSwiftCppBridge/include"),
+                .headerSearchPath("../LatticeCore/include"),
+                .define("SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE"),
+                .unsafeFlags(["-std=c++20"]),
+                .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
             ]
         ),
         .target(

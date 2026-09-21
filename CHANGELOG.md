@@ -1,5 +1,78 @@
 # Changelog
 
+## [2.1.0] - Unreleased
+
+### Added
+- Expose the logical model name separately from an object’s physical store route so Swift virtual results can select the correct concrete type after attachment.
+- Add bounded, selected-column file reads with one owned snapshot cursor,
+  row and copied-value byte budgets, cooperative cancellation, deadlines,
+  explicit resource admission, and completion notification after cleanup.
+  Preserve predicate bindings, order, grouping, distinct and geographic
+  bounds. WebAssembly projection execution remains unsupported.
+- Add native memory-store projected reads that capture selected values on
+  first demand, then release the writer before yielding batches. Capture
+  storage defaults to32 MiB per request with a64 MiB per-parent ceiling;
+  retained batches remain charged. Require committed idle state, supported
+  SQLite objects and Lattice-owned attachment changes; reject escaped raw
+  handles and unsafe expressions explicitly.
+- Add transaction-owned selected-object mutation batches with timestamp
+  assignment and checked atomic integer increments. Validate all selected
+  rows and physical attachment routes before writing; retain ordinary audit
+  and trigger behavior.
+- Expose immutable collection-query row images and statement-free managed
+  identity separately from live fields and materialized values.
+- Add payload-free coarse invalidation hooks as reconciliation hints.
+  These hooks do not provide a durable event cursor or transaction replay.
+
+### Fixed
+- Retain internal ordinary and cross-process readers through complete queries
+  while maintenance replaces connections. Restore attached views before reader
+  publication and release retired connections outside bookkeeping locks.
+  Raw connection references remain caller-serialized, and the parent must
+  outlive owned read borrows. Rebuild Core and bridge consumers together.
+- Suppress SIGPIPE per socket send on Linux when an IPC peer closes during
+  framing. Return the existing write failure instead of terminating the
+  process; retain Darwin socket setup and generic non-socket behavior.
+- Preserve each physical route and attachment token through heterogeneous
+  virtual UNION queries, including models present only in attached stores.
+  Keep ordinary main-store arms pinned to main when a TEMP view shadows them.
+- Read live primitive fields through one owned SQL cell, avoiding generic
+  row containers while preserving fresh queries, physical routing and types.
+- Initialize the default native Double fallback to zero instead of reading
+  uninitialized storage when a live value is absent or has the wrong type.
+- Deliver each stored AuditLog insertion once on WebAssembly persistent stores;
+  use the existing direct hook events instead of deriving duplicates.
+- Destroy projection-pressure maps in the native translation unit so optimized
+  Swift callers do not need to emit their nested libc++ deletion helpers.
+- Claim each audit-retention interval with one conditional SQLite write so
+  simultaneous maintenance handles cannot both acquire the same interval.
+  Release a failed pass's own claim for retry while preserving newer claims;
+  keep insertion-time watermarks, upload floors and audit IDs unchanged.
+- Route managed scalar and geographic SQL to the physical store when an
+  attached UNION view shadows the model's logical name. Keep geographic list
+  sidecars and their RTree updates in that same schema, including quoted
+  attachment aliases. Seal geographic SQL failures at the Swift bridge.
+- Expose the shared native close state to Swift so retained collection caches
+  can reject new reads after their database closes.
+- Preserve geographic query shape, bound precision and physical-store
+  identity through attached queries, counts and pagination. Resolve update
+  hook identities from the callback's quoted physical schema and table.
+- Retire projected snapshots across parent close, maintenance, attachment
+  topology changes and physical-store WAL pressure without interrupting a
+  subsequent writer or unrelated store.
+- Capture attachment identity and schema metadata within their owning SQLite
+  execution scope so a continuously active writer cannot win every repeated
+  metadata acquisition. Keep existing metadata types and filtering; report a
+  null SQLite TEXT conversion as an allocation error instead of an empty name.
+
+### Compatibility and validation scope
+- Rebuild Core and all C++/Swift bridge consumers together. Internal object
+  layouts changed; binary interchangeability is not assumed. The public C
+  ABI declarations and export list remain unchanged.
+- This is a qualification candidate. Full native, C ABI, SDK and JS/WASM
+  compatibility remain release gates. No benchmark speedup is claimed;
+  native memory projection and durable cursor-backed observation remain open.
+
 ## [2.0.6] - 2026-09-19
 
 ### Fixed

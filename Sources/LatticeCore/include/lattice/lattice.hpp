@@ -7474,12 +7474,18 @@ protected:
     }
 
     std::string generate_global_id() {
-        static std::random_device rd;
-        static std::mt19937_64 gen(rd());
-        static std::uniform_int_distribution<uint64_t> dis;
-
-        uint64_t a = dis(gen);
-        uint64_t b = dis(gen);
+        // Independent stores have independent write gates, but share this
+        // generator. Serialize both draws as one UUID; formatting needs no lock.
+        static std::mutex generator_mutex;
+        uint64_t a, b;
+        {
+            std::lock_guard<std::mutex> lock(generator_mutex);
+            static std::random_device rd;
+            static std::mt19937_64 gen(rd());
+            static std::uniform_int_distribution<uint64_t> dis;
+            a = dis(gen);
+            b = dis(gen);
+        }
 
         a = (a & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
         b = (b & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;

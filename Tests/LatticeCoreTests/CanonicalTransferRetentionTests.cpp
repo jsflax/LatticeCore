@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
+#include "RetentionCustodyPhaseDiagnostics.hpp"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include "../../Sources/LatticeCore/src/sync_recovery_values.hpp"
 #include <chrono>
@@ -245,14 +246,19 @@ TEST_F(CanonicalTransferRetention, RetiredAndReplacedOwnersCannotUseOldIncarnati
     EXPECT_EQ(scalar(sibling->db(),"SELECT COUNT(*) FROM _lattice_canonical_attempt"),0);
 }
 TEST_F(CanonicalTransferRetention, DetectedMainPathMovementRefusesBeforeRegistryMutation) {
-    attach();auto ticket=reserve();TempDB moved{"canonical-retention-moved"};
-    std::filesystem::rename(file.path,moved.path);
+    retention_fixture_diagnostics::phases diagnostics("CanonicalTransferRetention.DetectedMainPathMovementRefusesBeforeRegistryMutation");
+    diagnostics.call("initial-owner-attach",[&]{attach();});
+    auto ticket=diagnostics.call("initial-owner-reserve",[&]{return reserve();});TempDB moved{"canonical-retention-moved"};
+    diagnostics.call("rename-main-to-moved",[&]{std::filesystem::rename(file.path,moved.path);});
+    auto restoration=diagnostics.restored("restore-main-name");
     struct restore {
         std::filesystem::path from,to;
         ~restore(){std::error_code error;std::filesystem::rename(from,to,error);if(error)std::abort();}
     } restore_name{moved.path,file.path};
-    const auto result=adapter->reserve_recovery_owned(owner,{},10000);
-    EXPECT_NE(result.settlement.state,phase::committed);EXPECT_FALSE(result.reservation);EXPECT_EQ(count(),1);
+    const auto result=diagnostics.call("owner-reserve-under-main-movement",[&]{return adapter->reserve_recovery_owned(owner,{},10000);});
+    diagnostics.settlement("owner-reserve-under-main-movement",result.settlement);
+    EXPECT_NE(result.settlement.state,phase::committed);EXPECT_FALSE(result.reservation);
+    EXPECT_EQ(diagnostics.call("owner-attempt-count-under-main-movement",[&]{return count();}),1);
 }
 TEST_F(CanonicalTransferRetention, ExactReopenRejectsMissingAlteredAndExtraPersistentGuards) {
     for(int mode=0;mode!=3;++mode) {

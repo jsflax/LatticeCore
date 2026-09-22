@@ -4,6 +4,7 @@
 #include "canonical_transfer_retention.hpp"
 #include "canonical_durable_ready.hpp"
 #include "lattice/sync.hpp"
+#include "lattice/recovery_schema.hpp"
 #include <memory>
 #include <string>
 #include <vector>
@@ -68,6 +69,7 @@ struct canonical_upstream_limits {
 };
 class canonical_writer_adapter {
     friend class authenticated_relay_setup;
+    friend struct authenticated_relay_catalog_test_access;
     friend void require_canonical_relation(database&, const std::string&);
     friend class canonical_upstream_delivery;
     struct context;
@@ -91,6 +93,7 @@ class canonical_writer_adapter {
     canonical_namespace_admission admit_authenticated_session(std::shared_ptr<lattice_db>,
         const std::string&,const std::string&,std::shared_ptr<authenticated_session_fence>);
     std::string authenticated_descriptor_digest()const;
+    static const recovery_owner_schema& authenticated_catalog(const lattice_db&) noexcept;
     static std::shared_ptr<canonical_writer_adapter> open_authenticated_source(std::shared_ptr<lattice_db>,
         const canonical_namespaced_writer_profile&,canonical_upstream_limits,canonical_retention_limits,
         const canonical_ready_profile&,bool);

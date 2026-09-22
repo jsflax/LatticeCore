@@ -62,11 +62,11 @@ struct source_recipe {
     uint8_t unlisted=7;
     size_t maximum_deletes=frame_entries;
 };
-source_recipe recipe(lattice_db& owner,const json& j) {
+source_recipe recipe(const recovery_owner_schema& catalog,const json& j) {
     shape(j,{"version","authority","sourceID","epoch","localNamespace","namespaces","receiptNamespace","models","walFull","maximumAuthorizationMilliseconds","upload"});
     if(number(j,"version",1,1)!=1 || j.at("walFull")!=true)reject("relay explicit durability opt-in required");
     source_recipe r;r.maximum_duration=number(j,"maximumAuthorizationMilliseconds",1,3600000);
-    auto& p=r.profile;const auto& catalog=owner.recovery_declarations();
+    auto& p=r.profile;
     if(!catalog.valid()||catalog.swift_digest.size()!=64)reject("relay actual Swift declaration catalog unavailable");
     p.writer.binding.source=uuid(j,"sourceID");p.writer.binding.epoch=uuid(j,"epoch");p.writer.binding.schema=catalog.swift_digest;
     const auto& models=j.at("models");if(!models.is_array()||models.empty()||models.size()>16)reject("relay model scope bound");
@@ -161,7 +161,7 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
     if(!destroy)reject("relay route destroy required before ownership transfer");
     std::shared_ptr<void> retained(context,destroy);
     if(!owner||!context||!current||current(context)!=1)reject("relay actual live route required");
-    auto r=recipe(*owner,bounded(policy,policy_bytes));auto c=bounded(connection,connection_bytes);
+    auto r=recipe(canonical_writer_adapter::authenticated_catalog(*owner),bounded(policy,policy_bytes));auto c=bounded(connection,connection_bytes);
     shape(c,{"mount","connection","channel","authenticatedUserID","peer"});
     c["mount"]=uuid(c,"mount");c["connection"]=uuid(c,"connection");(void)text(c,"channel",64);c["authenticatedUserID"]=uuid(c,"authenticatedUserID");
     shape(c.at("peer"),{"replicaID","receiverIncarnation","channelIncarnation"});

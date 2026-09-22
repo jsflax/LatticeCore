@@ -808,6 +808,9 @@ std::shared_ptr<canonical_writer_adapter> canonical_writer_adapter::open_authent
     return std::shared_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p.writer,&upstream,&retention,&p.namespaces,&ready));
 }
 std::string canonical_writer_adapter::authenticated_descriptor_digest()const{return context_->source_descriptor_digest;}
+const recovery_owner_schema& canonical_writer_adapter::authenticated_catalog(const lattice_db& owner) noexcept {
+    return owner.recovery_declarations();
+}
 canonical_namespace_admission canonical_writer_adapter::admit_namespace_for_qualification(std::shared_ptr<lattice_db> owner,
     const std::string& namespace_id,const std::string& replica_id) {
     auto state=context_;auto writer=writer_;

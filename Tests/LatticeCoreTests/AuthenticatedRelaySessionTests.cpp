@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include <lattice.hpp>
+#include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <cstdio>
@@ -7,6 +8,13 @@
 #include <thread>
 
 #if defined(__APPLE__) || defined(__linux__)
+namespace lattice::detail {
+struct authenticated_relay_catalog_test_access {
+    static const recovery_owner_schema& catalog(const lattice_db& owner) noexcept {
+        return canonical_writer_adapter::authenticated_catalog(owner);
+    }
+};
+}
 namespace {
 using namespace lattice;
 using json=nlohmann::json;
@@ -70,7 +78,7 @@ protected:
     std::vector<database::row_t> receipts(){return owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY original_id");}
 };
 TEST_F(AuthenticatedRelaySession, ActualSwiftCatalogPrecedesAuthorizationAndUnauthenticatedReceiveRefuses) {
-    open();const auto d=json::parse(setup.descriptor());EXPECT_EQ(d["source"]["schemaDigest"],owner->recovery_declarations().swift_digest);
+    open();const auto d=json::parse(setup.descriptor());EXPECT_EQ(d["source"]["schemaDigest"],lattice::detail::authenticated_relay_catalog_test_access::catalog(*owner).swift_digest);
     EXPECT_EQ(d["incomingScope"]["models"].size(),1u);EXPECT_EQ(setup.receive(frame(entry())).status_code(),2);
     EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
 }

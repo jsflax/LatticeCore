@@ -46,6 +46,25 @@
 
 namespace lattice {
 
+// An owned close report. Pending/retired/disconnected are not ACK success;
+// cleanup always proceeds, preserving the first real error separately from a
+// later cleanup error. Exception ownership survives connection/owner reset.
+struct lattice_close_result {
+    sync_drain_state sync=sync_drain_state::not_attempted;
+    std::exception_ptr error,cleanup_error;
+    bool cleanup_complete=true;
+    void remember(std::exception_ptr value,bool cleanup=true) noexcept {
+        if(!value)return;
+        if(!error)error=value;
+        if(cleanup){cleanup_complete=false;if(!cleanup_error)cleanup_error=std::move(value);}
+    }
+    void merge(const lattice_close_result& value) noexcept {
+        remember(value.error,false);if(value.cleanup_error)remember(value.cleanup_error);
+        cleanup_complete=cleanup_complete&&value.cleanup_complete;
+        if(static_cast<int>(value.sync)>static_cast<int>(sync))sync=value.sync;
+    }
+};
+
 // Forward declarations
 template<typename T> class query;
 template<typename T> class results;
@@ -3794,6 +3813,7 @@ public:
 private:
     friend struct audit_maintenance_test_access;
     friend struct sync_entry_rollback_test_access;
+    friend struct detail::sync_discovery_test_access;
     friend struct detail::receive_delivery_guard_access;
     friend std::vector<std::string> apply_remote_changes(
         lattice_db&, const std::vector<audit_log_entry>&);
@@ -4719,6 +4739,7 @@ public:
     /// SQLite's logical close guard short-circuits later operations; an already
     /// running operation may finish. This does not grant raw getter safety.
     void close();
+    lattice_close_result close_checked() noexcept;
 
     /// Publish a fully opened reader pair with current attached views, or leave
     /// the prior published state intact. A newer close/reopen invalidates a
@@ -6280,6 +6301,7 @@ private:
     // sibling — that would re-hold the flock against our new URL and
     // re-trigger the same bug.
     void teardown_sync(bool fire_handoff = true);
+    lattice_close_result teardown_sync_checked(bool fire_handoff = true) noexcept;
 
     // Synchronizer registry — ensures at most one synchronizer per {path, websocket_url}
     static bool try_register_sync_key(const std::string& path, const std::string& ws_url);
@@ -8814,156 +8836,107 @@ namespace lattice {
 // ============================================================================
 
 inline void lattice_db::teardown_sync(bool fire_handoff) {
-    // Phase 0: Bounded drain — give connected synchronizers a short window to
-    // flush pending uploads and collect ACKs before disconnecting. Without
-    // this, dropping the last reference to a Lattice right after a write cuts
-    // the in-flight entry: the daemon shutting down, a task-scoped instance
-    // going out of scope, and the A→B sync handoff all lose data otherwise.
-    // The deadline is shared across all synchronizers so teardown latency is
-    // bounded regardless of how many are attached.
-    {
-        auto drain_deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(2000);
-        for (auto& ipc : ipc_synchronizers_) {
-            if (ipc.sync) ipc.sync->drain(drain_deadline);
+    const auto result=teardown_sync_checked(fire_handoff);
+    if(result.error)std::rethrow_exception(result.error);
+}
+inline lattice_close_result lattice_db::teardown_sync_checked(bool fire_handoff) noexcept {
+    lattice_close_result result;
+    const auto attempt=[&](auto&& operation) noexcept {
+        try {operation();}catch(...) {result.remember(std::current_exception());}
+    };
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(2000);
+    const auto drain=[&](synchronizer_base* sync) noexcept {
+        if(!sync)return;const auto outcome=sync->drain_checked(deadline);
+        result.remember(outcome.error,false);
+        if(static_cast<int>(outcome.state)>static_cast<int>(result.sync))result.sync=outcome.state;
+    };
+    for(auto& ipc:ipc_synchronizers_)drain(ipc.sync.get());
+    drain(synchronizer_.get());
+    // Disconnect every route before destroying any child owner. Failure on
+    // one route must not skip the remaining disconnect/reset/registry phases.
+    for(auto& ipc:ipc_synchronizers_)if(ipc.sync)attempt([&]{ipc.sync->disconnect();});
+    if(synchronizer_)attempt([&]{synchronizer_->disconnect();});
+    for(const auto& target:config_.ipc_targets)attempt([&]{unregister_sync_key(config_.path,"ipc:"+target.channel);});
+    for(auto& ipc:ipc_synchronizers_) {
+        if(ipc.sync) {
+            const auto cleanup=ipc.sync->cleanup_error_;ipc.sync.reset();
+            if(cleanup)result.remember(*cleanup);
         }
-        if (synchronizer_) synchronizer_->drain(drain_deadline);
-    }
-
-    // Phase 1: Disconnect ALL synchronizers (joins transport read threads,
-    // removes AuditLog observers). This must complete for every synchronizer
-    // BEFORE destroying any of them, because flush_changes() on one sync's
-    // db iterates ALL registered instances — destroying one sync's db while
-    // another sync's thread is in flush_changes causes a use-after-free on
-    // observers_mutex_.
-    for (auto& ipc : ipc_synchronizers_) {
-        if (ipc.sync) ipc.sync->disconnect();
-    }
-    if (synchronizer_) synchronizer_->disconnect();
-
-    // Phase 2: All transport threads stopped. Destroy IPC synchronizers
-    // and unregister their keys from the sync registry.
-    // Each synchronizer destructor drains its scheduler before destroying
-    // its owned lattice_db, so in-flight work completes safely while all
-    // remaining instances are still alive and registered.
-    for (const auto& target : config_.ipc_targets) {
-        unregister_sync_key(config_.path, "ipc:" + target.channel);
-    }
-    for (auto& ipc : ipc_synchronizers_) {
-        if (ipc.sync) ipc.sync.reset();
-        if (ipc.endpoint) {
-            ipc.endpoint->stop();
-            ipc.endpoint.reset();
-        }
-        if (ipc.lock_fd >= 0) {
-            ::flock(ipc.lock_fd, LOCK_UN);
-            ::close(ipc.lock_fd);
-            ipc.lock_fd = -1;
-        }
+        if(ipc.endpoint){attempt([&]{ipc.endpoint->stop();});ipc.endpoint.reset();}
+        if(ipc.lock_fd>=0){::flock(ipc.lock_fd,LOCK_UN);::close(ipc.lock_fd);ipc.lock_fd=-1;}
     }
     ipc_synchronizers_.clear();
-
-    // Phase 3: Destroy WSS synchronizer
-    if (!synchronizer_) return;
-    unregister_sync_key(config_.path, config_.websocket_url);
-    synchronizer_.reset();
-
-    // Release the cross-process flock so another process (or sibling) can
-    // acquire it and take over WSS sync responsibility.
-    if (sync_lock_fd_ >= 0) {
-        ::flock(sync_lock_fd_, LOCK_UN);
-        ::close(sync_lock_fd_);
-        sync_lock_fd_ = -1;
+    const bool had_wss=bool(synchronizer_);
+    if(had_wss) {
+        attempt([&]{unregister_sync_key(config_.path,config_.websocket_url);});
+        const auto cleanup=synchronizer_->cleanup_error_;synchronizer_.reset();
+        if(cleanup)result.remember(*cleanup);
     }
-
-    // Hand off sync responsibility to a surviving sibling instance with
-    // the same URL. Skipped when caller passed `fire_handoff = false` —
-    // i.e. the URL-change kick path in `setup_sync_if_configured`, which
-    // wants the flock free WITHOUT another sibling immediately re-grabbing
-    // it under the now-stale URL.
-    if (!fire_handoff) return;
-    bool handed_off = false;
-    instance_registry::instance().for_each_alive(config_.path,
-        [&](lattice_db* sibling) {
-            if (!handed_off && sibling != this &&
-                sibling->config_.is_sync_enabled() &&
-                sibling->config_.websocket_url == config_.websocket_url) {
-                sibling->setup_sync_if_configured();
-                handed_off = true;
+    // Even an incomplete/failed construction may have acquired this lock.
+    if(sync_lock_fd_>=0){::flock(sync_lock_fd_,LOCK_UN);::close(sync_lock_fd_);sync_lock_fd_=-1;}
+    if(had_wss&&fire_handoff)attempt([&]{
+        bool handed_off=false;
+        instance_registry::instance().for_each_alive(config_.path,[&](lattice_db* sibling){
+            if(!handed_off&&sibling!=this&&sibling->config_.is_sync_enabled()&&sibling->config_.websocket_url==config_.websocket_url){
+                sibling->setup_sync_if_configured();handed_off=true;
             }
         });
+    });
+    return result;
 }
-
 inline void lattice_db::close() {
-    // Close publication/admission before draining: staged opens cannot undo close.
-    std::shared_ptr<database> writer, reader, xproc;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        closed_.store(true, std::memory_order_seq_cst);
-        guard_->alive.store(false, std::memory_order_seq_cst);
-        ++connection_revision_;
-        writer = db_; reader = read_db_; xproc = xproc_read_db_;
-    }
-    managed_observers_.retire();
-    shutdown_projection_reads();
-    // 1. Mark as dying — prevents new notify_change() calls from starting.
-    guard_->alive.store(false, std::memory_order_seq_cst);
-    // 2. Wait for any in-flight notify_change() calls on OTHER threads to
-    //    complete. Exclude this thread's own holds: when close() is reached
-    //    from inside an observer callback (the callback released the last
-    //    reference), waiting for our own refcount is waiting for ourselves.
-    {
-        const int own = instance_guard::tls_depth(guard_.get());
-        while (guard_->notify_refcount.load(std::memory_order_seq_cst) > own) {
-            std::this_thread::yield();
-        }
-    }
-    // 3. Stop all sync threads while all members are still alive — the
-    //    retention thread first (it owns no sync state, but it does write).
-    stop_audit_maintenance();
-    teardown_sync();
-    sync_policy_.reset();
-    // 4. Drain the scheduler before unregistering — the xproc callback may
-    //    have queued observer work on the scheduler. Must complete while
-    //    members (db_, read_db_, etc.) are still alive.
-    if (scheduler_) scheduler_->shutdown();
-    // 5. Unregister — must NOT hold xproc_callback_mutex_ (deadlock with notifier thread).
-    instance_registry::instance().unregister_instance(config_.path, this);
-    // shared_xproc_notifier_ is owned by instance_registry — cleaned up
-    // when the last instance for this path is unregistered.
-    shared_xproc_notifier_ = nullptr;
-    // 6. Retire the read-generation pool BEFORE the connection teardown
-    //    (results spec §4.6 close ordering): COMMIT every keeper transaction
-    //    (force-retire protocol §3.4) and logically close the pooled
-    //    connections. In-flight generation reads hold a shared_ptr to their
-    //    keeper `database` wrapper and observe interrupt/logical-close as an
-    //    empty result → tolerant ladder, never a UAF.
-    retire_all_read_generations();
-    {
-        std::lock_guard<std::mutex> lock(read_pool_mutex_);
-        for (auto& conn : idle_read_pool_) conn->close();
-        idle_read_pool_.clear();
-    }
-    // Owned operations retain wrappers through logical close, outside publication
-    // locks. The parent must still outlive all borrows and their release.
-    deactivate_projection_pressure();
-    if (writer) writer->close();
-    if (reader) reader->close();
-    if (xproc) xproc->close();
+    const auto result=close_checked();
+    if(result.error)std::rethrow_exception(result.error);
 }
-
+inline lattice_close_result lattice_db::close_checked() noexcept {
+    lattice_close_result result;
+    const auto attempt=[&](auto&& operation) noexcept {
+        try {operation();}catch(...) {result.remember(std::current_exception());}
+    };
+    std::shared_ptr<database> writer,reader,xproc;
+    attempt([&]{
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        closed_.store(true,std::memory_order_seq_cst);guard_->alive.store(false,std::memory_order_seq_cst);++connection_revision_;
+        writer=db_;reader=read_db_;xproc=xproc_read_db_;
+    });
+    attempt([&]{managed_observers_.retire();});
+    attempt([&]{shutdown_projection_reads();});
+    guard_->alive.store(false,std::memory_order_seq_cst);
+    const int own=instance_guard::tls_depth(guard_.get());
+    while(guard_->notify_refcount.load(std::memory_order_seq_cst)>own)std::this_thread::yield();
+    attempt([&]{stop_audit_maintenance();});
+    result.merge(teardown_sync_checked());sync_policy_.reset();
+    attempt([&]{if(scheduler_)scheduler_->shutdown();});
+    attempt([&]{instance_registry::instance().unregister_instance(config_.path,this);});
+    shared_xproc_notifier_=nullptr;
+    attempt([&]{retire_all_read_generations();});
+    attempt([&]{
+        std::lock_guard<std::mutex> lock(read_pool_mutex_);
+        for(auto& conn:idle_read_pool_)attempt([&]{conn->close();});
+        idle_read_pool_.clear();
+    });
+    attempt([&]{deactivate_projection_pressure();});
+    if(writer)attempt([&]{writer->close();});
+    if(reader)attempt([&]{reader->close();});
+    if(xproc)attempt([&]{xproc->close();});
+    return result;
+}
 inline lattice_db::~lattice_db() {
+    // Keep the destructor's original retirement order. Every cleanup phase
+    // still runs after a drain/transport/scheduler failure; destruction has no
+    // reporting return and never turns pending work into an ACK claim.
+    const auto attempt=[](auto&& operation) noexcept {try{operation();}catch(...){}};
     closed_.store(true, std::memory_order_seq_cst);
     guard_->alive.store(false, std::memory_order_seq_cst);
-    managed_observers_.retire();
-    deactivate_projection_pressure();
-    shutdown_projection_reads();
+    attempt([&]{managed_observers_.retire();});
+    attempt([&]{deactivate_projection_pressure();});
+    attempt([&]{shutdown_projection_reads();});
     auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
     LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",
              (void*)this, config_.path.c_str(), (long long)n);
     // close() may have already been called; each step is idempotent.
     // 0. The retention thread must be joined before any member is torn down.
-    stop_audit_maintenance();
+    attempt([&]{stop_audit_maintenance();});
     // 1. Mark as dying (idempotent if close() already ran).
     LOG_INFO("lattice_db", "~dtor: setting alive=false, refcount=%d",
              (int)guard_->notify_refcount.load(std::memory_order_seq_cst));
@@ -8984,23 +8957,23 @@ inline lattice_db::~lattice_db() {
     }
     LOG_INFO("lattice_db", "~dtor: refcount drained (own holds: %d)", _own_holds);
     // 3. Stop all sync threads.
-    teardown_sync();
+    (void)teardown_sync_checked();
     sync_policy_.reset();
     LOG_INFO("lattice_db", "~dtor: teardown_sync done");
     // 3b. Retire the read-generation pool (idempotent if close() already
     //     ran): COMMIT keeper transactions before the wrappers are freed at
     //     member destruction — spec §4.6 ordering.
-    retire_all_read_generations();
+    attempt([&]{retire_all_read_generations();});
     // 4. Drain scheduler.
     LOG_INFO("lattice_db", "~dtor: shutting down scheduler");
-    if (scheduler_) scheduler_->shutdown();
+    attempt([&]{if (scheduler_) scheduler_->shutdown();});
     LOG_INFO("lattice_db", "~dtor: scheduler shutdown done");
     // 5. Unregister. Do NOT hold xproc_callback_mutex_ during unregister —
     //    unregister_instance takes registry mutex_, and may destroy the notifier
     //    (stop_listening → thread join). The notifier callback also takes
     //    registry mutex_ via for_each_alive → deadlock if we hold both.
     LOG_INFO("lattice_db", "~dtor: calling unregister_instance");
-    instance_registry::instance().unregister_instance(config_.path, this);
+    attempt([&]{instance_registry::instance().unregister_instance(config_.path, this);});
     LOG_INFO("lattice_db", "~dtor: unregister done");
     shared_xproc_notifier_ = nullptr;
     LOG_INFO("lattice_db", "~dtor: complete");

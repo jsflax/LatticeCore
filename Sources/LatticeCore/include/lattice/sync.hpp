@@ -21,9 +21,17 @@
 #include <unordered_set>
 #include <set>
 #include <mutex>
+#include <exception>
 
 namespace lattice {
 
+// Checked flush disposition is not a remote receipt/install guarantee.
+enum class sync_drain_state { not_attempted,drained,disconnected,retired,deadline_pending,reentrant_pending,failed };
+struct sync_drain_result {
+    sync_drain_state state=sync_drain_state::not_attempted;
+    std::exception_ptr error;
+    bool discovery_pending=false;
+};
 // Forward declaration
 class lattice_db;
 namespace detail {class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;enum class sync_discovery_kind;struct sync_discovery_test_access;}
@@ -291,6 +299,10 @@ struct sync_config {
 // ============================================================================
 
 class synchronizer_base {
+    friend class lattice_db;
+    // Retained by close across reset; destructor cleanup failures cannot be
+    // recovered from a destroyed synchronizer or substituted for a drain error.
+    std::shared_ptr<std::exception_ptr> cleanup_error_=std::make_shared<std::exception_ptr>();
 public:
     using on_sync_complete_handler = std::function<void(const std::vector<std::string>& synced_ids)>;
     using on_error_handler = std::function<void(const std::string& error)>;
@@ -352,6 +364,7 @@ public:
     /// of scope, and the A→B handoff all rely on this.
     /// Never blocks past `deadline`; returns immediately when disconnected.
     void drain(std::chrono::steady_clock::time_point deadline);
+    sync_drain_result drain_checked(std::chrono::steady_clock::time_point deadline) noexcept;
 
     std::shared_ptr<ack_retry_guard> ack_guard_ = std::make_shared<ack_retry_guard>();
 

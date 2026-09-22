@@ -599,6 +599,7 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
 
 namespace detail {
 thread_local std::function<void()> sync_background_test_hooks::before_late_discovery;
+thread_local std::function<void()> sync_background_test_hooks::before_drain_admission;
 thread_local std::shared_ptr<const sync_background_test_hooks::pacer_wait_schedule> sync_background_test_hooks::pacer_wait;
 struct sync_upload_continuation {
     bool sending=false,enumeration_hit_limit=false,late_replay_owned=false;
@@ -840,6 +841,7 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
         detail::sync_discovery_deferral::ticket addressed;
         bool reject() noexcept {
             if(!queue->reject_unbegun(addressed))return false;
+            if(addressed.completion)addressed.completion->cancel(detail::sync_discovery_completion::outcome::rejected);
             state->wake_changed();
             return true;
         }
@@ -850,10 +852,11 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
     reservation->queue=queue;reservation->state=state;
     detail::sync_discovery_deferral::ticket addressed;
     if(initial) {
-        const auto generation=initial->generation;
+        const auto generation=initial->generation;const auto completion=initial->completion;
         const auto admitted=queue->push_and_dispatch(std::move(initial),detail::sync_discovery_deferral::clock::now());
-        if(admitted.state==detail::sync_discovery_deferral::admission::obsolete)return;
+        if(admitted.state==detail::sync_discovery_deferral::admission::obsolete){if(completion)completion->cancel();return;}
         if(admitted.state==detail::sync_discovery_deferral::admission::exhausted) {
+            if(completion)completion->cancel(detail::sync_discovery_completion::outcome::rejected);
             if(queue->take_failure(generation))throw db_error("sync discovery deferral capacity exhausted; route stopped; explicit replay required (one-shot senders have no replay guarantee)");
             return;
         }
@@ -882,7 +885,8 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
                 try {done=work->step(*work);}catch(...) {failure=std::current_exception();}
                 const auto next=queue->finish_and_continue(ticket,work,done,
                     detail::sync_discovery_deferral::clock::now(),turn+1<detail::sync_discovery_deferral::turn_limit);
-                if(failure)detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,work->label);
+                if(work->completion)work->completion->finish(done,failure);
+                if(failure&&!work->completion)detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,work->label);
                 if(!lifetime->current(addressed.generation)||!next)break;
                 ticket=next;
             }
@@ -893,6 +897,7 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
         });
     });}catch(...) {
         const auto failure=std::current_exception();
+        if(addressed.completion)addressed.completion->cancel(detail::sync_discovery_completion::outcome::rejected,failure);
         if(reservation->reject()) {
             if(queue->take_failure(addressed.generation))
                 detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,
@@ -1118,18 +1123,21 @@ void synchronizer_base::setup_observer() {
 }
 
 synchronizer_base::~synchronizer_base() {
+    const auto remember=[&](auto&& operation) noexcept {
+        try {operation();}catch(...) {if(cleanup_error_&&!*cleanup_error_)*cleanup_error_=std::current_exception();}
+    };
     // FIRST retire callback/queued admission. Request off-callback transport
     // teardown before waiting, then drain foreign turns before member teardown.
     if(callback_lifetime_)callback_lifetime_->retire();
-    if(discovery_deferral_)discovery_deferral_->cancel(reconnect_lifecycle_.load(),true);
+    remember([&]{if(discovery_deferral_)discovery_deferral_->cancel(reconnect_lifecycle_.load(),true);});
     is_destroyed_=true;
     if(!retire_protected_transport()) {
         if(recovery_export_route_)recovery_export_route_->retire();
 #ifndef __EMSCRIPTEN__
-        stop_pacer();
+        remember([&]{stop_pacer();});
 #endif
     }
-    if(callback_lifetime_)callback_lifetime_->wait_for_foreign();
+    remember([&]{if(callback_lifetime_)callback_lifetime_->wait_for_foreign();});
     LOG_INFO("synchronizer", "[%s] ~synchronizer START (this=%p, db=%s)",
              log_id(), (void*)this,
              db_ptr_ ? db_ptr_->config().path.c_str() : "<unbound>");
@@ -1141,9 +1149,9 @@ synchronizer_base::~synchronizer_base() {
     }
     // Remove AuditLog observer
     if (audit_log_observer_id_ != 0) {
-        db().remove_table_observer("AuditLog", audit_log_observer_id_);
+        remember([&]{db().remove_table_observer("AuditLog", audit_log_observer_id_);});
     }
-    disconnect();
+    remember([&]{disconnect();});
 
     // Drain the scheduler: wait for any in-flight work to complete before
     // implicit member destruction invalidates the state that work accesses.
@@ -1151,12 +1159,12 @@ synchronizer_base::~synchronizer_base() {
     // access db_, config_, ws_client_ etc. after they're destroyed.
     // Skip if we're on the scheduler thread (destructor called from within
     // a callback) — the work will finish as part of the current call stack.
-    if (scheduler_) {
+    remember([&]{if (scheduler_) {
         if (owns_inline_scheduler_adapter_ || !scheduler_->is_on_thread()) {
             LOG_INFO("synchronizer", "[%s] ~synchronizer: draining scheduler...", log_id());
-            scheduler_->shutdown();
+            remember([&]{scheduler_->shutdown();});
         }
-    }
+    }});
     const auto n = counted_instance_
         ? g_sync_instance_count.fetch_sub(1, std::memory_order_relaxed) - 1
         : g_sync_instance_count.load(std::memory_order_relaxed);
@@ -1319,45 +1327,93 @@ void synchronizer_base::sync_now() {
 }
 
 void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
-    const auto queue=discovery_deferral_;
-    const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;
-    const auto generation=lifetime->dispatch_generation();
-    bool should_dispatch=false;
-    lifetime->queued(generation,[this,queue,generation,&should_dispatch] {
-        if(!is_connected_||is_destroyed_)return;
-        if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
-        bool pending=(receiver_source_&&continuous_route_&&receiver_source_->upload_pending(generation))||
-            queue->pending(generation)||progress_pending_upload_.load(std::memory_order_relaxed)>0;
-        if(!pending){std::lock_guard<std::mutex> lock(in_flight_mutex_);pending=!in_flight_ids_.empty();}
-        if(!pending)pending=!db().db().query("SELECT 1 FROM AuditLog WHERE isSynchronized=0 LIMIT 1").empty();
-        should_dispatch=pending;
-    });
-    if(!should_dispatch)return;
-    struct pass_state {std::atomic<bool> done{false};std::exception_ptr error;};
-    const auto pass=std::make_shared<pass_state>();
-    scheduled->invoke([this,pass] {
-        try {if(!is_destroyed_)upload_pending_changes();}
-        catch(...) {pass->error=std::current_exception();}
-        pass->done.store(true,std::memory_order_release);
-    });
-    for(;;) {
-        // The pass may have destroyed this owner. All owner reads below need
-        // a fresh ticket; no raw is_destroyed test can resurrect its lifetime.
-        const bool done=pass->done.load(std::memory_order_acquire);
-        if(done&&pass->error)std::rethrow_exception(pass->error);
-        bool admitted=false,connected=false,negotiated_pending=false;int64_t pending=0;std::string label;
-        const bool expired=std::chrono::steady_clock::now()>=deadline;
-        lifetime->queued(generation,[this,generation,&admitted,&connected,&pending,&negotiated_pending,&label,expired] {
-            admitted=true;connected=is_connected_.load()&&!is_destroyed_.load();
-            pending=progress_pending_upload_.load(std::memory_order_relaxed);
-            if(connected&&receiver_source_&&continuous_route_)negotiated_pending=receiver_source_->upload_pending(generation);
-            if(expired)label=log_id();
+    const auto result=drain_checked(deadline);
+    if(result.error)std::rethrow_exception(result.error);
+    if(result.state==sync_drain_state::reentrant_pending)
+        throw db_error("sync drain cannot wait on its own scheduler or callback; pending work remains");
+    // Preserve the legacy explicit pending-discovery refusal. Other legacy
+    // deadline/disconnect returns remain void; checked callers can distinguish
+    // them from an observed drain and must not infer an ACK from void return.
+    if(result.state==sync_drain_state::deadline_pending&&result.discovery_pending)
+        throw db_error("sync upload is pending discovery deferral");
+}
+sync_drain_result synchronizer_base::drain_checked(std::chrono::steady_clock::time_point deadline) noexcept {
+    try {
+        const auto queue=discovery_deferral_;const auto lifetime=callback_lifetime_;
+        if(!queue||!lifetime)return {sync_drain_state::not_attempted};
+        const auto generation=lifetime->dispatch_generation();
+        bool on_scheduler=lifetime->executing_here();
+#ifndef __EMSCRIPTEN__
+        on_scheduler=on_scheduler||(scheduler_&&scheduler_->is_on_thread());
+#endif
+        if(on_scheduler)return {sync_drain_state::reentrant_pending,{},true};
+        bool admitted=false,connected=false;
+        lifetime->queued(generation,[this,queue,generation,&admitted,&connected] {
+            admitted=true;connected=is_connected_&&!is_destroyed_;if(!connected)return;
+            if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
         });
-        if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
-        if(!admitted||!connected||(done&&pending<=0&&!negotiated_pending&&!queue->pending(generation)))return;
-        if(expired){LOG_INFO("synchronizer","[%s] drain: deadline reached with pending=%lld — disconnecting anyway",label.c_str(),static_cast<long long>(pending));return;}
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+        if(!admitted)return {sync_drain_state::retired};
+        if(!connected)return {sync_drain_state::disconnected};
+        // Every connected drain admits a FIFO upload barrier. An empty/busy
+        // precheck cannot establish that earlier or racing intake has settled.
+        // This private rendezvous is outside queue/SQL/lifetime locks.
+        const auto before_admission=detail::sync_background_test_hooks::before_drain_admission;
+        if(before_admission)before_admission();
+        const auto completion=std::make_shared<detail::sync_discovery_completion>();
+        struct completion_scope {
+            std::shared_ptr<detail::sync_discovery_completion> value;
+            ~completion_scope(){value->cancel();}
+        } settled_on_exit{completion};
+        const auto continuation=std::make_shared<detail::sync_upload_continuation>();
+        auto work=std::make_shared<detail::sync_discovery_operation>();
+        work->type=detail::sync_discovery_kind::drain_upload;work->label="drain upload";
+        work->generation=generation;work->charge=1024;work->completion=completion;
+        work->step=[this,continuation,completion,deadline](detail::sync_discovery_operation& unit) {
+            // Preserve the legacy first pass even for an already elapsed
+            // deadline. A subsequent BUSY continuation cannot extend it, nor
+            // turn this caller's short deadline into whole-route queue failure.
+            if(unit.attempts&&std::chrono::steady_clock::now()>=deadline) {
+                completion->cancel(detail::sync_discovery_completion::outcome::expired);return true;
+            }
+            return upload_pending_changes_step(*continuation,&unit);
+        };
+        bool enqueued=false;
+        lifetime->queued(generation,[this,&work,&enqueued]{enqueued=true;pump_discovery(std::move(work));});
+        if(!enqueued){completion->cancel();return {sync_drain_state::retired};}
+        for(;;) {
+            // Completion carries the original exception even after a send
+            // destroys this owner. All subsequent owner reads need admission.
+            const auto result=completion->read();
+            if(result.error)return {sync_drain_state::failed,result.error};
+            bool live=false,online=false,negotiated_pending=false;int64_t pending=0;
+            lifetime->queued(generation,[this,generation,&live,&online,&pending,&negotiated_pending] {
+                live=true;online=is_connected_.load()&&!is_destroyed_.load();
+                pending=progress_pending_upload_.load(std::memory_order_relaxed);
+                if(online&&receiver_source_&&continuous_route_)negotiated_pending=receiver_source_->upload_pending(generation);
+            });
+            if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
+            if(!live||!online) {
+                completion->cancel();const auto settled=completion->read();
+                if(settled.error)return {sync_drain_state::failed,settled.error};
+                if(settled.state!=detail::sync_discovery_completion::outcome::running)
+                    return {live?sync_drain_state::disconnected:sync_drain_state::retired};
+                // Retirement cannot erase a still-running admitted turn's
+                // failure. Give that passive completion the original budget;
+                // at the deadline report pending, without waiting on the owner.
+                if(std::chrono::steady_clock::now()>=deadline)
+                    return {sync_drain_state::deadline_pending,{},true};
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));continue;
+            }
+            const bool discovery_pending=queue->pending(generation);
+            if(result.state==detail::sync_discovery_completion::outcome::completed&&pending<=0&&!negotiated_pending&&!discovery_pending)
+                return {sync_drain_state::drained};
+            if(std::chrono::steady_clock::now()>=deadline) {
+                completion->cancel(detail::sync_discovery_completion::outcome::expired);
+                return {sync_drain_state::deadline_pending,{},discovery_pending};
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }catch(...) {return {sync_drain_state::failed,std::current_exception()};}
 }
 
 void synchronizer_base::on_websocket_open() {

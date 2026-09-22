@@ -51,6 +51,30 @@ void _lattice_post_cross_process_notification(const std::string& db_path);
 
 namespace lattice {
 
+// Owned, sealed close outcome; no member borrows the retired implementation.
+class swift_close_result {
+    friend class swift_lattice_ref;
+    int32_t sync_=0;
+    bool cleanup_complete_=false,failed_=false,cleanup_failed_=false,message_unavailable_=false;
+    std::string message_;
+    explicit swift_close_result(const lattice_close_result& result) noexcept
+        :sync_(static_cast<int32_t>(result.sync)),cleanup_complete_(result.cleanup_complete),
+         failed_(bool(result.error)),cleanup_failed_(bool(result.cleanup_error)) {
+        if(!result.error)return;
+        try {std::rethrow_exception(result.error);}
+        catch(const std::exception& error){try{message_=error.what();}catch(...){message_unavailable_=true;}}
+        catch(...){try{message_="Unknown C++ close failure";}catch(...){message_unavailable_=true;}}
+    }
+public:
+    swift_close_result() noexcept=default;
+    int32_t sync_state()const noexcept SWIFT_NAME(syncState()){return sync_;}
+    bool cleanup_complete()const noexcept SWIFT_NAME(cleanupComplete()){return cleanup_complete_;}
+    bool failed()const noexcept{return failed_;}
+    bool cleanup_failed()const noexcept SWIFT_NAME(cleanupFailed()){return cleanup_failed_;}
+    bool message_unavailable()const noexcept SWIFT_NAME(messageUnavailable()){return message_unavailable_;}
+    std::string take_message()noexcept SWIFT_NAME(takeMessage()){return std::move(message_);}
+};
+
 // ============================================================================
 // swift_dynamic_object - A type-erased model for Swift interop
 // Swift models map to this, with schema/properties set dynamically
@@ -1048,6 +1072,7 @@ public:
     /// on the same path create a fresh instance (e.g., after nuclear compaction).
     /// Call before deleting database files to avoid "vnode unlinked while in use".
     void close(); // defined after LatticeCache
+    lattice_close_result close_checked() noexcept;
     bool is_sync_connected() const { return lattice_db::is_sync_connected(); }
     bool is_sync_agent() const { return lattice_db::is_sync_agent(); }
 
@@ -3564,8 +3589,12 @@ template <typename ConfigT>
 
 // Out-of-line: defined after LatticeCache so evict() is visible.
 inline void swift_lattice::close() {
-    detail::LatticeCache::instance().evict(this);
-    lattice_db::close();
+    const auto result=close_checked();if(result.error)std::rethrow_exception(result.error);
+}
+inline lattice_close_result swift_lattice::close_checked() noexcept {
+    lattice_close_result result;
+    try{detail::LatticeCache::instance().evict(this);}catch(...){result.remember(std::current_exception());}
+    result.merge(lattice_db::close_checked());return result;
 }
 
 class swift_lattice_ref {
@@ -3968,7 +3997,28 @@ public:
     void begin_transaction() const { sealed([&] { impl().begin_transaction(); }); }
     void commit() const { sealed([&] { impl().commit(); }); }
     void rollback() const { sealed([&] { impl().rollback(); }); }
-    void close() const { impl().close(); }
+    swift_close_result close_checked() const noexcept SWIFT_NAME(closeChecked()) {
+        // Retain the real derived owner through cleanup and result conversion.
+        // Error formatting is independently sealed, including allocation failure.
+        try {
+            const auto retained=impl_;
+            if(!retained) {lattice_close_result result;result.cleanup_complete=false;return swift_close_result(result);}
+            return swift_close_result(retained->close_checked());
+        }catch(...) {
+            lattice_close_result result;result.remember(std::current_exception());return swift_close_result(result);
+        }
+    }
+    void close() const noexcept {
+        auto result=close_checked();
+        // Legacy compatibility remains nonthrowing and records an error without
+        // conflating a pending/disconnected close with completed remote ACKs.
+        try {
+            last_bridge_error().clear();
+            if(result.failed_)record_bridge_error(result.message_.empty()?"C++ close failed (message unavailable)":result.message_.c_str());
+            else if(result.sync_!=static_cast<int32_t>(sync_drain_state::drained)&&result.sync_!=static_cast<int32_t>(sync_drain_state::not_attempted))
+                record_bridge_error("Closed with synchronization incomplete; inspect closeChecked result");
+        }catch(...) {record_bridge_error("C++ close diagnostic unavailable");}
+    }
     bool is_closed() const SWIFT_NAME(isClosed()) { return impl().is_closed(); }
     bool has_attached_stores() const SWIFT_NAME(hasAttachedStores()) {
         return impl().has_attached_stores();

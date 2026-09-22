@@ -8,12 +8,42 @@
 #include <mutex>
 #include <atomic>
 #include <cstdint>
+#include <exception>
 
 namespace lattice::detail {
 // Private ownership for the ordinary sync discovery seam. Work returns false
 // only at its explicit first no-effect discovery stage. Exceptions are never
 // retried here; in particular no background_operation closure is replayed.
-enum class sync_discovery_kind { intake,ack,upload,initial_upload };
+enum class sync_discovery_kind { intake,ack,upload,initial_upload,drain_upload };
+// Passive completion ownership. No callbacks or owner pointers; admission and
+// cancellation settle it outside the queue leaf. A running turn retains its
+// first real failure even if cancellation/owner retirement races its tail.
+struct sync_discovery_completion {
+    enum class outcome { pending,running,completed,cancelled,rejected,expired };
+    struct result {outcome state;std::exception_ptr error;};
+private:
+    mutable std::mutex mutex_;
+    outcome state_=outcome::pending,cancellation_=outcome::pending;
+    std::exception_ptr error_;
+public:
+    bool start() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(state_!=outcome::pending)return false;state_=outcome::running;return true;
+    }
+    void cancel(outcome why=outcome::cancelled,std::exception_ptr error={}) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(error&&!error_)error_=std::move(error);
+        if(state_==outcome::running)cancellation_=why;
+        else if(state_==outcome::pending)state_=why;
+    }
+    void finish(bool done,std::exception_ptr error={}) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(error&&!error_)error_=std::move(error);
+        if(state_!=outcome::running)return;
+        state_=cancellation_!=outcome::pending?cancellation_:(done||error_?outcome::completed:outcome::pending);
+    }
+    result read()const {std::lock_guard<std::mutex> lock(mutex_);return {state_,error_};}
+};
 struct sync_discovery_operation {
         using clock=std::chrono::steady_clock;
         using kind=sync_discovery_kind;
@@ -25,6 +55,7 @@ struct sync_discovery_operation {
         clock::time_point deadline=clock::time_point::max();
         unsigned attempts=0;
         std::atomic<bool> coalescible{true};
+        std::shared_ptr<sync_discovery_completion> completion;
 };
 class sync_discovery_deferral {
 public:
@@ -32,7 +63,7 @@ public:
     using kind=sync_discovery_kind;
     using operation=sync_discovery_operation;
     enum class admission { accepted,coalesced,obsolete,exhausted };
-    struct ticket {uint64_t generation=0,serial=0;explicit operator bool()const{return serial!=0;}};
+    struct ticket {uint64_t generation=0,serial=0;std::shared_ptr<sync_discovery_completion> completion;explicit operator bool()const{return serial!=0;}};
     struct admission_result {admission state;ticket reserved;};
     static constexpr size_t capacity=64,byte_limit=16*1024*1024;
     static constexpr unsigned attempt_limit=32,turn_limit=4;
@@ -63,7 +94,7 @@ private:
         // Each admission has its own identity, including successive dispatches
         // in one generation. A throwing inline scheduler can have completed an
         // older callback while another reservation is already outstanding.
-        ++serial_;dispatched_=true;return {generation_,serial_};
+        ++serial_;dispatched_=true;return {generation_,serial_,slots_[head_]->completion};
     }
 public:
     uint64_t revision()const noexcept{return revision_.load(std::memory_order_acquire);}
@@ -91,10 +122,18 @@ public:
         dispatched_=false;failed_=true;changed();return true;
     }
     std::shared_ptr<operation> begin(ticket addressed,clock::time_point now) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_ptr<operation> released;
+        std::unique_lock<std::mutex> lock(mutex_);
         if(closed_||failed_||addressed.generation!=generation_||addressed.serial!=serial_||active_||!dispatched_||!count_)return {};
         dispatched_=false;
-        if(now>=slots_[head_]->deadline){failed_=true;changed();return {};}
+        if(now>=slots_[head_]->deadline) {
+            failed_=true;changed();const auto completion=slots_[head_]->completion;lock.unlock();
+            if(completion)completion->cancel(sync_discovery_completion::outcome::expired);return {};
+        }
+        if(slots_[head_]->completion&&!slots_[head_]->completion->start()) {
+            bytes_-=slots_[head_]->charge;released=std::move(slots_[head_]);head_=(head_+1)%capacity;--count_;next_=now;changed();
+            return {}; // released capture destructs after leaf unlock
+        }
         active_=true;return slots_[head_];
     }
     // Increase retention charge only before returning a newly staged busy
@@ -131,7 +170,7 @@ private:
         // A BUSY result, terminal failure or quantum boundary releases it.
         const bool continued=done&&retain_dispatch&&count_&&!failed_&&!closed_;
         if(continued)dispatched_=true;
-        changed();return {failed_,continued?addressed:ticket{}};
+        changed();return {failed_,continued?ticket{addressed.generation,addressed.serial,slots_[head_]->completion}:ticket{}};
     }
 public:
     bool finish(ticket addressed,const std::shared_ptr<operation>& work,bool done,clock::time_point now) {
@@ -169,6 +208,7 @@ public:
          released.swap(slots_);head_=count_=bytes_=0;active_=dispatched_=failed_=reported_=false;
          generation_=generation;closed_=closed_||close||serial_==std::numeric_limits<uint64_t>::max();
          if(!closed_)++serial_;changed();}
+        for(const auto& work:released)if(work&&work->completion)work->completion->cancel();
         // Captures may retire owners. Release them outside the leaf lock.
     }
 };

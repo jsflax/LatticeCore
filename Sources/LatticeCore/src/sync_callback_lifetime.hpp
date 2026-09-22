@@ -21,6 +21,8 @@ struct ack_schedule {
 extern thread_local std::shared_ptr<const ack_schedule> ack;
 // Source fixture rendezvous immediately before the late no-effect probe.
 extern thread_local std::function<void()> before_late_discovery;
+// Off-lock drain admission race rendezvous; production is null.
+extern thread_local std::function<void()> before_drain_admission;
 // Copied at pacer creation. Tests may hold initial startup, then pause its
 // final false predicate under the wait mutex. Production is null; no throwing.
 struct pacer_wait_schedule {std::function<void()> starting,before_wait;};

@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include <lattice.hpp>
 #include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
@@ -94,6 +95,14 @@ TEST(SyncDiscoveryDeferral, ActiveOrStagedUploadPreservesOneLaterEnumerationDema
 #ifndef __EMSCRIPTEN__
 namespace lattice::detail {
 struct sync_discovery_test_access {
+    static synchronizer_base* configured(lattice_db& owner){return owner.synchronizer_.get();}
+    static void flush_scheduler(synchronizer_base& sync){
+        const auto done=std::make_shared<std::promise<void>>();auto result=done->get_future();
+        sync.scheduler_->invoke([done]{done->set_value();});
+        if(result.wait_for(std::chrono::seconds(5))!=std::future_status::ready)throw std::runtime_error("actual scheduler did not settle");
+    }
+    static void schedule(synchronizer_base& sync,std::function<void()> work){sync.scheduler_->invoke(std::move(work));}
+
     static std::shared_ptr<lattice_db> owner(synchronizer_base& sync){return sync.owned_db_;}
     static auto queue(synchronizer_base& sync){return sync.discovery_deferral_;}
     static uint64_t generation(synchronizer_base& sync){return sync.reconnect_lifecycle_.load();}
@@ -367,6 +376,235 @@ TEST_F(SyncDiscoveryContention, PostIntakeCommitRefusalIsNeverRetriedAsInitialBu
     receive_guard_test_hooks::after_intake_commit=[&]{++calls;throw std::runtime_error("fixture postcommit refusal");};
     receive(e);EXPECT_EQ(calls,1);EXPECT_FALSE(pending());EXPECT_EQ(wire->count(),0u);EXPECT_EQ(name(e),"before");
     const auto guard=receive_delivery_guard_access::read(*owner,"wss:discovery-test");EXPECT_EQ(guard.state,receive_guard_state::in_progress);
+}
+
+// Completion is independent of owner lifetime and cannot lose a running
+// turn's original error when close cancels the same finite FIFO cell.
+TEST(SyncDiscoveryCompletion, CancelAndRetirementPreserveTheRunningError) {
+    queue q;auto work=unit(queue::kind::drain_upload);work->completion=std::make_shared<sync_discovery_completion>();
+    const auto completion=work->completion;const auto now=queue::clock::now();
+    const auto admitted=q.push_and_dispatch(work,now);ASSERT_TRUE(admitted.reserved);
+    ASSERT_EQ(q.begin(admitted.reserved,now),work);q.cancel(3,true);
+    const auto error=std::make_exception_ptr(std::runtime_error("original running failure"));
+    completion->finish(true,error);const auto result=completion->read();
+    EXPECT_EQ(result.state,sync_discovery_completion::outcome::cancelled);
+    ASSERT_TRUE(result.error);try{std::rethrow_exception(result.error);}catch(const std::exception& e){EXPECT_STREQ(e.what(),"original running failure");}
+    EXPECT_FALSE(q.pending(3));
+}
+TEST(SyncDiscoveryCompletion, CancelledQueuedDrainDoesNotExecuteOrBlockLaterWork) {
+    queue q;auto work=unit(queue::kind::drain_upload);work->completion=std::make_shared<sync_discovery_completion>();
+    auto later=unit();const auto now=queue::clock::now();q.push(work);q.push(later);
+    work->completion->cancel(sync_discovery_completion::outcome::expired);
+    EXPECT_EQ(q.begin(q.dispatch(now),now),nullptr);
+    const auto next=q.dispatch(now);ASSERT_EQ(q.begin(next,now),later);q.finish(next,later,true,now);
+    EXPECT_FALSE(q.pending(1));EXPECT_FALSE(q.failed(1));
+}
+TEST_F(SyncDiscoveryContention, CheckedDrainWaitsForEarlierBusyIntakeThenReportsPendingAckHonestly) {
+    const auto e=change("drain-earlier-intake","before");sync_discovery_test_access::connected(*sync);
+    held_writer_mutex held(*owner);receive(e);ASSERT_TRUE(pending());
+    auto result=std::async(std::launch::async,[&]{return sync->drain_checked(std::chrono::steady_clock::now()+2s);});
+    EXPECT_EQ(result.wait_for(30ms),std::future_status::timeout);held.allow();
+    ASSERT_EQ(result.wait_for(5s),std::future_status::ready);const auto outcome=result.get();
+    EXPECT_FALSE(outcome.error);EXPECT_EQ(outcome.state,sync_drain_state::deadline_pending);
+    EXPECT_EQ(name(e),"before-changed");EXPECT_GT(wire->count(),0u);
+    // No server ACK was fabricated: the real local original stays pending.
+    EXPECT_GT(sync_discovery_test_access::in_flight(*sync),0u);
+}
+TEST_F(SyncDiscoveryContention, RacingAdmissionBetweenDrainChecksIsOrderedBeforeItsUpload) {
+    const auto e=change("drain-racing-intake","race");sync_discovery_test_access::connected(*sync);
+    held_writer_mutex held(*owner);std::promise<void> inserted;auto seen=inserted.get_future();
+    auto result=std::async(std::launch::async,[&]{
+        struct reset {~reset(){sync_background_test_hooks::before_drain_admission={};}} reset_hook;
+        sync_background_test_hooks::before_drain_admission=[&]{receive(e);inserted.set_value();};
+        return sync->drain_checked(std::chrono::steady_clock::now()+2s);
+    });
+    ASSERT_EQ(seen.wait_for(5s),std::future_status::ready);EXPECT_TRUE(pending());
+    EXPECT_EQ(result.wait_for(30ms),std::future_status::timeout);held.allow();
+    ASSERT_EQ(result.wait_for(5s),std::future_status::ready);const auto outcome=result.get();
+    EXPECT_FALSE(outcome.error);EXPECT_EQ(outcome.state,sync_drain_state::deadline_pending);
+    EXPECT_EQ(name(e),"race-changed");const auto frames=wire->copy();ASSERT_FALSE(frames.empty());
+    const auto first=server_sent_event::from_json(frames.front());ASSERT_TRUE(first);
+    EXPECT_EQ(first->acked_ids,(std::vector<std::string>{e.global_id}));
+}
+TEST_F(SyncDiscoveryContention, RetiringOwnerSettlesQueuedDrainWithoutWaitingForDeadline) {
+    const auto e=change("drain-retired","before");sync_discovery_test_access::connected(*sync);
+    held_writer_mutex held(*owner);receive(e);
+    auto* raw=sync.get();auto result=std::async(std::launch::async,[raw]{return raw->drain_checked(std::chrono::steady_clock::now()+2s);});
+    EXPECT_EQ(result.wait_for(30ms),std::future_status::timeout);sync->disconnect();
+    ASSERT_EQ(result.wait_for(1s),std::future_status::ready);const auto outcome=result.get();
+    EXPECT_FALSE(outcome.error);EXPECT_TRUE(outcome.state==sync_drain_state::retired||outcome.state==sync_drain_state::disconnected);
+    held.allow();EXPECT_EQ(name(e),"before");EXPECT_EQ(wire->count(),0u);
+}
+TEST_F(SyncDiscoveryContention, DrainOnItsOwnSchedulerReturnsExplicitPendingWithoutWaiting) {
+    sync_discovery_test_access::connected(*sync);sync_drain_result outcome;
+    sync_discovery_test_access::schedule(*sync,[&]{outcome=sync->drain_checked(std::chrono::steady_clock::now()+2s);});
+    EXPECT_EQ(outcome.state,sync_drain_state::reentrant_pending);EXPECT_FALSE(outcome.error);EXPECT_FALSE(pending());
+}
+struct close_wire_state {
+    std::atomic<int> sends{0},disconnects{0},destroyed{0};
+    std::atomic<bool> fail_send{false},fail_disconnect{false};
+};
+class close_wire final:public sync_transport {
+    std::shared_ptr<close_wire_state> state_;
+public:
+    explicit close_wire(std::shared_ptr<close_wire_state> state):state_(std::move(state)){}
+    ~close_wire(){++state_->destroyed;}
+    void connect(const std::string&,const std::map<std::string,std::string>&)override{}
+    void disconnect()override{++state_->disconnects;if(state_->fail_disconnect)throw std::runtime_error("cleanup disconnect failure");}
+    transport_state state()const override{return transport_state::open;}
+    bool supports_reconnect()const override{return false;}
+    void send(const transport_message&)override{++state_->sends;if(state_->fail_send)throw std::runtime_error("first actual upload failure");}
+    void set_on_open(on_open_handler)override{}
+    void set_on_message(on_message_handler)override{}
+    void set_on_error(on_error_handler)override{}
+    void set_on_close(on_close_handler)override{}
+};
+class close_network final:public network_factory {
+public:
+    const std::shared_ptr<close_wire_state> state=std::make_shared<close_wire_state>();
+    std::unique_ptr<http_client> create_http_client()override{return std::make_unique<null_http_client>();}
+    std::unique_ptr<sync_transport> create_sync_transport()override{return std::make_unique<close_wire>(state);}
+};
+class SyncCheckedClose:public ::testing::Test {
+protected:
+    TempDB file{"checked_close"};std::shared_ptr<network_factory> prior;
+    std::shared_ptr<close_network> factory=std::make_shared<close_network>();
+    configuration config(){configuration out(file.str());out.audit_retention_seconds=0;out.busy_timeout_ms=100;
+        out.websocket_url="wss://checked-close.invalid/sync";out.authorization_token="fixture-token";return out;}
+    void SetUp()override{prior=get_network_factory();set_network_factory(factory);}
+    void TearDown()override{set_network_factory(prior);}
+    void stop_notifier(){if(auto* n=instance_registry::instance().get_or_create_notifier(file.str()))n->stop_listening();}
+    void connect(lattice_db& owner){auto* sync=sync_discovery_test_access::configured(owner);if(!sync)throw std::runtime_error("actual configured sync missing");
+        sync_discovery_test_access::flush_scheduler(*sync);
+        auto actual=sync_discovery_test_access::owner(*sync);register_replication_slot(actual->db(),"wss:"+config().websocket_url);
+        sync_discovery_test_access::connected(*sync);}
+    void held_close(bool racing) {
+        auto parent=std::make_unique<lattice_db>(config());stop_notifier();parent->add(TestPerson{"before",1,std::nullopt});connect(*parent);
+        auto* sync=sync_discovery_test_access::configured(*parent);auto child=sync_discovery_test_access::owner(*sync);
+        std::weak_ptr<lattice_db> weak_child=child;
+        audit_log_entry entry;entry.global_id="actual-close-intake";entry.table_name="TestPerson";entry.operation="UPDATE";
+        entry.global_row_id=std::get<std::string>(child->db().query("SELECT globalId FROM TestPerson").at(0).at("globalId"));
+        entry.changed_fields_names={"name"};entry.changed_fields={{"name",any_property("after")}};entry.timestamp="1789819200.0";
+        held_writer_mutex held(*child);child.reset();std::promise<void> admitted;auto observed=admitted.get_future();
+        if(!racing)sync_discovery_test_access::input(*sync,server_sent_event::make_audit_log({entry}));
+        auto closed=std::async(std::launch::async,[&]{
+            struct reset {~reset(){sync_background_test_hooks::before_drain_admission={};}} reset_hook;
+            sync_background_test_hooks::before_drain_admission=[&]{
+                if(racing)sync_discovery_test_access::input(*sync,server_sent_event::make_audit_log({entry}));
+                admitted.set_value();
+            };
+            return parent->close_checked();
+        });
+        const auto admission=observed.wait_for(5s);const auto blocked=closed.wait_for(30ms);
+        held.allow(); // Always release the actual writer before failure unwind.
+        ASSERT_EQ(admission,std::future_status::ready);EXPECT_EQ(blocked,std::future_status::timeout);
+        ASSERT_EQ(closed.wait_for(5s),std::future_status::ready);const auto result=closed.get();
+        EXPECT_EQ(result.sync,sync_drain_state::deadline_pending);EXPECT_FALSE(result.error);EXPECT_TRUE(result.cleanup_complete);
+        EXPECT_TRUE(parent->is_closed());EXPECT_EQ(sync_discovery_test_access::configured(*parent),nullptr);
+        EXPECT_TRUE(weak_child.expired());EXPECT_EQ(factory->state->destroyed.load(),1);parent.reset();
+        configuration read_config(file.str());read_config.audit_retention_seconds=0;lattice_db reopened(read_config);stop_notifier();
+        EXPECT_EQ(std::get<std::string>(reopened.db().query("SELECT name FROM TestPerson").at(0).at("name")),"after");
+        EXPECT_FALSE(reopened.db().query("SELECT id FROM AuditLog WHERE isSynchronized=0").empty());reopened.close();
+    }
+    static std::string message(const std::exception_ptr& error){if(!error)return {};try{std::rethrow_exception(error);}catch(const std::exception& e){return e.what();}catch(...){return "unknown";}}
+};
+TEST_F(SyncCheckedClose, ActualConfiguredCloseJoinsEarlierBusyDiscovery) {held_close(false);}
+TEST_F(SyncCheckedClose, ActualConfiguredCloseJoinsDiscoveryRacingItsAdmission) {held_close(true);}
+TEST_F(SyncCheckedClose, ActualConfiguredClosePreservesUploadErrorAndCompletesOtherCleanup) {
+    auto owner=std::make_unique<lattice_db>(config());stop_notifier();owner->add(TestPerson{"pending",1,std::nullopt});connect(*owner);
+    factory->state->fail_send=true;factory->state->fail_disconnect=true;
+    const auto result=owner->close_checked();EXPECT_EQ(result.sync,sync_drain_state::failed);
+    EXPECT_EQ(message(result.error),"first actual upload failure");EXPECT_EQ(message(result.cleanup_error),"cleanup disconnect failure");
+    EXPECT_FALSE(result.cleanup_complete);EXPECT_TRUE(owner->is_closed());
+    EXPECT_EQ(sync_discovery_test_access::configured(*owner),nullptr);EXPECT_GE(factory->state->disconnects.load(),1);
+    EXPECT_EQ(factory->state->destroyed.load(),1);owner.reset();
+    // Real reopen must reacquire the registry/flock after failed cleanup. It
+    // does not infer any ACK: the original is still present and unsynchronized.
+    factory->state->fail_send=false;factory->state->fail_disconnect=false;
+    auto reopened=std::make_unique<lattice_db>(config());stop_notifier();ASSERT_NE(sync_discovery_test_access::configured(*reopened),nullptr);
+    EXPECT_FALSE(reopened->db().query("SELECT id FROM AuditLog WHERE isSynchronized=0").empty());reopened->close();
+}
+TEST_F(SyncCheckedClose, LegacyNativeCloseRethrowsOnlyAfterActualCleanup) {
+    auto owner=std::make_unique<lattice_db>(config());stop_notifier();owner->add(TestPerson{"pending",1,std::nullopt});connect(*owner);
+    factory->state->fail_send=true;
+    try{owner->close();FAIL()<<"expected original upload error";}catch(const std::exception& e){EXPECT_STREQ(e.what(),"first actual upload failure");}
+    EXPECT_TRUE(owner->is_closed());EXPECT_EQ(sync_discovery_test_access::configured(*owner),nullptr);EXPECT_EQ(factory->state->destroyed.load(),1);
+}
+TEST_F(SyncCheckedClose, DestructorContainsActualTransportFailureAndReleasesConfiguredOwnership) {
+    {auto owner=std::make_unique<lattice_db>(config());stop_notifier();factory->state->fail_disconnect=true;}
+    EXPECT_GE(factory->state->disconnects.load(),1);EXPECT_EQ(factory->state->destroyed.load(),1);
+    factory->state->fail_disconnect=false;auto reopened=std::make_unique<lattice_db>(config());stop_notifier();
+    EXPECT_NE(sync_discovery_test_access::configured(*reopened),nullptr);reopened->close();
+}
+TEST_F(SyncCheckedClose, OwnedSwiftBridgeResultSurvivesRealConfiguredOwnerDestruction) {
+    SchemaVector schemas;swift_schema_entry schema;schema.table_name="CloseBridgeRow";
+    property_descriptor property{};property.name="value";property.type=column_type::text;property.kind=property_kind::primitive;
+    schema.properties[property.name]=property;schemas.push_back(schema);
+#if LATTICE_HAS_FRT
+    auto ref=std::unique_ptr<swift_lattice_ref>(swift_lattice_ref::create(config(),schemas));
+#else
+    auto ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(config(),schemas));
+#endif
+    ASSERT_TRUE(ref&&ref->valid());stop_notifier();
+    swift_dynamic_object raw;raw.table_name=schema.table_name;raw.properties=schema.properties;raw.values["value"]=std::string("pending");
+    {dynamic_object object(raw);ref->get()->add(object);}connect(*ref->get());factory->state->fail_send=true;factory->state->fail_disconnect=true;
+    static_assert(noexcept(ref->close_checked()));static_assert(noexcept(ref->close()));
+    auto result=ref->close_checked();EXPECT_TRUE(ref->get()->is_closed());ref.reset();
+    EXPECT_TRUE(result.failed());EXPECT_TRUE(result.cleanup_failed());EXPECT_FALSE(result.cleanup_complete());
+    EXPECT_EQ(result.sync_state(),static_cast<int32_t>(sync_drain_state::failed));
+    EXPECT_EQ(result.take_message(),"first actual upload failure");EXPECT_FALSE(result.message_unavailable());
+    EXPECT_EQ(factory->state->destroyed.load(),1);
+}
+
+class drop_drain_scheduler final:public scheduler {
+public:
+    void invoke(std::function<void()>&&)override{}
+    bool is_on_thread()const noexcept override{return false;}
+    bool is_same_as(const scheduler* other)const noexcept override{return other==this;}
+    bool can_invoke()const noexcept override{return true;}
+};
+TEST_F(SyncDiscoveryContention, DroppedScheduledDrainSettlesAsFailureWithoutDeadlineWait) {
+    sync.reset();owner.reset();open(":memory:",std::make_shared<drop_drain_scheduler>());
+    sync_discovery_test_access::connected(*sync);
+    const auto result=sync->drain_checked(std::chrono::steady_clock::now()+2s);
+    EXPECT_EQ(result.state,sync_drain_state::failed);EXPECT_TRUE(result.error);
+    EXPECT_TRUE(sync_discovery_test_access::queue(*sync)->failed(sync_discovery_test_access::generation(*sync)));
+}
+TEST_F(SyncDiscoveryContention, FiniteQueueRejectsDrainInsteadOfReportingFlushedSuccess) {
+    sync_discovery_test_access::connected(*sync);const auto q=sync_discovery_test_access::queue(*sync);
+    const auto generation=sync_discovery_test_access::generation(*sync);
+    auto first=unit(queue::kind::intake,1024,generation);ASSERT_EQ(q->push(first),queue::admission::accepted);
+    const auto now=queue::clock::now();ASSERT_EQ(q->begin(q->dispatch(now),now),first);
+    for(size_t i=1;i<queue::capacity;++i)ASSERT_EQ(q->push(unit(queue::kind::intake,1024,generation)),queue::admission::accepted);
+    const auto result=sync->drain_checked(std::chrono::steady_clock::now()+2s);
+    EXPECT_EQ(result.state,sync_drain_state::failed);ASSERT_TRUE(result.error);
+    EXPECT_TRUE(q->pending(generation));EXPECT_TRUE(q->failed(generation));EXPECT_EQ(wire->count(),0u);
+    sync->disconnect();EXPECT_FALSE(q->pending(sync_discovery_test_access::generation(*sync)));
+}
+
+TEST_F(SyncDiscoveryContention, CheckedDrainReportsDrainedOnlyAfterTheActualAckSettles) {
+    change("unused-remote","actual-ack");sync_discovery_test_access::connected(*sync);
+    auto result=std::async(std::launch::async,[&]{return sync->drain_checked(std::chrono::steady_clock::now()+2s);});
+    ASSERT_TRUE(wire->await(1));EXPECT_EQ(result.wait_for(30ms),std::future_status::timeout);
+    const auto frame=server_sent_event::from_json(wire->copy().front());ASSERT_TRUE(frame);
+    ASSERT_EQ(frame->event_type,server_sent_event::type::audit_log);std::vector<std::string> ids;
+    for(const auto& entry:frame->audit_logs)ids.push_back(entry.global_id);
+    sync_discovery_test_access::input(*sync,server_sent_event::make_ack(ids));
+    ASSERT_EQ(result.wait_for(5s),std::future_status::ready);const auto outcome=result.get();
+    EXPECT_EQ(outcome.state,sync_drain_state::drained);EXPECT_FALSE(outcome.error);EXPECT_FALSE(pending());
+    EXPECT_EQ(sync_discovery_test_access::in_flight(*sync),0u);
+    EXPECT_TRUE(owner->db().query("SELECT id FROM AuditLog WHERE isSynchronized=0").empty());
+}
+
+TEST_F(SyncCheckedClose, LegacySwiftBridgeCloseContainsRealCleanupFailure) {
+#if LATTICE_HAS_FRT
+    auto ref=std::unique_ptr<swift_lattice_ref>(swift_lattice_ref::create(config(),{}));
+#else
+    auto ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(config(),{}));
+#endif
+    ASSERT_TRUE(ref&&ref->valid());stop_notifier();factory->state->fail_disconnect=true;
+    EXPECT_NO_THROW(ref->close());EXPECT_NE(last_bridge_error().find("cleanup disconnect failure"),std::string::npos);
+    EXPECT_TRUE(ref->get()->is_closed());EXPECT_EQ(factory->state->destroyed.load(),1);ref.reset();
 }
 } // namespace
 #endif

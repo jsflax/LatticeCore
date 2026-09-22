@@ -115,7 +115,8 @@ struct recovery_receiver_controller::state {
     std::shared_ptr<const test_probe> probe;
     std::mutex mutex;
     std::vector<std::weak_ptr<recovery_receiver_route>> routes;
-    bool scheduled=false,running=false,demand=true,idle=false;
+    bool scheduled=false,running=false,demand=true,idle=false,deferred_external_request=false;
+    const recovery_reconciliation_reservation* reconciliation_reservation=nullptr;
     uint64_t revision=1,external_revision=1,reconciled_external_revision=0;
     std::exception_ptr failure;
     std::shared_ptr<const verified_unsent_set> frozen;
@@ -139,6 +140,25 @@ struct recovery_receiver_controller::state {
     std::map<std::string,lease> leases;
     std::map<std::string,receiver_source_binding::recovery_view> observed;
     explicit state(const recovery_continuous_policy& p):policy(p),caps(recovery_receiver_controller::limits(p)){}
+};
+// One result owns the successful admission until known-COMMIT publication or
+// abandonment. SQL bodies and owner destruction never run under the leaf.
+struct recovery_reconciliation_reservation {
+    std::shared_ptr<recovery_receiver_controller> controller;
+    std::shared_ptr<lattice_db> owner;
+    bool active=false;
+    void release()noexcept {
+        std::shared_ptr<const recovery_reconciliation_descriptor> retired;
+        if(active){auto& runtime=*controller->state_;{
+            std::lock_guard lock(runtime.mutex);
+            if(runtime.reconciliation_reservation==this){runtime.reconciliation_reservation=nullptr;runtime.running=false;
+                // Admission reserves room for publication plus this one
+                // coalesced actual external event. Internal wakes never set it.
+                if(runtime.deferred_external_request){runtime.deferred_external_request=false;++runtime.revision;++runtime.external_revision;
+                    runtime.demand=true;runtime.failure={};retired=std::move(runtime.reconciliation);}}
+            active=false;}}
+    }
+    ~recovery_reconciliation_reservation(){release();}
 };
 canonical_scoped_limits recovery_receiver_controller::limits(const recovery_continuous_policy& policy) {
     canonical_scoped_limits result;
@@ -222,7 +242,8 @@ void recovery_receiver_route::request(){
     std::shared_ptr<const recovery_reconciliation_descriptor> retired;
     {std::lock_guard lock(controller_->state_->mutex);auto& state=*controller_->state_;
         require(state.revision!=UINT64_MAX&&state.external_revision!=UINT64_MAX,"controller demand revision exhausted");
-        ++state.revision;++state.external_revision;state.demand=true;state.failure={};retired=std::move(state.reconciliation);}
+        if(state.reconciliation_reservation)state.deferred_external_request=true;
+        else {++state.revision;++state.external_revision;state.demand=true;state.failure={};retired=std::move(state.reconciliation);}}
     retired.reset();wake();
 }
 bool recovery_receiver_route::blocks_ordinary()const noexcept{return state_->blocked.load(std::memory_order_acquire);}
@@ -604,17 +625,26 @@ void recovery_receiver_controller::verify_reconciliation_route(
 }
 recovery_reconciliation_result recovery_receiver_controller::controller_reconcile_owned(
     const std::shared_ptr<const recovery_reconciliation_descriptor>& descriptor,recovery_reconciliation_step step,
-    const std::function<void(database&)>& body) {
+    const std::function<void(database&)>& body,bool* coordinator_busy) {
+    if(coordinator_busy)*coordinator_busy=false;
     require(descriptor&&body,"controller reconciliation input missing");auto controller=descriptor->controller_.lock();
     const auto owner=descriptor->owner();require(controller&&owner&&!owner->is_closed(),"controller reconciliation actual owner retired");
     auto& runtime=*controller->state_;
-    {std::lock_guard lock(runtime.mutex);require(!runtime.running&&runtime.reconciliation==descriptor&&runtime.revision==descriptor->controller_revision_,"controller reconciliation descriptor replaced or busy");runtime.running=true;}
-    struct finish {state& runtime;~finish(){std::lock_guard lock(runtime.mutex);runtime.running=false;}} release{runtime};
-    recovery_reconciliation_result result;result.descriptor_=descriptor;result.step_=step;
+    recovery_reconciliation_result result;
+    auto reservation=std::make_shared<recovery_reconciliation_reservation>();reservation->controller=controller;reservation->owner=owner;
+    {std::lock_guard lock(runtime.mutex);
+        require(runtime.reconciliation==descriptor&&runtime.revision==descriptor->controller_revision_,"controller reconciliation descriptor replaced");
+        if(runtime.running){result.coordinator_busy_=true;if(coordinator_busy)*coordinator_busy=true;return result;}
+        require(!runtime.reconciliation_reservation&&runtime.revision<UINT64_MAX-1&&runtime.external_revision<UINT64_MAX,"controller reconciliation reservation exhausted");
+        runtime.running=true;runtime.reconciliation_reservation=reservation.get();reservation->active=true;}
+    result.descriptor_=descriptor;result.step_=step;result.reservation_=reservation;
     const bool cancel=step==recovery_reconciliation_step::cancelled;
     require(descriptor->phase_==(cancel?2:4),"controller reconciliation step/phase differs");
     require(!cancel||(descriptor->barrier_<INT64_MAX&&descriptor->attempt_<INT64_MAX),"controller reconciliation sequence exhausted");
     result.next_barrier_=descriptor->barrier_+(cancel?1:0);result.next_attempt_=descriptor->attempt_+(cancel?1:0);
+    std::shared_ptr<void> scope_probe;
+    if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope)
+        scope_probe=runtime.probe->scope(cancel?"reconcile-cancel":"reconcile-refreeze");
     result.settlement_=recovery_continuous_producer::controller_owned(*controller,owner,[&](database& db){
         const auto current_sources=[&]{for(const auto& c:descriptor->contributions_)require(!c.route.expired()&&c.source&&c.source->recovery_live(c.view),"controller reconciliation source retired");};
         current_sources();
@@ -653,24 +683,34 @@ recovery_reconciliation_result recovery_receiver_controller::controller_reconcil
         recovery_continuous_producer::controller_transition_reconcile_owned(*controller,owner,descriptor->phase_,descriptor->barrier_,descriptor->attempt_,
             cancel?4:1,result.next_barrier_,result.next_attempt_);
     });
+    scope_probe.reset();
+    if(result.settlement_.state!=recovery_install_state::committed){reservation->release();result.reservation_.reset();}
+    else if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)
+        runtime.probe->observed(cancel?"reconcile-cancel-committed":"reconcile-refreeze-committed");
     return result;
 }
 void recovery_receiver_controller::controller_reconcile_publish(recovery_reconciliation_result&& result) {
-    require(result.descriptor_&&result.settlement_.state==recovery_install_state::committed,"controller reconciliation publication needs bound known COMMIT");
-    const auto descriptor=std::move(result.descriptor_);auto controller=descriptor->controller_.lock();
-    const auto owner=descriptor->owner();require(controller&&owner&&!owner->is_closed(),"controller reconciliation publication retired");
+    require(result.descriptor_&&result.reservation_&&result.settlement_.state==recovery_install_state::committed,
+        "controller reconciliation publication needs reserved known COMMIT");
+    const auto descriptor=std::move(result.descriptor_);auto reservation=std::move(result.reservation_);
+    const auto controller=reservation->controller;const auto owner=reservation->owner;
+    require(controller&&owner&&owner==descriptor->owner()&&!owner->is_closed(),"controller reconciliation publication retired");
+    auto& runtime=*controller->state_;
+    {std::lock_guard lock(runtime.mutex);require(reservation->active&&runtime.running&&runtime.reconciliation_reservation==reservation.get()&&
+        runtime.reconciliation==descriptor&&runtime.revision==descriptor->controller_revision_&&runtime.revision<UINT64_MAX,
+        "controller reconciliation publication reservation changed");}
+    // All coordinator preconditions are checked before runtime publication.
+    // The reserved result excludes worker turns; real external requests are
+    // coalesced until release, and cannot relabel this known COMMIT.
     recovery_continuous_producer::controller_publish_reconcile(*controller,owner,result.next_barrier_,result.next_attempt_);
-    auto& runtime=*controller->state_;std::shared_ptr<const recovery_reconciliation_descriptor> retired;
-    {std::lock_guard lock(runtime.mutex);require(!runtime.running&&runtime.reconciliation==descriptor&&runtime.revision==descriptor->controller_revision_&&runtime.revision<UINT64_MAX,"controller reconciliation publication replaced");
-        runtime.running=true;retired=std::move(runtime.reconciliation);++runtime.revision;runtime.failure={};runtime.demand=true;}
-    // Proof/source payload destruction is outside the coordinator leaf. The
-    // next worker reconstructs phase 4 or freezes only a published phase 1.
+    std::shared_ptr<const recovery_reconciliation_descriptor> retired;
+    {std::lock_guard lock(runtime.mutex);retired=std::move(runtime.reconciliation);++runtime.revision;runtime.failure={};runtime.demand=true;}
     runtime.frozen.reset();runtime.framing_committed=false;
+    reservation->release(); // payload/owner release is outside the leaf
+    if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)
+        runtime.probe->observed(result.step_==recovery_reconciliation_step::cancelled?"reconcile-cancel-published":"reconcile-refreeze-published");
     std::shared_ptr<recovery_receiver_route> next;
-    {std::lock_guard lock(runtime.mutex);runtime.running=false;
-        for(const auto& weak:runtime.routes)if(auto route=weak.lock())if(!route->state_->retired.load()){next=std::move(route);break;}}
-    // A known local transition wakes the actual scheduler. It neither implies
-    // remote acceptance nor opens ordinary producer/export admission.
+    {std::lock_guard lock(runtime.mutex);for(const auto& weak:runtime.routes)if(auto route=weak.lock())if(!route->state_->retired.load()){next=std::move(route);break;}}
     if(next)controller->wake(next);
 }
 } // namespace lattice::detail

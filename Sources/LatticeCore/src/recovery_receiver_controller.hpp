@@ -15,6 +15,7 @@ class recovery_receiver_controller final : public std::enable_shared_from_this<r
     friend class recovery_continuous_producer;
     friend class recovery_receiver_route;
     friend class recovery_unknown_reconciliation;
+    friend struct recovery_reconciliation_reservation;
     friend struct recovery_receiver_controller_test_access;
     // Restriction/observation only; captured before a real route is published.
     // The fixture peer cannot construct controllers, grants or source views.
@@ -43,7 +44,7 @@ class recovery_receiver_controller final : public std::enable_shared_from_this<r
         const std::vector<std::string>* ordered_originals=nullptr);
     static recovery_reconciliation_result controller_reconcile_owned(
         const std::shared_ptr<const recovery_reconciliation_descriptor>&,
-        recovery_reconciliation_step,const std::function<void(database&)>&);
+        recovery_reconciliation_step,const std::function<void(database&)>&,bool* coordinator_busy=nullptr);
     static void controller_reconcile_publish(recovery_reconciliation_result&&);
 public:
     ~recovery_receiver_controller();

@@ -142,7 +142,7 @@ class recovery_continuous_producer {
         const std::shared_ptr<recovery_continuous_route>&,std::shared_ptr<lattice_db>,uint64_t physical);
     static recovery_install_result reconciliation_export_owned(std::shared_ptr<lattice_db>,
         const std::shared_ptr<recovery_continuous_work>&,const std::vector<std::string>& ordered_originals,
-        const std::function<void(database&)>&);
+        const std::function<void(database&)>&,bool* admission_busy=nullptr);
     static recovery_install_result export_owned(std::shared_ptr<lattice_db>,
         const std::shared_ptr<recovery_continuous_work>&,const std::function<void(database&)>&);
     static void setup_configured_route(lattice_db&);

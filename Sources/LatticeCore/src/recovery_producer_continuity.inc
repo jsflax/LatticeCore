@@ -321,7 +321,11 @@ std::shared_ptr<recovery_continuous_work> recovery_continuous_producer::admit_re
     return work;
 }
 recovery_install_result recovery_continuous_producer::reconciliation_export_owned(std::shared_ptr<lattice_db> owner,
-    const std::shared_ptr<recovery_continuous_work>& work,const std::vector<std::string>& originals,const std::function<void(database&)>& body) {
+    const std::shared_ptr<recovery_continuous_work>& work,const std::vector<std::string>& originals,const std::function<void(database&)>& body,bool* admission_busy) {
+    // The b4f3 installer has no initial-admission probe. Its later errors are
+    // never relabeled BUSY. Exact d488 composition forwards this output to its
+    // new private install_impl probe, matching ordinary export_owned.
+    if(admission_busy)*admission_busy=false;
     return recovery_writer_access::install(owner,[&](database& db){
         if(!work||!work->reconciliation_||work->owner_!=owner||!owner->recovery_continuous_||work->state_!=owner->recovery_continuous_->state)
             refuse("restricted export lost counted descriptor custody");
@@ -570,7 +574,7 @@ void recovery_continuous_producer::controller_transition_reconcile_owned(const r
     std::shared_ptr<lattice_db> owner,int64_t phase,int64_t barrier,int64_t attempt,int64_t next_phase,int64_t next_barrier,int64_t next_attempt) {
     if(!owner||!owner->recovery_continuous_||!continuous_install_owned(*owner->recovery_continuous_))refuse("reconciliation transition lacks actual controller WRITE");
     auto state=owner->recovery_continuous_->state;auto& db=*recovery_writer_access::active_writer(*owner);
-    {std::lock_guard lock(state->mutex);if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load())refuse("reconciliation counted work remains live");}
+    {std::lock_guard lock(state->mutex);if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load()||state->gate_revision==UINT64_MAX)refuse("reconciliation counted work remains live or runtime generation exhausted");}
     continuous_verify_row(db,*state);const auto row=db.query(continuous_query).at(0);
     if(integer(row,"phase")!=phase||integer(row,"barrier")!=barrier||integer(row,"attempt")!=attempt||
        !((phase==2&&next_phase==4&&barrier<INT64_MAX&&attempt<INT64_MAX&&next_barrier==barrier+1&&next_attempt==attempt+1)||
@@ -582,9 +586,9 @@ void recovery_continuous_producer::controller_transition_reconcile_owned(const r
 }
 void recovery_continuous_producer::controller_publish_reconcile(const recovery_receiver_controller& controller,
     std::shared_ptr<lattice_db> owner,int64_t barrier,int64_t attempt) {
-    if(!owner||!owner->recovery_continuous_)return;auto state=owner->recovery_continuous_->state;
+    if(!owner||owner->is_closed()||!owner->recovery_continuous_)refuse("reconciliation runtime owner retired");auto state=owner->recovery_continuous_->state;
     std::lock_guard lock(state->mutex);
-    if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load())return;
+    if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load())refuse("reconciliation runtime admission changed");
     if(state->gate_revision==UINT64_MAX)refuse("reconciliation runtime generation exhausted");
     ++state->gate_revision;state->barrier=barrier;state->attempt=attempt;
 }

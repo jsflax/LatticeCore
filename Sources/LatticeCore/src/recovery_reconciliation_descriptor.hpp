@@ -8,6 +8,7 @@ namespace lattice::detail {
 class recovery_unknown_reconciliation;
 class recovery_receiver_controller;
 class recovery_receiver_route;
+struct recovery_reconciliation_reservation;
 
 // Only the real controller issues this after verified receipt pages expose an
 // unresolved, possibly-exported original. It is not a negative source receipt
@@ -15,6 +16,7 @@ class recovery_receiver_route;
 class recovery_reconciliation_descriptor final {
     friend class recovery_receiver_controller;
     friend class recovery_receiver_route;
+struct recovery_reconciliation_reservation;
     friend class recovery_unknown_reconciliation;
     struct contribution {
         recovery_request_row framing;
@@ -52,6 +54,8 @@ class recovery_reconciliation_result final {
     friend class recovery_unknown_reconciliation;
     std::shared_ptr<const recovery_reconciliation_descriptor> descriptor_;
     recovery_install_result settlement_;
+    std::shared_ptr<recovery_reconciliation_reservation> reservation_;
+    bool coordinator_busy_=false;
     recovery_reconciliation_step step_=recovery_reconciliation_step::cancelled;
     int64_t next_barrier_=0,next_attempt_=0;
     recovery_reconciliation_result()=default;
@@ -60,5 +64,6 @@ public:
     recovery_reconciliation_result& operator=(recovery_reconciliation_result&&)=default;
     recovery_reconciliation_result(const recovery_reconciliation_result&)=delete;
     const recovery_install_result& settlement()const noexcept{return settlement_;}
+    bool coordinator_busy()const noexcept{return coordinator_busy_;}
 };
 } // namespace lattice::detail

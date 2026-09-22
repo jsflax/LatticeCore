@@ -6,8 +6,10 @@ module LatticeCore {
     textual header "lattice/managed.hpp"
     textual header "lattice/network.hpp"
     textual header "lattice/observation.hpp"
+    textual header "lattice/projection.hpp"
     textual header "lattice/scheduler.hpp"
     textual header "lattice/schema.hpp"
+    textual header "lattice/spatial_query.hpp"
     textual header "lattice/sync.hpp"
     textual header "lattice/types.hpp"
     export *

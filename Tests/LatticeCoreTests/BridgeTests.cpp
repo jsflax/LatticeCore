@@ -1161,6 +1161,232 @@ TEST(Bridge, RowCacheMaterializedReads) {
     delete ref;
 }
 
+TEST(Bridge, ManagedPrimaryKeyDoesNotReadOrMaterializeRows) {
+    TempDB tmp{"bridge_bound_identity"};
+    lattice::SchemaVector schemas = {
+        make_schema("IdentityPerson", {{"age", int_prop("age")}})
+    };
+    auto* ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(tmp.str()), schemas);
+    auto& db = *ref->get();
+    for (int i = 0; i < 25; ++i) {
+        auto sdo = make_sdo("IdentityPerson", schemas[0].properties);
+        sdo.values["age"] = int64_t(i);
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+    auto rows = db.objects("IdentityPerson", std::nullopt, std::string("id ASC"));
+    ASSERT_EQ(rows.size(), 25u);
+
+    // Page identity reads must not grow the query count with page cardinality.
+    // Exercise both bridge forms without enabling or refreshing the row cache.
+    const auto page_base = lattice::database::thread_statement_count();
+    for (auto& row : rows) {
+        lattice::dynamic_object object(row);
+        lattice::dynamic_object_ref object_ref(row);
+        EXPECT_EQ(object.managed_primary_key(), row.id());
+        EXPECT_EQ(object_ref.managed_primary_key(), row.id());
+        EXPECT_FALSE(object.is_row_cache_enabled());
+        EXPECT_FALSE(object_ref.is_row_cache_enabled());
+    }
+    EXPECT_EQ(lattice::database::thread_statement_count() - page_base, 0u);
+
+    lattice::dynamic_object_ref live(rows[0]);
+    lattice::dynamic_object_ref snapshot(rows[0]);
+    snapshot.enable_row_cache();
+    const int64_t id = rows[0].id();
+    db.db().execute("UPDATE IdentityPerson SET age = 99 WHERE id = ?", {id});
+    const auto identity_base = lattice::database::thread_statement_count();
+    EXPECT_EQ(live.managed_primary_key(), id);
+    EXPECT_EQ(snapshot.managed_primary_key(), id);
+    EXPECT_EQ(lattice::database::thread_statement_count() - identity_base, 0u);
+    EXPECT_FALSE(live.is_row_cache_enabled());
+    EXPECT_TRUE(snapshot.is_row_cache_enabled());
+    EXPECT_EQ(live.get_int("age"), 99);
+    EXPECT_EQ(snapshot.get_int("age"), 0) << "identity access must not refresh a snapshot";
+
+    db.db().execute("DELETE FROM IdentityPerson WHERE id = ?", {id});
+    const auto deleted_base = lattice::database::thread_statement_count();
+    EXPECT_EQ(live.managed_primary_key(), id) << "bound identity is not an existence check";
+    EXPECT_EQ(lattice::database::thread_statement_count() - deleted_base, 0u);
+
+    auto unmanaged_sdo = make_sdo("IdentityPerson", schemas[0].properties);
+    unmanaged_sdo.values["id"] = int64_t(123);
+    lattice::dynamic_object unmanaged(unmanaged_sdo);
+    lattice::dynamic_object_ref unmanaged_ref(unmanaged_sdo);
+    EXPECT_EQ(unmanaged.managed_primary_key(), 0);
+    EXPECT_EQ(unmanaged_ref.managed_primary_key(), 0);
+    EXPECT_FALSE(unmanaged.has_query_row_image());
+    EXPECT_EQ(unmanaged_ref.query_row_value_type("id"), -1);
+    EXPECT_TRUE(lattice::column_value_is_null(unmanaged_ref.query_row_value("id")));
+    unmanaged_ref.release_query_row_image();
+#if LATTICE_HAS_FRT
+    auto* empty_ref = lattice::dynamic_object_ref::_make(nullptr);
+    EXPECT_EQ(empty_ref->managed_primary_key(), 0);
+    EXPECT_FALSE(empty_ref->has_query_row_image());
+    EXPECT_EQ(empty_ref->query_row_value_type("id"), -1);
+    empty_ref->release_query_row_image();
+    delete empty_ref;
+#else
+    auto empty_ref = lattice::dynamic_object_ref::_make(nullptr);
+    EXPECT_EQ(empty_ref.managed_primary_key(), 0);
+    EXPECT_FALSE(empty_ref.has_query_row_image());
+    EXPECT_EQ(empty_ref.query_row_value_type("id"), -1);
+    empty_ref.release_query_row_image();
+#endif
+    delete ref;
+}
+
+TEST(Bridge, ManagedPrimaryKeyPreservesAttachedWriteRouting) {
+    TempDB local_path{"identity_local"}, attached_path{"identity_attached"};
+    lattice::SchemaVector schemas = {
+        make_schema("IdentityArm", {{"age", int_prop("age")}})
+    };
+    auto* local_ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(local_path.str()), schemas);
+    auto* attached_ref = lattice::swift_lattice_ref::create(
+        lattice::swift_configuration(attached_path.str()), schemas);
+    auto& local = *local_ref->get();
+    auto& attached = *attached_ref->get();
+    for (auto* db : {&local, &attached}) {
+        auto sdo = make_sdo("IdentityArm", schemas[0].properties);
+        sdo.values["age"] = int64_t(db == &local ? 10 : 20);
+        lattice::dynamic_object obj(sdo);
+        db->add(obj);
+    }
+    local.attach(attached);
+    auto rows = local.objects("IdentityArm", std::nullopt, std::string("age ASC"));
+    ASSERT_EQ(rows.size(), 2u);
+    ASSERT_EQ(rows[0].id(), rows[1].id()) << "fixture requires colliding per-file keys";
+
+    lattice::dynamic_object_ref local_row(rows[0]);
+    lattice::dynamic_object_ref attached_row(rows[1]);
+    const auto base = lattice::database::thread_statement_count();
+    EXPECT_EQ(local_row.managed_primary_key(), rows[0].id());
+    EXPECT_EQ(attached_row.managed_primary_key(), rows[1].id());
+    EXPECT_TRUE(attached_row.has_query_row_image());
+    EXPECT_EQ(attached_row.query_row_value_type("age"), 1);
+    EXPECT_EQ(std::get<int64_t>(attached_row.query_row_value("age")), 20);
+    EXPECT_EQ(attached_row.query_row_value_type("_source"), 3);
+    EXPECT_EQ(lattice::database::thread_statement_count() - base, 0u);
+    EXPECT_FALSE(attached_row.is_row_cache_enabled());
+
+    attached_row.set_int("age", 44);
+    EXPECT_EQ(std::get<int64_t>(attached_row.query_row_value("age")), 20)
+        << "a write must not mutate the query-position image";
+    attached_row.release_query_row_image();
+    EXPECT_FALSE(attached_row.has_query_row_image());
+    EXPECT_FALSE(attached_row.is_row_cache_enabled());
+    // A fresh file connection, not a held/cached handle, proves persistence in
+    // the attached arm and catches the lost-write class from the cache revert.
+    lattice::database local_check(local_path.str());
+    lattice::database attached_check(attached_path.str());
+    auto local_values = local_check.query("SELECT age FROM IdentityArm");
+    auto attached_values = attached_check.query("SELECT age FROM IdentityArm");
+    ASSERT_EQ(local_values.size(), 1u);
+    ASSERT_EQ(attached_values.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(local_values[0].at("age")), 10);
+    EXPECT_EQ(std::get<int64_t>(attached_values[0].at("age")), 44);
+    delete local_ref;
+    delete attached_ref;
+}
+
+TEST(Bridge, QueryRowImageKeepsGenerationValuesSeparateFromMaterialization) {
+    TempDB tmp{"query_row_image"};
+    auto data_prop = blob_prop("payload");
+    data_prop.is_vector = false;
+    lattice::SchemaVector schemas = {
+        make_schema("QueryImage", {
+            {"age", int_prop("age")},
+            {"score", real_prop("score")},
+            {"name", text_prop("name")},
+            {"email", nullable_text_prop("email")},
+            {"payload", data_prop},
+        })
+    };
+    const auto config = lattice::swift_configuration(tmp.str());
+    auto* ref = lattice::swift_lattice_ref::create(config, schemas);
+    auto& db = *ref->get();
+    {
+        auto sdo = make_sdo("QueryImage", schemas[0].properties);
+        sdo.values["age"] = int64_t(7);
+        sdo.values["score"] = 1.25;
+        sdo.values["name"] = std::string("before");
+        sdo.values["email"] = nullptr;
+        sdo.values["payload"] = std::vector<uint8_t>{0, 1, 255};
+        lattice::dynamic_object obj(sdo);
+        db.add(obj);
+    }
+    auto* writer_ref = lattice::swift_lattice_ref::create_uncached(config, schemas);
+    auto& writer = *writer_ref->get();
+    auto generation = ref->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    auto rows = ref->objects_at(generation, "QueryImage");
+    ASSERT_FALSE(ref->last_generation_read_stale());
+    ASSERT_EQ(rows.size(), 1u);
+    lattice::dynamic_object_ref live(rows[0]);
+    lattice::dynamic_object_ref snapshot(rows[0]);
+    const int64_t id = rows[0].id();
+
+    // Mutate the sort key on another connection BEFORE anchor extraction.
+    // The immutable query image must retain the value selected by the keeper.
+    writer.db().execute("UPDATE QueryImage SET age = 99, name = 'after' WHERE id = ?", {id});
+    const auto base = lattice::database::thread_statement_count();
+    EXPECT_TRUE(live.has_query_row_image());
+    EXPECT_EQ(live.query_row_value_type("id"), 1);
+    EXPECT_EQ(live.query_row_value_type("age"), 1);
+    EXPECT_EQ(live.query_row_value_type("score"), 2);
+    EXPECT_EQ(live.query_row_value_type("name"), 3);
+    EXPECT_EQ(live.query_row_value_type("payload"), 4);
+    EXPECT_EQ(live.query_row_value_type("email"), 0);
+    EXPECT_EQ(live.query_row_value_type("missing"), -1);
+    EXPECT_EQ(std::get<int64_t>(live.query_row_value("id")), id);
+    EXPECT_EQ(std::get<int64_t>(live.query_row_value("age")), 7);
+    EXPECT_EQ(std::get<double>(live.query_row_value("score")), 1.25);
+    EXPECT_EQ(std::get<std::string>(live.query_row_value("name")), "before");
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(live.query_row_value("payload")),
+              (std::vector<uint8_t>{0, 1, 255}));
+    EXPECT_TRUE(lattice::column_value_is_null(live.query_row_value("email")));
+    EXPECT_TRUE(lattice::column_value_is_null(live.query_row_value("missing")));
+    EXPECT_TRUE(live.last_query_error_message().empty());
+    EXPECT_FALSE(live.is_row_cache_enabled());
+    EXPECT_EQ(lattice::database::thread_statement_count() - base, 0u);
+    EXPECT_EQ(live.get_int("age"), 99) << "ordinary property reads must stay live";
+
+    // Materialization is a separate, explicitly refreshed snapshot. It must
+    // neither consume the old query image nor replace it with a new row image.
+    snapshot.enable_row_cache();
+    EXPECT_EQ(snapshot.get_int("age"), 99);
+    EXPECT_EQ(std::get<int64_t>(snapshot.query_row_value("age")), 7);
+    writer.db().execute("UPDATE QueryImage SET age = 100 WHERE id = ?", {id});
+    snapshot.refresh_row_cache();
+    EXPECT_EQ(snapshot.get_int("age"), 100);
+    EXPECT_EQ(std::get<int64_t>(snapshot.query_row_value("age")), 7);
+    live.set_int("age", 101);
+    EXPECT_EQ(std::get<int64_t>(live.query_row_value("age")), 7);
+
+    const auto release_base = lattice::database::thread_statement_count();
+    snapshot.release_query_row_image();
+    EXPECT_FALSE(snapshot.has_query_row_image());
+    EXPECT_EQ(snapshot.query_row_value_type("age"), -1);
+    EXPECT_TRUE(lattice::column_value_is_null(snapshot.query_row_value("age")));
+    EXPECT_TRUE(snapshot.is_row_cache_enabled());
+    EXPECT_EQ(snapshot.get_int("age"), 100);
+    EXPECT_TRUE(live.has_query_row_image()) << "releasing one copy must not erase another's image";
+    EXPECT_EQ(lattice::database::thread_statement_count() - release_base, 0u);
+
+    writer.db().execute("DELETE FROM QueryImage WHERE id = ?", {id});
+    const auto deleted_base = lattice::database::thread_statement_count();
+    EXPECT_EQ(std::get<int64_t>(live.query_row_value("age")), 7);
+    live.release_query_row_image();
+    EXPECT_FALSE(live.has_query_row_image());
+    EXPECT_FALSE(live.is_row_cache_enabled());
+    EXPECT_EQ(lattice::database::thread_statement_count() - deleted_base, 0u);
+    ref->release_read_generation(generation);
+    delete writer_ref;
+    delete ref;
+}
+
 TEST(Bridge, RowCacheSnapshotAndRefresh) {
     TempDB tmp{"rowcache_refresh"};
     lattice::SchemaVector schemas = {
@@ -1730,4 +1956,189 @@ TEST(Bridge, UniqueIndexNameParityAcrossSwiftAndCapiSchemaShapes) {
     }
 }
 
+#endif // !__linux__
+
+#ifndef __linux__
+namespace {
+std::unique_ptr<lattice::swift_lattice_ref> managed_row_factory_owner(
+    const std::string& path, const lattice::SchemaVector& schemas) {
+#if LATTICE_HAS_FRT
+    auto owner = std::unique_ptr<lattice::swift_lattice_ref>(
+        lattice::swift_lattice_ref::create_uncached(lattice::swift_configuration(path), schemas));
+#else
+    auto owner = std::make_unique<lattice::swift_lattice_ref>(
+        lattice::swift_lattice_ref::create_uncached(lattice::swift_configuration(path), schemas));
+#endif
+    owner->get()->stop_audit_maintenance();
+    return owner;
+}
+
+std::unique_ptr<lattice::dynamic_object_ref> managed_row_factory_box(
+    const lattice::managed<lattice::swift_dynamic_object>& row, bool legacy = false) {
+    auto result = legacy
+        ? lattice::dynamic_object_ref::wrap(lattice::dynamic_object(row).make_shared())
+        : lattice::dynamic_object_ref::wrap_managed(row);
+#if LATTICE_HAS_FRT
+    return std::unique_ptr<lattice::dynamic_object_ref>(result);
+#else
+    return std::make_unique<lattice::dynamic_object_ref>(std::move(result));
+#endif
+}
+}
+
+TEST(Bridge, ManagedRowFactoryPreservesGenerationImageAndLiveReads) {
+    TempDB path{"managed_row_factory_image"};
+    lattice::SchemaVector schemas = {make_schema("FactoryImage", {
+        {"age", int_prop("age")}, {"score", real_prop("score")},
+        {"name", text_prop("name")}, {"email", nullable_text_prop("email")},
+    })};
+    auto owner = managed_row_factory_owner(path.str(), schemas);
+    {
+        auto source = make_sdo("FactoryImage", schemas[0].properties);
+        source.values["age"] = int64_t(7);
+        source.values["score"] = 1.25;
+        source.values["name"] = std::string("before");
+        source.values["email"] = nullptr;
+        lattice::dynamic_object object(source);
+        owner->get()->add(object);
+    }
+    const auto generation = owner->acquire_read_generation();
+    ASSERT_NE(generation, 0u);
+    std::unique_ptr<lattice::dynamic_object_ref> direct, legacy, sibling;
+    int64_t id = 0;
+    {
+        auto rows = owner->objects_at(generation, "FactoryImage");
+        ASSERT_FALSE(owner->last_generation_read_stale());
+        ASSERT_EQ(rows.size(), 1u);
+        id = rows[0].id();
+        const auto before_boxing = lattice::database::thread_statement_count();
+        direct = managed_row_factory_box(rows[0]);
+        legacy = managed_row_factory_box(rows[0], true);
+        sibling = managed_row_factory_box(rows[0]);
+        EXPECT_EQ(lattice::database::thread_statement_count() - before_boxing, 0u);
+    } // Destroy the input vector before inspecting either owning result.
+    owner->release_read_generation(generation);
+    ASSERT_NE(direct->get(), legacy->get());
+    ASSERT_NE(direct->get(), sibling->get());
+    owner->get()->db().execute("UPDATE FactoryImage SET age=99,score=2.5,name='after'");
+    const auto before_metadata = lattice::database::thread_statement_count();
+    for (auto* object : {direct.get(), legacy.get(), sibling.get()}) {
+        EXPECT_EQ(object->get()->lattice.get(), owner->get());
+        EXPECT_EQ(object->managed_primary_key(), id);
+        EXPECT_EQ(object->get_table_name(), "FactoryImage");
+        EXPECT_FALSE(object->is_row_cache_enabled());
+        ASSERT_TRUE(object->has_query_row_image());
+        ASSERT_EQ(object->query_row_value_type("age"), 1);
+        ASSERT_EQ(object->query_row_value_type("score"), 2);
+        ASSERT_EQ(object->query_row_value_type("name"), 3);
+        EXPECT_EQ(object->query_row_value_type("email"), 0);
+        EXPECT_EQ(object->query_row_value_type("missing"), -1);
+        EXPECT_EQ(std::get<int64_t>(object->query_row_value("age")), 7);
+        EXPECT_EQ(std::get<double>(object->query_row_value("score")), 1.25);
+        EXPECT_EQ(std::get<std::string>(object->query_row_value("name")), "before");
+        EXPECT_TRUE(lattice::column_value_is_null(object->query_row_value("email")));
+    }
+    direct->release_query_row_image();
+    EXPECT_FALSE(direct->has_query_row_image());
+    EXPECT_TRUE(legacy->has_query_row_image());
+    EXPECT_TRUE(sibling->has_query_row_image());
+    EXPECT_EQ(lattice::database::thread_statement_count() - before_metadata, 0u);
+    const auto before_live_reads = lattice::database::thread_statement_count();
+    for (auto* object : {direct.get(), legacy.get()}) {
+        EXPECT_EQ(object->get_int("age"), 99);
+        EXPECT_DOUBLE_EQ(object->get_double("score"), 2.5);
+        EXPECT_EQ(object->get_string("name"), "after");
+    }
+    EXPECT_EQ(lattice::database::thread_statement_count() - before_live_reads, 6u);
+}
+
+TEST(Bridge, ManagedRowFactoryOwnsRowAndLatticeAfterInputsAreDestroyed) {
+    std::unique_ptr<lattice::dynamic_object_ref> object;
+    std::weak_ptr<lattice::swift_lattice> weak_owner;
+    int64_t id = 0;
+    {
+        lattice::SchemaVector schemas = {make_schema("FactoryLifetime", {
+            {"age", int_prop("age")}, {"name", text_prop("name")},
+        })};
+        auto owner = managed_row_factory_owner(":memory:", schemas);
+        weak_owner = lattice::swift_lattice_ref::shared_for_lattice(owner->get());
+        ASSERT_FALSE(weak_owner.expired());
+        {
+            auto source = make_sdo("FactoryLifetime", schemas[0].properties);
+            source.values["age"] = int64_t(8);
+            source.values["name"] = std::string("owned");
+            lattice::dynamic_object inserted(source);
+            owner->get()->add(inserted);
+        }
+        auto rows = owner->get()->objects("FactoryLifetime");
+        ASSERT_EQ(rows.size(), 1u);
+        id = rows[0].id();
+        const auto before_boxing = lattice::database::thread_statement_count();
+        object = managed_row_factory_box(rows[0]);
+        EXPECT_EQ(object->get()->lattice.get(), owner->get());
+        EXPECT_EQ(lattice::database::thread_statement_count() - before_boxing, 0u);
+    } // Row vector, original schema, insertion object and owner ref are gone.
+    EXPECT_FALSE(weak_owner.expired());
+    EXPECT_EQ(object->managed_primary_key(), id);
+    EXPECT_EQ(object->get_table_name(), "FactoryLifetime");
+    EXPECT_EQ(object->get_string("name"), "owned");
+    object->set_int("age", 19);
+    EXPECT_TRUE(object->last_query_error_message().empty());
+    EXPECT_EQ(object->get_int("age"), 19);
+    // Serialization enumerates the retained schema after the source row and
+    // caller's schema have been destroyed, rather than only reading by name.
+    const auto json = object->to_json(0);
+    EXPECT_NE(json.find("\"age\":19"), std::string::npos);
+    EXPECT_NE(json.find("\"name\":\"owned\""), std::string::npos);
+    EXPECT_EQ(std::get<int64_t>(object->query_row_value("age")), 8);
+    object->release_query_row_image();
+    EXPECT_FALSE(object->is_row_cache_enabled());
+    object.reset();
+    EXPECT_TRUE(weak_owner.expired()) << "the final owning row must release its lattice";
+}
+
+TEST(Bridge, ManagedRowFactoryKeepsAttachedEqualIDsOnTheirPhysicalRoute) {
+    TempDB local_path{"factory_local"}, arm_path{"factory_arm_\"quote"};
+    lattice::SchemaVector schemas = {make_schema("FactoryArm", {{"age", int_prop("age")}})};
+    auto local = managed_row_factory_owner(local_path.str(), schemas);
+    auto arm = managed_row_factory_owner(arm_path.str(), schemas);
+    for (auto* owner : {local.get(), arm.get()}) {
+        auto source = make_sdo("FactoryArm", schemas[0].properties);
+        source.values["age"] = int64_t(owner == local.get() ? 10 : 20);
+        lattice::dynamic_object inserted(source);
+        owner->get()->add(inserted);
+    }
+    ASSERT_TRUE(local->get()->attach(*arm->get()));
+    std::unique_ptr<lattice::dynamic_object_ref> local_row, attached_row, legacy_attached;
+    {
+        auto rows = local->get()->objects("FactoryArm", std::nullopt, std::string("age ASC"));
+        ASSERT_EQ(rows.size(), 2u);
+        ASSERT_EQ(rows[0].id(), rows[1].id());
+        const auto before_boxing = lattice::database::thread_statement_count();
+        local_row = managed_row_factory_box(rows[0]);
+        attached_row = managed_row_factory_box(rows[1]);
+        legacy_attached = managed_row_factory_box(rows[1], true);
+        EXPECT_EQ(lattice::database::thread_statement_count() - before_boxing, 0u);
+    }
+    EXPECT_EQ(attached_row->get()->lattice.get(), local->get());
+    EXPECT_EQ(attached_row->get()->lattice.get(), legacy_attached->get()->lattice.get());
+    EXPECT_EQ(local_row->managed_primary_key(), attached_row->managed_primary_key());
+    EXPECT_EQ(attached_row->get_table_name(), legacy_attached->get_table_name());
+    EXPECT_NE(local_row->get_table_name(), attached_row->get_table_name());
+    ASSERT_EQ(attached_row->query_row_value_type("_source"), 3);
+    EXPECT_EQ(std::get<std::string>(attached_row->query_row_value("_source")),
+              std::get<std::string>(legacy_attached->query_row_value("_source")));
+    attached_row->set_int("age", 44);
+    EXPECT_TRUE(attached_row->last_query_error_message().empty());
+    EXPECT_EQ(legacy_attached->get_int("age"), 44);
+    EXPECT_EQ(local_row->get_int("age"), 10);
+    EXPECT_EQ(std::get<int64_t>(attached_row->query_row_value("age")), 20);
+    lattice::database local_check(local_path.str()), arm_check(arm_path.str());
+    auto local_values = local_check.query("SELECT age FROM FactoryArm");
+    auto arm_values = arm_check.query("SELECT age FROM FactoryArm");
+    ASSERT_EQ(local_values.size(), 1u);
+    ASSERT_EQ(arm_values.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(local_values[0].at("age")), 10);
+    EXPECT_EQ(std::get<int64_t>(arm_values[0].at("age")), 44);
+}
 #endif // !__linux__

@@ -3134,7 +3134,7 @@ std::optional<std::string> synchronizer_base::get_last_received_event_id() {
     // is a refusal, never permission to reconstruct a cursor from unrelated
     // remote AuditLog rows. Absent per-channel state starts at beginning;
     // initialized NULL and legacy-unverified state also retain that boundary.
-    return detail::receive_delivery_guard_access::read(db(), config_.sync_id).checkpoint;
+    return detail::receive_delivery_guard_access::legacy_checkpoint(db(), config_.sync_id);
 }
 
 // ============================================================================

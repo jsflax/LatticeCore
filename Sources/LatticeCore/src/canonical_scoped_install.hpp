@@ -2,6 +2,7 @@
 #include "canonical_range_staging.hpp"
 #include "recovery_obligation_store.hpp"
 #include "scoped_recovery_install.hpp"
+#include "receive_delivery_guard.hpp"
 
 namespace lattice::detail {
 struct canonical_scoped_contract {
@@ -36,6 +37,10 @@ class canonical_install_admission {
     canonical_scoped_contract contract_;
     canonical_scoped_limits limits_{};
     std::optional<receive_install_identity> supersede_;
+    // Inactive optional transition for existing mechanical fixture compatibility.
+    // A production issuer must bind the actual live receive guard as well as all
+    // source/route/producer obligations before activating canonical recovery.
+    std::optional<receive_guard_snapshot> receive_guard_;
     canonical_install_admission()=default;
     friend struct canonical_scoped_install_test_access;
     friend scoped_recovery_result install_staged_canonical_range(const canonical_install_admission&);
@@ -48,6 +53,8 @@ public:
 // Actual retained stage + journal, one retained-owner transaction. Derives I
 // exclusively from verified retained framing, rechecks C/E and journal after
 // effects, then commits models/membership/receipts/receiver/witness together.
+// An explicitly bound receive guard completes in that same COMMIT; canonical
+// channels refuse admission that omits it, including retained-stage retries.
 // Refuses every final non-Q obligation, including fresh local writes. No
 // never-dispatched inference, automatic progress, route activation or cleanup.
 // Retained-stage exact retries bypass effects and journal settlement. Released

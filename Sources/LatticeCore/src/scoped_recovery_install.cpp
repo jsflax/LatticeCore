@@ -811,6 +811,14 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
         require(current_journal && current_journal->address==grant.journal_ && current_journal->profile==grant.profile_,
             "canonical admission differs from current journal binding");
         const auto& identity=verified.installation_identity;
+        if(grant.receive_guard_) {
+            require(grant.receive_guard_->channel==grant.attempt_.channel,"canonical receive guard channel differs");
+            const auto installed=state.read(grant.attempt_.channel);
+            if(installed && installed->last_installed==std::optional<receive_install_identity>{identity})
+                receive_delivery_guard_access::verify_canonical_completed(*grant.owner_,writer,*grant.receive_guard_);
+            else receive_delivery_guard_access::verify_owned(*grant.owner_,writer,*grant.receive_guard_);
+        } else require(receive_delivery_guard_access::read_owned(*grant.owner_,writer,grant.attempt_.channel).state!=
+            receive_guard_state::canonical_installed,"canonical channel requires bound receive completion admission");
         std::optional<recovery_obligation_snapshot> before;
         std::optional<installed_plan> final_plan;
         std::vector<recovery_obligation_receipt_claim> positives;
@@ -945,11 +953,18 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
             final_plan->receipts=std::move(positive_receipts);
             final_plan->witness=bump_recovery_witness(*grant.owner_);
         });
+        // Capture actual receiver completion before journal/guard bookkeeping.
+        // Neither metadata write may silently rewrite its identity or counters.
+        const auto completed_receiver=grant.receive_guard_?state.read(grant.attempt_.channel):std::nullopt;
+        const auto completed_usage=grant.receive_guard_?std::optional<receive_install_usage>{state.usage()}:std::nullopt;
+        std::optional<receive_guard_snapshot> completed_guard;
         if(result.installation->disposition==receive_install_disposition::installed) {
             require(before.has_value(),"canonical new installation lost its journal snapshot");
             // Actual receiver completion must precede journal settlement; both
             // still live inside the retained outer transaction, never two commits.
             const auto expected=journal.settle_install(grant.journal_,before->scope.revision,identity,positives);
+            if(grant.receive_guard_)
+                completed_guard=receive_delivery_guard_access::complete_canonical(*grant.owner_,writer,*grant.receive_guard_);
             same_stage();journal.audit();
             require(journal.read(grant.journal_.channel)==std::optional<recovery_obligation_scope>{expected},
                 "canonical journal completion postimage changed");
@@ -971,6 +986,16 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
                     "canonical journal final original postimage changed");
             require(final_plan.has_value(),"canonical final model plan missing");
             final_plan->verify(*grant.owner_,writer,limits,identities(recovery_identity_mode::uuid));
+        }
+        if(grant.receive_guard_) {
+            require(completed_receiver && completed_receiver->binding==verified.installation_binding &&
+                completed_receiver->last_installed==std::optional<receive_install_identity>{identity},
+                "canonical guard completion lacks actual receiver installation");
+            state.audit();
+            require(state.read(grant.attempt_.channel)==completed_receiver && state.usage()==*completed_usage,
+                "canonical guard completion changed receiver postimage");
+            if(completed_guard)receive_delivery_guard_access::verify_owned(*grant.owner_,writer,*completed_guard);
+            else receive_delivery_guard_access::verify_canonical_completed(*grant.owner_,writer,*grant.receive_guard_);
         }
     });
     if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();

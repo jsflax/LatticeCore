@@ -54,7 +54,7 @@ struct statement {
 };
 struct store_state {
     bool legacy = false, overflow = false;
-    int64_t sequence = 0, count = 0, bytes = 0;
+    int64_t sequence = 0, count = 0, bytes = 0, version = 1;
 };
 bool schema(sqlite3* h, bool allow_absent = false) {
     statement q(h, "SELECT name,sql FROM main.sqlite_master WHERE name IN ('_lattice_receive_guard_store','_lattice_receive_guard','_lattice_receive_guard_state') ORDER BY name LIMIT 4");
@@ -78,9 +78,9 @@ bool schema(sqlite3* h, bool allow_absent = false) {
 }
 store_state store(sqlite3* h) {
     statement q(h, "SELECT id,version,legacy_origin,last_incarnation,channels,channel_bytes,capacity_refused FROM main._lattice_receive_guard_store LIMIT 2");
-    if (q.step() != SQLITE_ROW || q.number(0) != 1 || q.number(1) != 1) refuse("missing or unsupported store version");
+    if (q.step() != SQLITE_ROW || q.number(0) != 1 || (q.number(1) != 1 && q.number(1) != 2)) refuse("missing or unsupported store version");
     const auto legacy = q.number(2), overflow = q.number(6);
-    store_state s{legacy == 1, overflow == 1, q.number(3), q.number(4), q.number(5)};
+    store_state s{legacy == 1, overflow == 1, q.number(3), q.number(4), q.number(5), q.number(1)};
     if ((legacy != 0 && legacy != 1) || (overflow != 0 && overflow != 1) || s.sequence < 0 ||
         s.count < 0 || s.count > caps.channels || s.bytes < 0 || s.bytes > caps.channel_bytes || s.sequence < s.count)
         refuse("invalid bounded store counters");
@@ -89,21 +89,22 @@ store_state store(sqlite3* h) {
 receive_guard_snapshot read_row(sqlite3* h, const std::string& channel) {
     key(channel, caps.key_bytes); schema(h); const auto s = store(h);
     receive_guard_snapshot out; out.channel = channel; out.legacy_origin = s.legacy; out.capacity_refused = s.overflow;
-    out.store_incarnation = s.sequence; out.store_channels = s.count; out.store_channel_bytes = s.bytes;
+    out.store_version = s.version; out.store_incarnation = s.sequence; out.store_channels = s.count; out.store_channel_bytes = s.bytes;
     if (s.legacy) { out.state = receive_guard_state::recovery_required; out.reason = receive_guard_reason::legacy_unverified; }
     statement q(h, "SELECT incarnation,generation,state,reason,checkpoint FROM main._lattice_receive_guard WHERE channel=?"); q.bytes(1, channel);
     if (q.step() == SQLITE_DONE) return out;
     out.present = true; out.incarnation = q.number(0); out.generation = q.number(1);
     const auto state = q.number(2), reason = q.number(3);
-    if (out.incarnation <= 0 || out.incarnation > s.sequence || out.generation <= 0 || state < 0 || state > 3 || reason < 0 || reason > 4)
+    if (out.incarnation <= 0 || out.incarnation > s.sequence || out.generation <= 0 || state < 0 || state > (s.version == 2 ? 4 : 3) || reason < 0 || reason > 4)
         refuse("malformed channel state");
     out.state = static_cast<receive_guard_state>(state); out.reason = static_cast<receive_guard_reason>(reason);
     out.checkpoint = q.optional_bytes(4, caps.checkpoint_bytes); q.done();
     if ((state <= 1 && reason != 0) || (state == 2 && (reason == 0 || reason == 4)) || (state == 3 && reason == 0)) refuse("inconsistent state/reason");
+    if (state == 4 && (s.legacy || reason != 0 || out.checkpoint)) refuse("inconsistent canonical receive state");
     return out;
 }
 bool same_store(const store_state& a, const store_state& b) {
-    return a.legacy == b.legacy && a.overflow == b.overflow && a.sequence == b.sequence && a.count == b.count && a.bytes == b.bytes;
+    return a.legacy == b.legacy && a.overflow == b.overflow && a.sequence == b.sequence && a.count == b.count && a.bytes == b.bytes && a.version == b.version;
 }
 void save_store(sqlite3* h, const store_state& before, const store_state& after) {
     statement q(h, "UPDATE main._lattice_receive_guard_store SET last_incarnation=?,channels=?,channel_bytes=?,capacity_refused=? WHERE id=1 AND last_incarnation=? AND channels=? AND channel_bytes=? AND capacity_refused=?");
@@ -157,7 +158,7 @@ void verify_mirror(sqlite3* h, const receive_guard_snapshot& row) {
 }
 }
 bool receive_guard_snapshot::operator==(const receive_guard_snapshot& o) const {
-    return present == o.present && legacy_origin == o.legacy_origin && capacity_refused == o.capacity_refused && channel == o.channel && incarnation == o.incarnation && generation == o.generation && store_incarnation == o.store_incarnation && store_channels == o.store_channels && store_channel_bytes == o.store_channel_bytes && state == o.state && reason == o.reason && checkpoint == o.checkpoint;
+    return present == o.present && legacy_origin == o.legacy_origin && capacity_refused == o.capacity_refused && channel == o.channel && incarnation == o.incarnation && generation == o.generation && store_version == o.store_version && store_incarnation == o.store_incarnation && store_channels == o.store_channels && store_channel_bytes == o.store_channel_bytes && state == o.state && reason == o.reason && checkpoint == o.checkpoint;
 }
 sqlite3* receive_delivery_guard_access::owned(lattice_db& owner, database& writer) {
     auto* h = writer.internal_handle(); auto* hook = writer.lattice_update_hook_context_.get();
@@ -194,6 +195,7 @@ void receive_delivery_guard_access::initialize_schema(database& writer, bool leg
 receive_guard_token receive_delivery_guard_access::begin(lattice_db& owner, database& writer, const std::string& channel) {
     auto* h = owned(owner, writer); auto before = read_row(h, channel); auto next = before;
     if (before.state == receive_guard_state::retired) refuse("channel is retired; explicit recovery binding required");
+    if (before.state == receive_guard_state::canonical_installed) refuse("canonical channel refuses legacy receive admission");
     if (!allocate(h, next)) return {next, false, true};
     if (before.generation == std::numeric_limits<int64_t>::max()) refuse("delivery generation exhausted");
     const bool advance = before.state == receive_guard_state::idle;
@@ -205,7 +207,7 @@ receive_guard_token receive_delivery_guard_access::begin(lattice_db& owner, data
 }
 receive_guard_snapshot receive_delivery_guard_access::require_current(lattice_db& owner, database& writer, const receive_guard_token& token) {
     const auto row = read_row(owned(owner, writer), token.admitted.channel);
-    if (!row.present || row.incarnation != token.admitted.incarnation || row.generation != token.admitted.generation || row.state == receive_guard_state::retired || token.capacity_refused)
+    if (!row.present || row.incarnation != token.admitted.incarnation || row.generation != token.admitted.generation || row.state == receive_guard_state::retired || row.state == receive_guard_state::canonical_installed || token.capacity_refused)
         refuse("stale delivery token");
     return row;
 }
@@ -241,7 +243,7 @@ receive_guard_snapshot receive_delivery_guard_access::retire(lattice_db& owner, 
     if (!before.present) return before;
     if (before.generation == std::numeric_limits<int64_t>::max()) refuse("retirement generation exhausted");
     next.generation++; next.state = receive_guard_state::retired;
-    if (before.state == receive_guard_state::idle) next.reason = receive_guard_reason::retired;
+    if (before.state == receive_guard_state::idle || before.state == receive_guard_state::canonical_installed) next.reason = receive_guard_reason::retired;
     else if (before.state == receive_guard_state::in_progress) next.reason = receive_guard_reason::interrupted;
     save_row(h, before, next); return next;
 }
@@ -254,6 +256,54 @@ receive_guard_snapshot receive_delivery_guard_access::read(lattice_db& owner, co
     statement(h, "BEGIN").done();
     try { auto value = read_row(h, channel); statement(h, "COMMIT").done(); return value; }
     catch (...) { const auto error = std::current_exception(); try { statement(h, "ROLLBACK").done(); } catch (...) { writer->closed_.store(true); } std::rethrow_exception(error); }
+}
+namespace {
+receive_guard_snapshot canonical_postimage(const receive_guard_snapshot& before) {
+    if (!before.present || before.legacy_origin || before.capacity_refused ||
+        (before.store_version != 1 && before.store_version != 2) ||
+        before.state == receive_guard_state::retired || before.incarnation <= 0 || before.generation <= 0 ||
+        before.generation == std::numeric_limits<int64_t>::max())
+        refuse("canonical completion requires a current modern nonretired guard");
+    auto next = before; next.store_version = 2; next.generation++;
+    next.state = receive_guard_state::canonical_installed; next.reason = receive_guard_reason::none;
+    next.checkpoint.reset(); return next;
+}
+void require_canonical_metadata_without_triggers(sqlite3* h) {
+    // TEMP triggers may target main tables; inspect both namespaces before
+    // any completion write. Table-name comparison follows SQLite casing.
+    statement q(h, "SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name COLLATE NOCASE IN ('_lattice_receive_guard_store','_lattice_receive_guard','_lattice_replication_slots') "
+        "UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name COLLATE NOCASE IN ('_lattice_receive_guard_store','_lattice_receive_guard','_lattice_replication_slots') LIMIT 1");
+    if (q.step() != SQLITE_DONE) refuse("canonical completion metadata triggers are unsupported");
+}
+}
+std::optional<std::string> receive_delivery_guard_access::legacy_checkpoint(lattice_db& owner, const std::string& channel) {
+    const auto current = read(owner, channel);
+    if (current.state == receive_guard_state::canonical_installed) refuse("canonical channel has no legacy checkpoint");
+    return current.checkpoint;
+}
+receive_guard_snapshot receive_delivery_guard_access::complete_canonical(lattice_db& owner, database& writer,
+    const receive_guard_snapshot& before) {
+    auto* h = owned(owner, writer); const auto next = canonical_postimage(before);
+    require_canonical_metadata_without_triggers(h);
+    verify_owned(owner, writer, before);
+    if (before.store_version == 1) {
+        const auto prior = store(h); auto expected = prior; expected.version = 2;
+        statement q(h, "UPDATE main._lattice_receive_guard_store SET version=2 WHERE id=1 AND version=1"); q.done();
+        if (sqlite3_changes64(h) != 1 || !same_store(store(h), expected)) refuse("canonical store upgrade postimage mismatch");
+    }
+    save_row(h, before, next); mirror(h, next); verify_owned(owner, writer, next); return next;
+}
+receive_guard_snapshot receive_delivery_guard_access::verify_canonical_completed(lattice_db& owner, database& writer,
+    const receive_guard_snapshot& before) {
+    auto* h = owned(owner, writer); auto expected = canonical_postimage(before);
+    const auto current = read_row(h, before.channel);
+    // Other channels may legitimately be admitted between COMMIT and an exact
+    // retry. Their counters are not this channel's installation identity.
+    expected.store_incarnation = current.store_incarnation;
+    expected.store_channels = current.store_channels;
+    expected.store_channel_bytes = current.store_channel_bytes;
+    if (!(current == expected)) refuse("canonical installed guard differs from exact retry");
+    verify_owned(owner, writer, expected); return current;
 }
 bool receive_delivery_guard_access::manages_cursor(database& writer) { auto* h = writer.internal_handle(); if (!schema(h, true)) return false; (void)store(h); return true; }
 void receive_delivery_guard_access::require_history_unblocked(database& writer) {

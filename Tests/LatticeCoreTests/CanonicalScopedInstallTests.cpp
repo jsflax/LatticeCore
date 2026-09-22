@@ -15,12 +15,13 @@ struct canonical_scoped_install_test_access {
         canonical_range::attempt attempt,uint64_t route,std::string q,std::string m,
         recovery_obligation_profile profile,recovery_obligation_address journal,int64_t revision,
         canonical_scoped_contract contract,canonical_scoped_limits limits,
-        std::optional<receive_install_identity> supersede,std::string coverage="coverage") {
+        std::optional<receive_install_identity> supersede,std::string coverage="coverage",
+        std::optional<receive_guard_snapshot> receive_guard={}) {
         canonical_install_admission result;result.owner_=std::move(owner);result.attempt_=std::move(attempt);
         result.route_=route;result.request_digest_=std::move(q);result.manifest_digest_=std::move(m);
         result.coverage_id_=std::move(coverage);result.profile_=std::move(profile);result.journal_=std::move(journal);
         result.journal_revision_=revision;result.contract_=std::move(contract);result.limits_=std::move(limits);
-        result.supersede_=std::move(supersede);return result;
+        result.supersede_=std::move(supersede);result.receive_guard_=std::move(receive_guard);return result;
     }
 };
 }
@@ -157,6 +158,21 @@ protected:
         const auto installed=installation();owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);address=journal().resume(address,*installed.last_installed).address;});
         ++x.a.sequence;x.a.attempt_id=uuid('6');x.q.expected={static_cast<uint64_t>(installed.revision),x.q.source,{cr::frontier_kind::position,static_cast<uint64_t>(*installed.frontier.position)}};
         x.q.selection=mode;x.q.base=mode==cr::mode::delta?std::optional<uint64_t>{x.m.head}:std::nullopt;x.content.clear();x.receipts.clear();x.q.receipts.clear();contract.initial_row_grants.clear();
+    }
+    std::pair<receive_guard_token,receive_guard_snapshot> recovery_guard() {
+        receive_guard_token token;receive_guard_snapshot before;
+        owned([&](auto& db){token=receive_delivery_guard_access::begin(*owner,db,address.channel);
+            before=receive_delivery_guard_access::finish(*owner,db,token,token.admitted,std::string("old-legacy-prefix"),true,true);
+            receive_delivery_guard_access::verify_owned(*owner,db,before);});
+        return {token,before};
+    }
+    canonical_install_admission guarded(const receive_guard_snapshot& before) {
+        const auto s=scope();const auto i=installation();return canonical_scoped_install_test_access::mint(owner,x.a,1,
+            x.q.request_digest,x.m.manifest_digest,profile,address,s.revision,contract,limits,i.last_installed,"coverage",before);
+    }
+    std::vector<rows> guarded_snapshot() {
+        auto result=snapshot();for(const auto* name:{"_lattice_receive_guard_store","_lattice_receive_guard","_lattice_replication_slots"})
+            result.push_back(table(name));return result;
     }
     void baseline(){x.content={person(A,"A"),person(B,"B")};staged();if(!committed(run()))throw std::runtime_error("initial staged installation failed");}
 };
@@ -428,5 +444,135 @@ TEST_F(CanonicalScopedInstall, ExactBumpedWitnessSurvivesFinalJournalTriggers) {
         owner->db().execute("DROP TRIGGER _staged_final_witness");ASSERT_TRUE(committed(run()));
         const auto after=table("_lattice_recovery_witness");EXPECT_EQ(std::get<blob>(after.at(0).at("incarnation")),incarnation);
         EXPECT_EQ(number("SELECT generation FROM _lattice_recovery_witness"),generation+1);
+    }
+}
+
+
+TEST_F(CanonicalScopedInstall, GuardedInstallCommitsCanonicalMarkerAndRejectsLegacyCursor) {
+    auto e=add();requested(e,0);x.content={person(A,"canonical-guard")};const auto [token,before]=recovery_guard();staged();
+    const auto audit=table("AuditLog");const auto admission=guarded(before);const auto result=install_staged_canonical_range(admission);
+    ASSERT_TRUE(committed(result));const auto after=receive_delivery_guard_access::read(*owner,address.channel);
+    EXPECT_EQ(after.state,receive_guard_state::canonical_installed);EXPECT_EQ(after.reason,receive_guard_reason::none);
+    EXPECT_EQ(after.incarnation,before.incarnation);EXPECT_EQ(after.generation,before.generation+1);EXPECT_EQ(after.store_version,2);
+    EXPECT_FALSE(after.checkpoint);EXPECT_EQ(table("AuditLog"),audit);EXPECT_EQ(scope().mode,recovery_obligation_mode::installed);
+    EXPECT_EQ(std::get<std::string>(query("SELECT name FROM TestPerson")[0].at("name")),"canonical-guard");
+    EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_replication_slots WHERE last_received_event_id IS NULL"),1);
+    EXPECT_THROW(receive_delivery_guard_access::legacy_checkpoint(*owner,address.channel),lattice::db_error);
+    const auto stable=guarded_snapshot();owned([&](auto& db){
+        EXPECT_THROW(receive_delivery_guard_access::begin(*owner,db,address.channel),lattice::db_error);
+        EXPECT_THROW(receive_delivery_guard_access::require_current(*owner,db,token),lattice::db_error);
+    });EXPECT_EQ(guarded_snapshot(),stable);
+}
+TEST_F(CanonicalScopedInstall, GuardedDeniedCommitRollsBackVersionRowsReceiptsAndCursor) {
+    auto e=add();requested(e,0);x.content={person(A,"source")};const auto before=recovery_guard().second;staged();
+    const auto admission=guarded(before);const auto stable=guarded_snapshot();
+    struct DenyCommit {
+        sqlite3* db;
+        explicit DenyCommit(sqlite3* value):db(value){sqlite3_set_authorizer(db,[](void*,int action,const char* first,const char*,const char*,const char*){
+            return action==SQLITE_TRANSACTION&&first&&std::string_view(first)=="COMMIT"?SQLITE_DENY:SQLITE_OK;
+        },nullptr);}
+        ~DenyCommit(){sqlite3_set_authorizer(db,nullptr,nullptr);}
+    };
+    {DenyCommit deny(owner->db().handle());const auto result=install_staged_canonical_range(admission);refused(result);EXPECT_EQ(result.transaction.state,state::rolled_back);}
+    EXPECT_EQ(guarded_snapshot(),stable);EXPECT_EQ(receive_delivery_guard_access::read(*owner,address.channel),before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));
+}
+TEST_F(CanonicalScopedInstall, GuardedStaleGenerationAndWrongChannelPreserveEveryPostimage) {
+    for(const bool wrong_channel:{false,true}) {
+        reset();x.content={person(A)};auto before=recovery_guard().second;staged();
+        if(wrong_channel)before.channel="another-channel";
+        const auto admission=guarded(before);
+        if(!wrong_channel)owned([&](auto& db){receive_delivery_guard_access::begin(*owner,db,address.channel);});
+        const auto stable=guarded_snapshot();refused(install_staged_canonical_range(admission));EXPECT_EQ(guarded_snapshot(),stable);
+    }
+}
+TEST_F(CanonicalScopedInstall, GuardedModelAndJournalMutationCannotRewriteReceiveGeneration) {
+    for(const bool journal_mutation:{false,true}) {
+        reset();auto e=add();requested(e,0);x.content={person(A,"new")};const auto before=recovery_guard().second;staged();
+        owner->db().execute(journal_mutation?
+            "CREATE TRIGGER _guard_mutation AFTER UPDATE ON _lattice_obligation_scope WHEN NEW.mode=2 BEGIN UPDATE _lattice_receive_guard SET generation=generation+1; END":
+            "CREATE TRIGGER _guard_mutation AFTER UPDATE ON TestPerson BEGIN UPDATE _lattice_receive_guard SET generation=generation+1; END");
+        const auto stable=guarded_snapshot();refused(install_staged_canonical_range(guarded(before)));EXPECT_EQ(guarded_snapshot(),stable);
+        owner->db().execute("DROP TRIGGER _guard_mutation");ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
+    }
+}
+TEST_F(CanonicalScopedInstall, GuardedMetadataTriggersRefuseWithoutCommittingModelEffects) {
+    for(const auto* table_name:{"_lattice_receive_guard_store","_lattice_receive_guard","_lattice_replication_slots"}) {
+        reset();auto e=add();requested(e,0);x.content={person(A,"new")};const auto before=recovery_guard().second;staged();
+        owner->db().execute(std::string("CREATE TRIGGER _guard_metadata AFTER UPDATE ON ")+table_name+" BEGIN DELETE FROM _lattice_obligation_entry; END");
+        const auto stable=guarded_snapshot();refused(install_staged_canonical_range(guarded(before)),"metadata triggers");EXPECT_EQ(guarded_snapshot(),stable);
+        owner->db().execute("DROP TRIGGER _guard_metadata");ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
+    }
+}
+TEST_F(CanonicalScopedInstall, GuardedExactRetryPreservesLateOriginalAndOtherChannelActivity) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));const auto late=edit(A,"late-local");
+    owned([&](auto& db){const auto token=receive_delivery_guard_access::begin(*owner,db,"other-channel");
+        const auto done=receive_delivery_guard_access::finish(*owner,db,token,token.admitted,std::string("other-prefix"),false,true);
+        receive_delivery_guard_access::verify_owned(*owner,db,done);});
+    const auto stable=guarded_snapshot();const auto result=install_staged_canonical_range(admission);ASSERT_TRUE(committed(result));
+    EXPECT_EQ(result.installation->disposition,receive_install_disposition::already_installed);EXPECT_EQ(guarded_snapshot(),stable);
+    owned([&](auto&){EXPECT_EQ(journal().find(address,late.record.original_id)->stage,recovery_obligation_stage::open);});
+    EXPECT_EQ(receive_delivery_guard_access::legacy_checkpoint(*owner,"other-channel"),std::optional<std::string>{"other-prefix"});
+}
+TEST_F(CanonicalScopedInstall, GuardedRetryRejectsChangedCanonicalGenerationWithoutReapplying) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));
+    owner->db().execute("UPDATE _lattice_receive_guard SET generation=generation+1");const auto stable=guarded_snapshot();
+    refused(install_staged_canonical_range(admission),"exact retry");EXPECT_EQ(guarded_snapshot(),stable);
+}
+TEST_F(CanonicalScopedInstall, GuardedPostcommitNotificationFailureKeepsExactInstalledGuard) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    std::shared_ptr<lattice::lattice_db> base=owner;const auto observer=base->add_table_observer("TestPerson",[](const auto&){throw std::runtime_error("guarded observer failure");});
+    const auto result=install_staged_canonical_range(admission);EXPECT_EQ(result.transaction.state,state::committed);
+    EXPECT_TRUE(result.transaction.postcommit_error);ASSERT_TRUE(result.installation);
+    EXPECT_EQ(receive_delivery_guard_access::read(*owner,address.channel).state,receive_guard_state::canonical_installed);
+    base->remove_table_observer("TestPerson",observer);const auto stable=guarded_snapshot();const auto retry=install_staged_canonical_range(admission);
+    ASSERT_TRUE(committed(retry));EXPECT_EQ(retry.installation->disposition,receive_install_disposition::already_installed);EXPECT_EQ(guarded_snapshot(),stable);
+}
+TEST_F(CanonicalScopedInstall, GuardedFileReopenRetainsCanonicalMarkerAndExactRetry) {
+    TempDB path("canonical-receive-completion");reset(path.str());auto e=add();requested(e,0);x.content={person(A,"reopen")};
+    const auto before=recovery_guard().second;staged();const auto audit=table("AuditLog");owner->close();owner=std::make_shared<StagedOwner>(path.str());
+    ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));owner->close();owner=std::make_shared<StagedOwner>(path.str());
+    const auto stable=guarded_snapshot();const auto result=install_staged_canonical_range(guarded(before));ASSERT_TRUE(committed(result));
+    EXPECT_EQ(result.installation->disposition,receive_install_disposition::already_installed);EXPECT_EQ(guarded_snapshot(),stable);EXPECT_EQ(table("AuditLog"),audit);
+    EXPECT_THROW(receive_delivery_guard_access::legacy_checkpoint(*owner,address.channel),lattice::db_error);owner->close();
+}
+TEST_F(CanonicalScopedInstall, GuardedSuccessorInstallationAdvancesCanonicalGenerationOnce) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
+    const auto first=receive_delivery_guard_access::read(*owner,address.channel);next();++x.m.head;x.content={person(A,"successor")};staged();
+    const auto admission=guarded(first);ASSERT_TRUE(committed(install_staged_canonical_range(admission)));
+    const auto second=receive_delivery_guard_access::read(*owner,address.channel);EXPECT_EQ(second.generation,first.generation+1);EXPECT_EQ(second.store_version,2);
+    const auto stable=guarded_snapshot();ASSERT_TRUE(committed(install_staged_canonical_range(admission)));EXPECT_EQ(guarded_snapshot(),stable);
+}
+TEST_F(CanonicalScopedInstall, GuardedLegacyOriginCannotBecomeCanonicalByInstallingRows) {
+    x.content={person(A)};recovery_guard();owner->db().execute("UPDATE _lattice_receive_guard_store SET legacy_origin=1");
+    const auto before=receive_delivery_guard_access::read(*owner,address.channel);ASSERT_TRUE(before.legacy_origin);staged();const auto stable=guarded_snapshot();
+    refused(install_staged_canonical_range(guarded(before)),"modern nonretired guard");EXPECT_EQ(guarded_snapshot(),stable);
+}
+
+TEST_F(CanonicalScopedInstall, CanonicalChannelCannotOmitGuardOnRetryOrSuccessorInstall) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
+    const auto installed=guarded_snapshot();refused(run(),"requires bound receive");EXPECT_EQ(guarded_snapshot(),installed);
+    next();++x.m.head;x.content={person(A,"next")};staged();const auto staged_state=guarded_snapshot();
+    refused(run(),"requires bound receive");EXPECT_EQ(guarded_snapshot(),staged_state);
+    const auto current=receive_delivery_guard_access::read(*owner,address.channel);ASSERT_TRUE(committed(install_staged_canonical_range(guarded(current))));
+}
+
+TEST_F(CanonicalScopedInstall, GuardedTempTriggersCannotRewriteOutboundStateDuringCompletion) {
+    const std::vector<std::pair<std::string,std::string>> targets={
+        {"_LATTICE_RECEIVE_GUARD_STORE","NEW.version=2 AND OLD.version=1"},
+        {"_LATTICE_RECEIVE_GUARD","NEW.state=4 AND OLD.state<>4"},
+        {"_LATTICE_REPLICATION_SLOTS","NEW.last_received_event_id IS NULL AND OLD.last_received_event_id IS NOT NULL"}};
+    for(const auto& [table_name,condition]:targets) {
+        reset();auto e=add();requested(e,0);x.content={person(A,"new")};const auto before=recovery_guard().second;staged();
+        owner->db().execute("CREATE TEMP TRIGGER _guard_temp_metadata AFTER UPDATE ON main."+table_name+" WHEN "+condition+
+            " BEGIN UPDATE _lattice_replication_slots SET upload_floor=COALESCE(upload_floor,0)+7,confirmed_audit_id=COALESCE(confirmed_audit_id,0)+9; END");
+        EXPECT_EQ(number("SELECT COUNT(*) FROM main.sqlite_schema WHERE name='_guard_temp_metadata'"),0);
+        ASSERT_EQ(number("SELECT COUNT(*) FROM temp.sqlite_schema WHERE name='_guard_temp_metadata'"),1);
+        const auto temp_schema=query("SELECT name,sql FROM temp.sqlite_schema ORDER BY name");const auto stable=guarded_snapshot();
+        refused(install_staged_canonical_range(guarded(before)),"metadata triggers");EXPECT_EQ(guarded_snapshot(),stable);
+        EXPECT_EQ(query("SELECT name,sql FROM temp.sqlite_schema ORDER BY name"),temp_schema);
+        owner->db().execute("DROP TRIGGER temp._guard_temp_metadata");ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
     }
 }

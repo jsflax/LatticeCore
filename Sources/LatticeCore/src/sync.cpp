@@ -662,10 +662,12 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 #endif
     scheduler_=detail::make_sync_lifetime_scheduler(std::move(scheduler_),callback_lifetime_);
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    counted_instance_=true;
     LOG_INFO("synchronizer", "[%s] CREATED (WSS, this=%p, db=%s, alive=%lld)",
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
     auto factory = get_network_factory();
     ws_client_ = factory->create_sync_transport(scheduler_);
+    if(!ws_client_)throw db_error("synchronizer requires transport");
     recovery_export_route_ = std::make_shared<detail::recovery_export_route>(ws_client_,callback_lifetime_);
     setup_transport_handlers();
     setup_observer();
@@ -695,8 +697,10 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 #endif
     scheduler_=detail::make_sync_lifetime_scheduler(std::move(scheduler_),callback_lifetime_);
     ws_client_ = std::move(transport);
+    if(!ws_client_)throw db_error("synchronizer requires transport");
     recovery_export_route_ = std::make_shared<detail::recovery_export_route>(ws_client_,callback_lifetime_);
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    counted_instance_=true;
     LOG_INFO("synchronizer", "[%s] CREATED (IPC, this=%p, db=%s, alive=%lld)",
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
     setup_transport_handlers();
@@ -1117,7 +1121,7 @@ synchronizer_base::~synchronizer_base() {
     if(callback_lifetime_)callback_lifetime_->wait_for_foreign();
     LOG_INFO("synchronizer", "[%s] ~synchronizer START (this=%p, db=%s)",
              log_id(), (void*)this,
-             db().config().path.c_str());
+             db_ptr_ ? db_ptr_->config().path.c_str() : "<unbound>");
     // Invalidate the ack-timeout guard before ANY teardown: the detached
     // retry thread only touches `this` under this mutex while alive==true.
     {
@@ -1142,7 +1146,9 @@ synchronizer_base::~synchronizer_base() {
             scheduler_->shutdown();
         }
     }
-    auto n = g_sync_instance_count.fetch_sub(1, std::memory_order_relaxed) - 1;
+    const auto n = counted_instance_
+        ? g_sync_instance_count.fetch_sub(1, std::memory_order_relaxed) - 1
+        : g_sync_instance_count.load(std::memory_order_relaxed);
     LOG_INFO("synchronizer", "[%s] ~synchronizer END (this=%p, alive=%lld)", log_id(), (void*)this, (long long)n);
 }
 
@@ -1234,7 +1240,7 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
 void synchronizer_base::disconnect() {
     LOG_INFO("synchronizer", "[%s] disconnect() (this=%p, is_connected=%d, db=%s)",
              log_id(), (void*)this, is_connected_ ? 1 : 0,
-             db().config().path.c_str());
+             db_ptr_ ? db_ptr_->config().path.c_str() : "<unbound>");
     advance_reconnect_lifecycle(false);  // Invalidate already-queued retries too.
     is_connected_ = false;
     reconnect_attempts_ = 0;
@@ -1248,7 +1254,9 @@ void synchronizer_base::disconnect() {
     // A protected transport always retires on its pre-reserved native lane.
     // This remains true when destructor retirement already queued the slot.
     if(retire_protected_transport())return;
-    ws_client_->disconnect();
+    // A derived constructor may refuse its owner/route, throw in the factory,
+    // or receive a null transport before this member has been published.
+    if(ws_client_)ws_client_->disconnect();
 
     // An observer's slot carries no upload state — evict it on a clean
     // disconnect so it never lingers as a participant in anyone's floor.
@@ -3235,6 +3243,7 @@ synchronizer::synchronizer(std::shared_ptr<lattice_db> db, const sync_config& co
 
 synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config)
 {
+    if(!db)throw db_error("retained synchronizer requires owner");
     owned_db_ = std::move(db);
     db_ptr_ = owned_db_.get();
     auto sched = owned_db_->get_scheduler() ? owned_db_->get_scheduler() : std::make_shared<immediate_scheduler>();
@@ -3244,6 +3253,7 @@ synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& co
 synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
                            std::unique_ptr<sync_transport> transport)
 {
+    if(!db)throw db_error("retained synchronizer requires owner");
     owned_db_ = std::move(db);
     db_ptr_ = owned_db_.get();
     auto sched = owned_db_->get_scheduler() ? owned_db_->get_scheduler() : std::make_shared<immediate_scheduler>();

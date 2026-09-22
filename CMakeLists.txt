@@ -228,6 +228,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ExactVectorRowsTests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/SyncPartialConstructionTests.cpp
     Tests/LatticeCoreTests/SyncCommitProbeTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
     Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp

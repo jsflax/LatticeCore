@@ -397,6 +397,9 @@ protected:
     std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
     std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
     bool owns_inline_scheduler_adapter_=false;
+    // The completed base is destroyed even when a subclass constructor
+    // refuses a route before init_sync reaches the instance counter.
+    bool counted_instance_=false;
     friend struct detail::recovery_export_test_access;
     friend struct detail::sync_discovery_test_access;
     friend struct sync_discovery_admission_test_access;

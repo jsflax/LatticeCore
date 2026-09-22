@@ -1,6 +1,7 @@
 #include "recovery_producer_continuity.hpp"
 #include "sync_immediate_scheduler.hpp"
 #include "recovery_receiver_source.hpp"
+#include "recovery_receiver_controller.hpp"
 #include "sync_discovery_deferral.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "receive_delivery_guard.hpp"
@@ -675,11 +676,20 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     recovery_export_route_ = std::make_shared<detail::recovery_export_route>(ws_client_,callback_lifetime_);
     setup_transport_handlers();
     setup_observer();
+    // Validate before first dial, before the pacer can observe these members.
+    if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
+    receiver_controller_=detail::recovery_continuous_producer::attach_receiver(continuous_route_,owned_db_,receiver_source_,
+        std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_),scheduler_,callback_lifetime_);
+    if(receiver_controller_) {
+        const auto life=callback_lifetime_;
+        receiver_controller_->notifications([this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});},
+            [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{connect();});},
+            [this,life](std::exception_ptr error){const auto generation=life->dispatch_generation();life->queued(generation,[this,error]{
+                detail::report_sync_background_error(scheduler_,callback_lifetime_,callback_lifetime_->dispatch_generation(),on_error_,error,"canonical receiver");});});
+    }
 #ifndef __EMSCRIPTEN__
     start_pacer();
 #endif
-    // Validate before first dial, after the base owns complete teardown state.
-    if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
 }
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
@@ -711,11 +721,20 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
     setup_transport_handlers();
     setup_observer();
+    // Validate before first dial, before the pacer can observe these members.
+    if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
+    receiver_controller_=detail::recovery_continuous_producer::attach_receiver(continuous_route_,owned_db_,receiver_source_,
+        std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_),scheduler_,callback_lifetime_);
+    if(receiver_controller_) {
+        const auto life=callback_lifetime_;
+        receiver_controller_->notifications([this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});},
+            [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{connect();});},
+            [this,life](std::exception_ptr error){const auto generation=life->dispatch_generation();life->queued(generation,[this,error]{
+                detail::report_sync_background_error(scheduler_,callback_lifetime_,callback_lifetime_->dispatch_generation(),on_error_,error,"canonical receiver");});});
+    }
 #ifndef __EMSCRIPTEN__
     start_pacer();
 #endif
-    // Validate before first dial, after the base owns complete teardown state.
-    if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
 }
 
 void synchronizer_base::request_upload(bool background) {
@@ -976,17 +995,19 @@ void synchronizer_base::start_pacer() {
     const auto wait_schedule=detail::sync_background_test_hooks::pacer_wait;
     const auto heartbeat=std::chrono::milliseconds(config_.checkpoint_passive_interval_ms > 0
         ? std::min(config_.checkpoint_passive_interval_ms,60'000) : 60'000);
+    const bool receiver_tick=static_cast<bool>(receiver_controller_);
     last_passive_ckpt_=std::chrono::steady_clock::now();last_truncate_ckpt_=last_passive_ckpt_;
-    pacer_thread_=std::thread([this,state,lifetime,scheduled,queue,heartbeat,wait_schedule] {
+    pacer_thread_=std::thread([this,state,lifetime,scheduled,queue,heartbeat,receiver_tick,wait_schedule] {
         try {
         if(wait_schedule&&wait_schedule->starting)wait_schedule->starting();
         auto maintenance_at=std::chrono::steady_clock::now()+heartbeat;
+        auto receiver_at=receiver_tick?std::chrono::steady_clock::now()+std::chrono::milliseconds(100):std::chrono::steady_clock::time_point::max();
         std::unique_lock<std::mutex> lock(state->mutex);
         for (;;) {
             const auto revision=queue->revision();
             const bool requested=state->requested.load(std::memory_order_acquire);
             const auto coalesce=std::chrono::milliseconds(state->coalesce_milliseconds.load(std::memory_order_acquire));
-            auto wake=std::min(maintenance_at,queue->wake_at());
+            auto wake=std::min({maintenance_at,queue->wake_at(),receiver_at});
             if(coalesce.count()>0&&requested)wake=std::min(wake,state->next_allowed_tick);
             state->ready.wait_until(lock,wake,[&]{
                 const bool changed=state->stop||queue->revision()!=revision||
@@ -999,11 +1020,13 @@ void synchronizer_base::start_pacer() {
             const auto now=std::chrono::steady_clock::now();
             const bool maintenance=now>=maintenance_at;
             if(maintenance)maintenance_at=now+heartbeat;
+            const bool receiver_ready=receiver_tick&&now>=receiver_at;
+            if(receiver_ready)receiver_at=now+std::chrono::milliseconds(100);
             const bool upload=coalesce.count()>0&&now>=state->next_allowed_tick&&state->requested.exchange(false,std::memory_order_acq_rel);
             if(upload)state->next_allowed_tick=now+coalesce;
             lock.unlock();
             const auto generation=lifetime->dispatch_generation();
-            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload] {
+            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload,receiver_ready] {
                 on_error_handler error;
                 try {
                     error=on_error_;
@@ -1015,6 +1038,7 @@ void synchronizer_base::start_pacer() {
                     if(upload)background_upload();
                     if(!lifetime->current(generation))return;
                     pump_discovery();
+                    if(receiver_ready&&receiver_controller_&&lifetime->current(generation))receiver_controller_->wake();
                 }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,std::move(error),std::current_exception(),"pacer maintenance/discovery");}
             });
             lock.lock(); // Only independently retained state after owner callbacks.
@@ -1214,7 +1238,8 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
                 [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const transport_message& message) {
                     lifetime->platform_callback(lifecycle,attempt,[this,lifecycle,&attempt,&message] {
                         background_operation("transport message",[this,lifecycle,&attempt,&message] {
-                            if(receiver_source_&&receiver_source_->receive(attempt,lifecycle,message))return;
+                            if(receiver_controller_&&receiver_controller_->receive(attempt,lifecycle,message))return;
+                            if(receiver_source_&&receiver_source_->receive(attempt,lifecycle,message)){if(receiver_controller_)receiver_controller_->wake();return;}
                             on_transport_message(message);
                         });
                     });
@@ -1370,6 +1395,7 @@ void synchronizer_base::on_websocket_open() {
     // thread (e.g., IPC accept on the main thread). Reconciliation and the
     // initial upload must not block the caller.
     recovery_export_route_->publish(generation,true);
+    if(receiver_controller_){receiver_controller_->wake();return;}
     enqueue_discovery(detail::sync_discovery_kind::initial_upload,"initial upload",1024,[this,generation,lifetime](detail::sync_discovery_operation&) {
         if (is_destroyed_||!is_connected_||!lifetime->current(generation)) return true;
         bool busy=false;
@@ -1445,6 +1471,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                  (void*)this, db().config().path.c_str());
 
         if (event->event_type == server_sent_event::type::audit_log) {
+            if(receiver_controller_){receiver_controller_->request();return;} // canonical refresh, never legacy replacement/ACK
             // Dispatch to scheduler to serialize with upload_pending_changes.
             // Running apply_remote_changes on the IPC read thread causes
             // SQLite write contention (busy/locked) with the scheduler thread.
@@ -2791,6 +2818,7 @@ std::optional<bool> synchronizer_base::try_has_export_protection() {
 }
 
 bool synchronizer_base::upload_protected_entries(bool* discovery_busy) {
+    if(receiver_controller_&&receiver_controller_->blocks_ordinary()){receiver_controller_->wake();return true;}
 #ifdef __EMSCRIPTEN__
     return false;
 #else
@@ -3017,6 +3045,7 @@ void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::st
         if(!route->current(generation))return;
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:matched)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
         progress_acked_.fetch_add(static_cast<int64_t>(matched.size()));ack_resend_failures_.store(0);
+        if(receiver_controller_)receiver_controller_->request();
         schedule_background("ACK continuation",[this,route,generation]{if(!route->current(generation))return;background_upload();});
         return; // No canonical receipt, floor advance or eager audit cleanup.
     }

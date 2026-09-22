@@ -26,7 +26,7 @@ namespace lattice {
 
 // Forward declaration
 class lattice_db;
-namespace detail {class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;enum class sync_discovery_kind;struct sync_discovery_test_access;}
+namespace detail {class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;enum class sync_discovery_kind;struct sync_discovery_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -398,6 +398,7 @@ protected:
     std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
     std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
     std::shared_ptr<detail::receiver_source_binding> receiver_source_;
+    std::shared_ptr<detail::recovery_receiver_route> receiver_controller_;
     bool owns_inline_scheduler_adapter_=false;
     // The completed base is destroyed even when a subclass constructor
     // refuses a route before init_sync reaches the instance counter.

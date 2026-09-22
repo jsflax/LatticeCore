@@ -50,8 +50,9 @@ class recovery_obligation_producer_program {
     recovery_obligation_producer_profile profile_;
     recovery_obligation_limits obligations_;
     recovery_obligation_producer_limits producers_;
+    bool shared_domains_=false;
     recovery_obligation_producer_program(recovery_obligation_producer_profile,
-        recovery_obligation_limits,recovery_obligation_producer_limits);
+        recovery_obligation_limits,recovery_obligation_producer_limits,bool shared_domains=false);
 public:
     const recovery_obligation_producer_profile& profile() const noexcept { return profile_; }
     // Append immediately after the genuine generated AuditLog INSERT. The
@@ -78,6 +79,7 @@ class recovery_obligation_producer_store {
     recovery_obligation_limits obligations_;
     receive_install_limits installations_;
     recovery_obligation_producer_limits limits_;
+    bool shared_domains_=false;
     recovery_obligation_producer_store(std::shared_ptr<lattice_db>,
         recovery_obligation_limits,receive_install_limits,recovery_obligation_producer_limits);
     // Adapter-only enrollment/retirement. These retain the ordinary actual
@@ -94,14 +96,14 @@ class recovery_obligation_producer_store {
     // authority; exact owner/handle/hooks/program admission remains required.
     static recovery_obligation_producer_program compile(
         const recovery_obligation_producer_profile&,recovery_obligation_limits,
-        recovery_obligation_producer_limits);
+        recovery_obligation_producer_limits,bool shared_domains=false);
     // Read-only constructor/reopen exception: retain the unpublished physical
     // connection, require idle/nonwaiting admission, own one read snapshot,
     // enforce independent caps, and clean up exactly. No CREATE, migration,
     // writes, owner-WRITE inference or activation capability is permitted.
     static recovery_obligation_producer_inventory bootstrap_profiles(
         std::shared_ptr<database>,const recovery_obligation_producer_discovery_limits&,
-        const std::function<void(database&,const recovery_obligation_producer_inventory&)>& validate = {});
+        const std::function<void(database&,const recovery_obligation_producer_inventory&)>& validate = {},bool shared_domains=false);
 public:
     // Final assembler reads actual provenance in its retained owned transaction.
     // A returned value cannot be supplied back to record() to mint provenance.

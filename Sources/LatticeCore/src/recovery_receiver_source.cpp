@@ -200,4 +200,35 @@ bool receiver_source_binding::receive(const platform_transport_callbacks& attemp
 bool receiver_source_binding::described()const {
     std::shared_ptr<const record> current;{std::lock_guard lock(mutex_);current=current_;}return current&&current->described&&live(current);
 }
+std::optional<receiver_source_binding::recovery_view> receiver_source_binding::recovery_current()const {
+    std::shared_ptr<const record> current;{std::lock_guard lock(mutex_);current=current_;}
+    if(!current||!current->described||!live(current))return std::nullopt;
+    return recovery_view{std::move(current)};
+}
+bool receiver_source_binding::recovery_live(const recovery_view& view)const {
+    {std::lock_guard lock(mutex_);if(current_!=view.value)return false;}
+    return view.value&&view.value->described&&live(view.value);
+}
+bool receiver_source_binding::recovery_expired()const {
+    std::shared_ptr<const record> current;{std::lock_guard lock(mutex_);current=current_;}
+    return current&&current->described&&now()>=current->deadline;
+}
+bool receiver_source_binding::recovery_matches(const recovery_view& view,const platform_transport_callbacks& attempt,uint64_t lifecycle)const {
+    return view.value&&view.value->lifecycle==lifecycle&&view.value->endpoint.matches(attempt)&&recovery_live(view);
+}
+std::string receiver_source_binding::recovery_description(const recovery_view& view)const {
+    if(!recovery_live(view))reject("receiver controller source view retired");
+    auto result=view.value->response.dump();if(result.size()>max_bytes)reject("receiver controller descriptor bound");return result;
+}
+uint64_t receiver_source_binding::recovery_lifecycle(const recovery_view& view)const {
+    if(!recovery_live(view))reject("receiver controller source view retired");return view.value->lifecycle;
+}
+int64_t receiver_source_binding::recovery_remaining(const recovery_view& view)const {
+    if(!recovery_live(view))return 0;return std::max<int64_t>(0,view.value->deadline-now());
+}
+bool receiver_source_binding::recovery_send(const recovery_view& view,owned_platform_sync_transport& transport,const transport_message& message)const {
+    // No SQL or caller callback while the binding leaf is held. The actual SDK
+    // also fences the captured endpoint before its eventual socket operation.
+    if(!recovery_live(view))return false;return transport.send_to_attempt(view.value->endpoint,message);
+}
 }

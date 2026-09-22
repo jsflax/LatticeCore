@@ -1,4 +1,5 @@
 #include "receive_install_state.hpp"
+#include "recovery_producer_continuity.hpp"
 #include "recovery_writer_access.hpp"
 #include <limits>
 #include <algorithm>
@@ -191,6 +192,7 @@ receive_install_store::receive_install_store(std::shared_ptr<lattice_db> owner,r
     : owner_(std::move(owner)),limits_(limits) {
     if (!owner_ || limits.channels<0 || limits.field_bytes<=0 || limits.field_bytes>(maximum-176)/16 || limits.encoded_bytes<0)
         fail(code::invalid_argument,"receiver installation requires owner and representable explicit limits");
+    shared_domain_=recovery_continuous_producer::shared_install_domains(*owner_);
 }
 database& receive_install_store::connection() const {
     auto* db=recovery_writer_access::active_writer(*owner_);
@@ -204,8 +206,19 @@ receive_install_usage receive_install_store::configuration() const {
         sql+=integer_projection(name);
     }
     auto rows=connection().query(sql+" FROM main._lattice_install_store LIMIT 2");
-    if (rows.size()!=1 || integer(rows[0],"id")!=1 || integer(rows[0],"version")!=1)
+    if (rows.size()!=1 || integer(rows[0],"id")!=1 || integer(rows[0],"version")!=(shared_domain_?2:1))
         fail(code::corrupt_state,"receiver installation missing/unsupported fixed metadata");
+    if(shared_domain_) {
+        // This is a fresh explicit profile, never an in-place removal of v1's
+        // uniqueness contract. Check its exact durable table/index spelling.
+        const auto schema=connection().query("SELECT type,name,CASE WHEN length(CAST(sql AS BLOB))<=2048 THEN sql END AS sql FROM main.sqlite_schema WHERE name IN ('_lattice_install_channel','_lattice_install_domain') ORDER BY name LIMIT 3");
+        const std::string table="CREATE TABLE _lattice_install_channel(channel BLOB PRIMARY KEY NOT NULL,authority BLOB NOT NULL,source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_digest BLOB NOT NULL,frontier_kind INTEGER NOT NULL,frontier INTEGER,revision INTEGER NOT NULL,last_sequence INTEGER NOT NULL,active BLOB,last_install BLOB,bytes INTEGER NOT NULL) WITHOUT ROWID";
+        const std::string index="CREATE INDEX _lattice_install_domain ON _lattice_install_channel(authority,scope)";
+        const auto text=[](const row_t& row,const char* key)->std::string {const auto it=row.find(key);if(it==row.end()||!std::holds_alternative<std::string>(it->second))fail(code::corrupt_state,"receiver shared domain schema type differs");return std::get<std::string>(it->second);};
+        if(schema.size()!=2||text(schema[0],"type")!="table"||text(schema[0],"name")!="_lattice_install_channel"||text(schema[0],"sql")!=table||
+           text(schema[1],"type")!="index"||text(schema[1],"name")!="_lattice_install_domain"||text(schema[1],"sql")!=index)
+            fail(code::corrupt_state,"receiver shared domain schema/version differs; migration refused");
+    }
     const auto& r=rows[0];
     if (receive_install_limits{integer(r,"max_channels"),integer(r,"max_field_bytes"),integer(r,"max_bytes")}!=limits_)
         fail(code::limits_mismatch,"receiver installation explicit limits differ from durable configuration");
@@ -276,12 +289,22 @@ void receive_install_store::initialize() {
         db.execute("CREATE TABLE main._lattice_install_store(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,"
             "max_channels INTEGER NOT NULL,max_field_bytes INTEGER NOT NULL,max_bytes INTEGER NOT NULL,"
             "channels INTEGER NOT NULL,bytes INTEGER NOT NULL) WITHOUT ROWID");
+        if(shared_domain_) {
+            db.execute("CREATE TABLE main._lattice_install_channel(channel BLOB PRIMARY KEY NOT NULL,authority BLOB NOT NULL,"
+                "source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_digest BLOB NOT NULL,"
+                "frontier_kind INTEGER NOT NULL,frontier INTEGER,revision INTEGER NOT NULL,last_sequence INTEGER NOT NULL,"
+                "active BLOB,last_install BLOB,bytes INTEGER NOT NULL) WITHOUT ROWID");
+            db.execute("CREATE INDEX _lattice_install_domain ON _lattice_install_channel(authority,scope)");
+            db.execute("INSERT INTO main._lattice_install_store VALUES(1,2,?,?,?,0,0)",
+                {limits_.channels,limits_.field_bytes,limits_.encoded_bytes});changed(db);
+        } else {
         db.execute("CREATE TABLE main._lattice_install_channel(channel BLOB PRIMARY KEY NOT NULL,authority BLOB NOT NULL,"
             "source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_digest BLOB NOT NULL,"
             "frontier_kind INTEGER NOT NULL,frontier INTEGER,revision INTEGER NOT NULL,last_sequence INTEGER NOT NULL,"
             "active BLOB,last_install BLOB,bytes INTEGER NOT NULL,UNIQUE(authority,scope)) WITHOUT ROWID");
         db.execute("INSERT INTO main._lattice_install_store VALUES(1,1,?,?,?,0,0)",
             {limits_.channels,limits_.field_bytes,limits_.encoded_bytes}); changed(db);
+        }
         if (configuration()!=receive_install_usage{}) fail(code::corrupt_state,"receiver installation initialization was altered");
         return true;
     });
@@ -298,15 +321,28 @@ void receive_install_store::audit() const {
         auto key=bounded_string(keys[0],"channel",limits_.field_bytes);
         const auto s=row(key);
         if (!s) fail(code::corrupt_state,"receiver installation channel disappeared during owned audit");
+        if(shared_domain_)verify_domain_aliases(s->binding);
+        else {
         if (connection().query("SELECT 1 FROM main._lattice_install_channel WHERE authority=? AND scope=? LIMIT 2",
                 {bytes(s->binding.authority),bytes(s->binding.scope)}).size()!=1)
             fail(code::corrupt_state,"receiver installation duplicate authority/scope alias");
+        }
         const auto n=row_size(*s,limits_);
         if (!fits(actual.channels,1,limits_.channels) || !fits(actual.encoded_bytes,n,limits_.encoded_bytes))
             fail(code::corrupt_state,"receiver installation actual usage exceeds limits");
         ++actual.channels; actual.encoded_bytes+=n; previous=std::move(key);
     }
     if (actual!=expected) fail(code::corrupt_state,"receiver installation durable usage differs from full audit");
+}
+void receive_install_store::verify_domain_aliases(const receive_install_binding& binding)const {
+    const auto keys=connection().query("SELECT "+bounded_projection("channel",limits_.field_bytes)+
+        " FROM main._lattice_install_channel WHERE authority=? AND scope=? ORDER BY channel LIMIT 17",
+        {bytes(binding.authority),bytes(binding.scope)});
+    if(keys.size()>16)fail(code::capacity,"receiver shared domain channel capacity");
+    for(const auto& key:keys){const auto existing=row(bounded_string(key,"channel",limits_.field_bytes));
+        if(!existing||existing->binding.authority!=binding.authority||existing->binding.source!=binding.source||existing->binding.epoch!=binding.epoch||
+           existing->binding.scope!=binding.scope||existing->binding.schema!=binding.schema)
+            fail(code::binding_mismatch,"receiver shared domain source/epoch/schema differs");}
 }
 receive_install_usage receive_install_store::usage() const { return configuration(); }
 std::optional<receive_install_snapshot> receive_install_store::read(const std::string& channel) const {
@@ -347,8 +383,11 @@ void receive_install_store::bind(const receive_install_binding& b) {
     atomic(db,[&] {
         const auto existing=row(b.channel); covered(existing,u,limits_);
         if (existing) { bound(*existing,b); return true; }
+        if(shared_domain_)verify_domain_aliases(b);
+        else {
         if (!db.query("SELECT 1 FROM main._lattice_install_channel WHERE authority=? AND scope=? LIMIT 1",{bytes(b.authority),bytes(b.scope)}).empty())
             fail(code::alias,"receiver installation authority/scope already belongs to another channel");
+        }
         receive_install_snapshot s; s.binding=b; write_row(s,nullptr); return true;
     });
 }

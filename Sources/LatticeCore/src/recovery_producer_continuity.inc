@@ -4,25 +4,36 @@ void recovery_local_producer_adapter::compile_continuous(lattice_db& owner,conte
     for(auto& p:admitted.profiles)for(const auto& [name,t]:p.schema.tables)relations[name].push_back(&p);
     size_t aggregate=0;
     for(auto& [name,contributions]:relations) {
-        auto& first=contributions.front()->schema.tables.at(name);std::string tail,guards;
+        auto& first=contributions.front()->schema.tables.at(name);std::string tail,guards,install_guards;
         for(auto* contribution:contributions) {
             auto& table=contribution->schema.tables.at(name);const auto& p=contribution->stored;
             if(table.ddl!=first.ddl||table.columns!=first.columns||table.no_history!=first.no_history||table.link!=first.link||table.ordinary!=first.ordinary)
                 refuse("continuous shared relation descriptor differs");
-            const auto emitted=recovery_obligation_producer_store::compile(p,admitted.admitted_limits.obligations,admitted.admitted_limits.producers).emit_tail(name,table.link,max_sql);
+            const auto emitted=recovery_obligation_producer_store::compile(p,admitted.admitted_limits.obligations,admitted.admitted_limits.producers,continuous_receiver_enabled(*admitted.continuous->state)).emit_tail(name,table.link,max_sql);
             if(emitted.size()>max_sql-tail.size())refuse("continuous combined generated tail bound");tail+=emitted;
             if(!guards.empty())guards+=" AND ";
+            if(!install_guards.empty())install_guards+=" AND ";
+            install_guards+="lattice_recovery_producer_guard_v1("+literal(p.contribution.binding.channel)+","+std::to_string(p.contribution_incarnation)+","+
+                std::to_string(p.program_revision)+","+literal(p.program_digest)+","+literal(name)+",2)=1";
             guards+="lattice_recovery_producer_guard_v1("+literal(p.contribution.binding.channel)+","+std::to_string(p.contribution_incarnation)+","+
                 std::to_string(p.program_revision)+","+literal(p.program_digest)+","+literal(name)+",1)=1";
         }
         // Every contribution tail follows the SAME genuine AuditLog insert.
         // WITHOUT ROWID metadata preserves last_insert_rowid across tails.
+        if(continuous_receiver_enabled(*admitted.continuous->state)) {
+            // Count actual distinct unresolved originals after every generated
+            // contribution has been inserted, in this same model transaction.
+            // The 8,193-row result is bounded; SQLite may scan the admitted
+            // journal's full finite raw-record cap (at most 100,000 records).
+            tail+=require("(SELECT COUNT(*) FROM (SELECT DISTINCT original FROM _lattice_obligation_entry WHERE stage<>2 ORDER BY original LIMIT 8193))<=8192");
+        }
         std::vector<std::string> emitted;
         if(first.link)owner.create_link_table_triggers(name,tail,&emitted);
         else owner.create_model_table_triggers(name,first.columns,first.no_history,tail,&emitted);
         for(const char* operation:{"INSERT","UPDATE","DELETE"}) {
             const std::string op(operation),key=op=="DELETE"?"OLD.globalId":"NEW.globalId";
             std::string check="sync_disabled()=0 AND ("+guards+") AND (SELECT phase FROM main._lattice_producer_continuity WHERE id=1)=0 AND lattice_recovery_producer_uuid_v1("+key+") IS NOT NULL";
+            if(continuous_receiver_enabled(*admitted.continuous->state))check="(("+check+") OR (sync_disabled()=1 AND ("+install_guards+") AND lattice_recovery_producer_uuid_v1("+key+") IS NOT NULL))";
             if(op=="UPDATE")check+=" AND CAST(OLD.globalId AS BLOB) IS CAST(NEW.globalId AS BLOB)"+(first.link?std::string(" AND OLD.lhs IS NEW.lhs AND OLD.rhs IS NEW.rhs"):std::string(" AND OLD.id IS NEW.id"));
             emitted.push_back("CREATE TRIGGER _lattice_local_producer_"+name+"_"+op+" BEFORE "+op+" ON "+name+" BEGIN"+require(check)+" END");
         }
@@ -87,6 +98,7 @@ void recovery_continuous_producer::require_no_continuous_export(database& writer
 void require_continuous_legacy_export_absent(database& writer){recovery_continuous_producer::require_no_continuous_export(writer);}
 void require_continuous_raw_handle_absent(database& writer){recovery_continuous_producer::require_no_continuous_export(writer);}
 bool recovery_continuous_producer::attached(const lattice_db& owner)noexcept{return static_cast<bool>(owner.recovery_continuous_);}
+bool recovery_continuous_producer::shared_install_domains(const lattice_db& owner)noexcept{return owner.recovery_continuous_&&continuous_receiver_enabled(*owner.recovery_continuous_->state);}
 void recovery_continuous_producer::require_no_continuous_route(lattice_db& owner) {
     if(owner.recovery_continuous_)refuse("continuous unsupported route before publication");
     require_no_continuous_export(*owner.db_);
@@ -184,15 +196,26 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
                 receiver.bind(contribution.profile.binding);const auto scope=journal.bind(contribution.profile);
                 recovery_local_producer_grant grant{scope.address,contribution.models,contribution.incoming_grant_claim};
                 auto description=recovery_local_producer_adapter::describe(*owner,db,grant,true);
+                if(continuous_receiver_enabled(*state))for(const auto& prior:candidate->profiles) {
+                    const auto& binding=prior.stored.contribution.binding;
+                    if(binding.authority==contribution.profile.binding.authority&&binding.scope==contribution.profile.binding.scope) {
+                        const auto previous=grant_from(prior.stored);
+                        if(previous.models!=grant.models||previous.incoming_grant_receipt!=grant.incoming_grant_receipt||prior.schema.tables.size()!=description.tables.size())
+                            refuse("continuous shared domain model/catalog contract differs");
+                        for(const auto& [name,table]:description.tables){const auto found=prior.schema.tables.find(name);
+                            if(found==prior.schema.tables.end()||found->second.link!=table.link||found->second.columns!=table.columns||found->second.no_history!=table.no_history)
+                                refuse("continuous shared domain actual catalog differs");}
+                    }
+                }
                 for(const auto& [name,table]:description.tables)if(actual_programs(db,name)!=table.ordinary)refuse("continuous initial generated inventory differs");
-                recovery_obligation_producer_profile profile{scope.profile,scope.address.incarnation,2,description.digest,description.manifest};
+                recovery_obligation_producer_profile profile{scope.profile,scope.address.incarnation,continuous_receiver_enabled(*state)?3:2,description.digest,description.manifest};
                 producer.enroll(profile);candidate->profiles.push_back({profile,std::move(description)});
             }
             recovery_local_producer_adapter::compile_continuous(*owner,*candidate);
             recovery_local_producer_adapter::register_context(db,candidate);
             db.execute(continuous_ddl);for(const auto& [name,sql]:continuous_guards())db.execute(sql);
-            db.execute("INSERT INTO _lattice_producer_continuity VALUES(1,1,?,?,?,?,?,?,?,?,1,0,0,0)",
-                {state->manifest,blob(state->digest.begin(),state->digest.end()),static_cast<int64_t>(state->identity->device),static_cast<int64_t>(state->identity->inode),state->parent_device,state->parent_inode,state->container_device,state->container_inode});
+            db.execute("INSERT INTO _lattice_producer_continuity VALUES(1,?,?,?,?,?,?,?,?,?,1,0,0,0)",
+                {int64_t(continuous_receiver_enabled(*state)?2:1),state->manifest,blob(state->digest.begin(),state->digest.end()),static_cast<int64_t>(state->identity->device),static_cast<int64_t>(state->identity->inode),state->parent_device,state->parent_inode,state->container_device,state->container_inode});
             db.execute("PRAGMA recursive_triggers=ON");
             for(const auto& [name,sql]:retention_programs())db.execute(sql);
             std::set<std::string> installed;
@@ -200,6 +223,7 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
                 for(const auto& [key,sql]:table.ordinary)db.execute("DROP TRIGGER "+key);
                 for(const auto& [key,sql]:table.enrolled)db.execute(sql);
             }
+            if(continuous_receiver_enabled(*state))recovery_receiver_controller::initialize_owned(owner,state->policy);
             new_incarnation=1;owner->store_recovery_fingerprints();
         } else {
             continuous_verify_row(db,*state,false);
@@ -217,7 +241,9 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
             recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);
             receive_install_store receiver(owner,state->policy.limits.installations);journal.audit();receiver.audit();
             if(journal.usage().scopes!=static_cast<int64_t>(state->policy.contributions.size())||receiver.usage().channels!=static_cast<int64_t>(state->policy.contributions.size()))refuse("continuous extra or missing journal/receiver contribution");
-            for(const auto& profile:candidate->profiles){
+            if(continuous_receiver_enabled(*state)) {
+                recovery_receiver_controller::validate_reopen_owned(owner,state->policy,phase,attempt);
+            } else for(const auto& profile:candidate->profiles){
                 const auto scope=journal.read(profile.stored.contribution.binding.channel);
                 const auto received=receiver.read(profile.stored.contribution.binding.channel);
                 const auto prior_attempt=phase==0?attempt:attempt-1;
@@ -259,7 +285,7 @@ std::shared_ptr<recovery_continuous_route> recovery_continuous_producer::admit_r
     if(checked.state!=recovery_install_state::committed){if(checked.primary_error)std::rethrow_exception(checked.primary_error);refuse("continuous route admission did not commit");}
     auto route=std::shared_ptr<recovery_continuous_route>(new recovery_continuous_route);
     {std::lock_guard<std::mutex> lock(state->mutex);
-     if(!state->initialized||!state->dml_open.load(std::memory_order_acquire)||state->routes==state->policy.physical_routes||state->next_route==std::numeric_limits<uint64_t>::max())refuse("continuous route gate closed or full");
+     if(!state->initialized||(!state->dml_open.load(std::memory_order_acquire)&&!continuous_receiver_enabled(*state))||state->routes==state->policy.physical_routes||state->next_route==std::numeric_limits<uint64_t>::max())refuse("continuous route gate closed or full");
      route->route_=++state->next_route;route->incarnation_=state->incarnation;route->owner_=owner;route->state_=state;++state->routes;}
     return route;
 }
@@ -275,10 +301,37 @@ std::shared_ptr<recovery_continuous_work> recovery_continuous_producer::admit_wo
 void recovery_continuous_producer::verify_work(const std::shared_ptr<recovery_continuous_work>& work,lattice_db& owner,database& writer) {
     if(!owner.recovery_continuous_){if(work)refuse("continuous work on legacy owner");return;}
     auto state=owner.recovery_continuous_->state;
-    if(!work||work->owner_.get()!=&owner||work->state_!=state||work->incarnation_!=state->incarnation||!work->route_||!work->physical_)refuse("continuous export lacks retained admission");
+    if(!work||work->reconciliation_||work->owner_.get()!=&owner||work->state_!=state||work->incarnation_!=state->incarnation||!work->route_||!work->physical_)refuse("continuous export lacks retained admission");
     continuous_verify_row(writer,*state);
     const auto row=writer.query(continuous_query).at(0);
-    if(integer(row,"phase")==2)refuse("continuous export arrived after frozen Q");
+    if(integer(row,"phase")>=2)refuse("continuous export arrived after frozen Q");
+}
+std::shared_ptr<recovery_continuous_work> recovery_continuous_producer::admit_reconciliation_work(
+    const std::shared_ptr<const recovery_reconciliation_descriptor>& descriptor,const std::shared_ptr<recovery_continuous_route>& route,
+    std::shared_ptr<lattice_db> owner,uint64_t physical) {
+    recovery_receiver_controller::verify_reconciliation_route(descriptor,route,owner,physical);
+    if(!owner->recovery_continuous_||route->owner_.lock()!=owner||route->state_!=owner->recovery_continuous_->state)refuse("restricted work actual continuous route differs");
+    auto state=route->state_;auto work=std::shared_ptr<recovery_continuous_work>(new recovery_continuous_work);
+    // Retain payloads before entering the leaf; failure/destruction runs off it.
+    work->reconciliation_=descriptor;work->restricted_route_=route;work->owner_=owner;
+    {std::lock_guard lock(state->mutex);if(!continuous_receiver_enabled(*state)||state->dml_open.load()||state->incarnation!=route->incarnation_||
+        state->incarnation!=descriptor->physical_incarnation()||state->barrier!=descriptor->barrier()||state->attempt!=descriptor->attempt()||state->operations==state->policy.operations)
+            refuse("restricted work gate changed or full");
+        work->route_=route->route_;work->physical_=physical;work->incarnation_=state->incarnation;work->state_=state;++state->operations;}
+    return work;
+}
+recovery_install_result recovery_continuous_producer::reconciliation_export_owned(std::shared_ptr<lattice_db> owner,
+    const std::shared_ptr<recovery_continuous_work>& work,const std::vector<std::string>& originals,const std::function<void(database&)>& body) {
+    return recovery_writer_access::install(owner,[&](database& db){
+        if(!work||!work->reconciliation_||work->owner_!=owner||!owner->recovery_continuous_||work->state_!=owner->recovery_continuous_->state)
+            refuse("restricted export lost counted descriptor custody");
+        auto state=work->state_;
+        const auto verify=[&]{recovery_receiver_controller::verify_reconciliation_route(work->reconciliation_,work->restricted_route_,owner,work->physical_,&originals);
+            continuous_verify_row(db,*state);const auto row=db.query(continuous_query).at(0);
+            if(integer(row,"phase")!=4||integer(row,"incarnation")!=work->incarnation_||integer(row,"barrier")!=work->reconciliation_->barrier()||
+                integer(row,"attempt")!=work->reconciliation_->attempt())refuse("restricted export durable generation changed");};
+        verify();continuous_frame claim(*state,db,2);body(db);verify();
+    });
 }
 recovery_install_result recovery_continuous_producer::export_owned(std::shared_ptr<lattice_db> owner,const std::shared_ptr<recovery_continuous_work>& work,const std::function<void(database&)>& body) {
     return recovery_writer_access::install(owner,[&](database& db){
@@ -345,7 +398,7 @@ recovery_continuous_quiescence recovery_continuous_producer::finish(const recove
             auto snapshot=journal.snapshot_for_install(scope->address,token.attempt_);
             for(const auto& entry:snapshot.entries){
                 const auto stamp=recovery_obligation_producer_store::read_stamp(token.owner_,state->policy.limits.obligations,state->policy.limits.installations,state->policy.limits.producers,scope->address,entry.record.original_id);
-                if(!stamp||stamp->contribution_incarnation!=scope->address.incarnation||stamp->program_revision!=2||stamp->program_digest!=profile.program_digest||stamp->audit_id!=entry.record.audit_id||stamp->record_sequence!=entry.sequence||entry.record.origin!=recovery_obligation_origin::local_candidate||entry.stage!=recovery_obligation_stage::open)
+                if(!stamp||stamp->contribution_incarnation!=scope->address.incarnation||stamp->program_revision!=(continuous_receiver_enabled(*state)?3:2)||stamp->program_digest!=profile.program_digest||stamp->audit_id!=entry.record.audit_id||stamp->record_sequence!=entry.sequence||entry.record.origin!=recovery_obligation_origin::local_candidate||entry.stage!=recovery_obligation_stage::open)
                     refuse("continuous finite Q lacks exact generated provenance");
                 const auto [at,added]=originals.emplace(entry.canonical_original_id,entry.record);
                 if(!added&&at->second!=entry.record)refuse("continuous shared original target/body identity differs");
@@ -378,6 +431,7 @@ recovery_install_result recovery_continuous_producer::cancel(const recovery_cont
     auto state=token.state_.lock();uint64_t gate_revision=0;
     const auto result=recovery_writer_access::install(token.owner_,[&](database& db){
         if(!state||!token.owner_->recovery_continuous_||token.owner_->recovery_continuous_->state!=state)refuse("continuous cancel custody expired");
+        if(continuous_receiver_enabled(*state))refuse("enabled controller owns canonical cancellation; public barrier cannot reopen its gate");
         continuous_verify_row(db,*state);const auto row=db.query(continuous_query).at(0);
         if(token.incarnation_!=state->incarnation||integer(row,"barrier")!=token.barrier_||integer(row,"attempt")!=token.attempt_||integer(row,"phase")==0)refuse("continuous cancel stale barrier");
         {std::lock_guard<std::mutex> lock(state->mutex);if(state->operations||state->dml_open.load(std::memory_order_acquire))refuse("continuous cancel has live work");gate_revision=state->gate_revision;}
@@ -394,12 +448,13 @@ recovery_install_result recovery_continuous_producer::cancel(const recovery_cont
     return result;
 }
 void recovery_continuous_producer::verify_for_owned_write(const verified_unsent_set& value) {
-    auto state=value.state_.lock();if(!state||!value.owner_||value.owner_->is_closed()||!value.owner_->recovery_continuous_||value.owner_->recovery_continuous_->state!=state)refuse("continuous UNSENT custody expired");
-    auto* writer=recovery_writer_access::active_writer(*value.owner_);if(!writer)refuse("continuous UNSENT verification needs actual owned WRITE");
+    const auto owner=value.owner_?value.owner_:value.controller_owner_.lock();
+    auto state=value.state_.lock();if(!state||!owner||owner->is_closed()||!owner->recovery_continuous_||owner->recovery_continuous_->state!=state)refuse("continuous UNSENT custody expired");
+    auto* writer=recovery_writer_access::active_writer(*owner);if(!writer)refuse("continuous UNSENT verification needs actual owned WRITE");
     continuous_verify_row(*writer,*state);const auto row=writer->query(continuous_query).at(0);
     if(value.incarnation_!=state->incarnation||value.policy_digest_!=state->digest||integer(row,"phase")!=2||integer(row,"barrier")!=value.barrier_)refuse("continuous UNSENT generation changed");
     {std::lock_guard<std::mutex> lock(state->mutex);if(state->operations||state->dml_open.load(std::memory_order_acquire))refuse("continuous UNSENT work not settled");}
-    recovery_obligation_store journal(value.owner_,state->policy.limits.obligations,state->policy.limits.installations);
+    recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);
     for(const auto& snapshot:value.journals_)if(!same_snapshot(snapshot,journal.snapshot_for_install(snapshot.scope.address,integer(row,"attempt"))))refuse("continuous UNSENT frozen Q changed");
 }
 
@@ -409,6 +464,7 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     const auto state=owner.recovery_continuous_->state;
     sync_config config;config.websocket_url=owner.config_.websocket_url;config.authorization_token=owner.config_.authorization_token;
     config.sync_id="wss:"+config.websocket_url;config.sync_filter=owner.config_.sync_filter;config.is_observer=owner.config_.sync_is_observer;
+    config.recovery_source_expectation=owner.config_.recovery_source_expectation;
     owner.config_.tuning.apply(config);
     for(const auto& route:state->policy.routes)config.all_active_sync_ids.push_back(route.sync_id);
     bool admitted=false;for(const auto& route:state->policy.routes)if(route.sync_id==config.sync_id&&route.endpoint==config.websocket_url)admitted=true;
@@ -425,4 +481,117 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
 #else
     (void)owner;refuse("continuous browser route not implemented");
 #endif
+}
+
+std::shared_ptr<recovery_receiver_route> recovery_continuous_producer::attach_receiver(
+    const std::shared_ptr<recovery_continuous_route>& route,std::shared_ptr<lattice_db> owner,
+    const std::shared_ptr<receiver_source_binding>& source,const std::shared_ptr<owned_platform_sync_transport>& transport,
+    const std::shared_ptr<scheduler>& scheduler,const std::shared_ptr<sync_callback_lifetime>& lifetime) {
+    if(!owner||!owner->recovery_continuous_)return {};
+    auto state=owner->recovery_continuous_->state;
+    if(!continuous_receiver_enabled(*state))return {};
+    if(!route||route->state_!=state||route->owner_.lock()!=owner||route->incarnation_!=state->incarnation||
+       !source||!transport||!scheduler||!lifetime)refuse("continuous receiver requires its actual authenticated platform route");
+    // Construct outside the leaf: no destructor, allocator or platform callback
+    // runs while a producer registration lock is held.
+    auto candidate=std::shared_ptr<recovery_receiver_controller>(new recovery_receiver_controller(state->policy));
+    std::shared_ptr<recovery_receiver_controller> controller;
+    {std::lock_guard<std::mutex> lock(state->mutex);controller=state->controller.lock();if(!controller){controller=candidate;state->controller=controller;}}
+    return controller->attach(std::move(owner),route,source,transport,scheduler,lifetime);
+}
+recovery_install_result recovery_continuous_producer::controller_owned(const recovery_receiver_controller& controller,
+    std::shared_ptr<lattice_db> owner,const std::function<void(database&)>& body) {
+    return recovery_writer_access::install(owner,[&](database& db){
+        if(!owner->recovery_continuous_)refuse("controller lost actual continuous owner");
+        auto state=owner->recovery_continuous_->state;
+        if(!continuous_receiver_enabled(*state))refuse("controller profile is not enabled");
+        {std::lock_guard<std::mutex> lock(state->mutex);if(state->controller.lock().get()!=&controller)refuse("controller physical registration changed");}
+        continuous_verify_row(db,*state);
+        continuous_frame frame(*state,db,6);body(db);
+        continuous_verify_row(db,*state);state->verify_file(db);
+    });
+}
+void recovery_continuous_producer::controller_park_proof(verified_unsent_set& proof) {
+    if(!proof.owner_||!proof.owner_->recovery_continuous_||!continuous_receiver_enabled(*proof.owner_->recovery_continuous_->state))refuse("controller proof parking requires actual enabled owner");
+    proof.controller_owner_=proof.owner_;proof.owner_.reset();
+}
+int64_t recovery_continuous_producer::controller_next_attempt_owned(std::shared_ptr<lattice_db> owner) {
+    if(!owner||!owner->recovery_continuous_)refuse("controller missing retained owner");
+    const auto state=owner->recovery_continuous_->state;
+    auto* writer=recovery_writer_access::active_writer(*owner);
+    if(!writer||!continuous_install_owned(*owner->recovery_continuous_))refuse("controller sequence read outside checked operation");
+    continuous_verify_row(*writer,*state);
+    receive_install_store receiver(owner,state->policy.limits.installations);std::optional<int64_t> next;
+    for(const auto& c:state->policy.contributions){const auto current=receiver.read(c.profile.binding.channel);
+        if(!current||current->binding!=c.profile.binding||current->active||current->last_sequence==INT64_MAX)refuse("controller receiver cannot start next attempt");
+        if(next&&*next!=current->last_sequence+1)refuse("controller contribution sequences differ");next=current->last_sequence+1;}
+    if(!next)refuse("controller empty contribution inventory");return *next;
+}
+const recovery_owner_schema& recovery_continuous_producer::controller_catalog(const lattice_db& owner)noexcept {
+    return owner.recovery_declarations();
+}
+void recovery_continuous_producer::controller_installed_owned(const recovery_receiver_controller& controller,const verified_unsent_set& proof) {
+    auto owner=proof.owner_?proof.owner_:proof.controller_owner_.lock();auto state=proof.state_.lock();
+    if(!owner||!state||!owner->recovery_continuous_||owner->recovery_continuous_->state!=state||
+       !continuous_install_owned(*owner->recovery_continuous_)||proof.incarnation_!=state->incarnation||proof.policy_digest_!=state->digest)
+        refuse("controller installation lost frozen physical custody");
+    {std::lock_guard<std::mutex> lock(state->mutex);if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load())refuse("controller installation gate changed");}
+    auto* writer=recovery_writer_access::active_writer(*owner);if(!writer)refuse("controller installation needs owned WRITE");
+    continuous_verify_row(*writer,*state);const auto row=writer->query(continuous_query).at(0);
+    if(integer(row,"phase")!=2||integer(row,"barrier")!=proof.barrier_)refuse("controller installation barrier changed");
+    recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);
+    receive_install_store receiver(owner,state->policy.limits.installations);
+    for(const auto& before:proof.journals_){const auto scope=journal.read(before.scope.address.channel);const auto actual=receiver.read(before.scope.address.channel);
+        if(!scope||!actual||scope->address!=before.scope.address||scope->profile!=before.scope.profile||scope->mode!=recovery_obligation_mode::installed||
+           !actual->last_installed||actual->active||scope->installed_sequence!=integer(row,"attempt")||scope->installed_sequence!=actual->last_installed->sequence||
+           scope->installed_manifest!=actual->last_installed->manifest_digest||scope->installed_head!=actual->last_installed->head||scope->installed_revision!=actual->revision)
+            refuse("controller missing exact all-contribution installed evidence");}
+    writer->execute("UPDATE _lattice_producer_continuity SET phase=3 WHERE id=1 AND phase=2 AND barrier=? AND attempt=?",{proof.barrier_,integer(row,"attempt")});
+    const auto after=writer->query(continuous_query).at(0);
+    if(integer(after,"phase")!=3||integer(after,"barrier")!=proof.barrier_||integer(after,"attempt")!=integer(row,"attempt"))refuse("controller installed transition changed");
+}
+void recovery_continuous_producer::controller_resume_owned(const recovery_receiver_controller& controller,std::shared_ptr<lattice_db> owner,int64_t barrier,int64_t attempt) {
+    if(!owner||!owner->recovery_continuous_||!continuous_install_owned(*owner->recovery_continuous_))refuse("controller resume outside checked WRITE");
+    auto state=owner->recovery_continuous_->state;auto* writer=recovery_writer_access::active_writer(*owner);
+    {std::lock_guard<std::mutex> lock(state->mutex);if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load())refuse("controller resume gate changed");}
+    continuous_verify_row(*writer,*state);const auto row=writer->query(continuous_query).at(0);
+    if(integer(row,"phase")!=3||integer(row,"barrier")!=barrier||integer(row,"attempt")!=attempt)refuse("controller resume durable barrier changed");
+    recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);
+    receive_install_store receiver(owner,state->policy.limits.installations);
+    for(const auto& c:state->policy.contributions){const auto scope=journal.read(c.profile.binding.channel);const auto actual=receiver.read(c.profile.binding.channel);
+        if(!scope||scope->profile!=c.profile||scope->mode!=recovery_obligation_mode::recording||!actual||actual->active||!actual->last_installed||
+           scope->installed_sequence!=attempt||actual->last_installed->sequence!=attempt||scope->installed_manifest!=actual->last_installed->manifest_digest||
+           scope->installed_head!=actual->last_installed->head||scope->installed_revision!=actual->revision)refuse("controller resume lacks all exact resumed journals");}
+    writer->execute("UPDATE _lattice_producer_continuity SET phase=0 WHERE id=1 AND phase=3 AND barrier=? AND attempt=?",{barrier,attempt});
+    const auto after=writer->query(continuous_query).at(0);
+    if(integer(after,"phase")!=0||integer(after,"barrier")!=barrier||integer(after,"attempt")!=attempt)refuse("controller resume transition changed");
+}
+void recovery_continuous_producer::controller_transition_reconcile_owned(const recovery_receiver_controller& controller,
+    std::shared_ptr<lattice_db> owner,int64_t phase,int64_t barrier,int64_t attempt,int64_t next_phase,int64_t next_barrier,int64_t next_attempt) {
+    if(!owner||!owner->recovery_continuous_||!continuous_install_owned(*owner->recovery_continuous_))refuse("reconciliation transition lacks actual controller WRITE");
+    auto state=owner->recovery_continuous_->state;auto& db=*recovery_writer_access::active_writer(*owner);
+    {std::lock_guard lock(state->mutex);if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load())refuse("reconciliation counted work remains live");}
+    continuous_verify_row(db,*state);const auto row=db.query(continuous_query).at(0);
+    if(integer(row,"phase")!=phase||integer(row,"barrier")!=barrier||integer(row,"attempt")!=attempt||
+       !((phase==2&&next_phase==4&&barrier<INT64_MAX&&attempt<INT64_MAX&&next_barrier==barrier+1&&next_attempt==attempt+1)||
+         (phase==4&&next_phase==1&&next_barrier==barrier&&next_attempt==attempt)))refuse("reconciliation phase transition differs");
+    db.execute("UPDATE _lattice_producer_continuity SET phase=?,barrier=?,attempt=? WHERE id=1 AND phase=? AND barrier=? AND attempt=?",{next_phase,next_barrier,next_attempt,phase,barrier,attempt});
+    const auto after=db.query(continuous_query);if(after.size()!=1)refuse("reconciliation lineage disappeared");
+    auto expected=row;expected["phase"]=next_phase;expected["barrier"]=next_barrier;expected["attempt"]=next_attempt;
+    if(after[0]!=expected)refuse("reconciliation lineage postimage changed");state->verify_file(db);
+}
+void recovery_continuous_producer::controller_publish_reconcile(const recovery_receiver_controller& controller,
+    std::shared_ptr<lattice_db> owner,int64_t barrier,int64_t attempt) {
+    if(!owner||!owner->recovery_continuous_)return;auto state=owner->recovery_continuous_->state;
+    std::lock_guard lock(state->mutex);
+    if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load())return;
+    if(state->gate_revision==UINT64_MAX)refuse("reconciliation runtime generation exhausted");
+    ++state->gate_revision;state->barrier=barrier;state->attempt=attempt;
+}
+void recovery_continuous_producer::controller_publish_resume(const recovery_receiver_controller& controller,std::shared_ptr<lattice_db> owner,int64_t barrier,int64_t attempt) {
+    if(!owner||owner->is_closed()||!owner->recovery_continuous_)return;
+    const auto state=owner->recovery_continuous_->state;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if(state->controller.lock().get()==&controller&&state->barrier==barrier&&state->attempt==attempt&&!state->operations)
+        state->dml_open.store(true,std::memory_order_release);
 }

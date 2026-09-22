@@ -54,6 +54,7 @@ extern thread_local std::function<void()> after_intake_commit;
 
 class canonical_install_admission;
 struct receive_install_identity;
+struct receive_install_receipt;
 namespace canonical_range { struct request; struct manifest; }
 struct scoped_recovery_result;
 struct receive_delivery_guard_access {
@@ -74,7 +75,10 @@ struct receive_delivery_guard_access {
     static bool manages_cursor(database&);
     static void require_history_unblocked(database&);
 private:
+    friend struct canonical_install_engine;
+    friend class recovery_receiver_controller;
     friend scoped_recovery_result install_staged_canonical_range(const canonical_install_admission&);
+    friend receive_install_receipt inspect_committed_canonical_owned(const canonical_install_admission&,const receive_install_identity&,const canonical_range::request&,const canonical_range::manifest&);
     friend scoped_recovery_result inspect_committed_canonical_range(const canonical_install_admission&, const receive_install_identity&, const canonical_range::request&, const canonical_range::manifest&);
     // Explicit canonical-install transition only: preserves the actual guard
     // incarnation, fences old deliveries, and never creates a legacy cursor.

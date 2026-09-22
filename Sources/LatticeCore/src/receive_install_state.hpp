@@ -85,6 +85,8 @@ class receive_install_store {
     // alias for a borrowed/stack object. Every call retains this owner.
     std::shared_ptr<lattice_db> owner_;
     receive_install_limits limits_;
+    bool shared_domain_=false;
+    void verify_domain_aliases(const receive_install_binding&)const;
     database& connection() const;
     receive_install_usage configuration() const;
     std::optional<receive_install_snapshot> row(const std::string&) const;

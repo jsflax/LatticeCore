@@ -94,9 +94,13 @@ struct recovery_obligation_usage {
 };
 
 class recovery_obligation_store {
+    friend class recovery_receiver_controller;
+    friend class recovery_unknown_reconciliation;
+    recovery_obligation_snapshot snapshot_for_reconciliation(const recovery_obligation_address&) const;
     std::shared_ptr<lattice_db> owner_;
     recovery_obligation_limits limits_;
     receive_install_limits install_limits_;
+    bool shared_domains_=false;
     database& writer() const;
 public:
     // Actual owning pointer only, not a no-op-deleter alias for a borrowed DB.

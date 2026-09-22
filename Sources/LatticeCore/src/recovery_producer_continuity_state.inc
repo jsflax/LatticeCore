@@ -13,6 +13,7 @@ struct recovery_continuous_state {
     uint64_t next_route=0,gate_revision=0;
     int64_t incarnation=0,barrier=0,attempt=0;
     std::set<std::string> generated_names;
+    std::weak_ptr<recovery_receiver_controller> controller;
     int64_t parent_device=0,parent_inode=0,container_device=0,container_inode=0;
 #if defined(__APPLE__) || defined(__linux__)
     int parent_fd=-1,container_fd=-1;
@@ -61,7 +62,7 @@ constexpr const char* continuous_query="SELECT CASE WHEN typeof(id)='integer' TH
 struct continuous_frame {
     recovery_continuous_state* state;
     const database* writer;
-    int operation; // 1 enrollment, 2 claim, 3 begin, 4 freeze, 5 cancel
+    int operation; // 1 enrollment, 2 claim, 3 begin, 4 freeze, 5 cancel, 6 checked controller
     continuous_frame* previous;
     static thread_local continuous_frame* current;
     continuous_frame(recovery_continuous_state& s,database& w,int op):state(&s),writer(&w),operation(op),previous(current){current=this;}
@@ -72,13 +73,29 @@ bool continuous_owned(const recovery_continuous_admission& a)noexcept {
     for(auto* f=continuous_frame::current;f;f=f->previous)if(f->state==a.state.get()&&f->writer==a.writer)return true;
     return false;
 }
+bool continuous_receiver_enabled(const recovery_continuous_state& state)noexcept {
+    return state.policy.receiver==recovery_continuous_receiver_profile::full_canonical_v2;
+}
+bool continuous_install_owned(const recovery_continuous_admission& admission)noexcept {
+    if(!continuous_receiver_enabled(*admission.state))return false;
+    for(auto* f=continuous_frame::current;f;f=f->previous)
+        if(f->state==admission.state.get()&&f->writer==admission.writer&&f->operation==6)return true;
+    return false;
+}
 bool continuous_authorize(const recovery_continuous_admission& a,int action,const char* table,const char* column,const char* origin)noexcept {
     if(action==SQLITE_PRAGMA&&column&&(same_ascii(table,"synchronous")||same_ascii(table,"journal_mode")))return false;
     const bool mutation=action==SQLITE_INSERT||action==SQLITE_UPDATE||action==SQLITE_DELETE;
     if(!mutation||!table)return true;
+    if(continuous_receiver_enabled(*a.state)&&
+       (std::strncmp(table,"_lattice_recovery_",18)==0||std::strncmp(table,"_lattice_range_",15)==0)) {
+        for(auto* f=continuous_frame::current;f;f=f->previous)
+            if(f->state==a.state.get()&&f->writer==a.writer&&(f->operation==1||f->operation==6))return true;
+        return false;
+    }
     if(std::strcmp(table,continuous_table)==0 || std::strncmp(table,"_lattice_obligation_",20)==0 ||
        std::strncmp(table,"_lattice_install_",17)==0) {
         for(auto* f=continuous_frame::current;f;f=f->previous)if(f->state==a.state.get()&&f->writer==a.writer) {
+            if(f->operation==6&&continuous_receiver_enabled(*a.state))return true;
             if(std::strcmp(table,continuous_table)==0)return f->operation==1||f->operation==3||f->operation==4||f->operation==5;
             if(std::strncmp(table,"_lattice_install_",17)==0)return f->operation==1||f->operation==5;
             return f->operation==1||f->operation==2||f->operation==4||f->operation==5;
@@ -114,7 +131,15 @@ blob continuous_manifest(const recovery_continuous_policy& policy) {
     if(policy.contributions.size()>static_cast<size_t>(policy.limits.obligations.scopes)||policy.contributions.size()>static_cast<size_t>(policy.limits.installations.channels)||
        policy.contributions.size()>static_cast<size_t>(policy.limits.producers.profiles)||policy.frozen_entries<static_cast<size_t>(policy.limits.obligations.records)||
        policy.frozen_bytes<static_cast<uint64_t>(policy.limits.obligations.encoded_bytes))refuse("continuous Q policy must contain the complete bounded journal");
-    blob out;field(out,std::string("lattice-continuous-generated-v1"));
+    if(policy.receiver!=recovery_continuous_receiver_profile::disabled&&policy.receiver!=recovery_continuous_receiver_profile::full_canonical_v2)
+        refuse("continuous receiver profile unavailable");
+    blob out;field(out,std::string(policy.receiver==recovery_continuous_receiver_profile::disabled?
+        "lattice-continuous-generated-v1":"lattice-continuous-canonical-receiver-v2"));
+    // The named receiver profile carries fixed explicit caps. The original
+    // disabled profile has exactly its previous manifest spelling.
+    if(policy.receiver!=recovery_continuous_receiver_profile::disabled) {
+        for(const uint64_t n:{16,4194304,65536,134217728,16777216,8192,262144,536870912,4096,131072,134217728,805306368})number(out,n);
+    }
     for(const auto n:{policy.limits.obligations.scopes,policy.limits.obligations.records,policy.limits.obligations.field_bytes,policy.limits.obligations.encoded_bytes,
         policy.limits.installations.channels,policy.limits.installations.field_bytes,policy.limits.installations.encoded_bytes,
         policy.limits.producers.profiles,policy.limits.producers.stamps,policy.limits.producers.field_bytes,policy.limits.producers.manifest_bytes,policy.limits.producers.encoded_bytes})number(out,n);
@@ -209,11 +234,11 @@ void continuous_verify_row(database& db,recovery_continuous_state& state,bool cu
     const auto rows=db.query(continuous_query);
     if(rows.size()!=1)refuse("continuous lineage row missing or duplicate");const auto& row=rows[0];
     const auto bytes=[&](const char* name)->const blob&{const auto at=row.find(name);if(at==row.end()||!std::holds_alternative<blob>(at->second))refuse("continuous invalid blob");return std::get<blob>(at->second);};
-    if(integer(row,"id")!=1||integer(row,"version")!=1||bytes("manifest")!=state.manifest||bytes("digest")!=blob(state.digest.begin(),state.digest.end())||
+    if(integer(row,"id")!=1||integer(row,"version")!=(continuous_receiver_enabled(state)?2:1)||bytes("manifest")!=state.manifest||bytes("digest")!=blob(state.digest.begin(),state.digest.end())||
        integer(row,"main_device")!=static_cast<int64_t>(state.identity->device)||integer(row,"main_inode")!=static_cast<int64_t>(state.identity->inode)||
        integer(row,"parent_device")!=state.parent_device||integer(row,"parent_inode")!=state.parent_inode||
        integer(row,"container_device")!=state.container_device||integer(row,"container_inode")!=state.container_inode||
-       integer(row,"incarnation")<=0||integer(row,"barrier")<0||integer(row,"attempt")<0||integer(row,"phase")<0||integer(row,"phase")>2||(integer(row,"phase")!=0&&(integer(row,"barrier")==0||integer(row,"attempt")==0))||
+       integer(row,"incarnation")<=0||integer(row,"barrier")<0||integer(row,"attempt")<0||integer(row,"phase")<0||integer(row,"phase")>(continuous_receiver_enabled(state)?4:2)||(integer(row,"phase")!=0&&(integer(row,"barrier")==0||integer(row,"attempt")==0))||
        (current&&integer(row,"incarnation")!=state.incarnation))refuse("continuous lineage physical/policy binding differs");
     const auto mode=db.query("PRAGMA journal_mode"),durability=db.query("PRAGMA synchronous");
     if(mode.size()!=1||text(mode[0],"journal_mode")!="wal"||durability.size()!=1||integer(durability[0],"synchronous")<2)refuse("continuous requires WAL and FULL/EXTRA synchronous");

@@ -2424,14 +2424,15 @@ public:
     /// Pool cap (default 3): acquiring beyond capacity force-retires the
     /// OLDEST live generation (spec §2.2(e)) — reads against it re-resolve
     /// through the tolerant ladder. A pending WAL-threshold eviction is
-    /// executed first, so the new pin lands on a rewound log (§3.4).
+    /// attempted first without waiting for foreign readers. A busy checkpoint
+    /// stays pending for bounded maintenance retry (§3.4).
     uint64_t acquire_read_generation() {
 #ifdef __EMSCRIPTEN__
         return 0;
 #else
         if (closed_.load(std::memory_order_seq_cst)) return 0;
         if (config_.is_in_memory()) return 0;  // §4.1: NO keepers (covers named shared-cache memory)
-        run_pending_wal_eviction_if_any();
+        run_pending_wal_eviction_if_any(/*checkpoint_busy_budget_ms=*/0);
 
         std::shared_ptr<database> conn;
         std::shared_ptr<read_generation> victim;
@@ -2886,11 +2887,11 @@ private:
     /// same-path instances — regardless of generation age or active reads
     /// (an age precondition would defeat the cap in exactly the burst case
     /// it exists for) — then, once aggregate outstanding == 0, run one
-    /// bounded TRUNCATE-else-PASSIVE checkpoint and clear the flags so
-    /// re-pins land on a rewound log. Self-healing: if the gap is lost to a
-    /// racing acquire or a foreign reader, the next threshold-crossing
-    /// commit re-flags and the next acquisition/maintenance tick retries.
-    void run_pending_wal_eviction_if_any() {
+    /// TRUNCATE-else-PASSIVE checkpoint. Foreground acquisition uses zero
+    /// lock wait; maintenance retains its bounded wait. Clear the flags only
+    /// after successful truncation: a foreign reader or racing acquire must
+    /// leave the request pending even when no later write re-flags it.
+    void run_pending_wal_eviction_if_any(int checkpoint_busy_budget_ms = 250) {
 #ifndef __EMSCRIPTEN__
         if (config_.is_in_memory()) return;
         bool pending = false;
@@ -2903,9 +2904,11 @@ private:
         instance_registry::instance().for_each_alive(config_.path,
             [](lattice_db* inst) { inst->retire_all_read_generations(); });
         if (read_generations_outstanding() != 0) return;  // racing acquire — retry next tick
-        if (db_ && !config_.read_only && !closed_.load(std::memory_order_seq_cst)) {
-            auto res = db_->wal_checkpoint(/*truncate=*/true, /*busy_budget_ms=*/250);
-            if (res.busy != 0) db_->wal_checkpoint(/*truncate=*/false);
+        if (!db_ || config_.read_only || closed_.load(std::memory_order_seq_cst)) return;
+        auto res = db_->wal_checkpoint(/*truncate=*/true, checkpoint_busy_budget_ms);
+        if (res.rc != SQLITE_OK || res.busy != 0) {
+            db_->wal_checkpoint(/*truncate=*/false);
+            return;  // retain the obligation for the next maintenance tick
         }
         instance_registry::instance().for_each_alive(config_.path,
             [](lattice_db* inst) {

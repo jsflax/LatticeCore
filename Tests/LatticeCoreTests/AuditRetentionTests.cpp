@@ -1,6 +1,9 @@
 #include "TestHelpers.hpp"
 #include <lattice/sync.hpp>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <string_view>
 #include <thread>
 
 // ============================================================================
@@ -288,4 +291,165 @@ TEST(AuditRetention, ReadOnlyAndUnconfiguredOpensRunNoThread) {
     ro.read_only = true;
     ro.audit_retention_seconds = 1;
     EXPECT_NO_THROW({ lattice::lattice_db db{ro}; });   // must not start a writer thread
+}
+
+namespace {
+
+struct RetentionTrace {
+    std::mutex mutex;
+    std::condition_variable ready;
+    int arrivals = 0;
+    bool expired = false;
+    std::atomic<int> prune_calls{0};
+
+    static int trace(unsigned kind, void* context, void* statement, void*) {
+        if (kind != SQLITE_TRACE_STMT) return 0;
+        auto& state = *static_cast<RetentionTrace*>(context);
+        const char* text = sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
+        if (!text) return 0;
+        const std::string_view sql(text);
+        if (sql.find("SELECT MAX(CAST(value AS INTEGER)) AS m FROM _lattice_meta") == 0)
+            ++state.prune_calls;
+        if (sql.find("INSERT") == 0 && sql.find("'audit_prune_at'") != sql.npos) {
+            // Both connections stop immediately before their stamp write.
+            // The former separate-read/unconditional-write implementation
+            // reaches this barrier after both have observed an expired stamp.
+            std::unique_lock<std::mutex> lock(state.mutex);
+            ++state.arrivals;
+            state.ready.notify_all();
+            if (!state.ready.wait_for(lock, std::chrono::seconds(3), [&] { return state.arrivals == 2; }))
+                state.expired = true;
+        }
+        return 0;
+    }
+};
+
+struct RetentionTraceRegistration {
+    sqlite3* handle;
+    ~RetentionTraceRegistration() { sqlite3_trace_v2(handle, 0, nullptr, nullptr); }
+};
+
+int64_t retention_claims(lattice::database& db) {
+    const auto rows = db.query("SELECT COUNT(*) AS c FROM _lattice_meta WHERE key = 'audit_prune_at'", {});
+    return std::get<int64_t>(rows.at(0).at("c"));
+}
+
+} // namespace
+
+TEST(AuditRetention, SimultaneousHandlesClaimOnlyOnePrunePass) {
+    TempDB tmp{"retention_claim"};
+    lattice::configuration cfg(tmp.str());
+    cfg.audit_retention_seconds = 600;
+    lattice::lattice_db a{cfg};
+    lattice::lattice_db b{cfg};
+    a.stop_audit_maintenance();
+    b.stop_audit_maintenance();
+    for (int i = 0; i < 5; ++i) a.add(TestPerson{"old", i, std::nullopt});
+    backdate_watermark(a.db(), 900);
+    const auto sequence = audit_sequence(a.db());
+
+    RetentionTrace trace;
+    RetentionTraceRegistration trace_a{a.db().handle()}, trace_b{b.db().handle()};
+    ASSERT_EQ(sqlite3_trace_v2(trace_a.handle, SQLITE_TRACE_STMT, &RetentionTrace::trace, &trace), SQLITE_OK);
+    ASSERT_EQ(sqlite3_trace_v2(trace_b.handle, SQLITE_TRACE_STMT, &RetentionTrace::trace, &trace), SQLITE_OK);
+    std::thread first([&] { a.run_audit_retention_tick(); });
+    std::thread second([&] { b.run_audit_retention_tick(); });
+    first.join();
+    second.join();
+
+    EXPECT_FALSE(trace.expired);
+    EXPECT_EQ(trace.arrivals, 2);
+    EXPECT_EQ(trace.prune_calls.load(), 1);
+    EXPECT_EQ(retention_claims(a.db()), 1);
+    EXPECT_EQ(audit_rows(a.db()), 0);
+    EXPECT_EQ(audit_sequence(a.db()), sequence);
+}
+
+TEST(AuditRetention, RecentClaimSkipsPruneButStillSamples) {
+    TempDB tmp{"retention_claim_recent"};
+    lattice::configuration cfg(tmp.str());
+    cfg.audit_retention_seconds = 600;
+    lattice::lattice_db db{cfg};
+    db.stop_audit_maintenance();
+    db.add(TestPerson{"kept", 1, std::nullopt});
+    backdate_watermark(db.db(), 900);
+    const auto stamp = std::to_string(now_epoch(db.db()));
+    db.db().execute("INSERT INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?)", {stamp});
+    db.run_audit_retention_tick();
+    EXPECT_EQ(audit_rows(db.db()), 1);
+    const auto claims = db.db().query("SELECT value FROM _lattice_meta WHERE key = 'audit_prune_at'", {});
+    ASSERT_EQ(claims.size(), 1);
+    EXPECT_EQ(std::get<std::string>(claims[0].at("value")), stamp);
+    const auto samples = db.db().query("SELECT COUNT(*) AS c FROM _lattice_meta WHERE key LIKE 'audit_wm:%'", {});
+    EXPECT_EQ(std::get<int64_t>(samples[0].at("c")), 2);
+}
+
+TEST(AuditRetention, ExpiredOrMalformedClaimCanBeReplaced) {
+    for (const auto& previous : {std::string("0"), std::string("not-a-timestamp")}) {
+        SCOPED_TRACE(previous);
+        TempDB tmp{"retention_claim_expired"};
+        lattice::configuration cfg(tmp.str());
+        cfg.audit_retention_seconds = 600;
+        lattice::lattice_db db{cfg};
+        db.stop_audit_maintenance();
+        db.add(TestPerson{"old", 1, std::nullopt});
+        backdate_watermark(db.db(), 900);
+        db.db().execute("INSERT INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?)", {previous});
+        db.run_audit_retention_tick();
+        EXPECT_EQ(audit_rows(db.db()), 0);
+        const auto claims = db.db().query("SELECT value FROM _lattice_meta WHERE key = 'audit_prune_at'", {});
+        ASSERT_EQ(claims.size(), 1);
+        EXPECT_NE(std::get<std::string>(claims[0].at("value")), previous);
+    }
+}
+
+TEST(AuditRetention, FailedPruneReleasesClaimForNextTick) {
+    TempDB tmp{"retention_claim_retry"};
+    lattice::configuration cfg(tmp.str());
+    cfg.audit_retention_seconds = 600;
+    lattice::lattice_db db{cfg};
+    db.stop_audit_maintenance();
+    db.add(TestPerson{"old", 1, std::nullopt});
+    backdate_watermark(db.db(), 900);
+    struct Authorizer {
+        sqlite3* handle;
+        bool denied = false;
+        ~Authorizer() { sqlite3_set_authorizer(handle, nullptr, nullptr); }
+    } authorizer{db.db().handle()};
+    ASSERT_EQ(sqlite3_set_authorizer(authorizer.handle,
+        [](void* context, int action, const char* table, const char*, const char*, const char*) {
+            auto& state = *static_cast<Authorizer*>(context);
+            if (action == SQLITE_DELETE && table && std::strcmp(table, "AuditLog") == 0) {
+                state.denied = true;
+                return SQLITE_DENY;
+            }
+            return SQLITE_OK;
+        }, &authorizer), SQLITE_OK);
+    EXPECT_NO_THROW(db.run_audit_retention_tick());
+    EXPECT_TRUE(authorizer.denied);
+    EXPECT_EQ(audit_rows(db.db()), 1);
+    EXPECT_EQ(retention_claims(db.db()), 0);
+    ASSERT_EQ(sqlite3_set_authorizer(authorizer.handle, nullptr, nullptr), SQLITE_OK);
+    db.run_audit_retention_tick();
+    EXPECT_EQ(audit_rows(db.db()), 0);
+    EXPECT_EQ(retention_claims(db.db()), 1);
+}
+
+TEST(AuditRetention, ManualTickAlsoHonorsDisabledAndReadOnlyConfiguration) {
+    TempDB tmp{"retention_tick_disabled"};
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        db.add(TestPerson{"kept", 1, std::nullopt});
+        backdate_watermark(db.db(), 900);
+        db.run_audit_retention_tick();
+        EXPECT_EQ(audit_rows(db.db()), 1);
+        EXPECT_EQ(retention_claims(db.db()), 0);
+    }
+    lattice::configuration cfg(tmp.str());
+    cfg.audit_retention_seconds = 600;
+    cfg.read_only = true;
+    lattice::lattice_db reader{cfg};
+    EXPECT_NO_THROW(reader.run_audit_retention_tick());
+    EXPECT_EQ(audit_rows(reader.db()), 1);
+    EXPECT_EQ(retention_claims(reader.db()), 0);
 }

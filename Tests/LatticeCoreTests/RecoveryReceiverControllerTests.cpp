@@ -401,13 +401,18 @@ struct recovery_receiver_cohort_test_access {
 }
 namespace {
 struct CohortWriterHold {
-    std::mutex mutex;std::condition_variable changed;bool entered=false,released=false,timed_out=false;std::thread worker;
+    std::mutex mutex;std::condition_variable changed;bool entered=false,released=false,timed_out=false,admission_failed=false;std::thread worker;
     explicit CohortWriterHold(lattice_db& owner){
         auto* handle=detail::canonical_writer_custody_test_access::fault_handle(owner.db());
-        worker=std::thread([this,handle]{auto* sql_mutex=sqlite3_db_mutex(handle);sqlite3_mutex_enter(sql_mutex);
+        const auto acquire_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        worker=std::thread([this,handle,acquire_deadline]{auto* sql_mutex=sqlite3_db_mutex(handle);
+            while(sql_mutex&&sqlite3_mutex_try(sql_mutex)!=SQLITE_OK){
+                if(std::chrono::steady_clock::now()>=acquire_deadline){sql_mutex=nullptr;break;}
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+            if(!sql_mutex){std::lock_guard lock(mutex);admission_failed=true;changed.notify_all();return;}
             {std::unique_lock lock(mutex);entered=true;changed.notify_all();if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
             sqlite3_mutex_leave(sql_mutex);});
-        std::unique_lock lock(mutex);if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return entered;})){
+        std::unique_lock lock(mutex);if(!changed.wait_until(lock,acquire_deadline,[&]{return entered||admission_failed;})||!entered){
             released=true;changed.notify_all();lock.unlock();worker.join();throw db_error("cohort writer fixture admission timeout");}
     }
     void release(){ {std::lock_guard lock(mutex);released=true;changed.notify_all();}if(worker.joinable())worker.join();}

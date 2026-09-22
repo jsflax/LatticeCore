@@ -1,6 +1,7 @@
 #pragma once
 #include "recovery_local_producer.hpp"
 
+namespace lattice { class swift_lattice_ref; }
 namespace lattice::detail {
 // Private opt-in storage/route policy. These spellings do not authenticate a
 // source or namespace. The actual accepted application/TLS issuer is separate.
@@ -92,6 +93,16 @@ public:
     recovery_continuous_route& operator=(const recovery_continuous_route&)=delete;
 };
 class recovery_continuous_producer {
+    friend class ::lattice::swift_lattice_ref;
+    friend struct recovery_continuous_admission;
+    // Closed recipe: only native and Swift retained-owner factories construct it.
+    // Captures immutable declarations, never an owner or application callback.
+    struct owner_recipe {
+        std::function<std::shared_ptr<lattice_db>(const configuration&,const std::shared_ptr<recovery_continuous_admission>&)> construct;
+        std::function<void(const std::shared_ptr<lattice_db>&)> publish_pointer;
+    };
+    static recovery_continuous_open_result open_owned(const configuration&,const recovery_continuous_policy&,
+        std::shared_ptr<const owner_recipe>);
     friend class recovery_local_producer_adapter;
     friend class recovery_export_adapter;
     friend class recovery_export_route;

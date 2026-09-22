@@ -204,6 +204,14 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
     }
 }
 
+// Private unpublished derived construction. Enrollment and every publication
+// occur in the common retained-owner factory after this constructor returns.
+swift_lattice::swift_lattice(const swift_configuration& config,const SchemaVector& schemas,
+    const std::shared_ptr<detail::recovery_continuous_admission>& admission)
+    :lattice_db(config,true,recovery_catalog(config,schemas),admission),swift_config_(config) {
+    ensure_swift_tables(schemas,false);
+}
+
 // A `@Unique(..., allowsUpsert: true)` whose conflict set includes a to-one link
 // uses the `<link>__link_gid` shadow column (Phase 8a). That column is normally
 // filled by the post-insert link-table trigger — too late for `ON CONFLICT` to
@@ -484,7 +492,7 @@ void swift_lattice::persist_union_values(swift_dynamic_object& unmanaged_obj,
     }
 }
 
-void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
+void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish_background)  {
     if(recovery_producer_bootstrapped()) {
         // Base bootstrap has already compared complete declared schema and
         // exact enrolled programs in its retained view. Never enter ordinary
@@ -539,7 +547,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         if (fast) {
             populate_swift_in_memory_state(schemas);
             LOG_INFO("swift_lattice", "ensure_swift_tables: fast path (fingerprint match)");
-            dispatch_vec0_reconcile(schemas);
+            if(publish_background)dispatch_vec0_reconcile(schemas);
             return;
         }
     }
@@ -555,7 +563,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
         populate_swift_in_memory_state(schemas);
         transaction.commit();
         LOG_INFO("swift_lattice", "ensure_swift_tables: fast path after lock (sibling completed)");
-        dispatch_vec0_reconcile(schemas);
+        if(publish_background)dispatch_vec0_reconcile(schemas);
         return;
     }
     // NOTE: No unconditional defer{commit} — if an exception occurs during
@@ -1158,7 +1166,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas)  {
     // If anything above threw, the transaction destructor rolls back instead.
     LOG_INFO("swift_lattice", "ensure_swift_tables: committing transaction");
     transaction.commit();
-    dispatch_vec0_reconcile(schemas);
+    if(publish_background)dispatch_vec0_reconcile(schemas);
 
     // TODO: Dispatch background IVF training for untrained vec0 tables.
     // Disabled pending investigation of IVF+int8 dimension mismatch.

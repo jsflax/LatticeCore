@@ -124,6 +124,7 @@ add_library(LatticeSwiftCppBridge STATIC
     Sources/LatticeSwiftCppBridge/src/lattice.cpp
     Sources/LatticeSwiftCppBridge/src/bulk_mutation.cpp
     Sources/LatticeSwiftCppBridge/src/projection.cpp
+    Sources/LatticeSwiftCppBridge/src/recovery_continuity.cpp
     Sources/LatticeSwiftCppBridge/src/recovery_export.cpp
     Sources/LatticeSwiftCppBridge/src/recovery_relay.cpp
     Sources/LatticeSwiftCppBridge/src/dynamic_object.cpp
@@ -276,6 +277,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp
     Tests/LatticeCoreTests/RecoveryServerExportTests.cpp
     Tests/LatticeCoreTests/RecoveryOwnerSchemaTests.cpp
+    Tests/LatticeCoreTests/RecoverySwiftContinuityTests.cpp
     Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp
     Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp
     Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp

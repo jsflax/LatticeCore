@@ -30,6 +30,7 @@
 #include <list.hpp>
 #include <managed_object.hpp>
 #include <projection.hpp>
+#include <recovery_continuity.hpp>
 #include <recovery_export.hpp>
 #include <unmanaged_object.hpp>
 #include <util.hpp>

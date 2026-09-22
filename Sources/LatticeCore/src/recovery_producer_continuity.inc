@@ -95,27 +95,48 @@ std::shared_ptr<database> open_continuous_writer(const configuration& config,con
     return recovery_continuous_producer::open_writer(config,admission);
 }
 recovery_continuous_open_result recovery_continuous_producer::open(const configuration& requested,const recovery_continuous_policy& policy) {
-    recovery_continuous_open_result output;
     try {
+        auto recipe=std::make_shared<owner_recipe>();
+        recipe->construct=[](const configuration& config,const std::shared_ptr<recovery_continuous_admission>& admission){
+            return std::shared_ptr<lattice_db>(new lattice_db(config,true,recovery_owner_schema::capture_native(),admission));
+        };
+        return open_owned(requested,policy,std::move(recipe));
+    }catch(...){recovery_continuous_open_result output;output.settlement.primary_error=std::current_exception();return output;}
+}
+recovery_continuous_open_result recovery_continuous_producer::open_owned(const configuration& requested,const recovery_continuous_policy& policy,
+    std::shared_ptr<const owner_recipe> recipe) {
+    recovery_continuous_open_result output;
+    std::shared_ptr<lattice_db> owner;
+    try {
+        if(!recipe||!recipe->construct)refuse("continuous retained owner recipe unavailable");
         if(requested.path.empty()||requested.path.starts_with("file:")||configuration::path_is_memory(requested.path))refuse("continuous factory requires an explicit native file path");
         configuration config=requested;
         const auto lexical=std::filesystem::absolute(config.path).lexically_normal();
         config.path=(std::filesystem::canonical(lexical.parent_path().parent_path())/lexical.parent_path().filename()/lexical.filename()).string();
         auto admission=continuous_acquire(config,policy);
-        auto owner=std::shared_ptr<lattice_db>(new lattice_db(config,true,recovery_owner_schema::capture_native(),admission));
+        admission->recipe=recipe;
+        owner=recipe->construct(config,admission);
+        if(!owner||owner->recovery_continuous_!=admission||owner->db_.get()!=admission->writer)
+            refuse("continuous recipe did not retain the admitted physical owner");
         admission->owner=owner.get();
         output.settlement=enroll(owner);
-        if(output.settlement.state!=recovery_install_state::committed||output.settlement.postcommit_error){owner->close();return output;}
+        if(output.settlement.state!=recovery_install_state::committed||output.settlement.postcommit_error){
+            try{owner->close();}catch(...){output.settlement.cleanup_error=std::current_exception();}
+            return output;
+        }
+        // A known enrollment COMMIT survives every later publication failure.
+        // No callback, key-cache hit or borrowed pointer may grant admission.
+        if(recipe->publish_pointer)recipe->publish_pointer(owner);
         instance_registry::instance().register_instance(config.path,owner.get(),owner->guard_);
         owner->adopt_path_wal_eviction_threshold();owner->setup_cross_process_notifier();
-        output.owner=owner;
-        // Configuration transport publication happens only after the retained
-        // owner and its exact continuous profile have committed.
         owner->setup_sync_if_configured();
+        output.owner=owner;
     } catch(...) {
-        if(output.owner){output.owner->close();output.owner.reset();}
-        if(output.settlement.state==recovery_install_state::committed)output.settlement.postcommit_error=std::current_exception();
-        else output.settlement.primary_error=std::current_exception();
+        const auto error=std::current_exception();
+        if(owner){try{owner->close();}catch(...){output.settlement.cleanup_error=std::current_exception();}}
+        output.owner.reset();
+        if(output.settlement.state==recovery_install_state::committed)output.settlement.postcommit_error=error;
+        else output.settlement.primary_error=error;
     }
     return output;
 }
@@ -376,7 +397,7 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     if(owner.synchronizer_)return;
     configuration child(owner.config_.path,std::make_shared<std_thread_scheduler>());
     child.busy_timeout_ms=owner.config_.busy_timeout_ms;child.target_schema_version=owner.config_.target_schema_version;
-    auto opened=open(child,state->policy);
+    auto opened=open_owned(child,state->policy,owner.recovery_continuous_->recipe);
     if(!opened.owner||opened.settlement.state!=recovery_install_state::committed){if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);refuse("continuous dedicated facade open failed");}
     owner.synchronizer_=std::make_unique<synchronizer>(std::move(opened.owner),config);
     if(owner.on_sync_state_change_)owner.synchronizer_->set_on_state_change(owner.on_sync_state_change_);

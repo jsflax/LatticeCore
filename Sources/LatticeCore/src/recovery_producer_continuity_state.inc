@@ -47,6 +47,7 @@ struct recovery_continuous_state {
 #endif
 };
 struct recovery_continuous_admission {
+    std::shared_ptr<const recovery_continuous_producer::owner_recipe> recipe;
     std::shared_ptr<recovery_continuous_state> state;
     lattice_db* owner=nullptr;
     database* writer=nullptr;

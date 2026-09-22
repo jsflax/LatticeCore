@@ -19,6 +19,7 @@
 #include <projection.hpp>
 #include <recovery_export.hpp>
 #include <recovery_relay.hpp>
+#include <recovery_continuity.hpp>
 #include <list.hpp>
 #include <error.hpp>
 
@@ -528,6 +529,7 @@ private:
     std::unordered_map<size_t, std::unordered_map<std::string, SchemaPair>> migration_schemas_;
 
     friend class swift_lattice;
+    friend class swift_lattice_ref;
 };
 
 // Internal implementation - inherits from lattice_db
@@ -673,6 +675,9 @@ public:
     }
 
 private:
+    friend class swift_lattice_ref;
+    swift_lattice(const swift_configuration&,const SchemaVector&,
+        const std::shared_ptr<detail::recovery_continuous_admission>&);
     /// Best-effort schema reconstruction for databases written before the
     /// snapshot existed. Enumerates user tables from sqlite_master, reads column
     /// types via PRAGMA table_info, and detects link / vec / fts / geo sidecars.
@@ -696,7 +701,7 @@ private:
     // Background vec0 gap healing dispatched after open (off the open path).
     std::future<void> vec0_reconcile_future_;
 
-    void ensure_swift_tables(const SchemaVector& schemas);
+    void ensure_swift_tables(const SchemaVector& schemas,bool publish_background=true);
     /// Fingerprint of the Swift-declared schemas covering every DDL-driving
     /// attribute (properties, constraints, unions). See kLatticeSchemaFormatEpoch.
     std::string compute_swift_fingerprint_key(const SchemaVector& schemas) const;
@@ -3704,6 +3709,12 @@ public:
                                      const SchemaVector& schemas,
                                      cxx_error& err) SWIFT_NAME(create(swiftConfig:schemas:error:)) LATTICE_SLREF_UNRETAINED;
 
+
+    // Explicit fresh-only opt-in; every facade retains the actual derived owner.
+    static LATTICE_SLREF_RET create_continuous(const swift_configuration&,const SchemaVector&,
+        const continuous_policy&,continuous_result&) SWIFT_NAME(createContinuous(swiftConfig:schemas:policy:result:)) LATTICE_SLREF_UNRETAINED;
+    continuous_result begin_continuous(int64_t attempt) const noexcept SWIFT_NAME(beginContinuous(attempt:));
+    continuous_result inspect_continuous() const noexcept SWIFT_NAME(inspectContinuous());
 
     // Access the underlying swift_lattice (returns pointer for Swift interop)
     swift_lattice* get() { return impl_.get(); }

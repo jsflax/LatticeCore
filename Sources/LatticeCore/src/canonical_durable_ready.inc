@@ -158,6 +158,7 @@ int64_t ready_metadata_charge(const database::row_t& row) {
 }
 cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,const database::row_t& row,
     const std::function<void(const cr::receipt_item&)>& validate_receipt={}) {
+    observe_ready(canonical_ready_test_observation::point::audit_begin);
     const auto request=ready_request(row,p);const auto& q=std::get<cr::request>(request.body);const auto key=ready_blob(row,"binding");
     const auto n=integer(row,"frame_count");if(n<2 || n>static_cast<int64_t>(p.package.frames))refuse("canonical READY frame count outside cap");
     const auto counts=db.query("SELECT COUNT(*) AS n FROM main._lattice_canonical_ready_frame WHERE binding=?",{bytes(key)});
@@ -168,29 +169,28 @@ cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,co
     if(manifest.head!=static_cast<uint64_t>(integer(row,"head")) || manifest.manifest_digest!=ready_blob(row,"manifest_sha") ||
        manifest.protection!=cr::lease{ready_blob(row,"manifest_lease"),static_cast<uint64_t>(integer(row,"manifest_duration"))})
         refuse("canonical READY immutable manifest binding differs");
-    auto sequence=cr::begin(request.logical,q,manifest,p.package.codec);
-    cr::stream_hasher content(manifest,cr::stream_kind::content,p.package.codec),receipts(manifest,cr::stream_kind::receipts,p.package.codec);
+    cr::validated_sequence sequence(request.logical,q,manifest,p.package.codec);
     picosha2::hash256_one_by_one hash;int64_t wire=0,charge=ready_metadata_charge(row);
     for(int64_t i=0;i<n;++i) {
+        if(auto* observation=canonical_ready_test_observation::current)++observation->audited_frames;
         const auto raw=ready_frame(db,p,key,i);wire=ready_add(wire,raw.size());charge=ready_add(charge,ready_add(raw.size(),128));ready_hash_frame(hash,raw);
         if(wire>static_cast<int64_t>(p.package.retained_wire_bytes) || charge>p.transfer_bytes)refuse("canonical READY bytes exceed charged cap");
         const auto frame=cr::decode(raw,p.package.codec);
         if(frame.logical!=request.logical || frame.route_generation!=ready_route || cr::encode(frame,p.package.codec)!=raw)
             refuse("canonical READY frame association or canonical bytes differ");
-        if(i)sequence=cr::propose(sequence,frame,p.package.codec);
-        if(const auto* page=std::get_if<cr::content_page>(&frame.body))for(const auto& item:page->items)content.append(item);
+        if(i)sequence.advance(frame);
         if(const auto* page=std::get_if<cr::receipt_page>(&frame.body))for(const auto& item:page->items) {
             if(std::holds_alternative<cr::not_committed>(item.value))refuse("canonical READY cannot prove negative receipt");
             if(const auto* committed=std::get_if<cr::committed>(&item.value))
                 if(committed->namespace_id!=ready_blob(row,"namespace_id") || committed->coverage_id!=ready_blob(row,"coverage_id"))
                     refuse("canonical READY receipt coverage differs");
-            receipts.append(item);
             if(validate_receipt)validate_receipt(item);
         }
     }
-    hash.finish();if(sequence.status!=cr::phase::sequence_complete_unverified || wire!=integer(row,"wire_bytes") ||
-       picosha2::get_hash_hex_string(hash)!=ready_blob(row,"frames_sha") || content.finish()!=manifest.content_digest || receipts.finish()!=manifest.receipt_digest)
+    hash.finish();if(sequence.status()!=cr::phase::sequence_complete_unverified || wire!=integer(row,"wire_bytes") ||
+       picosha2::get_hash_hex_string(hash)!=ready_blob(row,"frames_sha"))
         refuse("canonical READY exact capsule or whole-stream hashes differ");
+    observe_ready(canonical_ready_test_observation::point::audit_end);
     return manifest;
 }
 std::vector<std::string> ready_key_parts(const std::string& key) {
@@ -399,6 +399,8 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
     // Retain every physical component before any callback. Subsequent stages
     // call the same static retained-capture implementation without this.
     auto state=context_;auto writer=writer_;auto session=retention_;canonical_ready_result result;
+    observe_ready(canonical_ready_test_observation::point::entered);
+    struct finish_observation {~finish_observation(){observe_ready(canonical_ready_test_observation::point::finished);}} observed;
     try {
         const auto held_admission=admission;
         if(!state || !state->ready || !session)refuse("canonical READY v3 profile unavailable");
@@ -449,6 +451,11 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
             ticket=canonical_retention_ticket(session,clock.incarnation,id,pin,deadline,q.base?std::optional<int64_t>(static_cast<int64_t>(*q.base)):std::nullopt);
             prepared=ready_info(actual,*state,clock,key);validate_namespace_admission(owner,writer,state,held_admission);
         });
+        observe_ready(canonical_ready_test_observation::point::prepared);
+        if(auto* observation=canonical_ready_test_observation::current) {
+            observation->preparation=static_cast<int>(result.preparation.state);
+            observation->preparation_error=bool(result.preparation.primary_error);
+        }
         if(result.preparation.state!=recovery_install_state::committed)return result;
         result.requires_full_request=needs_full;if(needs_full)return result;
         result.transfer=prepared;
@@ -456,6 +463,7 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
         try {
             if(after_preparation)after_preparation();
             const auto captured=capture_reserved_session(owner,writer,state,session,*ticket,requests,p.capture,after_batch,&held_admission);
+            observe_ready(canonical_ready_test_observation::point::captured);
             if(!captured.capture || captured.descriptor_digest!=state->source_descriptor_digest || captured.binding!=state->binding || captured.head<ticket->base_)
                 refuse("canonical READY capture lacks exact retained source proof");
             std::vector<cr::content_item> content;content.reserve(captured.capture->rows.size());
@@ -473,8 +481,11 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
             }
             const auto package=cr::assemble_package(logical,ready_route,q,static_cast<uint64_t>(captured.head),
                 {manifest_lease,static_cast<uint64_t>(duration)},content,receipts,p.package);
+            observe_ready(canonical_ready_test_observation::point::assembled);
             std::optional<canonical_ready_info> published;
+            observe_ready(canonical_ready_test_observation::point::publish_requested);
             result.publication=retention_owned(owner,writer,state,session,ready_publish,[&](database& actual,retention_session& clock){
+                observe_ready(canonical_ready_test_observation::point::publish_body);
                 validate_namespace_admission(owner,writer,state,held_admission);
                 if(clock.now()>=deadline || clock.incarnation!=ticket->incarnation_)refuse("canonical READY preparation lease expired or retired before publication");
                 const auto row=ready_row(actual,p,key);ready_require_identity(row,p,logical,raw,held_admission.namespace_,replica);
@@ -502,11 +513,17 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
                 published=ready_info(actual,*state,clock,key);validate_namespace_admission(owner,writer,state,held_admission);
                 if(clock.now()>=deadline)refuse("canonical READY preparation expired during publication");
             });
+            observe_ready(canonical_ready_test_observation::point::publication_settled);
+            if(auto* observation=canonical_ready_test_observation::current) {
+                observation->publication=static_cast<int>(result.publication.state);
+                observation->publication_error=bool(result.publication.primary_error);
+            }
             if(result.publication.state==recovery_install_state::committed) {
                 result.transfer=std::move(published);
                 if(result.transfer)result.lease=canonical_ready_lease(session,state,result.transfer->identity,ticket->incarnation_,lease_sequence,deadline,route);
             }
-        } catch(...) {result.capture_error=std::current_exception();}
+            if(auto* observation=canonical_ready_test_observation::current)observation->lease_available=bool(result.lease);
+        } catch(...) {result.capture_error=std::current_exception();if(auto* observation=canonical_ready_test_observation::current)observation->capture_error=true;}
     } catch(...) {result.preparation.primary_error=std::current_exception();}
     return result;
 }

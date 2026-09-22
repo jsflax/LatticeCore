@@ -7,6 +7,7 @@
 #include <cstring>
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
+#include "../../Sources/LatticeCore/src/canonical_validated_sequence.hpp"
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <cstdio>
@@ -233,7 +234,26 @@ protected:
         if(std::string(op)!="discard")value["durationMilliseconds"]=duration;return value;
     }
     json lease(const relay_recovery_setup& value,const ready_wire::frame& f,const json& d,const char* op="prepare",int64_t duration=10000) {
-        auto result=invoke(value,command(op,f,d,duration));if(result.status_code()!=1||!result.publishable())throw std::runtime_error("READY lease response unavailable");
+        using namespace lattice::detail::canonical_ready_test_observation;
+        observation trace;const auto previous=current;current=&trace;
+        namespace counts=lattice::detail::canonical_range::sequence_test_observation;
+        counts::counters work;const auto previous_work=counts::current;counts::current=&work;
+        struct reset {observation* previous;counts::counters* work;~reset(){current=previous;counts::current=work;}} restore{previous,previous_work};
+        auto result=invoke(value,command(op,f,d,duration));
+        if(result.status_code()!=1||!result.publishable()) {
+            // Bounded local diagnostics even when the expired response MUST NOT
+            // be sent. The original failure and all workload/lease inputs stay.
+            const json diagnostic={{"status",result.status_code()},{"publishable",result.publishable()},
+                {"bridgeError",last_bridge_error().substr(0,2048)},{"response",result.wire().substr(0,4096)},
+                {"preparation",trace.preparation},{"publication",trace.publication},
+                {"preparationError",trace.preparation_error},{"publicationError",trace.publication_error},
+                {"captureError",trace.capture_error},{"leaseAvailable",trace.lease_available},
+                {"phases",{"entered","prepared","captured","assembled","publishRequested","publishBody","publicationSettled","auditBegin","auditEnd","finished"}},
+                {"visits",trace.visits},{"firstMicroseconds",trace.first_us},{"lastMicroseconds",trace.last_us},{"auditedFrames",trace.audited_frames},
+                {"requestValidations",work.request_validations},{"rebaseBuilds",work.rebase_builds},{"restartObjects",work.restart_objects},
+                {"cursors",work.cursors},{"pageTransitions",work.transitions}};
+            throw std::runtime_error("READY lease response unavailable: "+diagnostic.dump());
+        }
         auto answer=json::parse(result.wire());if(answer.at("leaseAvailable")!=true)throw std::runtime_error("READY lease did not commit: "+answer.dump());return answer;
     }
     relay_ready_result read(const relay_recovery_setup& value,const json& lease,uint64_t index) {

@@ -165,8 +165,11 @@ enum class stream_kind { content, receipts };
 // Retains only manifest/limits, counters and the last key, never prior records.
 // Discard after any append/finish refusal. A digest is integrity, not authority.
 class stream_hasher {
+    friend class validated_sequence;
     struct state;
     std::unique_ptr<state> state_;
+    explicit stream_hasher(std::unique_ptr<state>);
+    stream_hasher clone() const;
 public:
     stream_hasher(const manifest&, stream_kind, const limits&);
     ~stream_hasher();

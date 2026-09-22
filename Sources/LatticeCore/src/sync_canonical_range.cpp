@@ -1,5 +1,6 @@
 #include "sync_canonical_range.hpp"
 #include "canonical_range_package.hpp"
+#include "canonical_validated_sequence.hpp"
 #include "vendor/picosha2/picosha2.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <type_traits>
 
 namespace lattice::detail::canonical_range {
+thread_local sequence_test_observation::counters* sequence_test_observation::current=nullptr;
 namespace {
 using json = nlohmann::json;
 constexpr uint64_t maximum = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
@@ -81,6 +83,7 @@ void selection(mode m,const std::optional<uint64_t>& base,uint64_t head){
 }
 uint64_t identity_bytes(const identity& i){return add(16,add(i.table.size(),i.id.size()));}
 std::vector<identity> rebase(const request& r){
+    if(auto* c=sequence_test_observation::current)++c->rebase_builds;
     std::vector<identity> result;
     for(const auto& q:r.receipts) for(const auto& t:q.targets) result.push_back(t);
     std::sort(result.begin(),result.end(),less);result.erase(std::unique(result.begin(),result.end()),result.end());return result;
@@ -173,7 +176,7 @@ std::string request_hash(const attempt& a,const request& r){
 }
 std::string anchor(const manifest& m){hash_writer h("anchor");h.d(m.request_digest);write(h,m.source);h.s(spelling(m.selection));write(h,m.base);h.u(m.head);h.s(m.protection.id);h.u(m.protection.duration_ms);return h.finish();}
 std::string manifest_hash(const manifest& m){hash_writer h("manifest");h.d(anchor(m));write(h,m.counts);h.d(m.content_digest);h.d(m.receipt_digest);h.d(m.rebase_digest);return h.finish();}
-void request_valid(const attempt& a,const request& r,const limits& b){request_shape(a,r,b);digest(r.request_digest);check(request_hash(a,r)==r.request_digest,"request digest mismatch");}
+void request_valid(const attempt& a,const request& r,const limits& b){if(auto* c=sequence_test_observation::current)++c->request_validations;request_shape(a,r,b);digest(r.request_digest);check(request_hash(a,r)==r.request_digest,"request digest mismatch");}
 void manifest_valid(const manifest& m,const limits& b){manifest_shape(m,b);digest(m.manifest_digest);check(manifest_hash(m)==m.manifest_digest,"manifest digest mismatch");}
 
 uint64_t content_size(const content_item& x){uint64_t n=add(1,identity_bytes(x.key));if(const auto* p=std::get_if<present>(&x.value))n=add(n,add(8,p->payload.size()));return n;}
@@ -351,6 +354,40 @@ void bound_offer(const attempt& a,const request& r,const manifest& m,const limit
     const auto ids=rebase(r);uint64_t bytes=0;for(const auto& i:ids)bytes=add(bytes,identity_bytes(i));
     check(m.counts.receipts==r.receipts.size()&&m.counts.rebase_identities==ids.size()&&m.counts.rebase_bytes==bytes&&m.rebase_digest==rebase_hash(r),"receipt or rebase manifest coverage differs");
 }
+// Count the codec's actual compact JSON representation without first dumping
+// an escaped payload. DTOs produce only bounded, shallow JSON shapes here.
+struct package_json_size { uint64_t bytes=0, nodes=0, depth=0; };
+uint64_t package_string_bytes(const std::string& text) {
+    uint64_t n=2;
+    for(unsigned char c:text) {
+        const uint64_t width=(c=='"'||c=='\\'||c=='\b'||c=='\f'||c=='\n'||c=='\r'||c=='\t')?2:(c<32?6:1);
+        n=add(n,width);
+    }
+    return n;
+}
+package_json_size package_size(const json& value) {
+    package_json_size result;result.nodes=1;
+    if(value.is_string())result.bytes=package_string_bytes(value.get_ref<const std::string&>());
+    else if(value.is_null())result.bytes=4;
+    else if(value.is_boolean())result.bytes=value.get<bool>()?4:5;
+    else if(value.is_number_integer()||value.is_number_unsigned())result.bytes=value.dump().size();
+    else {
+        check(value.is_structured(),"unsupported package JSON scalar");
+        result.bytes=2;result.depth=1;bool first=true;
+        for(auto it=value.begin();it!=value.end();++it) {
+            if(!first)result.bytes=add(result.bytes,1);first=false;
+            if(value.is_object()) {
+                result.bytes=add(result.bytes,add(package_string_bytes(it.key()),1));
+                result.nodes=add(result.nodes,1);
+            }
+            const auto child=package_size(it.value());
+            result.bytes=add(result.bytes,child.bytes);result.nodes=add(result.nodes,child.nodes);
+            result.depth=std::max(result.depth,add(child.depth,1));
+        }
+    }
+    return result;
+}
+
 void progress(uint64_t pages,uint64_t rows,uint64_t bytes,uint64_t all_pages,uint64_t all_rows,uint64_t all_bytes,const wire_limits& w){
     check(pages<=all_pages&&rows<=all_rows&&bytes<=all_bytes,"sequence exceeds manifest");
     stream_counts(pages,rows,bytes,all_pages,all_rows,all_bytes,w);
@@ -376,11 +413,71 @@ void state_valid(const sequence_state& s,const limits& b){
     if(s.status==phase::sequence_complete_unverified)check(s.next_content_page==t.content_pages&&s.next_receipt_page==t.receipt_pages&&seen==ids.size(),"incomplete canonical terminal sequence");
 }
 json state_json(const sequence_state& s){
+    if(auto* c=sequence_test_observation::current)++c->restart_objects;
     std::string bitmap;bitmap.reserve(s.rebase_seen.size());for(auto c:s.rebase_seen)bitmap.push_back(c?'1':'0');
     return {{"latticeCanonicalRangeState",{{"version",2},{"attempt",attempt_json(s.logical)},{"request",request_json(s.frozen_request)},{"manifest",manifest_json(s.offer)},
         {"phase",s.status==phase::receiving?"receiving":"sequence_complete_unverified"},{"next_content_page",decimal(s.next_content_page)},{"next_receipt_page",decimal(s.next_receipt_page)},
         {"identities",decimal(s.identities)},{"present",decimal(s.present_count)},{"tombstones",decimal(s.tombstone_count)},{"content_bytes",decimal(s.content_bytes)},
         {"receipts",decimal(s.receipt_count)},{"receipt_bytes",decimal(s.receipt_bytes)},{"last_identity",s.last_identity?identity_json(*s.last_identity):json(nullptr)},{"rebase_seen",bitmap}}}};
+}
+// Only progress is mutable in an owned cursor. Public DTO validation still
+// checks the entire caller-controlled bitmap before entering these same rules.
+struct sequence_progress {
+    phase status=phase::receiving;
+    uint64_t next_content_page=0,next_receipt_page=0,identities=0,present_count=0,tombstone_count=0,content_bytes=0,receipt_count=0,receipt_bytes=0;
+    std::optional<identity> last_identity;
+    size_t rebase_count=0;
+};
+sequence_progress progress_of(const sequence_state& s) {
+    return {s.status,s.next_content_page,s.next_receipt_page,s.identities,s.present_count,s.tombstone_count,s.content_bytes,s.receipt_count,s.receipt_bytes,s.last_identity,
+        static_cast<size_t>(std::count(s.rebase_seen.begin(),s.rebase_seen.end(),uint8_t{1}))};
+}
+void apply_progress(sequence_state& s,const sequence_progress& p) {
+    s.status=p.status;s.next_content_page=p.next_content_page;s.next_receipt_page=p.next_receipt_page;
+    s.identities=p.identities;s.present_count=p.present_count;s.tombstone_count=p.tombstone_count;
+    s.content_bytes=p.content_bytes;s.receipt_count=p.receipt_count;s.receipt_bytes=p.receipt_bytes;s.last_identity=p.last_identity;
+    std::fill(s.rebase_seen.begin(),s.rebase_seen.end(),uint8_t{0});
+    std::fill_n(s.rebase_seen.begin(),p.rebase_count,uint8_t{1});
+}
+sequence_progress transition(const sequence_progress& current,const request& r,const manifest& m,
+    const std::vector<identity>& ids,const frame& f) {
+    check(current.status==phase::receiving,"canonical sequence already ended");auto next=current;
+    if(const auto* p=std::get_if<content_page>(&f.body)){
+        check(p->manifest_digest==m.manifest_digest&&current.next_receipt_page==0&&p->index==current.next_content_page&&p->index<m.counts.content_pages,"duplicate or out-of-order content page");
+        check(!current.last_identity||less(*current.last_identity,p->items.front().key),"content identity repeats across pages");
+        check(p->count<=m.counts.identities-current.identities&&p->bytes<=m.counts.content_bytes-current.content_bytes,"content page exceeds remaining manifest");
+        for(const auto& x:p->items){auto it=std::lower_bound(ids.begin(),ids.end(),x.key,less);const bool target=it!=ids.end()&&*it==x.key;
+            if(m.selection==mode::delta&&m.base==std::optional<uint64_t>{m.head})check(target,"same-head refresh contains identity outside request union");
+            // Sorted content can consume only the next exact requested target.
+            // This is the bitmap/passed-identity invariant checked by state_valid.
+            check(next.rebase_count==ids.size()||!less(ids[next.rebase_count],x.key),"missing or impossible rebase identity");
+            if(target)++next.rebase_count;
+            if(std::holds_alternative<present>(x.value))++next.present_count;
+            else {check(m.selection==mode::delta||target,"full snapshot tombstone is not a requested refresh");++next.tombstone_count;}}
+        ++next.next_content_page;next.identities+=p->count;next.content_bytes+=p->bytes;next.last_identity=p->items.back().key;
+    }else if(const auto* p=std::get_if<receipt_page>(&f.body)){
+        check(p->manifest_digest==m.manifest_digest&&current.next_content_page==m.counts.content_pages&&p->index==current.next_receipt_page&&p->index<m.counts.receipt_pages,"duplicate or out-of-order receipt page");
+        check(p->count<=m.counts.receipts-current.receipt_count&&p->bytes<=m.counts.receipt_bytes-current.receipt_bytes,"receipt page exceeds remaining manifest");
+        for(size_t i=0;i<p->items.size();++i)receipt_binding(p->items[i],r.receipts.at(static_cast<size_t>(current.receipt_count)+i),m.head);
+        ++next.next_receipt_page;next.receipt_count+=p->count;next.receipt_bytes+=p->bytes;
+    }else if(const auto* e=std::get_if<end>(&f.body)){
+        check(e->manifest_digest==m.manifest_digest,"terminal manifest differs");next.status=phase::sequence_complete_unverified;
+    }else throw protocol_error("request or manifest cannot replace active sequence");
+    const auto& t=m.counts;
+    check(next.identities==add(next.present_count,next.tombstone_count)&&next.present_count<=t.present&&next.tombstone_count<=t.tombstones,"sequence tag totals differ");
+    progress(next.next_content_page,next.identities,next.content_bytes,t.content_pages,t.identities,t.content_bytes,r.budget);
+    progress(next.next_receipt_page,next.receipt_count,next.receipt_bytes,t.receipt_pages,t.receipts,t.receipt_bytes,r.budget);
+    check(next.rebase_count<=next.identities,"rebase coverage exceeds content");
+    if(next.status==phase::sequence_complete_unverified)
+        check(next.next_content_page==t.content_pages&&next.next_receipt_page==t.receipt_pages&&next.rebase_count==ids.size(),"incomplete canonical terminal sequence");
+    return next;
+}
+json progress_json(const sequence_progress& s) {
+    return {{"phase",s.status==phase::receiving?"receiving":"sequence_complete_unverified"},
+        {"next_content_page",decimal(s.next_content_page)},{"next_receipt_page",decimal(s.next_receipt_page)},
+        {"identities",decimal(s.identities)},{"present",decimal(s.present_count)},{"tombstones",decimal(s.tombstone_count)},
+        {"content_bytes",decimal(s.content_bytes)},{"receipts",decimal(s.receipt_count)},{"receipt_bytes",decimal(s.receipt_bytes)},
+        {"last_identity",s.last_identity?identity_json(*s.last_identity):json(nullptr)}};
 }
 } // namespace
 
@@ -414,6 +511,11 @@ struct stream_hasher::state {
 };
 stream_hasher::stream_hasher(const manifest& m,stream_kind k,const limits& b) {
     manifest_shape(m,b);state_=std::make_unique<state>(m,k,b);
+}
+stream_hasher::stream_hasher(std::unique_ptr<state> s):state_(std::move(s)){}
+stream_hasher stream_hasher::clone() const {
+    check(bool(state_),"canonical hasher has no state");
+    return stream_hasher(std::make_unique<state>(*state_));
 }
 stream_hasher::~stream_hasher()=default;
 stream_hasher::stream_hasher(stream_hasher&&) noexcept=default;
@@ -473,26 +575,9 @@ sequence_state begin(const attempt& a,const request& r,const manifest& m,const l
 }
 sequence_state propose(const sequence_state& current,const frame& f,const limits& b){
     state_valid(current,b);const auto effective=narrowed(b,current.frozen_request.budget);(void)encode(f,effective);
-    check(f.logical==current.logical,"frame logical attempt differs");check(current.status==phase::receiving,"canonical sequence already ended");
-    auto next=current;const auto ids=rebase(current.frozen_request);const auto& m=current.offer;
-    if(const auto* p=std::get_if<content_page>(&f.body)){
-        check(p->manifest_digest==m.manifest_digest&&current.next_receipt_page==0&&p->index==current.next_content_page&&p->index<m.counts.content_pages,"duplicate or out-of-order content page");
-        check(!current.last_identity||less(*current.last_identity,p->items.front().key),"content identity repeats across pages");
-        check(p->count<=m.counts.identities-current.identities&&p->bytes<=m.counts.content_bytes-current.content_bytes,"content page exceeds remaining manifest");
-        for(const auto& x:p->items){auto it=std::lower_bound(ids.begin(),ids.end(),x.key,less);const bool target=it!=ids.end()&&*it==x.key;
-            if(m.selection==mode::delta&&m.base==std::optional<uint64_t>{m.head})check(target,"same-head refresh contains identity outside request union");
-            if(target)next.rebase_seen[static_cast<size_t>(it-ids.begin())]=1;
-            if(std::holds_alternative<present>(x.value))++next.present_count;
-            else {check(m.selection==mode::delta||target,"full snapshot tombstone is not a requested refresh");++next.tombstone_count;}}
-        ++next.next_content_page;next.identities+=p->count;next.content_bytes+=p->bytes;next.last_identity=p->items.back().key;
-    }else if(const auto* p=std::get_if<receipt_page>(&f.body)){
-        check(p->manifest_digest==m.manifest_digest&&current.next_content_page==m.counts.content_pages&&p->index==current.next_receipt_page&&p->index<m.counts.receipt_pages,"duplicate or out-of-order receipt page");
-        check(p->count<=m.counts.receipts-current.receipt_count&&p->bytes<=m.counts.receipt_bytes-current.receipt_bytes,"receipt page exceeds remaining manifest");
-        for(size_t i=0;i<p->items.size();++i)receipt_binding(p->items[i],current.frozen_request.receipts.at(static_cast<size_t>(current.receipt_count)+i),m.head);
-        ++next.next_receipt_page;next.receipt_count+=p->count;next.receipt_bytes+=p->bytes;
-    }else if(const auto* e=std::get_if<end>(&f.body)){
-        check(e->manifest_digest==m.manifest_digest,"terminal manifest differs");next.status=phase::sequence_complete_unverified;
-    }else throw protocol_error("request or manifest cannot replace active sequence");
+    check(f.logical==current.logical,"frame logical attempt differs");
+    const auto next_progress=transition(progress_of(current),current.frozen_request,current.offer,rebase(current.frozen_request),f);
+    auto next=current;apply_progress(next,next_progress);
     (void)encode_state(next,b);return next;
 }
 std::string encode_state(const sequence_state& s,const limits& b){state_valid(s,b);return dump(state_json(s),b,b.restart_bytes);}
@@ -504,40 +589,57 @@ sequence_state decode_state(std::string_view bytes,const attempt& expected,const
     const auto bitmap=text(j.at("rebase_seen"));check(bitmap.size()<=b.request_targets,"restart bitmap exceeds budget");for(char c:bitmap){check(c=='0'||c=='1',"invalid restart bitmap");s.rebase_seen.push_back(c-'0');}
     state_valid(s,b);return s;
 }
+struct validated_sequence::state {
+    const sequence_state initial;
+    const limits budget,effective;
+    const std::vector<identity> ids;
+    const package_json_size whole_size,dynamic_size;
+    struct pending {
+        sequence_progress progress;
+        stream_hasher content,receipts;
+        pending(sequence_progress p,stream_hasher c,stream_hasher r)
+            :progress(std::move(p)),content(std::move(c)),receipts(std::move(r)){}
+    };
+    std::unique_ptr<pending> live;
+    state(const attempt& a,const request& r,const manifest& m,const limits& b)
+        :initial(begin(a,r,m,b)),budget(b),effective(narrowed(b,r.budget)),ids(rebase(r)),
+         whole_size(package_size(state_json(initial))),dynamic_size(package_size(progress_json({}))),
+         live(std::make_unique<pending>(sequence_progress{},stream_hasher(m,stream_kind::content,effective),stream_hasher(m,stream_kind::receipts,effective))) {}
+    void restart_fits(const sequence_progress& p) const {
+        // Same fixed field names, bitmap width and immutable objects as the
+        // already parsed initial restart. Only these ten values can change.
+        // Names are checked by page encoding; decimals/phase are ASCII <= 28
+        // bytes (parser string budget is >= 64). Bitmap width never changes.
+        const auto size=package_size(progress_json(p));
+        check(add(whole_size.bytes-dynamic_size.bytes,size.bytes)<=budget.restart_bytes,"raw canonical frame exceeds budget");
+        check(add(whole_size.nodes-dynamic_size.nodes,size.nodes)<=budget.nodes&&
+              std::max(whole_size.depth,add(size.depth,1))<=budget.depth,"invalid or over-budget canonical JSON");
+    }
+};
+validated_sequence::validated_sequence(const attempt& a,const request& r,const manifest& m,const limits& b)
+    :state_(std::make_unique<state>(a,r,m,b)) {if(auto* c=sequence_test_observation::current)++c->cursors;}
+validated_sequence::~validated_sequence()=default;
+validated_sequence::validated_sequence(validated_sequence&&) noexcept=default;
+validated_sequence& validated_sequence::operator=(validated_sequence&&) noexcept=default;
+phase validated_sequence::status()const noexcept{return state_?state_->live->progress.status:phase::receiving;}
+sequence_state validated_sequence::snapshot()const {
+    check(bool(state_),"canonical cursor has no state");auto result=state_->initial;apply_progress(result,state_->live->progress);return result;
+}
+void validated_sequence::advance(const frame& f) {
+    check(bool(state_),"canonical cursor has no state");auto& s=*state_;
+    check(!std::holds_alternative<request>(f.body)&&!std::holds_alternative<manifest>(f.body),"request or manifest cannot replace active sequence");
+    (void)encode(f,s.effective);check(f.logical==s.initial.logical,"frame logical attempt differs");
+    const auto progress=transition(s.live->progress,s.initial.frozen_request,s.initial.offer,s.ids,f);
+    s.restart_fits(progress);
+    auto next=std::make_unique<state::pending>(progress,s.live->content.clone(),s.live->receipts.clone());
+    if(const auto* p=std::get_if<content_page>(&f.body))for(const auto& item:p->items)next->content.append(item);
+    if(const auto* p=std::get_if<receipt_page>(&f.body))for(const auto& item:p->items)next->receipts.append(item);
+    if(progress.status==phase::sequence_complete_unverified)
+        check(next->content.finish()==s.initial.offer.content_digest&&next->receipts.finish()==s.initial.offer.receipt_digest,"canonical whole-stream hashes differ");
+    s.live.swap(next); // sole publication; no throwing work follows
+    if(auto* c=sequence_test_observation::current)++c->transitions;
+}
 namespace {
-// Count the codec's actual compact JSON representation without first dumping
-// an escaped payload. DTOs produce only bounded, shallow JSON shapes here.
-struct package_json_size { uint64_t bytes=0, nodes=0, depth=0; };
-uint64_t package_string_bytes(const std::string& text) {
-    uint64_t n=2;
-    for(unsigned char c:text) {
-        const uint64_t width=(c=='"'||c=='\\'||c=='\b'||c=='\f'||c=='\n'||c=='\r'||c=='\t')?2:(c<32?6:1);
-        n=add(n,width);
-    }
-    return n;
-}
-package_json_size package_size(const json& value) {
-    package_json_size result;result.nodes=1;
-    if(value.is_string())result.bytes=package_string_bytes(value.get_ref<const std::string&>());
-    else if(value.is_null())result.bytes=4;
-    else if(value.is_boolean())result.bytes=value.get<bool>()?4:5;
-    else if(value.is_number_integer()||value.is_number_unsigned())result.bytes=value.dump().size();
-    else {
-        check(value.is_structured(),"unsupported package JSON scalar");
-        result.bytes=2;result.depth=1;bool first=true;
-        for(auto it=value.begin();it!=value.end();++it) {
-            if(!first)result.bytes=add(result.bytes,1);first=false;
-            if(value.is_object()) {
-                result.bytes=add(result.bytes,add(package_string_bytes(it.key()),1));
-                result.nodes=add(result.nodes,1);
-            }
-            const auto child=package_size(it.value());
-            result.bytes=add(result.bytes,child.bytes);result.nodes=add(result.nodes,child.nodes);
-            result.depth=std::max(result.depth,add(child.depth,1));
-        }
-    }
-    return result;
-}
 struct package_slice { size_t first=0,count=0;uint64_t logical_bytes=0; };
 template<class Page,class Item>
 std::vector<package_slice> package_partition(const attempt& a,uint64_t route,
@@ -635,7 +737,7 @@ encoded_package assemble_package(const attempt& a,uint64_t route,const request& 
     m.rebase_digest=rebase_sha256(a,r,b);
     m.content_digest=content_sha256(m,rows,b);m.receipt_digest=receipts_sha256(m,receipts,b);
     m.manifest_digest=manifest_sha256(m,b);
-    auto sequence=begin(a,r,m,local);
+    validated_sequence sequence(a,r,m,local);
     const auto retain=[&](frame value) {
         // Check exact wire length BEFORE allocating the retained encoding.
         // At most one page DTO/JSON tree and codec temporaries exist beside
@@ -651,15 +753,15 @@ encoded_package assemble_package(const attempt& a,uint64_t route,const request& 
     retain({a,route,m});
     for(size_t i=0;i<content_pages.size();++i) {
         frame value{a,route,package_page<content_page>(rows,content_pages[i],i,m.manifest_digest,b)};
-        sequence=propose(sequence,value,local);retain(std::move(value));
+        sequence.advance(value);retain(std::move(value));
     }
     for(size_t i=0;i<receipt_pages.size();++i) {
         frame value{a,route,package_page<receipt_page>(receipts,receipt_pages[i],i,m.manifest_digest,b)};
-        sequence=propose(sequence,value,local);retain(std::move(value));
+        sequence.advance(value);retain(std::move(value));
     }
     frame terminal{a,route,end{m.manifest_digest}};
-    sequence=propose(sequence,terminal,local);retain(std::move(terminal));
-    check(sequence.status==phase::sequence_complete_unverified,"package sequence incomplete");
+    sequence.advance(terminal);retain(std::move(terminal));
+    check(sequence.status()==phase::sequence_complete_unverified,"package sequence incomplete");
     return result;
 }
 } // namespace lattice::detail::canonical_range

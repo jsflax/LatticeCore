@@ -2,8 +2,24 @@
 #include "canonical_range_package.hpp"
 #include "canonical_source_capture.hpp"
 #include "recovery_writer_access.hpp"
+#include <array>
+#include <chrono>
 
 namespace lattice::detail {
+namespace canonical_ready_test_observation {
+// Passive fixed-storage observations only. No callback, SQL, allocation, wait,
+// clock override or authority. A fixture owns/resets this same-thread slot.
+// Times measure real elapsed work and never participate in lease decisions.
+enum class point { entered,prepared,captured,assembled,publish_requested,publish_body,publication_settled,audit_begin,audit_end,finished,count };
+struct observation {
+    std::chrono::steady_clock::time_point origin=std::chrono::steady_clock::now();
+    std::array<uint64_t,static_cast<size_t>(point::count)> visits{},first_us{},last_us{};
+    uint64_t audited_frames=0;
+    int preparation=-1,publication=-1;
+    bool preparation_error=false,publication_error=false,capture_error=false,lease_available=false;
+};
+extern thread_local observation* current;
+}
 class canonical_writer_adapter;
 struct canonical_ready_profile {
     // Exact private source spelling, not authenticated issuer authority.

@@ -1,8 +1,10 @@
 #include "TestHelpers.hpp"
 #include "../../Sources/LatticeCore/src/canonical_range_package.hpp"
+#include "../../Sources/LatticeCore/src/canonical_validated_sequence.hpp"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include <type_traits>
 #include <numeric>
+#include <nlohmann/json.hpp>
 
 struct PackageSourceRow { std::string body; };
 LATTICE_SCHEMA(PackageSourceRow,body);
@@ -201,4 +203,234 @@ TEST(CanonicalRangePackage, ActualImportedOriginalAndItsStoredReceiptSurviveCano
     EXPECT_EQ(std::get<std::string>(values.at("body")),"imported");
     EXPECT_EQ(package.offer().counts.receipts,1u);EXPECT_EQ(package.offer().counts.rebase_identities,1u);
     adapter.reset();owner->close();
+}
+
+namespace {
+void sequence_reseal(cr::frame& frame,const cr::limits& limits) {
+    if(auto* p=std::get_if<cr::content_page>(&frame.body)) {
+        p->count=p->items.size();p->bytes=0;
+        for(const auto& item:p->items)p->bytes+=cr::content_record_bytes(item,limits);
+        p->digest=cr::page_sha256(*p,limits);
+    }
+    if(auto* p=std::get_if<cr::receipt_page>(&frame.body)) {
+        p->count=p->items.size();p->bytes=0;
+        for(const auto& item:p->items)p->bytes+=cr::receipt_record_bytes(item,limits);
+        p->digest=cr::page_sha256(*p,limits);
+    }
+}
+struct sequence_counter_scope {
+    cr::sequence_test_observation::counters value;
+    cr::sequence_test_observation::counters* previous=cr::sequence_test_observation::current;
+    sequence_counter_scope(){cr::sequence_test_observation::current=&value;}
+    ~sequence_counter_scope(){cr::sequence_test_observation::current=previous;}
+};
+}
+TEST(CanonicalValidatedSequence, EveryPrefixMatchesStrictDTOAndExactWireAcrossReceiptKinds) {
+    for(unsigned kind=0;kind<3;++kind) {
+        PackageFixture f;
+        cr::receipt_item receipt{"original",cr::unknown{}};
+        if(kind==0)receipt.value=cr::committed{"namespace","coverage",cr::decision::no_op,3,cr::identity{"PackageSourceRow","A"}};
+        if(kind==1)receipt.value=cr::not_committed{"namespace","coverage"};
+        f.receipt(receipt);auto package=f.build();
+        auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+        EXPECT_EQ(cursor.snapshot(),reference);
+        for(size_t i=1;i<package.frames().size();++i) {
+            const auto frame=cr::decode(package.frames()[i],f.policy.codec);
+            EXPECT_EQ(cr::encode(frame,f.policy.codec),package.frames()[i]);
+            reference=cr::propose(reference,frame,f.policy.codec);cursor.advance(frame);
+            EXPECT_EQ(cursor.snapshot(),reference);
+            EXPECT_EQ(cr::encode_state(cursor.snapshot(),f.policy.codec),cr::encode_state(reference,f.policy.codec));
+        }
+        EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+    }
+}
+TEST(CanonicalValidatedSequence, OwnsFrozenInputsAndMoveRetainsProgressWithoutImportBypass) {
+    PackageFixture f;f.receipt({"original",cr::unknown{}});auto package=f.build();
+    cr::validated_sequence original(f.attempt,f.request,package.offer(),f.policy.codec);
+    original.advance(cr::decode(package.frames()[1],f.policy.codec));const auto before=original.snapshot();
+    cr::validated_sequence cursor(std::move(original));EXPECT_EQ(cursor.snapshot(),before);
+    const auto codec=f.policy.codec;f.request.receipts.clear();f.request.request_digest.assign(64,'0');f.policy.codec.maximum={};
+    for(size_t i=2;i<package.frames().size();++i)cursor.advance(cr::decode(package.frames()[i],codec));
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+    EXPECT_THROW(original.advance(cr::decode(package.frames().back(),codec)),cr::protocol_error);
+    static_assert(!std::is_copy_constructible_v<cr::validated_sequence>);
+    static_assert(!std::is_constructible_v<cr::validated_sequence,cr::sequence_state,cr::limits>);
+}
+TEST(CanonicalValidatedSequence, CorruptPageAttemptOrderCountsAndDigestLeaveExactPriorState) {
+    PackageFixture f;f.receipt({"original",cr::unknown{}});auto package=f.build();
+    cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+    const auto before=cursor.snapshot();const auto valid=cr::decode(package.frames()[1],f.policy.codec);
+    for(unsigned variant=0;variant<6;++variant) {
+        auto bad=valid;auto& page=std::get<cr::content_page>(bad.body);
+        if(variant==0)bad.logical.sequence++;
+        if(variant==1){++page.index;sequence_reseal(bad,f.policy.codec);}
+        if(variant==2)++page.count;
+        if(variant==3)++page.bytes;
+        if(variant==4)page.digest.assign(64,'0');
+        if(variant==5){page.manifest_digest.assign(64,'0');sequence_reseal(bad,f.policy.codec);}
+        EXPECT_THROW(cr::propose(before,bad,f.policy.codec),cr::protocol_error);
+        EXPECT_THROW(cursor.advance(bad),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),before);
+    }
+    EXPECT_THROW(cursor.advance(cr::decode(package.frames().back(),f.policy.codec)),cr::protocol_error);
+    EXPECT_EQ(cursor.snapshot(),before);
+    for(size_t i=1;i<package.frames().size();++i)cursor.advance(cr::decode(package.frames()[i],f.policy.codec));
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+}
+TEST(CanonicalValidatedSequence, RebaseSkipAndReceiptBindingRefuseBeforeHashOrProgressPublication) {
+    PackageFixture f;f.receipt({"original",cr::committed{"namespace","coverage",cr::decision::applied,3,cr::identity{"PackageSourceRow","A"}}});
+    auto package=f.build();cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+    auto first=cr::decode(package.frames()[1],f.policy.codec);const auto initial=cursor.snapshot();
+    auto& page=std::get<cr::content_page>(first.body);page.items.front().key.id="AA";sequence_reseal(first,f.policy.codec);
+    EXPECT_THROW(cr::propose(initial,first,f.policy.codec),cr::protocol_error);
+    EXPECT_THROW(cursor.advance(first),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),initial);
+    size_t i=1;
+    for(;i<package.frames().size();++i) {
+        const auto frame=cr::decode(package.frames()[i],f.policy.codec);
+        if(std::holds_alternative<cr::receipt_page>(frame.body))break;
+        cursor.advance(frame);
+    }
+    ASSERT_LT(i,package.frames().size());const auto prior=cursor.snapshot();
+    for(unsigned variant=0;variant<4;++variant) {
+        auto bad=cr::decode(package.frames()[i],f.policy.codec);auto& item=std::get<cr::receipt_page>(bad.body).items[0];
+        auto& receipt=std::get<cr::committed>(item.value);
+        if(variant==0)item.original_id="different";
+        if(variant==1)receipt.namespace_id="other";
+        if(variant==2)receipt.accepted_target->id="B";
+        if(variant==3)receipt.position=8;
+        sequence_reseal(bad,f.policy.codec);
+        EXPECT_THROW(cr::propose(prior,bad,f.policy.codec),cr::protocol_error);
+        EXPECT_THROW(cursor.advance(bad),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),prior);
+    }
+    for(;i<package.frames().size();++i)cursor.advance(cr::decode(package.frames()[i],f.policy.codec));
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+}
+TEST(CanonicalValidatedSequence, RestartByteBoundaryMatchesStrictProposalsIncludingEscapedLastIdentity) {
+    PackageFixture f;f.rows={f.row("A","first"),f.row("B\"\\","second"),f.row("C","third")};auto package=f.build();
+    auto initial=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+    const auto first=cr::decode(package.frames()[1],f.policy.codec);
+    const auto next=cr::propose(initial,first,f.policy.codec);
+    const auto size=cr::encode_state(next,f.policy.codec).size();
+    ASSERT_GT(size,cr::encode_state(initial,f.policy.codec).size());
+    for(int extra=-1;extra<=1;++extra) {
+        auto limits=f.policy.codec;limits.restart_bytes=size+extra;
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),limits);
+        if(extra<0) {
+            EXPECT_THROW(cr::propose(initial,first,limits),cr::protocol_error);
+            EXPECT_THROW(cursor.advance(first),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),initial);
+        }else {EXPECT_EQ(cr::propose(initial,first,limits),next);cursor.advance(first);EXPECT_EQ(cursor.snapshot(),next);}
+    }
+}
+TEST(CanonicalValidatedSequence, TerminalWholeHashesRefuseEvenWhenAllPageHashesAndSequenceAreValid) {
+    for(bool corrupt_receipts:{false,true}) {
+        PackageFixture f;f.receipt({"original",cr::unknown{}});auto package=f.build();auto manifest=package.offer();
+        (corrupt_receipts?manifest.receipt_digest:manifest.content_digest).assign(64,'0');
+        manifest.manifest_digest=cr::manifest_sha256(manifest,f.policy.codec);
+        cr::validated_sequence cursor(f.attempt,f.request,manifest,f.policy.codec);
+        auto reference=cr::begin(f.attempt,f.request,manifest,f.policy.codec);
+        for(size_t i=1;i+1<package.frames().size();++i) {
+            auto frame=cr::decode(package.frames()[i],f.policy.codec);
+            std::visit([&](auto& body){using T=std::decay_t<decltype(body)>;
+                if constexpr(std::is_same_v<T,cr::content_page>||std::is_same_v<T,cr::receipt_page>)body.manifest_digest=manifest.manifest_digest;
+            },frame.body);sequence_reseal(frame,f.policy.codec);
+            cursor.advance(frame);reference=cr::propose(reference,frame,f.policy.codec);
+        }
+        const cr::frame terminal{f.attempt,1,cr::end{manifest.manifest_digest}};const auto prior=cursor.snapshot();
+        // Public proposals deliberately remain sequence-only, as documented.
+        EXPECT_EQ(cr::propose(reference,terminal,f.policy.codec).status,cr::phase::sequence_complete_unverified);
+        EXPECT_THROW(cursor.advance(terminal),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),prior);
+        EXPECT_THROW(cursor.advance(terminal),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),prior);
+    }
+}
+TEST(CanonicalValidatedSequence, FullRequestWorkIsConstantAcrossTwoHundredFiftySixPages) {
+    PackageFixture f;auto& b=f.policy.codec;
+    b.maximum.frame_bytes=65536;b.maximum.items_per_page=1;b.maximum.content_pages=128;b.maximum.receipt_pages=128;b.maximum.receipts=128;
+    b.request_entries=128;b.nodes=16384;f.policy.frames=258;f.request.budget=b.maximum;f.rows.clear();
+    for(unsigned i=0;i<128;++i) {
+        const auto id="id-"+std::to_string(1000+i);f.rows.push_back(f.row(id,"payload"));
+        const auto original="original-"+std::to_string(1000+i);
+        f.request.receipts.push_back({original,"namespace",{{"PackageSourceRow",id}}});f.receipts.push_back({original,cr::unknown{}});
+    }
+    f.seal_request();auto package=f.build();ASSERT_EQ(package.frames().size(),258u);
+    sequence_counter_scope observed;cr::validated_sequence cursor(f.attempt,f.request,package.offer(),b);
+    const auto construction=observed.value;EXPECT_EQ(construction.cursors,1u);
+    EXPECT_GT(construction.request_validations,0u);EXPECT_GT(construction.rebase_builds,0u);EXPECT_GT(construction.restart_objects,0u);
+    for(size_t i=1;i<package.frames().size();++i)cursor.advance(cr::decode(package.frames()[i],b));
+    EXPECT_EQ(observed.value.request_validations,construction.request_validations);
+    EXPECT_EQ(observed.value.rebase_builds,construction.rebase_builds);
+    EXPECT_EQ(observed.value.restart_objects,construction.restart_objects);
+    EXPECT_EQ(observed.value.transitions,257u);EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+}
+TEST(CanonicalValidatedSequence, RawDTOAndRestartStillRejectForgedImmutableProofAndBitmap) {
+    PackageFixture f;f.receipt({"original",cr::unknown{}});auto package=f.build();
+    const auto first=cr::decode(package.frames()[1],f.policy.codec);
+    auto state=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+    auto forged=state;forged.frozen_request.receipts.clear();
+    EXPECT_THROW(cr::propose(forged,first,f.policy.codec),cr::protocol_error);
+    EXPECT_THROW(cr::encode_state(forged,f.policy.codec),cr::protocol_error);
+    EXPECT_THROW(cr::validated_sequence(f.attempt,forged.frozen_request,package.offer(),f.policy.codec),cr::protocol_error);
+    forged=state;forged.rebase_seen[0]=1;
+    EXPECT_THROW(cr::propose(forged,first,f.policy.codec),cr::protocol_error);
+    auto raw=cr::encode_state(state,f.policy.codec);const auto at=raw.find("\"rebase_seen\":\"0\"");ASSERT_NE(at,std::string::npos);
+    raw.replace(at,std::string("\"rebase_seen\":\"0\"").size(),"\"rebase_seen\":\"1\"");
+    EXPECT_THROW(cr::decode_state(raw,f.attempt,f.policy.codec),cr::protocol_error);
+}
+
+TEST(CanonicalValidatedSequence, TerminalRestartBudgetRefusalRetainsReceivingStateAndHashes) {
+    PackageFixture f;auto package=f.build();auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+    for(size_t i=1;i+1<package.frames().size();++i)reference=cr::propose(reference,cr::decode(package.frames()[i],f.policy.codec),f.policy.codec);
+    const auto terminal=cr::decode(package.frames().back(),f.policy.codec);
+    const auto complete=cr::propose(reference,terminal,f.policy.codec);
+    const auto exact=cr::encode_state(complete,f.policy.codec).size();
+    ASSERT_GT(exact,cr::encode_state(reference,f.policy.codec).size());
+    for(int delta=-1;delta<=0;++delta) {
+        auto limits=f.policy.codec;limits.restart_bytes=exact+delta;
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),limits);
+        for(size_t i=1;i+1<package.frames().size();++i)cursor.advance(cr::decode(package.frames()[i],limits));
+        if(delta<0) {
+            EXPECT_THROW(cr::propose(reference,terminal,limits),cr::protocol_error);
+            EXPECT_THROW(cursor.advance(terminal),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),reference);
+        }else {cursor.advance(terminal);EXPECT_EQ(cursor.snapshot(),complete);}
+    }
+}
+TEST(CanonicalValidatedSequence, EmptyFullAndSameHeadRequestedTombstoneMatchPublicSequence) {
+    for(bool same_head:{false,true}) {
+        PackageFixture f;f.rows.clear();
+        if(same_head) {
+            f.receipt({"original",cr::unknown{}},std::nullopt,"absent");
+            f.request.selection=cr::mode::delta;f.request.base=7;f.request.expected.revision=1;
+            f.request.expected.binding=f.request.source;f.request.expected.base={cr::frontier_kind::position,7};
+            f.rows={{{"PackageSourceRow","absent"},cr::tombstone{}}};f.seal_request();
+        }
+        auto package=f.build();auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+        for(size_t i=1;i<package.frames().size();++i) {
+            const auto frame=cr::decode(package.frames()[i],f.policy.codec);
+            reference=cr::propose(reference,frame,f.policy.codec);cursor.advance(frame);EXPECT_EQ(cursor.snapshot(),reference);
+        }
+        EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+    }
+}
+
+TEST(CanonicalValidatedSequence, ExactRestartNodeBudgetMatchesSAXWhenLastIdentityAppears) {
+    PackageFixture f;auto package=f.build();auto initial=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+    const auto first=cr::decode(package.frames()[1],f.policy.codec);
+    const auto next=cr::propose(initial,first,f.policy.codec);
+    const auto nodes=[](const std::string& raw) {
+        size_t count=0;
+        (void)nlohmann::json::parse(raw,[&](int,nlohmann::json::parse_event_t event,nlohmann::json&){
+            if(event!=nlohmann::json::parse_event_t::object_end&&event!=nlohmann::json::parse_event_t::array_end)++count;
+            return true;
+        });return count;
+    };
+    const auto exact=nodes(cr::encode_state(next,f.policy.codec));
+    ASSERT_GT(exact,nodes(cr::encode_state(initial,f.policy.codec)));
+    for(int delta=-1;delta<=0;++delta) {
+        auto limits=f.policy.codec;limits.nodes=exact+delta;
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),limits);
+        if(delta<0) {
+            EXPECT_THROW(cr::propose(initial,first,limits),cr::protocol_error);
+            EXPECT_THROW(cursor.advance(first),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),initial);
+        }else {cursor.advance(first);EXPECT_EQ(cursor.snapshot(),next);}
+    }
 }

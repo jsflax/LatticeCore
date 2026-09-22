@@ -1,4 +1,5 @@
 #include "canonical_writer_adapter.hpp"
+#include "canonical_validated_sequence.hpp"
 #include "recovery_authenticated_session.hpp"
 #include "recovery_writer_access.hpp"
 #include "vendor/picosha2/picosha2.h"
@@ -21,7 +22,17 @@
 #endif
 
 namespace lattice::detail {
+thread_local canonical_ready_test_observation::observation* canonical_ready_test_observation::current=nullptr;
 namespace {
+void observe_ready(canonical_ready_test_observation::point point) noexcept {
+    if(auto* value=canonical_ready_test_observation::current) {
+        const auto index=static_cast<size_t>(point);
+        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-value->origin).count();
+        if(!value->visits[index]++)value->first_us[index]=static_cast<uint64_t>(elapsed);
+        value->last_us[index]=static_cast<uint64_t>(elapsed);
+    }
+}
+
 constexpr size_t max_tables=16, max_columns=32, max_existing_rows=4096, max_sql=262144;
 using blob=std::vector<uint8_t>;
 [[noreturn]] void refuse(const char* why) { throw db_error(why); }

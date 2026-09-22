@@ -540,4 +540,33 @@ TEST_F(CanonicalDurableReady, NamespacedCaptureWithoutReadyRetains4096RequestCei
     EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY 1"),before);EXPECT_EQ(head(),before_head);
     committed(adapter->release_recovery_owned(owner,*reserved.reservation));
 }
+
+TEST_F(CanonicalDurableReady, AddressedReadStillAuditsEveryFrameBeforeAndAfterOwnedBody) {
+    attach();auto admission=admit();
+    for(unsigned i=1;i<=3;++i)import_entry(admission,ready_entry(i,i));
+    auto result=prepare(admission);complete(result);ASSERT_GT(result.transfer->frames,3u);
+    const auto before=snapshot();
+    using namespace canonical_ready_test_observation;
+    observation trace;const auto previous=current;current=&trace;
+    struct reset {observation* previous;~reset(){current=previous;}} restore{previous};
+    const auto read=adapter->read_ready_frame_owned(owner,admission,*result.lease,0);committed(read.settlement);ASSERT_TRUE(read.frame);
+    EXPECT_EQ(trace.visits[static_cast<size_t>(point::audit_begin)],2u);
+    EXPECT_EQ(trace.visits[static_cast<size_t>(point::audit_end)],2u);
+    EXPECT_EQ(trace.audited_frames,2*result.transfer->frames);
+    EXPECT_EQ(snapshot(),before);
+}
+TEST_F(CanonicalDurableReady, OffPageTailCorruptionStillRefusesReopenBeforeIncarnationOrCleanup) {
+    attach();auto admission=admit();import_entry(admission,ready_entry(1,1));
+    auto result=prepare(admission);complete(result);ASSERT_GT(result.transfer->frames,2u);
+    adapter.reset();owner->close();sibling->close();
+    {database raw(file.str());
+        const auto sql=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=X'7b7d' WHERE frame_index=(SELECT MAX(frame_index) FROM _lattice_canonical_ready_frame)");
+        raw.execute(sql);
+    }
+    owner=ready_owner(file.str());sibling=ready_owner(file.str());const auto before=snapshot();
+    EXPECT_THROW(attach(),db_error);
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+}
 #endif

@@ -88,7 +88,7 @@ let package = Package(
             dependencies: ["SqliteVec"],
             path: "Sources/LatticeCore",
             // Included by canonical_writer_adapter.cpp, never a standalone translation unit.
-            exclude: ["src/vendor/picosha2/LICENSE", "src/vendor/picosha2/README.md", "src/canonical_transfer_retention.inc"],
+            exclude: ["src/vendor/picosha2/LICENSE", "src/vendor/picosha2/README.md", "src/canonical_transfer_retention.inc", "src/canonical_durable_ready.inc"],
             sources: ["src"],
             publicHeadersPath: "include",
             cxxSettings: [

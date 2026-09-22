@@ -1001,4 +1001,55 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
     if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();
     return result;
 }
+scoped_recovery_result inspect_committed_canonical_range(const canonical_install_admission& grant,
+    const receive_install_identity& identity,const canonical_range::request& request,
+    const canonical_range::manifest& manifest) {
+    scoped_recovery_result result;
+    const auto& limits=grant.limits_.install;
+    result.transaction=recovery_writer_access::install(grant.owner_,[&](database& writer) {
+        validate_install_limits(limits);
+        require(grant.journal_revision_>0 && !grant.coverage_id_.empty() &&
+            grant.coverage_id_.size()<=limits.field_bytes,"canonical inspection lacks bound admission");
+        require(grant.receive_guard_.has_value() && grant.receive_guard_->channel==grant.attempt_.channel &&
+            grant.journal_.channel==grant.attempt_.channel && grant.profile_.binding.channel==grant.attempt_.channel,
+            "canonical inspection channel or guard admission differs");
+        // Q includes receiver/channel incarnations and attempt UUID. Validate
+        // complete frozen framing before using stored digests as retry evidence.
+        const auto described=describe_canonical_range(grant.attempt_,request,manifest,grant.limits_.codec,grant.route_);
+        require(described.installation_binding==grant.profile_.binding && described.installation_identity==identity &&
+            request.request_digest==grant.request_digest_ && manifest.manifest_digest==grant.manifest_digest_,
+            "canonical inspection framing differs from exact retained receiver identity");
+        // Audit existing stores only. A missing result must not initialize an
+        // empty receiver/journal or recreate discarded staging as a side effect.
+        receive_install_store state(grant.owner_,limits.installations);state.audit();
+        const auto current=state.read(grant.attempt_.channel);
+        require(current && current->binding==grant.profile_.binding && current->last_installed &&
+            *current->last_installed==identity && identity.sequence>0 &&
+            static_cast<uint64_t>(identity.sequence)==grant.attempt_.sequence &&
+            identity.request_digest==grant.request_digest_ && identity.manifest_digest==grant.manifest_digest_,
+            "canonical inspection lacks exact retained receiver identity");
+        recovery_obligation_store journal(grant.owner_,grant.limits_.obligations,limits.installations);journal.audit();
+        const auto scope=journal.read(grant.attempt_.channel);
+        require(scope && scope->address==grant.journal_ && scope->profile==grant.profile_ &&
+            scope->revision>=grant.journal_revision_ && scope->installed_sequence==identity.sequence &&
+            scope->installed_revision==current->revision && scope->installed_head==identity.head &&
+            scope->installed_manifest==identity.manifest_digest,
+            "canonical inspection differs from current journal installation");
+        const auto guard=receive_delivery_guard_access::read_owned(*grant.owner_,writer,grant.attempt_.channel);
+        require(guard.present && !guard.legacy_origin && !guard.capacity_refused &&
+            guard.state==receive_guard_state::canonical_installed,
+            "canonical inspection lacks current modern installed guard");
+        auto expected=*grant.receive_guard_;
+        // Global counters can grow on unrelated channels between observation
+        // and retry; the exact target incarnation/generation still must match.
+        expected.store_incarnation=guard.store_incarnation;
+        expected.store_channels=guard.store_channels;
+        expected.store_channel_bytes=guard.store_channel_bytes;
+        if(expected==guard)receive_delivery_guard_access::verify_owned(*grant.owner_,writer,guard);
+        else receive_delivery_guard_access::verify_canonical_completed(*grant.owner_,writer,*grant.receive_guard_);
+        result.installation=receive_install_receipt{receive_install_disposition::already_installed,current->revision,identity.head};
+    });
+    if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();
+    return result;
+}
 } // namespace lattice::detail

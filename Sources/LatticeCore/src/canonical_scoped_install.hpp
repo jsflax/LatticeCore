@@ -44,6 +44,7 @@ class canonical_install_admission {
     canonical_install_admission()=default;
     friend struct canonical_scoped_install_test_access;
     friend scoped_recovery_result install_staged_canonical_range(const canonical_install_admission&);
+    friend scoped_recovery_result inspect_committed_canonical_range(const canonical_install_admission&, const receive_install_identity&, const canonical_range::request&, const canonical_range::manifest&);
 public:
     canonical_install_admission(const canonical_install_admission&)=default;
     canonical_install_admission(canonical_install_admission&&)=default;
@@ -60,4 +61,19 @@ public:
 // Retained-stage exact retries bypass effects and journal settlement. Released
 // stages are outside this entry; no digest/head-only retry path is added.
 scoped_recovery_result install_staged_canonical_range(const canonical_install_admission&);
+// Inspect one full, exact retained receiver result, including after stage release
+// or reopen. This reads existing receiver/journal/guard metadata in one owned
+// transaction and does not initialize storage, apply models, settle originals,
+// release pages, resume a journal or activate transport. The guard admission may
+// be the original preinstall snapshot or a fresh exact canonical snapshot.
+// Complete frozen request/manifest framing is revalidated against every logical
+// attempt field and the private grant Q/M. The shared staging conversion derives
+// binding and I from those exact bytes; route validation is framing, not liveness.
+// The full supplied identity must equal both that derived I and actual durable last-installed evidence;
+// a sequence/head/digest or journal claim alone cannot produce a receipt. The
+// private admission binds the owner, source/profile and current journal address.
+// This is committed-state observation, not source authentication or permission
+// to resume a current/newer route. Its receipt is usable only after owned COMMIT.
+scoped_recovery_result inspect_committed_canonical_range(const canonical_install_admission&,
+    const receive_install_identity&,const canonical_range::request&,const canonical_range::manifest&);
 } // namespace lattice::detail

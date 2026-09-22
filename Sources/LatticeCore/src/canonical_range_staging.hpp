@@ -35,6 +35,12 @@ struct canonical_staging_snapshot {
     receive_install_binding installation_binding;
     receive_install_identity installation_identity;
 };
+// Pure bounded framing description shared by staging and committed-result
+// observation. Revalidates Q/M against the complete logical attempt and derives
+// checked receiver binding/I. It is not source authority or content verification.
+canonical_staging_snapshot describe_canonical_range(const canonical_range::attempt&,
+    const canonical_range::request&,const canonical_range::manifest&,
+    const canonical_range::limits&,uint64_t route_generation);
 struct canonical_staging_begin {
     receive_install_disposition disposition;
     // Empty for exact last-installed retry after explicit staging release.

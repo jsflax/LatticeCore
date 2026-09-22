@@ -576,3 +576,149 @@ TEST_F(CanonicalScopedInstall, GuardedTempTriggersCannotRewriteOutboundStateDuri
         owner->db().execute("DROP TRIGGER temp._guard_temp_metadata");ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
     }
 }
+
+TEST_F(CanonicalScopedInstall, CommittedInspectionAfterReleasePreservesLateOriginalAndAllRows) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));const auto identity=*installation().last_installed;
+    owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});
+    const auto late=edit(A,"late-pending");owned([&](auto& db){const auto token=receive_delivery_guard_access::begin(*owner,db,"other-channel");
+        receive_delivery_guard_access::finish(*owner,db,token,token.admitted,std::string("other-prefix"),false,true);});
+    std::shared_ptr<lattice::lattice_db> base=owner;int notifications=0;
+    const auto observer=base->add_table_observer("TestPerson",[&](const auto&){++notifications;});
+    const auto stable=guarded_snapshot();const auto result=inspect_committed_canonical_range(admission,identity,x.q,x.m);
+    ASSERT_TRUE(committed(result));EXPECT_EQ(result.installation->disposition,receive_install_disposition::already_installed);
+    EXPECT_EQ(result.installation->revision,identity.expected_revision+1);EXPECT_EQ(result.installation->head,identity.head);
+    EXPECT_EQ(guarded_snapshot(),stable);EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_range_attempt"),0);
+    EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_range_page"),0);EXPECT_EQ(notifications,0);
+    owned([&](auto&){EXPECT_EQ(journal().find(address,late.record.original_id)->stage,recovery_obligation_stage::open);});
+    base->remove_table_observer("TestPerson",observer);
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionAfterFileReopenUsesFreshCanonicalGuard) {
+    TempDB path("canonical-install-inspection");reset(path.str());x.content={person(A,"committed-before-reopen")};
+    const auto before=recovery_guard().second;staged();ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
+    const auto identity=*installation().last_installed;owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});
+    owner->close();owner=std::make_shared<StagedOwner>(path.str());
+    const auto fresh=receive_delivery_guard_access::read(*owner,address.channel);ASSERT_EQ(fresh.state,receive_guard_state::canonical_installed);
+    const auto admission=guarded(fresh);const auto stable=guarded_snapshot();const auto result=inspect_committed_canonical_range(admission,identity,x.q,x.m);
+    ASSERT_TRUE(committed(result));EXPECT_EQ(result.installation->disposition,receive_install_disposition::already_installed);
+    EXPECT_EQ(guarded_snapshot(),stable);EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_range_attempt"),0);
+    EXPECT_EQ(std::get<std::string>(query("SELECT name FROM TestPerson")[0].at("name")),"committed-before-reopen");owner->close();
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionRequiresEveryIdentityField) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));const auto identity=*installation().last_installed;
+    owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});const auto stable=guarded_snapshot();
+    for(int field=0;field<10;++field) {
+        auto changed=identity;
+        switch(field) {
+            case 0:++changed.sequence;break;case 1:++changed.expected_revision;break;
+            case 2:changed.base.kind=receive_frontier_kind::beginning_null;break;
+            case 3:changed.base={receive_frontier_kind::position,int64_t{0}};break;
+            case 4:++changed.head;break;case 5:changed.mode=receive_install_mode::delta;break;
+            case 6:changed.request_digest=std::string(64,'1');break;
+            case 7:changed.receipt_digest=std::string(64,'2');break;
+            case 8:changed.content_digest=std::string(64,'3');break;
+            case 9:changed.manifest_digest=std::string(64,'4');break;
+        }
+        refused(inspect_committed_canonical_range(admission,changed,x.q,x.m),"exact retained receiver identity");EXPECT_EQ(guarded_snapshot(),stable);
+    }
+    ASSERT_TRUE(committed(inspect_committed_canonical_range(admission,identity,x.q,x.m)));EXPECT_EQ(guarded_snapshot(),stable);
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionRejectsUninstalledAndDoesNotCreateMissingStores) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    const auto identity=*installation().active;const auto stable=guarded_snapshot();
+    refused(inspect_committed_canonical_range(admission,identity,x.q,x.m),"exact retained receiver identity");EXPECT_EQ(guarded_snapshot(),stable);
+    const auto revision=scope().revision;owner->close();owner=std::make_shared<StagedOwner>();
+    const auto missing=canonical_scoped_install_test_access::mint(owner,x.a,1,x.q.request_digest,x.m.manifest_digest,
+        profile,address,revision,contract,limits,std::nullopt,"coverage",before);
+    const auto pristine=guarded_snapshot();refused(inspect_committed_canonical_range(missing,identity,x.q,x.m));EXPECT_EQ(guarded_snapshot(),pristine);
+    EXPECT_EQ(number("SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('_lattice_install_store','_lattice_obligation_store','_lattice_range_store')"),0);
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionFencesOldJournalGenerationButFreshAdmissionPreservesPending) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto old=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(old)));const auto identity=*installation().last_installed;
+    owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);address=journal().resume(address,identity).address;});
+    const auto late=edit(A,"pending-after-resume");const auto stable=guarded_snapshot();
+    refused(inspect_committed_canonical_range(old,identity,x.q,x.m),"current journal installation");EXPECT_EQ(guarded_snapshot(),stable);
+    const auto fresh=guarded(receive_delivery_guard_access::read(*owner,address.channel));
+    ASSERT_TRUE(committed(inspect_committed_canonical_range(fresh,identity,x.q,x.m)));EXPECT_EQ(guarded_snapshot(),stable);
+    owned([&](auto&){EXPECT_EQ(journal().find(address,late.record.original_id)->stage,recovery_obligation_stage::open);});
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionRejectsWrongProfileMissingGuardAndChangedGuard) {
+    for(int fault=0;fault<4;++fault) {
+        reset();x.content={person(A)};const auto before=recovery_guard().second;staged();const auto original=guarded(before);
+        ASSERT_TRUE(committed(install_staged_canonical_range(original)));const auto identity=*installation().last_installed;
+        owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});
+        auto changed=profile;if(fault==0)changed.binding.source="different-source";if(fault==1)changed.receipt_namespace="different-namespace";
+        const auto grant=canonical_scoped_install_test_access::mint(owner,x.a,1,x.q.request_digest,x.m.manifest_digest,changed,address,
+            scope().revision,contract,limits,identity,"coverage",fault==2?std::nullopt:std::optional<receive_guard_snapshot>{before});
+        if(fault==3)owner->db().execute("UPDATE _lattice_receive_guard SET generation=generation+1");
+        const auto stable=guarded_snapshot();refused(inspect_committed_canonical_range(grant,identity,x.q,x.m));EXPECT_EQ(guarded_snapshot(),stable);
+    }
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionDiscardsReceiptWhenItsOwnedCommitFails) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));const auto identity=*installation().last_installed;
+    owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});const auto stable=guarded_snapshot();
+    struct DenyCommit {
+        sqlite3* db;explicit DenyCommit(sqlite3* value):db(value){sqlite3_set_authorizer(db,[](void*,int action,const char* first,const char*,const char*,const char*){
+            return action==SQLITE_TRANSACTION&&first&&std::string_view(first)=="COMMIT"?SQLITE_DENY:SQLITE_OK;
+        },nullptr);}~DenyCommit(){sqlite3_set_authorizer(db,nullptr,nullptr);}
+    };
+    {DenyCommit deny(owner->db().handle());const auto result=inspect_committed_canonical_range(admission,identity,x.q,x.m);
+        refused(result);EXPECT_EQ(result.transaction.state,state::rolled_back);}
+    EXPECT_EQ(guarded_snapshot(),stable);ASSERT_TRUE(committed(inspect_committed_canonical_range(admission,identity,x.q,x.m)));
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionRejectsSupersededLastIdentity) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto old=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(old)));const auto previous=*installation().last_installed;
+    const auto previous_request=x.q;const auto previous_manifest=x.m;
+    const auto guard=receive_delivery_guard_access::read(*owner,address.channel);next();++x.m.head;x.content={person(A,"successor")};staged();
+    ASSERT_TRUE(committed(install_staged_canonical_range(guarded(guard))));const auto stable=guarded_snapshot();
+    refused(inspect_committed_canonical_range(old,previous,previous_request,previous_manifest),"exact retained receiver identity");EXPECT_EQ(guarded_snapshot(),stable);
+}
+
+TEST_F(CanonicalScopedInstall, CommittedInspectionBindsEveryLogicalAttemptFieldToFrozenRequest) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
+    const auto identity=*installation().last_installed;owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});
+    const auto logical=x.a;const auto current=receive_delivery_guard_access::read(*owner,address.channel);const auto stable=guarded_snapshot();
+    for(int field=0;field<3;++field) {
+        x.a=logical;if(field==0)x.a.receiver_incarnation=uuid('7');if(field==1)x.a.channel_incarnation=uuid('8');if(field==2)x.a.attempt_id=uuid('9');
+        const auto changed=guarded(current);refused(inspect_committed_canonical_range(changed,identity,x.q,x.m));EXPECT_EQ(guarded_snapshot(),stable);
+    }
+    x.a=logical;const auto exact=guarded(current);ASSERT_TRUE(committed(inspect_committed_canonical_range(exact,identity,x.q,x.m)));EXPECT_EQ(guarded_snapshot(),stable);
+}
+TEST_F(CanonicalScopedInstall, CommittedInspectionRejectsChangedFrozenRequestOrManifestBytes) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));const auto identity=*installation().last_installed;
+    owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});const auto stable=guarded_snapshot();
+    for(int field=0;field<4;++field) {
+        auto request=x.q;auto manifest=x.m;
+        if(field==0)++request.expected.revision;if(field==1)request.source.authority="different-authority";
+        if(field==2)++manifest.head;if(field==3)manifest.protection.id="different-lease";
+        refused(inspect_committed_canonical_range(admission,identity,request,manifest));EXPECT_EQ(guarded_snapshot(),stable);
+    }
+    ASSERT_TRUE(committed(inspect_committed_canonical_range(admission,identity,x.q,x.m)));EXPECT_EQ(guarded_snapshot(),stable);
+}
+
+TEST_F(CanonicalScopedInstall, CommittedInspectionReadDenialCannotBecomeSuccessOrAbsence) {
+    x.content={person(A)};const auto before=recovery_guard().second;staged();const auto admission=guarded(before);
+    ASSERT_TRUE(committed(install_staged_canonical_range(admission)));const auto identity=*installation().last_installed;
+    owned([&](auto&){stage().release_installed(x.a,x.m.manifest_digest,1);});const auto stable=guarded_snapshot();
+    struct DenyRead {
+        sqlite3* db;std::string table;
+        DenyRead(sqlite3* value,std::string name):db(value),table(std::move(name)) {
+            sqlite3_set_authorizer(db,[](void* context,int action,const char* first,const char*,const char*,const char*){
+                const auto& self=*static_cast<DenyRead*>(context);
+                return action==SQLITE_READ&&first&&self.table==first?SQLITE_DENY:SQLITE_OK;
+            },this);
+        }
+        ~DenyRead(){sqlite3_set_authorizer(db,nullptr,nullptr);}
+    };
+    for(const auto* table_name:{"_lattice_install_channel","_lattice_obligation_scope"}) {
+        {DenyRead deny(owner->db().handle(),table_name);const auto result=inspect_committed_canonical_range(admission,identity,x.q,x.m);
+            refused(result);EXPECT_EQ(result.transaction.state,state::rolled_back);}
+        EXPECT_EQ(guarded_snapshot(),stable);
+    }
+    ASSERT_TRUE(committed(inspect_committed_canonical_range(admission,identity,x.q,x.m)));EXPECT_EQ(guarded_snapshot(),stable);
+}

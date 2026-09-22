@@ -71,6 +71,13 @@ cr::frame stored_page(database& db,const std::string& channel,int64_t kind,uint6
     catch(const cr::protocol_error&){fail(code::corrupt_state,"canonical stored page fails framing/hash");}
 }
 }
+canonical_staging_snapshot describe_canonical_range(const cr::attempt& a,const cr::request& request,
+    const cr::manifest& manifest,const cr::limits& codec,uint64_t route) {
+    const auto initial=cr::begin(a,request,manifest,codec);
+    (void)cr::encode({a,route,request},codec);
+    (void)cr::encode({a,route,manifest},narrow(codec,request.budget));
+    return snapshot(initial,route,false);
+}
 canonical_range_staging::canonical_range_staging(std::shared_ptr<lattice_db> owner,receive_install_limits il,cr::limits codec,canonical_staging_limits limits)
     : owner_(std::move(owner)),installation_(owner_,il),install_limits_(il),codec_(codec),limits_(limits) {
     if(!owner_)fail(code::invalid_argument,"canonical staging needs retained owner");
@@ -183,11 +190,11 @@ void canonical_range_staging::audit() const {
     }
 }
 canonical_staging_begin canonical_range_staging::begin(const cr::attempt& a,const cr::request& request,const cr::manifest& manifest,uint64_t route){
-    auto& db=connection();const auto initial=cr::begin(a,request,manifest,codec_);const auto effective=narrow(codec_,request.budget);
-    // Validate the real route envelope and SHA-prefix reservations at admission.
-    (void)cr::encode({a,route,request},codec_);(void)cr::encode({a,route,manifest},effective);
+    auto& db=connection();const auto first=describe_canonical_range(a,request,manifest,codec_,route);
+    const auto& initial=first.state;const auto effective=narrow(codec_,request.budget);
+    // Preserve actual SHA-prefix reservation checks at staging admission.
     cr::stream_hasher content(manifest,cr::stream_kind::content,effective),receipts(manifest,cr::stream_kind::receipts,effective);
-    const auto first=snapshot(initial,route,false);const auto image=cr::encode_state(initial,codec_);const auto key_wire=cr::encode({a,1,cr::end{manifest.manifest_digest}},codec_);
+    const auto image=cr::encode_state(initial,codec_);const auto key_wire=cr::encode({a,1,cr::end{manifest.manifest_digest}},codec_);
     const auto before=usage();
     return atomic(db,[&]{
         const auto admitted=installation_.begin(first.installation_binding,first.installation_identity);

@@ -965,4 +965,270 @@ TEST(RecoveryDeliveryRegistration, LifecycleClearRetiresTransferredTokensWithout
     {std::lock_guard lock(state->mutex);EXPECT_FALSE(state->erase_locked("original",1,first,true));EXPECT_FALSE(state->erase_locked("original",1,0,true));EXPECT_TRUE(state->matches_locked("original",3,second,true));state->clear_ids_locked();EXPECT_TRUE(state->ids.empty());EXPECT_TRUE(state->delivery_tokens.empty());EXPECT_TRUE(state->pre_handoff.empty());}
 }
 }
+
+namespace {
+// Every gate holds only copied test state on a real ACK worker or an existing
+// off-lock controller probe. Teardown releases gates before retiring the owner.
+struct DeliveryTimeoutGate {
+    std::mutex mutex;std::condition_variable changed;bool released=false,timed_out=false;
+    std::atomic<unsigned> arrived{0};
+    void wait(){std::unique_lock lock(mutex);++arrived;changed.notify_all();if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
+    void release(){std::lock_guard lock(mutex);released=true;changed.notify_all();}
+    bool timedOut(){std::lock_guard lock(mutex);return timed_out;}
+};
+struct DeliveryTimeoutReadFault {
+    static thread_local DeliveryTimeoutReadFault* active;
+    std::atomic<unsigned>& hits;detail::recovery_local_producer_test_hooks::authorizer_fault fault;
+    const detail::recovery_local_producer_test_hooks::authorizer_fault* prior;DeliveryTimeoutReadFault* prior_active;
+    DeliveryTimeoutReadFault(const lattice_db* owner,std::atomic<unsigned>& count):hits(count),fault{owner,restrict_action},prior(detail::recovery_local_producer_test_hooks::fault),prior_active(active){active=this;detail::recovery_local_producer_test_hooks::fault=&fault;}
+    ~DeliveryTimeoutReadFault(){detail::recovery_local_producer_test_hooks::fault=prior;active=prior_active;}
+    static int restrict_action(int action,const char* table,const char*,const char*)noexcept{
+        if(active&&action==SQLITE_READ&&table&&std::strcmp(table,"_lattice_producer_continuity")==0){++active->hits;return SQLITE_DENY;}return SQLITE_OK;
+    }
+};
+thread_local DeliveryTimeoutReadFault* DeliveryTimeoutReadFault::active=nullptr;
+struct DeliveryTimeoutWorkers:std::enable_shared_from_this<DeliveryTimeoutWorkers> {
+    std::atomic<unsigned> started{0},completed{0},transitioned{0};
+    unsigned first_windows=1;
+    std::shared_ptr<DeliveryTimeoutGate> first,following,after;
+    std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> hooks(){
+        auto self=shared_from_this();auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
+        hook->before_expiry=[self]{const auto index=self->started.fetch_add(1);const auto gate=index<self->first_windows?self->first:self->following;if(gate)gate->wait();};
+        hook->after_timeout_transition=[self]{++self->transitioned;if(self->after)self->after->wait();};
+        hook->completed=[self]{++self->completed;};return hook;
+    }
+};
+struct DeliveryTimeoutEvents {
+    std::shared_ptr<DeliveryTimeoutWorkers> ordinary=std::make_shared<DeliveryTimeoutWorkers>();
+    std::shared_ptr<DeliveryTimeoutWorkers> restricted=std::make_shared<DeliveryTimeoutWorkers>();
+    std::atomic<unsigned> admitted{0},pending{0},refrozen{0};
+    std::shared_ptr<DeliveryTimeoutGate> admitted_gate;
+    std::function<void(const char*)> observed;
+    std::function<std::shared_ptr<void>(const char*)> scope;
+};
+struct DeliveryTimeoutThrowState {std::atomic<bool> enabled{false};std::atomic<unsigned> rejected{0};};
+class DeliveryTimeoutThrowNetwork final:public network_factory {
+    struct Pipe {std::weak_ptr<ControllerWire> wire;std::shared_ptr<DeliveryTimeoutThrowState> fault;};
+    std::shared_ptr<ControllerWire> wire_;std::shared_ptr<DeliveryTimeoutThrowState> fault_;
+public:
+    DeliveryTimeoutThrowNetwork(std::shared_ptr<ControllerWire> wire,std::shared_ptr<DeliveryTimeoutThrowState> fault):wire_(std::move(wire)),fault_(std::move(fault)){}
+    std::unique_ptr<http_client> create_http_client()override{return std::make_unique<null_http_client>();}
+    std::unique_ptr<sync_transport> create_sync_transport()override{
+        return std::unique_ptr<sync_transport>(make_system_tls_platform_sync_transport(new Pipe{wire_,fault_},
+            [](void* p,const void* url,const void*,const void* endpoint){if(auto wire=static_cast<Pipe*>(p)->wire.lock()){std::lock_guard lock(wire->mutex);wire->dials.push_back({*static_cast<const std::string*>(url),*static_cast<const platform_transport_callbacks*>(endpoint)});}},
+            [](void*){},
+            [](void* p,const void* message,const void* endpoint){auto& pipe=*static_cast<Pipe*>(p);const auto raw=static_cast<const transport_message*>(message)->as_string();
+                if(raw.size()>8388608)throw db_error("timeout fixture wire bound");
+                const auto value=json::parse(raw);
+                if(value.contains("auditLog")&&pipe.fault->enabled.load()){++pipe.fault->rejected;throw db_error("timeout fixture rejects actual restricted send");}
+                if(auto wire=pipe.wire.lock()){std::lock_guard lock(wire->mutex);if(wire->frames.size()>=32)throw db_error("timeout fixture queue bound");wire->frames.push_back({*static_cast<const platform_transport_callbacks*>(endpoint),raw});}},
+            [](void* p){delete static_cast<Pipe*>(p);},nullptr,[](void*,const void*,const void*)->int32_t{return 1;},[](void*){}));
+    }
+};
+class RecoveryDeliveryTimeout:public RecoveryReceiverController {
+protected:
+    std::shared_ptr<DeliveryTimeoutEvents> events=std::make_shared<DeliveryTimeoutEvents>();
+    std::vector<std::shared_ptr<DeliveryTimeoutGate>> gates;
+    std::vector<std::string> sent_ids;
+    size_t ordinary_windows=0;
+    std::shared_ptr<DeliveryTimeoutGate> gate(){auto value=std::make_shared<DeliveryTimeoutGate>();gates.push_back(value);return value;}
+    void start(unsigned count=1,size_t chunk=1000,bool default_timeout=false){
+        upload_chunk=chunk;configure();ordinary_windows=(count+chunk-1)/chunk;
+        events->ordinary->first_windows=static_cast<unsigned>(ordinary_windows);events->ordinary->first=gate();
+        events->restricted->first_windows=static_cast<unsigned>(ordinary_windows);
+        if(!default_timeout){events->restricted->first=gate();events->restricted->following=gate();}
+        const auto captured=events;
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[captured](const char* stage){
+            if(std::strcmp(stage,"install-committed")==0)detail::sync_background_test_hooks::ack=captured->ordinary->hooks();
+            if(std::strcmp(stage,"reconciliation-pending")==0){++captured->pending;detail::sync_background_test_hooks::ack=captured->restricted->hooks();}
+            if(std::strcmp(stage,"reconcile-refreeze-committed")==0)++captured->refrozen;
+            if(std::strcmp(stage,"delivery-retry-admitted")==0){++captured->admitted;if(captured->admitted_gate)captured->admitted_gate->wait();}
+            if(captured->observed)captured->observed(stage);
+        },[captured](const char* stage)->std::shared_ptr<void>{return captured->scope?captured->scope(stage):nullptr;});
+        connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+        if(!default_timeout)ASSERT_TRUE(detail::recovery_delivery_registration_test_access::timeout(*synchronizers[0],0));
+        seed_local(count,800);sent_ids=originals();ASSERT_EQ(sent_ids.size(),count);
+        ASSERT_TRUE(until([&]{return held_originals()==sent_ids&&events->ordinary->started.load()==ordinary_windows;}));
+    }
+    void restricted(){
+        // The actual ordinary delivery ACK creates no canonical acceptance:
+        // these first bytes are deliberately held before source.receive.
+        legacy_ack(0,sent_ids);
+        ASSERT_TRUE(until([&]{return held_uploads.size()==2*ordinary_windows&&events->restricted->started.load()==ordinary_windows;}));
+        events->ordinary->first->release();
+        ASSERT_TRUE(until([&]{return events->ordinary->completed.load()==ordinary_windows;}));
+        ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+    }
+    bool error_contains(const std::string& text){std::lock_guard lock(errors_mutex);return std::any_of(errors.begin(),errors.end(),[&](const auto& e){return e.find(text)!=std::string::npos;});}
+    size_t dial_count(){std::lock_guard lock(wire->mutex);return wire->endpoints.size();}
+    void expect_failed_drain(){const auto result=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(5));EXPECT_EQ(result.state,sync_drain_state::failed);EXPECT_TRUE(result.error);}
+    void controller_failure_survives_timeout(bool commit_fault){
+        struct fault_state {std::atomic<unsigned> hits{0},installs{0};std::atomic<bool> first_refreeze{true},armed{false};std::mutex mutex;Snapshot before;};
+        const auto state=std::make_shared<fault_state>();const auto refreeze=gate();
+        events->scope=[this,state,refreeze,commit_fault](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"reconcile-refreeze")==0&&state->first_refreeze.exchange(false))refreeze->wait();
+            if(std::strcmp(stage,"install")!=0||!state->armed.load())return {};
+            // Only the first real positive install is faulted. An incorrect
+            // timeout reset would allow a second install, and is observable.
+            if(state->installs.fetch_add(1)!=0)return {};
+            {std::lock_guard lock(state->mutex);state->before=snapshot();}
+            if(commit_fault)return std::make_shared<ControllerCommitFault>(receiver.get(),state->hits);
+            return std::make_shared<DeliveryTimeoutReadFault>(receiver.get(),state->hits);
+        };
+        start();ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+        ASSERT_TRUE(until([&]{return refreeze->arrived.load()==1;}));ASSERT_EQ(phase(),4);
+        auto applied=peers[0].setup.receive(held_uploads[1].raw);ASSERT_EQ(applied.status_code(),1);ASSERT_EQ(applied.take_ids(),sent_ids);
+        // The real positive source receipt precedes the fresh Q. No legacy ACK
+        // is delivered, so the first restricted timer still owns its ID.
+        state->armed.store(true);refreeze->release();
+        ASSERT_TRUE(until([&]{return state->hits.load()==1&&has_error();}));ASSERT_EQ(phase(),2);
+        Snapshot before;{std::lock_guard lock(state->mutex);before=state->before;}
+        ASSERT_FALSE(before.empty());EXPECT_EQ(snapshot(),before);
+        events->restricted->first->release();
+        ASSERT_TRUE(until([&]{return events->admitted.load()==1&&events->restricted->completed.load()==1;}));
+        // This is an actual checked drain, not a queue sentinel or a sleep:
+        // with the one-shot fault gone, a wrongly cleared controller failure
+        // could install the genuine positive receipt and settle this drain.
+        const auto drained=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(5));
+        EXPECT_EQ(drained.state,sync_drain_state::deadline_pending);EXPECT_TRUE(drained.discovery_pending);EXPECT_FALSE(drained.error);
+        EXPECT_EQ(state->installs.load(),1u);EXPECT_EQ(state->hits.load(),1u);EXPECT_EQ(phase(),2);EXPECT_EQ(snapshot(),before);
+        EXPECT_EQ(held_uploads.size(),2u);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),1);
+        EXPECT_EQ(originals(),sent_ids);
+    }
+    void TearDown()override{
+        for(const auto& value:gates)value->release();
+        RecoveryReceiverController::TearDown();
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(std::chrono::steady_clock::now()<deadline&&(events->ordinary->started.load()!=events->ordinary->completed.load()||events->restricted->started.load()!=events->restricted->completed.load()))std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        EXPECT_EQ(events->ordinary->started.load(),events->ordinary->completed.load());
+        EXPECT_EQ(events->restricted->started.load(),events->restricted->completed.load());
+        for(const auto& value:gates)EXPECT_FALSE(value->timedOut());
+    }
+};
+TEST_F(RecoveryDeliveryTimeout, DefaultTimeoutRecoversDroppedRestrictedDeliveryWithoutReconnectOrAnotherRequest) {
+    ASSERT_EQ(sync_config{}.ack_timeout_base_ms,10000);
+    start(1,1000,true);ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    const auto initial_endpoint=peers[0].physical;const auto initial_dials=dial_count();
+    const auto raw_originals=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto first_claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    ASSERT_TRUE(until([&]{return phase()==2&&error_contains("UNKNOWN persisted after one restricted pass");}));
+    ASSERT_EQ(events->admitted.load(),0u);
+    // The first restricted true handoff is dropped. No further user request,
+    // reconnect, timeout override, or legacy delivery ACK occurs in this test.
+    bool accepted=false;size_t consumed=2;
+    ASSERT_TRUE(until([&]{
+        while(consumed<held_uploads.size()){
+            const auto& frame=held_uploads[consumed++];const auto event=server_sent_event::from_json(frame.raw);
+            if(!event||event->audit_logs.size()!=1||event->audit_logs[0].global_id!=sent_ids[0])throw db_error("timeout retransmission changed original");
+            auto result=peers[0].setup.receive(frame.raw);if(result.status_code()!=1||result.take_ids()!=sent_ids)throw db_error("actual retransmission was not accepted");
+            accepted=true; // Retain the real canonical receipt; withhold ACK.
+        }
+        return accepted&&events->restricted->started.load()+1==held_uploads.size()&&phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==1;
+    },35000));
+    EXPECT_GE(events->admitted.load(),1u);EXPECT_EQ(dial_count(),initial_dials);EXPECT_TRUE(peers[0].physical.matches(initial_endpoint));
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),1);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM AuditLog"),1);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),raw_originals);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),first_claims);
+    EXPECT_EQ(originals(),sent_ids);
+}
+TEST_F(RecoveryDeliveryTimeout, TwoActualSiblingWindowsAdmitOnlyOneCohortRetry) {
+    events->restricted->after=gate();events->admitted_gate=gate();
+    start(2,1);ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return phase()==2&&error_contains("UNKNOWN persisted after one restricted pass");}));
+    const auto before=snapshot();events->restricted->first->release();
+    ASSERT_TRUE(until([&]{return events->restricted->transitioned.load()==2;}));
+    EXPECT_EQ(synchronizers[0]->get_progress().pending_upload,0);EXPECT_EQ(events->admitted.load(),0u);
+    events->restricted->after->release();
+    ASSERT_TRUE(until([&]{return events->admitted_gate->arrived.load()==1&&events->restricted->completed.load()==1;}));
+    EXPECT_EQ(events->admitted.load(),1u);EXPECT_EQ(snapshot(),before);
+    events->admitted_gate->release();
+    ASSERT_TRUE(until([&]{return events->restricted->completed.load()>=2&&held_uploads.size()==6&&events->restricted->started.load()==4;}));
+    EXPECT_EQ(events->admitted.load(),1u);EXPECT_EQ(events->restricted->started.load(),4u);
+    EXPECT_EQ(held_originals(),(std::vector<std::string>{sent_ids[0],sent_ids[1],sent_ids[0],sent_ids[1],sent_ids[0],sent_ids[1]}));
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    EXPECT_EQ(originals(),sent_ids);
+}
+TEST_F(RecoveryDeliveryTimeout, ExpiryBeforeRefreezeRetainsDemandForTheNextActualUnknownDecision) {
+    const auto refreeze=gate();auto first=std::make_shared<std::atomic<bool>>(true);
+    events->scope=[refreeze,first](const char* stage)->std::shared_ptr<void>{if(std::strcmp(stage,"reconcile-refreeze")==0&&first->exchange(false))refreeze->wait();return {};};
+    start();ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return refreeze->arrived.load()==1;}));ASSERT_EQ(phase(),4);
+    const auto before=snapshot();events->restricted->first->release();
+    ASSERT_TRUE(until([&]{return events->admitted.load()==1&&events->restricted->completed.load()==1;}));
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(held_uploads.size(),2u);
+    refreeze->release();
+    ASSERT_TRUE(until([&]{return held_uploads.size()==3&&events->restricted->started.load()==2;}));
+    EXPECT_EQ(events->admitted.load(),1u);EXPECT_EQ(held_originals(),(std::vector<std::string>{sent_ids[0],sent_ids[0],sent_ids[0]}));
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+}
+TEST_F(RecoveryDeliveryTimeout, ActualExternalRequestInvalidatesAnAlreadyExpiredOldRetryToken) {
+    events->restricted->after=gate();const auto replacement=gate();auto replacing=std::make_shared<std::atomic<bool>>(false);
+    events->observed=[replacement,replacing](const char* stage){if(replacing->load()&&std::strcmp(stage,"reconciliation-pending")==0)replacement->wait();};
+    start();ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return phase()==2&&error_contains("UNKNOWN persisted after one restricted pass");}));
+    events->restricted->first->release();ASSERT_TRUE(until([&]{return events->restricted->transitioned.load()==1;}));
+    replacing->store(true);request_recovery();ASSERT_TRUE(until([&]{return replacement->arrived.load()==1;}));
+    const auto before=snapshot();events->restricted->after->release();
+    ASSERT_TRUE(until([&]{return events->restricted->completed.load()==1;}));
+    EXPECT_EQ(events->admitted.load(),0u);EXPECT_EQ(snapshot(),before);EXPECT_EQ(held_uploads.size(),2u);
+    replacement->release();
+}
+TEST_F(RecoveryDeliveryTimeout, RetiredPhysicalAttemptRejectsAnAlreadyExpiredOldRetryToken) {
+    events->restricted->after=gate();start();ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return phase()==2&&error_contains("UNKNOWN persisted after one restricted pass");}));
+    events->restricted->first->release();ASSERT_TRUE(until([&]{return events->restricted->transitioned.load()==1;}));
+    const auto old=peers[0].physical;synchronizers[0]->disconnect();const auto before=snapshot();
+    events->restricted->after->release();ASSERT_TRUE(until([&]{return events->restricted->completed.load()==1;}));
+    EXPECT_EQ(events->admitted.load(),0u);EXPECT_EQ(snapshot(),before);
+    ASSERT_TRUE(until([&]{return !old.is_current();}));
+    EXPECT_EQ(held_uploads.size(),2u);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+}
+TEST_F(RecoveryDeliveryTimeout, RevokedSourceOnTheSamePhysicalAttemptRejectsAnExpiredOldRetryToken) {
+    events->restricted->after=gate();start();ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return phase()==2&&error_contains("UNKNOWN persisted after one restricted pass");}));
+    events->restricted->first->release();ASSERT_TRUE(until([&]{return events->restricted->transitioned.load()==1;}));
+    const auto endpoint=peers[0].physical;
+    // An unsolicited second describe is a real native-source response. Feed
+    // it through the same physical endpoint to exercise source revocation,
+    // without changing the physical lifecycle or creating a source record.
+    const auto command=json{{"kind","recoveryReady"},{"version",1},{"operation","describe"},{"requestID",::lattice::uuid_t::generate().to_string()}}.dump();
+    auto charge=peers[0].setup.stop_token().reserve_ready(command.size());ASSERT_TRUE(charge.valid());
+    auto response=peers[0].setup.ready(command,charge);ASSERT_EQ(response.status_code(),1);ASSERT_TRUE(response.publishable());
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(response.wire())));
+    ASSERT_TRUE(until([&]{return error_contains("unsolicited, repeated or expired recovery frame");}));
+    const auto before=snapshot();events->restricted->after->release();
+    ASSERT_TRUE(until([&]{return events->restricted->completed.load()==1;}));
+    EXPECT_EQ(events->admitted.load(),0u);EXPECT_TRUE(endpoint.is_current());
+    EXPECT_TRUE(peers[0].physical.matches(endpoint));EXPECT_EQ(snapshot(),before);EXPECT_EQ(held_uploads.size(),2u);
+}
+TEST_F(RecoveryDeliveryTimeout, PositiveInstallCommitFailureRemainsClosedAfterARealDeliveryTimeout) {
+    controller_failure_survives_timeout(true);
+}
+TEST_F(RecoveryDeliveryTimeout, PositiveInstallSqlReadFailureRemainsClosedAfterARealDeliveryTimeout) {
+    controller_failure_survives_timeout(false);
+}
+TEST_F(RecoveryDeliveryTimeout, ActualOrdinaryAckAndReplacementRegistrationGiveTheOldWorkerNoRetryEffect) {
+    start();ASSERT_FALSE(HasFatalFailure());
+    const auto old=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],sent_ids[0]);ASSERT_NE(old,0u);
+    restricted();ASSERT_FALSE(HasFatalFailure());
+    const auto current=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],sent_ids[0]);
+    EXPECT_NE(current,0u);EXPECT_NE(current,old);EXPECT_EQ(synchronizers[0]->get_progress().pending_upload,1);
+    EXPECT_EQ(events->ordinary->completed.load(),1u);EXPECT_EQ(events->ordinary->transitioned.load(),0u);
+    EXPECT_EQ(events->admitted.load(),0u);EXPECT_EQ(events->restricted->completed.load(),0u);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+    // A late restricted ACK while frozen belongs to the separately composed
+    // late-ACK correction. This case does not manufacture its tracking effect.
+}
+TEST_F(RecoveryDeliveryTimeout, ThrowingActualRestrictedSendLaunchesNoWorkerAndCannotRearm) {
+    const auto fault=std::make_shared<DeliveryTimeoutThrowState>();set_network_factory(std::make_shared<DeliveryTimeoutThrowNetwork>(wire,fault));
+    start();ASSERT_FALSE(HasFatalFailure());fault->enabled.store(true);legacy_ack(0,sent_ids);
+    ASSERT_TRUE(until([&]{return fault->rejected.load()==1&&error_contains("timeout fixture rejects actual restricted send");}));
+    events->ordinary->first->release();ASSERT_TRUE(until([&]{return events->ordinary->completed.load()==1;}));
+    EXPECT_EQ(events->restricted->started.load(),0u);EXPECT_EQ(events->restricted->transitioned.load(),0u);EXPECT_EQ(events->admitted.load(),0u);
+    EXPECT_EQ(held_uploads.size(),1u);EXPECT_EQ(originals(),sent_ids);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL AND stage=0"),1);expect_failed_drain();
+}
+}
 #endif

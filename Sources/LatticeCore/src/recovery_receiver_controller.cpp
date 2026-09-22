@@ -1,4 +1,5 @@
 #include "recovery_receiver_controller.hpp"
+#include "recovery_unknown_reconciliation.hpp"
 #include "recovery_request_store.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "recovery_witness.hpp"
@@ -17,6 +18,10 @@ namespace cr=canonical_range;
 using json=nlohmann::json;
 constexpr size_t pending_bytes=16777216;
 [[noreturn]] void refuse(const char* reason){throw db_error(reason);}
+class delivery_retry_wait final : public db_error {
+public:
+    delivery_retry_wait():db_error("controller UNKNOWN persisted after one restricted pass; new external source/request generation or actual delivery timeout required"){}
+};
 void require(bool value,const char* reason){if(!value)refuse(reason);}
 int64_t now(){return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 json parse(const std::string& raw,size_t cap) {
@@ -118,6 +123,8 @@ struct recovery_receiver_controller::state {
     bool scheduled=false,running=false,demand=true,idle=false,deferred_external_request=false;
     const recovery_reconciliation_reservation* reconciliation_reservation=nullptr;
     uint64_t revision=1,external_revision=1,reconciled_external_revision=0;
+    uint64_t delivery_retry_revision=0,reconciled_delivery_retry_revision=0;
+    bool awaiting_delivery_retry=false;
     std::exception_ptr failure;
     std::shared_ptr<const verified_unsent_set> frozen;
     std::shared_ptr<const recovery_reconciliation_descriptor> reconciliation;
@@ -155,7 +162,7 @@ struct recovery_reconciliation_reservation {
                 // Admission reserves room for publication plus this one
                 // coalesced actual external event. Internal wakes never set it.
                 if(runtime.deferred_external_request){runtime.deferred_external_request=false;++runtime.revision;++runtime.external_revision;
-                    runtime.demand=true;runtime.failure={};retired=std::move(runtime.reconciliation);}}
+                    runtime.demand=true;runtime.failure={};runtime.awaiting_delivery_retry=false;retired=std::move(runtime.reconciliation);}}
             active=false;}}
     }
     ~recovery_reconciliation_reservation(){release();}
@@ -243,8 +250,48 @@ void recovery_receiver_route::request(){
     {std::lock_guard lock(controller_->state_->mutex);auto& state=*controller_->state_;
         require(state.revision!=UINT64_MAX&&state.external_revision!=UINT64_MAX,"controller demand revision exhausted");
         if(state.reconciliation_reservation)state.deferred_external_request=true;
-        else {++state.revision;++state.external_revision;state.demand=true;state.failure={};retired=std::move(state.reconciliation);}}
+        else {++state.revision;++state.external_revision;state.demand=true;state.failure={};state.awaiting_delivery_retry=false;retired=std::move(state.reconciliation);}}
     retired.reset();wake();
+}
+std::function<void()> recovery_receiver_route::delivery_timeout_retry(const committed_export_frame& frame,uint64_t physical) {
+    if(!frame.reconciliation_)return {};
+    const auto& grant=*frame.reconciliation_;const auto& descriptor=grant.descriptor_;
+    require(descriptor&&descriptor->phase_==4&&!frame.consumed_&&!frame.entries_.empty()&&frame.physical_generation_==physical&&
+        frame.owner_==state_->owner.lock(),"delivery retry lacks actual restricted frame");
+    require(grant.contribution_<descriptor->contributions_.size(),"delivery retry contribution missing");
+    const auto& part=descriptor->contributions_[grant.contribution_];
+    require(part.route.lock().get()==this&&part.source==state_->source,"delivery retry frame route differs");
+    // An obsolete parked frame must reach the actual handoff's stale disposal
+    // path. It cannot issue a retry event, but staleness is not a new error.
+    if(state_->retired.load()||!state_->lifetime->current(physical)||!part.source->recovery_live(part.view))return {};
+    {
+        std::lock_guard lock(controller_->state_->mutex);const auto& runtime=*controller_->state_;
+        if(runtime.reconciliation!=descriptor||runtime.revision!=descriptor->controller_revision_||
+            runtime.external_revision!=descriptor->external_revision_)return {};
+    }
+    // No descriptor/cohort/database/transport retention in the ACK worker.
+    // The actual send registration separately fences which IDs may expire.
+    return [weak=weak_from_this(),record=std::weak_ptr<const receiver_source_binding::record>(part.view.value),
+        physical,external=descriptor->external_revision_,retry=descriptor->delivery_retry_revision_] {
+        const auto route=weak.lock();const auto current=record.lock();
+        if(!route||!current||route->state_->retired.load()||!route->state_->lifetime->current(physical))return;
+        const receiver_source_binding::recovery_view view{current};
+        if(!route->state_->source->recovery_live(view))return;
+        {
+            std::lock_guard lock(route->controller_->state_->mutex);auto& runtime=*route->controller_->state_;
+            if(runtime.external_revision!=external||runtime.delivery_retry_revision!=retry)return;
+            require(runtime.delivery_retry_revision!=UINT64_MAX,"controller delivery retry revision exhausted");
+            ++runtime.delivery_retry_revision;runtime.demand=true;
+            // This event never replaces a live descriptor or changes its
+            // ordinary revision, including during known-COMMIT publication.
+            // A timeout preceding fresh UNKNOWN remains pending in the counter.
+            if(runtime.awaiting_delivery_retry){runtime.failure={};runtime.awaiting_delivery_retry=false;}
+        }
+        const auto probe=route->controller_->state_->probe;
+        if(probe&&probe->owner==route->state_->owner.lock().get()&&probe->observed)
+            probe->observed("delivery-retry-admitted");
+        route->wake();
+    };
 }
 bool recovery_receiver_route::blocks_ordinary()const noexcept{return state_->blocked.load(std::memory_order_acquire);}
 void recovery_receiver_controller::dropped_turn()noexcept {std::lock_guard lock(state_->mutex);state_->scheduled=false;}
@@ -309,7 +356,7 @@ void recovery_receiver_controller::turn() {
             const auto key=domain(c.description);if(common_domain.empty())common_domain=key;
             require(key==common_domain,"controller overlapping replacement authority requires explicit configuration");
             if(!runtime.observed.count(channel)||runtime.observed.at(channel).value!=c.view.value){
-                {std::lock_guard lock(runtime.mutex);require(runtime.revision!=UINT64_MAX&&runtime.external_revision!=UINT64_MAX,"controller demand revision exhausted");++runtime.revision;++runtime.external_revision;runtime.demand=true;runtime.failure={};}
+                {std::lock_guard lock(runtime.mutex);require(runtime.revision!=UINT64_MAX&&runtime.external_revision!=UINT64_MAX,"controller demand revision exhausted");++runtime.revision;++runtime.external_revision;runtime.demand=true;runtime.failure={};runtime.awaiting_delivery_retry=false;}
                 std::shared_ptr<const recovery_reconciliation_descriptor> retired;
                 {std::lock_guard lock(runtime.mutex);retired=std::move(runtime.reconciliation);}
                 runtime.observed[channel]=c.view;runtime.frozen.reset();runtime.framing_committed=false;
@@ -448,7 +495,12 @@ void recovery_receiver_controller::turn() {
                         descriptor->contributions_.push_back(std::move(contribution));
                     }
                 });
-                {std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision,"controller restricted restart generation changed");runtime.reconciled_external_revision=runtime.external_revision;runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;
+                {std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision,"controller restricted restart generation changed");
+                    runtime.reconciled_external_revision=runtime.external_revision;
+                    descriptor->external_revision_=runtime.external_revision;descriptor->delivery_retry_revision_=runtime.delivery_retry_revision;
+                    // Only the fresh phase-2 UNKNOWN decision consumes retry
+                    // demand. Reconstruction cannot discard an earlier expiry.
+                    runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;
             }
             if(phase==1) {auto status=recovery_continuous_producer::inspect(owner);known(status.settlement);require(status.barrier.has_value(),"controller closed phase lacks actual barrier");
                 auto frozen=recovery_continuous_producer::finish(*status.barrier);if(frozen.waiting)return;known(frozen.settlement);continue;}
@@ -476,7 +528,7 @@ void recovery_receiver_controller::turn() {
                 scope_probe.reset();observe("resume-committed");
                 recovery_continuous_producer::controller_publish_resume(*this,owner,barrier,attempt);
                 runtime.frozen.reset();runtime.framing_committed=false;runtime.idle=true;
-                {std::lock_guard lock(runtime.mutex);if(runtime.revision==demand_revision)runtime.demand=false;runtime.failure={};}
+                {std::lock_guard lock(runtime.mutex);if(runtime.revision==demand_revision)runtime.demand=false;runtime.failure={};runtime.awaiting_delivery_retry=false;}
                 for(const auto& route:routes){route->state_->blocked.store(false,std::memory_order_release);if(route->state_->resumed)route->state_->resumed();}return;
             }
             require(phase==2,"controller unsupported durable phase");
@@ -559,8 +611,11 @@ void recovery_receiver_controller::turn() {
                     }
                 });
                 if(unknown){{std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision,"controller pending generation changed");
-                    require(runtime.reconciled_external_revision!=runtime.external_revision,"controller UNKNOWN persisted after one restricted pass; new external source/request generation required");
-                    runtime.reconciled_external_revision=runtime.external_revision;runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;}
+                    if(runtime.reconciled_external_revision==runtime.external_revision&&runtime.reconciled_delivery_retry_revision==runtime.delivery_retry_revision)
+                        throw delivery_retry_wait();
+                    runtime.reconciled_external_revision=runtime.external_revision;runtime.reconciled_delivery_retry_revision=runtime.delivery_retry_revision;
+                    descriptor->external_revision_=runtime.external_revision;descriptor->delivery_retry_revision_=runtime.delivery_retry_revision;
+                    runtime.awaiting_delivery_retry=false;runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;}
                 auto scope_probe=probe_scope("install");
                 owned([&](database& db){
                     recovery_continuous_producer::verify_for_owned_write(*proof);recovery_request_store requests(owner);
@@ -603,10 +658,22 @@ void recovery_receiver_controller::turn() {
         }
     }catch(...){
         const auto error=std::current_exception();std::shared_ptr<state::pending> released;
-        {std::lock_guard lock(runtime.mutex);runtime.failure=error;released=std::move(runtime.outstanding);}
+        bool awaiting_delivery=false,retry_arrived=false;
+        try{std::rethrow_exception(error);}catch(const delivery_retry_wait&){awaiting_delivery=true;}catch(...){}
+        {std::lock_guard lock(runtime.mutex);
+            // The actual timer may arrive after the UNKNOWN decision unlocks
+            // but before this catch stores its wait. Preserve that admitted
+            // demand instead of latching over it until an unrelated event.
+            retry_arrived=awaiting_delivery&&(runtime.reconciled_external_revision!=runtime.external_revision||
+                runtime.reconciled_delivery_retry_revision!=runtime.delivery_retry_revision);
+            if(retry_arrived){runtime.demand=true;runtime.awaiting_delivery_retry=false;}
+            else {runtime.failure=error;runtime.awaiting_delivery_retry=awaiting_delivery;}
+            released=std::move(runtime.outstanding);
+        }
         released.reset(); // source/endpoint ownership is released off the leaf
         std::vector<std::shared_ptr<recovery_receiver_route>> report;
         {std::lock_guard lock(runtime.mutex);for(const auto& weak:runtime.routes)if(auto route=weak.lock())report.push_back(std::move(route));}
+        if(retry_arrived){settle.after=[report]{for(const auto& route:report)if(!route->state_->retired.load()){route->wake();break;}};return;}
         for(const auto& route:report)if(route->state_->error)try{route->state_->error(error);}catch(...){}
         try{std::rethrow_exception(error);}catch(const std::exception& e){LOG_ERROR("recovery-controller","receiver remains closed: %s",e.what());}catch(...){LOG_ERROR("recovery-controller","receiver remains closed after unknown failure");}
     }
@@ -728,7 +795,7 @@ void recovery_receiver_controller::controller_reconcile_publish(recovery_reconci
     // coalesced until release, and cannot relabel this known COMMIT.
     recovery_continuous_producer::controller_publish_reconcile(*controller,owner,result.next_barrier_,result.next_attempt_);
     std::shared_ptr<const recovery_reconciliation_descriptor> retired;
-    {std::lock_guard lock(runtime.mutex);retired=std::move(runtime.reconciliation);++runtime.revision;runtime.failure={};runtime.demand=true;}
+    {std::lock_guard lock(runtime.mutex);retired=std::move(runtime.reconciliation);++runtime.revision;runtime.failure={};runtime.awaiting_delivery_retry=false;runtime.demand=true;}
     runtime.frozen.reset();runtime.framing_committed=false;
     reservation->release(); // payload/owner release is outside the leaf
     if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)

@@ -41,6 +41,9 @@ class recovery_reconciliation_descriptor final {
     canonical_scoped_limits limits_{};
     bool restart_revalidation_=false;
     uint64_t controller_revision_=0;
+    // Fixed at issuance. Every actual send in this cohort shares one retry
+    // revision, so sibling delivery deadlines cannot each mint another pass.
+    uint64_t external_revision_=0,delivery_retry_revision_=0;
     int64_t physical_incarnation_=0,barrier_=0,attempt_=0,phase_=0;
     recovery_reconciliation_descriptor()=default;
 public:

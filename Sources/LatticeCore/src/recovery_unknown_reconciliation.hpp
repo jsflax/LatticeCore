@@ -12,6 +12,7 @@ class recovery_unknown_reconciliation;
 // assertion of source absence. The frame retains the separately counted work.
 class recovery_reconciliation_export final {
     friend class recovery_unknown_reconciliation;
+    friend class recovery_receiver_route;
     friend class recovery_export_adapter;
     friend class recovery_export_route;
     friend class committed_export_frame;

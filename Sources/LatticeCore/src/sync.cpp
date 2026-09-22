@@ -2782,7 +2782,8 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
 
 void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& entries) {prepare_ack_retry(entries)();}
 
-std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<audit_log_entry>& entries,bool after_handoff,uint64_t delivery_token) {
+std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<audit_log_entry>& entries,bool after_handoff,uint64_t delivery_token,
+    std::function<void()> delivery_retry) {
     // At-least-once delivery: a sent frame can vanish without any error —
     // e.g. the peer registers its frame handlers a beat after the upgrade
     // completes (WebSocketKit discards unhandled frames), or plain network
@@ -2811,7 +2812,7 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
     // This launcher owns every input before a foreign send. It may execute
     // after that send synchronously ACKed or destroyed the owner.
     return [guard = ack_guard_, self = this, sent_ids = std::move(sent_ids),
-            ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule,after_handoff,delivery_token]() mutable {
+            ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule,after_handoff,delivery_token,delivery_retry=std::move(delivery_retry)]() mutable {
       if(after_handoff){
           std::lock_guard<std::mutex> g(guard->m);
           if(!guard->alive||!lifetime->current(generation))return;
@@ -2819,7 +2820,7 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
           if(std::none_of(sent_ids.begin(),sent_ids.end(),[&](const auto& id){return self->upload_tracking_->matches_locked(id,generation,delivery_token,true);}))return;
       }
       std::thread([guard,self,sent_ids=std::move(sent_ids),ack_timeout_base_ms,resend_failures,
-                   lifetime,generation,scheduled,test_schedule,delivery_token] {
+                   lifetime,generation,scheduled,test_schedule,delivery_token,delivery_retry=std::move(delivery_retry)] {
         struct completion {
             std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> test;
             ~completion(){if(test&&test->completed)try{test->completed();}catch(...) {}}
@@ -2895,7 +2896,11 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
         // Inline upload may retire this synchronizer. No ACK leaf lock may be
         // held across that call; the separate cell admits/retains the owner.
         if(request&&test_schedule&&test_schedule->after_timeout_transition)test_schedule->after_timeout_transition();
-        if(request)lifetime->queued(generation,[self]{self->request_upload(true);});
+        if(request)lifetime->queued(generation,[self,lifetime,generation,delivery_retry]{
+            if(delivery_retry)delivery_retry();
+            // Controller wake may dispatch inline and retire this owner.
+            if(lifetime->current(generation))self->request_upload(true);
+        });
         }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,{},std::current_exception(),"ACK retry worker");}
       }).detach();
     };
@@ -2997,7 +3002,8 @@ bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation&
     try {
         // Capture the exact registration before the foreign call. Reentrant
         // ACK may remove it before handed_off/launcher run; never relabel it.
-        auto retry=prepare_ack_retry(frame.entries(),true,exclusion->delivery_token());
+        auto retry=prepare_ack_retry(frame.entries(),true,exclusion->delivery_token(),
+            receiver_controller_?receiver_controller_->delivery_timeout_retry(frame,continuation.generation):std::function<void()>{});
         const auto sent=discovery_busy?route->try_handoff(frame):std::optional<bool>(route->handoff(std::move(frame)));
         if(!sent){
             // Charge only when parking payload across turns. Ordinary handoff

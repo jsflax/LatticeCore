@@ -72,6 +72,7 @@ public:
 
 class recovery_obligation_producer_store {
     friend class recovery_local_producer_adapter;
+    friend class recovery_continuous_producer;
     friend struct recovery_obligation_producer_test_access;
     std::shared_ptr<lattice_db> owner_;
     recovery_obligation_limits obligations_;

@@ -39,6 +39,7 @@ struct recovery_local_export_scope {
     std::vector<recovery_local_export_table> tables;
 };
 struct recovery_local_export_inventory {
+    bool continuous=false;
     recovery_obligation_producer_discovery_limits limits{};
     std::vector<recovery_local_export_scope> scopes;
 };
@@ -57,12 +58,14 @@ class recovery_local_producer_adapter {
     static thread_local management* management_;
     static std::shared_ptr<database> retained_writer_for_test(lattice_db&);
     static descriptor describe(lattice_db&, database&, const recovery_local_producer_grant&, bool initial_inventory);
+    static void compile_continuous(lattice_db&,context&);
     static void compile_programs(lattice_db&, descriptor&, const recovery_obligation_producer_program&);
     static void register_context(database&, const std::shared_ptr<context>&);
     static std::shared_ptr<context> bootstrap(lattice_db&, const std::shared_ptr<database>&);
     static void validate_custody(lattice_db&, database&);
     static void publish(lattice_db&, database&) noexcept;
     friend struct recovery_local_producer_test_access;
+    friend class recovery_continuous_producer;
     friend bool prepare_recovery_local_producer(lattice_db&, const std::shared_ptr<database>&);
     friend void publish_recovery_local_producer(lattice_db&, database&) noexcept;
     friend bool preserve_recovery_local_producer_relation(database&, const std::string&);

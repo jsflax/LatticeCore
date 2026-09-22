@@ -116,6 +116,7 @@ recovery_server_export_endpoint recovery_server_export_endpoint::create_for_qual
     // shared_ptr invokes its deleter even if control-block allocation fails.
     std::shared_ptr<void> owned(context,[destroy](void* p)noexcept{if(destroy){try{destroy(p);}catch(...){}}});
     if(!owner||owner->is_closed()||!enqueue)throw db_error("server export requires retained owner and owned immutable sink");
+    recovery_continuous_producer::require_no_continuous_route(*owner);
     recovery_export_adapter::validate_server_limits(limits);
     auto control=std::make_shared<recovery_server_control>();
     auto custody=std::make_shared<context_custody>();custody->owner=std::move(owner);custody->context=std::move(owned);custody->enqueue=enqueue;custody->control=control;

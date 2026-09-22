@@ -1,3 +1,4 @@
+#include "recovery_producer_continuity.hpp"
 #include "lattice/db.hpp"
 #include "lattice/projection.hpp"
 #include "lattice/log.hpp"
@@ -263,6 +264,7 @@ std::shared_ptr<database> database::make_read_keeper(const std::string& path,
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
                    std::shared_ptr<database_read_control> read_control, initialization_key key)
     : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
+    if(mode==open_mode::read_write && !key.continuous_)detail::require_continuous_path_unowned(path);
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
     int rc;
@@ -331,6 +333,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
         throw db_error("Failed to initialize sqlite-vec extension");
     }
+
+    detail::recovery_continuous_producer::classify_open(*this,static_cast<bool>(key.continuous_),mode==open_mode::read_write);
 
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
@@ -450,6 +454,7 @@ sqlite3* database::handle() const {
     auto* mutex = sqlite3_db_mutex(db_);
     sqlite3_mutex_enter(mutex);
     struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    detail::require_continuous_raw_handle_absent(const_cast<database&>(*this));
     if (canonical_custody_bootstrap_)
         throw db_error("canonical attachment owns connection policy");
     if (canonical_callback_custody_) {
@@ -576,6 +581,7 @@ database::database(database&& other) noexcept
     canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
     canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
     suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
+    continuous_file_ = std::exchange(other.continuous_file_,false);
     txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
     local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
     local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
@@ -611,6 +617,7 @@ database& database::operator=(database&& other) noexcept {
         canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
         canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
         suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
+        continuous_file_ = std::exchange(other.continuous_file_,false);
         txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
         local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
         local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);

@@ -1,3 +1,4 @@
+#include "recovery_producer_continuity.hpp"
 #include "sync_immediate_scheduler.hpp"
 #include "sync_discovery_deferral.hpp"
 #include "canonical_writer_adapter.hpp"
@@ -642,6 +643,7 @@ struct discovery_charge {
 // ============================================================================
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched) {
+    continuous_route_=detail::recovery_continuous_producer::admit_route(owned_db_,config,false);
     config_ = config;
     log_label_cache_ = config_.log_label;
 #ifndef __EMSCRIPTEN__
@@ -674,6 +676,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
                                    std::unique_ptr<sync_transport> transport) {
+    continuous_route_=detail::recovery_continuous_producer::admit_route(owned_db_,config,true);
     config_ = config;
     log_label_cache_ = config_.log_label;
 #ifndef __EMSCRIPTEN__
@@ -2768,8 +2771,7 @@ bool synchronizer_base::upload_protected_entries(bool* discovery_busy) {
     }
     const size_t count=std::min(chunk,2000-in_flight.size());
     std::optional<detail::recovery_export_preparation> result;
-    if(discovery_busy)result=detail::recovery_export_adapter::try_prepare_pending(owner,channel,generation,count,in_flight,filtered);
-    else result=detail::recovery_export_adapter::prepare_pending(owner,channel,generation,count,in_flight,filtered);
+    result=detail::recovery_export_adapter::prepare_for_route(owner,continuous_route_,channel,generation,count,in_flight,filtered,discovery_busy);
     if(!result){*discovery_busy=true;return false;}
     auto& prepared=*result;
     // The owned operation can deliver callbacks. Only independent retained
@@ -3223,6 +3225,14 @@ synchronizer::synchronizer(lattice_db& db_ref, const sync_config& config,
 
 #else
 
+synchronizer::synchronizer(std::shared_ptr<lattice_db> db, const sync_config& config)
+{
+    if(!db)throw db_error("retained synchronizer requires owner");
+    owned_db_=std::move(db);db_ptr_=owned_db_.get();
+    auto sched=owned_db_->get_scheduler()?owned_db_->get_scheduler():std::make_shared<immediate_scheduler>();
+    init_sync(config,std::move(sched));
+}
+
 synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config)
 {
     owned_db_ = std::move(db);
@@ -3358,6 +3368,7 @@ std::vector<audit_log_entry> query_audit_log(database& db,
     bool only_unsynced,
     std::optional<std::string> after_global_id)
 {
+    detail::require_continuous_legacy_export_absent(db);
     std::string sql = "SELECT * FROM AuditLog";
     std::vector<column_value_t> params;
 
@@ -3609,6 +3620,7 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
         const std::optional<std::vector<sync_filter_entry>>& sync_filter,
         int64_t min_id_exclusive,
         size_t limit) {
+    detail::require_continuous_legacy_export_absent(db);
     // Query entries not yet synced for this specific sync_id.
     // No isFromRemote filter — any entry not synced by this sync_id is pending,
     // enabling cross-transport relay (IPC→WSS, WSS→BLE, etc.)
@@ -3741,6 +3753,7 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
 }
 
 std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id) {
+    detail::require_continuous_legacy_export_absent(db);
     if (checkpoint_global_id) {
         // Resolve the checkpoint EXPLICITLY. The filter's correlated subquery
         // ("id > (SELECT id ... WHERE globalId = ?)") yields NULL for an

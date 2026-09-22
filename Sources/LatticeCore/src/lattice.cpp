@@ -1,3 +1,4 @@
+#include "recovery_producer_continuity.hpp"
 // lattice.cpp - Implementation moved to header (templates)
 // This file kept for potential non-template implementations
 
@@ -439,6 +440,7 @@ void lattice_db::restore_attached_views(database& connection) {
 }
 
 void lattice_db::reopen_write_db() {
+    if(recovery_continuous_)throw db_error("continuous writer replacement requires a new admitted facade");
     if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
         throw db_error("writer reopen refused during owned recovery install");
     if (detail::managed_route_scope::active_for(this) ||
@@ -1154,6 +1156,7 @@ static std::vector<std::string> collect_all_sync_ids(const configuration& config
 }
 
 void lattice_db::setup_sync_if_configured() {
+    if(recovery_continuous_) {if(config_.is_sync_enabled())detail::recovery_continuous_producer::setup_configured_route(*this);return;}
     if (!config_.is_sync_enabled()) {
         return;
     }
@@ -1298,6 +1301,7 @@ void lattice_db::setup_sync_if_configured() {
 }
 
 void lattice_db::setup_ipc_if_configured() {
+    if(config_.is_ipc_enabled())detail::recovery_continuous_producer::require_no_continuous_route(*this);
 #ifndef __EMSCRIPTEN__
     if (!config_.is_ipc_enabled()) {
         return;
@@ -1480,6 +1484,7 @@ void lattice_db::attach(lattice_db &lattice) {
 }
 
 void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const void> metadata) {
+    if(recovery_continuous_||lattice.recovery_continuous_)throw db_error("continuous attachment topology requires admitted same-file facades");
     if (detail::managed_route_scope::active_for(this))
         throw db_error("attach: topology mutation during managed scalar access");
     std::shared_ptr<database> other, writer;

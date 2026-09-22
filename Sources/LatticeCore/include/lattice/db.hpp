@@ -61,6 +61,10 @@ struct receive_delivery_guard_access;
 class canonical_writer_adapter;
 struct canonical_writer_custody_test_access;
 class recovery_local_producer_adapter;
+class recovery_continuous_producer;
+struct recovery_continuous_admission;
+void require_continuous_raw_handle_absent(database&);
+void require_continuous_legacy_export_absent(database&);
 class recovery_obligation_producer_store;
 void require_canonical_relation(database&, const std::string&);
 bool prepare_recovery_local_producer(lattice_db&, const std::shared_ptr<database>&);
@@ -106,6 +110,9 @@ class database {
     friend class detail::canonical_writer_adapter;
     friend struct detail::canonical_writer_custody_test_access;
     friend class detail::recovery_local_producer_adapter;
+    friend class detail::recovery_continuous_producer;
+    friend void detail::require_continuous_raw_handle_absent(database&);
+    friend void detail::require_continuous_legacy_export_absent(database&);
     friend class detail::recovery_obligation_producer_store;
     friend void detail::require_canonical_relation(database&, const std::string&);
     friend bool detail::preserve_recovery_local_producer_relation(database&, const std::string&);
@@ -121,6 +128,9 @@ class database {
     // mutate the schema it just refused. This policy follows the physical
     // handle through moves, even before producer callback custody exists.
     bool suppress_destructor_optimize_ = false;
+    // Closed constructor fact for the fresh-only continuous profile. Never
+    // grants producer/source authority; it only refuses raw/legacy exports.
+    bool continuous_file_ = false;
     bool txn_hooks_external_ = false;
     void set_txn_hooks_owned_(std::function<void()>, std::function<void()>);
     void rebind_txn_hooks_owned_() noexcept;
@@ -137,7 +147,10 @@ class database {
     // accessible to make_shared so keepers retain its single allocation.
     class initialization_key {
         friend class database;
+        friend class detail::recovery_continuous_producer;
         const bool keeper_cache_;
+        std::shared_ptr<detail::recovery_continuous_admission> continuous_;
+        explicit initialization_key(std::shared_ptr<detail::recovery_continuous_admission> value) : keeper_cache_(false), continuous_(std::move(value)) {}
         explicit initialization_key(bool keeper_cache) : keeper_cache_(keeper_cache) {}
     public:
         initialization_key(const initialization_key&) = default;

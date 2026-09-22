@@ -234,11 +234,20 @@ std::vector<int64_t> covered_pending(sqlite3* db,const std::string& channel,
             const auto id=integer(query,0);if(id<=0)refuse("export coverage invalid audit identity");ids.push_back(id);
         }
     };
+    if(inventory.continuous) {
+        // A complete continuous lineage has generated stamps for its selected
+        // contributions since first write. Bound the raw journal candidates
+        // before route-state exclusions; unrelated local-only rows coexist.
+        statement query(db,"SELECT audit_id FROM main._lattice_obligation_entry WHERE stage=0 ORDER BY audit_id LIMIT ?");
+        query.integer(1,static_cast<int64_t>(cap+1));collect(query,global_ids);
+        std::sort(global_ids.begin(),global_ids.end());global_ids.erase(std::unique(global_ids.begin(),global_ids.end()),global_ids.end());
+    } else {
     {statement query(db,"SELECT CASE WHEN typeof(audit_entry_id)='integer' THEN audit_entry_id END "
         "FROM main._lattice_sync_state INDEXED BY idx_sync_state_pending WHERE sync_id=? AND is_synchronized=0 LIMIT ?");
      query.text(1,channel);query.integer(2,static_cast<int64_t>(cap+1));collect(query,explicit_ids);}
     {statement query(db,"SELECT id FROM main.AuditLog INDEXED BY idx_audit_log_pending_sync WHERE isSynchronized=0 LIMIT ?");
      query.integer(1,static_cast<int64_t>(cap+1));collect(query,global_ids);}
+    }
     std::set<int64_t> pending(explicit_ids.begin(),explicit_ids.end());
     for(const auto id:global_ids){
         statement state(db,"SELECT is_synchronized FROM main._lattice_sync_state WHERE audit_entry_id=? AND sync_id=? LIMIT 2");
@@ -246,11 +255,12 @@ std::vector<int64_t> covered_pending(sqlite3* db,const std::string& channel,
         if(!state.next()){pending.insert(id);continue;}
         const auto value=integer(state,0);if((value!=0&&value!=1)||state.next())refuse("export coverage invalid channel state");
         // Explicit zero is already in stream A; one resolves this route.
-        if(value==0&&!pending.count(id))refuse("export coverage explicit pending inventory changed");
+        if(value==0){if(inventory.continuous)pending.insert(id);else if(!pending.count(id))refuse("export coverage explicit pending inventory changed");}
     }
-    std::map<std::string,size_t> tables;
-    for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& table:inventory.scopes[i].tables)
-        if(!tables.emplace(table.name,i).second)refuse("export coverage ambiguous admitted table");
+    std::map<std::string,std::vector<size_t>> tables;
+    for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& table:inventory.scopes[i].tables) {
+        auto& matches=tables[table.name];if(!matches.empty()&&!inventory.continuous)refuse("export coverage ambiguous admitted table");matches.push_back(i);
+    }
     for(const auto id:pending){
         statement audit(db,"SELECT id,globalId,tableName,globalRowId,rowId,isFromRemote,synthesized,isSynchronized "
             "FROM main.AuditLog WHERE id=? LIMIT 2");audit.integer(1,id);
@@ -261,12 +271,12 @@ std::vector<int64_t> covered_pending(sqlite3* db,const std::string& channel,
         if(actual_id!=id||original.size()!=36||target.size()!=36||row_id<0||remote!=0||synthetic!=0||
            (synchronized!=0&&synchronized!=1)||audit.next())refuse("export coverage unsupported pending original");
         const auto found=tables.find(table);if(found==tables.end())refuse("export coverage pending original has no admitted contribution");
-        const auto& scope=inventory.scopes[found->second];const auto entry=journal.find(scope.contribution.address,original);
+        for(const auto index:found->second){const auto& scope=inventory.scopes[index];const auto entry=journal.find(scope.contribution.address,original);
         if(!entry||entry->record.audit_id!=id||entry->record.original_id!=original||entry->record.table!=table||
            entry->record.target_id!=target||entry->record.origin!=recovery_obligation_origin::local_candidate||
            entry->stage!=recovery_obligation_stage::open)
             refuse("export coverage pending original lacks current open obligation");
-        coverage_stamp(db,inventory,scope,*entry);
+        coverage_stamp(db,inventory,scope,*entry);}
     }
     return {pending.begin(),pending.end()};
 }
@@ -302,6 +312,7 @@ committed_export_frame::committed_export_frame(committed_export_frame&& other) n
 }
 committed_export_frame& committed_export_frame::operator=(committed_export_frame&& other) noexcept {
     if(this==&other)return *this;
+    continuous_work_=std::move(other.continuous_work_);
     owner_=std::move(other.owner_);claims_=std::move(other.claims_);scopes_=std::move(other.scopes_);
     limits_=other.limits_;entries_=std::move(other.entries_);message_=std::move(other.message_);
     physical_generation_=std::exchange(other.physical_generation_,0);
@@ -320,6 +331,13 @@ bool recovery_export_adapter::protected_store(std::shared_ptr<lattice_db> owner)
 std::optional<bool> recovery_export_adapter::try_protected_store(std::shared_ptr<lattice_db> owner){
     try{return recovery_local_producer_adapter::export_protection_required(std::move(owner));}
     catch(const export_discovery_busy&){return std::nullopt;}
+}
+std::optional<recovery_export_preparation> recovery_export_adapter::prepare_for_route(std::shared_ptr<lattice_db> owner,
+    const std::shared_ptr<recovery_continuous_route>& route,const std::string& channel,uint64_t generation,size_t count,
+    const std::vector<int64_t>& in_flight,bool filtered,bool* discovery_busy){
+    auto work=recovery_continuous_producer::admit_work(route,owner,generation);
+    bool busy=false;auto prepared=prepare(std::move(owner),channel,generation,count,in_flight,filtered,{},std::nullopt,discovery_busy?&busy:nullptr,false,std::move(work));
+    if(busy){*discovery_busy=true;return std::nullopt;}return prepared;
 }
 std::optional<recovery_export_preparation> recovery_export_adapter::try_prepare_pending(std::shared_ptr<lattice_db> owner,
     const std::string& sync_id,uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,
@@ -345,7 +363,7 @@ recovery_export_preparation recovery_export_adapter::prepare_retained_page(std::
 }
 recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits,
-    std::optional<int64_t> history_after,bool* discovery_busy,bool retained_delete_page){
+    std::optional<int64_t> history_after,bool* discovery_busy,bool retained_delete_page,std::shared_ptr<recovery_continuous_work> work){
     recovery_export_preparation output;
     // Catch only this first no-effect classifier. A busy exception arising
     // later from reentrant work must never replay a claim or mutation stage.
@@ -354,8 +372,8 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         if(!discovery_busy)throw;
         *discovery_busy=true;return output;
     }
-    committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;
-    const auto result=recovery_writer_access::install(owner,[&](database& writer){
+    committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;frame.continuous_work_=std::move(work);
+    const auto result=recovery_continuous_producer::export_owned(owner,frame.continuous_work_,[&](database& writer){
         auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);if(inventory.scopes.empty())return;
         limits_ok(limits,count,in_flight);if(!history_after&&(sync_id.empty()||sync_id.size()>4096))refuse("export invalid route channel");
         output.protected_store=true;if(filtered)refuse("protected export refuses legacy filter synthesis");
@@ -375,12 +393,15 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         // can justify an earlier UPDATE projection. No caller-provided flag,
         // operation text alone or unselected DELETE is generated evidence.
         std::vector<const recovery_local_export_table*> tables;
-        std::vector<size_t> scope_indexes;
-        for(const auto id:ids){auto row=read_audit(db,id,raw);const recovery_local_export_table* table=nullptr;size_t scope_index=0;
-            for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& t:inventory.scopes[i].tables)if(t.name==row.entry.table_name){if(table)refuse("export ambiguous contribution table");table=&t;scope_index=i;}
+        std::vector<std::vector<size_t>> scope_indexes;
+        for(const auto id:ids){auto row=read_audit(db,id,raw);const recovery_local_export_table* table=nullptr;std::vector<size_t> matches;
+            for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& t:inventory.scopes[i].tables)if(t.name==row.entry.table_name){
+                if(table&&(!inventory.continuous||table->columns!=t.columns||table->no_history!=t.no_history||table->regular_link!=t.regular_link))refuse("export ambiguous contribution table");
+                table=&t;matches.push_back(i);
+            }
             if(!table)refuse("export original has no admitted whole-model contribution");
-            if(history_after)history_original(db,inventory,inventory.scopes[scope_index],journal,row.entry);
-            tables.push_back(table);scope_indexes.push_back(scope_index);originals.push_back(std::move(row));
+            if(history_after)for(const auto i:matches)history_original(db,inventory,inventory.scopes[i],journal,row.entry);
+            tables.push_back(table);scope_indexes.push_back(std::move(matches));originals.push_back(std::move(row));
         }
         const auto later_delete=[&](size_t index){
             if(!retained_delete_page)return false;
@@ -396,7 +417,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         for(size_t i=0;i<originals.size();++i){auto& row=originals[i];
             decode_generated(db,row,*tables[i],raw,later_delete(i));wire_bound(row.entry,limits.wire_bytes-encoded.size()-2);
             const auto json=row.entry.to_json();if(json.size()+3>limits.wire_bytes-encoded.size())refuse("export encoded frame exceeds budget");
-            if(!frame.entries_.empty())encoded+=',';encoded+=json;by_scope[scope_indexes[i]].push_back(row.entry.global_id);frame.entries_.push_back(row.entry);
+            if(!frame.entries_.empty())encoded+=',';encoded+=json;for(const auto index:scope_indexes[i])by_scope[index].push_back(row.entry.global_id);frame.entries_.push_back(row.entry);
         }
         encoded+="]}";if(frame.entries_.empty())return;
         std::vector<std::pair<recovery_obligation_address,recovery_obligation_entry>> expected_entries;
@@ -455,7 +476,10 @@ void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> own
         for(const auto& id:ids){
             if(id.size()!=36||!unique.insert(id).second)refuse("export legacy ACK invalid or duplicate original");
             std::optional<recovery_obligation_entry> entry;
-            for(const auto& scope:inventory.scopes){const auto found=journal.find(scope.contribution.address,id);if(found){if(entry)refuse("export ambiguous ACK contribution");entry=found;}}
+            for(const auto& scope:inventory.scopes){const auto found=journal.find(scope.contribution.address,id);if(found){
+                if(entry&&(!inventory.continuous||entry->record!=found->record))refuse("export ambiguous ACK contribution");
+                if(inventory.continuous&&!found->first_export_claim)refuse("continuous ACK has unclaimed shared contribution");entry=found;
+            }}
             if(!entry||!entry->first_export_claim||entry->stage!=recovery_obligation_stage::open)refuse("export legacy ACK has no retained claimed original");
             writer.execute("INSERT INTO main._lattice_sync_state(audit_entry_id,sync_id,is_synchronized) VALUES(?,?,1) ON CONFLICT(audit_entry_id,sync_id) DO UPDATE SET is_synchronized=1",{entry->record.audit_id,channel});
             const auto rows=writer.query("SELECT 1 AS ok FROM main._lattice_sync_state WHERE audit_entry_id=? AND sync_id=? AND typeof(is_synchronized)='integer' AND is_synchronized=1 LIMIT 2",{entry->record.audit_id,channel});
@@ -466,7 +490,7 @@ void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> own
 }
 void recovery_export_adapter::validate_server_limits(const recovery_export_limits& limits){limits_ok(limits,limits.entries,{});}
 void recovery_export_adapter::revalidate_claimed_frame(const committed_export_frame& frame){
-    const auto result=recovery_writer_access::install(frame.owner_,[&](database&){
+    const auto result=recovery_continuous_producer::export_owned(frame.owner_,frame.continuous_work_,[&](database&){
         check_scopes(recovery_local_producer_adapter::export_inventory_for_owned_write(frame.owner_),frame.scopes_);
         recovery_obligation_store journal(frame.owner_,frame.limits_.obligations,frame.limits_.installations);check_claims(journal,frame.claims_,frame.entries_);
     });

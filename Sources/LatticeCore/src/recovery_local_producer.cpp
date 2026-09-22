@@ -1,6 +1,17 @@
 #include "recovery_local_producer.hpp"
+#include "recovery_producer_continuity.hpp"
+#include <filesystem>
+#include <limits>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "vendor/picosha2/picosha2.h"
 #include <array>
+#include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <map>
 #include <set>
@@ -272,6 +283,8 @@ struct recovery_local_producer_adapter::management {
     ~management(){management_=previous;}
 };
 thread_local recovery_local_producer_adapter::management* recovery_local_producer_adapter::management_=nullptr;
+#include "recovery_producer_continuity_state.inc"
+
 struct recovery_local_producer_adapter::context {
     struct profile {recovery_obligation_producer_profile stored; descriptor schema;};
     sqlite3* connection=nullptr; lattice_db* owner=nullptr; // identity, never lifetime ownership
@@ -283,6 +296,7 @@ struct recovery_local_producer_adapter::context {
     std::atomic<int> status{0}; // 0 pending, 1 committed, 2 rolled back
     std::shared_ptr<context> previous;
     std::vector<profile> profiles;
+    std::shared_ptr<recovery_continuous_admission> continuous;
     const context* effective() const noexcept {
         const auto state=status.load(std::memory_order_acquire);
         if(state==2)return previous ? previous->effective() : nullptr;
@@ -297,6 +311,7 @@ struct recovery_local_producer_adapter::context {
             sqlite3_value_type(v[1])==SQLITE_INTEGER && sqlite3_value_type(v[2])==SQLITE_INTEGER && sqlite3_value_type(v[5])==SQLITE_INTEGER;
         const auto phase=ok?sqlite3_value_int64(v[5]):0;
         const bool install=ok&&recovery_writer_access::active_install_for(c.owner,c.connection);
+        if(c.continuous && (phase!=1 || !c.continuous->state->dml_open.load(std::memory_order_acquire)))ok=false;
         ok=ok&&((phase==1 && !install && root.active->load(std::memory_order_acquire) && c.active->load(std::memory_order_acquire) && c.lifetime->alive.load(std::memory_order_acquire)) ||
                 (phase==2 && install));
         bool found=false;
@@ -309,6 +324,12 @@ struct recovery_local_producer_adapter::context {
         }
         sqlite3_result_int(sql,found?1:0);
     }
+    static void continuous_guard(sqlite3_context* sql,int n,sqlite3_value**) noexcept {
+        auto& root=**static_cast<std::shared_ptr<context>*>(sqlite3_user_data(sql));
+        const auto* c=root.effective();
+        const bool ok=n==0&&c&&c->continuous&&sqlite3_context_db_handle(sql)==c->connection&&continuous_owned(*c->continuous);
+        sqlite3_result_int(sql,ok?1:0);
+    }
     static int authorize(void* raw,int action,const char* one,const char* two,const char* schema,const char* origin) noexcept {
         auto& root=*static_cast<context*>(raw);
         const auto normal=[&]() noexcept -> int {
@@ -316,6 +337,7 @@ struct recovery_local_producer_adapter::context {
         const auto* effective=root.effective();
         if(!effective || effective->profiles.empty())return SQLITE_OK;
         const auto& c=*effective;
+        if(c.continuous && !continuous_authorize(*c.continuous,action,one,two,origin))return SQLITE_DENY;
         switch(action) {
         case SQLITE_ATTACH:case SQLITE_DETACH:case SQLITE_ALTER_TABLE:
         case SQLITE_CREATE_TABLE:case SQLITE_CREATE_TEMP_TABLE:case SQLITE_CREATE_TRIGGER:case SQLITE_CREATE_TEMP_TRIGGER:
@@ -455,7 +477,7 @@ recovery_local_producer_adapter::descriptor recovery_local_producer_adapter::des
 }
 
 void recovery_local_producer_adapter::validate_custody(lattice_db& owner,database& writer) {
-    if(owner.config_.read_only||owner.config_.is_sync_enabled()||owner.config_.is_ipc_enabled()||owner.config_.audit_retention_seconds!=0)
+    if(owner.config_.read_only||(!owner.recovery_continuous_ && owner.config_.is_sync_enabled())||owner.config_.is_ipc_enabled()||owner.config_.audit_retention_seconds!=0)
         refuse("local producer qualification refuses legacy transports/automatic retention/read-only owner");
     if(writer.raw_handle_escaped_.load(std::memory_order_acquire))refuse("local producer raw handle escaped; engine hook custody unavailable");
     if(writer.canonical_callback_custody_ || writer.table_exists("_lattice_canonical_coverage"))
@@ -469,6 +491,11 @@ void recovery_local_producer_adapter::validate_custody(lattice_db& owner,databas
         refuse("local producer obligation metadata triggers are unqualified");
 }
 void recovery_local_producer_adapter::register_context(database& writer,const std::shared_ptr<context>& c) {
+    if(c->continuous) {
+        auto* continuous_held=new std::shared_ptr<context>(c);
+        if(sqlite3_create_function_v2(c->connection,"lattice_recovery_continuity_owned_v1",0,SQLITE_UTF8,continuous_held,context::continuous_guard,nullptr,nullptr,
+            [](void* p){delete static_cast<std::shared_ptr<context>*>(p);})!=SQLITE_OK)refuse("continuous guard registration failed");
+    }
     auto* held=new std::shared_ptr<context>(c);
     if(sqlite3_create_function_v2(c->connection,"lattice_recovery_producer_guard_v1",6,SQLITE_UTF8,held,context::guard,nullptr,nullptr,
         [](void* p){delete static_cast<std::shared_ptr<context>*>(p);})!=SQLITE_OK)refuse("local producer guard registration failed");
@@ -519,6 +546,7 @@ recovery_install_result recovery_local_producer_adapter::enroll_for_qualificatio
     const recovery_obligation_producer_discovery_limits& limits) {
     std::shared_ptr<context> candidate;
     auto result=recovery_writer_access::install_impl(owner,[&](database& db) {
+        if(owner->recovery_continuous_)refuse("continuous producer cannot use qualification enrollment or retirement");
         validate_limits(limits);validate_custody(*owner,db);
         management changing(db.internal_handle());
         auto prior=std::static_pointer_cast<context>(std::atomic_load(&db.local_producer_callback_custody_));
@@ -573,6 +601,7 @@ recovery_install_result recovery_local_producer_adapter::retire_for_qualificatio
     const recovery_obligation_producer_discovery_limits& limits) {
     std::shared_ptr<context> candidate;
     auto result=recovery_writer_access::install_impl(owner,[&](database& db) {
+        if(owner->recovery_continuous_)refuse("continuous producer cannot use qualification enrollment or retirement");
         validate_limits(limits);validate_custody(*owner,db);management changing(db.internal_handle());
         auto prior=std::static_pointer_cast<context>(std::atomic_load(&db.local_producer_callback_custody_));
         while(prior && prior->status.load(std::memory_order_acquire)==2)prior=prior->previous;
@@ -616,19 +645,28 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
             validate_retention_programs(view,!inventory.profiles.empty());
             if(inventory.profiles.empty())return;
             validate_custody(owner,view);
+            const bool continuous=view.table_exists(continuous_table);
+            if(continuous!=static_cast<bool>(owner.recovery_continuous_))refuse("continuous lineage requires actual retained factory; no legacy adoption");
+            if(continuous)continuous_verify_row(view,*owner.recovery_continuous_->state,false);
             if(recovery_local_producer_test_hooks::after_inventory)recovery_local_producer_test_hooks::after_inventory();
             c=std::make_shared<context>();c->connection=view.internal_handle();c->owner=&owner;c->lifetime=owner.guard_;
             c->admitted_limits={inventory.stored_obligation_limits,inventory.stored_installation_limits,inventory.stored_producer_limits};
+            c->continuous=owner.recovery_continuous_;
             std::set<std::string> relations;
             for(const auto& p:inventory.profiles) {
                 auto d=describe(owner,view,grant_from(p),false);
-                if(p.program_revision!=1||d.manifest!=p.grant_manifest||d.digest!=p.program_digest)refuse("local producer bootstrap descriptor/program revision mismatch");
-                compile_programs(owner,d,recovery_obligation_producer_store::compile(p,inventory.stored_obligation_limits,inventory.stored_producer_limits));
-                for(const auto& [name,t]:d.tables) {
+                if(p.program_revision!=(continuous?2:1)||d.manifest!=p.grant_manifest||d.digest!=p.program_digest)refuse("local producer bootstrap descriptor/program revision mismatch");
+                if(!continuous)compile_programs(owner,d,recovery_obligation_producer_store::compile(p,inventory.stored_obligation_limits,inventory.stored_producer_limits));
+                if(!continuous)for(const auto& [name,t]:d.tables) {
                     if(!relations.insert(name).second)refuse("local producer bootstrap overlapping grants");
                     if(actual_programs(view,name)!=t.enrolled)refuse("local producer bootstrap generated program mismatch");
                 }
                 c->profiles.push_back({p,std::move(d)});
+            }
+            if(continuous) {
+                compile_continuous(owner,*c);
+                for(const auto& p:c->profiles)for(const auto& [name,t]:p.schema.tables)
+                    if(actual_programs(view,name)!=t.enrolled)refuse("continuous complete generated program differs");
             }
         });
     if(!c) {
@@ -645,6 +683,8 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
     writer->suppress_destructor_optimize_=prior_suppression;
     return c;
 }
+
+#include "recovery_producer_continuity.inc"
 
 void recovery_local_producer_adapter::publish(lattice_db& owner,database& db) noexcept {
     auto c=std::static_pointer_cast<context>(std::atomic_load(&db.local_producer_callback_custody_));
@@ -777,7 +817,7 @@ recovery_local_export_inventory recovery_local_producer_adapter::export_inventor
        writer->raw_handle_escaped_.load(std::memory_order_acquire)||static_cast<size_t>(n)!=admitted->profiles.size())
         refuse("export producer inventory lacks current physical admission");
     validate_limits(admitted->admitted_limits);
-    recovery_local_export_inventory result;result.limits=admitted->admitted_limits;
+    recovery_local_export_inventory result;result.limits=admitted->admitted_limits;result.continuous=static_cast<bool>(admitted->continuous);
     recovery_obligation_store journal(owner,result.limits.obligations,result.limits.installations);
     for(const auto& profile:admitted->profiles) {
         const auto& p=profile.stored;

@@ -26,7 +26,7 @@ namespace lattice {
 
 // Forward declaration
 class lattice_db;
-namespace detail {class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;enum class sync_discovery_kind;struct sync_discovery_test_access;}
+namespace detail {class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;enum class sync_discovery_kind;struct sync_discovery_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -395,6 +395,7 @@ protected:
     std::shared_ptr<detail::sync_pacer_state> pacer_state_;
     std::shared_ptr<detail::sync_discovery_deferral> discovery_deferral_;
     std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
+    std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
     bool owns_inline_scheduler_adapter_=false;
     friend struct detail::recovery_export_test_access;
     friend struct detail::sync_discovery_test_access;
@@ -627,6 +628,7 @@ public:
 /// Native: owns a dedicated lattice_db (separate connection on its own thread).
 class synchronizer : public synchronizer_base {
 public:
+    synchronizer(std::shared_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
                  std::unique_ptr<sync_transport> transport);

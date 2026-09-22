@@ -52,7 +52,11 @@ template<typename T> class results;
 class lattice_db;
 class synchronizer_base;
 class synchronizer;
-namespace detail { struct recovery_writer_access; class canonical_writer_adapter; class recovery_local_producer_adapter; struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
+struct configuration;
+namespace detail { struct recovery_writer_access; class canonical_writer_adapter; class recovery_local_producer_adapter;
+class recovery_continuous_producer;
+struct recovery_continuous_admission;
+std::shared_ptr<database> open_continuous_writer(const configuration&,const std::shared_ptr<recovery_continuous_admission>&); struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -903,17 +907,18 @@ public:
 protected:
     // Swift supplies complete immutable declarations before base-constructor
     // bootstrap. A virtual getter here would see only the base subobject.
-    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas)
-        : config_(config)
-        , db_(std::make_shared<database>(resolve_path(config),
+    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas, std::shared_ptr<detail::recovery_continuous_admission> continuous = {})
+        : recovery_continuous_(std::move(continuous))
+        , recovery_schemas_(std::move(recovery_schemas))
+        , config_(config)
+        , db_(recovery_continuous_ ? detail::open_continuous_writer(config,recovery_continuous_) : std::make_shared<database>(resolve_path(config),
               config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
               config.busy_timeout_ms))
         , read_db_(config.read_only ? nullptr :
                    (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
                          std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
-        , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>())
-        , recovery_schemas_(std::move(recovery_schemas)) {
+        , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
         config_.path = resolve_path(config);
@@ -926,16 +931,17 @@ protected:
         if (!config.read_only) {
             LOG_DEBUG("lattice_db", "ensure_tables");
             ensure_tables();
-            heal_collapsed_sync_state();
+            if (!recovery_continuous_) heal_collapsed_sync_state();
             LOG_DEBUG("lattice_db", "setup_change_hook");
             setup_change_hook();
-            if (!defer_sync) {
+            if (!defer_sync && !recovery_continuous_) {
                 LOG_DEBUG("lattice_db", "setup_sync_if_configured");
                 setup_sync_if_configured();
                 LOG_DEBUG("lattice_db", "setup_ipc_if_configured");
                 setup_ipc_if_configured();
             }
         }
+        if (recovery_continuous_) return; // Retained factory publishes only after exact owned enrollment.
         LOG_DEBUG("lattice_db", "register_instance");
         instance_registry::instance().register_instance(config_.path, this, guard_);
         adopt_path_wal_eviction_threshold();
@@ -6057,6 +6063,8 @@ protected:
     friend struct detail::recovery_refresh_access;
     friend class detail::canonical_writer_adapter;
     friend class detail::recovery_local_producer_adapter;
+    friend class detail::recovery_continuous_producer;
+    std::shared_ptr<detail::recovery_continuous_admission> recovery_continuous_;
     const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
     bool recovery_producer_bootstrapped_=false;
     friend struct managed_attachment_test_access;

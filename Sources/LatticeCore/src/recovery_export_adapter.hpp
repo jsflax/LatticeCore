@@ -16,6 +16,9 @@ namespace recovery_export_test_hooks {
 // inside the owned claim transaction; the second is after known COMMIT.
 extern thread_local void (*before_claim_commit)();
 extern thread_local void (*after_claim_commit)();
+// Private fault seam after one contribution's claim postimage was captured.
+// Null in production; permits deterministic cross-contribution fault tests.
+extern thread_local void (*after_contribution_claim)(size_t);
 }
 class recovery_export_adapter;
 class recovery_export_route;

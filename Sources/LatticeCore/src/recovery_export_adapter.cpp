@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <utility>
 #include <iomanip>
 #include <limits>
@@ -13,6 +14,7 @@ namespace lattice::detail {
 namespace recovery_export_test_hooks {
 thread_local void (*before_claim_commit)()=nullptr;
 thread_local void (*after_claim_commit)()=nullptr;
+thread_local void (*after_contribution_claim)(size_t)=nullptr;
 }
 namespace {
 [[noreturn]] void refuse(const char* message){throw db_error(message);}
@@ -107,7 +109,7 @@ bool has_column(const recovery_local_export_table& table,const std::string& name
     return false;
 }
 void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_table& table,budget& b,
-    bool retained_later_delete=false){
+    bool retained_later_delete=false,const std::function<bool()>& absent_row_proof={}){
     auto& e=row.entry;
     {statement valid(db,"SELECT json_valid(?1),json_valid(?2),CASE WHEN json_valid(?1) THEN json_type(?1) END,CASE WHEN json_valid(?2) THEN json_type(?2) END");
      valid.text(1,row.fields);valid.text(2,row.names);
@@ -130,7 +132,7 @@ void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_tab
         if(!changed.count(column))continue;
         statement current(db,"SELECT "+quote_identifier(column)+" FROM main."+quote_identifier(table.name)+" WHERE globalId=? LIMIT 2");current.text(1,e.global_row_id);
         if(!current.next()){
-            if(!retained_later_delete)refuse("export NoHistory current row is absent");
+            if(!retained_later_delete&&(!absent_row_proof||!absent_row_proof()))refuse("export NoHistory current row is absent");
             // Only the wire projection changes. The original names/fields and
             // generated stamp remain intact and are verified again precommit.
             e.changed_fields.erase(column);
@@ -198,7 +200,7 @@ void coverage_indexes(sqlite3* db){
 }
 // This is an addressed stamp check, not a repeated full profile/manifest read.
 // Full schema/profile audit and exclusive metadata custody remain prerequisites.
-void coverage_stamp(sqlite3* db,const recovery_local_export_inventory& inventory,
+std::array<int64_t,20> coverage_stamp(sqlite3* db,const recovery_local_export_inventory& inventory,
     const recovery_local_export_scope& scope,const recovery_obligation_entry& entry){
     statement query(db,"SELECT t.incarnation,t.program_revision,t.audit_id,t.record_sequence,t.generation,t.scope_revision,"
         "t.base_scopes,t.base_records,t.base_bytes,t.base_incarnation,t.base_export,t.producer_profiles,t.producer_stamps,t.producer_bytes,t.bytes,"
@@ -223,6 +225,7 @@ void coverage_stamp(sqlite3* db,const recovery_local_export_inventory& inventory
        value[14]!=stamp_bytes||value[17]<1||value[17]>pl.stamps||value[18]<stamp_bytes||value[18]>pl.encoded_bytes||
        value[19]!=static_cast<int64_t>(inventory.scopes.size()))
         refuse("export coverage generated stamp contradicts current obligation");
+    return value;
 }
 std::vector<int64_t> covered_pending(sqlite3* db,const std::string& channel,
     const recovery_local_export_inventory& inventory,recovery_obligation_store& journal,size_t cap){
@@ -346,6 +349,57 @@ void history_original(sqlite3* db,const recovery_local_export_inventory& invento
         refuse("export history original lacks current open obligation");
     coverage_stamp(db,inventory,scope,*entry);
 }
+// Metadata only: the complete scan is bounded by the already admitted journal,
+// and retained keys by the finite selected page. Unrelated AuditLog payloads
+// are never decoded or copied. This index is built at most once, lazily after
+// an actual NoHistory row read proves absence on a negotiated continuous route.
+class continuous_delete_index {
+    using target=std::pair<std::string,std::string>;
+    bool loaded_=false;
+    std::map<target,int64_t> latest_;
+public:
+    int64_t later(sqlite3* db,const recovery_local_export_inventory& inventory,
+        recovery_obligation_store& journal,const std::vector<int64_t>& selected,const audit_log_entry& update){
+        if(!loaded_){
+            const auto cap=inventory.limits.obligations.records;
+            if(!inventory.continuous||cap<=0||cap>100000||selected.size()>1000)
+                refuse("continuous delete proof lacks bounded admitted journal");
+            const auto usage=journal.usage();
+            statement total(db,"SELECT COUNT(*) FROM (SELECT 1 FROM main._lattice_obligation_entry LIMIT ?)");total.integer(1,cap+1);
+            if(!total.next())refuse("continuous delete proof count unavailable");
+            const auto records=integer(total,0);
+            if(records<0||records>cap||records!=usage.records||total.next())refuse("continuous delete proof journal count differs");
+            for(const auto id:selected){
+                statement row(db,"SELECT tableName,globalRowId FROM main.AuditLog WHERE id=? LIMIT 2");row.integer(1,id);
+                if(!row.next())refuse("continuous delete proof selected original disappeared");
+                target key{small_text(row,0,64),small_text(row,1,36)};
+                if(key.first.empty()||key.second.size()!=36||row.next())refuse("continuous delete proof selected target differs");
+                latest_.emplace(std::move(key),0);
+            }
+            statement candidates(db,"SELECT e.audit_id,a.tableName,a.globalRowId,a.operation FROM "
+                "(SELECT audit_id FROM main._lattice_obligation_entry WHERE stage=0 LIMIT ?) e "
+                "LEFT JOIN main.AuditLog a ON a.id=e.audit_id");candidates.integer(1,cap+1);
+            int64_t scanned=0;
+            while(candidates.next()){
+                if(++scanned>records)refuse("continuous delete proof raw inventory exceeded");
+                const auto id=integer(candidates,0);
+                target key{small_text(candidates,1,64),small_text(candidates,2,36)};
+                const auto operation=small_text(candidates,3,6);
+                if(id<=0||key.first.empty()||key.second.size()!=36)refuse("continuous delete proof invalid metadata");
+                const auto found=latest_.find(key);
+                if(operation=="DELETE"&&found!=latest_.end())found->second=std::max(found->second,id);
+            }
+            loaded_=true;
+        }
+        const auto found=latest_.find({update.table_name,update.global_row_id});
+        return found!=latest_.end()&&found->second>update.id?found->second:0;
+    }
+};
+struct continuous_delete_witness {
+    raw_audit original;
+    struct contribution {size_t index;recovery_obligation_entry entry;std::array<int64_t,15> stamp;};
+    std::vector<contribution> contributions;
+};
 } // namespace
 
 committed_export_frame::committed_export_frame(committed_export_frame&& other) noexcept {
@@ -442,6 +496,9 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         // operation text alone or unselected DELETE is generated evidence.
         std::vector<const recovery_local_export_table*> tables;
         std::vector<std::vector<size_t>> scope_indexes;
+        continuous_delete_index delete_index;
+        std::map<int64_t,continuous_delete_witness> delete_witnesses;
+        std::vector<int64_t> selected_delete_witnesses;
         std::string encoded="{\"auditLog\":[";
         if(frame.upload_view_) {
             std::vector<int64_t> selected;size_t deletes=0;
@@ -459,9 +516,34 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                     }
                     if(!table)refuse("export original has no admitted whole-model contribution");
                     for(const auto i:matches)history_original(db,inventory,inventory.scopes[i],journal,row.entry);
-                    // Ordinary uploads retain their missing NoHistory refusal;
-                    // no later DELETE outside this fitted prefix is evidence.
-                    decode_generated(db,row,*table,raw,false);wire_bound(row.entry,limits.wire_bytes);
+                    int64_t witness_id=0;
+                    const auto prove_absence=[&]{
+                        if(witness_id)return true;
+                        const auto later=delete_index.later(db,inventory,journal,ids,row.entry);
+                        if(!later)return false;
+                        if(!delete_witnesses.count(later)){
+                            continuous_delete_witness witness;witness.original=read_audit(db,later,raw);
+                            const auto& original=witness.original.entry;
+                            if(original.id<=row.entry.id||original.operation!="DELETE"||
+                               original.table_name!=row.entry.table_name||original.global_row_id!=row.entry.global_row_id)
+                                refuse("continuous delete proof original differs from selected target");
+                            for(const auto i:matches){
+                                const auto& scope=inventory.scopes[i];history_original(db,inventory,scope,journal,original);
+                                const auto entry=journal.find(scope.contribution.address,original.global_id);
+                                if(!entry)refuse("continuous delete proof contribution disappeared");
+                                const auto stamp=coverage_stamp(db,inventory,scope,*entry);
+                                continuous_delete_witness::contribution part{i,*entry,{}};
+                                std::copy_n(stamp.begin(),part.stamp.size(),part.stamp.begin());witness.contributions.push_back(std::move(part));
+                            }
+                            // Validate the full generated original, not merely
+                            // its operation label. It is evidence only: no
+                            // claim, frame member or delivery state is added.
+                            decode_generated(db,witness.original,*table,raw);
+                            delete_witnesses.emplace(later,std::move(witness));
+                        }
+                        witness_id=later;return true;
+                    };
+                    decode_generated(db,row,*table,raw,false,prove_absence);wire_bound(row.entry,limits.wire_bytes);
                     const auto json=row.entry.to_json();
                     const size_t overhead=encoded.size()+(!frame.entries_.empty()?1:0)+2;
                     if(overhead>frame.upload_view_->wire_||json.size()>frame.upload_view_->wire_-overhead)reason="wire bytes";
@@ -472,6 +554,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                             encoded.assign(candidate.data(),candidate.size()-2);deletes=next_deletes;selected.push_back(id);
                             for(const auto i:matches)by_scope[i].push_back(row.entry.global_id);
                             frame.entries_.push_back(row.entry);tables.push_back(table);scope_indexes.push_back(std::move(matches));originals.push_back(std::move(row));
+                            selected_delete_witnesses.push_back(witness_id);
                             continue;
                         }
                     }
@@ -517,6 +600,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
             frame.claims_.push_back(journal.claim_export(address,by_scope[i]));
             for(const auto& id:by_scope[i]){const auto entry=journal.find(address,id);if(!entry)refuse("export claimed original missing");expected_entries.emplace_back(address,*entry);}
             const auto scope=journal.read(address.channel);if(!scope)refuse("export claimed scope missing");expected_scopes.push_back(*scope);
+            if(recovery_export_test_hooks::after_contribution_claim)recovery_export_test_hooks::after_contribution_claim(i);
         }
         if(recovery_export_test_hooks::before_claim_commit)recovery_export_test_hooks::before_claim_commit();
         const auto final_inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);
@@ -524,12 +608,34 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         for(const auto& [address,expected]:expected_entries)if(journal.find(address,expected.record.original_id)!=std::optional<recovery_obligation_entry>(expected))refuse("export cross-contribution final entry changed");
         for(const auto& expected:expected_scopes)if(journal.read(expected.address.channel)!=std::optional<recovery_obligation_scope>(expected))refuse("export cross-contribution final scope changed");
         budget verify{limits};
+        // Revalidate only witnesses used by the fitting prefix. A selected D
+        // may have gained its own claim in this transaction; every other D
+        // entry and each immutable producer stamp must remain byte-equivalent.
+        std::set<int64_t> checked_delete_witnesses;
+        for(const auto id:selected_delete_witnesses)if(id&&checked_delete_witnesses.insert(id).second){
+            const auto& witness=delete_witnesses.at(id);auto actual=read_audit(db,id,verify);
+            if(!same_original(witness.original,actual))refuse("continuous delete proof original changed after claims");
+            for(const auto& part:witness.contributions){
+                const auto& scope=final_inventory.scopes.at(part.index);
+                history_original(db,final_inventory,scope,journal,actual.entry);
+                auto expected=part.entry;
+                for(const auto& claim:frame.claims_)if(claim.address==scope.contribution.address&&
+                    std::find(claim.canonical_original_ids.begin(),claim.canonical_original_ids.end(),expected.canonical_original_id)!=claim.canonical_original_ids.end()){
+                    if(!expected.first_export_claim)expected.first_export_claim=claim.sequence;
+                }
+                const auto entry=journal.find(scope.contribution.address,actual.entry.global_id);
+                if(!entry||*entry!=expected)refuse("continuous delete proof contribution changed after claims");
+                const auto stamp=coverage_stamp(db,final_inventory,scope,*entry);
+                if(!std::equal(part.stamp.begin(),part.stamp.end(),stamp.begin()))refuse("continuous delete proof stamp changed after claims");
+            }
+        }
         for(size_t i=0;i<originals.size();++i){const auto& before=originals[i];auto after=read_audit(db,before.entry.id,verify);
             if(!same_original(before,after))refuse("export original changed after claims");
             if(retained_delete_page||frame.upload_view_){
                 // Recheck both actual row absence/value and exact projection
                 // after reentrant claim hooks; read errors never prove absence.
-                decode_generated(db,after,*tables[i],verify,later_delete(i));
+                const bool continuous_absence=frame.upload_view_&&selected_delete_witnesses.at(i)!=0;
+                decode_generated(db,after,*tables[i],verify,later_delete(i)||continuous_absence);
                 const auto& projected=frame.entries_[i];
                 if(after.entry.changed_fields_names!=projected.changed_fields_names||after.entry.changed_fields.size()!=projected.changed_fields.size())
                     refuse("export retained projection changed after claims");

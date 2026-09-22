@@ -1044,3 +1044,173 @@ TEST_F(RecoveryNegotiatedExport, RetainedStaleEndpointDoesNotKeepFixturePayloadO
     EXPECT_FALSE(stale.trigger_on_open());EXPECT_FALSE(stale.trigger_on_message(transport_message::from_string("{}")));EXPECT_FALSE(stale.is_current());
 }
 #endif
+
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include <lattice.hpp>
+struct ContinuousNoHistoryRow {std::string title;std::string body;};
+LATTICE_SCHEMA(ContinuousNoHistoryRow,title,body);
+namespace {
+const bool continuous_no_history_schema=[] {
+    auto schema=managed<ContinuousNoHistoryRow>::schema();schema.properties[1].no_history=true;
+    schema_registry::instance().register_model(typeid(ContinuousNoHistoryRow),std::move(schema));return true;
+}();
+struct no_history_source_route {
+    static int32_t current(void*){return 1;}
+    static void destroy(void* p){delete static_cast<no_history_source_route*>(p);}
+};
+class RecoveryNegotiatedNoHistory:public RecoveryNegotiatedExport {
+protected:
+    TempDB source_file{"continuous_no_history_source"};
+    std::unique_ptr<swift_lattice_ref> source_ref;
+    std::shared_ptr<::lattice::swift_lattice> source;
+    std::vector<relay_recovery_setup> sessions;
+    std::vector<negotiated_json> descriptors;
+    std::string target,update_id,delete_id;
+    void SetUp()override {
+        RecoveryNegotiatedExport::SetUp();
+        for(size_t i=0;i<policy.contributions.size();++i){
+            policy.contributions[i].models={"ContinuousNoHistoryRow"};
+            policy.contributions[i].profile.receipt_namespace="app-"+std::to_string(i);
+        }
+        policy.limits.obligations.records=1024;policy.limits.obligations.encoded_bytes=16*1024*1024;
+        policy.limits.producers.stamps=1024;policy.limits.producers.encoded_bytes=16*1024*1024;
+        policy.frozen_entries=1024;policy.frozen_bytes=16*1024*1024;
+    }
+    void mount(size_t delete_cap=256,bool deny_delete=false){
+        swift_schema_entry schema;schema.table_name="ContinuousNoHistoryRow";
+        for(const char* name:{"title","body"}){property_descriptor field{};field.name=name;field.type=column_type::text;schema.properties[name]=field;}
+        swift_configuration config(source_file.str(),std::make_shared<immediate_scheduler>());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+#if LATTICE_HAS_FRT
+        source_ref.reset(swift_lattice_ref::create(config,{schema}));
+#else
+        source_ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(config,{schema}));
+#endif
+        source=swift_lattice_ref::shared_for_lattice(source_ref->get());if(!source)throw db_error("NoHistory source owner missing");
+        if(auto* n=instance_registry::instance().get_or_create_notifier(source_file.str()))n->stop_listening();
+        const auto source_id=uuid_t::generate().to_string(),epoch=uuid_t::generate().to_string(),mount_id=uuid_t::generate().to_string(),user=uuid_t::generate().to_string();
+        for(size_t i=0;i<2;++i){
+            negotiated_json recipe={{"version",1},{"authority","actual-nohistory-service"},{"sourceID",source_id},{"epoch",epoch},{"localNamespace","local"},
+                {"namespaces",negotiated_json::array({{{"namespaceID","local"},{"coverageID","local-v1"},{"revision",1}},{{"namespaceID","app-0"},{"coverageID","app-0-v1"},{"revision",1}},{{"namespaceID","app-1"},{"coverageID","app-1-v1"},{"revision",1}}})},
+                {"receiptNamespace","app-"+std::to_string(i)},{"models",negotiated_json::array({"ContinuousNoHistoryRow"})},{"walFull",true},{"maximumAuthorizationMilliseconds",600000},
+                {"upload",{{"tables",negotiated_json::array()},{"unlisted","allow"},{"maximumDeletes",delete_cap}}}};
+            if(deny_delete)recipe["upload"]["tables"]=negotiated_json::array({{{"table","ContinuousNoHistoryRow"},{"operations",negotiated_json::array({"INSERT","UPDATE"})}}});
+            negotiated_json connection={{"mount",mount_id},{"connection",uuid_t::generate().to_string()},{"channel",policy.routes[i].sync_id},{"authenticatedUserID",user},
+                {"peer",{{"replicaID","nohistory-peer-"+std::to_string(i)},{"receiverIncarnation",uuid_t::generate().to_string()},{"channelIncarnation",uuid_t::generate().to_string()}}}};
+            auto setup=source_ref->open_relay_recovery_setup(recipe.dump(),connection.dump(),new no_history_source_route,no_history_source_route::current,no_history_source_route::destroy);
+            if(!setup.valid())throw db_error("NoHistory actual source setup failed: "+last_bridge_error());
+            auto descriptor=negotiated_json::parse(setup.descriptor());
+            negotiated_json authorization={{"context",descriptor},{"authenticatedUserID",descriptor["route"]["authenticatedUserID"]},{"peer",descriptor["route"]["peer"]},
+                {"source",descriptor["source"]},{"incomingScope",descriptor["incomingScope"]},{"authorizationRevision","actual-nohistory-fixture"},{"validForMilliseconds",600000}};
+            if(!setup.finish_authorization(authorization.dump()))throw db_error("NoHistory actual source authorization failed: "+last_bridge_error());
+            descriptors.push_back(std::move(descriptor));sessions.push_back(std::move(setup));
+        }
+    }
+    void start_actual(size_t route=0){
+        const auto& d=descriptors.at(route);
+        negotiated_json expected={{"endpoint",policy.routes[route].endpoint},{"source",d.at("source")},{"incomingScope",d.at("incomingScope")},
+            {"peer",d.at("route").at("peer")},{"channel",policy.routes[route].sync_id},{"validForMilliseconds",600000}};
+        sync_config c;c.sync_id=policy.routes[route].sync_id;c.websocket_url=policy.routes[route].endpoint;c.recovery_source_expectation=expected.dump();c.checkpoint_passive_interval_ms=0;c.upload_coalesce_ms=0;
+        auto sender=std::make_unique<synchronizer>(owner,c);sender->set_on_error([this](const std::string& error){errors.push_back(error);});sender->connect();queue->drain();factory->wires.back()->open();queue->drain();senders.push_back(std::move(sender));
+        std::string request;{std::lock_guard lock(factory->wires[route]->mutex);request=factory->wires[route]->frames.front();}
+        const auto input=sessions[route].stop_token().reserve_ready(request.size());if(!input.valid())throw db_error("NoHistory describe input not admitted");
+        const auto response=sessions[route].ready(request,input);if(response.status_code()!=1||!response.publishable())throw db_error("NoHistory actual describe failed");
+        platform->attempts[route]->current().trigger_on_message(transport_message::from_string(response.wire()));queue->drain();
+    }
+    void generate(bool mixed,size_t gap=270){
+        open();auto co=facade();auto row=owner->add(ContinuousNoHistoryRow{"seed-title","seed-body"});target=row.global_id();
+        if(mixed)owner->db().execute("UPDATE ContinuousNoHistoryRow SET title='historical-title',body='unavailable-body' WHERE globalId=?",{target});
+        else row.body="unavailable-body";
+        update_id=std::get<std::string>(owner->db().query("SELECT globalId FROM AuditLog ORDER BY id DESC LIMIT 1")[0].at("globalId"));
+        co->add_bulk(std::vector<ContinuousNoHistoryRow>(gap,{"unrelated","payload"}));owner->remove(row);
+        delete_id=std::get<std::string>(owner->db().query("SELECT globalId FROM AuditLog ORDER BY id DESC LIMIT 1")[0].at("globalId"));
+    }
+    auto originals(){return owner->db().query("SELECT * FROM AuditLog ORDER BY id");}
+    auto complete_snapshot(){std::vector<std::vector<database::row_t>> result;
+        for(const char* name:{"AuditLog","ContinuousNoHistoryRow","_lattice_obligation_store","_lattice_obligation_scope","_lattice_obligation_entry","_lattice_obligation_producer_store","_lattice_obligation_producer_stamp"})
+            result.push_back(owner->db().query(std::string("SELECT * FROM ")+name+" ORDER BY 1,2"));return result;}
+    auto source_receipts(){return source->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY original_id");}
+    int64_t delete_claims(){return std::get<int64_t>(owner->db().query("SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE actual_original=CAST(? AS BLOB) AND first_export IS NOT NULL",{delete_id})[0].at("n"));}
+    std::vector<audit_log_entry> parsed(size_t page,size_t route=0){const auto event=server_sent_event::from_json(audit_wire(route).at(page));if(!event)throw db_error("NoHistory invalid actual wire");return event->audit_logs;}
+    void ack(size_t page,negotiated_ack_pause& pause,size_t route=0){const auto batches=factory->wires[route]->audit_batches();factory->wires[route]->ack(batches.at(page));
+        if(!queue->run_one())throw db_error("NoHistory actual ACK task missing");pause.acknowledged();queue->drain();}
+    void cross_page(bool mixed){
+        negotiated_ack_pause pause(senders,factory);mount();generate(mixed);const auto before=originals();start_actual();
+        ASSERT_EQ(audit_wire().size(),1u);const auto first=parsed(0);ASSERT_EQ(first.size(),256u);EXPECT_EQ(delete_claims(),0);
+        const auto update=std::find_if(first.begin(),first.end(),[&](const auto& e){return e.global_id==update_id;});ASSERT_NE(update,first.end());
+        EXPECT_EQ(update->changed_fields.count("body"),0u);EXPECT_EQ(std::count(update->changed_fields_names.begin(),update->changed_fields_names.end(),"body"),0);
+        if(mixed){EXPECT_EQ(update->changed_fields_names,(std::vector<std::string>{"title"}));EXPECT_EQ(std::get<std::string>(update->changed_fields.at("title").value),"historical-title");}
+        else EXPECT_TRUE(update->changed_fields_names.empty());
+        auto accepted=sessions[0].receive(audit_wire()[0]);ASSERT_EQ(accepted.status_code(),1);ASSERT_EQ(accepted.ids().size(),first.size());
+        const auto update_receipt=source->db().query("SELECT outcome FROM _lattice_canonical_receipt WHERE original_id=CAST(? AS BLOB) AND namespace_id=CAST('app-0' AS BLOB)",{update_id});
+        ASSERT_EQ(update_receipt.size(),1u);EXPECT_EQ(std::get<int64_t>(update_receipt[0].at("outcome")),mixed?1:2);
+        const auto receipts=source_receipts();const auto rows=source->db().query("SELECT title,body FROM ContinuousNoHistoryRow WHERE globalId=?",{target});ASSERT_EQ(rows.size(),1u);
+        EXPECT_EQ(std::get<std::string>(rows[0].at("title")),mixed?"historical-title":"seed-title");EXPECT_EQ(std::get<std::string>(rows[0].at("body")),"seed-body");
+        auto replay=sessions[0].receive(audit_wire()[0]);EXPECT_EQ(replay.ids(),accepted.ids());EXPECT_EQ(source_receipts(),receipts);
+        ack(0,pause);ASSERT_EQ(audit_wire().size(),2u);const auto second=parsed(1);ASSERT_FALSE(second.empty());EXPECT_EQ(second.back().global_id,delete_id);
+        auto deleted=sessions[0].receive(audit_wire()[1]);ASSERT_EQ(deleted.status_code(),1);EXPECT_EQ(deleted.ids().size(),second.size());ack(1,pause);
+        EXPECT_TRUE(source->db().query("SELECT * FROM ContinuousNoHistoryRow WHERE globalId=?",{target}).empty());EXPECT_EQ(delete_claims(),2);
+        EXPECT_EQ(originals(),before);EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=1"),0);
+        start_actual(1);ASSERT_EQ(audit_wire(1).size(),1u);for(size_t page=0;page<2;++page){auto result=sessions[1].receive(audit_wire(1).at(page));ASSERT_EQ(result.status_code(),1);ack(page,pause,1);}
+        EXPECT_EQ(originals(),before);EXPECT_TRUE(errors.empty());EXPECT_TRUE(source->db().query("SELECT * FROM ContinuousNoHistoryRow WHERE globalId=?",{target}).empty());
+    }
+    void TearDown()override {RecoveryNegotiatedExport::TearDown();for(auto& session:sessions)session.close_on_io();sessions.clear();if(source)source->close();source.reset();source_ref.reset();}
+};
+}
+TEST_F(RecoveryNegotiatedNoHistory, CrossPageMixedUpdateAndDeleteReachActualSourceWithLostAckReplay) {cross_page(true);}
+TEST_F(RecoveryNegotiatedNoHistory, CrossPageEmptyUpdateAndDeletePreserveActualNoopReceipt) {cross_page(false);}
+TEST_F(RecoveryNegotiatedNoHistory, ZeroDeleteBudgetKeepsLaterWitnessUnclaimedAndDrainBlocked) {
+    negotiated_ack_pause pause(senders,factory);mount(0);generate(true);const auto before=originals();start_actual();
+    for(size_t page=0;page<2;++page){ASSERT_GT(audit_wire().size(),page);auto accepted=sessions[0].receive(audit_wire()[page]);ASSERT_EQ(accepted.status_code(),1);ack(page,pause);}
+    EXPECT_EQ(delete_claims(),0);EXPECT_EQ(originals(),before);ASSERT_FALSE(errors.empty());
+    EXPECT_THROW(senders[0]->drain(std::chrono::steady_clock::now()+std::chrono::seconds(1)),db_error);
+}
+TEST_F(RecoveryNegotiatedNoHistory, PositiveDeleteBudgetDoesNotGrantSourceDeletePermission) {
+    negotiated_ack_pause pause(senders,factory);mount(256,true);generate(true);const auto before=originals();start_actual();
+    auto first=sessions[0].receive(audit_wire()[0]);ASSERT_EQ(first.status_code(),1);ack(0,pause);ASSERT_EQ(audit_wire().size(),2u);const auto receipts=source_receipts();
+    auto refused=sessions[0].receive(audit_wire()[1]);EXPECT_EQ(refused.status_code(),4);EXPECT_TRUE(refused.ids().empty());EXPECT_EQ(source_receipts(),receipts);
+    EXPECT_EQ(delete_claims(),2);EXPECT_EQ(originals(),before);EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=1"),0);
+}
+namespace {thread_local bool no_history_final_read_denied=false;thread_local size_t no_history_final_read_denials=0;}
+TEST_F(RecoveryNegotiatedNoHistory, FinalWitnessReadErrorRollsBackEveryFittedClaim) {
+    negotiated_ack_pause pause(senders,factory);mount();generate(true);const auto before=complete_snapshot();
+    no_history_final_read_denied=false;no_history_final_read_denials=0;
+    {continuity_fault fault(owner.get(),[](int action,const char* table,const char*,const char*)noexcept{
+        if(no_history_final_read_denied&&action==SQLITE_READ&&table&&std::strcmp(table,"AuditLog")==0){++no_history_final_read_denials;return SQLITE_DENY;}return SQLITE_OK;});
+     negotiated_precommit_hook_scope hook([] {no_history_final_read_denied=true;});start_actual();}
+    no_history_final_read_denied=false;EXPECT_GT(no_history_final_read_denials,0u);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(complete_snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_FALSE(errors.empty());
+}
+TEST_F(RecoveryNegotiatedNoHistory, RecreatedTargetBeforeCommitRollsBackModelAndClaims) {
+    negotiated_ack_pause pause(senders,factory);mount();generate(true);const auto before=complete_snapshot();
+    {negotiated_precommit_hook_scope hook([&]{owner->db().execute("INSERT INTO ContinuousNoHistoryRow(globalId,title,body) VALUES(?,'new-title','new-body')",{target});});start_actual();}
+    EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(complete_snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_FALSE(errors.empty());
+}
+#endif
+
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+thread_local std::function<void(size_t)> no_history_contribution_action;
+struct no_history_contribution_hook {
+    void(*prior)(size_t)=recovery_export_test_hooks::after_contribution_claim;
+    std::function<void(size_t)> old=std::move(no_history_contribution_action);
+    explicit no_history_contribution_hook(std::function<void(size_t)> action){no_history_contribution_action=std::move(action);recovery_export_test_hooks::after_contribution_claim=[](size_t index){no_history_contribution_action(index);};}
+    ~no_history_contribution_hook(){recovery_export_test_hooks::after_contribution_claim=prior;no_history_contribution_action=std::move(old);}
+};
+}
+TEST_F(RecoveryNegotiatedNoHistory, AnotherContributionCannotRewriteWitnessFirstClaimBeforeItsOwnClaimSnapshot) {
+    negotiated_ack_pause pause(senders,factory);mount();generate(true,0);start_actual();ASSERT_EQ(audit_wire().size(),1u);
+    const auto first=sessions[0].receive(audit_wire()[0]);ASSERT_EQ(first.status_code(),1);ASSERT_EQ(first.ids().size(),3u);ack(0,pause);
+    const auto before=complete_snapshot();const auto channel=policy.contributions[1].profile.binding.channel;
+    const auto first_claim=owner->db().query("SELECT first_export FROM _lattice_obligation_entry WHERE channel=CAST(? AS BLOB) AND actual_original=CAST(? AS BLOB)",{channel,delete_id});
+    ASSERT_EQ(first_claim.size(),1u);const auto original=std::get<int64_t>(first_claim[0].at("first_export"));ASSERT_GT(original,0);
+    const int64_t different=original==1?2:1;bool injected=false;
+    {no_history_contribution_hook hook([&](size_t index){if(index!=0)return;
+        owner->db().execute("UPDATE _lattice_obligation_entry SET first_export=? WHERE channel=CAST(? AS BLOB) AND actual_original=CAST(? AS BLOB)",{different,channel,delete_id});
+        const auto observed=owner->db().query("SELECT first_export FROM _lattice_obligation_entry WHERE channel=CAST(? AS BLOB) AND actual_original=CAST(? AS BLOB)",{channel,delete_id});
+        if(observed.size()!=1||std::get<int64_t>(observed[0].at("first_export"))!=different)throw db_error("NoHistory inter-contribution fault did not take effect");injected=true;
+    });start_actual(1);}
+    EXPECT_TRUE(injected);EXPECT_TRUE(audit_wire(1).empty());EXPECT_EQ(complete_snapshot(),before);ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors.back().find("continuous delete proof contribution changed after claims"),std::string::npos);
+}
+#endif

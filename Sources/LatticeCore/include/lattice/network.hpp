@@ -225,9 +225,20 @@ using UniqueSyncTransport = std::unique_ptr<sync_transport>;
 // value owns only its callback cell and the exact connect attempt. It is safe
 // to retain after the transport is deleted; stale events then do nothing.
 // This is lifetime provenance, NOT authenticated source/recovery authority.
-namespace detail { struct platform_transport_test_access; struct platform_attempt_owner_test_access; class sync_callback_lifetime; }
+namespace detail { struct platform_transport_test_access; struct platform_attempt_owner_test_access; class sync_callback_lifetime; class receiver_source_binding; }
 class owned_platform_sync_transport;
+class platform_tls_test_driver; // observation-only test-support product
 class platform_transport_callbacks {
+    // Installed only by the separate trusted SDK system-TLS adapter factory.
+    // This is a retained platform verifier, never an application source grant.
+    struct tls_provider {
+        void* context;
+        int32_t (*verify)(void*,const void*,const void*);
+        void (*release)(void*);
+        tls_provider(void* c,int32_t(*v)(void*,const void*,const void*),void(*r)(void*))
+            :context(c),verify(v),release(r){}
+        ~tls_provider(){if(release)release(context);}
+    };
     struct handlers {
         std::function<void(const platform_transport_callbacks&)> open;
         std::function<void(const platform_transport_callbacks&, const transport_message&)> message;
@@ -241,6 +252,9 @@ class platform_transport_callbacks {
         // mutex. Owner admission reads it without taking this endpoint lock.
         std::atomic<uint64_t> owner_attempt{0};
         std::atomic<uint64_t> live_owner_attempt{0};
+        std::atomic<uint64_t> verified_tls_attempt{0};
+        std::shared_ptr<tls_provider> system_tls; // immutable after construction
+        std::shared_ptr<const std::string> dial_url;
         transport_state phase = transport_state::closed;
         bool retired = false;
         handlers callbacks;
@@ -260,6 +274,12 @@ class platform_transport_callbacks {
     friend struct detail::platform_transport_test_access;
     friend struct detail::platform_attempt_owner_test_access;
     friend class detail::sync_callback_lifetime;
+    friend class detail::receiver_source_binding;
+    friend class platform_tls_test_driver;
+    bool current_system_tls_for_owner()const noexcept {
+        return cell_&&generation_&&cell_->verified_tls_attempt.load(std::memory_order_acquire)==generation_&&
+            current_attempt_for_owner(false);
+    }
     // Called only while the owner admission leaf is held. The atomic fence
     // avoids nesting endpoint and owner locks (including capture-copy paths).
     // A terminal callback has already closed its phase; identity, not phase,
@@ -286,10 +306,22 @@ public:
     bool trigger_on_open() const {
         if (!cell_) return false;
         decltype(handlers::open) callback;
+        std::shared_ptr<tls_provider> verifier;
+        std::shared_ptr<const std::string> url;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            if (!current_locked() || cell_->phase != transport_state::connecting) return false;
+            verifier=cell_->system_tls;url=cell_->dial_url;
+        }
+        // Retention outlives concurrent native deletion. The SDK verifies the
+        // same actual task/socket and callback endpoint, outside native locks.
+        bool verified=false;
+        if(verifier&&url){try{verified=verifier->verify(verifier->context,this,url.get())==1;}catch(...){}}
         {
             std::lock_guard<std::mutex> lock(cell_->mutex);
             if (!current_locked() || cell_->phase != transport_state::connecting) return false;
             callback = cell_->callbacks.open;
+            cell_->verified_tls_attempt.store(verified?generation_:0,std::memory_order_release);
             cell_->phase = transport_state::open;
         }
         if (callback) callback(*this);
@@ -320,6 +352,7 @@ public:
             before_delivery = cell_->before_error_delivery;
             cell_->phase = transport_state::closed;
             cell_->live_owner_attempt.store(0, std::memory_order_release);
+            cell_->verified_tls_attempt.store(0, std::memory_order_release);
         }
         if (before_delivery) before_delivery();
         if (callback) callback(*this, error);
@@ -334,6 +367,7 @@ public:
             callback = cell_->callbacks.close;
             cell_->phase = transport_state::closed;
             cell_->live_owner_attempt.store(0, std::memory_order_release);
+            cell_->verified_tls_attempt.store(0, std::memory_order_release);
         }
         if (callback) callback(*this, code, reason);
         return true;
@@ -361,6 +395,29 @@ public:
     owned_platform_sync_transport(void* user_data, connect_fn_ptr connect,
         disconnect_fn_ptr disconnect, send_fn_ptr send, destroy_fn_ptr destroy)
         : user_data_(user_data), connect_(connect), disconnect_(disconnect), send_(send), destroy_(destroy) {}
+    // Trusted SDK/native-host system-TLS boundary (callable C++ surface).
+    // A native host can install a verifier here; it must be trusted. Generic
+    // legacy factory callers never install
+    // this provider. Both separately retained contexts are consumed on failure.
+    // The trusted SDK implementation must verify real system TLS on the exact
+    // Attempt; this factory does not accept a source descriptor or a grant.
+    static sync_transport* make_system_tls_adapter(void* user_data,connect_fn_ptr connect,
+        disconnect_fn_ptr disconnect,send_fn_ptr send,destroy_fn_ptr destroy,
+        void* verification_context,int32_t(*verify)(void*,const void*,const void*),
+        void(*release_verification)(void*))noexcept {
+        std::shared_ptr<platform_transport_callbacks::tls_provider> provider;
+        try {
+            if(!verify||!release_verification||!destroy)throw std::invalid_argument("system TLS adapter requires owned verification");
+            provider=std::make_shared<platform_transport_callbacks::tls_provider>(verification_context,verify,release_verification);
+            auto* result=new owned_platform_sync_transport(user_data,connect,disconnect,send,destroy);
+            result->cell_->system_tls=std::move(provider);
+            return result;
+        }catch(...){
+            if(!provider&&release_verification)release_verification(verification_context);
+            if(destroy)destroy(user_data);
+            return nullptr;
+        }
+    }
     owned_platform_sync_transport(const owned_platform_sync_transport&) = delete;
     owned_platform_sync_transport& operator=(const owned_platform_sync_transport&) = delete;
     ~owned_platform_sync_transport() override {
@@ -371,6 +428,7 @@ public:
             cell_->phase = transport_state::closed;
             cell_->owner_attempt.store(0, std::memory_order_release);
             cell_->live_owner_attempt.store(0, std::memory_order_release);
+            cell_->verified_tls_attempt.store(0, std::memory_order_release);
             std::swap(retired_callbacks, cell_->callbacks);
         }
         // Release captures and platform resources outside the cell lock.
@@ -381,12 +439,18 @@ private:
     void connect_impl(const std::string& url, const HeadersMap& headers,
                       std::optional<platform_transport_callbacks::handlers> replacement) {
         platform_transport_callbacks endpoint;
+        // Generic transports retain no URL or trust callback. A malformed or
+        // oversized system-adapter URL remains legacy/non-authoritative.
+        std::shared_ptr<const std::string> bound_url;
+        if(cell_->system_tls&&url.size()<=8192)bound_url=std::make_shared<const std::string>(url);
         {
             std::lock_guard<std::mutex> lock(cell_->mutex);
             if (cell_->retired || cell_->generation == std::numeric_limits<uint64_t>::max())
                 throw std::overflow_error("platform transport attempt exhausted");
             if (replacement) std::swap(cell_->callbacks, *replacement);
             ++cell_->generation;
+            cell_->verified_tls_attempt.store(0,std::memory_order_release);
+            cell_->dial_url.swap(bound_url); // displaced URL releases off lock
             cell_->phase = transport_state::connecting;
             endpoint = platform_transport_callbacks(cell_, cell_->generation);
             cell_->owner_attempt.store(cell_->generation, std::memory_order_release);
@@ -428,12 +492,20 @@ public:
             cell_->phase = transport_state::closed;
             cell_->owner_attempt.store(0, std::memory_order_release);
             cell_->live_owner_attempt.store(0, std::memory_order_release);
+            cell_->verified_tls_attempt.store(0, std::memory_order_release);
         }
         if (disconnect_) disconnect_(user_data_);
     }
     transport_state state() const override {
         std::lock_guard<std::mutex> lock(cell_->mutex);
         return cell_->phase;
+    }
+    // Keeps a control send on the exact admitted socket. The SDK still checks
+    // this endpoint after the lock is released, including replacement races.
+    bool send_to_attempt(const platform_transport_callbacks& endpoint,const transport_message& message) {
+        {std::lock_guard<std::mutex> lock(cell_->mutex);
+            if(endpoint.cell_!=cell_||!endpoint.current_locked()||cell_->phase!=transport_state::open)return false;}
+        if(!send_)return false;send_(user_data_,&message,&endpoint);return true;
     }
     void send(const transport_message& message) override {
         platform_transport_callbacks endpoint;
@@ -483,6 +555,19 @@ inline sync_transport* make_owned_platform_sync_transport(void* user_data,
         if (destroy) destroy(user_data);
         return nullptr;
     }
+}
+
+// Called only by the SDK's closed system-TLS adapters. This software boundary
+// is distinct from the generic factory above and never constructs a grant.
+inline sync_transport* make_system_tls_platform_sync_transport(void* user_data,
+    owned_platform_sync_transport::connect_fn_ptr connect,
+    owned_platform_sync_transport::disconnect_fn_ptr disconnect,
+    owned_platform_sync_transport::send_fn_ptr send,
+    owned_platform_sync_transport::destroy_fn_ptr destroy,
+    void* verification_context,int32_t(*verify)(void*,const void*,const void*),
+    void(*release_verification)(void*))noexcept {
+    return owned_platform_sync_transport::make_system_tls_adapter(user_data,connect,disconnect,send,destroy,
+        verification_context,verify,release_verification);
 }
 
 // ============================================================================

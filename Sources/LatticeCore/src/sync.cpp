@@ -1,5 +1,6 @@
 #include "recovery_producer_continuity.hpp"
 #include "sync_immediate_scheduler.hpp"
+#include "recovery_receiver_source.hpp"
 #include "sync_discovery_deferral.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "receive_delivery_guard.hpp"
@@ -554,6 +555,9 @@ std::string server_sent_event::to_json() const {
 
 std::optional<server_sent_event> server_sent_event::from_json(const std::string& json_str) {
     try {
+        // Inspect the control VALUE, preserving ordinary kind auditLog/ack/
+        // replayRequest. Any mixed/duplicate recoveryReady occurrence refuses.
+        if(detail::reserved_recovery_source_frame(json_str))return std::nullopt;
         json j = json::parse(json_str);
 
         if (j.contains("auditLog") && j["auditLog"].is_array()) {
@@ -674,6 +678,8 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 #ifndef __EMSCRIPTEN__
     start_pacer();
 #endif
+    // Validate before first dial, after the base owns complete teardown state.
+    if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
 }
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
@@ -708,6 +714,8 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 #ifndef __EMSCRIPTEN__
     start_pacer();
 #endif
+    // Validate before first dial, after the base owns complete teardown state.
+    if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
 }
 
 void synchronizer_base::request_upload(bool background) {
@@ -1189,11 +1197,32 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
     const auto dial = [this,transport,lifetime,lifecycle](const std::string& url, const HeadersMap& headers) {
         if (const auto platform = std::dynamic_pointer_cast<owned_platform_sync_transport>(transport)) {
             platform->connect_with_attempt_handlers(url, headers,
-                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt) { lifetime->platform_callback(lifecycle,attempt,[this] { background_operation("transport open",[this] { on_websocket_open(); }); }); },
-                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const transport_message& message) { lifetime->platform_callback(lifecycle,attempt,[this,&message] { background_operation("transport message",[this,&message] { on_transport_message(message); }); }); },
+                [this,lifetime,lifecycle,weak_platform=std::weak_ptr<owned_platform_sync_transport>(platform)](const platform_transport_callbacks& attempt) {
+                    lifetime->platform_callback(lifecycle,attempt,[this,lifetime,lifecycle,&attempt,&weak_platform] {
+                        background_operation("transport open",[this,lifetime,lifecycle,&attempt,&weak_platform] {
+                            const auto source=receiver_source_;
+                            if(source) {
+                                const auto retained=weak_platform.lock();if(!retained)return;
+                                source->opened(attempt,lifecycle,*retained);
+                                // A synchronous platform send may retire the owner.
+                                if(!lifetime->current(lifecycle))return;
+                            }
+                            on_websocket_open();
+                        });
+                    });
+                },
+                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const transport_message& message) {
+                    lifetime->platform_callback(lifecycle,attempt,[this,lifecycle,&attempt,&message] {
+                        background_operation("transport message",[this,lifecycle,&attempt,&message] {
+                            if(receiver_source_&&receiver_source_->receive(attempt,lifecycle,message))return;
+                            on_transport_message(message);
+                        });
+                    });
+                },
                 [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const std::string& error) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,&error] { background_operation("transport error",[this,&error] { on_websocket_error(error); }); }); },
                 [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,int code,const std::string& reason) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,code,&reason] { background_operation("transport close",[this,code,&reason] { on_websocket_close(code,reason); }); }); });
         } else {
+            if(receiver_source_)throw db_error("receiver source requires trusted owned SDK platform transport");
             transport->connect(url, headers);
         }
     };
@@ -1214,7 +1243,7 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
         return;
     }
 
-    std::string url = config_.websocket_url;
+    std::string url = receiver_source_ ? receiver_source_->dial_url() : config_.websocket_url;
 
     // Add last-event-id query param if we have a checkpoint
     auto last_event = protected_route ? std::optional<std::string>{} : get_last_received_event_id();

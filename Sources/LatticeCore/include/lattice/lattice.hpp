@@ -57,6 +57,7 @@ namespace detail { struct recovery_writer_access; class canonical_writer_adapter
 class recovery_continuous_producer;
 struct recovery_continuous_admission;
 std::shared_ptr<database> open_continuous_writer(const configuration&,const std::shared_ptr<recovery_continuous_admission>&); struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
+namespace detail { struct sync_policy_reservation; }
 
 // Type trait to detect if T has a 'source' member (for swift_dynamic_object)
 template<typename T, typename = void>
@@ -495,6 +496,10 @@ struct configuration {
 
     /// Authorization token for sync. Required if websocket_url is set.
     std::string authorization_token;
+
+    // Explicit app expectation, not authority. The trusted SDK transport and
+    // same physical describe exchange must independently authenticate it.
+    std::string recovery_source_expectation;
 
     /// Target schema version. Default is 1 (initial schema).
     /// If the database is at a lower version, migrations will run.
@@ -6182,6 +6187,9 @@ private:
     std::atomic<bool> closed_{false};
     std::shared_ptr<scheduler> scheduler_;
     std::unique_ptr<synchronizer> synchronizer_;
+    // Payload-free immutable policy shared by pending, active and dormant
+    // same-path/URL owners. Its registry lock never spans owner work.
+    std::shared_ptr<const detail::sync_policy_reservation> sync_policy_;
 
     // IPC sync
     struct ipc_sync_state {
@@ -8914,6 +8922,7 @@ inline void lattice_db::close() {
     //    retention thread first (it owns no sync state, but it does write).
     stop_audit_maintenance();
     teardown_sync();
+    sync_policy_.reset();
     // 4. Drain the scheduler before unregistering — the xproc callback may
     //    have queued observer work on the scheduler. Must complete while
     //    members (db_, read_db_, etc.) are still alive.
@@ -8976,6 +8985,7 @@ inline lattice_db::~lattice_db() {
     LOG_INFO("lattice_db", "~dtor: refcount drained (own holds: %d)", _own_holds);
     // 3. Stop all sync threads.
     teardown_sync();
+    sync_policy_.reset();
     LOG_INFO("lattice_db", "~dtor: teardown_sync done");
     // 3b. Retire the read-generation pool (idempotent if close() already
     //     ran): COMMIT keeper transactions before the wrappers are freed at

@@ -1132,6 +1132,32 @@ static std::set<std::pair<std::string, std::string>>& active_sync_keys() {
     return *s;
 }
 
+struct detail::sync_policy_reservation {
+    const std::string policy;
+    explicit sync_policy_reservation(std::string value):policy(std::move(value)){}
+};
+static std::shared_ptr<const detail::sync_policy_reservation> reserve_sync_policy(
+    const std::string& path,const std::string& url,const std::string& policy) {
+    // Match the existing process-local sync key spelling. This is policy
+    // agreement, not filesystem custody or cross-process authorization.
+    using key=std::pair<std::string,std::string>;
+    using reservations=std::map<key,std::weak_ptr<const detail::sync_policy_reservation>>;
+    static auto* entries=new reservations();
+    std::lock_guard<std::mutex> lock(sync_registry_mutex());
+    for(auto i=entries->begin();i!=entries->end();) {
+        if(i->second.expired())i=entries->erase(i);else ++i;
+    }
+    auto& slot=(*entries)[{path,url}];
+    auto current=slot.lock();
+    if(current) {
+        if(current->policy!=policy)throw db_error("WSS owners have different recovery source expectations");
+        return current;
+    }
+    auto admitted=std::make_shared<const detail::sync_policy_reservation>(policy);
+    slot=admitted;
+    return admitted;
+}
+
 bool lattice_db::try_register_sync_key(const std::string& path, const std::string& key) {
     std::lock_guard<std::mutex> lock(sync_registry_mutex());
     return active_sync_keys().emplace(path, key).second;
@@ -1161,6 +1187,12 @@ void lattice_db::setup_sync_if_configured() {
         return;
     }
 
+    // Reserve before flock, instance registration or synchronizer publication.
+    // A same-policy dormant owner keeps this token for its eventual handoff;
+    // an in-flight constructor is visible even before its lattice is registered.
+    if(!sync_policy_)sync_policy_=reserve_sync_policy(config_.path,config_.websocket_url,config_.recovery_source_expectation);
+    bool registered_key=false;
+    try {
 #ifndef __EMSCRIPTEN__
     // Cross-process flock: only one in-process lattice_db at a time may
     // own the WSS synchronizer for a given path. If the lock is held, we
@@ -1223,11 +1255,13 @@ void lattice_db::setup_sync_if_configured() {
         LOG_DEBUG("lattice_db", "Synchronizer already active for this path, skipping");
         return;
     }
+    registered_key=true;
 
     // Create sync config from our configuration
     sync_config sync_cfg;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
+    sync_cfg.recovery_source_expectation = config_.recovery_source_expectation;
     sync_cfg.sync_filter = config_.sync_filter;
 
     // Always use per-synchronizer sync state
@@ -1298,6 +1332,22 @@ void lattice_db::setup_sync_if_configured() {
 
     // Auto-connect (like Swift's Lattice.init)
     synchronizer_->connect();
+    } catch (...) {
+        // Constructor failure does not run lattice_db's destructor. Release
+        // only this setup's key/flock before permitting a transport retry. All
+        // transport teardown and capture destruction remain outside the leaf.
+        const auto failure=std::current_exception();
+        synchronizer_.reset();
+        if(registered_key)unregister_sync_key(config_.path,config_.websocket_url);
+#ifndef __EMSCRIPTEN__
+        if(sync_lock_fd_>=0) {
+            ::flock(sync_lock_fd_,LOCK_UN);::close(sync_lock_fd_);sync_lock_fd_=-1;
+        }
+#endif
+        // A surviving dormant owner keeps its policy for retry. If this is a
+        // throwing owner constructor, normal member unwinding releases it.
+        std::rethrow_exception(failure);
+    }
 }
 
 void lattice_db::setup_ipc_if_configured() {

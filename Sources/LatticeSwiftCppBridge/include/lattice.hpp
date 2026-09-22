@@ -492,6 +492,8 @@ struct swift_configuration : public configuration {
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
 
+    void set_recovery_source_expectation(const std::string& value) { recovery_source_expectation=value; }
+
     void set_sync_filter(const SyncFilterVector& filter) {
         sync_filter = std::vector<sync_filter_entry>(filter.begin(), filter.end());
     }
@@ -3297,6 +3299,7 @@ template <typename ConfigT>
         int32_t schema_version;     // Target schema version (differentiates pre/post migration)
         std::string ipc_fingerprint; // Channels + socket paths + sync filter (see ipc_targets_fingerprint)
         std::string tuning_fingerprint; // sync_tuning overlay (different tuning must not share an instance)
+        std::string recovery_expectation; // never reuse a cached owner for changed source policy
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if (path != other.path) return path < other.path;
@@ -3305,6 +3308,7 @@ template <typename ConfigT>
             if (schema_version != other.schema_version) return schema_version < other.schema_version;
             if (ipc_fingerprint != other.ipc_fingerprint) return ipc_fingerprint < other.ipc_fingerprint;
             if (tuning_fingerprint != other.tuning_fingerprint) return tuning_fingerprint < other.tuning_fingerprint;
+            if (recovery_expectation != other.recovery_expectation) return recovery_expectation < other.recovery_expectation;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -3320,6 +3324,7 @@ template <typename ConfigT>
             if (schema_version != other.schema_version) return false;
             if (ipc_fingerprint != other.ipc_fingerprint) return false;
             if (tuning_fingerprint != other.tuning_fingerprint) return false;
+            if (recovery_expectation != other.recovery_expectation) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -3373,7 +3378,7 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config)};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,

@@ -195,6 +195,7 @@ struct sync_filter_entry {
 struct sync_config {
     std::string websocket_url;
     std::string authorization_token;
+    std::string recovery_source_expectation; // explicit app expectation only
     int max_reconnect_attempts = 0;  // 0 = unlimited
     double base_delay_seconds = 1.0;
     double max_delay_seconds = 60.0;
@@ -396,6 +397,7 @@ protected:
     std::shared_ptr<detail::sync_discovery_deferral> discovery_deferral_;
     std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
     std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
+    std::shared_ptr<detail::receiver_source_binding> receiver_source_;
     bool owns_inline_scheduler_adapter_=false;
     // The completed base is destroyed even when a subclass constructor
     // refuses a route before init_sync reaches the instance counter.

@@ -2,6 +2,7 @@
 #include "recovery_authenticated_session.hpp"
 #include "recovery_writer_access.hpp"
 #include "vendor/picosha2/picosha2.h"
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cstring>
@@ -624,8 +625,14 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
         refuse("canonical source requires this admitted owner and exact binding");
     if(bool(state->namespaces)!=bool(namespace_admission))refuse("canonical capture requires exact receipt profile admission");
     if(namespace_admission) {
-        if(!limits.requests || limits.requests>4096 || requests.size()>limits.requests)
+        // Only the actual validated, retained READY profile can authorize a
+        // larger request window. Ordinary namespaced capture keeps its cap.
+        const uint64_t request_cap=state->ready?std::min<uint64_t>(8192,state->ready->capture.requests):4096;
+        if(!limits.requests || limits.requests>request_cap || requests.size()>limits.requests)
             refuse("canonical namespaced request count exceeds finite capture policy");
+        if(state->ready && (!limits.requested_targets ||
+           limits.requested_targets>std::min<uint64_t>(8192,state->ready->capture.requested_targets)))
+            refuse("canonical namespaced target count exceeds retained READY capture policy");
         validate_namespace_admission(owner,writer,state,*namespace_admission);
         for(const auto& request:requests)if(request.namespace_id!=std::optional<std::string>(namespace_admission->namespace_.namespace_id))
             refuse("canonical capture request namespace differs from admission");

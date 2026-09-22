@@ -504,3 +504,40 @@ TEST(CanonicalDurableReadyRestart, FreshProcessesResumeKnownCommittedCapsuleAfte
     }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST_F(CanonicalDurableReady, RetainedCaptureCannotExceedEitherReadyProfileRequestBudget) {
+    attach();auto admission=admit();const auto original=ready_entry(901,901);import_entry(admission,original);
+    const std::vector<sr::canonical_capture_request> requested{{original.global_id,{{original.table_name,original.global_row_id}},"application-a"}};
+    auto reserved=adapter->reserve_recovery_owned(owner,std::nullopt,10000);committed(reserved.settlement);ASSERT_TRUE(reserved.reservation);
+    const auto before=snapshot();
+    auto requests_over=policy.capture;++requests_over.requests;
+    EXPECT_THROW(adapter->capture_reserved_namespaced_owned(owner,admission,*reserved.reservation,requested,requests_over),db_error);
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(owner->local_read_generations_outstanding(),0u);
+    auto targets_over=policy.capture;++targets_over.requested_targets;
+    EXPECT_THROW(adapter->capture_reserved_namespaced_owned(owner,admission,*reserved.reservation,requested,targets_over),db_error);
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(owner->local_read_generations_outstanding(),0u);
+    auto captured=adapter->capture_reserved_namespaced_owned(owner,admission,*reserved.reservation,requested,policy.capture);
+    ASSERT_TRUE(captured.capture);ASSERT_EQ(captured.capture->receipts.size(),1u);
+    EXPECT_EQ(captured.capture->receipts.front().original_id,original.global_id);EXPECT_TRUE(captured.capture->receipts.front().stored);
+    EXPECT_EQ(snapshot(),before);committed(adapter->release_recovery_owned(owner,*reserved.reservation));
+}
+TEST_F(CanonicalDurableReady, NamespacedCaptureWithoutReadyRetains4096RequestCeiling) {
+    adapter=canonical_writer_adapter::attach_namespaced_upstream_for_qualification(owner,p,upstream(),retention());
+    auto admission=admit();const auto original=ready_entry(902,902);import_entry(admission,original);
+    EXPECT_FALSE(owner->db().table_exists("_lattice_canonical_ready_profile"));
+    const std::vector<sr::canonical_capture_request> requested{{original.global_id,{{original.table_name,original.global_row_id}},"application-a"}};
+    auto reserved=adapter->reserve_recovery_owned(owner,std::nullopt,10000);committed(reserved.settlement);ASSERT_TRUE(reserved.reservation);
+    const auto before=owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY 1");const auto before_head=head();
+    auto limits=policy.capture;limits.requests=4097;
+    EXPECT_THROW(adapter->capture_reserved_namespaced_owned(owner,admission,*reserved.reservation,requested,limits),db_error);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY 1"),before);EXPECT_EQ(head(),before_head);
+    EXPECT_EQ(owner->local_read_generations_outstanding(),0u);
+    limits.requests=4096;
+    auto captured=adapter->capture_reserved_namespaced_owned(owner,admission,*reserved.reservation,requested,limits);
+    ASSERT_TRUE(captured.capture);ASSERT_EQ(captured.capture->receipts.size(),1u);EXPECT_TRUE(captured.capture->receipts.front().stored);
+    EXPECT_EQ(captured.capture->receipts.front().original_id,original.global_id);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY 1"),before);EXPECT_EQ(head(),before_head);
+    committed(adapter->release_recovery_owned(owner,*reserved.reservation));
+}
+#endif

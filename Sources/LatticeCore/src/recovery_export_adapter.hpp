@@ -36,6 +36,9 @@ class committed_export_frame {
     std::shared_ptr<const receiver_upload_view> upload_view_;
     std::shared_ptr<recovery_reconciliation_export> reconciliation_;
     std::vector<recovery_obligation_export_ticket> claims_;
+    // Restricted frames bind each ticket member to its validated first claim.
+    // An earlier route may already have claimed it before this preparation.
+    std::vector<std::vector<int64_t>> restricted_first_claims_;
     std::vector<recovery_local_export_scope> scopes_;
     recovery_obligation_producer_discovery_limits limits_{};
     std::vector<audit_log_entry> entries_;

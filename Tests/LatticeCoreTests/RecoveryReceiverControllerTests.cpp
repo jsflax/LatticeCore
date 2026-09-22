@@ -2,6 +2,8 @@
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/recovery_receiver_controller.hpp"
 #include "../../Sources/LatticeCore/src/recovery_local_producer.hpp"
+#include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
+#include "CanonicalWriterTestAccess.hpp"
 #include <nlohmann/json.hpp>
 #include <deque>
 #include <chrono>
@@ -491,10 +493,196 @@ TEST_F(RecoveryReceiverController, FullTwoThousandSendWindowRefreezesWithoutWait
     ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);
     EXPECT_EQ(synchronizers[0]->get_progress().pending_upload,2000);
     EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),3);
-    EXPECT_EQ(observed_originals(0,first),ids);EXPECT_EQ(observed_uploads.size()-first,2u);
+    EXPECT_EQ(observed_originals(0,first),ids);ASSERT_EQ(observed_uploads.size()-first,8u);
+    for(size_t n=0;n<8;++n){EXPECT_EQ(observed_uploads[first+n].first,0u);EXPECT_EQ(observed_uploads[first+n].second.size(),n<7?256u:208u);}
     EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);
     EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
     {std::lock_guard lock(errors_mutex);ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors.front().find("UNKNOWN persisted after one restricted pass"),std::string::npos);}
+}
+
+// These cases drive the real owner scheduler. No descriptor, export grant or
+// claim ticket is constructed by the fixture; callbacks only observe or pause.
+class FirstClaimScheduler final : public scheduler {
+    mutable std::mutex mutex_;std::deque<std::function<void()>> jobs_;bool stopped_=false;
+    static thread_local const FirstClaimScheduler* current_;
+public:
+    void invoke(std::function<void()>&& job)override {std::lock_guard lock(mutex_);if(stopped_)return;
+        if(jobs_.size()>=256)throw db_error("first-claim fixture scheduler capacity");jobs_.push_back(std::move(job));}
+    bool is_on_thread()const noexcept override{return current_==this;}
+    bool is_same_as(const scheduler* other)const noexcept override{return other==this;}
+    bool can_invoke()const noexcept override{std::lock_guard lock(mutex_);return !stopped_;}
+    bool run_one(){std::function<void()> job;{std::lock_guard lock(mutex_);if(jobs_.empty())return false;job=std::move(jobs_.front());jobs_.pop_front();}
+        struct Restore{const FirstClaimScheduler* old;~Restore(){current_=old;}} restore{current_};current_=this;job();return true;}
+    void discard(){std::deque<std::function<void()>> old;{std::lock_guard lock(mutex_);old.swap(jobs_);}}
+    void shutdown()override{std::deque<std::function<void()>> old;{std::lock_guard lock(mutex_);stopped_=true;old.swap(jobs_);}}
+};
+thread_local const FirstClaimScheduler* FirstClaimScheduler::current_=nullptr;
+struct FirstClaimAckGate {
+    std::mutex mutex;std::condition_variable changed;bool released=false,timed_out=false;
+    std::atomic<unsigned> started{0},finished{0};
+    void wait(){++started;std::unique_lock lock(mutex);changed.notify_all();
+        if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
+    void release(){std::lock_guard lock(mutex);released=true;changed.notify_all();}
+    bool timedOut(){std::lock_guard lock(mutex);return timed_out;}
+};
+struct FirstClaimWriterHold {
+    std::mutex mutex;std::condition_variable changed;bool entered=false,released=false,timed_out=false,admission_failed=false;std::thread worker;
+    explicit FirstClaimWriterHold(lattice_db& owner){auto* db=detail::canonical_writer_custody_test_access::fault_handle(owner.db());
+        worker=std::thread([this,db]{auto* m=sqlite3_db_mutex(db);const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+            while(m&&sqlite3_mutex_try(m)!=SQLITE_OK){if(std::chrono::steady_clock::now()>=deadline){m=nullptr;break;}std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+            if(!m){std::lock_guard lock(mutex);admission_failed=true;changed.notify_all();return;}
+            {std::unique_lock lock(mutex);entered=true;changed.notify_all();if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
+            sqlite3_mutex_leave(m);});
+        std::unique_lock lock(mutex);if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return entered||admission_failed;})||!entered){
+            released=true;changed.notify_all();lock.unlock();worker.join();throw db_error("first-claim fixture writer admission timeout");}}
+    void release(){{std::lock_guard lock(mutex);released=true;changed.notify_all();}if(worker.joinable())worker.join();}
+    ~FirstClaimWriterHold(){release();}
+};
+thread_local std::function<void()> first_claim_committed_action;
+void first_claim_committed(){if(first_claim_committed_action)first_claim_committed_action();}
+class RecoveryRestrictedFirstClaim : public RecoveryReceiverController {
+protected:
+    std::shared_ptr<FirstClaimScheduler> manual=std::make_shared<FirstClaimScheduler>();
+    std::vector<std::shared_ptr<FirstClaimAckGate>> ack_gates;
+    std::shared_ptr<FirstClaimAckGate> restricted_ack;
+    std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> previous_ack;
+    void(*previous_claim)()=nullptr;
+    std::function<void()> previous_claim_action;
+    std::unique_ptr<FirstClaimWriterHold> writer_hold;
+    std::vector<std::string> mixed_ids;
+    std::vector<std::vector<database::row_t>> committed_claims;
+    std::vector<int64_t> committed_sequences;
+    Snapshot phase4_snapshot,committed_snapshot;
+    size_t restricted_begin=0,phase4_publications=0;bool park_first=false;
+    void SetUp()override{RecoveryReceiverController::SetUp();previous_ack=detail::sync_background_test_hooks::ack;
+        previous_claim=detail::recovery_export_test_hooks::after_claim_commit;previous_claim_action=std::move(first_claim_committed_action);}
+    std::shared_ptr<FirstClaimAckGate> install_ack_gate(){auto gate=std::make_shared<FirstClaimAckGate>();ack_gates.push_back(gate);
+        auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();hook->before_expiry=[gate]{gate->wait();};
+        hook->completed=[gate]{++gate->finished;};detail::sync_background_test_hooks::ack=std::move(hook);return gate;}
+    template<class F> bool drive(F predicate){const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;manual->run_one();if(predicate())return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));}return predicate();}
+    template<class F> bool observe(F predicate){const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(std::chrono::steady_clock::now()<end){if(predicate())return true;std::this_thread::sleep_for(std::chrono::milliseconds(1));}return predicate();}
+    void open_manual_receiver(){swift_configuration config((container/"store.sqlite").string(),manual);config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+        continuous_result result;
+#if LATTICE_HAS_FRT
+        receiver_ref.reset(swift_lattice_ref::create_continuous(config,{controller_schema()},policy,result));
+#else
+        receiver_ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create_continuous(config,{controller_schema()},policy,result));
+#endif
+        if(result.phase()!=2||result.has_error())throw db_error("first-claim actual continuous factory failed");
+        receiver=swift_lattice_ref::shared_for_lattice(receiver_ref->get());ASSERT_TRUE(receiver);
+        if(auto* notifier=instance_registry::instance().get_or_create_notifier(receiver->config().path))notifier->stop_listening();}
+    std::vector<database::row_t> claims(){return receiver->db().query("SELECT channel,original,first_export FROM _lattice_obligation_entry ORDER BY channel,original");}
+    int64_t first_claim(const std::string& channel,const std::string& original){const auto rows=receiver->db().query(
+        "SELECT first_export AS n FROM _lattice_obligation_entry WHERE channel=CAST(? AS BLOB) AND actual_original=CAST(? AS BLOB)",{channel,original});
+        if(rows.size()!=1)throw db_error("first-claim fixture original missing");return std::get<int64_t>(rows.front().at("n"));}
+    Snapshot snapshot(){auto result=RecoveryReceiverController::snapshot();
+        const auto tables=receiver->db().query("SELECT name FROM sqlite_schema WHERE type='table' AND name GLOB '_lattice_*' ORDER BY name LIMIT 129");
+        if(tables.size()>128)throw db_error("first-claim fixture state-table bound");
+        for(const auto& row:tables){const auto& name=std::get<std::string>(row.at("name"));
+            if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';}))
+                throw db_error("first-claim fixture state-table identity");
+            result[name]=receiver->db().query("SELECT * FROM \""+name+"\"");}
+        result["sqlite_schema"]=receiver->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");return result;}
+    void prepare_mixed(){
+        configure(2,false);open_manual_receiver();const auto initial_ack=install_ack_gate();connect();
+        ASSERT_TRUE(drive([&]{return phase()==0;}));seed_local(1,700);const auto claimed=originals();ASSERT_EQ(claimed.size(),1u);
+        ASSERT_TRUE(drive([&]{return held_originals(0)==claimed&&held_originals(1)==claimed;}));
+        ASSERT_TRUE(observe([&]{return initial_ack->started.load()==2;}));
+        // Both real sends are UNKNOWN at the source. Retire volatile route
+        // ownership, preserve the same actual database and its durable claims.
+        // The real destructor shuts down a borrowed scheduler off-thread.
+        // Retire on this actual scheduler; never clear/rearm its stopped bit.
+        const auto retired=std::make_shared<std::atomic<bool>>(false);
+        manual->invoke([this,retired]{synchronizers.clear();retired->store(true);});
+        ASSERT_TRUE(drive([&]{return retired->load();}));ASSERT_TRUE(manual->can_invoke());
+        manual->discard();initial_ack->release();
+        ASSERT_TRUE(observe([&]{return initial_ack->finished.load()==2;}));
+        ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL"),2);
+        seed_local(1,701);mixed_ids=originals();ASSERT_EQ(mixed_ids.size(),2u);
+        ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NULL"),2);
+        ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+        held_uploads.clear();restricted_begin=observed_uploads.size();restricted_ack=install_ack_gate();
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this](const char* stage){
+            if(std::strcmp(stage,"reconciliation-pending")!=0||phase()!=4)return;
+            ++phase4_publications;phase4_snapshot=snapshot();
+            first_claim_committed_action=[this]{
+                committed_claims.push_back(claims());committed_sequences.push_back(scalar(*receiver,"SELECT export_sequence AS n FROM _lattice_obligation_store"));
+                if(committed_claims.size()==1){committed_snapshot=snapshot();if(park_first)writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);}
+            };
+            detail::recovery_export_test_hooks::after_claim_commit=first_claim_committed;
+        });
+        connect();
+    }
+    void TearDown()override{
+        if(writer_hold){writer_hold->release();EXPECT_FALSE(writer_hold->timed_out);writer_hold.reset();}
+        synchronizers.clear();manual->shutdown();for(const auto& gate:ack_gates)gate->release();
+        for(const auto& gate:ack_gates){EXPECT_TRUE(observe([&]{return gate->finished.load()==gate->started.load();}));EXPECT_FALSE(gate->timedOut());}
+        detail::recovery_export_test_hooks::after_claim_commit=previous_claim;first_claim_committed_action=std::move(previous_claim_action);
+        detail::sync_background_test_hooks::ack=previous_ack;probe.reset();RecoveryReceiverController::TearDown();
+    }
+};
+TEST_F(RecoveryRestrictedFirstClaim, EarlierActualRouteClaimSurvivesLaterSameDescriptorSharedOriginalHandoff) {
+    ASSERT_NO_FATAL_FAILURE(prepare_mixed());
+    ASSERT_TRUE(drive([&]{return observed_originals(0,restricted_begin)==mixed_ids&&observed_originals(1,restricted_begin)==mixed_ids;}));
+    ASSERT_EQ(phase4_publications,1u);ASSERT_EQ(committed_claims.size(),2u);ASSERT_EQ(committed_sequences.size(),2u);
+    ASSERT_EQ(observed_uploads.size()-restricted_begin,2u);
+    EXPECT_NE(observed_uploads[restricted_begin].first,observed_uploads[restricted_begin+1].first);
+    // Whichever actual route ran first is A. Its claim covers both matching
+    // contributions; B allocates later tickets while preserving those claims.
+    EXPECT_EQ(committed_claims[0],committed_claims[1]);EXPECT_GT(committed_sequences[1],committed_sequences[0]);
+    for(const auto& peer:peers)EXPECT_LT(first_claim(peer.channel,mixed_ids[1]),committed_sequences[1]);
+    size_t absent=0;for(const auto& row:phase4_snapshot.at("_lattice_obligation_entry"))if(std::holds_alternative<std::nullptr_t>(row.at("first_export")))++absent;
+    EXPECT_EQ(absent,2u);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog"),phase4_snapshot.at("AuditLog"));
+    EXPECT_FALSE(has_error());
+}
+TEST_F(RecoveryRestrictedFirstClaim, AuditValidMatchingContributionFirstClaimRewriteAfterCommitRefusesBusyHandoff) {
+    park_first=true;ASSERT_NO_FATAL_FAILURE(prepare_mixed());
+    ASSERT_TRUE(drive([&]{return bool(writer_hold);}));ASSERT_EQ(phase4_publications,1u);ASSERT_EQ(committed_claims.size(),1u);
+    EXPECT_EQ(observed_uploads.size(),restricted_begin);EXPECT_EQ(restricted_ack->started.load(),0u);
+    EXPECT_EQ(synchronizers[0]->get_progress().pending_upload+synchronizers[1]->get_progress().pending_upload,2);
+    // The run_one that returned has actually parked the committed frame on
+    // initial BUSY. No scheduler callback can run between release and fault.
+    writer_hold->release();EXPECT_FALSE(writer_hold->timed_out);
+    const auto target_channel=peers[1].channel;const auto original=mixed_ids[1];
+    const auto before_claim=first_claim(target_channel,original);const auto older_claim=first_claim(target_channel,mixed_ids[0]);
+    ASSERT_GT(older_claim,0);ASSERT_LT(older_claim,before_claim);
+    unsigned audited=0;
+    const auto audit=[&]{return detail::recovery_writer_access::install(receiver,[&](database&){
+        const auto inventory=detail::recovery_local_producer_adapter::export_inventory_for_owned_write(receiver);
+        detail::recovery_obligation_store journal(receiver,inventory.limits.obligations,inventory.limits.installations);journal.audit();++audited;
+    });};
+    const auto before_audit=audit();ASSERT_EQ(before_audit.state,detail::recovery_install_state::committed);ASSERT_FALSE(before_audit.primary_error);
+    ASSERT_EQ(snapshot(),committed_snapshot);
+    // Explicit external corruption fixture. It neither replaces the actual
+    // owner's authorizer nor fabricates a continuous claim/controller token.
+    // The private scheduler keeps every actual handoff stopped until closure.
+    sqlite3* raw_fault=nullptr;
+    const auto opened=sqlite3_open_v2(receiver->config().path.c_str(),&raw_fault,SQLITE_OPEN_READWRITE|SQLITE_OPEN_NOMUTEX,nullptr);
+    std::unique_ptr<sqlite3,decltype(&sqlite3_close)> fault_db(raw_fault,sqlite3_close);ASSERT_EQ(opened,SQLITE_OK);
+    ASSERT_EQ(sqlite3_busy_timeout(fault_db.get(),100),SQLITE_OK);
+    sqlite3_stmt* raw_update=nullptr;
+    const auto prepared=sqlite3_prepare_v2(fault_db.get(),"UPDATE _lattice_obligation_entry SET first_export=? WHERE channel=? AND actual_original=?",-1,&raw_update,nullptr);
+    std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> update(raw_update,sqlite3_finalize);ASSERT_EQ(prepared,SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_int64(update.get(),1,older_claim),SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(update.get(),2,target_channel.data(),static_cast<int>(target_channel.size()),SQLITE_TRANSIENT),SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(update.get(),3,original.data(),static_cast<int>(original.size()),SQLITE_TRANSIENT),SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(update.get()),SQLITE_DONE);ASSERT_EQ(sqlite3_changes(fault_db.get()),1);
+    ASSERT_EQ(sqlite3_finalize(update.release()),SQLITE_OK);ASSERT_EQ(sqlite3_close(fault_db.release()),SQLITE_OK);
+    const auto after_audit=audit();ASSERT_EQ(after_audit.state,detail::recovery_install_state::committed);ASSERT_FALSE(after_audit.primary_error);ASSERT_EQ(audited,2u);
+    auto expected=committed_snapshot;size_t changed=0;
+    for(auto& row:expected.at("_lattice_obligation_entry")){
+        const auto& channel=std::get<std::vector<uint8_t>>(row.at("channel"));const auto& id=std::get<std::vector<uint8_t>>(row.at("actual_original"));
+        if(std::string(channel.begin(),channel.end())==target_channel&&std::string(id.begin(),id.end())==original){row["first_export"]=older_claim;++changed;}}
+    ASSERT_EQ(changed,1u);ASSERT_EQ(snapshot(),expected);
+    ASSERT_TRUE(drive([&]{return has_error();}));
+    {std::lock_guard lock(errors_mutex);EXPECT_TRUE(std::any_of(errors.begin(),errors.end(),[](const auto& error){return error.find("restricted handoff validated first claim changed")!=std::string::npos;}));}
+    for(size_t n=0;n<64&&pump();++n){}
+    EXPECT_EQ(observed_uploads.size(),restricted_begin);EXPECT_EQ(restricted_ack->started.load(),0u);
+    EXPECT_EQ(snapshot(),expected);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
 }
 
 }

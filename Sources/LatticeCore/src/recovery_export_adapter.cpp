@@ -412,6 +412,7 @@ committed_export_frame& committed_export_frame::operator=(committed_export_frame
     upload_view_=std::move(other.upload_view_);
     reconciliation_=std::move(other.reconciliation_);
     owner_=std::move(other.owner_);claims_=std::move(other.claims_);scopes_=std::move(other.scopes_);
+    restricted_first_claims_=std::move(other.restricted_first_claims_);
     limits_=other.limits_;entries_=std::move(other.entries_);message_=std::move(other.message_);
     physical_generation_=std::exchange(other.physical_generation_,0);
     consumed_=std::exchange(other.consumed_,true);
@@ -630,8 +631,25 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         std::vector<recovery_obligation_scope> expected_scopes;
         for(size_t i=0;i<by_scope.size();++i)if(!by_scope[i].empty()){
             const auto& address=inventory.scopes[i].contribution.address;
+            std::vector<recovery_obligation_entry> before_claim;
+            if(frame.reconciliation_)for(const auto& id:by_scope[i]){
+                const auto entry=journal.find(address,id);if(!entry)refuse("restricted pre-claim original missing");
+                before_claim.push_back(*entry);
+            }
             frame.claims_.push_back(journal.claim_export(address,by_scope[i]));
-            for(const auto& id:by_scope[i]){const auto entry=journal.find(address,id);if(!entry)refuse("export claimed original missing");expected_entries.emplace_back(address,*entry);}
+            if(frame.reconciliation_){
+                const auto& ticket=frame.claims_.back();
+                if(ticket.canonical_original_ids.size()!=before_claim.size())refuse("restricted claim member count changed");
+                std::vector<int64_t> first_claims;first_claims.reserve(before_claim.size());
+                for(size_t n=0;n<before_claim.size();++n){auto expected=std::move(before_claim[n]);
+                    if(expected.canonical_original_id!=ticket.canonical_original_ids[n])refuse("restricted claim member order changed");
+                    if(!expected.first_export_claim)expected.first_export_claim=ticket.sequence;
+                    if(journal.find(address,expected.canonical_original_id)!=std::optional<recovery_obligation_entry>{expected})
+                        refuse("restricted claim changed validated preimage");
+                    first_claims.push_back(*expected.first_export_claim);expected_entries.emplace_back(address,std::move(expected));
+                }
+                frame.restricted_first_claims_.push_back(std::move(first_claims));
+            }else for(const auto& id:by_scope[i]){const auto entry=journal.find(address,id);if(!entry)refuse("export claimed original missing");expected_entries.emplace_back(address,*entry);}
             const auto scope=journal.read(address.channel);if(!scope)refuse("export claimed scope missing");expected_scopes.push_back(*scope);
             if(recovery_export_test_hooks::after_contribution_claim)recovery_export_test_hooks::after_contribution_claim(i);
         }
@@ -745,18 +763,26 @@ void recovery_export_adapter::revalidate_claimed_frame(const committed_export_fr
             if(grant.selected_.empty()||grant.selected_.size()!=frame.entries_.size()||grant.selected_.size()>grant.originals_.size()||
                !std::equal(grant.selected_.begin(),grant.selected_.end(),grant.originals_.begin()))
                 refuse("restricted handoff selected prefix differs");
-            const recovery_obligation_export_ticket* issued=nullptr;
-            for(const auto& claim:frame.claims_)if(claim.address==grant.address_){
-                if(issued)refuse("restricted handoff has duplicate contribution claim");issued=&claim;
+            if(frame.restricted_first_claims_.size()!=frame.claims_.size())refuse("restricted handoff claim witness count differs");
+            size_t issued=frame.claims_.size();
+            for(size_t i=0;i<frame.claims_.size();++i){const auto& claim=frame.claims_[i];const auto& first=frame.restricted_first_claims_[i];
+                if(first.size()!=claim.canonical_original_ids.size())refuse("restricted handoff claim witness members differ");
+                for(size_t n=0;n<first.size();++n){const auto entry=journal.find(claim.address,claim.canonical_original_ids[n]);
+                    if(first[n]<=0||!entry||entry->first_export_claim!=std::optional<int64_t>{first[n]})
+                        refuse("restricted handoff validated first claim changed");}
+                if(claim.address==grant.address_){
+                    if(issued!=frame.claims_.size())refuse("restricted handoff has duplicate contribution claim");issued=i;
+                }
             }
-            if(!issued)refuse("restricted handoff lacks exact contribution claim");
-            const std::set<std::string> issued_ids(issued->canonical_original_ids.begin(),issued->canonical_original_ids.end());
+            if(issued==frame.claims_.size())refuse("restricted handoff lacks exact contribution claim");
+            const auto& issued_ids=frame.claims_[issued].canonical_original_ids;
             for(size_t n=0;n<grant.selected_.size();++n){const auto actual=journal.find(grant.address_,grant.selected_[n]);auto expected=grant.requested_[n];
                 if(!actual)refuse("restricted handoff original disappeared");
-                if(!expected.first_export_claim){
-                    if(!issued_ids.count(grant.selected_[n]))refuse("restricted handoff original lacks issued claim");
-                    expected.first_export_claim=issued->sequence;
-                }
+                const auto member=std::find(issued_ids.begin(),issued_ids.end(),grant.selected_[n]);
+                if(member==issued_ids.end())refuse("restricted handoff original lacks issued claim");
+                const auto first=frame.restricted_first_claims_[issued][static_cast<size_t>(member-issued_ids.begin())];
+                if(expected.first_export_claim&&*expected.first_export_claim!=first)refuse("restricted handoff descriptor first claim differs");
+                expected.first_export_claim=first;
                 if(*actual!=expected||frame.entries_[n].id!=actual->record.audit_id||frame.entries_[n].global_id!=actual->record.original_id)
                     refuse("restricted handoff retained original changed");}
         }
@@ -800,6 +826,8 @@ size_t committed_export_frame::retained_metadata_bytes(size_t cap)const noexcept
     const auto text=[&](const std::string& value){add(value.capacity());add(1);};
     if(reconciliation_)add(reconciliation_->retained_bytes(cap));
     add(message_.data.capacity());add(claims_.capacity(),sizeof(recovery_obligation_export_ticket));
+    add(restricted_first_claims_.capacity(),sizeof(std::vector<int64_t>));
+    for(const auto& first:restricted_first_claims_)add(first.capacity(),sizeof(int64_t));
     for(const auto& claim:claims_){text(claim.address.channel);add(claim.canonical_original_ids.capacity(),sizeof(std::string));for(const auto& id:claim.canonical_original_ids)text(id);}
     add(scopes_.capacity(),sizeof(recovery_local_export_scope));
     for(const auto& scope:scopes_){

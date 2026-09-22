@@ -745,9 +745,18 @@ void recovery_export_adapter::revalidate_claimed_frame(const committed_export_fr
             if(grant.selected_.empty()||grant.selected_.size()!=frame.entries_.size()||grant.selected_.size()>grant.originals_.size()||
                !std::equal(grant.selected_.begin(),grant.selected_.end(),grant.originals_.begin()))
                 refuse("restricted handoff selected prefix differs");
+            const recovery_obligation_export_ticket* issued=nullptr;
+            for(const auto& claim:frame.claims_)if(claim.address==grant.address_){
+                if(issued)refuse("restricted handoff has duplicate contribution claim");issued=&claim;
+            }
+            if(!issued)refuse("restricted handoff lacks exact contribution claim");
+            const std::set<std::string> issued_ids(issued->canonical_original_ids.begin(),issued->canonical_original_ids.end());
             for(size_t n=0;n<grant.selected_.size();++n){const auto actual=journal.find(grant.address_,grant.selected_[n]);auto expected=grant.requested_[n];
                 if(!actual)refuse("restricted handoff original disappeared");
-                if(!expected.first_export_claim)expected.first_export_claim=actual->first_export_claim;
+                if(!expected.first_export_claim){
+                    if(!issued_ids.count(grant.selected_[n]))refuse("restricted handoff original lacks issued claim");
+                    expected.first_export_claim=issued->sequence;
+                }
                 if(*actual!=expected||frame.entries_[n].id!=actual->record.audit_id||frame.entries_[n].global_id!=actual->record.original_id)
                     refuse("restricted handoff retained original changed");}
         }

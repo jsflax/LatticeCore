@@ -2941,14 +2941,15 @@ bool synchronizer_base::upload_protected_entries(detail::sync_upload_continuatio
     const size_t chunk=std::min<size_t>(config_.chunk_size,1000);
     std::vector<int64_t> in_flight;
     {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& [id,n]:in_flight_ids_)in_flight.push_back(n);}
-    if(in_flight.size()>=2000) {
-        if(reconciling)return true; // Real earlier sends retain their ACK ownership.
+    if(in_flight.size()>=2000&&!reconciling) {
         if(!discovery_busy)return has_export_protection();
         const auto protected_store=try_has_export_protection();
         if(!protected_store){*discovery_busy=true;return false;}
         return *protected_store;
     }
-    const size_t count=std::min(chunk,2000-in_flight.size());
+    // A saturated restricted pass can still cancel/refreeze; those phase
+    // transitions do not acquire another send slot or release genuine ACKs.
+    const size_t count=in_flight.size()>=2000?0:std::min(chunk,2000-in_flight.size());
     std::optional<detail::recovery_export_preparation> result;
     if(reconciling) {
         result=detail::recovery_unknown_reconciliation::prepare(receiver_controller_,continuous_route_,source,

@@ -88,6 +88,7 @@ protected:
     continuous_policy policy;
     std::vector<std::string> requests,errors;std::mutex errors_mutex;
     std::deque<ControllerWire::Frame> held_uploads;
+    std::vector<std::pair<size_t,std::vector<std::string>>> observed_uploads;
     std::vector<std::shared_ptr<ControllerPause>> pauses;
     std::unique_ptr<detail::recovery_receiver_controller_test_access> probe;
     bool hold_second=false,drop_prepare=false,hold_uploads=true;size_t dropped=0,handled=0;
@@ -100,7 +101,7 @@ protected:
             {"readyProfile","bounded48MiBV1"},{"upload",{{"tables",json::array()},{"unlisted","allow"},{"maximumDeletes",256}}}};
     }
     relay_recovery_setup serve(size_t index) {
-        auto& peer=peers.at(index);auto config=json{{"mount",controller_uuid(3)},{"connection",uuid_t::generate().to_string()},
+        auto& peer=peers.at(index);auto config=json{{"mount",controller_uuid(3)},{"connection",::lattice::uuid_t::generate().to_string()},
             {"channel",peer.channel},{"authenticatedUserID",controller_uuid(4)},
             {"peer",{{"replicaID","registered-controller"},{"receiverIncarnation",controller_uuid(20)},{"channelIncarnation",controller_uuid(30+index)}}}};
         auto setup=source_ref->open_relay_recovery_setup(source_policy(peer.ns).dump(),config.dump(),new ControllerServerRoute{peer.live},ControllerServerRoute::current,ControllerServerRoute::destroy);
@@ -164,6 +165,10 @@ protected:
             for(const auto& entry:event->audit_logs)result.push_back(entry.global_id);
         }return result;
     }
+    std::vector<std::string> observed_originals(size_t peer=0,size_t from=0) {
+        std::vector<std::string> result;for(size_t n=from;n<observed_uploads.size();++n)if(observed_uploads[n].first==peer)
+            result.insert(result.end(),observed_uploads[n].second.begin(),observed_uploads[n].second.end());return result;
+    }
     void seed_local(unsigned count,unsigned first=200) {
         receiver->begin_transaction();try {for(unsigned n=0;n<count;++n){
             swift_dynamic_object row;row.table_name="ControllerRow";row.properties=controller_schema().properties;
@@ -202,9 +207,13 @@ protected:
             if(drop_prepare&&control["operation"]=="prepare"&&dropped++==0)return true;
             peer.physical.trigger_on_message(transport_message::from_string(result.wire()));
         } else if(control.contains("auditLog")) {
+            if(observed_uploads.size()>=64)throw db_error("fixture observed upload bound");
+            const auto event=server_sent_event::from_json(frame->raw);if(!event||event->event_type!=server_sent_event::type::audit_log)throw db_error("fixture invalid actual upload");
+            std::vector<std::string> ids;for(const auto& entry:event->audit_logs)ids.push_back(entry.global_id);
+            observed_uploads.emplace_back(index,std::move(ids));
             if(hold_uploads){if(held_uploads.size()>=32)throw db_error("fixture held upload bound");held_uploads.push_back(std::move(*frame));return true;}
             auto result=peer.setup.receive(frame->raw);if(result.status_code()!=1)throw db_error("actual source upload refused");
-            auto ids=result.take_ids();peer.physical.trigger_on_message(transport_message::from_string(server_sent_event::make_ack(ids).to_json()));
+            auto accepted_ids=result.take_ids();peer.physical.trigger_on_message(transport_message::from_string(server_sent_event::make_ack(accepted_ids).to_json()));
         }
         return true;
     }
@@ -379,6 +388,113 @@ TEST_F(RecoveryReceiverController, EnabledUniqueOriginalCapacityCountsSharedRows
     EXPECT_THROW(insert(*receiver,controller_uuid(191),"one beyond the explicit profile"),db_error);
     EXPECT_EQ(snapshot(),before);
     EXPECT_EQ(scalar(*receiver,"SELECT max_records AS n FROM _lattice_obligation_store"),20000);
+}
+
+TEST_F(RecoveryReceiverController, LegacyAckedUnknownResendsEveryOriginalAcrossNegotiatedPagesAndResumes) {
+    configure();upload_chunk=2;connect();ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(5);
+    const auto ids=originals();ASSERT_EQ(ids.size(),5u);ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    const auto first=observed_uploads.size();ASSERT_EQ(first,3u);held_uploads.clear();hold_uploads=false;
+    // A current legacy delivery ACK carries no canonical receipt. Even with
+    // every marker=1, the actual authoritative source still reports UNKNOWN.
+    legacy_ack(0,ids);
+    ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==5;}));
+    EXPECT_EQ(observed_originals(0,first),ids);EXPECT_EQ(observed_uploads.size()-first,3u);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),5);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),5);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),5);
+    EXPECT_FALSE(has_error());EXPECT_NO_THROW(insert(*receiver,controller_uuid(299),"writes resumed"));
+}
+TEST_F(RecoveryReceiverController, UnchangedUnknownRefreezesOnceWithoutAckAndDrainRemainsPending) {
+    configure();upload_chunk=2;connect();ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(5);
+    const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    const auto first=observed_uploads.size();held_uploads.clear();legacy_ack(0,ids);
+    ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);
+    {std::lock_guard lock(errors_mutex);ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors.front().find("UNKNOWN persisted after one restricted pass"),std::string::npos);}
+    EXPECT_EQ(held_originals(),ids);EXPECT_EQ(observed_originals(0,first),ids);EXPECT_EQ(observed_uploads.size()-first,3u);
+    EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),3);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+    const auto closed=snapshot();const auto frames=observed_uploads;
+    for(unsigned n=0;n<3;++n){EXPECT_NO_THROW(synchronizers[0]->sync_now());
+        const auto result=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::milliseconds(100));
+        EXPECT_EQ(result.state,sync_drain_state::deadline_pending);EXPECT_FALSE(result.error);EXPECT_TRUE(result.discovery_pending);
+        for(unsigned step=0;step<128&&pump();++step){}EXPECT_EQ(observed_uploads,frames);EXPECT_EQ(snapshot(),closed);
+    }
+    EXPECT_THROW(insert(*receiver,controller_uuid(299),"must remain closed"),db_error);
+}
+TEST_F(RecoveryReceiverController, LostKnownReconciliationCancelCommitReopensRestrictedPhaseWithOriginalClaims) {
+    configure();std::atomic<bool> stop{false};
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[&](const char* stage){
+        if(stop&&std::strcmp(stage,"reconcile-cancel-committed")==0)throw db_error("fixture lost known cancellation result");});
+    connect();ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(3);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    stop=true;held_uploads.clear();legacy_ack(0,ids);ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),4);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NOT NULL"),3);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+    const auto framing=receiver->db().query("SELECT request_frame,manifest_frame FROM _lattice_recovery_request");
+    close_receiver();probe.reset();open_receiver();ASSERT_EQ(phase(),4);
+    EXPECT_EQ(receiver->db().query("SELECT request_frame,manifest_frame FROM _lattice_recovery_request"),framing);
+    hold_uploads=false;connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==3;}));
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),3);EXPECT_FALSE(has_error());
+}
+TEST_F(RecoveryReceiverController, ReconciliationCancelCommitDenialPreservesWholeFrozenCohortAndReopenRecovers) {
+    configure();std::atomic<bool> deny{false};std::atomic<unsigned> hits{0};std::mutex before_mutex;Snapshot before;
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[&](const char* stage)->std::shared_ptr<void>{
+        if(!deny||std::strcmp(stage,"reconcile-cancel")!=0)return {};{std::lock_guard lock(before_mutex);before=snapshot();}
+        return std::make_shared<ControllerCommitFault>(receiver.get(),hits);});
+    connect();ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(2);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");deny=true;held_uploads.clear();legacy_ack(0,ids);
+    ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);EXPECT_EQ(hits.load(),1u);
+    {std::lock_guard lock(before_mutex);ASSERT_FALSE(before.empty());EXPECT_EQ(snapshot(),before);}
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    close_receiver();probe.reset();open_receiver();hold_uploads=false;connect();
+    ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==2;}));
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);EXPECT_FALSE(has_error());
+}
+TEST_F(RecoveryReceiverController, RefreezeCommitDenialPreservesRestrictedPhaseAndReopenReplaysExactOriginals) {
+    configure();std::atomic<bool> deny{false};std::atomic<unsigned> hits{0};std::mutex before_mutex;Snapshot before;
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[&](const char* stage)->std::shared_ptr<void>{
+        if(!deny||std::strcmp(stage,"reconcile-refreeze")!=0)return {};{std::lock_guard lock(before_mutex);before=snapshot();}
+        return std::make_shared<ControllerCommitFault>(receiver.get(),hits);});
+    connect();ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(2);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");deny=true;held_uploads.clear();legacy_ack(0,ids);
+    ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),4);EXPECT_EQ(hits.load(),1u);
+    {std::lock_guard lock(before_mutex);ASSERT_FALSE(before.empty());EXPECT_EQ(snapshot(),before);}
+    EXPECT_EQ(held_originals(),ids);EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    close_receiver();probe.reset();open_receiver();hold_uploads=false;connect();
+    ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==2;}));
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);EXPECT_FALSE(has_error());
+}
+
+TEST_F(RecoveryReceiverController, FullTwoThousandSendWindowRefreezesWithoutWaitingForLegacyAck) {
+    configure(1,false);policy.records=2048;policy.stamps=2048;policy.frozen_entries=2048;
+    policy.journal_bytes=8388608;policy.frozen_bytes=8388608;policy.producer_bytes=16777216;open_receiver();
+    connect();ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(2000,1000);
+    const auto ids=originals();ASSERT_EQ(ids.size(),2000u);ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");const auto first=observed_uploads.size();
+    held_uploads.clear();legacy_ack(0,ids);
+    // The original fixture's five-second observation bound is shorter than
+    // the ordinary ten-second ACK timeout. Only transition-only count0 work
+    // can reach this next verified Q while every restricted send stays live.
+    ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);
+    EXPECT_EQ(synchronizers[0]->get_progress().pending_upload,2000);
+    EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),3);
+    EXPECT_EQ(observed_originals(0,first),ids);EXPECT_EQ(observed_uploads.size()-first,2u);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    {std::lock_guard lock(errors_mutex);ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors.front().find("UNKNOWN persisted after one restricted pass"),std::string::npos);}
 }
 
 }

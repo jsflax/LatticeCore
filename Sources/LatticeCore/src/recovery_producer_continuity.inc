@@ -50,20 +50,39 @@ void require_continuous_path_unowned(const std::string& value) {
         refuse("continuous container requires retained owner factory");
 }
 void recovery_continuous_producer::classify_open(database& writer,bool admitted,bool writable) {
-    // Called once on an unpublished connection, before any ordinary pragma or
-    // schema effects. The reserved-path check already precedes writable open.
+    // Writable open is unpublished, before ordinary pragma/schema effects.
+    // Deferred read-only classification owns this connection's SQLite mutex.
+    // The reserved-path check already precedes ordinary writable open.
     // There is NO online enrollment/upgrade of existing files, so an ordinary
     // legacy writer cannot acquire this profile later. Preserve its hot-path
-    // mutex and transaction behavior; this bit is denial-only, never proof.
+    // mutex and transaction behavior; this state is denial-only, never proof.
     discovery_statement query(writer.internal_handle(),"SELECT 1 FROM main.sqlite_schema WHERE name='_lattice_producer_continuity' LIMIT 1");
     const bool present=query.row();
     bool reserved=false;
     try {require_continuous_path_unowned(writer.path_);}catch(const db_error&){reserved=true;}
-    writer.continuous_file_=admitted||present||reserved;
-    if(writable&&writer.continuous_file_&&!admitted)refuse("continuous file requires retained constructor custody");
+    const bool protected_file=admitted||present||reserved;
+    // Publish only after every read/path check succeeds. A failed probe leaves
+    // unknown so a subsequent guarded boundary retries rather than assuming
+    // absence. No read-only constructor/keeper query needs this probe.
+    writer.continuous_file_.store(protected_file?database::continuous_classification::protected_file:
+        database::continuous_classification::ordinary,std::memory_order_release);
+    if(writable&&protected_file&&!admitted)refuse("continuous file requires retained constructor custody");
 }
 void recovery_continuous_producer::require_no_continuous_export(database& writer) {
-    if(writer.continuous_file_)refuse("continuous store refuses unclaimed legacy export/raw access");
+    using classification=database::continuous_classification;
+    auto known=writer.continuous_file_.load(std::memory_order_acquire);
+    if(known==classification::unknown) {
+        auto* db=writer.internal_handle();
+        if(!db)refuse("continuous classification requires a live physical connection");
+        auto* mutex=sqlite3_db_mutex(db);sqlite3_mutex_enter(mutex);
+        struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+        known=writer.continuous_file_.load(std::memory_order_acquire);
+        if(known==classification::unknown) {
+            classify_open(writer,false,false);
+            known=writer.continuous_file_.load(std::memory_order_acquire);
+        }
+    }
+    if(known!=classification::ordinary)refuse("continuous store refuses unclaimed legacy export/raw access");
 }
 void require_continuous_legacy_export_absent(database& writer){recovery_continuous_producer::require_no_continuous_export(writer);}
 void require_continuous_raw_handle_absent(database& writer){recovery_continuous_producer::require_no_continuous_export(writer);}

@@ -334,7 +334,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         throw db_error("Failed to initialize sqlite-vec extension");
     }
 
-    detail::recovery_continuous_producer::classify_open(*this,static_cast<bool>(key.continuous_),mode==open_mode::read_write);
+    if(mode==open_mode::read_write)
+        detail::recovery_continuous_producer::classify_open(*this,static_cast<bool>(key.continuous_),true);
 
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
@@ -581,7 +582,7 @@ database::database(database&& other) noexcept
     canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
     canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
     suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
-    continuous_file_ = std::exchange(other.continuous_file_,false);
+    continuous_file_.store(other.continuous_file_.exchange(continuous_classification::unknown));
     txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
     local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
     local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
@@ -617,7 +618,7 @@ database& database::operator=(database&& other) noexcept {
         canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
         canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
         suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
-        continuous_file_ = std::exchange(other.continuous_file_,false);
+        continuous_file_.store(other.continuous_file_.exchange(continuous_classification::unknown));
         txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
         local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
         local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);

@@ -128,9 +128,11 @@ class database {
     // mutate the schema it just refused. This policy follows the physical
     // handle through moves, even before producer callback custody exists.
     bool suppress_destructor_optimize_ = false;
-    // Closed constructor fact for the fresh-only continuous profile. Never
-    // grants producer/source authority; it only refuses raw/legacy exports.
-    bool continuous_file_ = false;
+    // Writable constructors classify eagerly. Read-only internal/keeper paths
+    // defer until a guarded raw/legacy export boundary. Unknown never means
+    // absence; this denial-only state cannot grant producer/source authority.
+    enum class continuous_classification { unknown, ordinary, protected_file };
+    std::atomic<continuous_classification> continuous_file_{continuous_classification::unknown};
     bool txn_hooks_external_ = false;
     void set_txn_hooks_owned_(std::function<void()>, std::function<void()>);
     void rebind_txn_hooks_owned_() noexcept;

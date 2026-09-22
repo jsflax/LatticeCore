@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/recovery_producer_continuity.hpp"
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include <deque>
@@ -574,5 +575,115 @@ TEST_F(RecoveryProducerContinuity, ActualRouteFinalSelectedStampReadFailureRolls
     senders.clear();queue->drain();
     connect();const auto batches=factory->wires.back()->audit_batches();ASSERT_EQ(batches.size(),1u);EXPECT_EQ(batches[0].size(),1u);
     auto done=freeze();ASSERT_TRUE(done.unsent);EXPECT_TRUE(done.unsent->canonical_originals().empty());
+}
+
+namespace {
+struct readonly_classification_fault {
+    sqlite3* handle;
+    size_t denied=0;
+    explicit readonly_classification_fault(database& db):handle(canonical_writer_custody_test_access::fault_handle(db)) {
+        sqlite3_set_authorizer(handle,[](void* context,int action,const char*,const char*,const char*,const char*)noexcept {
+            auto& self=*static_cast<readonly_classification_fault*>(context);
+            if(action==SQLITE_SELECT){++self.denied;return SQLITE_DENY;}return SQLITE_OK;
+        },this);
+    }
+    ~readonly_classification_fault(){sqlite3_set_authorizer(handle,nullptr,nullptr);}
+};
+}
+TEST_F(RecoveryProducerContinuity, OrdinaryReadOnlyFirstRawBoundaryClassifiesOnceAfterInternalReads) {
+    TempDB ordinary{"continuous_readonly_ordinary"};
+    lattice_db writer(ordinary.str());writer.add(ContinuousSharedRow{"ordinary"});
+    database reader(ordinary.str(),database::open_mode::read_only);
+    EXPECT_EQ(number(reader,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
+    const auto before=database::thread_statement_count();
+    ASSERT_NE(reader.handle(),nullptr);
+    EXPECT_EQ(database::thread_statement_count()-before,1u);
+    const auto classified=database::thread_statement_count();
+    ASSERT_NE(reader.handle(),nullptr);
+    EXPECT_EQ(database::thread_statement_count(),classified);
+    EXPECT_EQ(query_audit_log(reader).size(),1u);
+    EXPECT_EQ(events_after(reader,std::nullopt).size(),1u);
+}
+TEST_F(RecoveryProducerContinuity, ReadOnlyProtectedStoreAllowsReadsButRefusesEveryLegacyBoundary) {
+    open();owner->add(ContinuousSharedRow{"protected"});const auto before=snapshot();
+    database reader(config().path,database::open_mode::read_only);
+    EXPECT_EQ(number(reader,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
+    const auto count=database::thread_statement_count();
+    EXPECT_THROW(reader.handle(),db_error);
+    EXPECT_EQ(database::thread_statement_count()-count,1u);
+    const auto classified=database::thread_statement_count();
+    EXPECT_THROW(query_audit_log(reader),db_error);
+    EXPECT_THROW(query_audit_log_for_sync(reader,policy.routes[0].sync_id),db_error);
+    EXPECT_THROW(events_after(reader,std::nullopt),db_error);
+    EXPECT_EQ(database::thread_statement_count(),classified);
+    EXPECT_EQ(snapshot(),before);
+}
+TEST_F(RecoveryProducerContinuity, ReadOnlyUnknownAndKnownClassificationFollowPhysicalMoves) {
+    TempDB ordinary{"continuous_readonly_move"};
+    lattice_db writer(ordinary.str());writer.add(ContinuousSharedRow{"ordinary"});
+    database original(ordinary.str(),database::open_mode::read_only);
+    database moved(std::move(original));
+    const auto count=database::thread_statement_count();ASSERT_NE(moved.handle(),nullptr);
+    EXPECT_EQ(database::thread_statement_count()-count,1u);
+    database destination(ordinary.str(),database::open_mode::read_only);destination=std::move(moved);
+    const auto known=database::thread_statement_count();ASSERT_NE(destination.handle(),nullptr);
+    EXPECT_EQ(database::thread_statement_count(),known);
+    open();owner->add(ContinuousSharedRow{"protected"});
+    database protected_reader(config().path,database::open_mode::read_only);
+    destination=std::move(protected_reader);
+    const auto unknown=database::thread_statement_count();EXPECT_THROW(destination.handle(),db_error);
+    EXPECT_EQ(database::thread_statement_count()-unknown,1u);
+    database protected_moved(std::move(destination));
+    const auto protected_count=database::thread_statement_count();
+    EXPECT_THROW(protected_moved.handle(),db_error);
+    EXPECT_THROW(query_audit_log(protected_moved),db_error);
+    EXPECT_EQ(database::thread_statement_count(),protected_count);
+}
+TEST_F(RecoveryProducerContinuity, ReadOnlyClassificationFailuresNeverCacheAbsence) {
+    open();owner->add(ContinuousSharedRow{"preserved"});const auto before=snapshot();
+    database reader(config().path,database::open_mode::read_only);
+    {
+        readonly_classification_fault denied(reader);
+        EXPECT_THROW(reader.handle(),db_error);
+        EXPECT_THROW(query_audit_log(reader),db_error);
+        EXPECT_THROW(events_after(reader,std::nullopt),db_error);
+        EXPECT_EQ(denied.denied,3u);
+    }
+    const auto retry=database::thread_statement_count();
+    EXPECT_THROW(query_audit_log_for_sync(reader,policy.routes[0].sync_id),db_error);
+    EXPECT_EQ(database::thread_statement_count()-retry,1u);
+    EXPECT_EQ(snapshot(),before);
+}
+TEST_F(RecoveryProducerContinuity, ReadOnlyCopiedAndAliasedProtectedFilesStillRefuseRawAndLegacyExport) {
+    open();owner->add(ContinuousSharedRow{"copied"});owner->close();owner.reset();
+    TempDB copied{"continuous_readonly_copy"};
+    std::filesystem::copy_file(config().path,copied.str(),std::filesystem::copy_options::overwrite_existing);
+    {
+        database copy(copied.str(),database::open_mode::read_only);
+        EXPECT_EQ(number(copy,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
+        EXPECT_THROW(copy.handle(),db_error);
+        EXPECT_THROW(query_audit_log(copy),db_error);
+        EXPECT_THROW(query_audit_log_for_sync(copy,policy.routes[0].sync_id),db_error);
+        EXPECT_THROW(events_after(copy,std::nullopt),db_error);
+    }
+    const auto alias=container.parent_path()/(unique.path.filename().string()+"-readonly-alias");
+    std::filesystem::create_directory_symlink(container,alias);
+    struct remove_alias {std::filesystem::path path;~remove_alias(){std::error_code error;std::filesystem::remove(path,error);}} cleanup{alias};
+    database reader((alias/"store.sqlite").string(),database::open_mode::read_only);
+    EXPECT_EQ(number(reader,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
+    EXPECT_THROW(reader.handle(),db_error);
+    EXPECT_THROW(events_after(reader,std::nullopt),db_error);
+}
+
+TEST_F(RecoveryProducerContinuity, ReadOnlyProtectedRouteRefusesBeforeFactoryPublication) {
+    // Executing a pre-init route refusal also requires root's separate C7
+    // partial-synchronizer destructor correction; no such fix is copied here.
+    open();owner->add(ContinuousSharedRow{"not-exported"});const auto before=snapshot();
+    auto reader_config=config();reader_config.read_only=true;
+    auto reader=std::make_shared<lattice_db>(reader_config);
+    sync_config route;route.sync_id=policy.routes[0].sync_id;route.websocket_url=policy.routes[0].endpoint;
+    const auto created=factory->wires.size();
+    EXPECT_THROW((void)std::make_unique<synchronizer>(reader,route),db_error);
+    EXPECT_EQ(factory->wires.size(),created);EXPECT_EQ(snapshot(),before);reader->close();
 }
 #endif

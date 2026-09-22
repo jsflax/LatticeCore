@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <deque>
 #include <future>
+#include <utility>
 
 #ifndef __EMSCRIPTEN__
 struct ExportCallbackRow {std::string value;};
@@ -53,6 +54,7 @@ struct callback_wire_state {
     std::vector<std::string> frames;
     std::atomic<transport_state> status{transport_state::closed};
     std::atomic<int> connects{0};
+    std::atomic<size_t> successful_sends{0};
     std::promise<void> destroyed;
     std::shared_future<void> destruction=destroyed.get_future().share();
     void open() {
@@ -93,6 +95,7 @@ struct callback_wire final:sync_transport {
         const auto state=shared;std::function<void()> callback;
         {std::lock_guard<std::mutex> lock(state->mutex);state->frames.push_back(frame.as_string());callback=state->sending;}
         if(callback)callback();
+        ++state->successful_sends;
     }
     void set_on_open(on_open_handler fn)override{std::lock_guard<std::mutex> lock(shared->mutex);shared->opened=std::move(fn);}
     void set_on_message(on_message_handler fn)override{std::lock_guard<std::mutex> lock(shared->mutex);shared->message=std::move(fn);}
@@ -110,16 +113,26 @@ struct callback_errors {
     std::vector<std::string> copy(){std::lock_guard<std::mutex> lock(mutex);return values;}
 };
 struct callback_ack_hold {
-    std::mutex mutex;std::condition_variable ready;bool released=false;
+    std::mutex mutex;std::condition_variable ready;bool released=false,schedule_retired=true;
     std::atomic<bool> timed_out{false};
-    std::promise<void> completed;std::shared_future<void> completion=completed.get_future().share();
+    size_t started=0,finished=0;
     void wait() {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);++started;ready.notify_all();
         if(!ready.wait_for(lock,5s,[&]{return released;})) {
             timed_out=true;throw std::runtime_error("callback test ACK custody gate timed out");
         }
     }
-    void release(){std::lock_guard<std::mutex> lock(mutex);released=true;ready.notify_all();}
+    void finish(){std::lock_guard<std::mutex> lock(mutex);++finished;ready.notify_all();}
+    void retire(){std::lock_guard<std::mutex> lock(mutex);schedule_retired=true;ready.notify_all();}
+    bool release_and_wait(){std::unique_lock<std::mutex> lock(mutex);released=true;ready.notify_all();
+        return ready.wait_for(lock,5s,[&]{return schedule_retired&&finished==started;});}
+    auto counts(){std::lock_guard<std::mutex> lock(mutex);return std::pair{started,finished};}
+};
+struct callback_ack_custody {
+    std::shared_ptr<callback_ack_hold> hold;
+    explicit callback_ack_custody(std::shared_ptr<callback_ack_hold> value):hold(std::move(value)){
+        std::lock_guard<std::mutex> lock(hold->mutex);hold->schedule_retired=false;}
+    ~callback_ack_custody(){hold->retire();}
 };
 void callback_commit(const recovery_install_result& result) {
     if(result.state!=recovery_install_state::committed) {
@@ -155,14 +168,17 @@ protected:
         }));
         callback_commit(recovery_local_producer_adapter::enroll_for_qualification(owner,{address,{"ExportCallbackRow"},{'g'}},limits));
         install_error_handler(false,false);queue->drain();
-        const auto hold=ack_hold;auto schedule=std::make_shared<sync_background_test_hooks::ack_schedule>();
-        schedule->before_expiry=[hold]{hold->wait();};schedule->completed=[hold]{hold->completed.set_value();};
+        const auto custody=std::make_shared<callback_ack_custody>(ack_hold);auto schedule=std::make_shared<sync_background_test_hooks::ack_schedule>();
+        schedule->before_expiry=[custody]{custody->hold->wait();};schedule->completed=[custody]{custody->hold->finish();};
         sync_background_test_hooks::ack=std::move(schedule);
     }
     void TearDown()override {
-        holder->sync.reset();ack_hold->release();
-        if(!transport->sent().empty())EXPECT_EQ(ack_hold->completion.wait_for(5s),std::future_status::ready);
-        EXPECT_FALSE(ack_hold->timed_out.load());sync_background_test_hooks::ack=std::move(previous_ack);
+        holder->sync.reset();sync_background_test_hooks::ack=std::move(previous_ack);
+        // Retire every captured schedule before asserting zero workers: a
+        // created-but-not-yet-running thread still owns that schedule.
+        EXPECT_TRUE(ack_hold->release_and_wait());const auto [started,finished]=ack_hold->counts();
+        EXPECT_EQ(started,transport->successful_sends.load());EXPECT_EQ(finished,started);
+        EXPECT_FALSE(ack_hold->timed_out.load());
         queue->shutdown();
     }
     void install_error_handler(bool retire,bool throws) {

@@ -1171,13 +1171,18 @@ TEST_F(RecoveryNegotiatedExport, HandoffContentionExhaustionKeepsClaimsAndReport
 
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 #include <lattice.hpp>
-struct ContinuousNoHistoryRow {std::string title;std::string body;};
-LATTICE_SCHEMA(ContinuousNoHistoryRow,title,body);
 namespace {
-const bool continuous_no_history_schema=[] {
-    auto schema=managed<ContinuousNoHistoryRow>::schema();schema.properties[1].no_history=true;
-    schema_registry::instance().register_model(typeid(ContinuousNoHistoryRow),std::move(schema));return true;
-}();
+// Both endpoints declare this logical table through their actual Swift owner.
+// Registering it globally as native as well would correctly refuse the Swift
+// recovery catalog before the source's authenticated setup can be exercised.
+swift_schema_entry continuous_no_history_schema(bool producer) {
+    swift_schema_entry schema;schema.table_name="ContinuousNoHistoryRow";
+    for(const char* name:{"title","body"}) {
+        property_descriptor field{};field.name=name;field.type=column_type::text;
+        field.no_history=producer&&field.name=="body";schema.properties[name]=field;
+    }
+    return schema;
+}
 struct no_history_source_route {
     static int32_t current(void*){return 1;}
     static void destroy(void* p){delete static_cast<no_history_source_route*>(p);}
@@ -1201,8 +1206,7 @@ protected:
         policy.frozen_entries=1024;policy.frozen_bytes=16*1024*1024;
     }
     void mount(size_t delete_cap=256,bool deny_delete=false){
-        swift_schema_entry schema;schema.table_name="ContinuousNoHistoryRow";
-        for(const char* name:{"title","body"}){property_descriptor field{};field.name=name;field.type=column_type::text;schema.properties[name]=field;}
+        const auto schema=continuous_no_history_schema(false);
         swift_configuration config(source_file.str(),std::make_shared<immediate_scheduler>());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
 #if LATTICE_HAS_FRT
         source_ref.reset(swift_lattice_ref::create(config,{schema}));
@@ -1240,12 +1244,74 @@ protected:
         const auto response=sessions[route].ready(request,input);if(response.status_code()!=1||!response.publishable())throw db_error("NoHistory actual describe failed");
         platform->attempts[route]->current().trigger_on_message(transport_message::from_string(response.wire()));queue->drain();
     }
+    continuous_policy swift_policy()const {
+        // Translate the existing fixture recipe exactly; no new limits,
+        // contribution identity, admission authority or topology are supplied.
+        continuous_policy out;const auto& o=policy.limits.obligations;
+        out.scopes=o.scopes;out.records=o.records;out.field_bytes=o.field_bytes;out.journal_bytes=o.encoded_bytes;
+        const auto& i=policy.limits.installations;
+        out.channels=i.channels;out.binding_field_bytes=i.field_bytes;out.binding_bytes=i.encoded_bytes;
+        const auto& p=policy.limits.producers;
+        out.profiles=p.profiles;out.stamps=p.stamps;out.producer_field_bytes=p.field_bytes;
+        out.manifest_bytes=p.manifest_bytes;out.producer_bytes=p.encoded_bytes;
+        out.owners=policy.owners;out.physical_routes=policy.physical_routes;out.operations=policy.operations;
+        out.frozen_entries=policy.frozen_entries;out.frozen_bytes=policy.frozen_bytes;
+        for(const auto& c:policy.contributions) {
+            const auto& b=c.profile.binding;
+            out.contributions.push_back({b.channel,b.authority,b.source,b.epoch,b.scope,b.schema,
+                c.profile.profile_digest,c.profile.receipt_namespace,c.models,c.incoming_grant_claim});
+        }
+        for(const auto& route:policy.routes)out.routes.push_back({route.sync_id,route.endpoint});
+        return out;
+    }
+    std::shared_ptr<::lattice::swift_lattice> producer_facade() {
+        continuous_result result;const swift_configuration c{config()};
+        const SchemaVector schemas{continuous_no_history_schema(true)};
+#if LATTICE_HAS_FRT
+        auto ref=std::unique_ptr<swift_lattice_ref>(swift_lattice_ref::create_continuous(c,schemas,swift_policy(),result));
+#else
+        auto ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create_continuous(c,schemas,swift_policy(),result));
+#endif
+        if(result.phase()!=2||result.has_error())throw db_error("NoHistory actual Swift producer: "+
+            result.primary_error()+result.cleanup_error()+result.postcommit_error()+result.notification_error());
+        if(!ref||!ref->valid())throw db_error("NoHistory actual Swift producer facade missing");
+        auto actual=swift_lattice_ref::shared_for_lattice(ref->get());
+        if(!actual||actual.get()!=ref->get())throw db_error("NoHistory actual Swift producer owner missing");
+        // Retain the factory's actual derived control block after the bridge
+        // shell leaves scope, just as the existing owner/facade vectors do.
+        return actual;
+    }
     void generate(bool mixed,size_t gap=270){
-        open();auto co=facade();auto row=owner->add(ContinuousNoHistoryRow{"seed-title","seed-body"});target=row.global_id();
+        auto producer=producer_facade();owner=producer;stop_notifier();
+        auto co=producer_facade();facades.push_back(co);
+        if(co==producer)throw db_error("NoHistory co-writer must be a distinct admitted Swift facade");
+        const auto schema=continuous_no_history_schema(true);
+        swift_dynamic_object seed;seed.table_name=schema.table_name;seed.properties=schema.properties;
+        seed.values["title"]=std::string("seed-title");seed.values["body"]=std::string("seed-body");
+        dynamic_object row(seed);producer->add(row);
+        if(row.lattice!=producer)throw db_error("NoHistory managed row lost actual producer ownership");
+        target=row.get_string("globalId");
+        // Preserve one mixed UPDATE original; two individual setters would
+        // change the exact page inventory and omission proof under test.
         if(mixed)owner->db().execute("UPDATE ContinuousNoHistoryRow SET title='historical-title',body='unavailable-body' WHERE globalId=?",{target});
-        else row.body="unavailable-body";
+        else row.set_string("body","unavailable-body");
         update_id=std::get<std::string>(owner->db().query("SELECT globalId FROM AuditLog ORDER BY id DESC LIMIT 1")[0].at("globalId"));
-        co->add_bulk(std::vector<ContinuousNoHistoryRow>(gap,{"unrelated","payload"}));owner->remove(row);
+        std::vector<swift_dynamic_object> unrelated;unrelated.reserve(gap);
+        for(size_t n=0;n<gap;++n) {
+            swift_dynamic_object raw;raw.table_name=schema.table_name;raw.properties=schema.properties;
+            raw.values["title"]=std::string("unrelated");raw.values["body"]=std::string("payload");unrelated.push_back(std::move(raw));
+        }
+        const auto managed=co->add_bulk(std::move(unrelated));
+        if(managed.size()!=gap)throw db_error("NoHistory co-writer did not generate the complete gap");
+        for(const auto& entry:managed)if(entry.lattice_shared()!=co)throw db_error("NoHistory bulk row lost actual co-writer ownership");
+        // Use the real Swift reference removal surface, which transitions the
+        // removed handle's managed storage and marks it deleted.
+#if LATTICE_HAS_FRT
+        auto deletion=std::unique_ptr<dynamic_object_ref>(dynamic_object_ref::wrap(row));
+#else
+        auto deletion=std::make_unique<dynamic_object_ref>(dynamic_object_ref::wrap(row));
+#endif
+        if(!deletion||!deletion->is_managed()||!producer->remove(*deletion))throw db_error("NoHistory actual managed delete failed");
         delete_id=std::get<std::string>(owner->db().query("SELECT globalId FROM AuditLog ORDER BY id DESC LIMIT 1")[0].at("globalId"));
     }
     auto originals(){return owner->db().query("SELECT * FROM AuditLog ORDER BY id");}

@@ -185,6 +185,14 @@ protected:
     auto snapshot(){std::vector<std::vector<database::row_t>> rows;for(const char* name:{"_lattice_producer_continuity","_lattice_obligation_store","_lattice_obligation_scope","_lattice_obligation_entry","_lattice_obligation_producer_store","_lattice_obligation_producer_profile","_lattice_obligation_producer_stamp","_lattice_install_store","_lattice_install_channel","AuditLog","ContinuousSharedRow"})rows.push_back(owner->db().query(std::string("SELECT * FROM ")+name+" ORDER BY 1,2"));return rows;}
     void connect(size_t index=0){sync_config c;c.sync_id=policy.routes.at(index).sync_id;c.websocket_url=policy.routes.at(index).endpoint;c.checkpoint_passive_interval_ms=0;c.upload_coalesce_ms=0;
         auto sync=std::make_unique<synchronizer>(owner,c);sync->connect();queue->drain();factory->wires.back()->open();queue->drain();senders.push_back(std::move(sync));}
+    void connect_replacement(){
+        // The first sender owns shutdown of its scheduler. Retain a real
+        // admitted co-facade whose scheduler is fresh; assigning only queue
+        // would leave synchronizer(owner, ...) bound to the stopped queue.
+        queue=std::make_shared<continuity_queue>();auto fresh_owner=facade();
+        sync_config c;c.sync_id=policy.routes.at(0).sync_id;c.websocket_url=policy.routes.at(0).endpoint;c.checkpoint_passive_interval_ms=0;c.upload_coalesce_ms=0;
+        auto sync=std::make_unique<synchronizer>(std::move(fresh_owner),c);sync->connect();queue->drain();factory->wires.back()->open();queue->drain();senders.push_back(std::move(sync));
+    }
     void TearDown()override {
         senders.clear();queue->shutdown();facades.clear();if(owner)owner->close();owner.reset();
         for(const auto& wire:factory->wires)EXPECT_EQ(wire->destruction.wait_for(std::chrono::seconds(5)),std::future_status::ready);
@@ -583,7 +591,7 @@ TEST_F(RecoveryProducerContinuity, ActualRouteFinalSelectorChangeRollsBackClaims
     EXPECT_EQ(invoked,1u);EXPECT_TRUE(changed);EXPECT_TRUE(factory->wires.back()->audit_batches().empty());
     EXPECT_EQ(snapshot(),before);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2"),route_before);
     senders.clear();queue->drain();
-    connect();const auto batches=factory->wires.back()->audit_batches();ASSERT_EQ(batches.size(),1u);EXPECT_EQ(batches[0].size(),1u);
+    connect_replacement();const auto batches=factory->wires.back()->audit_batches();ASSERT_EQ(batches.size(),1u);EXPECT_EQ(batches[0].size(),1u);
     auto done=freeze();ASSERT_TRUE(done.unsent);EXPECT_TRUE(done.unsent->canonical_originals().empty());
 }
 TEST_F(RecoveryProducerContinuity, ActualRouteFinalSelectedStampReadFailureRollsBackEveryClaim) {
@@ -592,7 +600,7 @@ TEST_F(RecoveryProducerContinuity, ActualRouteFinalSelectedStampReadFailureRolls
      EXPECT_EQ(invoked,1u);EXPECT_EQ(continuity_stamp_denials,1u);}
     EXPECT_TRUE(factory->wires.back()->audit_batches().empty());EXPECT_EQ(snapshot(),before);
     senders.clear();queue->drain();
-    connect();const auto batches=factory->wires.back()->audit_batches();ASSERT_EQ(batches.size(),1u);EXPECT_EQ(batches[0].size(),1u);
+    connect_replacement();const auto batches=factory->wires.back()->audit_batches();ASSERT_EQ(batches.size(),1u);EXPECT_EQ(batches[0].size(),1u);
     auto done=freeze();ASSERT_TRUE(done.unsent);EXPECT_TRUE(done.unsent->canonical_originals().empty());
 }
 

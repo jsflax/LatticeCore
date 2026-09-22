@@ -1327,7 +1327,7 @@ void synchronizer_base::disconnect() {
     // Clear in-flight set — entries will be re-queried on reconnect
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        in_flight_ids_.clear();
+        upload_tracking_->clear_ids_locked();
     }
 
     // A protected transport always retires on its pre-reserved native lane.
@@ -1706,7 +1706,7 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
         const auto scheduled=scheduler_;const auto lifetime=callback_lifetime_;
         const auto generation=lifetime->dispatch_generation();const auto callback=on_error_;
         is_connected_=false;
-        {std::lock_guard<std::mutex> lock(in_flight_mutex_);in_flight_ids_.clear();progress_pending_upload_.store(0);}
+        {std::lock_guard<std::mutex> lock(in_flight_mutex_);upload_tracking_->clear_ids_locked();progress_pending_upload_.store(0);}
         retire_protected_transport();
         // Transport ingress is closed, while this copied notification can
         // finish under the same generation's owner-admission scheduler.
@@ -1740,7 +1740,7 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
         if (!in_flight_ids_.empty()) {
             LOG_INFO("synchronizer", "[%s] Clearing %zu in-flight entries after error",
                      log_id(), in_flight_ids_.size());
-            in_flight_ids_.clear();
+            upload_tracking_->clear_ids_locked();
         }
         progress_pending_upload_.store(0, std::memory_order_relaxed);
     }
@@ -1759,7 +1759,7 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
         const auto scheduled=scheduler_;const auto lifetime=callback_lifetime_;
         const auto generation=lifetime->dispatch_generation();const auto callback=on_state_change_;
         is_connected_=false;
-        {std::lock_guard<std::mutex> lock(in_flight_mutex_);in_flight_ids_.clear();progress_pending_upload_.store(0);}
+        {std::lock_guard<std::mutex> lock(in_flight_mutex_);upload_tracking_->clear_ids_locked();progress_pending_upload_.store(0);}
         retire_protected_transport();
         if(callback)detail::schedule_sync_terminal_notification(scheduled,lifetime,generation,[callback]{try{callback(false);}catch(...){LOG_ERROR("synchronizer","transport close callback threw");}});
         return;
@@ -1777,7 +1777,7 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
         if (!in_flight_ids_.empty()) {
             LOG_INFO("synchronizer", "[%s] Clearing %zu in-flight entries after close",
                      log_id(), in_flight_ids_.size());
-            in_flight_ids_.clear();
+            upload_tracking_->clear_ids_locked();
         }
         progress_pending_upload_.store(0, std::memory_order_relaxed);
     }
@@ -2782,7 +2782,7 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
 
 void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& entries) {prepare_ack_retry(entries)();}
 
-std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<audit_log_entry>& entries,bool after_handoff) {
+std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<audit_log_entry>& entries,bool after_handoff,uint64_t delivery_token) {
     // At-least-once delivery: a sent frame can vanish without any error —
     // e.g. the peer registers its frame handlers a beat after the upgrade
     // completes (WebSocketKit discards unhandled frames), or plain network
@@ -2811,15 +2811,15 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
     // This launcher owns every input before a foreign send. It may execute
     // after that send synchronously ACKed or destroyed the owner.
     return [guard = ack_guard_, self = this, sent_ids = std::move(sent_ids),
-            ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule,after_handoff]() mutable {
+            ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule,after_handoff,delivery_token]() mutable {
       if(after_handoff){
           std::lock_guard<std::mutex> g(guard->m);
           if(!guard->alive||!lifetime->current(generation))return;
           std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
-          if(std::none_of(sent_ids.begin(),sent_ids.end(),[&](const auto& id){return self->in_flight_ids_.count(id)!=0;}))return;
+          if(std::none_of(sent_ids.begin(),sent_ids.end(),[&](const auto& id){return self->upload_tracking_->matches_locked(id,generation,delivery_token,true);}))return;
       }
       std::thread([guard,self,sent_ids=std::move(sent_ids),ack_timeout_base_ms,resend_failures,
-                   lifetime,generation,scheduled,test_schedule] {
+                   lifetime,generation,scheduled,test_schedule,delivery_token] {
         struct completion {
             std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> test;
             ~completion(){if(test&&test->completed)try{test->completed();}catch(...) {}}
@@ -2853,11 +2853,11 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
         while (std::chrono::steady_clock::now() < deadline) {
             {
                 std::lock_guard<std::mutex> g(guard->m);
-                if (!guard->alive) return;
+                if (!guard->alive || !lifetime->current(generation)) return;
                 std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
                 size_t remaining = 0;
                 for (const auto& id : sent_ids) {
-                    if (self->in_flight_ids_.count(id)) ++remaining;
+                    if (self->upload_tracking_->matches_locked(id,generation,delivery_token,true)) ++remaining;
                 }
                 if (remaining == 0) return;  // everything ACKed
                 if (remaining < last_remaining) {
@@ -2874,7 +2874,7 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
             size_t released = 0;
             {
                 std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
-                for (const auto& id : sent_ids) released += self->in_flight_ids_.erase(id);
+                for (const auto& id : sent_ids) released += self->upload_tracking_->erase_locked(id,generation,delivery_token,true);
                 // Publish finite opted-route demand before exposing zero
                 // progress. This counter-only receiver leaf never enters
                 // lifetime/endpoint/SQL locks or invokes callbacks. Keeping
@@ -2982,7 +2982,6 @@ bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation&
     auto& frame=*continuation.protected_frame;
     const auto route=recovery_export_route_;
     std::vector<std::string> ids;ids.reserve(frame.entries().size());
-    auto retry=prepare_ack_retry(frame.entries(),true);
     for(const auto& entry:frame.entries())ids.push_back(entry.global_id);
     if(!continuation.protected_exclusion){
         std::vector<std::pair<std::string,int64_t>> registrations;registrations.reserve(frame.entries().size());
@@ -2995,6 +2994,9 @@ bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation&
     }
     const auto exclusion=continuation.protected_exclusion;
     try {
+        // Capture the exact registration before the foreign call. Reentrant
+        // ACK may remove it before handed_off/launcher run; never relabel it.
+        auto retry=prepare_ack_retry(frame.entries(),true,exclusion->delivery_token());
         const auto sent=discovery_busy?route->try_handoff(frame):std::optional<bool>(route->handoff(std::move(frame)));
         if(!sent){
             // Charge only when parking payload across turns. Ordinary handoff
@@ -3187,15 +3189,15 @@ void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::st
     const auto owner=owned_db_;const auto route=recovery_export_route_;const auto lifetime=callback_lifetime_;const auto generation=reconnect_lifecycle_.load();
     if(!lifetime->current(generation))return;
     if(protected_store) {
-        std::vector<std::string> matched;std::set<std::string> seen;
-        {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:global_ids)if(in_flight_ids_.count(id)&&seen.insert(id).second)matched.push_back(id);}
+        std::vector<std::string> matched;std::vector<uint64_t> registrations;std::set<std::string> seen;
+        {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:global_ids)if(in_flight_ids_.count(id)&&seen.insert(id).second){matched.push_back(id);registrations.push_back(upload_tracking_->registration_locked(id));}}
         if(matched.empty())return;
         detail::recovery_export_adapter::acknowledge_legacy(owner,config_.sync_id,matched);
         if(!route->current(generation))return;
         // Close the zero-in-flight / queued-next-selection drain window before
         // clearing this ACK batch. The next actual empty selection settles it.
         if(receiver_source_&&continuous_route_)receiver_source_->request_upload();
-        {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:matched)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
+        {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(size_t n=0;n<matched.size();++n)upload_tracking_->erase_locked(matched[n],generation,registrations[n],false);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
         progress_acked_.fetch_add(static_cast<int64_t>(matched.size()));ack_resend_failures_.store(0);
         if(receiver_controller_)receiver_controller_->request();
         schedule_background("ACK continuation",[this,route,generation]{if(!route->current(generation))return;background_upload();});
@@ -3219,7 +3221,7 @@ void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::st
             auto it = in_flight_ids_.find(id);
             if (it != in_flight_ids_.end()) {
                 if (it->second > 0) resolved_audit_ids.push_back(it->second);
-                in_flight_ids_.erase(it);
+                upload_tracking_->erase_locked(id,generation,upload_tracking_->registration_locked(id),false);
                 ++matched;
             } else {
                 unmatched.push_back(id);

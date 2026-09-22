@@ -1,4 +1,7 @@
 #include "TestHelpers.hpp"
+#include "../../Sources/LatticeCore/src/sync_callback_lifetime.hpp"
+#include "../../Sources/LatticeCore/src/sync_upload_exclusion.hpp"
+#include <future>
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/recovery_receiver_controller.hpp"
 #include "../../Sources/LatticeCore/src/recovery_local_producer.hpp"
@@ -381,5 +384,68 @@ TEST_F(RecoveryReceiverController, EnabledUniqueOriginalCapacityCountsSharedRows
     EXPECT_EQ(scalar(*receiver,"SELECT max_records AS n FROM _lattice_obligation_store"),20000);
 }
 
+}
+
+namespace lattice::detail {
+struct recovery_delivery_registration_test_access {
+    static bool timeout(synchronizer_base& sync,int milliseconds){
+        auto done=std::make_shared<std::promise<void>>();auto result=done->get_future();
+        sync.schedule_background("delivery identity fixture",[&sync,milliseconds,done]{sync.config_.ack_timeout_base_ms=milliseconds;done->set_value();});
+        return result.wait_for(std::chrono::seconds(5))==std::future_status::ready;
+    }
+    static uint64_t token(synchronizer_base& sync,const std::string& id){
+        std::lock_guard lock(sync.in_flight_mutex_);return sync.upload_tracking_->registration_locked(id);
+    }
+};
+}
+namespace {
+TEST_F(RecoveryReceiverController, AckedOldWorkerCannotReleaseNewRestrictedHandoffOfSameOriginal) {
+    configure();auto first_pause=std::make_shared<ControllerPause>();pauses.push_back(first_pause);
+    auto started=std::make_shared<std::atomic<unsigned>>(0),completed=std::make_shared<std::atomic<unsigned>>(0);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[first_pause,started,completed](const char* stage){
+        if(std::strcmp(stage,"install-committed")!=0)return;
+        auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
+        hook->before_expiry=[first_pause,started]{if(started->fetch_add(1)==0)first_pause->wait();};
+        hook->completed=[completed]{++*completed;};detail::sync_background_test_hooks::ack=std::move(hook);
+    });
+    connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+    ASSERT_TRUE(detail::recovery_delivery_registration_test_access::timeout(*synchronizers[0],0));
+    seed_local(1,700);const auto ids=originals();ASSERT_EQ(ids.size(),1u);
+    ASSERT_TRUE(until([&]{return held_originals()==ids&&first_pause->ready();}));
+    const auto first=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]);ASSERT_NE(first,0u);
+    ASSERT_TRUE(detail::recovery_delivery_registration_test_access::timeout(*synchronizers[0],10000));
+    // A legacy delivery ACK is deliberately not a canonical receipt. The
+    // source has not imported this held frame; its real Q reports UNKNOWN.
+    legacy_ack(0,ids);
+    ASSERT_TRUE(until([&]{return held_originals().size()==2&&started->load()==2;}));
+    const auto replacement=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]);
+    ASSERT_NE(replacement,0u);ASSERT_NE(replacement,first);ASSERT_EQ(synchronizers[0]->get_progress().pending_upload,1);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL AND ack_position IS NULL"),1);
+    first_pause->release();ASSERT_TRUE(until([&]{return completed->load()>=1;}));
+    EXPECT_EQ(detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]),replacement);
+    EXPECT_EQ(synchronizers[0]->get_progress().pending_upload,1);EXPECT_EQ(held_originals().size(),2u);
+    // The source UNKNOWN latch remains closed. This correction adds delivery
+    // ownership only and does not yet authorize another controller retry.
+    EXPECT_THROW(insert(*receiver,controller_uuid(701),"closed pending source outcome"),db_error);
+}
+TEST(RecoveryDeliveryRegistration, PresendCancellationAndLegacyTimerCannotEraseReplacement) {
+    auto state=std::make_shared<detail::sync_upload_tracking>();
+    auto old=detail::sync_upload_exclusion::create(state,1,{{"original",7}});const auto first=old->delivery_token();
+    {std::lock_guard lock(state->mutex);EXPECT_FALSE(state->matches_locked("original",1,first,true));}
+    old->release();
+    {std::lock_guard lock(state->mutex);EXPECT_TRUE(state->ids.empty());EXPECT_TRUE(state->delivery_tokens.empty());EXPECT_TRUE(state->pre_handoff.empty());}
+    auto current=detail::sync_upload_exclusion::create(state,1,{{"original",7}});const auto second=current->delivery_token();current->handed_off();
+    {std::lock_guard lock(state->mutex);EXPECT_NE(first,second);EXPECT_FALSE(state->erase_locked("original",1,first,true));EXPECT_FALSE(state->erase_locked("original",1,0,true));EXPECT_TRUE(state->matches_locked("original",1,second,true));}
+    old.reset();current->release();
+    {std::lock_guard lock(state->mutex);EXPECT_TRUE(state->matches_locked("original",1,second,true));EXPECT_TRUE(state->erase_locked("original",1,second,false));EXPECT_TRUE(state->delivery_tokens.empty());}
+}
+TEST(RecoveryDeliveryRegistration, LifecycleClearRetiresTransferredTokensWithoutAffectingNewSend) {
+    auto state=std::make_shared<detail::sync_upload_tracking>();auto old=detail::sync_upload_exclusion::create(state,1,{{"original",7}});
+    const auto first=old->delivery_token();old->handed_off();
+    {std::lock_guard lock(state->mutex);state->clear_ids_locked();state->generation=3;EXPECT_TRUE(state->delivery_tokens.empty());EXPECT_TRUE(state->pre_handoff.empty());}
+    auto current=detail::sync_upload_exclusion::create(state,3,{{"original",7}});const auto second=current->delivery_token();current->handed_off();old.reset();
+    {std::lock_guard lock(state->mutex);EXPECT_FALSE(state->erase_locked("original",1,first,true));EXPECT_FALSE(state->erase_locked("original",1,0,true));EXPECT_TRUE(state->matches_locked("original",3,second,true));state->clear_ids_locked();EXPECT_TRUE(state->ids.empty());EXPECT_TRUE(state->delivery_tokens.empty());EXPECT_TRUE(state->pre_handoff.empty());}
+}
 }
 #endif

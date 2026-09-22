@@ -866,7 +866,13 @@ protected:
         EXPECT_EQ(observation->captures.load(),captures);EXPECT_FALSE(has_error());
         writer->release();EXPECT_FALSE(writer->timed_out);
         if(recreate){
-            synchronizers.clear();ASSERT_TRUE(until([&]{return old_controller.expired();}));
+            // Retire on the real owner scheduler so destruction cannot stop the
+            // shared scheduler before the replacement controller is admitted.
+            const auto scheduled=receiver->get_scheduler();ASSERT_TRUE(scheduled);
+            auto retired=std::make_shared<std::atomic<bool>>(false);
+            scheduled->invoke([this,retired]{synchronizers.clear();retired->store(true);});
+            ASSERT_TRUE(until([&]{return retired->load()&&old_controller.expired();}));
+            ASSERT_TRUE(scheduled->can_invoke());
             const auto waits=observation->waiting.load();connect();
             ASSERT_TRUE(until([&]{return observation->waiting.load()>waits;}));
             const auto current=detail::recovery_receiver_cohort_test_access::controller(*synchronizers[0]);

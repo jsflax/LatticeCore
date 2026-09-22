@@ -246,6 +246,8 @@ class database {
         static inline thread_local maintenance_scope* current = nullptr;
         static bool idle(database& db) noexcept;
         static void probe_before_store_gate(database& db);
+        // False is only the initial no-effect SQLite mutex contention probe.
+        static bool try_probe_before_store_gate(database& db);
         explicit maintenance_scope(database& db);
         ~maintenance_scope() noexcept;
         maintenance_scope(const maintenance_scope&) = delete;

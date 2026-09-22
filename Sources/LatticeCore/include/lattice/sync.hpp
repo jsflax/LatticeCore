@@ -583,11 +583,12 @@ protected:
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
     void send_entries(std::vector<audit_log_entry>& entries);
     void send_entries_after_discovery(std::vector<audit_log_entry>& entries);
-    void send_entries(detail::committed_export_frame);
-    bool upload_protected_entries(bool* discovery_busy=nullptr);
+    bool send_committed_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy);
+    bool upload_protected_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy=nullptr);
     std::optional<bool> try_has_export_protection();
     bool has_export_protection();
     void schedule_ack_retry(const std::vector<audit_log_entry>&);
+    std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false);
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")

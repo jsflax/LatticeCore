@@ -121,8 +121,10 @@ class recovery_continuous_producer {
     static std::shared_ptr<recovery_continuous_work> admit_work(
         const std::shared_ptr<recovery_continuous_route>&,std::shared_ptr<lattice_db>,uint64_t);
     static void verify_work(const std::shared_ptr<recovery_continuous_work>&,lattice_db&,database&);
+    // Optional busy output is set only before entering the owned body.
     static recovery_install_result export_owned(std::shared_ptr<lattice_db>,
-        const std::shared_ptr<recovery_continuous_work>&,const std::function<void(database&)>&);
+        const std::shared_ptr<recovery_continuous_work>&,const std::function<void(database&)>&,
+        bool* initial_admission_busy = nullptr);
     static void setup_configured_route(lattice_db&);
     static bool attached(const lattice_db&) noexcept;
     static void require_no_continuous_export(database&);

@@ -280,12 +280,12 @@ void recovery_continuous_producer::verify_work(const std::shared_ptr<recovery_co
     const auto row=writer.query(continuous_query).at(0);
     if(integer(row,"phase")==2)refuse("continuous export arrived after frozen Q");
 }
-recovery_install_result recovery_continuous_producer::export_owned(std::shared_ptr<lattice_db> owner,const std::shared_ptr<recovery_continuous_work>& work,const std::function<void(database&)>& body) {
-    return recovery_writer_access::install(owner,[&](database& db){
+recovery_install_result recovery_continuous_producer::export_owned(std::shared_ptr<lattice_db> owner,const std::shared_ptr<recovery_continuous_work>& work,const std::function<void(database&)>& body,bool* initial_admission_busy) {
+    return recovery_writer_access::install_impl(owner,[&](database& db){
         verify_work(work,*owner,db);
         if(!work){body(db);return;}
         continuous_frame claim(*work->state_,db,2);body(db);verify_work(work,*owner,db);
-    });
+    },{},{},initial_admission_busy);
 }
 recovery_continuous_quiescence recovery_continuous_producer::begin(std::shared_ptr<lattice_db> owner,int64_t attempt) {
     recovery_continuous_quiescence output;std::shared_ptr<recovery_continuous_state> state;

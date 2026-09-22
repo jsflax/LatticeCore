@@ -4,6 +4,7 @@
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include <deque>
 #include <condition_variable>
+#include <cstdlib>
 #include <future>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -30,8 +31,14 @@ using namespace lattice::detail;
 class continuity_queue final:public scheduler {
     std::mutex mutex_;std::deque<std::function<void()>> jobs_;bool stopped_=false;
     static thread_local const continuity_queue* current_;
+    static thread_local const continuity_queue* inline_;
 public:
-    void invoke(std::function<void()>&& job)override {std::lock_guard<std::mutex> lock(mutex_);if(!stopped_){if(jobs_.size()==256)throw db_error("continuity fixture queue full");jobs_.push_back(std::move(job));}}
+    void invoke(std::function<void()>&& job)override {
+        if(inline_==this){struct restore{const continuity_queue* old;~restore(){current_=old;}} prior{current_};current_=this;job();return;}
+        std::lock_guard<std::mutex> lock(mutex_);if(!stopped_){if(jobs_.size()==256)throw db_error("continuity fixture queue full");jobs_.push_back(std::move(job));}}
+    // One caller-owned immediate turn, used only by the synchronous ACK case.
+    // Other threads still queue; no callback runs under the fixture queue lock.
+    void with_inline(const std::function<void()>& work){struct restore{const continuity_queue* old;~restore(){inline_=old;}} prior{inline_};inline_=this;work();}
     bool is_on_thread()const noexcept override{return current_==this;}
     bool is_same_as(const scheduler* other)const noexcept override{return other==this;}
     bool can_invoke()const noexcept override{return true;}
@@ -45,13 +52,19 @@ public:
         struct restore{const continuity_queue* old;~restore(){current_=old;}} prior{current_};current_=this;job();}throw db_error("continuity fixture turn budget exceeded");}
 };
 thread_local const continuity_queue* continuity_queue::current_=nullptr;
+thread_local const continuity_queue* continuity_queue::inline_=nullptr;
 struct continuity_wire_state {
-    std::mutex mutex;sync_transport::on_open_handler opened;std::function<void()> sending;
+    std::mutex mutex;std::condition_variable published;sync_transport::on_open_handler opened;std::function<void()> sending;
     sync_transport::on_message_handler received;
     std::vector<std::string> frames;std::atomic<transport_state> state{transport_state::closed};
     std::promise<void> destroyed;std::shared_future<void> destruction=destroyed.get_future().share();
     void open(){sync_transport::on_open_handler callback;{std::lock_guard<std::mutex> lock(mutex);callback=opened;}state=transport_state::open;callback();}
     size_t count(){std::lock_guard<std::mutex> lock(mutex);return frames.size();}
+    bool wait_audit_batches(size_t expected){std::unique_lock lock(mutex);
+        return published.wait_for(lock,std::chrono::seconds(5),[&]{size_t count=0;
+            for(const auto& raw:frames){const auto event=server_sent_event::from_json(raw);if(event&&event->event_type==server_sent_event::type::audit_log)++count;}
+            return count>=expected;});}
+
     void ack(const std::vector<std::string>& ids){sync_transport::on_message_handler callback;
         {std::lock_guard<std::mutex> lock(mutex);callback=received;}
         if(!callback)throw db_error("continuity fixture lacks actual receive callback");
@@ -824,7 +837,8 @@ public:
                 // Same check as the stock SDK adapters: never retarget this
                 // passed endpoint to the newly current Attempt.
                 if(!endpoint.matches(state->current())||!endpoint.is_current())return;
-                std::lock_guard lock(state->wire->mutex);state->wire->frames.push_back(static_cast<const transport_message*>(value)->as_string());},
+                {std::lock_guard lock(state->wire->mutex);state->wire->frames.push_back(static_cast<const transport_message*>(value)->as_string());}
+                state->wire->published.notify_all();},
             [](void* p){std::unique_ptr<holder> state(static_cast<holder*>(p));(*state)->wire->destroyed.set_value();},
             nullptr,[](void*,const void*,const void*)->int32_t{return 1;},
             [](void*){});
@@ -873,6 +887,20 @@ protected:
         for(const auto* name:{"source","incomingScope","peer","channel"})result[name]=policy.at(name);
         result["routeGeneration"]=std::to_string(index+1);result["profile"]=negotiated_profile();result["upload"]=limits;return result;}
     void accept(const negotiated_json& limits,size_t index=0){platform->attempts[index]->current().trigger_on_message(transport_message::from_string(response(index,limits).dump()));queue->drain();}
+    bool pump_until_batch(size_t expected,size_t index=0){
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        do {if(factory->wires[index]->audit_batches().size()>=expected)return true;
+            if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }while(std::chrono::steady_clock::now()<deadline);
+        return factory->wires[index]->audit_batches().size()>=expected;
+    }
+    bool pump_until_ack(size_t index=0){
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        do {if(senders[index]->get_progress().pending_upload==0)return true;
+            if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }while(std::chrono::steady_clock::now()<deadline);
+        return senders[index]->get_progress().pending_upload==0;
+    }
     int64_t claimed(){return number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL");}
     std::vector<std::string> audit_wire(size_t index=0){std::vector<std::string> result;std::lock_guard lock(factory->wires[index]->mutex);
         for(const auto& raw:factory->wires[index]->frames)if(negotiated_json::parse(raw).contains("auditLog"))result.push_back(raw);return result;}
@@ -897,7 +925,8 @@ TEST_F(RecoveryNegotiatedExport, ActualConfiguredOwnerForwardsExpectationToRetai
     factory->wires[0]->open();negotiated_scheduler_pass(child_queue);
     EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(claimed(),0);ASSERT_EQ(factory->wires[0]->count(),1u);
     EXPECT_THROW(owner->sync_now(),db_error);
-    platform->attempts[0]->current().trigger_on_message(transport_message::from_string(response(0,caps()).dump()));negotiated_scheduler_pass(child_queue);
+    platform->attempts[0]->current().trigger_on_message(transport_message::from_string(response(0,caps()).dump()));
+    ASSERT_TRUE(factory->wires[0]->wait_audit_batches(1)); // Actual wire publication, not a FIFO marker ahead of nested discovery.
     const auto batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),1u);ASSERT_EQ(batches[0].size(),1u);EXPECT_EQ(claimed(),2);
     factory->wires[0]->ack(batches[0]);negotiated_scheduler_pass(child_queue);pause.acknowledged();negotiated_scheduler_pass(child_queue);
     EXPECT_EQ(factory->wires[0]->audit_batches(),batches);EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
@@ -913,11 +942,12 @@ TEST_F(RecoveryNegotiatedExport, ActualEightThousandTwoKiBOriginalsMakeOrderedBo
     const auto before=owner->db().query("SELECT * FROM AuditLog ORDER BY id");ASSERT_EQ(before.size(),count);
     start();EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(claimed(),0);EXPECT_THROW(senders[0]->sync_now(),db_error);
     accept(caps());std::vector<std::string> emitted;
-    for(size_t turn=0;turn<40;++turn){const auto batches=factory->wires[0]->audit_batches();if(turn>=batches.size())break;
+    for(size_t turn=0;turn<40&&emitted.size()<count;++turn){
+        ASSERT_TRUE(pump_until_batch(turn+1));const auto batches=factory->wires[0]->audit_batches();
         ASSERT_LE(batches[turn].size(),256u);ASSERT_FALSE(batches[turn].empty());
         const auto raw=audit_wire()[turn];const auto metrics=wire_metrics(raw);EXPECT_LE(metrics.bytes,1048576u);EXPECT_LE(metrics.scalar,65536u);EXPECT_LE(metrics.nodes,32768u);EXPECT_LE(metrics.depth,16u);
         emitted.insert(emitted.end(),batches[turn].begin(),batches[turn].end());factory->wires[0]->ack(batches[turn]);
-        ASSERT_TRUE(queue->run_one());pause.acknowledged();queue->drain();}
+        ASSERT_TRUE(pump_until_ack());pause.acknowledged();queue->drain();}
     ASSERT_EQ(emitted.size(),count);for(size_t i=0;i<count;++i)EXPECT_EQ(emitted[i],std::get<std::string>(before[i].at("globalId")));
     EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),before);EXPECT_EQ(claimed(),2*count);
     start(1);accept(caps(),1);const auto other=factory->wires[1]->audit_batches();ASSERT_EQ(other.size(),1u);EXPECT_EQ(other[0],factory->wires[0]->audit_batches()[0]);
@@ -1043,6 +1073,99 @@ TEST_F(RecoveryNegotiatedExport, RetainedStaleEndpointDoesNotKeepFixturePayloadO
     EXPECT_TRUE(attempt.expired());EXPECT_TRUE(wire.expired());EXPECT_FALSE(stale.is_current());
     EXPECT_FALSE(stale.trigger_on_open());EXPECT_FALSE(stale.trigger_on_message(transport_message::from_string("{}")));EXPECT_FALSE(stale.is_current());
 }
+namespace {
+struct negotiated_writer_hold {
+    std::promise<void> ready,release;
+    std::future<void> ready_future=ready.get_future(),release_future=release.get_future();
+    std::thread worker;
+    explicit negotiated_writer_hold(sqlite3* db):worker([this,db]{
+        auto* mutex=sqlite3_db_mutex(db);sqlite3_mutex_enter(mutex);ready.set_value();
+        if(release_future.wait_for(std::chrono::seconds(10))!=std::future_status::ready)std::abort();
+        sqlite3_mutex_leave(mutex);
+    }){if(ready_future.wait_for(std::chrono::seconds(5))!=std::future_status::ready)std::abort();}
+    ~negotiated_writer_hold(){release.set_value();worker.join();}
+};
+struct negotiated_worker_observation {
+    std::shared_ptr<std::atomic<size_t>> started=std::make_shared<std::atomic<size_t>>(0),finished=std::make_shared<std::atomic<size_t>>(0);
+    std::shared_ptr<const sync_background_test_hooks::ack_schedule> prior=sync_background_test_hooks::ack;
+    negotiated_worker_observation(){auto schedule=std::make_shared<sync_background_test_hooks::ack_schedule>();
+        schedule->before_expiry=[count=started]{++*count;};schedule->completed=[count=finished]{++*count;};sync_background_test_hooks::ack=std::move(schedule);}
+    ~negotiated_worker_observation(){sync_background_test_hooks::ack=prior;}
+};
+}
+TEST_F(RecoveryNegotiatedExport, ClaimedHandoffBusyKeepsExactFrameAndClaimsWithoutStartingAckWorker) {
+    negotiated_ack_pause pause(senders,factory);open();owner->add(ContinuousSharedRow{"busy-handoff"});start();
+    auto* physical=canonical_writer_custody_test_access::fault_handle(owner->db());
+    std::unique_ptr<negotiated_writer_hold> held;size_t commits=0;
+    decltype(snapshot()) committed;
+    negotiated_hook_scope hold([&]{++commits;committed=snapshot();held=std::make_unique<negotiated_writer_hold>(physical);});
+    accept(caps());ASSERT_TRUE(held);EXPECT_EQ(commits,1u);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    EXPECT_EQ(senders[0]->get_progress().pending_upload,1);
+    {std::lock_guard lock(pause.held->mutex);EXPECT_EQ(pause.held->started,0u);}
+    ASSERT_TRUE(queue->wait_for_work());queue->drain(); // At least one actual busy retry, still the same frame.
+    EXPECT_EQ(commits,1u);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    held.reset();EXPECT_EQ(snapshot(),committed);
+    ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(commits,1u);EXPECT_EQ(snapshot(),committed);
+    const auto batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),1u);ASSERT_EQ(batches[0].size(),1u);
+    factory->wires[0]->ack(batches[0]);ASSERT_TRUE(queue->run_one());pause.acknowledged();queue->drain();
+    EXPECT_EQ(claimed(),2);EXPECT_EQ(senders[0]->get_progress().pending_upload,0);EXPECT_TRUE(errors.empty());
+}
+TEST_F(RecoveryNegotiatedExport, ClosedAttemptWhileHandoffBusyKeepsUnknownAndCreatesNoAckWorker) {
+    negotiated_worker_observation workers;open();owner->add(ContinuousSharedRow{"retired-busy-handoff"});start();
+    auto* physical=canonical_writer_custody_test_access::fault_handle(owner->db());std::unique_ptr<negotiated_writer_hold> held;
+    decltype(snapshot()) committed;
+    negotiated_hook_scope hold([&]{committed=snapshot();held=std::make_unique<negotiated_writer_hold>(physical);});
+    accept(caps());ASSERT_TRUE(held);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(workers.started->load(),0u);
+    platform->attempts[0]->current().trigger_on_close(1000,"retire deferred handoff");held.reset();queue->drain();
+    EXPECT_EQ(snapshot(),committed);EXPECT_EQ(claimed(),2);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    senders.clear();const auto q=freeze();ASSERT_TRUE(q.unsent);EXPECT_TRUE(q.unsent->canonical_originals().empty());
+}
+TEST_F(RecoveryNegotiatedExport, SendCallbackCanDestroyOwnerBeforePreparedAckWorkerLaunch) {
+    negotiated_worker_observation workers;open();owner->add(ContinuousSharedRow{"destroy-on-send"});start();
+    const auto attempt=platform->attempts[0];attempt->before_send=[&](const platform_transport_callbacks&){senders.clear();};
+    EXPECT_NO_THROW(accept(caps()));EXPECT_TRUE(senders.empty());EXPECT_EQ(claimed(),2);
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    {std::lock_guard lock(attempt->mutex);attempt->before_send={};}
+    const auto q=freeze();ASSERT_TRUE(q.unsent);EXPECT_TRUE(q.unsent->canonical_originals().empty());
+}
+TEST_F(RecoveryNegotiatedExport, SynchronousActualAckCallbackSettlesWithoutRearmingAfterSend) {
+    negotiated_worker_observation workers;open();start();accept(caps());EXPECT_TRUE(audit_wire().empty());
+    owner->add(ContinuousSharedRow{"ack-inside-send"});
+    const auto original=std::get<std::string>(owner->db().query("SELECT globalId FROM AuditLog")[0].at("globalId"));
+    const auto attempt=platform->attempts[0];size_t callbacks=0;
+    attempt->before_send=[&](const platform_transport_callbacks& endpoint){++callbacks;
+        EXPECT_TRUE(endpoint.trigger_on_message(transport_message::from_string(server_sent_event::make_ack({original}).to_json())));
+        // Actual ACK processing completes reentrantly before foreign send returns.
+        EXPECT_EQ(senders[0]->get_progress().pending_upload,0);
+        EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),1);
+    };
+    queue->with_inline([&]{senders[0]->sync_now();});ASSERT_EQ(callbacks,1u);
+    queue->drain();EXPECT_EQ(senders[0]->get_progress().pending_upload,0);
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    EXPECT_EQ(claimed(),2);EXPECT_EQ(factory->wires[0]->audit_batches().size(),1u);EXPECT_TRUE(errors.empty());
+    {std::lock_guard lock(attempt->mutex);attempt->before_send={};}
+}
+
+TEST_F(RecoveryNegotiatedExport, MutationStageBusyTextIsAnErrorAndNeverReplayedAsAdmissionBusy) {
+    negotiated_worker_observation workers;open();owner->add(ContinuousSharedRow{"body-error"});start();const auto before=snapshot();size_t bodies=0;
+    negotiated_precommit_hook_scope fail([&]{++bodies;throw db_error("audit maintenance connection is busy");});
+    accept(caps());queue->drain();EXPECT_EQ(bodies,1u);EXPECT_EQ(errors.size(),1u);EXPECT_TRUE(audit_wire().empty());
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+}
+TEST_F(RecoveryNegotiatedExport, HandoffContentionExhaustionKeepsClaimsAndReportsWithoutAckWorker) {
+    negotiated_worker_observation workers;open();owner->add(ContinuousSharedRow{"bounded-busy"});start();
+    auto* physical=canonical_writer_custody_test_access::fault_handle(owner->db());std::unique_ptr<negotiated_writer_hold> held;
+    decltype(snapshot()) committed;size_t commits=0;
+    negotiated_hook_scope hold([&]{++commits;committed=snapshot();held=std::make_unique<negotiated_writer_hold>(physical);});
+    accept(caps());ASSERT_TRUE(held);
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(errors.empty()&&std::chrono::steady_clock::now()<deadline){if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+    ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors[0].find("deferral exhausted"),std::string::npos);
+    EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(commits,1u);EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    held.reset();EXPECT_EQ(snapshot(),committed);EXPECT_EQ(claimed(),2);
+    senders.clear();const auto q=freeze();ASSERT_TRUE(q.unsent);EXPECT_TRUE(q.unsent->canonical_originals().empty());
+}
+
 #endif
 
 

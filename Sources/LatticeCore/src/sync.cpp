@@ -606,6 +606,8 @@ struct sync_upload_continuation {
     uint64_t generation=0,policy_revision=0;
     std::string channel;
     std::vector<audit_log_entry> entries;
+    std::optional<committed_export_frame> protected_frame;
+    bool protected_in_flight=false;
 };
 }
 namespace {
@@ -1381,10 +1383,11 @@ void synchronizer_base::on_websocket_open() {
     // thread (e.g., IPC accept on the main thread). Reconciliation and the
     // initial upload must not block the caller.
     recovery_export_route_->publish(generation,true);
-    enqueue_discovery(detail::sync_discovery_kind::initial_upload,"initial upload",1024,[this,generation,lifetime](detail::sync_discovery_operation&) {
+    const auto protected_upload=std::make_shared<detail::sync_upload_continuation>();
+    enqueue_discovery(detail::sync_discovery_kind::initial_upload,"initial upload",1024,[this,generation,lifetime,protected_upload](detail::sync_discovery_operation& work) {
         if (is_destroyed_||!is_connected_||!lifetime->current(generation)) return true;
         bool busy=false;
-        if(upload_protected_entries(&busy))return true;
+        if(upload_protected_entries(*protected_upload,&work,&busy))return true;
         if(busy)return false;
         if(!lifetime->current(generation))return true;
         register_replication_slot(db().db(), config_.sync_id, config_.is_observer);
@@ -2684,7 +2687,9 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
     schedule_ack_retry(entries);
 }
 
-void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& entries) {
+void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& entries) {prepare_ack_retry(entries)();}
+
+std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<audit_log_entry>& entries,bool after_handoff) {
     // At-least-once delivery: a sent frame can vanish without any error —
     // e.g. the peer registers its frame handlers a beat after the upgrade
     // completes (WebSocketKit discards unhandled frames), or plain network
@@ -2710,8 +2715,18 @@ void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& e
     const int resend_failures = ack_resend_failures_.load(std::memory_order_relaxed);
     const auto lifetime=callback_lifetime_;const auto generation=lifetime->dispatch_generation();
     const auto scheduled=scheduler_;const auto test_schedule=detail::sync_background_test_hooks::ack;
-    std::thread([guard = ack_guard_, self = this, sent_ids = std::move(sent_ids),
-                 ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule] {
+    // This launcher owns every input before a foreign send. It may execute
+    // after that send synchronously ACKed or destroyed the owner.
+    return [guard = ack_guard_, self = this, sent_ids = std::move(sent_ids),
+            ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule,after_handoff]() mutable {
+      if(after_handoff){
+          std::lock_guard<std::mutex> g(guard->m);
+          if(!guard->alive||!lifetime->current(generation))return;
+          std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
+          if(std::none_of(sent_ids.begin(),sent_ids.end(),[&](const auto& id){return self->in_flight_ids_.count(id)!=0;}))return;
+      }
+      std::thread([guard,self,sent_ids=std::move(sent_ids),ack_timeout_base_ms,resend_failures,
+                   lifetime,generation,scheduled,test_schedule] {
         struct completion {
             std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> test;
             ~completion(){if(test&&test->completed)try{test->completed();}catch(...) {}}
@@ -2789,7 +2804,10 @@ void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& e
         if(request&&test_schedule&&test_schedule->after_timeout_transition)test_schedule->after_timeout_transition();
         if(request)lifetime->queued(generation,[self]{self->request_upload(true);});
         }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,{},std::current_exception(),"ACK retry worker");}
-    }).detach();
+      }).detach();
+    };
+#else
+    return []{};
 #endif  // !__EMSCRIPTEN__
 }
 
@@ -2809,10 +2827,11 @@ std::optional<bool> synchronizer_base::try_has_export_protection() {
 #endif
 }
 
-bool synchronizer_base::upload_protected_entries(bool* discovery_busy) {
+bool synchronizer_base::upload_protected_entries(detail::sync_upload_continuation& continuation,detail::sync_discovery_operation* work,bool* discovery_busy) {
 #ifdef __EMSCRIPTEN__
     return false;
 #else
+    if(continuation.protected_frame)return send_committed_entries(continuation,work,discovery_busy);
     const auto owner=owned_db_;const auto route=recovery_export_route_;const auto lifetime=callback_lifetime_;
     const auto generation=reconnect_lifecycle_.load();const auto channel=config_.sync_id;
     const auto source=continuous_route_?receiver_source_:nullptr;
@@ -2848,27 +2867,48 @@ bool synchronizer_base::upload_protected_entries(bool* discovery_busy) {
         throw db_error(prepared.blocked_original);
     }
     if(source&&!prepared.frame)source->finish_upload(upload_view);
-    if(prepared.frame)send_entries(std::move(*prepared.frame));
+    if(prepared.frame){
+        continuation.protected_frame.emplace(std::move(*prepared.frame));
+        return send_committed_entries(continuation,work,discovery_busy);
+    }
     return true; // No owner access after the reentrant transport call.
 #endif
 }
 
-void synchronizer_base::send_entries(detail::committed_export_frame frame) {
+bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation& continuation,detail::sync_discovery_operation* work,bool* discovery_busy) {
+    auto& frame=*continuation.protected_frame;
     const auto route=recovery_export_route_;const auto generation=reconnect_lifecycle_.load();
     std::vector<std::string> ids;ids.reserve(frame.entries().size());
-    {std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        for(const auto& entry:frame.entries()){in_flight_ids_[entry.global_id]=entry.id;ids.push_back(entry.global_id);}
+    auto retry=prepare_ack_retry(frame.entries(),true);
+    for(const auto& entry:frame.entries())ids.push_back(entry.global_id);
+    if(!continuation.protected_in_flight){
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        for(const auto& entry:frame.entries())in_flight_ids_[entry.global_id]=entry.id;
         progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));
+        progress_total_upload_.fetch_add(static_cast<int64_t>(ids.size()));
+        continuation.protected_in_flight=true;
     }
-    progress_total_upload_.fetch_add(static_cast<int64_t>(ids.size()));
-    schedule_ack_retry(frame.entries());
-    try {if(route->handoff(std::move(frame)))return;}
+    try {
+        const auto sent=discovery_busy?route->try_handoff(frame):std::optional<bool>(route->handoff(std::move(frame)));
+        if(!sent){
+            // Charge only when parking payload across turns. Ordinary handoff
+            // keeps its existing frame limits and does not reserve queue bytes.
+            discovery_charge charge;charge.entries(frame.entries());
+            charge.add(frame.retained_metadata_bytes(detail::sync_discovery_deferral::byte_limit));
+            if(!work||!discovery_deferral_->resize(work,charge.bytes))
+                throw db_error("committed export frame exceeds discovery retention budget; claimed originals remain pending");
+            work->coalescible.store(false,std::memory_order_release);
+            *discovery_busy=true;return false; // Exact frame, claims and in-flight exclusion survive.
+        }
+        if(*sent){retry();return true;} // Only captured inputs after possibly reentrant send.
+    }
     catch(...) {
         if(route->current(generation)){std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:ids)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
         throw;
     }
-    if(!route->current(generation))return;
+    if(!route->current(generation))return true;
     {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:ids)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
+    return true;
 }
 
 void synchronizer_base::upload_pending_changes() {
@@ -2892,7 +2932,7 @@ bool synchronizer_base::upload_pending_changes_step(detail::sync_upload_continua
     if(work&&work->generation!=generation)return true;
     if(!continuation.sending) {
         bool busy=false;
-        if(upload_protected_entries(work?&busy:nullptr))return true;
+        if(upload_protected_entries(continuation,work,work?&busy:nullptr))return true;
         if(busy)return false;
         if(!lifetime->current(generation))return true;
         continuation.policy_revision=upload_policy_revision_.load(std::memory_order_acquire);

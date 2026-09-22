@@ -45,6 +45,8 @@ public:
     committed_export_frame& operator=(committed_export_frame&&) noexcept;
     committed_export_frame(const committed_export_frame&)=delete;
     const std::vector<audit_log_entry>& entries()const noexcept{return entries_;}
+    // Payload metadata in addition to the separately charged decoded entries.
+    size_t retained_metadata_bytes(size_t cap)const noexcept;
     // Exact last selected local PK, not a source frontier or delivery receipt.
     // A moved-from/empty permit has no cursor. Only successful preparation
     // publishes a nonempty frame; the caller advances after its own handoff.
@@ -75,6 +77,10 @@ public:
     // A freeze after admission may coexist with completion of this already
     // claimed send. This is not a network drain or source receipt.
     bool handoff(committed_export_frame);
+    // Nullopt preserves the exact permit on initial no-effect admission busy.
+    std::optional<bool> try_handoff(committed_export_frame&);
+private:
+    bool handoff_impl(committed_export_frame&, bool*);
 };
 struct recovery_export_preparation {
     bool protected_store=false;
@@ -92,7 +98,7 @@ class recovery_export_adapter {
     friend class recovery_server_export_endpoint;
     friend class recovery_server_export_page;
     static void validate_server_limits(const recovery_export_limits&);
-    static void revalidate_claimed_frame(const committed_export_frame&);
+    static void revalidate_claimed_frame(const committed_export_frame&, bool* = nullptr);
     static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
         const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr,
@@ -102,8 +108,8 @@ public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.
     static bool protected_store(std::shared_ptr<lattice_db>);
-    // Nullopt is exclusively the first no-effect mutex probe being busy.
-    // Every other classifier/preparation failure still throws unchanged.
+    // Nullopt is exclusively a no-effect initial mutex admission being busy.
+    // The installer reports this before its owned body; all later errors throw.
     static std::optional<bool> try_protected_store(std::shared_ptr<lattice_db>);
     static std::optional<recovery_export_preparation> try_prepare_pending(std::shared_ptr<lattice_db>,
         const std::string& sync_id,uint64_t physical_generation,size_t maximum_entries,

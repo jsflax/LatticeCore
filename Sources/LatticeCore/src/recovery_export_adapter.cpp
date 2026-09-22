@@ -660,7 +660,8 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
             refuse("export coverage pending inventory changed during claims");
         frame.message_=transport_message::from_binary({encoded.begin(),encoded.end()});
         if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked during claims");
-    });
+    },discovery_busy);
+    if(discovery_busy&&*discovery_busy)return output;
     require_committed(result);
     if(!frame.entries_.empty()){
         if(recovery_export_test_hooks::after_claim_commit)recovery_export_test_hooks::after_claim_commit();
@@ -693,11 +694,12 @@ void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> own
     require_committed(result);
 }
 void recovery_export_adapter::validate_server_limits(const recovery_export_limits& limits){limits_ok(limits,limits.entries,{});}
-void recovery_export_adapter::revalidate_claimed_frame(const committed_export_frame& frame){
+void recovery_export_adapter::revalidate_claimed_frame(const committed_export_frame& frame,bool* busy){
     const auto result=recovery_continuous_producer::export_owned(frame.owner_,frame.continuous_work_,[&](database&){
         check_scopes(recovery_local_producer_adapter::export_inventory_for_owned_write(frame.owner_),frame.scopes_);
         recovery_obligation_store journal(frame.owner_,frame.limits_.obligations,frame.limits_.installations);check_claims(journal,frame.claims_,frame.entries_);
-    });
+    },busy);
+    if(busy&&*busy)return;
     recovery_export_adapter::require_committed(result);
 }
 recovery_export_route::recovery_export_route(std::shared_ptr<sync_transport> transport,std::shared_ptr<sync_callback_lifetime> lifetime):transport_(std::move(transport)),lifetime_(std::move(lifetime)){}
@@ -727,10 +729,35 @@ bool recovery_export_route::retire_protected(std::thread pacer)noexcept{
 void recovery_export_route::publish(uint64_t generation,bool open) noexcept{std::lock_guard<std::mutex> lock(mutex_);if(!retired_){generation_=generation;open_=open;}}
 void recovery_export_route::retire() noexcept{if(retire_protected())return;std::lock_guard<std::mutex> lock(mutex_);retired_=true;open_=false;}
 bool recovery_export_route::current(uint64_t generation) noexcept{std::lock_guard<std::mutex> lock(mutex_);return !retired_&&open_&&generation_==generation&&lifetime_->current(generation);}
-bool recovery_export_route::handoff(committed_export_frame frame){
-    if(frame.consumed_||!frame.owner_||frame.entries_.empty()||frame.claims_.empty())refuse("export permit already consumed or missing custody");frame.consumed_=true;
-    if(!current(frame.physical_generation_)||frame.owner_->is_closed())return false;
-    recovery_export_adapter::revalidate_claimed_frame(frame);
+size_t committed_export_frame::retained_metadata_bytes(size_t cap)const noexcept {
+    size_t bytes=sizeof(*this);
+    const auto add=[&](size_t n,size_t width=1){if(bytes>cap||n>(cap-bytes)/width)bytes=cap+1;else bytes+=n*width;};
+    const auto text=[&](const std::string& value){add(value.capacity());add(1);};
+    add(message_.data.capacity());add(claims_.capacity(),sizeof(recovery_obligation_export_ticket));
+    for(const auto& claim:claims_){text(claim.address.channel);add(claim.canonical_original_ids.capacity(),sizeof(std::string));for(const auto& id:claim.canonical_original_ids)text(id);}
+    add(scopes_.capacity(),sizeof(recovery_local_export_scope));
+    for(const auto& scope:scopes_){
+        const auto& c=scope.contribution;const auto& b=c.profile.binding;
+        for(const auto* value:{&b.channel,&b.authority,&b.source,&b.epoch,&b.scope,&b.schema,&c.profile.profile_digest,&c.profile.receipt_namespace,&c.address.channel,&c.installed_manifest,&scope.program_digest})text(*value);
+        add(scope.tables.capacity(),sizeof(recovery_local_export_table));
+        for(const auto& table:scope.tables){text(table.name);add(table.columns.capacity(),sizeof(decltype(table.columns)::value_type));
+            for(const auto& column:table.columns)text(column.first);
+            add(table.no_history.size(),sizeof(std::string)+4*sizeof(void*));for(const auto& name:table.no_history)text(name);}
+    }
+    return bytes;
+}
+bool recovery_export_route::handoff(committed_export_frame frame){return handoff_impl(frame,nullptr);}
+std::optional<bool> recovery_export_route::try_handoff(committed_export_frame& frame){
+    bool busy=false;const bool sent=handoff_impl(frame,&busy);
+    if(busy)return std::nullopt;return sent;
+}
+bool recovery_export_route::handoff_impl(committed_export_frame& frame,bool* busy){
+    if(frame.consumed_||!frame.owner_||frame.entries_.empty()||frame.claims_.empty())refuse("export permit already consumed or missing custody");
+    if(!current(frame.physical_generation_)||frame.owner_->is_closed()){frame.consumed_=true;return false;}
+    try {recovery_export_adapter::revalidate_claimed_frame(frame,busy);}
+    catch(...){frame.consumed_=true;throw;}
+    if(busy&&*busy)return false;
+    frame.consumed_=true;
     if(frame.owner_->is_closed()||!lifetime_->protected_current(frame.physical_generation_))return false;
     std::shared_ptr<sync_transport> transport;
     {std::lock_guard<std::mutex> lock(mutex_);if(retired_||!open_||generation_!=frame.physical_generation_)return false;transport=transport_;}

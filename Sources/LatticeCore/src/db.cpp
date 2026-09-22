@@ -1262,6 +1262,11 @@ bool database::maintenance_scope::idle(database& db) noexcept {
 }
 
 void database::maintenance_scope::probe_before_store_gate(database& db) {
+    if (!try_probe_before_store_gate(db))
+        throw db_error("audit maintenance connection is busy");
+}
+
+bool database::maintenance_scope::try_probe_before_store_gate(database& db) {
     auto* mutex = db.db_ ? sqlite3_db_mutex(db.db_) : nullptr;
 #ifndef __EMSCRIPTEN__
     if (!mutex) throw db_error("audit maintenance requires a serialized connection");
@@ -1270,11 +1275,11 @@ void database::maintenance_scope::probe_before_store_gate(database& db) {
     // writer owns the shared-memory gate and is waiting for SQLite. Reject
     // callback/statement reentry BEFORE waiting for that gate. This probe
     // acquires no gate and never waits for another SQLite thread.
-    if (sqlite3_mutex_try(mutex) != SQLITE_OK)
-        throw db_error("audit maintenance connection is busy");
+    if (sqlite3_mutex_try(mutex) != SQLITE_OK) return false;
     const bool available = idle(db);
     sqlite3_mutex_leave(mutex);
     if (!available) throw db_error("audit maintenance requires an idle connection");
+    return true;
 }
 
 database::maintenance_scope::maintenance_scope(database& db)

@@ -442,8 +442,9 @@ void reset_sync_channel_with_producer_fence(lattice_db& owner,const std::string&
 
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
     const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
-    const std::function<void()>& after_writer_capture) {
+    const std::function<void()>& after_writer_capture, bool* initial_admission_busy) {
     recovery_install_result result;
+    if (initial_admission_busy) *initial_admission_busy = false;
     std::shared_ptr<database> writer;
     lattice_db::recovery_commit_batch batch;
     using phase = database::sync_apply_chunk_state::phase;
@@ -461,7 +462,12 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
         // Private deterministic test rendezvous only; no owner/store/SQLite
         // lock is held here. Production supplies no callback.
         if (after_writer_capture) after_writer_capture();
-        database::maintenance_scope::probe_before_store_gate(*writer);
+        if (initial_admission_busy) {
+            if (!database::maintenance_scope::try_probe_before_store_gate(*writer)) {
+                *initial_admission_busy = true;
+                return result; // No gate, owned body, mutation or COMMIT entered.
+            }
+        } else database::maintenance_scope::probe_before_store_gate(*writer);
         {
             lattice_db::store_write_gate_hold gate(*owner);
             std::unique_lock<std::recursive_timed_mutex> memory_gate;

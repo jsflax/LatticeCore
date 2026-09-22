@@ -95,7 +95,7 @@ private:
     static bool active_install_for(const lattice_db*, sqlite3*) noexcept;
     static recovery_install_result install_impl(std::shared_ptr<lattice_db>,
         const std::function<void(database&)>&, const std::function<void()>& after_unlock,
-        const std::function<void()>& after_writer_capture = {});
+        const std::function<void()>& after_writer_capture = {}, bool* initial_admission_busy = nullptr);
     static void deliver(lattice_db&, const lattice_db::recovery_commit_batch&);
     friend struct recovery_install_test_access;
     friend struct recovery_install_admission_test_access;

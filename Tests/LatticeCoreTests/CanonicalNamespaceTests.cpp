@@ -110,7 +110,8 @@ struct Fault {
         previous(canonical_upstream_test_hooks::fault),prior(active){active=this;canonical_upstream_test_hooks::fault=&probe;}
     ~Fault(){canonical_upstream_test_hooks::fault=previous;active=prior;}
     static int restrict_action(int action,const char* one,const char* two,const char* origin)noexcept{
-        auto& f=*active;if(origin||f.hits)return SQLITE_OK;
+        // COMMIT failure retries once; keep denying while this fault is live.
+        auto& f=*active;if(origin||(f.hits&&f.kind!=Kind::commit_deny))return SQLITE_OK;
         const auto same=[](const char* a,const char* b){return a&&std::strcmp(a,b)==0;};
         if(f.kind==Kind::commit_deny&&action==SQLITE_TRANSACTION&&same(one,"COMMIT")){++f.hits;return SQLITE_DENY;}
         if(action==SQLITE_INSERT&&same(one,"_lattice_canonical_receipt")&&(f.kind==Kind::receipt_ignore||f.kind==Kind::receipt_deny)){
@@ -220,7 +221,7 @@ TEST_F(CanonicalNamespace, IgnoredOrDeniedFirstReceiptRollsBackItsEffectButNextE
 }
 TEST_F(CanonicalNamespace, CommitFailureLeavesNoNamespaceReceiptAndObserverFailurePreservesCommit){
     attach();auto admission=admit();auto e=entry(101,1);const auto before=state(*owner,p);
-    {Fault fault(owner->db(),Fault::Kind::commit_deny);EXPECT_TRUE(apply(admission,{e}).empty());EXPECT_EQ(fault.hits,1);}
+    {Fault fault(owner->db(),Fault::Kind::commit_deny);EXPECT_TRUE(apply(admission,{e}).empty());EXPECT_EQ(fault.hits,2);}
     EXPECT_EQ(state(*owner,p),before);EXPECT_FALSE(receipt(*owner,p,e.global_id));EXPECT_EQ(scalar(owner->db(),"SELECT COUNT(*) FROM NamespaceRow"),0);
     int calls=0;auto token=owner->add_table_observer("NamespaceRow",[&](const auto&){++calls;throw std::runtime_error("postcommit observer");});
     EXPECT_EQ(apply(admission,{e}),std::vector<std::string>{e.global_id});owner->remove_table_observer("NamespaceRow",token);

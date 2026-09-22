@@ -360,7 +360,7 @@ TEST_F(RecoveryProducerContinuity, ImpossibleFrozenCapacityRefusesBeforeEnrollme
     EXPECT_FALSE(std::filesystem::exists(container));
 }
 TEST_F(RecoveryProducerContinuity, ConfiguredUnsupportedRouteRefusesBeforeContainerCreation) {
-    auto c=config();c.websocket_url="wss://outside.invalid";auto refused=recovery_continuous_producer::open(c,policy);
+    auto c=config();c.websocket_url="wss://outside.invalid";c.authorization_token="configured-route-fixture";auto refused=recovery_continuous_producer::open(c,policy);
     EXPECT_FALSE(refused.owner);
     EXPECT_FALSE(std::filesystem::exists(container));
     EXPECT_TRUE(factory->wires.empty());

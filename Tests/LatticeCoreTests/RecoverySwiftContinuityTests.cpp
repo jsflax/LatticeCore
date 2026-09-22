@@ -163,7 +163,7 @@ TEST_F(RecoverySwiftContinuity, OrdinarySwiftFactoryAndLegacyNativeCannotReattac
     EXPECT_EQ(before,snapshot(ref));
 }
 TEST_F(RecoverySwiftContinuity, ConfiguredWSSFacadeOwnsSameDerivedSchemaBeforeRoutePublication) {
-    auto c=config();c.websocket_url=policy.routes[0].endpoint;
+    auto c=config();c.websocket_url=policy.routes[0].endpoint;c.authorization_token="configured-route-fixture";
     continuous_result result;auto ref=open_swift_continuous(c,schemas,policy,result);require_swift_commit(result);
     ASSERT_TRUE(ref&&ref->valid());facades.push_back(std::move(ref));stop_notifier();
     std::vector<std::shared_ptr<::lattice::swift_lattice>> owners;
@@ -174,7 +174,7 @@ TEST_F(RecoverySwiftContinuity, ConfiguredWSSFacadeOwnsSameDerivedSchemaBeforeRo
     EXPECT_EQ(owners[0]->objects("ContinuousSwiftRow").size(),1u);EXPECT_EQ(owners[1]->objects("ContinuousSwiftRow").size(),1u);
 }
 TEST_F(RecoverySwiftContinuity, FailedRoutePublicationReportsKnownCommitAndExactReopen) {
-    policy.owners=1;auto c=config();c.websocket_url=policy.routes[0].endpoint;
+    policy.owners=1;auto c=config();c.websocket_url=policy.routes[0].endpoint;c.authorization_token="configured-route-fixture";
     continuous_result result;auto refused=open_swift_continuous(c,schemas,policy,result);
     EXPECT_FALSE(refused&&refused->valid());EXPECT_EQ(result.phase(),2);EXPECT_FALSE(result.postcommit_error().empty());
     EXPECT_TRUE(result.primary_error().empty());EXPECT_TRUE(std::filesystem::exists(container/"store.sqlite"));

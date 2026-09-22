@@ -3,5 +3,6 @@
 module LatticeServerExportTestSupport {
     header "swift_test_support_umbrella.hpp"
     textual header "server_export_fixture.hpp"
+    textual header "platform_transport_fixture.hpp"
     export *
 }

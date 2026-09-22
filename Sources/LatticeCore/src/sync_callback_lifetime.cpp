@@ -38,11 +38,18 @@ void sync_callback_lifetime::wait_for_foreign(){
     std::unique_lock<std::mutex> lock(mutex_);
     settled_.wait(lock,[&]{return active_<=own;}); // wait releases leaf lock
 }
-bool sync_callback_lifetime::run(uint64_t generation,const std::function<void()>& work,bool require_live){
+bool sync_callback_lifetime::run(uint64_t generation,const std::function<void()>& work,bool require_live,const platform_transport_callbacks* attempt,bool terminal){
     std::shared_ptr<lattice_db> db;
     {std::lock_guard<std::mutex> lock(mutex_);
         if(retired_||!owner_||generation_!=generation||(protected_&&(protected_generation_!=generation||(require_live&&!attempt_live_))))return false;
         if(active_==std::numeric_limits<uint64_t>::max())return false;
+        // Linearization point for a platform callback: both owner permission
+        // (above) and actual dial identity are current here, while retirement
+        // cannot pass this owner leaf. Replacement after this check is an
+        // already-admitted execution, whose existing settlement is preserved.
+        // The endpoint check is one atomic load, never an endpoint lock,
+        // callback, capture copy/destruction, SQL operation or scheduler call.
+        if(attempt&&!attempt->current_attempt_for_owner(terminal))return false;
         db=database_.lock();++active_;
     }
     execution turn(*this,generation,std::move(db));work();return true;
@@ -52,6 +59,8 @@ void sync_callback_lifetime::transport(const std::function<void()>& work){
     run(generation,work);
 }
 void sync_callback_lifetime::queued(uint64_t generation,const std::function<void()>& work){run(generation,work);}
+void sync_callback_lifetime::platform_callback(uint64_t generation,const platform_transport_callbacks& attempt,const std::function<void()>& work){run(generation,work,true,&attempt);}
+void sync_callback_lifetime::platform_terminal_callback(uint64_t generation,const platform_transport_callbacks& attempt,const std::function<void()>& work){run(generation,work,true,&attempt,true);}
 void sync_callback_lifetime::terminal_notification(uint64_t generation,const std::function<void()>& work){run(generation,work,false);}
 namespace {
 class lifetime_scheduler final : public scheduler {

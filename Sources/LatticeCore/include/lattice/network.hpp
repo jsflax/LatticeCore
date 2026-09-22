@@ -9,6 +9,9 @@
 #include <optional>
 #include <map>
 #include <mutex>
+#include <atomic>
+#include <limits>
+#include <stdexcept>
 
 namespace lattice {
 
@@ -217,6 +220,270 @@ public:
 };
 
 using UniqueSyncTransport = std::unique_ptr<sync_transport>;
+
+// Platform callbacks must not retain a pointer to the native transport. This
+// value owns only its callback cell and the exact connect attempt. It is safe
+// to retain after the transport is deleted; stale events then do nothing.
+// This is lifetime provenance, NOT authenticated source/recovery authority.
+namespace detail { struct platform_transport_test_access; struct platform_attempt_owner_test_access; class sync_callback_lifetime; }
+class owned_platform_sync_transport;
+class platform_transport_callbacks {
+    struct handlers {
+        std::function<void(const platform_transport_callbacks&)> open;
+        std::function<void(const platform_transport_callbacks&, const transport_message&)> message;
+        std::function<void(const platform_transport_callbacks&, const std::string&)> error;
+        std::function<void(const platform_transport_callbacks&, int, const std::string&)> close;
+    };
+    struct cell {
+        std::mutex mutex;
+        uint64_t generation = 0;
+        // A denial fence published only with the endpoint transition under
+        // mutex. Owner admission reads it without taking this endpoint lock.
+        std::atomic<uint64_t> owner_attempt{0};
+        std::atomic<uint64_t> live_owner_attempt{0};
+        transport_state phase = transport_state::closed;
+        bool retired = false;
+        handlers callbacks;
+        // Private source-test rendezvous; normally empty. Never runs under mutex.
+        std::function<void()> before_error_delivery;
+        std::function<void()> before_message_delivery;
+    };
+    std::shared_ptr<cell> cell_;
+    uint64_t generation_ = 0;
+    platform_transport_callbacks(std::shared_ptr<cell> state, uint64_t generation)
+        : cell_(std::move(state)), generation_(generation) {}
+    bool current_locked() const {
+        return !cell_->retired && generation_ != 0 && cell_->generation == generation_ &&
+            (cell_->phase == transport_state::connecting || cell_->phase == transport_state::open);
+    }
+    friend class owned_platform_sync_transport;
+    friend struct detail::platform_transport_test_access;
+    friend struct detail::platform_attempt_owner_test_access;
+    friend class detail::sync_callback_lifetime;
+    // Called only while the owner admission leaf is held. The atomic fence
+    // avoids nesting endpoint and owner locks (including capture-copy paths).
+    // A terminal callback has already closed its phase; identity, not phase,
+    // distinguishes it from a replaced or retired physical attempt.
+    bool current_attempt_for_owner(bool terminal) const {
+        if (!cell_) return false;
+        const auto current = terminal ? cell_->owner_attempt.load(std::memory_order_acquire)
+                                      : cell_->live_owner_attempt.load(std::memory_order_acquire);
+        return generation_ != 0 && current == generation_;
+    }
+public:
+    platform_transport_callbacks() = default;
+    bool is_current() const {
+        if (!cell_) return false;
+        std::lock_guard<std::mutex> lock(cell_->mutex);
+        return current_locked();
+    }
+    bool matches(const platform_transport_callbacks& other) const {
+        return cell_ && cell_ == other.cell_ && generation_ != 0 && generation_ == other.generation_;
+    }
+    // Admission linearizes under the cell mutex; admitted work may finish
+    // after a concurrent disconnect. No foreign callback runs under this lock.
+    // The synchronizer's separate owner-lifetime admission protects its body.
+    bool trigger_on_open() const {
+        if (!cell_) return false;
+        decltype(handlers::open) callback;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            if (!current_locked() || cell_->phase != transport_state::connecting) return false;
+            callback = cell_->callbacks.open;
+            cell_->phase = transport_state::open;
+        }
+        if (callback) callback(*this);
+        return true;
+    }
+    bool trigger_on_message(const transport_message& message) const {
+        if (!cell_) return false;
+        decltype(handlers::message) callback;
+        std::function<void()> before_delivery;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            if (!current_locked() || cell_->phase != transport_state::open) return false;
+            callback = cell_->callbacks.message;
+            before_delivery = cell_->before_message_delivery;
+        }
+        if (before_delivery) before_delivery();
+        if (callback) callback(*this, message);
+        return true;
+    }
+    bool trigger_on_error(const std::string& error) const {
+        if (!cell_) return false;
+        decltype(handlers::error) callback;
+        std::function<void()> before_delivery;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            if (!current_locked()) return false;
+            callback = cell_->callbacks.error;
+            before_delivery = cell_->before_error_delivery;
+            cell_->phase = transport_state::closed;
+            cell_->live_owner_attempt.store(0, std::memory_order_release);
+        }
+        if (before_delivery) before_delivery();
+        if (callback) callback(*this, error);
+        return true;
+    }
+    bool trigger_on_close(int code, const std::string& reason) const {
+        if (!cell_) return false;
+        decltype(handlers::close) callback;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            if (!current_locked()) return false;
+            callback = cell_->callbacks.close;
+            cell_->phase = transport_state::closed;
+            cell_->live_owner_attempt.store(0, std::memory_order_release);
+        }
+        if (callback) callback(*this, code, reason);
+        return true;
+    }
+};
+
+// Constructed by the native factory below, never copied into Swift-allocated
+// storage. Native delete releases the platform retain exactly once. Existing
+// generic/custom transports keep their original API and trust semantics.
+class owned_platform_sync_transport final : public sync_transport {
+public:
+    using connect_fn_ptr = void (*)(void*, const void*, const void*, const void*);
+    using disconnect_fn_ptr = void (*)(void*);
+    using send_fn_ptr = void (*)(void*, const void*, const void*);
+    using destroy_fn_ptr = void (*)(void*);
+private:
+    std::shared_ptr<platform_transport_callbacks::cell> cell_ =
+        std::make_shared<platform_transport_callbacks::cell>();
+    void* user_data_;
+    connect_fn_ptr connect_;
+    disconnect_fn_ptr disconnect_;
+    send_fn_ptr send_;
+    destroy_fn_ptr destroy_;
+public:
+    owned_platform_sync_transport(void* user_data, connect_fn_ptr connect,
+        disconnect_fn_ptr disconnect, send_fn_ptr send, destroy_fn_ptr destroy)
+        : user_data_(user_data), connect_(connect), disconnect_(disconnect), send_(send), destroy_(destroy) {}
+    owned_platform_sync_transport(const owned_platform_sync_transport&) = delete;
+    owned_platform_sync_transport& operator=(const owned_platform_sync_transport&) = delete;
+    ~owned_platform_sync_transport() override {
+        platform_transport_callbacks::handlers retired_callbacks;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            cell_->retired = true;
+            cell_->phase = transport_state::closed;
+            cell_->owner_attempt.store(0, std::memory_order_release);
+            cell_->live_owner_attempt.store(0, std::memory_order_release);
+            std::swap(retired_callbacks, cell_->callbacks);
+        }
+        // Release captures and platform resources outside the cell lock.
+        // Platform destruction must be nonthrowing and must not join itself.
+        if (destroy_) destroy_(user_data_);
+    }
+private:
+    void connect_impl(const std::string& url, const HeadersMap& headers,
+                      std::optional<platform_transport_callbacks::handlers> replacement) {
+        platform_transport_callbacks endpoint;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            if (cell_->retired || cell_->generation == std::numeric_limits<uint64_t>::max())
+                throw std::overflow_error("platform transport attempt exhausted");
+            if (replacement) std::swap(cell_->callbacks, *replacement);
+            ++cell_->generation;
+            cell_->phase = transport_state::connecting;
+            endpoint = platform_transport_callbacks(cell_, cell_->generation);
+            cell_->owner_attempt.store(cell_->generation, std::memory_order_release);
+            cell_->live_owner_attempt.store(cell_->generation, std::memory_order_release);
+        }
+        // Any displaced handler captures outlive the lock and are released
+        // only after this call. Copied old handlers retain their old lifecycle.
+        if (connect_) connect_(user_data_, &url, &headers, &endpoint);
+    }
+public:
+    void connect(const std::string& url, const HeadersMap& headers = {}) override {
+        connect_impl(url, headers, std::nullopt);
+    }
+    // The actual synchronizer supplies handlers that capture its lifecycle.
+    // Publish the complete handler set atomically with the new dial attempt.
+    void connect_with_handlers(const std::string& url, const HeadersMap& headers,
+        on_open_handler open, on_message_handler message, on_error_handler error, on_close_handler close) {
+        connect_with_attempt_handlers(url, headers,
+            [open=std::move(open)](const platform_transport_callbacks&) { if (open) open(); },
+            [message=std::move(message)](const platform_transport_callbacks&, const transport_message& value) { if (message) message(value); },
+            [error=std::move(error)](const platform_transport_callbacks&, const std::string& value) { if (error) error(value); },
+            [close=std::move(close)](const platform_transport_callbacks&, int code, const std::string& reason) { if (close) close(code,reason); });
+    }
+    // Preserve the actual endpoint identity through the independent owner
+    // admission. Automatic redials can share an owner lifecycle, never this
+    // monotonically identified native attempt. Compatibility APIs above keep
+    // their original callback signatures and do not confer owner admission.
+    void connect_with_attempt_handlers(const std::string& url, const HeadersMap& headers,
+        std::function<void(const platform_transport_callbacks&)> open,
+        std::function<void(const platform_transport_callbacks&, const transport_message&)> message,
+        std::function<void(const platform_transport_callbacks&, const std::string&)> error,
+        std::function<void(const platform_transport_callbacks&, int, const std::string&)> close) {
+        connect_impl(url, headers, platform_transport_callbacks::handlers{
+            std::move(open), std::move(message), std::move(error), std::move(close)});
+    }
+    void disconnect() override {
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            cell_->phase = transport_state::closed;
+            cell_->owner_attempt.store(0, std::memory_order_release);
+            cell_->live_owner_attempt.store(0, std::memory_order_release);
+        }
+        if (disconnect_) disconnect_(user_data_);
+    }
+    transport_state state() const override {
+        std::lock_guard<std::mutex> lock(cell_->mutex);
+        return cell_->phase;
+    }
+    void send(const transport_message& message) override {
+        platform_transport_callbacks endpoint;
+        {
+            std::lock_guard<std::mutex> lock(cell_->mutex);
+            if (cell_->retired || cell_->phase != transport_state::open) return;
+            endpoint = platform_transport_callbacks(cell_, cell_->generation);
+        }
+        if (send_) send_(user_data_, &message, &endpoint);
+    }
+    void set_on_open(on_open_handler handler) override {
+        decltype(platform_transport_callbacks::handlers::open) replacement =
+            [handler=std::move(handler)](const platform_transport_callbacks&) { if (handler) handler(); };
+        std::lock_guard<std::mutex> lock(cell_->mutex);
+        cell_->callbacks.open.swap(replacement);
+    }
+    void set_on_message(on_message_handler handler) override {
+        decltype(platform_transport_callbacks::handlers::message) replacement =
+            [handler=std::move(handler)](const platform_transport_callbacks&, const transport_message& value) { if (handler) handler(value); };
+        std::lock_guard<std::mutex> lock(cell_->mutex);
+        cell_->callbacks.message.swap(replacement);
+    }
+    void set_on_error(on_error_handler handler) override {
+        decltype(platform_transport_callbacks::handlers::error) replacement =
+            [handler=std::move(handler)](const platform_transport_callbacks&, const std::string& value) { if (handler) handler(value); };
+        std::lock_guard<std::mutex> lock(cell_->mutex);
+        cell_->callbacks.error.swap(replacement);
+    }
+    void set_on_close(on_close_handler handler) override {
+        decltype(platform_transport_callbacks::handlers::close) replacement =
+            [handler=std::move(handler)](const platform_transport_callbacks&, int code, const std::string& reason) { if (handler) handler(code,reason); };
+        std::lock_guard<std::mutex> lock(cell_->mutex);
+        cell_->callbacks.close.swap(replacement);
+    }
+};
+
+// Consumes the platform retain on both success and allocation failure. The
+// caller gives the resulting native pointer directly to unique_ptr ownership.
+inline sync_transport* make_owned_platform_sync_transport(void* user_data,
+    owned_platform_sync_transport::connect_fn_ptr connect,
+    owned_platform_sync_transport::disconnect_fn_ptr disconnect,
+    owned_platform_sync_transport::send_fn_ptr send,
+    owned_platform_sync_transport::destroy_fn_ptr destroy) noexcept {
+    try {
+        return new owned_platform_sync_transport(user_data, connect, disconnect, send, destroy);
+    } catch (...) {
+        if (destroy) destroy(user_data);
+        return nullptr;
+    }
+}
 
 // ============================================================================
 // Factory for creating platform-specific clients

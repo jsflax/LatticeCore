@@ -52,7 +52,7 @@ class sync_callback_lifetime {
     std::weak_ptr<lattice_db> database_;
     uint64_t generation_=1, active_=0, protected_generation_=0;
     bool retired_=false, ever_connected_=false, protected_=false, attempt_live_=false;
-    bool run(uint64_t,const std::function<void()>&,bool require_live=true);
+    bool run(uint64_t,const std::function<void()>&,bool require_live=true,const platform_transport_callbacks* attempt=nullptr,bool terminal=false);
 public:
     sync_callback_lifetime(synchronizer_base*,const std::shared_ptr<lattice_db>&);
     uint64_t dispatch_generation();
@@ -71,6 +71,11 @@ public:
     bool executing_here()const noexcept;
     void transport(const std::function<void()>&);
     void queued(uint64_t,const std::function<void()>&);
+    // Per-dial endpoint identity and owner generation are checked in ONE owner
+    // admission. Replaced/retired endpoints cannot borrow an automatic retry's
+    // unchanged lifecycle. Already owner-admitted executions still settle.
+    void platform_callback(uint64_t,const platform_transport_callbacks&,const std::function<void()>&);
+    void platform_terminal_callback(uint64_t,const platform_transport_callbacks&,const std::function<void()>&);
     void terminal_notification(uint64_t,const std::function<void()>&);
 };
 void report_sync_background_error(std::shared_ptr<scheduler>,std::shared_ptr<sync_callback_lifetime>,uint64_t,

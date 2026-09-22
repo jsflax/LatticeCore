@@ -1047,6 +1047,10 @@ bool synchronizer_base::retire_protected_transport() noexcept {
 }
 
 void synchronizer_base::setup_transport_handlers() {
+    // Owned platform endpoints receive a complete lifecycle-bound handler set
+    // atomically with each actual dial below. Custom transports retain their
+    // original once-installed callback contract.
+    if (dynamic_cast<owned_platform_sync_transport*>(ws_client_.get())) return;
     // Installed exactly once before connect; no racing handler replacement.
     // Every callback acquires physical owner admission before touching this.
     const auto lifetime=callback_lifetime_;
@@ -1173,6 +1177,17 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
     if(!lifetime->current(lifecycle))return;
     if(protected_route)route->prepare_protected(lifecycle);
     else lifetime->begin_connect(lifecycle,false);
+    const auto dial = [this,transport,lifetime,lifecycle](const std::string& url, const HeadersMap& headers) {
+        if (const auto platform = std::dynamic_pointer_cast<owned_platform_sync_transport>(transport)) {
+            platform->connect_with_attempt_handlers(url, headers,
+                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt) { lifetime->platform_callback(lifecycle,attempt,[this] { background_operation("transport open",[this] { on_websocket_open(); }); }); },
+                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const transport_message& message) { lifetime->platform_callback(lifecycle,attempt,[this,&message] { background_operation("transport message",[this,&message] { on_transport_message(message); }); }); },
+                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const std::string& error) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,&error] { background_operation("transport error",[this,&error] { on_websocket_error(error); }); }); },
+                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,int code,const std::string& reason) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,code,&reason] { background_operation("transport close",[this,code,&reason] { on_websocket_close(code,reason); }); }); });
+        } else {
+            transport->connect(url, headers);
+        }
+    };
     LOG_INFO("synchronizer", "[%s] connect() (this=%p, db=%s)",
              log_id(), (void*)this, db().config().path.c_str());
     if (config_.websocket_url.empty()) {
@@ -1186,7 +1201,7 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
         LOG_INFO("synchronizer", "[%s] IPC connect: supports_reconnect=%d",
                  log_id(), (lifecycle & 1) ? 1 : 0);
         if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
-        transport->connect("", {});
+        dial("", {});
         return;
     }
 
@@ -1210,7 +1225,7 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
     // Cursor lookup may take time. Do not publish an old attempt after an
     // explicit stop or replacement completed while its parameters were read.
     if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
-    transport->connect(url, headers);
+    dial(url, headers);
 }
 
 void synchronizer_base::disconnect() {

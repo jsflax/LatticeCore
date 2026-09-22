@@ -242,10 +242,6 @@ TEST(RecoveryReceiverSource, OrdinaryKindsAndMixedDuplicateControlAreDiscriminat
 namespace {
 // Exercise actual owner construction/publication, without opening a socket or
 // granting TLS/source authority. The global factory is restored on every exit.
-class PolicyQuietTransport final:public lattice::mock_sync_transport {
-public:
-    void connect(const std::string&,const std::map<std::string,std::string>& = {})override{}
-};
 class PolicyConstructionFactory final:public lattice::network_factory {
     std::mutex mutex_;std::condition_variable changed_;
     bool hold_=false,entered_=false,released_=false,fail_=false,timed_out_=false;
@@ -267,7 +263,14 @@ public:
             }
         }
         if(fail)throw std::runtime_error("bounded injected transport construction failure");
-        return std::make_unique<PolicyQuietTransport>();
+        // Exercise the actual owned-platform dial boundary, but never report
+        // an open event or provide a TLS verifier/source proof. No callback
+        // retains fixture state; normal native retirement remains unchanged.
+        auto quiet=std::unique_ptr<lattice::sync_transport>(lattice::make_owned_platform_sync_transport(nullptr,
+            [](void*,const void*,const void*,const void*){},[](void*){},
+            [](void*,const void*,const void*){},[](void*){}));
+        if(!quiet)throw std::runtime_error("quiet owned transport allocation failed");
+        return quiet;
     }
 };
 struct PolicyFactoryScope {

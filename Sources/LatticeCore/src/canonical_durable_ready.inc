@@ -174,6 +174,7 @@ cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,co
     for(int64_t i=0;i<n;++i) {
         if(auto* observation=canonical_ready_test_observation::current)++observation->audited_frames;
         const auto raw=ready_frame(db,p,key,i);wire=ready_add(wire,raw.size());charge=ready_add(charge,ready_add(raw.size(),128));ready_hash_frame(hash,raw);
+        if(auto* observation=canonical_ready_read_test_observation::current){++observation->audited_frames;observation->audited_bytes+=raw.size();}
         if(wire>static_cast<int64_t>(p.package.retained_wire_bytes) || charge>p.transfer_bytes)refuse("canonical READY bytes exceed charged cap");
         const auto frame=cr::decode(raw,p.package.codec);
         if(frame.logical!=request.logical || frame.route_generation!=ready_route || cr::encode(frame,p.package.codec)!=raw)
@@ -224,6 +225,7 @@ void dispose_ready(database& db,const canonical_ready_profile& p,const database:
 }
 }
 void canonical_writer_adapter::verify_ready_retention(database& writer,const context& state,const retention_session& session) {
+    if(auto* observation=canonical_ready_read_test_observation::current)++observation->full_audits;
     if(!state.ready || !state.namespaces)refuse("canonical READY profile missing");const auto& p=*state.ready;
     const auto sync=writer.query("PRAGMA main.synchronous"),mode=writer.query("PRAGMA main.journal_mode");
     if(sync.size()!=1 || integer(sync[0],"synchronous")<2 || integer(sync[0],"synchronous")>3 ||
@@ -289,6 +291,7 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
                 refuse("canonical READY tail pin or captured bounds differ");
             (void)audit_ready_frames(writer,p,row,[&](const cr::receipt_item& item){
                 const auto* positive=std::get_if<cr::committed>(&item.value);if(!positive)return;
+                if(auto* observation=canonical_ready_read_test_observation::current)++observation->positive_receipt_lookups;
                 const auto actual=store.receipt(item.original_id);
                 if(!actual || actual->original.namespace_id!=std::optional<std::string>{ns} ||
                    actual->position!=static_cast<int64_t>(positive->position) ||
@@ -576,6 +579,9 @@ canonical_ready_resume_result canonical_writer_adapter::resume_ready_owned(std::
 }
 canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(std::shared_ptr<lattice_db> owner,const canonical_namespace_admission& admission,
     const canonical_ready_lease& lease,uint64_t index) {
+    observe_ready_read(canonical_ready_read_test_observation::point::entered);
+    if(auto* observation=canonical_ready_read_test_observation::current){observation->index=index;observation->deadline_ms=lease.deadline_;}
+    struct finish_read_observation {~finish_read_observation(){observe_ready_read(canonical_ready_read_test_observation::point::finished);}} observed;
     auto state=context_;auto writer=writer_;auto session=retention_;canonical_ready_frame_result result;
     std::optional<std::string> frame;
     try {
@@ -583,7 +589,11 @@ canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(st
         if(!state || !state->ready || !session || lease.session_.lock()!=session || lease.context_.lock()!=state || lease.incarnation_!=session->incarnation)
             refuse("canonical READY old or foreign physical lease");
         validate_namespace_admission(owner,writer,state,held);
+        observe_ready_read(canonical_ready_read_test_observation::point::owned_requested);
         result.settlement=retention_owned(owner,writer,state,session,ready_read,[&](database& actual,retention_session& clock){
+            observe_ready_read(canonical_ready_read_test_observation::point::body_begin);
+            if(auto* observation=canonical_ready_read_test_observation::current)
+                observation->clock_before_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-clock.started).count();
             validate_namespace_admission(owner,writer,state,held);const auto& p=*state->ready;
             const auto row=ready_row(actual,p,lease.identity_.binding_);const auto frozen=ready_request(row,p);
             ready_require_identity(row,p,frozen.logical,ready_blob(row,"request"),held.namespace_,held.replica_);
@@ -594,14 +604,26 @@ canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(st
                 refuse("canonical READY frame lease expired, superseded or outside capsule");
             auto decoded=cr::decode(ready_frame(actual,p,lease.identity_.binding_,static_cast<int64_t>(index)),p.package.codec);
             decoded.route_generation=lease.route_;frame=cr::encode(decoded,p.package.codec);
+            if(auto* observation=canonical_ready_read_test_observation::current){++observation->addressed_frames;observation->addressed_bytes+=frame->size();}
             if(frame->size()>std::get<cr::request>(frozen.body).budget.frame_bytes)
                 refuse("canonical READY route envelope exceeds frozen request frame budget");
             // This byte return is still not a transport handoff. The future
             // controller must revalidate its authenticated route at send time.
             validate_namespace_admission(owner,writer,state,held);if(clock.now()>=lease.deadline_)refuse("canonical READY frame lease expired while reading");
+            if(auto* observation=canonical_ready_read_test_observation::current)
+                observation->clock_after_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-clock.started).count();
+            observe_ready_read(canonical_ready_read_test_observation::point::body_end);
         });
+        observe_ready_read(canonical_ready_read_test_observation::point::settled);
+        if(auto* observation=canonical_ready_read_test_observation::current)
+            observation->clock_settled_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-session->started).count();
         if(result.settlement.state==recovery_install_state::committed)result.frame=std::move(frame);
     } catch(...) {result.settlement.primary_error=std::current_exception();}
+    if(auto* observation=canonical_ready_read_test_observation::current){
+        observation->settlement=static_cast<int>(result.settlement.state);
+        observation->primary_error=bool(result.settlement.primary_error);observation->cleanup_error=bool(result.settlement.cleanup_error);
+        observation->postcommit_error=bool(result.settlement.postcommit_error);observation->notification_error=bool(result.settlement.notification_error);
+    }
     return result;
 }
 recovery_install_result canonical_writer_adapter::abandon_ready_owned(std::shared_ptr<lattice_db> owner,const canonical_ready_identity& identity) {

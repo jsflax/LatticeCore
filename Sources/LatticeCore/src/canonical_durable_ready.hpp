@@ -20,6 +20,21 @@ struct observation {
 };
 extern thread_local observation* current;
 }
+namespace canonical_ready_read_test_observation {
+// Same-thread fixed-storage measurements only. Values never grant admission,
+// skip validation, change a deadline or invoke a fixture callback.
+enum class point { entered,owned_requested,body_begin,body_end,settled,finished,count };
+struct observation {
+    std::chrono::steady_clock::time_point origin=std::chrono::steady_clock::now();
+    std::array<uint64_t,static_cast<size_t>(point::count)> visits{},first_us{},last_us{};
+    uint64_t index=0,full_audits=0,audited_frames=0,audited_bytes=0,positive_receipt_lookups=0;
+    uint64_t addressed_frames=0,addressed_bytes=0;
+    int64_t deadline_ms=-1,clock_before_ms=-1,clock_after_ms=-1,clock_settled_ms=-1;
+    int settlement=-1;
+    bool primary_error=false,cleanup_error=false,postcommit_error=false,notification_error=false;
+};
+extern thread_local observation* current;
+}
 class canonical_writer_adapter;
 struct canonical_ready_profile {
     // Exact private source spelling, not authenticated issuer authority.

@@ -199,6 +199,7 @@ TEST_F(AuthenticatedRelaySession, OwnedIdsOutliveResultsWithoutReleasingPublicat
 namespace ready_wire=lattice::detail::canonical_range;
 class AuthenticatedReadySession:public AuthenticatedRelaySession {
 protected:
+    std::string last_read_diagnostic;
     json source_policy(bool large=false){auto p=policy();p["maximumAuthorizationMilliseconds"]=600000;if(large)p["readyProfile"]="bounded48MiBV1";return p;}
     relay_recovery_setup admitted(unsigned replica=1,bool large=false) {
         auto value=open(source_policy(large),connection(replica));if(!value.valid())throw std::runtime_error("actual READY setup failed");
@@ -258,7 +259,33 @@ protected:
     }
     relay_ready_result read(const relay_recovery_setup& value,const json& lease,uint64_t index) {
         auto c=control("read");for(const auto* name:{"routeGeneration","leaseID","requestDigest","attemptID","sequence"})c[name]=lease.at(name);
-        c["index"]=std::to_string(index);return invoke(value,c);
+        c["index"]=std::to_string(index);
+        namespace reads=lattice::detail::canonical_ready_read_test_observation;
+        namespace counts=lattice::detail::canonical_range::sequence_test_observation;
+        reads::observation trace;counts::counters work;
+        const auto prior=reads::current;const auto prior_work=counts::current;
+        reads::current=&trace;counts::current=&work;
+        struct reset {reads::observation* prior;counts::counters* work;~reset(){reads::current=prior;counts::current=work;}} restore{prior,prior_work};
+        last_read_diagnostic.clear();auto result=invoke(value,c);
+        if(result.status_code()!=1||!result.publishable()) {
+            // Preserve the failure's actual frame index and phase costs without
+            // changing any lease, workload, publication or assertion policy.
+            last_read_diagnostic=json{{"requestedIndex",index},{"observedIndex",trace.index},
+                {"status",result.status_code()},{"publishable",result.publishable()},
+                {"bridgeError",last_bridge_error().substr(0,2048)},{"response",result.wire().substr(0,4096)},
+                {"phases",{"entered","ownedRequested","bodyBegin","bodyEnd","settled","finished"}},
+                {"visits",trace.visits},{"firstMicroseconds",trace.first_us},{"lastMicroseconds",trace.last_us},
+                {"fullAudits",trace.full_audits},{"auditedFrames",trace.audited_frames},{"auditedBytes",trace.audited_bytes},
+                {"positiveReceiptLookups",trace.positive_receipt_lookups},
+                {"addressedFrames",trace.addressed_frames},{"addressedBytes",trace.addressed_bytes},
+                {"deadlineMilliseconds",trace.deadline_ms},{"clockBeforeBodyMilliseconds",trace.clock_before_ms},
+                {"clockAfterBodyMilliseconds",trace.clock_after_ms},{"clockAfterSettlementMilliseconds",trace.clock_settled_ms},
+                {"settlement",trace.settlement},{"primaryError",trace.primary_error},{"cleanupError",trace.cleanup_error},
+                {"postcommitError",trace.postcommit_error},{"notificationError",trace.notification_error},
+                {"requestValidations",work.request_validations},{"rebaseBuilds",work.rebase_builds},
+                {"restartObjects",work.restart_objects},{"cursors",work.cursors},{"pageTransitions",work.transitions}}.dump();
+        }
+        return result;
     }
     std::vector<std::vector<database::row_t>> exact_source() {
         std::vector<std::vector<database::row_t>> out;
@@ -390,12 +417,12 @@ TEST_F(AuthenticatedReadySession, LargerExplicitProfileCarriesEightThousandRowsA
     const auto before=receipts();auto f=request(d);auto& q=std::get<ready_wire::request>(f.body);
     for(const auto& e:entries)q.receipts.push_back({e.global_id,"app",{{e.table_name,e.global_row_id}}});seal(f,d);
     const auto offered=lease(setup,f,d,"prepare",300000);const auto frames=std::stoull(offered["frames"].get<std::string>());ASSERT_LE(frames,770u);
-    auto first=read(setup,offered,0);ASSERT_TRUE(first.publishable());auto manifest=ready_wire::decode(first.wire(),codec(d));
+    auto first=read(setup,offered,0);ASSERT_TRUE(first.publishable())<<last_read_diagnostic;auto manifest=ready_wire::decode(first.wire(),codec(d));
     const auto& m=std::get<ready_wire::manifest>(manifest.body);auto sequence=ready_wire::begin(f.logical,q,m,codec(d));
     ready_wire::stream_hasher contents(m,ready_wire::stream_kind::content,codec(d)),receipts_hash(m,ready_wire::stream_kind::receipts,codec(d));
     std::set<std::string> row_ids,original_ids;size_t bytes=first.wire().size();
     for(uint64_t index=1;index<frames;++index) {
-        auto result=read(setup,offered,index);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());bytes+=result.wire().size();
+        auto result=read(setup,offered,index);ASSERT_EQ(result.status_code(),1)<<last_read_diagnostic;ASSERT_TRUE(result.publishable())<<last_read_diagnostic;bytes+=result.wire().size();
         const auto frame=ready_wire::decode(result.wire(),codec(d));sequence=ready_wire::propose(sequence,frame,codec(d));
         if(const auto* page=std::get_if<ready_wire::content_page>(&frame.body))for(const auto& item:page->items) {
             ASSERT_TRUE(std::holds_alternative<ready_wire::present>(item.value));contents.append(item);EXPECT_TRUE(row_ids.insert(item.key.id).second);

@@ -1,4 +1,7 @@
 #include "TestHelpers.hpp"
+#include "CanonicalWriterTestAccess.hpp"
+#include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
+#include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/recovery_receiver_controller.hpp"
 #include "../../Sources/LatticeCore/src/recovery_local_producer.hpp"
@@ -777,5 +780,119 @@ TEST_F(RecoveryReceiverController, RestrictedResendAckAfterRefreezePreservesExis
     {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());for(const auto& error:errors)EXPECT_NE(error.find("fixture late restricted ACK refrozen checkpoint"),std::string::npos);}
 }
 
+}
+
+namespace lattice::detail {
+struct recovery_receiver_cohort_test_access {
+    static void next_ack_timeout(synchronizer_base& sync){sync.config_.ack_timeout_base_ms=0;}
+    static std::weak_ptr<recovery_receiver_controller> controller(synchronizer_base& sync){return sync.receiver_controller_->controller_;}
+    static std::shared_ptr<sync_discovery_operation> retained_busy(synchronizer_base& sync) {
+        const auto queue=sync.discovery_deferral_;std::lock_guard lock(queue->mutex_);
+        if(!queue->count_||queue->active_)return {};
+        const auto& head=queue->slots_[queue->head_];
+        if(!head->attempts||head->coalescible.load(std::memory_order_acquire))return {};
+        return head;
+    }
+};
+}
+namespace {
+struct CohortWriterHold {
+    std::mutex mutex;std::condition_variable changed;bool entered=false,released=false,timed_out=false,admission_failed=false;std::thread worker;
+    explicit CohortWriterHold(lattice_db& owner){
+        auto* handle=detail::canonical_writer_custody_test_access::fault_handle(owner.db());
+        const auto acquire_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        worker=std::thread([this,handle,acquire_deadline]{auto* sql_mutex=sqlite3_db_mutex(handle);
+            while(sql_mutex&&sqlite3_mutex_try(sql_mutex)!=SQLITE_OK){
+                if(std::chrono::steady_clock::now()>=acquire_deadline){sql_mutex=nullptr;break;}
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+            if(!sql_mutex){std::lock_guard lock(mutex);admission_failed=true;changed.notify_all();return;}
+            {std::unique_lock lock(mutex);entered=true;changed.notify_all();if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
+            sqlite3_mutex_leave(sql_mutex);});
+        std::unique_lock lock(mutex);if(!changed.wait_until(lock,acquire_deadline,[&]{return entered||admission_failed;})||!entered){
+            released=true;changed.notify_all();lock.unlock();worker.join();throw db_error("cohort writer fixture admission timeout");}
+    }
+    void release(){ {std::lock_guard lock(mutex);released=true;changed.notify_all();}if(worker.joinable())worker.join();}
+    ~CohortWriterHold(){release();}
+};
+thread_local std::function<void()> cohort_after_claim;
+void cohort_claimed(){auto action=std::move(cohort_after_claim);detail::recovery_export_test_hooks::after_claim_commit=nullptr;if(action)action();}
+class RecoveryReceiverCohort : public RecoveryReceiverController {
+protected:
+    void retained_replacement(bool recreate) {
+        configure();
+        struct Observation {std::mutex mutex;std::shared_ptr<CohortWriterHold> writer;Snapshot claimed;bool closing=false;std::atomic<unsigned> captures{0},waiting{0},restricted{0};std::atomic<bool> armed{false},hooked{false};};
+        auto observation=std::make_shared<Observation>();
+        struct Release {std::shared_ptr<Observation> value;~Release(){std::shared_ptr<CohortWriterHold> held;{std::lock_guard lock(value->mutex);value->closing=true;held=value->writer;}if(held)held->release();}} release{observation};
+        auto timeout_pause=std::make_shared<ControllerPause>();pauses.push_back(timeout_pause);
+        auto timeout_seen=std::make_shared<std::atomic<bool>>(false);
+        // Installed before actual route publication; this is a restriction on
+        // the real worker, not a factory for recovery authority.
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this,observation,timeout_pause,timeout_seen](const char* stage){
+            if(std::strcmp(stage,"install-committed")==0){
+                auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
+                hook->after_timeout_transition=[timeout_pause,timeout_seen]{if(!timeout_seen->exchange(true))timeout_pause->wait();};
+                detail::sync_background_test_hooks::ack=std::move(hook);
+            }
+            if(std::strcmp(stage,"cohort-reserved")==0)++observation->captures;
+            if(std::strcmp(stage,"cohort-retained")==0)++observation->waiting;
+            if(std::strcmp(stage,"reconciliation-pending")==0&&phase()==4){
+                ++observation->restricted;
+                if(observation->armed.load()&&!observation->hooked.exchange(true)){
+                    cohort_after_claim=[this,observation]{
+                        std::lock_guard lock(observation->mutex);if(observation->closing)return;
+                        observation->claimed=snapshot();observation->writer=std::make_shared<CohortWriterHold>(*receiver);
+                    };
+                    detail::recovery_export_test_hooks::after_claim_commit=cohort_claimed;
+                }
+            }
+        });
+        connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+        detail::recovery_receiver_cohort_test_access::next_ack_timeout(*synchronizers[0]);
+        observation->armed.store(true);seed_local(1,600);const auto ids=originals();ASSERT_EQ(ids.size(),1u);
+        ASSERT_TRUE(until([&]{return !held_originals().empty()&&timeout_pause->ready();}));
+        ASSERT_EQ(synchronizers[0]->get_progress().pending_upload,0);
+        request_recovery();timeout_pause->release();
+        std::shared_ptr<detail::sync_discovery_operation> retained;
+        ASSERT_TRUE(until([&]{retained=detail::recovery_receiver_cohort_test_access::retained_busy(*synchronizers[0]);return bool(retained);}));
+        std::shared_ptr<CohortWriterHold> writer;Snapshot before;
+        {std::lock_guard lock(observation->mutex);writer=observation->writer;before=observation->claimed;}
+        ASSERT_TRUE(writer);ASSERT_FALSE(before.empty());ASSERT_EQ(observation->restricted.load(),1u);
+        const auto captures=observation->captures.load();
+        const auto old_controller=detail::recovery_receiver_cohort_test_access::controller(*synchronizers[0]);
+        // Real inbound refresh retires the descriptor without needing SQL.
+        // Keep the mutex held to prove pending is decided before any new read.
+        request_recovery();ASSERT_TRUE(until([&]{return observation->waiting.load()>0;}));
+        EXPECT_EQ(observation->captures.load(),captures);EXPECT_FALSE(has_error());
+        writer->release();EXPECT_FALSE(writer->timed_out);
+        if(recreate){
+            synchronizers.clear();ASSERT_TRUE(until([&]{return old_controller.expired();}));
+            const auto waits=observation->waiting.load();connect();
+            ASSERT_TRUE(until([&]{return observation->waiting.load()>waits;}));
+            const auto current=detail::recovery_receiver_cohort_test_access::controller(*synchronizers[0]);
+            EXPECT_FALSE(current.expired());EXPECT_TRUE(old_controller.expired());
+        }
+        EXPECT_EQ(snapshot(),before);EXPECT_EQ(observation->captures.load(),captures);
+        // Queue disposal/cancellation has no right to clear physical custody
+        // while this real operation still retains the original committed frame.
+        EXPECT_FALSE(has_error());retained.reset();
+        ASSERT_TRUE(until([&]{return observation->restricted.load()>=2;}));
+        EXPECT_GT(observation->captures.load(),captures);
+        EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog"),before.at("AuditLog"));
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL"),1);
+    }
+};
+TEST_F(RecoveryReceiverCohort, ReplacedRequestWaitsForActualRetainedBusyFrameBeforeRecapture) {retained_replacement(false);}
+TEST_F(RecoveryReceiverCohort, RecreatedLastControllerSharesActualRetainedBusyFrameCustody) {retained_replacement(true);}
+TEST_F(RecoveryReceiverCohort, FailedActualCaptureReleasesPhysicalReservationForFreshRequest) {
+    configure();insert(*source,controller_uuid(610),"canonical");auto first=std::make_shared<std::atomic<bool>>(true);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[first](const char* stage){
+        if(std::strcmp(stage,"cohort-reserved")==0&&first->exchange(false))throw db_error("fixture cohort capture interrupted");
+    });
+    connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=0"),1);
+    request_recovery();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+    {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());for(const auto& error:errors)EXPECT_NE(error.find("fixture cohort capture interrupted"),std::string::npos);}
+}
 }
 #endif

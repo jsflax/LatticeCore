@@ -320,6 +320,15 @@ void recovery_receiver_controller::turn() {
             if(!reconciliation_waiting&&(runtime.failure||(runtime.idle&&!runtime.demand&&!runtime.outstanding)))return;}
         if(reconciliation_waiting){settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;}
         const auto observe=[&](const char* stage){if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)runtime.probe->observed(stage);};
+        // No new Q/frozen/journal graph may coexist with a retired cohort.
+        // The actual running/current-controller reservation spans this whole
+        // turn; current descriptors took their notification branch above.
+        if(recovery_continuous_producer::controller_cohort(*this,owner)==recovery_continuous_producer::cohort_admission::retained){observe("cohort-retained");return;}
+        const auto reserve_cohort=[&](const std::shared_ptr<recovery_reconciliation_descriptor>& descriptor){
+            const auto admitted=recovery_continuous_producer::controller_cohort(*this,owner,descriptor);
+            if(admitted==recovery_continuous_producer::cohort_admission::retained){observe("cohort-retained");return false;}
+            observe("cohort-reserved");return true;
+        };
         const auto probe_scope=[&](const char* stage)->std::shared_ptr<void>{return runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope?runtime.probe->scope(stage):nullptr;};
         const auto live=[&]{for(const auto& [_,c]:connected_routes)require(!c.route->state_->retired.load()&&c.route->state_->source->recovery_live(c.view),"controller authenticated source retired during owned operation");};
         const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();});known(result);};
@@ -420,6 +429,7 @@ void recovery_receiver_controller::turn() {
             for(const auto& route:routes)route->state_->blocked.store(true,std::memory_order_release);
             if(phase==4) {
                 auto descriptor=std::shared_ptr<recovery_reconciliation_descriptor>(new recovery_reconciliation_descriptor);
+                if(!reserve_cohort(descriptor))return;
                 descriptor->owner_=owner;descriptor->limits_=runtime.caps;descriptor->controller_=shared_from_this();descriptor->controller_revision_=demand_revision;
                 descriptor->physical_incarnation_=physical_incarnation;descriptor->barrier_=barrier;descriptor->attempt_=attempt;descriptor->phase_=4;descriptor->restart_revalidation_=true;
                 owned([&](database&){
@@ -525,6 +535,7 @@ void recovery_receiver_controller::turn() {
                 }});
             if(all_complete) {
                 auto descriptor=std::shared_ptr<recovery_reconciliation_descriptor>(new recovery_reconciliation_descriptor);
+                if(!reserve_cohort(descriptor))return;
                 descriptor->owner_=owner;descriptor->limits_=runtime.caps;descriptor->controller_=shared_from_this();descriptor->frozen_=proof;descriptor->controller_revision_=demand_revision;
                 descriptor->physical_incarnation_=physical_incarnation;descriptor->barrier_=barrier;descriptor->attempt_=attempt;descriptor->phase_=2;
                 bool unknown=false;const std::set<std::string> unsent(proof->canonical_originals().begin(),proof->canonical_originals().end());
@@ -607,6 +618,19 @@ std::shared_ptr<const recovery_reconciliation_descriptor> recovery_receiver_rout
     if(!current)return {};
     for(const auto& contribution:current->contributions_)if(contribution.route.lock().get()==this)return current;
     return {};
+}
+bool recovery_receiver_controller::reconciliation_route_current(
+    const std::shared_ptr<const recovery_reconciliation_descriptor>& descriptor,const std::shared_ptr<recovery_continuous_route>& continuous,
+    const std::shared_ptr<lattice_db>& owner,uint64_t physical) {
+    require(descriptor&&descriptor->phase_==4&&descriptor->owner()==owner&&owner&&continuous&&physical,
+        "restricted export lacks exact phase-4 owner/descriptor");
+    if(owner->is_closed())return false;
+    auto controller=descriptor->controller_.lock();if(!controller)return false;
+    {std::lock_guard lock(controller->state_->mutex);if(controller->state_->reconciliation!=descriptor||controller->state_->revision!=descriptor->controller_revision_)return false;}
+    bool matched=false;
+    for(const auto& c:descriptor->contributions_)if(auto route=c.route.lock())if(route->state_->continuous==continuous&&route->state_->owner.lock()==owner&&
+        !route->state_->retired.load()&&c.source==route->state_->source&&c.source->recovery_live(c.view)&&c.source->recovery_lifecycle(c.view)==physical){require(!matched,"restricted export ambiguous actual route");matched=true;}
+    return matched;
 }
 void recovery_receiver_controller::verify_reconciliation_route(
     const std::shared_ptr<const recovery_reconciliation_descriptor>& descriptor,const std::shared_ptr<recovery_continuous_route>& continuous,

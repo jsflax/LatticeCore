@@ -6,6 +6,7 @@ namespace lattice::detail {
 class recovery_receiver_controller;
 class recovery_receiver_route;
 class recovery_reconciliation_descriptor;
+struct recovery_reconciliation_cohort;
 class receiver_source_binding;
 class sync_callback_lifetime;
 enum class recovery_continuous_receiver_profile : int64_t { disabled=0, full_canonical_v2=2 };
@@ -157,6 +158,12 @@ class recovery_continuous_producer {
         const std::shared_ptr<recovery_continuous_route>&,std::shared_ptr<lattice_db>,
         const std::shared_ptr<receiver_source_binding>&,const std::shared_ptr<owned_platform_sync_transport>&,
         const std::shared_ptr<scheduler>&,const std::shared_ptr<sync_callback_lifetime>&);
+    enum class cohort_admission { available, retained };
+    static cohort_admission controller_cohort(const recovery_receiver_controller&,
+        const std::shared_ptr<lattice_db>&,
+        const std::shared_ptr<recovery_reconciliation_descriptor>& candidate = {});
+    static bool reconciliation_work_current(const std::shared_ptr<recovery_continuous_work>&,
+        const std::shared_ptr<lattice_db>&);
     static recovery_install_result controller_owned(const recovery_receiver_controller&,
         std::shared_ptr<lattice_db>,const std::function<void(database&)>&);
     static void controller_park_proof(verified_unsent_set&);

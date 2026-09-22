@@ -1,4 +1,5 @@
 #include "recovery_export_adapter.hpp"
+#include "recovery_unknown_reconciliation.hpp"
 #include "recovery_receiver_source.hpp"
 #include <cmath>
 #include <algorithm>
@@ -409,6 +410,7 @@ committed_export_frame& committed_export_frame::operator=(committed_export_frame
     if(this==&other)return *this;
     continuous_work_=std::move(other.continuous_work_);
     upload_view_=std::move(other.upload_view_);
+    reconciliation_=std::move(other.reconciliation_);
     owner_=std::move(other.owner_);claims_=std::move(other.claims_);scopes_=std::move(other.scopes_);
     limits_=other.limits_;entries_=std::move(other.entries_);message_=std::move(other.message_);
     physical_generation_=std::exchange(other.physical_generation_,0);
@@ -436,6 +438,18 @@ std::optional<recovery_export_preparation> recovery_export_adapter::prepare_for_
     bool busy=false;auto prepared=prepare(std::move(owner),channel,generation,count,in_flight,filtered,{},std::nullopt,discovery_busy?&busy:nullptr,false,std::move(work),std::move(upload_view));
     if(busy){*discovery_busy=true;return std::nullopt;}return prepared;
 }
+recovery_export_preparation recovery_export_adapter::prepare_reconciliation(std::shared_ptr<lattice_db> owner,
+    std::shared_ptr<recovery_continuous_work> work,std::shared_ptr<recovery_reconciliation_export> grant,
+    uint64_t generation,std::shared_ptr<const receiver_upload_view> upload,bool* busy) {
+    if(!owner||!work||!grant||grant->descriptor_->owner()!=owner||grant->descriptor_->phase()!=4||
+       !upload||!upload->current()||grant->requested_.empty()||grant->requested_.size()>1000||
+       grant->requested_.size()!=grant->originals_.size()||!grant->selected_.empty())
+        refuse("restricted export lacks exact current window");
+    const auto count=std::min(grant->requested_.size(),upload->entries_);
+    const auto channel=grant->address_.channel;
+    return prepare(std::move(owner),channel,generation,count,{},false,{},std::nullopt,busy,false,
+        std::move(work),std::move(upload),std::move(grant));
+}
 std::optional<recovery_export_preparation> recovery_export_adapter::try_prepare_pending(std::shared_ptr<lattice_db> owner,
     const std::string& sync_id,uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,
     bool filtered,const recovery_export_limits& limits){
@@ -461,7 +475,7 @@ recovery_export_preparation recovery_export_adapter::prepare_retained_page(std::
 recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits,
     std::optional<int64_t> history_after,bool* discovery_busy,bool retained_delete_page,std::shared_ptr<recovery_continuous_work> work,
-    std::shared_ptr<const receiver_upload_view> upload_view){
+    std::shared_ptr<const receiver_upload_view> upload_view,std::shared_ptr<recovery_reconciliation_export> reconciliation){
     recovery_export_preparation output;
     // Catch only this first no-effect classifier. A busy exception arising
     // later from reentrant work must never replay a claim or mutation stage.
@@ -470,8 +484,8 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         if(!discovery_busy)throw;
         *discovery_busy=true;return output;
     }
-    committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;frame.continuous_work_=std::move(work);frame.upload_view_=std::move(upload_view);
-    const auto result=recovery_continuous_producer::export_owned(owner,frame.continuous_work_,[&](database& writer){
+    committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;frame.continuous_work_=std::move(work);frame.upload_view_=std::move(upload_view);frame.reconciliation_=std::move(reconciliation);
+    const auto owned_body=[&](database& writer){
         if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked before owned selection");
         auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);if(inventory.scopes.empty())return;
         limits_ok(limits,count,in_flight);if(!history_after&&(sync_id.empty()||sync_id.size()>4096))refuse("export invalid route channel");
@@ -482,8 +496,27 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         recovery_obligation_store journal(owner,inventory.limits.obligations,inventory.limits.installations);
         const bool continuous_page=inventory.continuous&&static_cast<bool>(frame.continuous_work_);
         if(frame.upload_view_&&(!continuous_page||history_after||retained_delete_page))refuse("negotiated export requires actual continuous pending route");
+        const auto restricted_ids=[&](size_t maximum){
+            const auto& grant=frame.reconciliation_;
+            if(!grant||!continuous_page||!frame.upload_view_||history_after||retained_delete_page||
+               maximum>grant->requested_.size()||maximum>count)refuse("restricted export window mode differs");
+            const auto scope=std::find_if(inventory.scopes.begin(),inventory.scopes.end(),[&](const auto& item){return item.contribution.address==grant->address_;});
+            if(scope==inventory.scopes.end())refuse("restricted export contribution changed");
+            std::vector<int64_t> selected;selected.reserve(maximum);
+            for(size_t n=0;n<maximum;++n){
+                auto expected=grant->requested_[n];const auto actual=journal.find(grant->address_,grant->originals_[n]);
+                if(!actual)refuse("restricted export retained original disappeared");
+                if(!expected.first_export_claim)expected.first_export_claim=actual->first_export_claim;
+                if(*actual!=expected||actual->stage!=recovery_obligation_stage::open||actual->acknowledged||
+                   actual->canonical_original_id!=grant->originals_[n])refuse("restricted export retained original or receipt changed");
+                if(!selected.empty()&&selected.back()>=actual->record.audit_id)refuse("restricted export original order changed");
+                coverage_stamp(db,inventory,*scope,*actual);selected.push_back(actual->record.audit_id);
+            }
+            return selected;
+        };
         std::vector<int64_t> pending,ids;
-        if(history_after)ids=history_page(db,*history_after,count);
+        if(frame.reconciliation_)ids=restricted_ids(count);
+        else if(history_after)ids=history_page(db,*history_after,count);
         else if(continuous_page)ids=continuous_pending_page(db,sync_id,inventory,journal,count,in_flight);
         else {
             pending=covered_pending(db,sync_id,inventory,journal,limits.coverage_candidates);
@@ -645,7 +678,14 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                 }
             }
         }
-        if(history_after){
+        if(frame.reconciliation_){
+            if(restricted_ids(ids.size())!=ids)refuse("restricted export exact selected prefix changed during claims");
+            for(const auto& scope:final_inventory.scopes)for(const auto& table:scope.tables)
+                for(const auto& entry:frame.entries_)if(entry.table_name==table.name)
+                    history_original(db,final_inventory,scope,journal,entry);
+            frame.reconciliation_->selected_.assign(frame.reconciliation_->originals_.begin(),
+                frame.reconciliation_->originals_.begin()+ids.size());
+        }else if(history_after){
             if(history_page(db,*history_after,count)!=ids)refuse("export history page changed during claims");
             for(const auto& scope:final_inventory.scopes)for(const auto& table:scope.tables)
                 for(const auto& entry:frame.entries_)if(entry.table_name==table.name)
@@ -660,7 +700,10 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
             refuse("export coverage pending inventory changed during claims");
         frame.message_=transport_message::from_binary({encoded.begin(),encoded.end()});
         if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked during claims");
-    },discovery_busy);
+    };
+    const auto result=frame.reconciliation_
+        ?recovery_continuous_producer::reconciliation_export_owned(owner,frame.continuous_work_,frame.reconciliation_->originals_,owned_body,discovery_busy)
+        :recovery_continuous_producer::export_owned(owner,frame.continuous_work_,owned_body,discovery_busy);
     if(discovery_busy&&*discovery_busy)return output;
     require_committed(result);
     if(!frame.entries_.empty()){
@@ -695,10 +738,23 @@ void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> own
 }
 void recovery_export_adapter::validate_server_limits(const recovery_export_limits& limits){limits_ok(limits,limits.entries,{});}
 void recovery_export_adapter::revalidate_claimed_frame(const committed_export_frame& frame,bool* busy){
-    const auto result=recovery_continuous_producer::export_owned(frame.owner_,frame.continuous_work_,[&](database&){
+    const auto owned_body=[&](database&){
         check_scopes(recovery_local_producer_adapter::export_inventory_for_owned_write(frame.owner_),frame.scopes_);
         recovery_obligation_store journal(frame.owner_,frame.limits_.obligations,frame.limits_.installations);check_claims(journal,frame.claims_,frame.entries_);
-    },busy);
+        if(frame.reconciliation_){const auto& grant=*frame.reconciliation_;
+            if(grant.selected_.empty()||grant.selected_.size()!=frame.entries_.size()||grant.selected_.size()>grant.originals_.size()||
+               !std::equal(grant.selected_.begin(),grant.selected_.end(),grant.originals_.begin()))
+                refuse("restricted handoff selected prefix differs");
+            for(size_t n=0;n<grant.selected_.size();++n){const auto actual=journal.find(grant.address_,grant.selected_[n]);auto expected=grant.requested_[n];
+                if(!actual)refuse("restricted handoff original disappeared");
+                if(!expected.first_export_claim)expected.first_export_claim=actual->first_export_claim;
+                if(*actual!=expected||frame.entries_[n].id!=actual->record.audit_id||frame.entries_[n].global_id!=actual->record.original_id)
+                    refuse("restricted handoff retained original changed");}
+        }
+    };
+    const auto result=frame.reconciliation_
+        ?recovery_continuous_producer::reconciliation_export_owned(frame.owner_,frame.continuous_work_,frame.reconciliation_->selected_,owned_body,busy)
+        :recovery_continuous_producer::export_owned(frame.owner_,frame.continuous_work_,owned_body,busy);
     if(busy&&*busy)return;
     recovery_export_adapter::require_committed(result);
 }
@@ -733,6 +789,7 @@ size_t committed_export_frame::retained_metadata_bytes(size_t cap)const noexcept
     size_t bytes=sizeof(*this);
     const auto add=[&](size_t n,size_t width=1){if(bytes>cap||n>(cap-bytes)/width)bytes=cap+1;else bytes+=n*width;};
     const auto text=[&](const std::string& value){add(value.capacity());add(1);};
+    if(reconciliation_)add(reconciliation_->retained_bytes(cap));
     add(message_.data.capacity());add(claims_.capacity(),sizeof(recovery_obligation_export_ticket));
     for(const auto& claim:claims_){text(claim.address.channel);add(claim.canonical_original_ids.capacity(),sizeof(std::string));for(const auto& id:claim.canonical_original_ids)text(id);}
     add(scopes_.capacity(),sizeof(recovery_local_export_scope));
@@ -761,10 +818,20 @@ bool recovery_export_route::handoff_impl(committed_export_frame& frame,bool* bus
     if(frame.owner_->is_closed()||!lifetime_->protected_current(frame.physical_generation_))return false;
     std::shared_ptr<sync_transport> transport;
     {std::lock_guard<std::mutex> lock(mutex_);if(retired_||!open_||generation_!=frame.physical_generation_)return false;transport=transport_;}
+    bool sent=false;
     if(frame.upload_view_) {
         const auto platform=std::dynamic_pointer_cast<owned_platform_sync_transport>(transport);
-        return platform&&frame.upload_view_->send(*platform,frame.message_);
+        sent=platform&&frame.upload_view_->send(*platform,frame.message_);
+    }else {
+        if(frame.reconciliation_)refuse("restricted handoff lacks current negotiated source");
+        transport->send(frame.message_);sent=true;
     }
-    transport->send(frame.message_);return true;
+    if(frame.reconciliation_){
+        // Counted custody spans the entire real handoff. Only after it is
+        // released may a completed cursor permit the next owned refreeze.
+        frame.continuous_work_.reset();
+        if(sent)frame.reconciliation_->did_handoff();
+    }
+    return sent;
 }
 } // namespace lattice::detail

@@ -25,6 +25,8 @@ class recovery_export_route;
 class recovery_server_export_endpoint;
 class recovery_server_export_page;
 class receiver_upload_view;
+class recovery_unknown_reconciliation;
+class recovery_reconciliation_export;
 class committed_export_frame {
     friend class recovery_export_adapter;
     friend class recovery_export_route;
@@ -32,6 +34,7 @@ class committed_export_frame {
     std::shared_ptr<lattice_db> owner_;
     std::shared_ptr<recovery_continuous_work> continuous_work_;
     std::shared_ptr<const receiver_upload_view> upload_view_;
+    std::shared_ptr<recovery_reconciliation_export> reconciliation_;
     std::vector<recovery_obligation_export_ticket> claims_;
     std::vector<recovery_local_export_scope> scopes_;
     recovery_obligation_producer_discovery_limits limits_{};
@@ -90,6 +93,10 @@ struct recovery_export_preparation {
     std::string blocked_original;
 };
 class recovery_export_adapter {
+    friend class recovery_unknown_reconciliation;
+    static recovery_export_preparation prepare_reconciliation(std::shared_ptr<lattice_db>,
+        std::shared_ptr<recovery_continuous_work>,std::shared_ptr<recovery_reconciliation_export>,
+        uint64_t,std::shared_ptr<const receiver_upload_view>,bool*);
     friend class ::lattice::synchronizer_base;
     static std::optional<recovery_export_preparation> prepare_for_route(std::shared_ptr<lattice_db>,
         const std::shared_ptr<recovery_continuous_route>&,const std::string&,uint64_t,size_t,
@@ -103,7 +110,7 @@ class recovery_export_adapter {
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
         const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr,
         bool retained_delete_page=false,std::shared_ptr<recovery_continuous_work> = {},
-        std::shared_ptr<const receiver_upload_view> = {});
+        std::shared_ptr<const receiver_upload_view> = {},std::shared_ptr<recovery_reconciliation_export> = {});
 public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.

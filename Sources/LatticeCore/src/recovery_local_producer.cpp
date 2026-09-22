@@ -1,5 +1,7 @@
 #include "recovery_local_producer.hpp"
 #include "recovery_producer_continuity.hpp"
+#include "recovery_receiver_controller.hpp"
+#include "recovery_request_store.hpp"
 #include <filesystem>
 #include <limits>
 #if defined(__APPLE__) || defined(__linux__)
@@ -311,7 +313,11 @@ struct recovery_local_producer_adapter::context {
             sqlite3_value_type(v[1])==SQLITE_INTEGER && sqlite3_value_type(v[2])==SQLITE_INTEGER && sqlite3_value_type(v[5])==SQLITE_INTEGER;
         const auto phase=ok?sqlite3_value_int64(v[5]):0;
         const bool install=ok&&recovery_writer_access::active_install_for(c.owner,c.connection);
-        if(c.continuous && (phase!=1 || !c.continuous->state->dml_open.load(std::memory_order_acquire)))ok=false;
+        if(c.continuous) {
+            if(phase==1)ok=ok&&c.continuous->state->dml_open.load(std::memory_order_acquire);
+            else if(phase==2)ok=ok&&continuous_install_owned(*c.continuous);
+            else ok=false;
+        }
         ok=ok&&((phase==1 && !install && root.active->load(std::memory_order_acquire) && c.active->load(std::memory_order_acquire) && c.lifetime->alive.load(std::memory_order_acquire)) ||
                 (phase==2 && install));
         bool found=false;
@@ -356,7 +362,8 @@ struct recovery_local_producer_adapter::context {
         if(one && action==SQLITE_DELETE && (same_ascii(one,"_lattice_sync_state") ||
            same_ascii(one,"_lattice_sync_set")||same_ascii(one,"_lattice_replication_slots")))return SQLITE_DENY;
         if(one && action==SQLITE_UPDATE && same_ascii(one,"_lattice_replication_slots") &&
-           (same_ascii(two,"confirmed_audit_id")||same_ascii(two,"upload_floor")))return SQLITE_DENY;
+           (same_ascii(two,"confirmed_audit_id")||same_ascii(two,"upload_floor"))&&
+           !(c.continuous&&continuous_install_owned(*c.continuous)))return SQLITE_DENY;
         if((action==SQLITE_INSERT||action==SQLITE_UPDATE||action==SQLITE_DELETE) && one &&
            std::strncmp(one,"_lattice_obligation_producer_",sizeof("_lattice_obligation_producer_")-1)==0) {
             if(!schema||std::strcmp(schema,"main")||!origin)return SQLITE_DENY;
@@ -655,7 +662,7 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
             std::set<std::string> relations;
             for(const auto& p:inventory.profiles) {
                 auto d=describe(owner,view,grant_from(p),false);
-                if(p.program_revision!=(continuous?2:1)||d.manifest!=p.grant_manifest||d.digest!=p.program_digest)refuse("local producer bootstrap descriptor/program revision mismatch");
+                if(p.program_revision!=(continuous?(continuous_receiver_enabled(*c->continuous->state)?3:2):1)||d.manifest!=p.grant_manifest||d.digest!=p.program_digest)refuse("local producer bootstrap descriptor/program revision mismatch");
                 if(!continuous)compile_programs(owner,d,recovery_obligation_producer_store::compile(p,inventory.stored_obligation_limits,inventory.stored_producer_limits));
                 if(!continuous)for(const auto& [name,t]:d.tables) {
                     if(!relations.insert(name).second)refuse("local producer bootstrap overlapping grants");
@@ -668,7 +675,7 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
                 for(const auto& p:c->profiles)for(const auto& [name,t]:p.schema.tables)
                     if(actual_programs(view,name)!=t.enrolled)refuse("continuous complete generated program differs");
             }
-        });
+        },recovery_continuous_producer::shared_install_domains(owner));
     if(!c) {
         writer->suppress_destructor_optimize_=prior_suppression;
         return {};

@@ -31,6 +31,8 @@ detail::recovery_continuous_policy native_policy(const continuous_policy& value)
         value.operations>0&&value.operations<=256&&value.frozen_entries>0&&value.frozen_entries<=100000&&
         value.frozen_bytes>0&&value.frozen_bytes<=67108864,"continuous bridge admission limits outside caps");
     detail::recovery_continuous_policy out;
+    require((value.canonical_recovery_profile==0||value.canonical_recovery_profile==2),"continuous bridge receiver profile unavailable");
+    out.receiver=static_cast<detail::recovery_continuous_receiver_profile>(value.canonical_recovery_profile);
     out.limits={{value.scopes,value.records,value.field_bytes,value.journal_bytes},
         {value.channels,value.binding_field_bytes,value.binding_bytes},
         {value.profiles,value.stamps,value.producer_field_bytes,value.manifest_bytes,value.producer_bytes}};

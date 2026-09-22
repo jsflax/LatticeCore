@@ -31,6 +31,9 @@ struct continuous_policy {
     int64_t channels=0,binding_field_bytes=0,binding_bytes=0;
     int64_t profiles=0,stamps=0,producer_field_bytes=0,manifest_bytes=0,producer_bytes=0;
     int64_t owners=0,physical_routes=0,operations=0,frozen_entries=0,frozen_bytes=0;
+    // 0 preserves the original profile; 1 enrolls the explicit full canonical
+    // receiver profile. This selects behavior, never source/session authority.
+    int64_t canonical_recovery_profile=0;
 };
 class continuous_result;
 // Opaque actual owner/barrier identity. No public token/proof constructor.

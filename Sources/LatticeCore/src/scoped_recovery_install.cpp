@@ -1,6 +1,7 @@
 #include "scoped_recovery_install.hpp"
 #include "canonical_scoped_install.hpp"
 #include "recovery_witness.hpp"
+#include "recovery_producer_continuity.hpp"
 #include "canonical_writer_adapter.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -154,36 +155,42 @@ int64_t checked_add(int64_t a,uint64_t b,int64_t maximum) {
 struct member { std::string channel; key target; };
 struct metadata {
     sqlite3* db; const scoped_recovery_limits& limits;
+    const bool domains;
+    const std::string config_table,scope_table,member_table;
     int64_t channels=0,members=0,bytes=0;
     std::map<std::string,std::string> declarations;
     std::map<key,member> ownership; // NOCASE identity matches Core UUID keys
-    explicit metadata(sqlite3* handle,const scoped_recovery_limits& l):db(handle),limits(l) {
+    explicit metadata(sqlite3* handle,const scoped_recovery_limits& l,bool domain=false,bool create=true):db(handle),limits(l),domains(domain),
+        config_table(domain?"_lattice_recovery_domain_config":"_lattice_recovery_scope_config"),
+        scope_table(domain?"_lattice_recovery_domain":"_lattice_recovery_scope"),
+        member_table(domain?"_lattice_recovery_domain_member":"_lattice_recovery_member") {
         stmt count(db,"SELECT COUNT(*) FROM main.sqlite_schema WHERE type='table' AND name IN "
-            "('_lattice_recovery_scope_config','_lattice_recovery_scope','_lattice_recovery_member')");
+            "('"+config_table+"','"+scope_table+"','"+member_table+"')");
         require(count.next(),"recovery metadata table count missing"); const auto n=count.number(0);
         require(!count.next() && (n==0 || n==3),"recovery partial membership schema");
+        require(n!=0||create,"recovery membership schema missing on exact reopen");
         if(n==0) {
-            execute(db,"CREATE TABLE main._lattice_recovery_scope_config(id INTEGER PRIMARY KEY CHECK(id=1),"
+            execute(db,"CREATE TABLE main."+config_table+"(id INTEGER PRIMARY KEY CHECK(id=1),"
                 "version INTEGER NOT NULL,channel_limit INTEGER NOT NULL,member_limit INTEGER NOT NULL,byte_limit INTEGER NOT NULL,"
                 "channels INTEGER NOT NULL,members INTEGER NOT NULL,bytes INTEGER NOT NULL) WITHOUT ROWID");
-            execute(db,"CREATE TABLE main._lattice_recovery_scope(channel TEXT PRIMARY KEY,declaration TEXT NOT NULL) WITHOUT ROWID");
-            execute(db,"CREATE TABLE main._lattice_recovery_member(table_name TEXT NOT NULL,global_id TEXT COLLATE NOCASE NOT NULL,"
+            execute(db,"CREATE TABLE main."+scope_table+"(channel TEXT PRIMARY KEY,declaration TEXT NOT NULL) WITHOUT ROWID");
+            execute(db,"CREATE TABLE main."+member_table+"(table_name TEXT NOT NULL,global_id TEXT COLLATE NOCASE NOT NULL,"
                 "channel TEXT NOT NULL,PRIMARY KEY(table_name,global_id)) WITHOUT ROWID");
-            stmt insert(db,"INSERT INTO main._lattice_recovery_scope_config VALUES(1,1,?,?,?,0,0,0)");
+            stmt insert(db,"INSERT INTO main."+config_table+" VALUES(1,"+std::to_string(domains?2:1)+",?,?,?,0,0,0)");
             insert.integer(1,l.channels);insert.integer(2,l.members);insert.integer(3,l.metadata_bytes);insert.done();changed(db);
         }
         audit();
     }
     void audit() {
         stmt config(db,"SELECT id,version,channel_limit,member_limit,byte_limit,channels,members,bytes "
-            "FROM main._lattice_recovery_scope_config LIMIT 2");
-        require(config.next() && config.number(0)==1 && config.number(1)==1 &&
+            "FROM main."+config_table+" LIMIT 2");
+        require(config.next() && config.number(0)==1 && config.number(1)==(domains?2:1) &&
             config.number(2)==limits.channels && config.number(3)==limits.members && config.number(4)==limits.metadata_bytes,
             "recovery membership version/limits mismatch");
         const auto expected_channels=config.number(5),expected_members=config.number(6),expected_bytes=config.number(7);
         require(!config.next(),"recovery duplicate membership configuration");
         declarations.clear();ownership.clear();channels=members=bytes=0;
-        stmt scopes(db,"SELECT channel,declaration FROM main._lattice_recovery_scope ORDER BY channel");
+        stmt scopes(db,"SELECT channel,declaration FROM main."+scope_table+" ORDER BY channel");
         while(scopes.next()) {
             channels=checked_add(channels,1,limits.channels);
             auto channel=scopes.string(0,std::min<uint64_t>(limits.field_bytes,static_cast<uint64_t>(limits.metadata_bytes-bytes)));
@@ -193,7 +200,7 @@ struct metadata {
             bytes=checked_add(bytes,declaration.size(),limits.metadata_bytes);
             require(declarations.emplace(std::move(channel),std::move(declaration)).second,"recovery duplicate scope");
         }
-        stmt rows(db,"SELECT table_name,global_id,channel FROM main._lattice_recovery_member ORDER BY table_name,global_id");
+        stmt rows(db,"SELECT table_name,global_id,channel FROM main."+member_table+" ORDER BY table_name,global_id");
         while(rows.next()) {
             members=checked_add(members,1,limits.members);
             auto bounded_string=[&](int at) {
@@ -215,14 +222,14 @@ struct metadata {
             channels=checked_add(channels,1,limits.channels);
             bytes=checked_add(bytes,channel.size(),limits.metadata_bytes);
             bytes=checked_add(bytes,declaration.size(),limits.metadata_bytes);
-            stmt add(db,"INSERT INTO main._lattice_recovery_scope VALUES(?,?)");add.text(1,channel);add.text(2,declaration);add.done();changed(db);
+            stmt add(db,"INSERT INTO main."+scope_table+" VALUES(?,?)");add.text(1,channel);add.text(2,declaration);add.done();changed(db);
         }
         for(auto it=ownership.begin();it!=ownership.end();) {
             if(it->second.channel!=channel) {++it;continue;}
             const auto& m=it->second;
             require(bytes>=static_cast<int64_t>(m.channel.size()+m.target.table.size()+m.target.global_id.size())&&members>0,"recovery counter underflow");
             bytes-=static_cast<int64_t>(m.channel.size()+m.target.table.size()+m.target.global_id.size());--members;
-            stmt del(db,"DELETE FROM main._lattice_recovery_member WHERE table_name=? AND global_id=? AND channel=?");
+            stmt del(db,"DELETE FROM main."+member_table+" WHERE table_name=? AND global_id=? AND channel=?");
             del.text(1,m.target.table);del.text(2,m.target.global_id);del.text(3,channel);del.done();changed(db);
             it=ownership.erase(it);
         }
@@ -232,10 +239,10 @@ struct metadata {
             bytes=checked_add(bytes,channel.size(),limits.metadata_bytes);
             bytes=checked_add(bytes,k.table.size(),limits.metadata_bytes);
             bytes=checked_add(bytes,k.global_id.size(),limits.metadata_bytes);
-            stmt add(db,"INSERT INTO main._lattice_recovery_member VALUES(?,?,?)");
+            stmt add(db,"INSERT INTO main."+member_table+" VALUES(?,?,?)");
             add.text(1,k.table);add.text(2,k.global_id);add.text(3,channel);add.done();changed(db);
         }
-        stmt update(db,"UPDATE main._lattice_recovery_scope_config SET channels=?,members=?,bytes=? "
+        stmt update(db,"UPDATE main."+config_table+" SET channels=?,members=?,bytes=? "
             "WHERE id=1 AND channels=? AND members=? AND bytes=?");
         update.integer(1,channels);update.integer(2,members);update.integer(3,bytes);
         update.integer(4,old_channels);update.integer(5,old_members);update.integer(6,old_bytes);update.done();changed(db);
@@ -448,17 +455,19 @@ struct installed_plan {
     std::set<std::string> models;
     std::set<key> membership;
     std::string channel,declaration;
+    std::string membership_domain;
     int64_t disabled=0;
     std::vector<receipt> receipts;
     std::optional<recovery_witness> witness;
     void verify(lattice_db& owner,database& writer,const scoped_recovery_limits& limits,const identities& ids) const {
         verify_planned_rows(owner,requested,rows,models,limits,ids);
         auto* db=recovery_writer_access::active_handle(owner,writer);
-        metadata actual(db,limits);
-        require(actual.declarations.count(channel) && actual.declarations.at(channel)==declaration,
+        metadata actual(db,limits,!membership_domain.empty());
+        const auto& membership_key=membership_domain.empty()?channel:membership_domain;
+        require(actual.declarations.count(membership_key) && actual.declarations.at(membership_key)==declaration,
             "canonical final scope declaration changed");
         std::set<key> members;
-        for(const auto& [_,member]:actual.ownership)if(member.channel==channel)members.insert(member.target);
+        for(const auto& [_,member]:actual.ownership)if(member.channel==membership_key)members.insert(member.target);
         require(members==membership,"canonical final scope membership changed");
         // Receiver completion and journal settlement can run triggers after the
         // model installer's own checks. Revalidate these owned outputs only
@@ -484,12 +493,19 @@ void validate_install_limits(const scoped_recovery_limits& limits) {
         limits.receipts>0&&limits.fields>0&&limits.field_bytes>0&&limits.field_bytes<=static_cast<uint64_t>(INT_MAX)&&
         limits.logical_bytes>0,"recovery invalid explicit limits");
 }
+struct cohort_intent_basis {
+    std::string domain;
+    std::vector<recovery_outbox_audit> audit;
+    std::map<key,std::optional<values>> before;
+    std::set<std::string> own;
+};
 void install_body(lattice_db& owner,database& writer,const scoped_recovery_request& request,
                   const scoped_recovery_limits& limits,
                   const std::vector<recovery_row_image>* explicit_images,
-                  installed_plan* final_plan=nullptr) {
+                  installed_plan* final_plan=nullptr,const cohort_intent_basis* intent=nullptr) {
     const identities ids(request.identity_mode);
-    auto* db=recovery_writer_access::active_handle(owner,writer);work_budget budget{limits};metadata durable(db,limits);
+    auto* db=recovery_writer_access::active_handle(owner,writer);work_budget budget{limits};metadata durable(db,limits,intent!=nullptr);
+    const std::string& membership_key=intent?intent->domain:request.binding.channel;
     const bool delta=request.identity.mode==receive_install_mode::delta;
     require(explicit_images || request.identity.mode==receive_install_mode::full,"recovery model installer supports full scope only");
     require(!explicit_images || request.full_rows.empty(),"recovery explicit images cannot mix with legacy full rows");
@@ -523,8 +539,8 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     }
     const auto declared=declaration(request,static_cast<uint64_t>(limits.metadata_bytes));
     require(declared.size()<=static_cast<uint64_t>(limits.metadata_bytes),"recovery declaration exceeds durable byte limit");
-    if(auto old=durable.declarations.find(request.binding.channel);old!=durable.declarations.end()) {
-        require(request.identity.expected_revision>0,"recovery membership exists without installed receiver state");
+    if(auto old=durable.declarations.find(membership_key);old!=durable.declarations.end()) {
+        require(intent || request.identity.expected_revision>0,"recovery membership exists without installed receiver state");
         require(old->second==declared,"recovery scope declaration changed");
     }
     else require(request.identity.expected_revision==0,"recovery installed scope membership is missing");
@@ -539,13 +555,13 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         if(found!=targets.end()) require(found->second==k,"recovery case-alias input target");
         else {require(targets.size()<limits.targets,"recovery target union limit exceeded");targets.emplace(normalized,k);}
         if(auto own=durable.ownership.find(normalized);own!=durable.ownership.end())
-            require(own->second.channel==request.binding.channel&&ids.normalized(own->second.target)==k,"recovery target owned by another scope or spelling");
+            require(own->second.channel==membership_key&&ids.normalized(own->second.target)==k,"recovery target owned by another scope or spelling");
         return k;
     };
-    for(const auto& [_,m]:durable.ownership)if(m.channel==request.binding.channel)target(m.target);
+    for(const auto& [_,m]:durable.ownership)if(m.channel==membership_key)target(m.target);
     std::set<key> granted;
     for(const auto& k:request.initial_row_grants) {
-        require(request.identity.expected_revision==0,"recovery initial adoption after installation is unsupported");
+        require(intent || request.identity.expected_revision==0,"recovery initial adoption after installation is unsupported");
         require(granted.insert(target(k)).second,"recovery duplicate initial row grant");
     }
     std::map<std::string,const recovery_pending_grant*> receipts;
@@ -609,22 +625,29 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     require(plan.size()==targets.size(),"recovery target capture incomplete");
     std::vector<key> filter;filter.reserve(targets.size());
     for(const auto& [_,k]:targets)filter.push_back(k);
-    auto pending=capture_pending_outbox_for_targets(owner,request.binding.channel,filter,limits.capture);
+    recovery_outbox_capture pending;
+    if(!intent)pending=capture_pending_outbox_for_targets(owner,request.binding.channel,filter,limits.capture);
+    const auto& original_audit=intent?intent->audit:pending.audit;
     std::vector<const recovery_outbox_audit*> accepted;
     std::set<std::string> classified;
-    for(const auto& audit:pending.audit) {
+    for(const auto& audit:original_audit) {
         const key k=ids.normalized({audit.table_name,audit.global_row_id});
         auto receipt=receipts.find(ids.id(audit.global_id));
         require(receipt!=receipts.end()&&ids.normalized(receipt->second->target)==k,"recovery pending identity lacks exact target-bound outcome");
         require(classified.insert(ids.id(audit.global_id)).second,"recovery duplicate original AuditLog identity");
         if(receipt->second->outcome==recovery_pending_outcome::not_committed) {
             auto& row=plan.at(k);row.unresolved=true;
-            if(row.base_replaced)replay(audit,schemas.at(k.table),row,budget,ids);
-        } else accepted.push_back(&audit);
+            if(row.base_replaced) {
+                if(intent) {
+                    auto replay_row=row;replay_row.before=intent->before.at(k);
+                    replay(audit,schemas.at(k.table),replay_row,budget,ids);row.after=std::move(replay_row.after);
+                } else replay(audit,schemas.at(k.table),row,budget,ids);
+            }
+        } else if(!intent||intent->own.count(ids.id(audit.global_id)))accepted.push_back(&audit);
     }
     // An explicit grant may refer to a receipt already settled locally, but
     // cannot acquire an unrelated row without an actual original audit record.
-    for(const auto& grant:request.pending)if(!classified.count(ids.id(grant.audit_global_id))) {
+    for(const auto& grant:request.pending)if(!intent&&!classified.count(ids.id(grant.audit_global_id))) {
         stmt audit(db,"SELECT a.tableName,a.globalRowId,ss.is_synchronized FROM main.AuditLog a "
             "LEFT JOIN main._lattice_sync_state ss ON ss.audit_entry_id=a.id AND ss.sync_id=?1 WHERE a.globalId=?2"+ids.collation()+" LIMIT 2");
         audit.text(1,request.binding.channel);audit.text(2,grant.audit_global_id);
@@ -700,7 +723,7 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
     }
     // Scope counters/capacity are evaluated before model effects; savepoint and
     // the trusted outer install transaction roll metadata back on any failure.
-    durable.replace(request.binding.channel,declared,membership);
+    durable.replace(membership_key,declared,membership);
     int64_t disabled;
     {
         stmt flag(db,"SELECT disabled FROM main._SyncControl WHERE id=1 LIMIT 2");
@@ -753,7 +776,7 @@ void install_body(lattice_db& owner,database& writer,const scoped_recovery_reque
         require(read.next()&&read.number(0)==1&&!read.next(),"recovery scoped obligation settlement failed");
     }
     if(final_plan)*final_plan={std::move(requested),std::move(plan),std::move(models),std::move(membership),
-        request.binding.channel,declared,disabled,{},{}};
+        request.binding.channel,declared,intent?intent->domain:std::string{},disabled,{},{}};
 }
 scoped_recovery_result install_images(std::shared_ptr<lattice_db> owner,
     const scoped_recovery_request& request,const scoped_recovery_limits& limits,
@@ -789,11 +812,18 @@ scoped_recovery_result install_scoped_recovery_images(std::shared_ptr<lattice_db
     return install_images(std::move(owner),request,limits,&images);
 }
 
-scoped_recovery_result install_staged_canonical_range(const canonical_install_admission& grant) {
+struct canonical_install_engine {
+    struct cohort_context {
+        std::map<std::string,recovery_obligation_entry> originals;
+        std::set<std::string> unsent;
+        cohort_intent_basis intent;
+        std::optional<installed_plan> latest;
+    };
+    static scoped_recovery_result owned(const canonical_install_admission& grant,database& writer,cohort_context* cohort=nullptr) {
     namespace cr=canonical_range;
     scoped_recovery_result result;
     const auto& limits=grant.limits_.install;
-    result.transaction=recovery_writer_access::install(grant.owner_,[&](database& writer) {
+
         validate_install_limits(limits);
         require(grant.journal_revision_>0 && !grant.coverage_id_.empty() &&
             grant.coverage_id_.size()<=limits.field_bytes,"canonical installation lacks bound coverage admission");
@@ -865,9 +895,10 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
                 const auto original=ids.id(q.original_id);
                 require(requested.emplace(original,&q).second,"canonical request has UUID alias originals");
                 auto entry=journal.find(grant.journal_,original);
-                require(entry && entry->canonical_target_id==ids.id(q.targets[0].id) &&
-                    entry->record.table==q.targets[0].table,"canonical request lacks actual journal original/target");
-                retained.emplace(original,std::move(*entry));
+                const auto* actual=entry?&*entry:cohort&&cohort->originals.count(original)?&cohort->originals.at(original):nullptr;
+                require(actual && actual->canonical_target_id==ids.id(q.targets[0].id) &&
+                    actual->record.table==q.targets[0].table,"canonical request lacks actual journal original/target");
+                if(entry)retained.emplace(original,std::move(*entry));
             }
             for(const auto& entry:before->entries)
                 require(requested.count(entry.canonical_original_id),"canonical final obligation is absent from frozen Q; reconciliation required");
@@ -916,7 +947,7 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
                     const auto original=ids.id(item.original_id);
                     require(requested.count(original) && seen.size()<limits.receipts && seen.insert(original).second,
                         "canonical receipt has missing or duplicate requested original");
-                    const auto& entry=retained.at(original);
+                    const auto& entry=retained.count(original)?retained.at(original):cohort->originals.at(original);
                     recovery_pending_outcome outcome;
                     if(const auto* positive=std::get_if<cr::committed>(&item.value)) {
                         require(positive->namespace_id==grant.profile_.receipt_namespace && positive->coverage_id==grant.coverage_id_ &&
@@ -929,14 +960,19 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
                             static_cast<int64_t>(positive->position),positive->outcome==cr::decision::applied?
                                 recovery_obligation_outcome::applied:recovery_obligation_outcome::no_op};
                         require(!entry.acknowledged || entry.acknowledged==claim,"canonical positive contradicts retained first ACK");
-                        if(entry.stage!=recovery_obligation_stage::settled)positives.push_back(std::move(claim));
+                        if(retained.count(original)&&entry.stage!=recovery_obligation_stage::settled)positives.push_back(std::move(claim));
                         require(positive_receipts.size()<limits.receipts && entry.record.audit_id>0,
                             "canonical positive actual receipt bound exceeded");
-                        positive_receipts.push_back({entry.record.audit_id,entry.canonical_original_id});
+                        if(retained.count(original))positive_receipts.push_back({entry.record.audit_id,entry.canonical_original_id});
                     } else if(const auto* negative=std::get_if<cr::not_committed>(&item.value)) {
                         require(negative->namespace_id==grant.profile_.receipt_namespace && negative->coverage_id==grant.coverage_id_ &&
                             entry.stage==recovery_obligation_stage::open && !entry.acknowledged,
                             "canonical negative lacks coverage or contradicts retained receipt");
+                        outcome=recovery_pending_outcome::not_committed;
+                    } else if(cohort && cohort->unsent.count(original)) {
+                        // This is local producer/route custody, never a minted
+                        // source-negative receipt. A claim on ANY contribution
+                        // removes the original from this exact proof.
                         outcome=recovery_pending_outcome::not_committed;
                     } else refuse("canonical unknown receipt requires reconciliation");
                     budget.identity(entry.record.original_id);budget.identity(entry.record.table);budget.identity(entry.record.target_id);
@@ -945,7 +981,8 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
             }
             require(seen.size()==requested.size(),"canonical receipt stream omitted a requested original");
             final_plan.emplace();
-            install_body(*grant.owner_,writer,context,limits,&images,&*final_plan);
+            if(cohort){cohort->intent.own.clear();for(const auto& [id,_]:retained)cohort->intent.own.insert(id);}
+            install_body(*grant.owner_,writer,context,limits,&images,&*final_plan,cohort?&cohort->intent:nullptr);
             same_stage();
             const auto unchanged=journal.snapshot_for_install(grant.journal_,identity.sequence);
             require(unchanged.scope==before->scope && unchanged.entries==before->entries,
@@ -997,16 +1034,149 @@ scoped_recovery_result install_staged_canonical_range(const canonical_install_ad
             if(completed_guard)receive_delivery_guard_access::verify_owned(*grant.owner_,writer,*completed_guard);
             else receive_delivery_guard_access::verify_canonical_completed(*grant.owner_,writer,*grant.receive_guard_);
         }
+    if(cohort&&final_plan)cohort->latest=std::move(final_plan);
+    return result;
+    }
+};
+scoped_recovery_result install_staged_canonical_range(const canonical_install_admission& grant) {
+    scoped_recovery_result result;
+    result.transaction=recovery_writer_access::install(grant.owner_,[&](database& writer) {
+        result.installation=canonical_install_engine::owned(grant,writer).installation;
     });
     if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();
     return result;
 }
-scoped_recovery_result inspect_committed_canonical_range(const canonical_install_admission& grant,
+void initialize_canonical_domains_owned(std::shared_ptr<lattice_db> owner,const scoped_recovery_limits& limits,bool create) {
+    auto* writer=owner?recovery_writer_access::active_writer(*owner):nullptr;
+    require(writer,"canonical domain initialization requires actual owned WRITE");
+    validate_install_limits(limits);metadata store(recovery_writer_access::active_handle(*owner,*writer),limits,true,create);
+}
+std::vector<receive_install_receipt> install_canonical_cohort_owned(const canonical_cohort_admission& admission) {
+    namespace cr=canonical_range;
+    require(admission.owner_&&admission.local_&&admission.verify_current_sources_&&admission.finalize_owned_&&
+        !admission.channels_.empty()&&admission.channels_.size()<=16&&admission.channels_.size()==admission.domains_.size(),
+        "canonical cohort admission incomplete");
+    auto& owner=*admission.owner_;auto* writer=recovery_writer_access::active_writer(owner);
+    require(writer,"canonical cohort needs actual owned WRITE");
+    recovery_continuous_producer::verify_for_owned_write(*admission.local_);
+    admission.verify_current_sources_();
+    const auto& limits=admission.channels_[0].limits_;
+    canonical_install_engine::cohort_context context;
+    context.intent.domain=admission.domains_[0];
+    require(!context.intent.domain.empty()&&context.intent.domain.size()==64,"canonical domain identity invalid");
+    // Multiple channels of one authority share row ownership. Distinct
+    // overlapping authorities require explicit semantics; model-name equality
+    // cannot manufacture a common replacement domain.
+    for(size_t i=0;i<admission.channels_.size();++i) {
+        require(admission.domains_[i]==context.intent.domain&&admission.channels_[i].owner_==admission.owner_,
+            "canonical cohort replacement domains differ");
+    }
+    const auto& frozen=admission.local_->frozen_journals();
+    require(frozen.size()==admission.channels_.size(),"canonical cohort omitted a contribution");
+    for(const auto& id:admission.local_->canonical_originals())context.unsent.insert(id);
+    std::set<std::string> channels;
+    for(const auto& snapshot:frozen)for(const auto& entry:snapshot.entries) {
+        auto [at,added]=context.originals.emplace(entry.canonical_original_id,entry);
+        if(!added)require(at->second.record==entry.record&&at->second.canonical_target_id==entry.canonical_target_id,
+            "canonical shared original changed target or audit identity");
+    }
+    require(context.originals.size()<=limits.install.receipts,"canonical union originals exceed request capacity");
+    std::vector<key> targets;std::map<std::string,std::vector<std::string>> requested;
+    std::set<key> unique_targets;
+    for(const auto& [id,entry]:context.originals)unique_targets.insert({entry.record.table,entry.canonical_target_id});
+    for(const auto& k:unique_targets){targets.push_back(k);requested[k.table].push_back(k.global_id);}
+    // Capture the original physical overlay ONCE before any canonical effect.
+    // Later capsules read current rows only to execute/verify physical writes;
+    // NoHistory replay keeps this original basis, never an intermediate image.
+    auto before=capture_recovery_rows(owner,requested,limits.install.capture);
+    for(const auto& row:before.current_rows)context.intent.before.emplace(
+        key{before.tables.at(row.table_index).name,canonical_writer_adapter::uuid_key(row.lookup_global_id)},
+        row.present?std::optional<values>{captured_values(before,row)}:std::nullopt);
+    std::map<int64_t,recovery_outbox_audit> audits;
+    uint64_t captured_bytes=before.charged_logical_bytes;
+    require(captured_bytes<=limits.install.logical_bytes,"canonical initial intent capture bound");
+    auto same_original=[](const recovery_outbox_audit& a,const recovery_outbox_audit& b) {
+        return a.id==b.id&&a.row_id==b.row_id&&a.global_id==b.global_id&&a.table_name==b.table_name&&a.operation==b.operation&&
+            a.global_row_id==b.global_row_id&&a.changed_fields_json==b.changed_fields_json&&a.changed_names_json==b.changed_names_json&&
+            a.timestamp==b.timestamp&&a.from_remote==b.from_remote&&a.globally_synchronized==b.globally_synchronized&&a.synthesized==b.synthesized;
+    };
+    for(const auto& snapshot:frozen) {
+        auto capture=capture_pending_outbox_for_targets(owner,snapshot.scope.address.channel,targets,limits.install.capture);
+        require(capture.charged_logical_bytes<=limits.install.logical_bytes-captured_bytes,"canonical aggregate intent capture bound");
+        captured_bytes+=capture.charged_logical_bytes;
+        for(auto& audit:capture.audit) {
+            const auto id=canonical_writer_adapter::uuid_key(audit.global_id);const auto found=context.originals.find(id);
+            require(found!=context.originals.end()&&found->second.record.audit_id==audit.id&&found->second.record.table==audit.table_name&&
+                found->second.canonical_target_id==canonical_writer_adapter::uuid_key(audit.global_row_id),"canonical pending audit absent from frozen union");
+            auto [at,added]=audits.emplace(audit.id,audit);if(!added)require(same_original(at->second,audit),"canonical shared original bytes differ");
+        }
+    }
+    std::set<std::string> captured;
+    for(auto& [_,audit]:audits){captured.insert(canonical_writer_adapter::uuid_key(audit.global_id));context.intent.audit.push_back(std::move(audit));}
+    for(const auto& id:context.unsent)require(captured.count(id),"canonical UNSENT original audit not retained in overlay");
+    receive_install_store receiver(admission.owner_,limits.install.installations);
+    recovery_obligation_store journal(admission.owner_,limits.obligations,limits.install.installations);
+    canonical_range_staging stages(admission.owner_,limits.install.installations,limits.codec,limits.staging);
+    std::vector<size_t> order;int64_t floor=0;
+    std::vector<canonical_staging_snapshot> images;
+    for(size_t i=0;i<admission.channels_.size();++i) {
+        const auto& grant=admission.channels_[i];
+        require(channels.insert(grant.journal_.channel).second,"canonical duplicate contribution admission");
+        auto found=std::find_if(frozen.begin(),frozen.end(),[&](const auto& value){return value.scope.address==grant.journal_;});
+        require(found!=frozen.end()&&found->scope.profile==grant.profile_&&found->scope.revision==grant.journal_revision_,
+            "canonical admission differs from actual frozen contribution");
+        require(grant.receive_guard_.has_value(),"canonical cohort missing actual guard admission");
+        receive_delivery_guard_access::verify_owned(owner,*writer,*grant.receive_guard_);
+        auto state=receiver.read(grant.journal_.channel);require(state&&state->binding==grant.profile_.binding,"canonical receiver binding changed");
+        if(state->last_installed)floor=std::max(floor,state->last_installed->head);
+        images.push_back(stages.verify_end({grant.attempt_,grant.route_,cr::end{grant.manifest_digest_}}));order.push_back(i);
+    }
+    std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b){return images[a].installation_identity.head<images[b].installation_identity.head;});
+    for(size_t n=0;n<order.size();++n){const auto& image=images[order[n]];
+        require(image.installation_identity.mode==receive_install_mode::full&&image.installation_identity.head>=floor,
+            "canonical cohort would regress an installed domain frontier");
+        if(n&&image.installation_identity.head==images[order[n-1]].installation_identity.head)
+            require(image.installation_identity.content_digest==images[order[n-1]].installation_identity.content_digest,
+                "canonical equal frontier images differ");
+    }
+    std::vector<receive_install_receipt> results;std::map<std::string,receive_install_snapshot> receivers;
+    std::map<std::string,recovery_obligation_scope> scopes;
+    std::map<std::string,receive_guard_snapshot> guards;
+    std::map<std::pair<std::string,std::string>,recovery_obligation_entry> entries;
+    for(auto i:order) {
+        admission.verify_current_sources_();
+        auto grant=admission.channels_[i];
+        // All preimages were checked before effects. The first successful
+        // completion may upgrade the one shared guard store from v1 to v2;
+        // later channels retain every original per-channel/counter field.
+        if(!results.empty()&&grant.receive_guard_->store_version==1)grant.receive_guard_->store_version=2;
+        receive_delivery_guard_access::verify_owned(owner,*writer,*grant.receive_guard_);
+        auto result=canonical_install_engine::owned(grant,*writer,&context);
+        require(result.installation&&result.installation->disposition==receive_install_disposition::installed,
+            "canonical cohort mixed installed and uninstalled results");
+        results.push_back(*result.installation);
+        receivers.emplace(grant.journal_.channel,*receiver.read(grant.journal_.channel));scopes.emplace(grant.journal_.channel,*journal.read(grant.journal_.channel));
+        guards.emplace(grant.journal_.channel,receive_delivery_guard_access::read_owned(owner,*writer,grant.journal_.channel));
+        for(const auto& [id,_]:context.originals)if(auto entry=journal.find(grant.journal_,id))entries.emplace(std::pair{grant.journal_.channel,id},*entry);
+    }
+    admission.finalize_owned_();admission.verify_current_sources_();
+    receiver.audit();journal.audit();
+    for(const auto& [channel,expected]:receivers)require(receiver.read(channel)==std::optional<receive_install_snapshot>{expected},"canonical cohort receiver postimage changed");
+    for(const auto& [channel,expected]:scopes)require(journal.read(channel)==std::optional<recovery_obligation_scope>{expected},"canonical cohort journal postimage changed");
+    for(const auto& [_,expected]:guards)receive_delivery_guard_access::verify_owned(owner,*writer,expected);
+    for(const auto& [address,expected]:entries)require(journal.find(scopes.at(address.first).address,address.second)==std::optional<recovery_obligation_entry>{expected},"canonical cohort original postimage changed");
+    require(context.latest.has_value(),"canonical cohort final row plan missing");
+    context.latest->verify(owner,*writer,limits.install,identities(recovery_identity_mode::uuid));
+    return results;
+}
+
+receive_install_receipt inspect_committed_canonical_owned(const canonical_install_admission& grant,
     const receive_install_identity& identity,const canonical_range::request& request,
     const canonical_range::manifest& manifest) {
-    scoped_recovery_result result;
+    std::optional<receive_install_receipt> result;
     const auto& limits=grant.limits_.install;
-    result.transaction=recovery_writer_access::install(grant.owner_,[&](database& writer) {
+    auto* owned=grant.owner_?recovery_writer_access::active_writer(*grant.owner_):nullptr;
+    require(owned,"canonical installed inspection requires actual owned WRITE");auto& writer=*owned;
         validate_install_limits(limits);
         require(grant.journal_revision_>0 && !grant.coverage_id_.empty() &&
             grant.coverage_id_.size()<=limits.field_bytes,"canonical inspection lacks bound admission");
@@ -1047,7 +1217,14 @@ scoped_recovery_result inspect_committed_canonical_range(const canonical_install
         expected.store_channel_bytes=guard.store_channel_bytes;
         if(expected==guard)receive_delivery_guard_access::verify_owned(*grant.owner_,writer,guard);
         else receive_delivery_guard_access::verify_canonical_completed(*grant.owner_,writer,*grant.receive_guard_);
-        result.installation=receive_install_receipt{receive_install_disposition::already_installed,current->revision,identity.head};
+        result=receive_install_receipt{receive_install_disposition::already_installed,current->revision,identity.head};
+    return *result;
+}
+scoped_recovery_result inspect_committed_canonical_range(const canonical_install_admission& grant,
+    const receive_install_identity& identity,const canonical_range::request& request,const canonical_range::manifest& manifest) {
+    scoped_recovery_result result;
+    result.transaction=recovery_writer_access::install(grant.owner_,[&](database&) {
+        result.installation=inspect_committed_canonical_owned(grant,identity,request,manifest);
     });
     if(result.transaction.state!=recovery_install_state::committed)result.installation.reset();
     return result;

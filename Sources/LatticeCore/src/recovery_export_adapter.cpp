@@ -737,20 +737,48 @@ void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> own
         const auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);
         if(inventory.scopes.empty())refuse("export legacy ACK lost protected inventory");
         recovery_obligation_store journal(owner,inventory.limits.obligations,inventory.limits.installations);
-        for(const auto& scope:inventory.scopes)if(scope.contribution.mode!=recovery_obligation_mode::recording)refuse("export legacy ACK belongs to frozen generation");
+        const bool enabled=inventory.continuous&&recovery_continuous_producer::shared_install_domains(*owner);
+        const auto target=std::find_if(inventory.scopes.begin(),inventory.scopes.end(),[&](const auto& scope){return scope.contribution.address.channel==channel;});
+        if(enabled&&target==inventory.scopes.end())refuse("enabled legacy ACK channel is not admitted");
+        if(!enabled)for(const auto& scope:inventory.scopes)if(scope.contribution.mode!=recovery_obligation_mode::recording)refuse("export legacy ACK belongs to frozen generation");
         std::set<std::string> unique;
         for(const auto& id:ids){
             if(id.size()!=36||!unique.insert(id).second)refuse("export legacy ACK invalid or duplicate original");
             std::optional<recovery_obligation_entry> entry;
-            for(const auto& scope:inventory.scopes){const auto found=journal.find(scope.contribution.address,id);if(found){
-                if(entry&&(!inventory.continuous||entry->record!=found->record))refuse("export ambiguous ACK contribution");
-                if(inventory.continuous&&!found->first_export_claim)refuse("continuous ACK has unclaimed shared contribution");entry=found;
-            }}
-            if(!entry||!entry->first_export_claim||entry->stage!=recovery_obligation_stage::open)refuse("export legacy ACK has no retained claimed original");
+            std::vector<std::pair<recovery_obligation_address,recovery_obligation_entry>> unchanged;
+            if(enabled){
+                // A delayed physical delivery ACK is orthogonal to the current
+                // canonical phase. It may observe frozen, installed or resumed
+                // journals, including an already settled retained original.
+                entry=journal.find(target->contribution.address,id);
+                if(!entry||!entry->first_export_claim||entry->record.origin!=recovery_obligation_origin::local_candidate)
+                    refuse("enabled legacy ACK has no retained channel claim");
+                for(const auto& scope:inventory.scopes){
+                    const auto found=journal.find(scope.contribution.address,id);
+                    const bool covers=std::any_of(scope.tables.begin(),scope.tables.end(),[&](const auto& table){return table.name==entry->record.table;});
+                    if(covers&&!found)refuse("enabled legacy ACK lost shared original");
+                    if(found){
+                        if(!found->first_export_claim||found->record!=entry->record||found->canonical_original_id!=entry->canonical_original_id||
+                           found->canonical_target_id!=entry->canonical_target_id)refuse("enabled legacy ACK shared claim identity differs");
+                        unchanged.emplace_back(scope.contribution.address,*found);
+                    }
+                }
+            }else{
+                for(const auto& scope:inventory.scopes){const auto found=journal.find(scope.contribution.address,id);if(found){
+                    if(entry&&(!inventory.continuous||entry->record!=found->record))refuse("export ambiguous ACK contribution");
+                    if(inventory.continuous&&!found->first_export_claim)refuse("continuous ACK has unclaimed shared contribution");entry=found;
+                }}
+                if(!entry||!entry->first_export_claim||entry->stage!=recovery_obligation_stage::open)refuse("export legacy ACK has no retained claimed original");
+            }
             writer.execute("INSERT INTO main._lattice_sync_state(audit_entry_id,sync_id,is_synchronized) VALUES(?,?,1) ON CONFLICT(audit_entry_id,sync_id) DO UPDATE SET is_synchronized=1",{entry->record.audit_id,channel});
             const auto rows=writer.query("SELECT 1 AS ok FROM main._lattice_sync_state WHERE audit_entry_id=? AND sync_id=? AND typeof(is_synchronized)='integer' AND is_synchronized=1 LIMIT 2",{entry->record.audit_id,channel});
             if(rows.size()!=1)refuse("export legacy ACK bookkeeping was ignored");
+            for(const auto& [address,before]:unchanged)if(journal.find(address,id)!=std::optional<recovery_obligation_entry>{before})
+                refuse("enabled legacy ACK changed canonical entry");
         }
+        if(enabled)for(const auto& scope:inventory.scopes)
+            if(journal.read(scope.contribution.address.channel)!=std::optional<recovery_obligation_scope>{scope.contribution})
+                refuse("enabled legacy ACK changed canonical scope");
     });
     require_committed(result);
 }

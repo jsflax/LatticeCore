@@ -177,7 +177,10 @@ struct canonical_writer_adapter::context {
     lattice_db* owner=nullptr; // identity only; upstream delivery holds the strong owner
     canonical_writer_profile profile;
     std::optional<canonical_namespace_profile> namespaces;
+    std::optional<canonical_ready_profile> ready;
     const canonical_namespace_profile* namespace_profile()const {return namespaces?&*namespaces:nullptr;}
+    const canonical_ready_profile* ready_profile()const {return ready?&*ready:nullptr;}
+    int64_t retention_version()const {return ready?3:2;}
     // Built once from the exact table/index/program bytes validated at attach.
     // Immutable after publication; capture never accepts replacement scope.
     std::vector<sync_recovery::source_relation> source_relations;
@@ -233,6 +236,7 @@ struct canonical_writer_adapter::context {
            action==SQLITE_CREATE_VTABLE || action==SQLITE_DROP_VTABLE) return SQLITE_DENY;
         if(action==SQLITE_PRAGMA && two && (same_ascii(one,"recursive_triggers") ||
            same_ascii(one,"writable_schema") || same_ascii(one,"schema_version")))return SQLITE_DENY;
+        if(self.ready && action==SQLITE_PRAGMA && two && (same_ascii(one,"synchronous") || same_ascii(one,"journal_mode")))return SQLITE_DENY;
         if((action==SQLITE_INSERT||action==SQLITE_UPDATE||action==SQLITE_DELETE) && one &&
            std::strncmp(one,"_lattice_canonical_",19)==0) {
             if(!self.active->load(std::memory_order_acquire)||!schema||std::strcmp(schema,"main"))return SQLITE_DENY;
@@ -267,6 +271,7 @@ struct canonical_writer_adapter::context {
     }
 };
 #include "canonical_transfer_retention.inc"
+#include "canonical_durable_ready.inc"
 std::string canonical_writer_adapter::uuid_key(const std::string& value) {
     if(value.size()!=36)refuse("canonical requires UUID identity");
     char out[36];if(!uuid(reinterpret_cast<const unsigned char*>(value.data()),static_cast<int>(value.size()),out))refuse("canonical requires UUID identity");return {out,36};
@@ -282,7 +287,7 @@ canonical_writer_adapter::~canonical_writer_adapter() {
 }
 canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canonical_writer_profile& p,
     const canonical_upstream_limits* upstream,const canonical_retention_limits* retention,
-    const canonical_namespace_profile* namespaces) {
+    const canonical_namespace_profile* namespaces,const canonical_ready_profile* ready) {
     const auto& catalog=owner.recovery_schemas_;
     if(!catalog.valid())refuse("canonical owner schema catalog outside bounds or ambiguous");
     // The attachment owns its setup transaction. It cannot attach during caller
@@ -295,6 +300,10 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         refuse("canonical unsupported scope/identity budget");
     for(const auto& name:p.models)if(!identifier(name))refuse("canonical invalid bounded model name");
     canonical_change_store store(owner,p.binding,p.limits,namespaces); // Validates before copying/registration.
+    if(ready) {
+        if(!namespaces || !upstream || !retention)refuse("canonical READY requires retained namespaced upstream profile");
+        validate_ready_profile(*ready,p,*retention);
+    }
     writer_=owner.db_;
     {
         auto* mutex=sqlite3_db_mutex(writer_->internal_handle());sqlite3_mutex_enter(mutex);
@@ -324,6 +333,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     context_=std::make_shared<context>();context_->connection=writer_->internal_handle();context_->binding=p.binding;
     context_->owner=&owner;context_->profile=p;
     if(namespaces)context_->namespaces=*namespaces;
+    if(ready)context_->ready=*ready;
     if(upstream)context_->upstream=*upstream;
     // An inert primitive ledger is not evidence of prior owned acceptance.
     // V2 first enrollment requires no canonical metadata at all; only the
@@ -374,7 +384,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             if(!namespaced_reopen &&
                !writer_->query("SELECT 1 FROM main.sqlite_master WHERE substr(name,1,19)='_lattice_canonical_' LIMIT 1").empty())
                 refuse("canonical namespaced enrollment refuses preexisting unadmitted metadata");
-            if(namespaced_reopen)retention_inventory_matches(*writer_,p,namespaces);
+            if(namespaced_reopen)retention_inventory_matches(*writer_,p,namespaces,ready);
         }
         const auto databases=writer_->query("SELECT name FROM pragma_database_list LIMIT 3");
         for(const auto& row:databases) {
@@ -595,9 +605,18 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
     const std::function<void()>& before_decision,const std::function<void()>& after_decision,
     const std::function<void(uint64_t)>& verify_retention_generation,
     const canonical_namespace_admission* namespace_admission) {
-    // No access to this after these copies: qualification callbacks may retire
-    // the wrapper. They cannot release our actual owner/writer/context custody.
-    auto state=context_;auto writer=writer_;
+    return capture_recovery_session(std::move(owner),writer_,context_,binding,base,requests,limits,
+        after_batch,before_decision,after_decision,verify_retention_generation,namespace_admission);
+}
+sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recovery_session(
+    std::shared_ptr<lattice_db> owner,std::shared_ptr<database> writer,std::shared_ptr<context> state,
+    const canonical_store_binding& binding,std::optional<int64_t> base,
+    const std::vector<sync_recovery::canonical_capture_request>& requests,
+    const sync_recovery::canonical_capture_limits& limits,const std::function<void(size_t,uint64_t)>& after_batch,
+    const std::function<void()>& before_decision,const std::function<void()>& after_decision,
+    const std::function<void(uint64_t)>& verify_retention_generation,const canonical_namespace_admission* namespace_admission) {
+    // Explicit retained arguments survive wrapper retirement in qualification
+    // callbacks. The same actual owner/writer/context remain in custody.
     const auto held_admission=namespace_admission?std::optional<canonical_namespace_admission>(*namespace_admission):std::nullopt;
     namespace_admission=held_admission?&*held_admission:nullptr;
     if(!owner || !state || state->owner!=owner.get() || binding!=state->binding)

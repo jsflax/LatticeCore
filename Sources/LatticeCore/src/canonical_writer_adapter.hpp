@@ -2,6 +2,7 @@
 #include "canonical_change_store.hpp"
 #include "canonical_source_capture.hpp"
 #include "canonical_transfer_retention.hpp"
+#include "canonical_durable_ready.hpp"
 #include "lattice/sync.hpp"
 #include <memory>
 #include <string>
@@ -77,7 +78,8 @@ class canonical_writer_adapter {
     explicit canonical_writer_adapter(lattice_db&, const canonical_writer_profile&,
                                       const canonical_upstream_limits* = nullptr,
                                       const canonical_retention_limits* = nullptr,
-                                      const canonical_namespace_profile* = nullptr);
+                                      const canonical_namespace_profile* = nullptr,
+                                      const canonical_ready_profile* = nullptr);
     static void validate_namespace_admission(const std::shared_ptr<lattice_db>&,
         const std::shared_ptr<database>&, const std::shared_ptr<context>&,
         const canonical_namespace_admission&);
@@ -93,6 +95,24 @@ class canonical_writer_adapter {
     friend struct canonical_source_session_test_access;
     friend struct canonical_retention_test_access;
     friend struct canonical_namespace_test_access;
+    friend struct canonical_ready_test_access;
+    static sync_recovery::owned_canonical_capture capture_reserved_session(std::shared_ptr<lattice_db>,
+        std::shared_ptr<database>,std::shared_ptr<context>,std::shared_ptr<retention_session>,
+        const canonical_retention_ticket&,const std::vector<sync_recovery::canonical_capture_request>&,
+        const sync_recovery::canonical_capture_limits&,const std::function<void(size_t,uint64_t)>&,
+        const canonical_namespace_admission*);
+    static sync_recovery::owned_canonical_capture capture_recovery_session(std::shared_ptr<lattice_db>,
+        std::shared_ptr<database>,std::shared_ptr<context>,const canonical_store_binding&,std::optional<int64_t>,
+        const std::vector<sync_recovery::canonical_capture_request>&,const sync_recovery::canonical_capture_limits&,
+        const std::function<void(size_t,uint64_t)>&,const std::function<void()>&,const std::function<void()>&,
+        const std::function<void(uint64_t)>&,const canonical_namespace_admission*);
+    void enroll_ready(lattice_db&,bool);
+    static void verify_ready_retention(database&,const context&,const retention_session&);
+    static void expire_ready_rows(database&,const context&,retention_session&);
+    static canonical_ready_info ready_info(database&,const context&,const retention_session&,const std::string&);
+    canonical_ready_result prepare_ready_impl(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_range::attempt&,const canonical_range::request&,int64_t,uint64_t,
+        const std::function<void()>&,const std::function<void(size_t,uint64_t)>&);
     sync_recovery::owned_canonical_capture capture_reserved_impl(std::shared_ptr<lattice_db>,
         const canonical_retention_ticket&,const std::vector<sync_recovery::canonical_capture_request>&,
         const sync_recovery::canonical_capture_limits&,const std::function<void(size_t,uint64_t)>&,
@@ -107,6 +127,27 @@ class canonical_writer_adapter {
         const canonical_namespace_admission* = nullptr);
 
 public:
+    // Distinct fresh receipt-v2/retention-v3 profile, or exact v3 reopen only.
+    // The actual writer must already use WAL and synchronous FULL or EXTRA;
+    // this API never changes ordinary owner/SDK durability configuration.
+    // No implicit v2 adoption, authenticated issuer or serving capability.
+    static std::unique_ptr<canonical_writer_adapter> attach_ready_for_qualification(
+        std::shared_ptr<lattice_db>,const canonical_namespaced_writer_profile&,
+        canonical_upstream_limits,canonical_retention_limits,const canonical_ready_profile&);
+    canonical_ready_result prepare_ready_owned(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_range::attempt&,const canonical_range::request&,int64_t duration_ms,uint64_t route_generation);
+    // Equivalent logical identity only. Immutable manifest lease bytes remain
+    // unchanged; receiver/controller binding of this new physical lease is a
+    // separate, still-unimplemented admission contract.
+    canonical_ready_resume_result resume_ready_owned(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_range::attempt&,const canonical_range::request&,int64_t duration_ms,uint64_t route_generation);
+    canonical_ready_frame_result read_ready_frame_owned(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_ready_lease&,uint64_t index);
+    // Source-owner inspection/disposal only. No remote cancellation, quiescence,
+    // installation, ACK or receipt settlement is implied by abandonment/expiry.
+    canonical_ready_inspection inspect_ready_owned(std::shared_ptr<lattice_db>);
+    recovery_install_result abandon_ready_owned(std::shared_ptr<lattice_db>,const canonical_ready_identity&);
+    recovery_install_result expire_ready_owned(std::shared_ptr<lattice_db>);
     static std::unique_ptr<canonical_writer_adapter> attach(lattice_db&, const canonical_writer_profile&);
     // Inactive qualification only. Requires upstream_requested and an idle,
     // retained owner with no configured sync/IPC. No borrowed upstream route.

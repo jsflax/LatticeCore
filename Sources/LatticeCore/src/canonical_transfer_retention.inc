@@ -2,10 +2,16 @@
 // No public callback or writable TLS switch exposes the closed operation frame.
 namespace {
 constexpr int retention_bootstrap=1, retention_reserve=2, retention_release=3, retention_expire=4, retention_prune=5;
+constexpr int ready_prepare=6,ready_publish=7,ready_resume=8,ready_read=9,ready_abandon=10;
 using retention_inventory=std::map<std::pair<std::string,std::string>,std::string>;
+void append_ready_schema(retention_inventory&);
+void validate_ready_profile(const canonical_ready_profile&,const canonical_writer_profile&,const canonical_retention_limits&);
+const char* ready_inventory_query();
+bool ready_authorize(int,int,const char*,const char*)noexcept;
 constexpr const char* retention_profile_query="SELECT CASE WHEN typeof(id)='integer' THEN id END AS id,CASE WHEN typeof(version)='integer' THEN version END AS version,CASE WHEN typeof(incarnation)='integer' THEN incarnation END AS incarnation,CASE WHEN typeof(next_attempt)='integer' THEN next_attempt END AS next_attempt,CASE WHEN typeof(max_attempts)='integer' THEN max_attempts END AS max_attempts,CASE WHEN typeof(max_duration_ms)='integer' THEN max_duration_ms END AS max_duration_ms,CASE WHEN typeof(main_device)='integer' THEN main_device END AS main_device,CASE WHEN typeof(main_inode)='integer' THEN main_inode END AS main_inode,CASE WHEN typeof(parent_device)='integer' THEN parent_device END AS parent_device,CASE WHEN typeof(parent_inode)='integer' THEN parent_inode END AS parent_inode,CASE WHEN typeof(custody_device)='integer' THEN custody_device END AS custody_device,CASE WHEN typeof(custody_inode)='integer' THEN custody_inode END AS custody_inode FROM main._lattice_canonical_retention LIMIT 2";
 constexpr const char* retention_attempts_query="SELECT CASE WHEN typeof(id)='integer' THEN id END AS id,CASE WHEN typeof(incarnation)='integer' THEN incarnation END AS incarnation,CASE WHEN typeof(base)='integer' THEN base END AS base,CASE WHEN typeof(deadline_ms)='integer' THEN deadline_ms END AS deadline_ms FROM main._lattice_canonical_attempt LIMIT 1025";
-retention_inventory retention_schema(const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr) {
+retention_inventory retention_schema(const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr,
+    const canonical_ready_profile* ready=nullptr) {
     retention_inventory out;
     out[{"table","_lattice_canonical_store"}]="CREATE TABLE _lattice_canonical_store (id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_id BLOB NOT NULL,head INTEGER NOT NULL,floor INTEGER NOT NULL,markers INTEGER NOT NULL,marker_bytes INTEGER NOT NULL,receipts INTEGER NOT NULL,receipt_bytes INTEGER NOT NULL,max_markers INTEGER NOT NULL,max_marker_bytes INTEGER NOT NULL,max_receipts INTEGER NOT NULL,max_receipt_bytes INTEGER NOT NULL,max_batch INTEGER NOT NULL,max_identity INTEGER NOT NULL,max_operation INTEGER NOT NULL) WITHOUT ROWID";
     out[{"table","_lattice_canonical_touch"}]="CREATE TABLE _lattice_canonical_touch (relation BLOB NOT NULL,identity BLOB NOT NULL,position INTEGER NOT NULL,charge INTEGER NOT NULL,PRIMARY KEY(relation,identity)) WITHOUT ROWID";
@@ -41,6 +47,7 @@ retention_inventory retention_schema(const canonical_writer_profile& p,const can
                 demand(condition)+" END";
         }
     }
+    if(ready)append_ready_schema(out);
     return out;
 }
 void changed_retention(database& writer,int64_t expected=1) {
@@ -52,15 +59,17 @@ constexpr const char* retention_inventory_query="SELECT type,CASE WHEN length(CA
         "OR (type='trigger' AND substr(tbl_name,1,19)='_lattice_canonical_') "
         "OR (tbl_name IN ('_lattice_canonical_retention','_lattice_canonical_attempt','_lattice_canonical_store',"
         "'_lattice_canonical_touch','_lattice_canonical_receipt','_lattice_canonical_coverage','_lattice_canonical_namespace') AND sql IS NOT NULL) LIMIT 32";
-void retention_inventory_matches(const std::vector<database::row_t>& rows,const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr) {
-    const auto expected=retention_schema(p,namespaces);
+void retention_inventory_matches(const std::vector<database::row_t>& rows,const canonical_writer_profile& p,
+    const canonical_namespace_profile* namespaces=nullptr,const canonical_ready_profile* ready=nullptr) {
+    const auto expected=retention_schema(p,namespaces,ready);
     if(rows.size()!=expected.size())refuse("canonical retention object inventory differs");
     retention_inventory actual;
     for(const auto& row:rows)actual.emplace(std::pair{string(row,"type"),string(row,"name")},string(row,"sql"));
     if(actual!=expected)refuse("canonical retention missing, altered or extra schema/guard");
 }
-void retention_inventory_matches(database& writer,const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr) {
-    retention_inventory_matches(writer.query(retention_inventory_query),p,namespaces);
+void retention_inventory_matches(database& writer,const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr,
+    const canonical_ready_profile* ready=nullptr) {
+    retention_inventory_matches(writer.query(ready?ready_inventory_query():retention_inventory_query),p,namespaces,ready);
 }
 }
 struct canonical_writer_adapter::retention_session {
@@ -148,6 +157,7 @@ bool canonical_writer_adapter::context::authorize_retention(context& self,int ac
     const auto* frame=retention_frame::current;
     if(!frame || frame->state!=&self || frame->bootstrap ||
        !recovery_writer_access::active_install_for(self.owner,self.connection))return false;
+    if(self.ready && ready_authorize(frame->operation,action,table,column))return true;
     if(std::strcmp(table,"_lattice_canonical_attempt")==0)
         return (action==SQLITE_INSERT && frame->operation==retention_reserve) ||
             (action==SQLITE_DELETE && (frame->operation==retention_release || frame->operation==retention_expire || frame->operation==retention_prune));
@@ -166,6 +176,11 @@ void canonical_writer_adapter::prepare_retention(lattice_db& owner,const canonic
         refuse("canonical retention requires bounded limits and a file writer without automatic audit retention");
     const auto mode=writer_->query("PRAGMA journal_mode");
     if(mode.size()!=1 || string(mode[0],"journal_mode")!="wal")refuse("canonical retention requires file WAL");
+    if(context_->ready) {
+        const auto sync=writer_->query("PRAGMA main.synchronous");
+        if(sync.size()!=1 || integer(sync[0],"synchronous")<2 || integer(sync[0],"synchronous")>3)
+            refuse("canonical READY requires FULL/EXTRA commit durability before enrollment");
+    }
     auto session=std::make_shared<retention_session>();session->limits=limits;
     session->identity=writer_->physical_identity("main",{},true);
     if(!session->identity)refuse("canonical retention actual physical file identity unavailable");
@@ -202,9 +217,9 @@ void canonical_writer_adapter::prepare_retention(lattice_db& owner,const canonic
     session->locked=true;
     session->verify_file(*writer_);
     if(existing) {
-        retention_inventory_matches(*writer_,context_->profile,context_->namespace_profile());
+        retention_inventory_matches(*writer_,context_->profile,context_->namespace_profile(),context_->ready_profile());
         const auto rows=writer_->query(retention_profile_query);
-        if(rows.size()!=1 || integer(rows[0],"id")!=1 || integer(rows[0],"version")!=2)
+        if(rows.size()!=1 || integer(rows[0],"id")!=1 || integer(rows[0],"version")!=context_->retention_version())
             refuse("canonical retention unsupported profile version; no migration or rebind");
         session->verify_binding(rows[0]);
     }
@@ -220,6 +235,7 @@ void canonical_writer_adapter::prepare_retention(lattice_db& owner,const canonic
 #endif
 }
 void canonical_writer_adapter::enroll_retention(lattice_db& owner,bool reopen) {
+    if(context_->ready){enroll_ready(owner,reopen);return;}
     auto& writer=*writer_;auto& session=*retention_;
     // A legacy coverage or v1 profile is never silently promoted. Profile v2
     // binds all three physical identities on first coverage enrollment only.
@@ -261,6 +277,7 @@ void canonical_writer_adapter::enroll_retention(lattice_db& owner,bool reopen) {
     verify_retention(writer,*context_,session);
 }
 void canonical_writer_adapter::verify_retention(database& writer,const context& state,const retention_session& session) {
+    if(state.ready){verify_ready_retention(writer,state,session);return;}
     session.verify_file(writer);
     retention_inventory_matches(writer,state.profile,state.namespace_profile());
     const auto rows=writer.query(retention_profile_query);
@@ -352,15 +369,21 @@ void expire_retention(database& writer,int64_t now) {
 }
 }
 recovery_install_result canonical_writer_adapter::expire_recovery_owned(std::shared_ptr<lattice_db> owner) {
-    return retention_owned(std::move(owner),writer_,context_,retention_,retention_expire,[](database& actual,retention_session& clock){expire_retention(actual,clock.now());});
+    auto state=context_;
+    return retention_owned(std::move(owner),writer_,state,retention_,retention_expire,[&](database& actual,retention_session& clock){
+        if(state->ready)expire_ready_rows(actual,*state,clock);
+        expire_retention(actual,clock.now());});
 }
 recovery_install_result canonical_writer_adapter::prune_recovery_owned(std::shared_ptr<lattice_db> owner,int64_t floor) {
     auto state=context_;
     return retention_owned(owner,writer_,state,retention_,retention_prune,[&](database& actual,retention_session& clock){
+        if(state->ready)expire_ready_rows(actual,*state,clock);
         expire_retention(actual,clock.now());
         canonical_change_store store(*owner,state->binding,state->profile.limits,state->namespace_profile());store.audit();
         const auto old=store.state();
-        const auto rows=actual.query("SELECT COALESCE(MIN(base),?) AS ceiling FROM main._lattice_canonical_attempt",{old.head});
+        const auto rows=actual.query(state->ready?
+            "SELECT COALESCE(MIN(base),?) AS ceiling FROM (SELECT base FROM main._lattice_canonical_attempt UNION ALL SELECT pin AS base FROM main._lattice_canonical_ready_transfer)":
+            "SELECT COALESCE(MIN(base),?) AS ceiling FROM main._lattice_canonical_attempt",{old.head});
         // The only protection input is this registry's committed rows under the
         // same owned writer transaction. Receipts remain independently retained.
         store.advance_floor(floor,integer(rows.at(0),"ceiling"));
@@ -382,7 +405,13 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_reserve
     const canonical_retention_ticket& ticket,const std::vector<sync_recovery::canonical_capture_request>& requests,
     const sync_recovery::canonical_capture_limits& limits,const std::function<void(size_t,uint64_t)>& after_batch,
     const canonical_namespace_admission* admission) {
-    auto state=context_;auto session=retention_;auto writer=writer_;
+    return capture_reserved_session(std::move(owner),writer_,context_,retention_,ticket,requests,limits,after_batch,admission);
+}
+sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_reserved_session(std::shared_ptr<lattice_db> owner,
+    std::shared_ptr<database> writer,std::shared_ptr<context> state,std::shared_ptr<retention_session> session,
+    const canonical_retention_ticket& ticket,const std::vector<sync_recovery::canonical_capture_request>& requests,
+    const sync_recovery::canonical_capture_limits& limits,const std::function<void(size_t,uint64_t)>& after_batch,
+    const canonical_namespace_admission* admission) {
     const auto requested_base=ticket.requested_base_;
     if(!session || !state || !owner || state->owner!=owner.get() || ticket.session_.lock()!=session || ticket.incarnation_!=session->incarnation)
         refuse("canonical reserved capture old or foreign source incarnation");
@@ -393,21 +422,21 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_reserve
     const auto validate=[&](uint64_t generation){
         if(session->now()>=ticket.deadline_)refuse("canonical reservation expired before capture");
         session->verify_file(*writer);
-        const auto inventory=owner->query_at_generation(generation,retention_inventory_query);
+        const auto inventory=owner->query_at_generation(generation,state->ready?ready_inventory_query():retention_inventory_query);
         if(!inventory)refuse("canonical retention schema generation unavailable");
-        retention_inventory_matches(*inventory,state->profile,state->namespace_profile());
+        retention_inventory_matches(*inventory,state->profile,state->namespace_profile(),state->ready_profile());
         const auto profile=owner->query_at_generation(generation,retention_profile_query);
-        if(!profile || profile->size()!=1 || integer(profile->at(0),"version")!=2 ||
+        if(!profile || profile->size()!=1 || integer(profile->at(0),"version")!=state->retention_version() ||
            integer(profile->at(0),"incarnation")!=session->incarnation)
             refuse("canonical capture retention profile differs");
         session->verify_binding(profile->at(0));
         const auto rows=owner->query_at_generation(generation,"SELECT a.id FROM main._lattice_canonical_attempt a JOIN main._lattice_canonical_retention r "
-            "ON r.id=1 AND r.version=2 AND r.incarnation=a.incarnation WHERE a.id=? AND a.incarnation=? AND a.base=? AND a.deadline_ms=?",
-            {ticket.id_,ticket.incarnation_,ticket.base_,ticket.deadline_});
+            "ON r.id=1 AND r.version=? AND r.incarnation=a.incarnation WHERE a.id=? AND a.incarnation=? AND a.base=? AND a.deadline_ms=?",
+            {state->retention_version(),ticket.id_,ticket.incarnation_,ticket.base_,ticket.deadline_});
         if(!rows || rows->size()!=1)refuse("canonical capture has no exact committed reservation");
     };
     const auto before_decision=[&]{if(session->now()>=ticket.deadline_)refuse("canonical reservation expired during capture");};
-    auto result=capture_recovery_impl(owner,state->binding,requested_base,requests,limits,after_batch,before_decision,{},validate,admission);
+    auto result=capture_recovery_session(owner,writer,state,state->binding,requested_base,requests,limits,after_batch,before_decision,{},validate,admission);
     if(!result.capture || result.head<ticket.base_)refuse("canonical reservation did not protect this coherent capture");
     return result; // actual generation custody ended before the session unlock
 }

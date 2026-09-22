@@ -1,5 +1,6 @@
 #pragma once
 #include "sync_recovery_values.hpp"
+#include "recovery_receipt_coverage.hpp"
 #include <optional>
 #include <memory>
 #include <string>
@@ -59,6 +60,7 @@ struct receipt_request {
     // null is unknown provenance, not an implicitly covered legacy namespace.
     std::optional<std::string> namespace_id;
     std::vector<identity> targets;
+    std::optional<std::string> operation_digest;
     bool operator==(const receipt_request&) const = default;
 };
 struct request {
@@ -69,6 +71,8 @@ struct request {
     wire_limits budget;
     std::vector<receipt_request> receipts;
     std::string request_digest;
+    std::optional<recovery_receipt_binding> registered_producer;
+    std::optional<std::string> receipt_namespace;
     bool operator==(const request&) const = default;
 };
 struct lease {
@@ -91,6 +95,9 @@ struct manifest {
     lease protection;
     totals counts;
     std::string content_digest, receipt_digest, rebase_digest, manifest_digest;
+    std::optional<recovery_receipt_binding> registered_producer;
+    std::optional<std::string> receipt_namespace;
+    std::optional<uint64_t> coverage_revision;
     bool operator==(const manifest&) const = default;
 };
 struct present {
@@ -123,6 +130,8 @@ struct unknown {
 struct receipt_item {
     std::string original_id;
     std::variant<committed, not_committed, unknown> value;
+    std::optional<std::string> operation_digest;
+    bool legacy_unbound=false;
     bool operator==(const receipt_item&) const = default;
 };
 struct content_page {
@@ -148,6 +157,7 @@ struct frame {
     attempt logical;
     uint64_t route_generation = 0; // spelling only; caller MUST authenticate/fence
     message body;
+    uint64_t version=2;
     bool operator==(const frame&) const = default;
 };
 

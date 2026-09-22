@@ -101,6 +101,14 @@ using changed_fields_map = std::unordered_map<std::string, any_property>;
 // AuditLog Entry - matches Lattice.swift's AuditLog model
 // ============================================================================
 
+// Passive wire facts. Only the registered-producer ingress recomputation can
+// establish original identity; these fields confer no receipt authority.
+struct audit_original_identity {
+    int64_t version = 1;
+    std::vector<std::string> changed_fields_names;
+    std::string digest;
+    bool operator==(const audit_original_identity&) const = default;
+};
 struct audit_log_entry {
     int64_t id = 0;
     std::string global_id;
@@ -125,6 +133,7 @@ struct audit_log_entry {
     /// Serialized as an optional "synthesized" JSON key; old receivers
     /// ignore it (legacy upsert behavior — acceptable, they predate groups).
     bool synthesized = false;
+    std::optional<audit_original_identity> original_identity;
 
     // Generate SQL instruction from this audit entry
     // Returns {sql, params} for executing the change

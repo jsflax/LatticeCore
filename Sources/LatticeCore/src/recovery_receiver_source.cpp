@@ -1,4 +1,5 @@
 #include "recovery_receiver_source.hpp"
+#include "recovery_receipt_json.hpp"
 #include "sync_callback_lifetime.hpp"
 #include <lattice/lattice.hpp>
 #include <nlohmann/json.hpp>
@@ -130,7 +131,11 @@ receiver_source_binding::receiver_source_binding(const std::shared_ptr<lattice_d
     if(!owner||!lifetime)reject("receiver source requires actual retained owner");
     auto value=bounded(raw);shape(value,{"endpoint","source","incomingScope","peer","channel","validForMilliseconds"});
     endpoint(url);if(text(value,"endpoint",4096)!=url)reject("receiver source endpoint differs from actual owner configuration");
-    const auto& source=value.at("source");shape(source,{"authority","sourceID","epoch","scopeDigest","schemaDigest","receiptNamespace","coverageID","coverageRevision","descriptorDigest"});
+    const auto& source=value.at("source");auto source_shape=source;source_shape.erase("receiptCoverage");shape(source_shape,{"authority","sourceID","epoch","scopeDigest","schemaDigest","receiptNamespace","coverageID","coverageRevision","descriptorDigest"});
+    if(source.contains("receiptCoverage")) {
+        const auto p=receipt_json::profile(source.at("receiptCoverage"));
+        if(std::find(p.namespaces.begin(),p.namespaces.end(),text(source,"receiptNamespace"))==p.namespaces.end())reject("receiver receipt namespace outside expected cohort");
+    }
     (void)text(source,"authority");uuid(source,"sourceID");uuid(source,"epoch");digest(source,"scopeDigest");digest(source,"schemaDigest");digest(source,"descriptorDigest");
     (void)text(source,"receiptNamespace");(void)text(source,"coverageID");(void)number(source,"coverageRevision");scope(value.at("incomingScope"));
     const auto& peer=value.at("peer");shape(peer,{"replicaID","receiverIncarnation","channelIncarnation"});(void)text(peer,"replicaID");uuid(peer,"receiverIncarnation");uuid(peer,"channelIncarnation");(void)text(value,"channel",64);
@@ -173,7 +178,8 @@ bool receiver_source_binding::receive(const platform_transport_callbacks& attemp
         const auto value=bounded(std::string(raw));
         const bool control=value.contains("kind")&&value.at("kind")=="recoveryReady";
         if(!control||pending->described||!live(pending))reject("receiver source unsolicited, repeated or expired recovery frame");
-        shape(value,{"kind","version","operation","requestID","routeGeneration","source","incomingScope","peer","channel","profile","upload"});
+        auto frame_shape=value;frame_shape.erase("receiptBinding");
+        shape(frame_shape,{"kind","version","operation","requestID","routeGeneration","source","incomingScope","peer","channel","profile","upload"});
         if(number(value,"version",1)!=1||value.at("operation")!="describe"||value.at("requestID")!=pending->request)reject("receiver source describe correlation differs");
         (void)decimal(value,"routeGeneration");profile(value.at("profile"));
         const auto& upload=value.at("upload");shape(upload,{"maximumEntries","maximumWireBytes","maximumScalarBytes","parserNodes","parserDepth","maximumDeletes"});
@@ -181,6 +187,11 @@ bool receiver_source_binding::receive(const platform_transport_callbacks& attemp
             if(it.key()=="maximumDeletes")(void)number(upload,"maximumDeletes",256,0);
             else (void)number(upload,it.key().c_str());
         for(const auto* key:{"source","incomingScope","peer","channel"})if(value.at(key)!=policy_->expected.at(key))reject("receiver source differs from explicit application expectation");
+        if(value.contains("receiptBinding")!=value.at("source").contains("receiptCoverage"))reject("receiver receipt producer binding profile differs");
+        if(value.contains("receiptBinding")) {
+            const auto p=receipt_json::profile(value.at("source").at("receiptCoverage"));const auto b=receipt_json::binding(value.at("receiptBinding"));
+            if(b.cohort_id!=p.cohort_id||b.cohort_revision!=p.revision)reject("receiver authenticated producer cohort differs");
+        }
         auto accepted=std::make_shared<record>(*pending);accepted->described=true;accepted->response=value;
         if(!live(accepted))reject("receiver source retired during describe validation");
         std::shared_ptr<const record> retired;
@@ -219,6 +230,10 @@ std::shared_ptr<const receiver_upload_view> receiver_source_binding::capture_upl
     view->entries_=cap("maximumEntries",1000);view->wire_=cap("maximumWireBytes",8388608);
     view->scalar_=cap("maximumScalarBytes",1048576);view->nodes_=cap("parserNodes",32768);
     view->depth_=cap("parserDepth",16);view->deletes_=cap("maximumDeletes",1000);
+    if(view->record_->response.contains("receiptBinding")) {
+        view->receipt_binding_=receipt_json::binding(view->record_->response.at("receiptBinding"));
+        view->schema_digest_=text(view->record_->response.at("source"),"schemaDigest",64);
+    }
     if(!view->current())reject("negotiated upload source revoked during capture");return view;
 }
 bool receiver_source_binding::upload_pending(uint64_t generation)const {

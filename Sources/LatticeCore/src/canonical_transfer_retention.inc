@@ -3,9 +3,10 @@
 namespace {
 constexpr int retention_bootstrap=1, retention_reserve=2, retention_release=3, retention_expire=4, retention_prune=5;
 constexpr int ready_prepare=6,ready_publish=7,ready_resume=8,ready_read=9,ready_abandon=10;
+constexpr int receipt_migrate=11;
 using retention_inventory=std::map<std::pair<std::string,std::string>,std::string>;
 void append_ready_schema(retention_inventory&);
-void validate_ready_profile(const canonical_ready_profile&,const canonical_writer_profile&,const canonical_retention_limits&);
+void validate_ready_profile(const canonical_ready_profile&,const canonical_writer_profile&,const canonical_retention_limits&,bool registered_profile=false);
 const char* ready_inventory_query();
 bool ready_authorize(int,int,const char*,const char*)noexcept;
 constexpr const char* retention_profile_query="SELECT CASE WHEN typeof(id)='integer' THEN id END AS id,CASE WHEN typeof(version)='integer' THEN version END AS version,CASE WHEN typeof(incarnation)='integer' THEN incarnation END AS incarnation,CASE WHEN typeof(next_attempt)='integer' THEN next_attempt END AS next_attempt,CASE WHEN typeof(max_attempts)='integer' THEN max_attempts END AS max_attempts,CASE WHEN typeof(max_duration_ms)='integer' THEN max_duration_ms END AS max_duration_ms,CASE WHEN typeof(main_device)='integer' THEN main_device END AS main_device,CASE WHEN typeof(main_inode)='integer' THEN main_inode END AS main_inode,CASE WHEN typeof(parent_device)='integer' THEN parent_device END AS parent_device,CASE WHEN typeof(parent_inode)='integer' THEN parent_inode END AS parent_inode,CASE WHEN typeof(custody_device)='integer' THEN custody_device END AS custody_device,CASE WHEN typeof(custody_inode)='integer' THEN custody_inode END AS custody_inode FROM main._lattice_canonical_retention LIMIT 2";
@@ -48,6 +49,17 @@ retention_inventory retention_schema(const canonical_writer_profile& p,const can
         }
     }
     if(ready)append_ready_schema(out);
+    if(namespaces&&namespaces->coverage) {
+        for(const auto& [name,ddl]:canonical_coverage_schema()) {
+            out[{"table",name}]=ddl;
+            for(const auto* action:{"INSERT","UPDATE","DELETE"}) {
+                const auto trigger=name+"_guard_"+action;
+                const auto condition=name=="_lattice_canonical_receipt_member"?std::string("0"):
+                    "lattice_canonical_guard_v1("+literal(p.binding.source)+","+literal(p.binding.epoch)+","+literal(p.binding.scope)+","+literal(p.binding.schema)+")=1";
+                out[{"trigger",trigger}]="CREATE TRIGGER "+trigger+" BEFORE "+action+" ON "+name+" BEGIN"+demand(condition)+" END";
+            }
+        }
+    }
     return out;
 }
 void changed_retention(database& writer,int64_t expected=1) {
@@ -69,7 +81,9 @@ void retention_inventory_matches(const std::vector<database::row_t>& rows,const 
 }
 void retention_inventory_matches(database& writer,const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr,
     const canonical_ready_profile* ready=nullptr) {
-    retention_inventory_matches(writer.query(ready?ready_inventory_query():retention_inventory_query),p,namespaces,ready);
+    auto query=std::string(ready?ready_inventory_query():retention_inventory_query);
+    if(namespaces&&namespaces->coverage)query.replace(query.rfind(" LIMIT "),std::string::npos," LIMIT 96");
+    retention_inventory_matches(writer.query(query),p,namespaces,ready);
 }
 }
 struct canonical_writer_adapter::retention_session {
@@ -137,12 +151,16 @@ struct canonical_writer_adapter::retention_frame {
     bool bootstrap;
     retention_frame* previous;
     static thread_local retention_frame* current;
-    retention_frame(context& s,int op):state(&s),operation(op),bootstrap(op==retention_bootstrap),previous(current){current=this;}
+    retention_frame(context& s,int op):state(&s),operation(op),bootstrap(op==retention_bootstrap||op==receipt_migrate),previous(current){current=this;}
     ~retention_frame(){current=previous;}
     retention_frame(const retention_frame&)=delete;
 };
 thread_local canonical_writer_adapter::retention_frame* canonical_writer_adapter::retention_frame::current=nullptr;
 thread_local const canonical_upstream_test_hooks::authorizer_fault* canonical_retention_test_hooks::fault=nullptr;
+bool canonical_writer_adapter::context::migration_admitted(const context& self) noexcept {
+    const auto* frame=retention_frame::current;
+    return frame&&frame->state==&self&&frame->operation==receipt_migrate&&!self.retention.expired();
+}
 void canonical_writer_adapter::context::admit_retention(sqlite3_context* sql,int count,sqlite3_value**) noexcept {
     auto& self=**static_cast<std::shared_ptr<context>*>(sqlite3_user_data(sql));
     const auto* frame=retention_frame::current;

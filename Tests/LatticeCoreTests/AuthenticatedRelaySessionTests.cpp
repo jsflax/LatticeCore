@@ -541,5 +541,384 @@ TEST_F(AuthenticatedReadySession, HeldReadyResultRetainsNoActualOwnerAfterSetupA
     EXPECT_TRUE(observed.expired());EXPECT_FALSE(queued.publishable());
     queued={};EXPECT_TRUE(observed.expired());
 }
+
+class AuthenticatedReceiptCoverageV3:public AuthenticatedReadySession {
+protected:
+    using Rows=std::vector<database::row_t>;
+    using Snapshot=std::map<std::string,Rows>;
+    detail::recovery_producer_registration producer(unsigned n=1) {
+        return {"explicit-installation-"+std::to_string(n),relay_uuid(5000+n)};
+    }
+    json covered_policy(const std::string& selected="app") {
+        auto p=policy();p["version"]=2;p["readyProfile"]="bounded48MiBV1";p["receiptNamespace"]=selected;
+        p["receiptCoverage"]={{"kind","registeredProducerV3"},{"cohortID",relay_uuid(5100)},
+            {"cohortRevision",7},{"operationCodec",1},{"namespaces",json::array({"app","other"})}};
+        return p;
+    }
+    json covered_answer(const relay_recovery_setup& actual,unsigned registration=1) {
+        auto answer=outcome(actual);const auto p=producer(registration);
+        answer["receiptCoverage"]={{"kind","registeredProducer"},{"registrationID",p.registration_id},
+            {"incarnation",p.incarnation},{"cohortID",relay_uuid(5100)},{"cohortRevision",7}};
+        return answer;
+    }
+    relay_recovery_setup covered_setup(const std::string& selected="app",unsigned peer=1,unsigned registration=1) {
+        auto actual=open(covered_policy(selected),connection(peer),std::make_shared<RelayRouteState>());
+        if(!actual.valid())throw std::runtime_error("actual v3 source setup refused: "+last_bridge_error());
+        if(!actual.finish_authorization(covered_answer(actual,registration).dump()))
+            throw std::runtime_error("actual v3 source authorization refused: "+last_bridge_error());
+        return actual;
+    }
+    audit_log_entry identified(audit_log_entry value,unsigned registration=1) {
+        const auto& catalog=detail::authenticated_relay_catalog_test_access::catalog(*owner);
+        value.original_identity=detail::make_original_identity(value,{{"text",column_type::text}},{},catalog.swift_digest,producer(registration));
+        return value;
+    }
+    Snapshot global_state() {
+        Snapshot result;
+        for(const auto* table:{"AuthenticatedRelayRow","AuditLog","_lattice_canonical_store","_lattice_canonical_receipt",
+                              "_lattice_canonical_touch","_lattice_canonical_namespace"})
+            result[table]=owner->db().query("SELECT * FROM "+std::string(table)+" ORDER BY 1");
+        return result;
+    }
+    Snapshot all_state() {
+        Snapshot result;const auto tables=owner->db().query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+        if(tables.size()>128)throw std::runtime_error("v3 fixture table inventory bound");
+        for(const auto& row:tables) {
+            const auto& name=std::get<std::string>(row.at("name"));
+            if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='_';}))
+                throw std::runtime_error("v3 fixture table name refused");
+            result[name]=owner->db().query("SELECT * FROM \""+name+"\" ORDER BY 1");
+        }
+        result["sqlite_schema"]=owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");return result;
+    }
+    Rows coverage() {return owner->db().query("SELECT * FROM _lattice_canonical_receipt_coverage ORDER BY original_id,namespace_id");}
+    static std::vector<uint8_t> bytes(const std::string& text) {return {text.begin(),text.end()};}
+};
+
+TEST_F(AuthenticatedReceiptCoverageV3, DistinctAuthenticatedPeersShareOneGlobalApplicationAndAddOnlyNamespaceCoverage) {
+    setup=covered_setup();auto other=covered_setup("other",2);
+    const auto a=json::parse(setup.descriptor()),b=json::parse(other.descriptor());
+    EXPECT_NE(a["route"]["peer"],b["route"]["peer"]);EXPECT_EQ(a["source"]["receiptCoverage"],b["source"]["receiptCoverage"]);
+    const auto e=identified(entry());auto first=setup.receive(frame(e));
+    ASSERT_EQ(first.status_code(),1);ASSERT_EQ(first.take_ids(),std::vector<std::string>{e.global_id});ASSERT_TRUE(first.publishable());
+    const auto global=global_state();const auto original_receipts=receipts();ASSERT_EQ(original_receipts.size(),1u);
+    ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);ASSERT_EQ(coverage().size(),1u);
+    const auto first_origin=owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin");
+    auto second=other.receive(frame(e));ASSERT_EQ(second.status_code(),1);ASSERT_EQ(second.take_ids(),std::vector<std::string>{e.global_id});ASSERT_TRUE(second.publishable());
+    EXPECT_EQ(global_state(),global);EXPECT_EQ(receipts(),original_receipts);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin"),first_origin);
+    const auto cells=coverage();ASSERT_EQ(cells.size(),2u);
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[0].at("namespace_id")),bytes("app"));
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[1].at("namespace_id")),bytes("other"));
+    for(const auto& cell:cells)EXPECT_EQ(std::get<std::vector<uint8_t>>(cell.at("original_id")),bytes(e.global_id));
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("AuditLog"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+    const auto complete=all_state();
+    EXPECT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(all_state(),complete);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, DifferentProducerAndChangedOrdinaryContentCannotAdoptTheOriginal) {
+    setup=covered_setup();const auto e=identified(entry());ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    auto different=covered_setup("other",2,2);auto same=covered_setup("other",3);
+    const auto before=all_state();auto wrong_producer=identified(entry(),2);
+    EXPECT_TRUE(different.receive(frame(wrong_producer)).ids().empty());EXPECT_EQ(all_state(),before);
+    auto changed=e;changed.changed_fields["text"]=any_property("different content with old identity");
+    EXPECT_TRUE(same.receive(frame(changed)).ids().empty());EXPECT_EQ(all_state(),before);
+    changed=identified(changed); // Valid current encoding, but not the accepted immutable operation.
+    EXPECT_TRUE(same.receive(frame(changed)).ids().empty());EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(same.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(coverage().size(),2u);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, DenyAllCannotAddCoverageEvenForAnAlreadyAcceptedOriginal) {
+    setup=covered_setup();const auto e=identified(entry());ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    auto p=covered_policy("other");p["upload"]["unlisted"]="deny";auto denied=open(p,connection(2));ASSERT_TRUE(denied.valid());
+    ASSERT_TRUE(denied.finish_authorization(covered_answer(denied).dump()));const auto before=all_state();
+    const auto result=denied.receive(frame(e));EXPECT_EQ(result.status_code(),4);EXPECT_TRUE(result.ids().empty());
+    EXPECT_EQ(all_state(),before);EXPECT_EQ(coverage().size(),1u);
+    EXPECT_EQ(denied.receive(server_sent_event::make_ack({relay_uuid(9999)}).to_json()).status_code(),1);
+    EXPECT_EQ(coverage().size(),1u);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, AuthorizationRequiresTheActualContextAndExactExplicitCohort) {
+    setup=covered_setup();const auto baseline=all_state();
+    for(const auto* mismatch:{"missing","cohort","revision","context"}) {
+        SCOPED_TRACE(mismatch);auto actual=open(covered_policy("other"),connection(2));ASSERT_TRUE(actual.valid());
+        auto answer=covered_answer(actual);const auto correct=answer;
+        if(std::string(mismatch)=="missing")answer.erase("receiptCoverage");
+        if(std::string(mismatch)=="cohort")answer["receiptCoverage"]["cohortID"]=relay_uuid(5199);
+        if(std::string(mismatch)=="revision")answer["receiptCoverage"]["cohortRevision"]=8;
+        if(std::string(mismatch)=="context")answer["context"]=json::parse(setup.descriptor());
+        EXPECT_FALSE(actual.finish_authorization(answer.dump()));EXPECT_FALSE(actual.finish_authorization(correct.dump()));
+        EXPECT_EQ(actual.receive(frame(identified(entry()))).status_code(),2);EXPECT_EQ(all_state(),baseline);
+    }
+    const auto missing=setup.receive(frame(entry()));EXPECT_TRUE(missing.ids().empty());EXPECT_NE(missing.status_code(),1);
+    EXPECT_EQ(all_state(),baseline);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, RegisteredSourceRequiresExplicitLargeProfileAndCannotImplicitlyUpgradeV2) {
+    const auto fresh=all_state();auto invalid=covered_policy();invalid.erase("readyProfile");
+    auto refused=open(invalid,connection());EXPECT_FALSE(refused.valid());EXPECT_EQ(all_state(),fresh);
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    setup.close_on_io();setup={};const auto before=all_state(),global=global_state();
+    auto implicit=open(covered_policy(),connection(2));EXPECT_FALSE(implicit.valid());EXPECT_EQ(all_state(),before);
+    setup=open(policy(),connection(3));ASSERT_TRUE(setup.valid());authorize();
+    EXPECT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(global_state(),global);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, ExplicitOwnedMigrationPreservesLegacyReceiptWithoutInventingProducerCoverage) {
+    open();authorize();const auto legacy=entry();ASSERT_EQ(setup.receive(frame(legacy)).ids().size(),1u);
+    const auto original_receipts=receipts();auto expected=global_state();
+    setup.close_on_io();setup={};ASSERT_FALSE(owner->is_closed());
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};
+    EXPECT_EQ(global_state(),expected);EXPECT_EQ(receipts(),original_receipts);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    const auto migrated=all_state();auto old=open(policy(),connection(2));EXPECT_FALSE(old.valid());EXPECT_EQ(all_state(),migrated);
+    setup=covered_setup("app",3);auto other=covered_setup("other",4);const auto retained=identified(legacy);
+    EXPECT_EQ(global_state(),expected);const auto reopened=all_state();
+    EXPECT_EQ(setup.receive(frame(retained)).take_ids(),std::vector<std::string>{legacy.global_id});
+    EXPECT_TRUE(other.receive(frame(retained)).ids().empty());EXPECT_EQ(all_state(),reopened);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    const auto next=identified(entry(2,"new registered operation"));ASSERT_EQ(setup.receive(frame(next)).ids().size(),1u);
+    const auto after_first=global_state();ASSERT_EQ(other.receive(frame(next)).ids().size(),1u);EXPECT_EQ(global_state(),after_first);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(coverage().size(),2u);
+    EXPECT_EQ(count("AuthenticatedRelayRow"),2);EXPECT_EQ(count("_lattice_canonical_receipt"),2);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, MigrationWaitsForActualSetupAndHeldReadyResultWithoutAnySqlEffects) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    auto held=invoke(setup,control("describe"));ASSERT_TRUE(held.publishable());const auto before=all_state();
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),2);EXPECT_TRUE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    setup.close_on_io();EXPECT_FALSE(held.publishable());
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),2);EXPECT_EQ(all_state(),before);
+    setup={};
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),2);EXPECT_TRUE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    held={};
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);
+    setup=covered_setup();EXPECT_TRUE(setup.stop_token().live());
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, InvalidMigrationPolicyLeavesTheExistingSourceExactlyReopenable) {
+    open();authorize();ASSERT_EQ(setup.receive(frame(entry())).ids().size(),1u);setup.close_on_io();setup={};
+    const auto before=all_state(),global=global_state();auto changed=covered_policy();changed["epoch"]=relay_uuid(5999);
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),changed.dump()),4);EXPECT_FALSE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    auto stale=policy();stale["epoch"]=relay_uuid(5999);auto corresponding=covered_policy();corresponding["epoch"]=relay_uuid(5999);
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(stale.dump(),corresponding.dump()),4);EXPECT_FALSE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    setup=open(policy(),connection(2));ASSERT_TRUE(setup.valid())<<last_bridge_error();authorize();
+    EXPECT_EQ(setup.receive(frame(entry())).ids().size(),1u);EXPECT_EQ(global_state(),global);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, MigrationDisposesActualOldReadyCapsuleButPreservesBindingHighWaterAndGlobalData) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    const auto d=description(setup);auto request_frame=request(d);auto& q=std::get<ready_wire::request>(request_frame.body);
+    q.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(request_frame,d);
+    const auto offered=lease(setup,request_frame,d);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);ASSERT_GT(count("_lattice_canonical_ready_frame"),0);
+    const auto binding=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");ASSERT_EQ(binding.size(),1u);
+    auto expected=global_state();setup.close_on_io();setup={};
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),binding);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    setup=covered_setup();EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),binding);
+}
+
+class AuthenticatedReceiptMigrationClosure:public AuthenticatedReceiptCoverageV3 {
+protected:
+    void recreate_owner() {
+        if(owner||ref)throw std::runtime_error("migration fixture requires complete prior owner release");
+        swift_configuration c(file.str(),std::make_shared<immediate_scheduler>());c.audit_retention_seconds=0;c.busy_timeout_ms=100;
+#if LATTICE_HAS_FRT
+        ref.reset(swift_lattice_ref::create(c,{relay_schema()}));
+#else
+        ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(c,{relay_schema()}));
+#endif
+        if(!ref)throw std::runtime_error("replacement migration ref unavailable");
+        owner=swift_lattice_ref::shared_for_lattice(ref->get());
+        if(!owner)throw std::runtime_error("replacement migration owner unavailable");
+        if(auto* n=instance_registry::instance().get_or_create_notifier(file.str()))n->stop_listening();
+    }
+    void require_pending_without_sql(const Snapshot& expected) {
+        const auto statements=database::thread_statement_count();
+        const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
+        EXPECT_EQ(database::thread_statement_count(),statements);
+        EXPECT_EQ(result,2)<<last_bridge_error();EXPECT_TRUE(last_bridge_error().empty());
+        EXPECT_EQ(all_state(),expected);
+    }
+};
+
+struct ReceiptMigrationCommitDenial {
+    static thread_local ReceiptMigrationCommitDenial* active;
+    int hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* previous;
+    ReceiptMigrationCommitDenial* prior;
+    explicit ReceiptMigrationCommitDenial(database& db):
+        fault{detail::canonical_writer_custody_test_access::fault_handle(db),deny},
+        previous(detail::canonical_retention_test_hooks::fault),prior(active) {
+        active=this;detail::canonical_retention_test_hooks::fault=&fault;
+    }
+    ~ReceiptMigrationCommitDenial(){detail::canonical_retention_test_hooks::fault=previous;active=prior;}
+    ReceiptMigrationCommitDenial(const ReceiptMigrationCommitDenial&)=delete;
+    ReceiptMigrationCommitDenial& operator=(const ReceiptMigrationCommitDenial&)=delete;
+    static int deny(int action,const char* operation,const char*,const char* origin)noexcept {
+        if(active&&!origin&&action==SQLITE_TRANSACTION&&operation&&std::strcmp(operation,"COMMIT")==0) {
+            ++active->hits;return SQLITE_DENY;
+        }
+        return SQLITE_OK;
+    }
+};
+thread_local ReceiptMigrationCommitDenial* ReceiptMigrationCommitDenial::active=nullptr;
+
+TEST_F(AuthenticatedReceiptMigrationClosure, ReplacementOwnerMigrationWaitsForEveryActualDescribeResultAndStopFence) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    auto held=invoke(setup,control("describe"));ASSERT_EQ(held.status_code(),1);ASSERT_TRUE(held.publishable());
+    auto copied=held;auto stopped=setup.stop_token();EXPECT_FALSE(stopped.drained());
+    const auto before=all_state();auto expected=global_state();
+    const auto physical=owner->db().physical_identity("main",{},true);ASSERT_TRUE(physical);
+    const std::weak_ptr<lattice::swift_lattice> prior_owner=owner;
+    setup.close_on_io();setup={};owner->close();owner.reset();ref.reset();
+    ASSERT_TRUE(prior_owner.expired());EXPECT_FALSE(held.publishable());EXPECT_FALSE(copied.publishable());EXPECT_FALSE(stopped.live());
+    recreate_owner();const auto replacement=owner->db().physical_identity("main",{},true);ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->device,physical->device);EXPECT_EQ(replacement->inode,physical->inode);EXPECT_EQ(all_state(),before);
+    require_pending_without_sql(before);
+    held={};EXPECT_FALSE(stopped.drained());require_pending_without_sql(before);
+    copied={};EXPECT_TRUE(stopped.drained());
+    // A drained, stopped fence still retains this source's capacity domain.
+    // Releasing the final actual fence is required before changing its recipe.
+    require_pending_without_sql(before);stopped={};
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    setup=covered_setup();EXPECT_TRUE(setup.stop_token().live());EXPECT_EQ(global_state(),expected);
+}
+
+TEST_F(AuthenticatedReceiptMigrationClosure, ActualMigrationCommitDenialRestoresWholeV2CapsuleAndRetryPreservesGlobalHistory) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto d=description(setup);auto requested=request(d);auto& q=std::get<ready_wire::request>(requested.body);
+    q.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(requested,d);
+    const auto offered=lease(setup,requested,d);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);ASSERT_GT(count("_lattice_canonical_ready_frame"),0);
+    const auto binding=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");ASSERT_EQ(binding.size(),1u);
+    setup.close_on_io();setup={};const auto before=all_state();auto expected=global_state();
+    {
+        ReceiptMigrationCommitDenial fault(owner->db());
+        const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
+        const auto error=last_bridge_error();EXPECT_EQ(fault.hits,1);EXPECT_EQ(result,4);EXPECT_FALSE(error.empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(std::get<int64_t>(before.at("_lattice_canonical_store").at(0).at("version")),2);
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),binding);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    const auto migrated=all_state();auto old=open(policy(),connection(2));EXPECT_FALSE(old.valid());EXPECT_EQ(all_state(),migrated);
+    setup=covered_setup("app",3);EXPECT_TRUE(setup.stop_token().live());EXPECT_EQ(global_state(),expected);
+}
+
+
+// The only rendezvous is before either actual API call, outside all production
+// locks/callbacks. SQL admission remains serialized by the real owned writer.
+struct ReceiptIngressWorkers {
+    struct Outcome {int32_t status=0;bool publishable=false;std::vector<std::string> ids;std::exception_ptr error;};
+    std::atomic<unsigned> arrived{0},completed{0};std::atomic<bool> released{false},cancelled{false},timed_out{false};
+    Outcome results[2];std::vector<std::thread> threads;
+    ReceiptIngressWorkers(){threads.reserve(2);}
+    ~ReceiptIngressWorkers(){cancelled.store(true);released.store(true);for(auto& worker:threads)if(worker.joinable())worker.join();}
+    void launch(size_t index,relay_recovery_setup actual,std::string raw){
+        threads.emplace_back([this,index,actual=std::move(actual),raw=std::move(raw)]{
+            ++arrived;const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+            while(!released.load()&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+            if(!released.load())timed_out.store(true);
+            if(released.load()&&!cancelled.load())try{auto result=actual.receive(raw);results[index].status=result.status_code();
+                results[index].publishable=result.publishable();results[index].ids=result.take_ids();}catch(...){results[index].error=std::current_exception();}
+            ++completed;
+        });
+    }
+    bool wait(const std::atomic<unsigned>& count,unsigned expected){const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(count.load()!=expected&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();return count.load()==expected;}
+    void join(){for(auto& worker:threads)if(worker.joinable())worker.join();}
+};
+struct ReceiptIngressCommitDenial {
+    static thread_local ReceiptIngressCommitDenial* active;
+    unsigned hits=0;detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* previous;ReceiptIngressCommitDenial* prior;
+    explicit ReceiptIngressCommitDenial(database& db):fault{detail::canonical_writer_custody_test_access::fault_handle(db),deny},
+        previous(detail::canonical_upstream_test_hooks::fault),prior(active){active=this;detail::canonical_upstream_test_hooks::fault=&fault;}
+    ~ReceiptIngressCommitDenial(){detail::canonical_upstream_test_hooks::fault=previous;active=prior;}
+    static int deny(int action,const char* operation,const char*,const char* origin)noexcept{
+        if(active&&!origin&&action==SQLITE_TRANSACTION&&operation&&std::strcmp(operation,"COMMIT")==0){++active->hits;return SQLITE_DENY;}return SQLITE_OK;
+    }
+};
+thread_local ReceiptIngressCommitDenial* ReceiptIngressCommitDenial::active=nullptr;
+
+TEST_F(AuthenticatedReceiptCoverageV3, ConcurrentApiStartsAcceptOneGlobalOriginalThroughTwoAuthorizedNamespaces) {
+    setup=covered_setup();auto c=connection(2);c["channel"]="other-channel";
+    auto other=open(covered_policy("other"),c,std::make_shared<RelayRouteState>());ASSERT_TRUE(other.valid());
+    ASSERT_TRUE(other.finish_authorization(covered_answer(other).dump()));
+    const auto e=identified(entry());const auto raw=frame(e);ASSERT_EQ(count("_lattice_canonical_receipt"),0);
+    ReceiptIngressWorkers workers;workers.launch(0,setup,raw);workers.launch(1,other,raw);
+    ASSERT_TRUE(workers.wait(workers.arrived,2));workers.released.store(true);
+    ASSERT_TRUE(workers.wait(workers.completed,2));workers.join();EXPECT_FALSE(workers.timed_out.load());
+    for(const auto& result:workers.results){EXPECT_FALSE(result.error);EXPECT_EQ(result.status,1);EXPECT_TRUE(result.publishable);EXPECT_EQ(result.ids,std::vector<std::string>{e.global_id});}
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("AuditLog"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    const auto head=owner->db().query("SELECT head FROM _lattice_canonical_store");ASSERT_EQ(head.size(),1u);EXPECT_EQ(std::get<int64_t>(head[0].at("head")),1);
+    const auto accepted=receipts();ASSERT_EQ(accepted.size(),1u);EXPECT_EQ(std::get<int64_t>(accepted[0].at("position")),1);
+    const auto cells=coverage();ASSERT_EQ(cells.size(),2u);
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[0].at("namespace_id")),bytes("app"));EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[1].at("namespace_id")),bytes("other"));
+    for(const auto& cell:cells)EXPECT_EQ(std::get<std::vector<uint8_t>>(cell.at("original_id")),bytes(e.global_id));
+    EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(other.stop_token().drained());
+    const auto complete=all_state();EXPECT_EQ(setup.receive(raw).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(other.receive(raw).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(all_state(),complete);
+}
+TEST_F(AuthenticatedReceiptCoverageV3, BothActualCommitAttemptsRollbackNewOriginAndLaterChannelCoverageBeforeRetry) {
+    setup=covered_setup();auto c=connection(2);c["channel"]="other-channel";
+    auto other=open(covered_policy("other"),c,std::make_shared<RelayRouteState>());ASSERT_TRUE(other.valid());
+    ASSERT_TRUE(other.finish_authorization(covered_answer(other).dump()));const auto e=identified(entry());const auto raw=frame(e);
+    const auto empty=all_state();
+    {
+        ReceiptIngressCommitDenial fault(owner->db());const auto failed=other.receive(raw);
+        EXPECT_EQ(fault.hits,2u);EXPECT_EQ(failed.status_code(),1);EXPECT_TRUE(failed.ids().empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(all_state(),empty);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);EXPECT_TRUE(coverage().empty());
+    ASSERT_EQ(other.receive(raw).take_ids(),std::vector<std::string>{e.global_id});const auto one=all_state(),global=global_state();
+    ASSERT_EQ(coverage().size(),1u);ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    {
+        ReceiptIngressCommitDenial fault(owner->db());const auto failed=setup.receive(raw);
+        EXPECT_EQ(fault.hits,2u);EXPECT_EQ(failed.status_code(),1);EXPECT_TRUE(failed.ids().empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(all_state(),one);EXPECT_EQ(global_state(),global);
+    ASSERT_EQ(setup.receive(raw).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(global_state(),global);
+    EXPECT_EQ(coverage().size(),2u);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("AuditLog"),1);
+    const auto complete=all_state();EXPECT_EQ(other.receive(raw).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(all_state(),complete);
+}
+TEST_F(AuthenticatedReceiptCoverageV3, OrdinaryIngressCountAndWireByteLimitsRefuseWithoutChangingDurableCapacityOrState) {
+    setup=covered_setup();const auto actual=description(setup);ASSERT_EQ(actual.at("upload").at("maximumEntries"),256);
+    ASSERT_EQ(actual.at("upload").at("maximumWireBytes"),1048576);ASSERT_EQ(actual.at("upload").at("maximumScalarBytes"),65536);
+    ASSERT_EQ(actual.at("upload").at("maximumDeletes"),256);
+    const auto profile=owner->db().query("SELECT max_origins,max_origin_bytes,max_cells,max_cell_bytes FROM _lattice_canonical_receipt_profile");ASSERT_EQ(profile.size(),1u);
+    EXPECT_EQ(std::get<int64_t>(profile[0].at("max_origins")),65536);EXPECT_EQ(std::get<int64_t>(profile[0].at("max_origin_bytes")),67108864);
+    EXPECT_EQ(std::get<int64_t>(profile[0].at("max_cells")),4194304);EXPECT_EQ(std::get<int64_t>(profile[0].at("max_cell_bytes")),1610612736);
+    const auto before=all_state();std::vector<audit_log_entry> too_many;too_many.reserve(257);
+    for(unsigned n=1;n<=257;++n)too_many.push_back(identified(entry(n)));
+    const auto count_frame=server_sent_event::make_audit_log(too_many).to_json();ASSERT_LT(count_frame.size(),1048576u);
+    const auto count_refusal=setup.receive(count_frame);EXPECT_EQ(count_refusal.status_code(),4);EXPECT_TRUE(count_refusal.ids().empty());EXPECT_EQ(all_state(),before);
+    std::vector<audit_log_entry> too_wide;too_wide.reserve(32);
+    for(unsigned n=1;n<=32;++n)too_wide.push_back(identified(entry(1000+n,std::string(40000,'x'))));
+    const auto byte_frame=server_sent_event::make_audit_log(too_wide).to_json();ASSERT_GT(byte_frame.size(),1048576u);ASSERT_LE(too_wide.size(),256u);
+    const auto byte_refusal=setup.receive(byte_frame);EXPECT_EQ(byte_refusal.status_code(),4);EXPECT_TRUE(byte_refusal.ids().empty());EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(owner->db().query("SELECT max_origins,max_origin_bytes,max_cells,max_cell_bytes FROM _lattice_canonical_receipt_profile"),profile);
+    EXPECT_TRUE(setup.stop_token().live());EXPECT_TRUE(setup.stop_token().drained());
+    const auto valid=identified(entry(800));ASSERT_EQ(setup.receive(frame(valid)).take_ids(),std::vector<std::string>{valid.global_id});
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(coverage().size(),1u);
+}
 }
 #endif

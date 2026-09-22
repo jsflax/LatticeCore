@@ -173,7 +173,7 @@ canonical_staging_snapshot canonical_range_staging::verify_storage(const canonic
     const auto charge=db.query("SELECT CASE WHEN typeof(page_bytes)='integer' THEN page_bytes END AS page_bytes FROM main._lattice_range_attempt WHERE channel=?",{bytes(channel)}).at(0);
     if(integer(charge,"page_bytes")!=actual_bytes)fail(code::corrupt_state,"canonical actual page bytes differ");
     if(whole||stored.content_verified){
-        state=cr::propose(state,{state.logical,1,cr::end{state.offer.manifest_digest}},codec_);
+        state=cr::propose(state,{state.logical,1,cr::end{state.offer.manifest_digest},state.frozen_request.registered_producer?3u:2u},codec_);
         if(content.finish()!=state.offer.content_digest||receipts.finish()!=state.offer.receipt_digest)fail(code::digest_mismatch,"canonical retained whole C/E mismatch");
     }
     auto compare=state;if(whole&&!stored.content_verified)compare.status=cr::phase::receiving;

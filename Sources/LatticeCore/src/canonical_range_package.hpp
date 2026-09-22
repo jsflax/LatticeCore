@@ -14,7 +14,7 @@ class encoded_package;
 encoded_package assemble_package(const attempt&, uint64_t route_generation,
     const request&, uint64_t head, const lease&,
     const std::vector<content_item>&, const std::vector<receipt_item>&,
-    const package_limits&);
+    const package_limits&, std::optional<uint64_t> coverage_revision = std::nullopt);
 
 // A move-only, immutable encoding result. Integrity/structural completeness
 // only: NOT a send permit, authenticated source, namespace coverage proof,
@@ -25,7 +25,7 @@ class encoded_package {
     friend encoded_package assemble_package(const attempt&, uint64_t,
         const request&, uint64_t, const lease&,
         const std::vector<content_item>&, const std::vector<receipt_item>&,
-        const package_limits&);
+        const package_limits&, std::optional<uint64_t>);
     manifest offer_;
     std::vector<std::string> frames_;
     uint64_t bytes_ = 0;

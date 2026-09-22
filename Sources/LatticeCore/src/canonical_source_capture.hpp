@@ -8,6 +8,8 @@ struct canonical_capture_request {
     std::string original_id; // normalized UUID comparison key
     std::vector<canonical_identity> targets; // complete receipt-rebase union
     std::optional<std::string> namespace_id; // explicit v2 request; legacy must omit
+    std::optional<recovery_receipt_binding> registered_producer;
+    std::optional<std::string> operation_digest;
 };
 struct canonical_capture_limits {
     source_limits rows;
@@ -25,6 +27,8 @@ struct canonical_source_receipt {
     // Missing is UNKNOWN. This capture does not prove negative coverage or
     // manufacture a negotiated operation namespace from receipt absence.
     std::optional<canonical_receipt> stored;
+    bool legacy_unbound=false;
+    std::optional<std::string> operation_digest;
 };
 struct unsealed_canonical_capture {
     int64_t head=0, floor=0, schema_cookie=0;
@@ -32,6 +36,7 @@ struct unsealed_canonical_capture {
     std::vector<canonical_source_row> rows;
     std::vector<canonical_source_receipt> receipts;
     uint64_t copied_logical_bytes=0;
+    std::optional<uint64_t> coverage_revision;
 };
 // A declared numeric base is a receiver claim, not evidence of installation.
 // No authority/receipt namespace is inferred from these source binding bytes.

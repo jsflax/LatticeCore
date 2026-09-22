@@ -2,6 +2,7 @@
 #include "recovery_local_producer.hpp"
 #include "recovery_producer_continuity.hpp"
 #include "sync_callback_lifetime.hpp"
+#include "recovery_receipt_coverage.hpp"
 #include <lattice/sync.hpp>
 
 namespace lattice::detail {
@@ -96,6 +97,9 @@ struct recovery_export_preparation {
     std::string blocked_original;
 };
 class recovery_export_adapter {
+    friend class recovery_receiver_controller;
+    static std::map<std::string,std::string> frozen_original_identities(std::shared_ptr<lattice_db>,
+        const verified_unsent_set&,const recovery_receipt_binding&,const std::string& schema);
     friend class recovery_unknown_reconciliation;
     static recovery_export_preparation prepare_reconciliation(std::shared_ptr<lattice_db>,
         std::shared_ptr<recovery_continuous_work>,std::shared_ptr<recovery_reconciliation_export>,

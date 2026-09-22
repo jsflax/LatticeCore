@@ -384,13 +384,16 @@ TEST_F(RecoveryReceiverController, EnabledUniqueOriginalCapacityCountsSharedRows
 TEST_F(RecoveryReceiverController, LateClaimedAckWhileFrozenPreservesBothCanonicalNamespaces) {
     configure(2);auto armed=std::make_shared<std::atomic<bool>>(false);
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,
-        [armed](const char* stage)->std::shared_ptr<void>{if(armed->load()&&std::strcmp(stage,"install")==0)throw db_error("fixture late ACK frozen checkpoint");return {};});
+        [armed](const char* stage)->std::shared_ptr<void>{if(armed->load()&&std::strcmp(stage,"reconcile-cancel")==0)throw db_error("fixture late ACK frozen checkpoint");return {};});
     connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==2;}));
     seed_local(1,500);const auto ids=originals();ASSERT_EQ(ids.size(),1u);
     ASSERT_TRUE(until([&]{return held_originals(0)==ids&&held_originals(1)==ids;}));
-    for(size_t peer=0;peer<2;++peer){auto frame=std::find_if(held_uploads.begin(),held_uploads.end(),[&](const auto& f){return f.endpoint.matches(peers[peer].physical);});ASSERT_NE(frame,held_uploads.end());
-        auto accepted=peers[peer].setup.receive(frame->raw);ASSERT_EQ(accepted.status_code(),1);EXPECT_EQ(accepted.take_ids(),ids);}
     armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_attempt WHERE verified=1"),2);
+    // Both retained snapshots truthfully predate source acceptance. This tests
+    // delivery ACK orthogonality, not a new B snapshot after A's receipt exists.
+    auto frame=std::find_if(held_uploads.begin(),held_uploads.end(),[&](const auto& f){return f.endpoint.matches(peers[0].physical);});ASSERT_NE(frame,held_uploads.end());
+    auto accepted=peers[0].setup.receive(frame->raw);ASSERT_EQ(accepted.status_code(),1);EXPECT_EQ(accepted.take_ids(),ids);
     const auto canonical=[this]{auto value=snapshot();for(const auto* table:{"_lattice_receive_guard","_lattice_receive_guard_store","_lattice_replication_slots"})value[table]=receiver->db().query(std::string("SELECT * FROM ")+table);return value;};
     const auto before=canonical();
     ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NOT NULL"),2);

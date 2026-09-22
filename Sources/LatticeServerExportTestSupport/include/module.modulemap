@@ -1,0 +1,8 @@
+// Keep the fixture textual for direct C++ includes; the separate umbrella is
+// owned by this Swift-imported module, matching the existing bridge pattern.
+module LatticeServerExportTestSupport {
+    header "swift_test_support_umbrella.hpp"
+    textual header "server_export_fixture.hpp"
+    textual header "platform_transport_fixture.hpp"
+    export *
+}

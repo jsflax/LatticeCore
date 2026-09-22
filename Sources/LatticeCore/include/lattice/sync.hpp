@@ -21,11 +21,20 @@
 #include <unordered_set>
 #include <set>
 #include <mutex>
+#include <exception>
 
 namespace lattice {
 
+// Checked flush disposition is not a remote receipt/install guarantee.
+enum class sync_drain_state { not_attempted,drained,disconnected,retired,deadline_pending,reentrant_pending,failed };
+struct sync_drain_result {
+    sync_drain_state state=sync_drain_state::not_attempted;
+    std::exception_ptr error;
+    bool discovery_pending=false;
+};
 // Forward declaration
 class lattice_db;
+namespace detail {class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -194,6 +203,7 @@ struct sync_filter_entry {
 struct sync_config {
     std::string websocket_url;
     std::string authorization_token;
+    std::string recovery_source_expectation; // explicit app expectation only
     int max_reconnect_attempts = 0;  // 0 = unlimited
     double base_delay_seconds = 1.0;
     double max_delay_seconds = 60.0;
@@ -289,6 +299,10 @@ struct sync_config {
 // ============================================================================
 
 class synchronizer_base {
+    friend class lattice_db;
+    // Retained by close across reset; destructor cleanup failures cannot be
+    // recovered from a destroyed synchronizer or substituted for a drain error.
+    std::shared_ptr<std::exception_ptr> cleanup_error_=std::make_shared<std::exception_ptr>();
 public:
     using on_sync_complete_handler = std::function<void(const std::vector<std::string>& synced_ids)>;
     using on_error_handler = std::function<void(const std::string& error)>;
@@ -315,7 +329,7 @@ public:
     virtual ~synchronizer_base();
 
 protected:
-    synchronizer_base() = default;
+    synchronizer_base();
 
 public:
     // Non-copyable, non-moveable
@@ -350,6 +364,7 @@ public:
     /// of scope, and the A→B handoff all rely on this.
     /// Never blocks past `deadline`; returns immediately when disconnected.
     void drain(std::chrono::steady_clock::time_point deadline);
+    sync_drain_result drain_checked(std::chrono::steady_clock::time_point deadline) noexcept;
 
     std::shared_ptr<ack_retry_guard> ack_guard_ = std::make_shared<ack_retry_guard>();
 
@@ -380,7 +395,7 @@ protected:
     /// Owned database (native only). Stored in the base class so it outlives
     /// ~synchronizer_base() — base members are destroyed after the base
     /// destructor body, avoiding use-after-free on db_ptr_.
-    std::unique_ptr<lattice_db> owned_db_;
+    std::shared_ptr<lattice_db> owned_db_;
 
     /// Common init — call from subclass constructors after db is set up.
     void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched);
@@ -389,7 +404,20 @@ protected:
 
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
-    std::unique_ptr<sync_transport> ws_client_;
+    std::shared_ptr<sync_transport> ws_client_;
+    std::shared_ptr<detail::sync_callback_lifetime> callback_lifetime_;
+    std::shared_ptr<detail::sync_pacer_state> pacer_state_;
+    std::shared_ptr<detail::sync_discovery_deferral> discovery_deferral_;
+    std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
+    std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
+    std::shared_ptr<detail::receiver_source_binding> receiver_source_;
+    bool owns_inline_scheduler_adapter_=false;
+    // The completed base is destroyed even when a subclass constructor
+    // refuses a route before init_sync reaches the instance counter.
+    bool counted_instance_=false;
+    friend struct detail::recovery_export_test_access;
+    friend struct detail::sync_discovery_test_access;
+    friend struct sync_discovery_admission_test_access;
 
     /// Log-line identity: config_.log_label when set, else sync_id. Cached
     /// so LOG_ macros can take a stable c_str(). Set by init_sync.
@@ -401,7 +429,17 @@ protected:
 
     std::atomic<bool> is_connected_{false};
     std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
-    std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
+    // Explicit connect/disconnect publish a new generation. The low bit carries
+    // retry permission in the SAME atomic value, so an overlapping old call
+    // cannot pair its permission with a newer lifecycle's generation. A retry
+    // only borrows its captured token; it never enables reconnect itself.
+    std::atomic<uint64_t> reconnect_lifecycle_{1};
+    // One plus the latest stopped generation (lifecycle >> 1), or zero. Old
+    // refusal cannot stop a newer explicit connect; concurrent old refusals
+    // cannot erase a newer stop. This is not a durable source/lifetime token.
+    std::atomic<uint64_t> receive_stop_generation_{0};
+    bool receive_lifecycle_stopped(uint64_t lifecycle) const noexcept;
+
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before
@@ -420,7 +458,14 @@ protected:
     /// sync_now). Leading edge dispatches inline; in-window requests are
     /// absorbed by the pacer thread's single trailing-edge tick. Thread-safe;
     /// no-op after destruction begins.
-    void request_upload();
+    void request_upload(bool background=false);
+    void dispatch_upload(bool background,bool consume_request);
+    void background_upload() noexcept;
+    void enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
+                           std::function<bool(detail::sync_discovery_operation&)> work);
+    void pump_discovery(std::shared_ptr<detail::sync_discovery_operation> initial = {});
+    void background_operation(const char* stage,const std::function<void()>& work) noexcept;
+    void schedule_background(const char* stage,std::function<void()> work);
 
     /// Consecutive ack-timeout failures (no ACK before the resend deadline).
     /// Grows the resend deadline (10s, 20s, 40s… capped) so a stalled server
@@ -442,14 +487,10 @@ protected:
 
 #ifndef __EMSCRIPTEN__
     // Pacer thread: owns trailing-edge coalescing and periodic WAL
-    // maintenance. Started by init_sync when upload_coalesce_ms > 0; joined
-    // in the destructor BEFORE scheduler shutdown (it only ever enqueues to
-    // the scheduler, never blocks on it).
+    // maintenance. Its waiting state is retained independently, and every
+    // owner access uses callback admission. Protected retirement transfers
+    // the existing thread into its reserved off-callback cleanup slot.
     std::thread pacer_thread_;
-    std::mutex pacer_mutex_;
-    std::condition_variable pacer_cv_;
-    bool pacer_stop_ = false;
-    std::chrono::steady_clock::time_point next_allowed_tick_{};
     std::chrono::steady_clock::time_point last_passive_ckpt_{};
     std::chrono::steady_clock::time_point last_truncate_ckpt_{};
     void start_pacer();
@@ -459,16 +500,24 @@ protected:
     /// TRUNCATE only when idle (in-flight empty — pending mirrors it).
     void maybe_checkpoint();
 #endif
-    std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
+    // Protected retirement moves its existing pacer into the already reserved
+    // transport slot before the first cleanup publication, including error,
+    // close and explicit disconnect. No per-close executor is created.
+    bool retire_protected_transport() noexcept;
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
+    // Actual policy mutations invalidate parked exact vectors independently of
+    // update request coalescing. Clear also changes this revision.
+    std::atomic<uint64_t> upload_policy_revision_{0};
+    void advance_upload_policy_revision();
 
     // In-flight tracking: entries sent but not yet ACK'd, mapping the entry's
     // global_id to its AuditLog id (0 for synthetic entries, which have no
     // audit row — they must never gate the upload floor).
     // Prevents upload_pending_changes from re-sending entries on each cycle.
     // Accessed from scheduler thread (upload) and WebSocket/IPC thread (ACK) — needs mutex.
-    std::mutex in_flight_mutex_;
-    std::unordered_map<std::string, int64_t> in_flight_ids_;
+    std::shared_ptr<detail::sync_upload_tracking> upload_tracking_;
+    std::mutex& in_flight_mutex_;
+    std::unordered_map<std::string, int64_t>& in_flight_ids_;
 
     // Upload-floor bookkeeping (guarded by in_flight_mutex_). open_audit_ids_
     // holds every real audit id enumerated but not yet resolved (ACKed or
@@ -508,7 +557,7 @@ protected:
     on_progress_handler on_progress_;
 
     // Progress tracking
-    std::atomic<int64_t> progress_pending_upload_{0};
+    std::atomic<int64_t>& progress_pending_upload_;
     std::atomic<int64_t> progress_total_upload_{0};
     std::atomic<int64_t> progress_acked_{0};
     std::atomic<int64_t> progress_received_{0};
@@ -530,8 +579,10 @@ protected:
 
     // Sync operations
     void upload_pending_changes();
+    bool upload_pending_changes_step(detail::sync_upload_continuation&,detail::sync_discovery_operation*);
     std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
+    void mark_as_synced_after_discovery(const std::vector<std::string>&,bool protected_store);
 
     // upload_pending_changes decomposed phases
     struct classified_entries {
@@ -545,6 +596,13 @@ protected:
     void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
     void send_entries(std::vector<audit_log_entry>& entries);
+    void send_entries_after_discovery(std::vector<audit_log_entry>& entries);
+    bool send_committed_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy);
+    bool upload_protected_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy=nullptr);
+    std::optional<bool> try_has_export_protection();
+    bool has_export_protection();
+    void schedule_ack_retry(const std::vector<audit_log_entry>&);
+    std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false);
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")
@@ -562,6 +620,8 @@ protected:
     void reconcile_sync_filter();
 
     // Reconnection
+    uint64_t advance_reconnect_lifecycle(bool enabled);
+    void connect_for_lifecycle(uint64_t lifecycle);
     void schedule_reconnect();
 
     // Get last received event ID for checkpoint
@@ -588,6 +648,7 @@ public:
 /// Native: owns a dedicated lattice_db (separate connection on its own thread).
 class synchronizer : public synchronizer_base {
 public:
+    synchronizer(std::shared_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
                  std::unique_ptr<sync_transport> transport);

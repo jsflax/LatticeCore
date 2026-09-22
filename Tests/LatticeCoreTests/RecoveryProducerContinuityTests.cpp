@@ -528,7 +528,7 @@ TEST_F(RecoveryProducerContinuity, GeneratedDmlCapacityRollsBackOriginalAndEvery
     EXPECT_EQ(done.unsent->canonical_originals().size(),1u);
 }
 TEST_F(RecoveryProducerContinuity, ActualRoutePagesBeyondQualificationCapWithSharedAckedAndInflightOriginals) {
-    continuity_ack_pause pause(senders,factory);
+    auto pause=std::make_unique<continuity_ack_pause>(senders,factory);
     constexpr size_t originals=2051;
     policy.limits.obligations.records=2*(originals+1);policy.limits.producers.stamps=2*(originals+1);
     policy.frozen_entries=2*(originals+1);
@@ -558,6 +558,7 @@ TEST_F(RecoveryProducerContinuity, ActualRoutePagesBeyondQualificationCapWithSha
     connect(1);ASSERT_EQ(factory->wires.size(),2u);const auto other=factory->wires[1]->audit_batches();
     ASSERT_EQ(other.size(),1u);EXPECT_EQ(other[0],batches[0]);
     senders.clear();queue->drain();
+    pause.reset(); // Retired senders no longer need held retries during freeze/cancel work.
     owner->add(ContinuousSharedRow{"never handed to any route"});
     const auto full=snapshot();
     EXPECT_THROW(owner->add(ContinuousSharedRow{"over actual admitted cap"}),db_error);

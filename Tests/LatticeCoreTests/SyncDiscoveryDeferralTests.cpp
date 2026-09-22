@@ -393,9 +393,10 @@ TEST(SyncDiscoveryCompletion, CancelAndRetirementPreserveTheRunningError) {
 }
 TEST(SyncDiscoveryCompletion, CancelledQueuedDrainDoesNotExecuteOrBlockLaterWork) {
     queue q;auto work=unit(queue::kind::drain_upload);work->completion=std::make_shared<sync_discovery_completion>();
-    auto later=unit();const auto now=queue::clock::now();q.push(work);q.push(later);
+    auto later=unit();ASSERT_EQ(q.push(work),queue::admission::accepted);ASSERT_EQ(q.push(later),queue::admission::accepted);
+    const auto now=queue::clock::now();
     work->completion->cancel(sync_discovery_completion::outcome::expired);
-    EXPECT_EQ(q.begin(q.dispatch(now),now),nullptr);
+    const auto cancelled=q.dispatch(now);ASSERT_TRUE(cancelled);EXPECT_EQ(q.begin(cancelled,now),nullptr);
     const auto next=q.dispatch(now);ASSERT_EQ(q.begin(next,now),later);q.finish(next,later,true,now);
     EXPECT_FALSE(q.pending(1));EXPECT_FALSE(q.failed(1));
 }

@@ -101,28 +101,46 @@ public:
 // This selection fixture owns the send/ACK order. Park the existing retry
 // worker before its clock starts; do not lengthen production ACK deadlines.
 struct continuity_ack_pause {
-    struct state {std::mutex mutex;std::condition_variable ready;bool released=false,timed_out=false;size_t finished=0;};
+    struct state {std::mutex mutex;std::condition_variable ready;bool released=false,timed_out=false;size_t started=0,finished=0;};
     std::shared_ptr<state> held=std::make_shared<state>();
     std::shared_ptr<const sync_background_test_hooks::ack_schedule> prior=sync_background_test_hooks::ack;
     std::vector<std::unique_ptr<synchronizer>>& senders;
     std::shared_ptr<continuity_factory> factory;
+    size_t first_batch=0;
+    bool settled=false;
+    size_t batches()const {size_t count=0;for(const auto& wire:factory->wires)count+=wire->audit_batches().size();return count;}
     continuity_ack_pause(std::vector<std::unique_ptr<synchronizer>>& s,std::shared_ptr<continuity_factory> f):senders(s),factory(std::move(f)){
+        first_batch=batches();
         const auto gate=held;auto schedule=std::make_shared<sync_background_test_hooks::ack_schedule>();
         schedule->before_expiry=[gate]{std::unique_lock<std::mutex> lock(gate->mutex);
+            ++gate->started;gate->ready.notify_all();
             if(!gate->ready.wait_for(lock,std::chrono::seconds(30),[&]{return gate->released;})){
                 gate->timed_out=true;throw db_error("continuous selection fixture ACK hold expired");}};
         schedule->completed=[gate]{std::lock_guard<std::mutex> lock(gate->mutex);++gate->finished;gate->ready.notify_all();};
         sync_background_test_hooks::ack=std::move(schedule);
     }
+    bool release_and_wait(size_t expected){
+        std::unique_lock<std::mutex> lock(held->mutex);held->released=true;held->ready.notify_all();
+        const bool completed=held->ready.wait_for(lock,std::chrono::seconds(5),[&]{return held->started==expected&&held->finished==expected;});
+        const bool timed_out=held->timed_out;const auto started=held->started,finished=held->finished;lock.unlock();
+        EXPECT_TRUE(completed);EXPECT_FALSE(timed_out);
+        EXPECT_EQ(started,expected);EXPECT_EQ(finished,expected);
+        return completed&&!timed_out;
+    }
+    bool release_acknowledged(size_t expected){
+        // The caller has delivered every actual ACK and drained its queue.
+        // Let these workers observe their settled IDs while both senders and
+        // owners stay alive; do not hold them through the next route's open.
+        const auto actual=batches()-first_batch;EXPECT_EQ(actual,expected);
+        if(actual!=expected||!release_and_wait(expected))return false;
+        sync_background_test_hooks::ack=prior;settled=true;return true;
+    }
     ~continuity_ack_pause(){
+        if(settled)return; // Replacing a finished gate must not retire senders or a newer hook.
         // Close actual owner lifetimes first, including every assertion exit.
         // Released workers then observe retirement before touching the sender.
         senders.clear();sync_background_test_hooks::ack=prior;
-        size_t expected=0;for(const auto& wire:factory->wires)expected+=wire->audit_batches().size();
-        std::unique_lock<std::mutex> lock(held->mutex);held->released=true;held->ready.notify_all();
-        const bool completed=held->ready.wait_for(lock,std::chrono::seconds(5),[&]{return held->finished==expected;});
-        const bool timed_out=held->timed_out;lock.unlock();
-        EXPECT_TRUE(completed);EXPECT_FALSE(timed_out);
+        (void)release_and_wait(batches()-first_batch);
     }
 };
 void known_commit(const recovery_install_result& result) {
@@ -573,6 +591,8 @@ TEST_F(RecoveryProducerContinuity, ActualRoutePagesBeyondQualificationCapWithSha
     wire->ack(batches[1]);queue->drain();wire->ack(batches[2]);queue->drain();
     senders[0]->sync_now();queue->drain();EXPECT_EQ(wire->audit_batches(),batches);
     EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),audit_before);
+    ASSERT_TRUE(pause->release_acknowledged(batches.size()));
+    pause=std::make_unique<continuity_ack_pause>(senders,factory); // B owns a distinct bounded worker gate.
     // A's legacy ACK does not exclude the same originals from actual route B.
     connect(1);ASSERT_EQ(factory->wires.size(),2u);const auto other=factory->wires[1]->audit_batches();
     ASSERT_EQ(other.size(),1u);EXPECT_EQ(other[0],batches[0]);

@@ -594,6 +594,7 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
 
 namespace detail {
 thread_local std::function<void()> sync_background_test_hooks::before_late_discovery;
+thread_local std::shared_ptr<const sync_background_test_hooks::pacer_wait_schedule> sync_background_test_hooks::pacer_wait;
 struct sync_upload_continuation {
     bool sending=false,enumeration_hit_limit=false,late_replay_owned=false;
     size_t skipped=0;
@@ -821,7 +822,7 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
         detail::sync_discovery_deferral::ticket addressed;
         bool reject() noexcept {
             if(!queue->reject_unbegun(addressed))return false;
-            state->ready.notify_one();
+            state->wake_changed();
             return true;
         }
         ~dispatch_owner(){reject();}
@@ -841,7 +842,7 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
         addressed=admitted.reserved;
     } else addressed=queue->dispatch(detail::sync_discovery_deferral::clock::now());
     reservation->addressed=addressed;
-    state->ready.notify_one(); // Reservation ownership is published before wake.
+    state->wake_changed(); // Reservation ownership is published before wake.
 
     if(!addressed) {
         // Includes exhausted reservation identities; no integer wrap can
@@ -870,7 +871,7 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
             if(queue->take_failure(addressed.generation))
                 detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,
                     std::make_exception_ptr(db_error("sync discovery deferral exhausted; route stopped; explicit replay required (one-shot senders have no replay guarantee)")),"discovery deferral");
-            state->ready.notify_one();
+            state->wake_changed();
         });
     });}catch(...) {
         const auto failure=std::current_exception();
@@ -954,14 +955,16 @@ void synchronizer_base::start_pacer() {
     // Also owns transient-discovery wakeups when coalescing/checkpoints are off.
     // Tests and callers that reconfigure pacing must never replace a live thread.
     pacer_state_->coalesce_milliseconds.store(std::max(config_.upload_coalesce_ms,0),std::memory_order_release);
-    if(pacer_thread_.joinable()){pacer_state_->ready.notify_one();return;}
+    if(pacer_thread_.joinable()){pacer_state_->wake_changed();return;}
     const auto state=pacer_state_;const auto lifetime=callback_lifetime_;const auto scheduled=scheduler_;
     const auto queue=discovery_deferral_;
+    const auto wait_schedule=detail::sync_background_test_hooks::pacer_wait;
     const auto heartbeat=std::chrono::milliseconds(config_.checkpoint_passive_interval_ms > 0
         ? std::min(config_.checkpoint_passive_interval_ms,60'000) : 60'000);
     last_passive_ckpt_=std::chrono::steady_clock::now();last_truncate_ckpt_=last_passive_ckpt_;
-    pacer_thread_=std::thread([this,state,lifetime,scheduled,queue,heartbeat] {
+    pacer_thread_=std::thread([this,state,lifetime,scheduled,queue,heartbeat,wait_schedule] {
         try {
+        if(wait_schedule&&wait_schedule->starting)wait_schedule->starting();
         auto maintenance_at=std::chrono::steady_clock::now()+heartbeat;
         std::unique_lock<std::mutex> lock(state->mutex);
         for (;;) {
@@ -970,9 +973,13 @@ void synchronizer_base::start_pacer() {
             const auto coalesce=std::chrono::milliseconds(state->coalesce_milliseconds.load(std::memory_order_acquire));
             auto wake=std::min(maintenance_at,queue->wake_at());
             if(coalesce.count()>0&&requested)wake=std::min(wake,state->next_allowed_tick);
-            state->ready.wait_until(lock,wake,[&]{return state->stop||queue->revision()!=revision||
-                state->requested.load(std::memory_order_acquire)!=requested||
-                state->coalesce_milliseconds.load(std::memory_order_acquire)!=coalesce.count();});
+            state->ready.wait_until(lock,wake,[&]{
+                const bool changed=state->stop||queue->revision()!=revision||
+                    state->requested.load(std::memory_order_acquire)!=requested||
+                    state->coalesce_milliseconds.load(std::memory_order_acquire)!=coalesce.count();
+                if(!changed&&wait_schedule&&wait_schedule->before_wait)wait_schedule->before_wait();
+                return changed;
+            });
             if(state->stop)return;
             const auto now=std::chrono::steady_clock::now();
             const bool maintenance=now>=maintenance_at;

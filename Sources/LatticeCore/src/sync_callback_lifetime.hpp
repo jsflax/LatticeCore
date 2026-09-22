@@ -16,6 +16,10 @@ struct ack_schedule {std::function<void()> before_expiry,completed;};
 extern thread_local std::shared_ptr<const ack_schedule> ack;
 // Source fixture rendezvous immediately before the late no-effect probe.
 extern thread_local std::function<void()> before_late_discovery;
+// Copied at pacer creation. Tests may hold initial startup, then pause its
+// final false predicate under the wait mutex. Production is null; no throwing.
+struct pacer_wait_schedule {std::function<void()> starting,before_wait;};
+extern thread_local std::shared_ptr<const pacer_wait_schedule> pacer_wait;
 }
 
 // The pacer may wake after its synchronizer has retired. Waiting, coalescing
@@ -28,6 +32,14 @@ struct sync_pacer_state {
     std::atomic<bool> requested{false};
     std::atomic<int> coalesce_milliseconds{0};
     std::chrono::steady_clock::time_point next_allowed_tick{};
+    // Queue revisions have their own mutex. Join the condition-variable
+    // handoff after changing them so a notification cannot pass between the
+    // waiter's final predicate check and its atomic unlock-and-wait. Call only
+    // after releasing the queue mutex and without already holding this mutex.
+    void wake_changed() noexcept {
+        {std::lock_guard<std::mutex> lock(mutex);}
+        ready.notify_one();
+    }
 };
 // Admission fences physical C++ owner teardown. A shared cell alone is not an
 // owner: destructor retirement waits for foreign executions before members die.

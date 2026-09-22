@@ -351,3 +351,66 @@ TEST_F(SyncDiscoveryAdmissionRuntime, UpdateThenClearCannotReuseAnOldMatchingPol
 }
 } // namespace
 #endif
+
+#ifndef __EMSCRIPTEN__
+namespace {
+struct pacer_wait_window {
+    std::atomic<bool> armed{true},started{false},released{false},timed_out{false};
+    std::promise<void> start_signal,entered_signal,release_signal;
+    std::shared_future<void> start_allowed=start_signal.get_future().share();
+    std::future<void> entered=entered_signal.get_future();
+    std::shared_future<void> proceed=release_signal.get_future().share();
+    void starting(){if(start_allowed.wait_for(10s)!=std::future_status::ready)timed_out.store(true);}
+    void allow_start(){if(!started.exchange(true))start_signal.set_value();}
+    void before_wait() {
+        if(!armed.exchange(false))return;
+        entered_signal.set_value();
+        if(proceed.wait_for(10s)!=std::future_status::ready)timed_out.store(true);
+    }
+    void release(){allow_start();if(!released.exchange(true))release_signal.set_value();}
+};
+class SyncDiscoveryWaitWindow:public SyncDiscoveryAdmissionRuntime {
+protected:
+    std::shared_ptr<pacer_wait_window> window=std::make_shared<pacer_wait_window>();
+    void SetUp()override {
+        struct restore {
+            std::shared_ptr<const detail::sync_background_test_hooks::pacer_wait_schedule> prior;
+            ~restore(){detail::sync_background_test_hooks::pacer_wait=std::move(prior);}
+        } saved{std::move(detail::sync_background_test_hooks::pacer_wait)};
+        auto hooks=std::make_shared<detail::sync_background_test_hooks::pacer_wait_schedule>();
+        hooks->starting=[held=window]{held->starting();};hooks->before_wait=[held=window]{held->before_wait();};
+        detail::sync_background_test_hooks::pacer_wait=std::move(hooks);
+        SyncDiscoveryAdmissionRuntime::SetUp();
+    }
+    void TearDown()override {
+        window->release();
+        SyncDiscoveryAdmissionRuntime::TearDown();
+    }
+};
+TEST_F(SyncDiscoveryWaitWindow, DroppedCallbackBetweenPredicateAndWaitStillReportsOnce) {
+    int effects=0;access::enqueue(*sync,[&](auto&){++effects;return true;});
+    ASSERT_TRUE(scheduled->await_queued());
+    std::thread drop;std::atomic<bool> drop_failed{false};
+    struct settle {
+        std::shared_ptr<pacer_wait_window> window;std::thread& drop;
+        ~settle(){window->release();if(drop.joinable())drop.join();}
+    } cleanup{window,drop};
+    // Start the real worker after the actual scheduler owns this reservation.
+    // No extra pump or wake can mask the subsequent dropped notification.
+    window->allow_start();
+    ASSERT_EQ(window->entered.wait_for(5s),std::future_status::ready);
+    // The worker has evaluated a false predicate while retaining its wait
+    // mutex. Destroy the actual queued capture under the scheduler's mutex.
+    drop=std::thread([&]{try{scheduled->discard_under_lock();}catch(...){drop_failed.store(true);}});
+    const auto deadline=std::chrono::steady_clock::now()+5s;
+    while(!failed()&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(1ms);
+    const bool rejected=failed();
+    window->release();drop.join();
+    ASSERT_TRUE(rejected);EXPECT_FALSE(drop_failed.load());
+    EXPECT_FALSE(window->timed_out.load());
+    ASSERT_TRUE(await([&]{return !errors.empty();}));
+    EXPECT_TRUE(failed());EXPECT_TRUE(pending());EXPECT_EQ(effects,0);
+    EXPECT_EQ(scheduled->recursive_drop_invocations.load(),0);EXPECT_EQ(errors.size(),1u);
+}
+} // namespace
+#endif

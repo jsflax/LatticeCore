@@ -9,6 +9,7 @@
 
 namespace lattice::detail {
 class canonical_upstream_delivery;
+class canonical_namespace_admission;
 struct canonical_source_session_test_access;
 struct canonical_retention_test_access;
 namespace canonical_upstream_test_hooks {
@@ -35,6 +36,28 @@ struct canonical_writer_profile {
     std::vector<std::string> models;
     bool upstream_requested = false; // legacy attach still refuses this request
 };
+struct canonical_namespaced_writer_profile {
+    canonical_writer_profile writer;
+    canonical_namespace_profile namespaces;
+};
+// Opaque qualification admission only. The explicitly named fixture issuer
+// below binds supplied test identities to the actual owner; it does not
+// authenticate them. The trusted application/TLS issuer remains unimplemented.
+// Copies retain the actual physical owner but cannot survive its retirement.
+class canonical_namespace_admission {
+    friend class canonical_writer_adapter;
+    friend class canonical_upstream_delivery;
+    std::shared_ptr<lattice_db> owner_;
+    std::shared_ptr<database> writer_;
+    std::shared_ptr<void> context_;
+    uint64_t revision_=0;
+    canonical_namespace_entry namespace_;
+    std::string replica_;
+    canonical_namespace_admission() = default;
+public:
+    canonical_namespace_admission(const canonical_namespace_admission&) = default;
+    canonical_namespace_admission& operator=(const canonical_namespace_admission&) = default;
+};
 struct canonical_upstream_limits {
     size_t entries, field_bytes, delivery_bytes; // explicit finite caller budgets
 };
@@ -48,9 +71,19 @@ class canonical_writer_adapter {
     static bool matches_connection(const database&, sqlite3*) noexcept;
     std::shared_ptr<database> writer_;
     std::shared_ptr<context> context_;
+    // Default-null, friend-only deterministic scheduling probe. It runs before
+    // BEGIN, confers no admission, and cannot skip the owned-write validation.
+    static thread_local const std::function<void(lattice_db&)>* namespace_before_write_test_hook_;
     explicit canonical_writer_adapter(lattice_db&, const canonical_writer_profile&,
                                       const canonical_upstream_limits* = nullptr,
-                                      const canonical_retention_limits* = nullptr);
+                                      const canonical_retention_limits* = nullptr,
+                                      const canonical_namespace_profile* = nullptr);
+    static void validate_namespace_admission(const std::shared_ptr<lattice_db>&,
+        const std::shared_ptr<database>&, const std::shared_ptr<context>&,
+        const canonical_namespace_admission&);
+    std::vector<std::string> apply_upstream_impl(std::shared_ptr<lattice_db>,
+        const std::vector<audit_log_entry>&, const std::optional<std::string>&,
+        const canonical_namespace_admission*);
     void prepare_retention(lattice_db&, const canonical_retention_limits&);
     void enroll_retention(lattice_db&, bool);
     static void verify_retention(database&, const context&, const retention_session&);
@@ -59,16 +92,19 @@ class canonical_writer_adapter {
         int, const std::function<void(database&,retention_session&)>&);
     friend struct canonical_source_session_test_access;
     friend struct canonical_retention_test_access;
+    friend struct canonical_namespace_test_access;
     sync_recovery::owned_canonical_capture capture_reserved_impl(std::shared_ptr<lattice_db>,
         const canonical_retention_ticket&,const std::vector<sync_recovery::canonical_capture_request>&,
-        const sync_recovery::canonical_capture_limits&,const std::function<void(size_t,uint64_t)>&);
+        const sync_recovery::canonical_capture_limits&,const std::function<void(size_t,uint64_t)>&,
+        const canonical_namespace_admission* = nullptr);
     sync_recovery::owned_canonical_capture capture_recovery_impl(std::shared_ptr<lattice_db>,
         const canonical_store_binding&, std::optional<int64_t>,
         const std::vector<sync_recovery::canonical_capture_request>&,
         const sync_recovery::canonical_capture_limits&,
         const std::function<void(size_t,uint64_t)>&,
         const std::function<void()>&, const std::function<void()>&,
-        const std::function<void(uint64_t)>& = {});
+        const std::function<void(uint64_t)>& = {},
+        const canonical_namespace_admission* = nullptr);
 
 public:
     static std::unique_ptr<canonical_writer_adapter> attach(lattice_db&, const canonical_writer_profile&);
@@ -88,6 +124,19 @@ public:
     static std::unique_ptr<canonical_writer_adapter> attach_retained_upstream_for_qualification(
         std::shared_ptr<lattice_db>, const canonical_writer_profile&,
         canonical_upstream_limits, canonical_retention_limits);
+    // New receipt v2 + existing retention v2 only: never adopts a v1 ledger.
+    static std::unique_ptr<canonical_writer_adapter> attach_namespaced_upstream_for_qualification(
+        std::shared_ptr<lattice_db>, const canonical_namespaced_writer_profile&,
+        canonical_upstream_limits, canonical_retention_limits);
+    canonical_namespace_admission admit_namespace_for_qualification(std::shared_ptr<lattice_db>,
+        const std::string& namespace_id, const std::string& replica_id);
+    std::vector<std::string> apply_upstream_namespaced_owned(std::shared_ptr<lattice_db>,
+        const canonical_namespace_admission&, const std::vector<audit_log_entry>&,
+        const std::optional<std::string>& receiving_channel = std::nullopt);
+    sync_recovery::owned_canonical_capture capture_reserved_namespaced_owned(std::shared_ptr<lattice_db>,
+        const canonical_namespace_admission&, const canonical_retention_ticket&,
+        const std::vector<sync_recovery::canonical_capture_request>&,
+        const sync_recovery::canonical_capture_limits&);
     canonical_retention_result reserve_recovery_owned(std::shared_ptr<lattice_db>,
         std::optional<int64_t> base, int64_t duration_ms);
     recovery_install_result release_recovery_owned(std::shared_ptr<lattice_db>, const canonical_retention_ticket&);
@@ -131,13 +180,14 @@ class canonical_upstream_delivery {
     std::shared_ptr<database> writer_;
     std::shared_ptr<canonical_writer_adapter::context> context_;
     uint64_t revision_;
+    std::optional<canonical_namespace_admission> namespace_admission_;
     const audit_log_entry* entry_ = nullptr;
     std::string original_, target_;
     bool finalizing_ = false;
     canonical_upstream_delivery* previous_ = nullptr;
     static thread_local canonical_upstream_delivery* current_;
     canonical_upstream_delivery(std::shared_ptr<lattice_db>, std::shared_ptr<database>,
-        std::shared_ptr<canonical_writer_adapter::context>, uint64_t);
+        std::shared_ptr<canonical_writer_adapter::context>, uint64_t, const canonical_namespace_admission*);
     void begin_entry(const audit_log_entry&);
     void end_entry() noexcept;
     std::string entry_guard() const;

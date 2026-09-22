@@ -27,10 +27,24 @@ struct canonical_identity {
     bool operator==(const canonical_identity&) const = default;
 };
 enum class canonical_receipt_outcome : int64_t { applied = 1, no_op = 2, policy = 3 };
+// Explicit immutable receipt profile v2. This catalog describes admitted
+// provenance; it does not authenticate a caller or prove negative coverage.
+struct canonical_namespace_entry {
+    std::string namespace_id, coverage_id;
+    int64_t revision;
+    bool operator==(const canonical_namespace_entry&) const = default;
+};
+struct canonical_namespace_profile {
+    std::string local_namespace;
+    std::vector<canonical_namespace_entry> entries;
+    void validate() const; // fixed v2 caps: 64 entries, 256 bytes per identity
+    bool operator==(const canonical_namespace_profile&) const = default;
+};
 struct canonical_receipt_request {
     std::string original_id;
     canonical_receipt_outcome outcome;
     std::optional<canonical_identity> target;
+    std::optional<std::string> namespace_id; // absent only in legacy receipt v1
     bool operator==(const canonical_receipt_request&) const = default;
 };
 struct canonical_receipt {
@@ -66,6 +80,7 @@ class canonical_change_store {
     lattice_db& owner_;
     canonical_store_binding binding_;
     canonical_store_limits limits_;
+    std::optional<canonical_namespace_profile> namespaces_;
     database& connection() const;
     void write_state(const canonical_store_state&, const canonical_store_state&);
 public:
@@ -73,7 +88,8 @@ public:
     // are bounded opaque bytes, compared exactly; no UUID/collation migration
     // or case normalization is performed. Admission must validate wire/schema
     // identities separately before attaching this to real writer paths.
-    canonical_change_store(lattice_db&, const canonical_store_binding&, canonical_store_limits);
+    canonical_change_store(lattice_db&, const canonical_store_binding&, canonical_store_limits,
+                           const canonical_namespace_profile* = nullptr);
     // Every call checks this thread's actual owned main WRITE transaction.
     // Owner/transaction custody remains with caller. No transferable token.
     void initialize(); // full integrity audit on reopen; no import/reset
@@ -88,6 +104,8 @@ public:
     // on any refusal. This call cannot retroactively roll back preceding DML.
     // Existing original ID returns its first accepted outcome without touching
     // head/markers or interpreting replacement target/outcome/identity values.
+    // Receipt v2 first requires the same enrolled namespace; UUID uniqueness
+    // remains global across namespaces. This primitive is not an issuer.
     // No payload parameter exists: NoHistory values cannot be retained here.
     canonical_record_result record(const std::vector<canonical_identity>&,
                                   const std::optional<canonical_receipt_request>& = std::nullopt);

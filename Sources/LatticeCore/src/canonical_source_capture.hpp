@@ -7,6 +7,7 @@ namespace lattice::detail::sync_recovery {
 struct canonical_capture_request {
     std::string original_id; // normalized UUID comparison key
     std::vector<canonical_identity> targets; // complete receipt-rebase union
+    std::optional<std::string> namespace_id; // explicit v2 request; legacy must omit
 };
 struct canonical_capture_limits {
     source_limits rows;
@@ -53,7 +54,8 @@ class canonical_source_session_access {
         const std::vector<source_relation>&, std::optional<int64_t>,
         const std::vector<canonical_capture_request>&, const canonical_capture_limits&,
         const std::function<void(uint64_t)>& verify_generation,
-        const std::function<void(size_t,uint64_t)>& after_batch);
+        const std::function<void(size_t,uint64_t)>& after_batch,
+        const canonical_namespace_profile* = nullptr);
 };
 // Private read-only, synchronous, file-WAL-only storage capture. The caller
 // retains the actual owner throughout. Source admission/complete schema,

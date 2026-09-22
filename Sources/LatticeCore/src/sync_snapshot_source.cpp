@@ -336,8 +336,10 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     const canonical_store_binding& binding,const std::vector<source_relation>& scope,
     std::optional<int64_t> base,const std::vector<canonical_capture_request>& requests,
     const canonical_capture_limits& b,const std::function<void(size_t,uint64_t)>& after_batch,
-    source_capture_selection* selection=nullptr, const std::function<void(uint64_t)>& verify_generation={}) {
+    source_capture_selection* selection=nullptr, const std::function<void(uint64_t)>& verify_generation={},
+    const canonical_namespace_profile* namespaces=nullptr) {
     validate_budget(b.rows);
+    if(namespaces)namespaces->validate();
     check(!scope.empty()&&scope.size()<=b.rows.tables&&b.requests>0&&b.requests<=4096&&
         b.requested_targets>0&&b.requested_targets<=4096&&b.marker_batch>0&&b.marker_batch<=4096&&
         requests.size()<=b.requests,"invalid canonical capture limits");
@@ -356,6 +358,12 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     uint64_t target_count=0;
     std::optional<std::string> previous_original;
     for(const auto& q:requests) {
+        check(bool(q.namespace_id)==bool(namespaces),"canonical request receipt profile differs");
+        if(namespaces) {
+            check(!q.namespace_id->empty()&&q.namespace_id->size()<=256,"canonical requested namespace outside bounds");
+            bool found=false;for(const auto& entry:namespaces->entries)if(entry.namespace_id==*q.namespace_id)found=true;
+            check(found,"canonical requested namespace not enrolled");
+        }
         check(canonical_uuid(q.original_id)==q.original_id,"canonical original key is not normalized");
         check(!previous_original||*previous_original<q.original_id,"duplicate or unordered canonical receipt request");
         previous_original=q.original_id;
@@ -380,7 +388,7 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
         "FROM main._lattice_canonical_store LIMIT 2";
     const auto state=held.query(state_sql);
     check(state.size()==1,"canonical source store singleton missing");const auto& metadata=state.front();
-    check(integer(metadata,"id")==1&&integer(metadata,"version")==1&&byte_string(metadata,"source")==binding.source&&
+    check(integer(metadata,"id")==1&&integer(metadata,"version")==int64_t(namespaces?2:1)&&byte_string(metadata,"source")==binding.source&&
         byte_string(metadata,"epoch")==binding.epoch&&byte_string(metadata,"scope")==binding.scope&&
         byte_string(metadata,"schema_id")==binding.schema,"canonical source binding mismatch");
     check(integer(metadata,"max_markers")==l.markers&&integer(metadata,"max_marker_bytes")==l.marker_bytes&&
@@ -416,7 +424,8 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
         "typeof(outcome)!='integer' OR outcome NOT IN(1,2,3) OR (relation IS NULL)!=(identity IS NULL) OR "
         "(relation IS NOT NULL AND (typeof(relation)!='blob' OR length(relation) NOT BETWEEN 1 AND ? OR "
         "typeof(identity)!='blob' OR length(identity)!=36)) OR typeof(charge)!='integer' OR "
-        "charge!=32+length(original_id)+COALESCE(length(relation),0)+COALESCE(length(identity),0) LIMIT 1",
+        "charge!=32+length(original_id)+COALESCE(length(relation),0)+COALESCE(length(identity),0)"+
+        std::string(namespaces?"+length(namespace_id) OR typeof(namespace_id)!='blob' OR length(namespace_id) NOT BETWEEN 1 AND 256 OR NOT EXISTS(SELECT 1 FROM main._lattice_canonical_namespace n WHERE n.namespace_id=_lattice_canonical_receipt.namespace_id AND n.status=1)":"")+" LIMIT 1",
         {result.head,l.identity_bytes}).empty(),"canonical source retained receipt is corrupt");
     const auto actual_markers=held.query("SELECT COUNT(*) AS n,COALESCE(SUM(charge),0) AS bytes FROM main._lattice_canonical_touch");
     const auto actual_receipts=held.query("SELECT COUNT(*) AS n,COALESCE(SUM(charge),0) AS bytes FROM main._lattice_canonical_receipt");
@@ -502,7 +511,9 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
         const auto rows=held.query("SELECT "+source_integer_column("position")+","+source_integer_column("outcome")+","
             "CASE WHEN relation IS NULL THEN NULL WHEN typeof(relation)='blob' AND length(relation) BETWEEN 1 AND 256 THEN relation END AS relation,"
             "CASE WHEN identity IS NULL THEN NULL WHEN typeof(identity)='blob' AND length(identity)=36 THEN identity END AS identity,"
-            "typeof(relation) AS rt,typeof(identity) AS it,"+source_integer_column("charge")+" FROM main._lattice_canonical_receipt WHERE original_id=? LIMIT 2",
+            "typeof(relation) AS rt,typeof(identity) AS it,"+source_integer_column("charge")+
+            std::string(namespaces?",CASE WHEN typeof(namespace_id)='blob' AND length(namespace_id) BETWEEN 1 AND 256 THEN namespace_id END AS namespace_id":"")+
+            " FROM main._lattice_canonical_receipt WHERE original_id=? LIMIT 2",
             {source_bytes(asked.original_id)});
         check(rows.size()<=1,"canonical source receipt identity collision");
         canonical_source_receipt fact{asked.original_id,{}};charge(48+asked.original_id.size());
@@ -511,6 +522,11 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
             check(position>0&&position<=result.head&&outcome>=1&&outcome<=3,"canonical source receipt is corrupt");
             const auto rt=string_value(row,"rt"),it=string_value(row,"it");std::optional<canonical_identity> target;
             uint64_t bytes=32+asked.original_id.size();
+            if(namespaces) {
+                const auto stored_namespace=byte_string(row,"namespace_id");
+                check(stored_namespace==*asked.namespace_id,"canonical receipt belongs to another namespace");
+                bytes+=stored_namespace.size();charge(stored_namespace.size());
+            }
             if(rt=="blob"&&it=="blob") {
                 target=canonical_identity{byte_string(row,"relation"),byte_string(row,"identity")};
                 check(canonical_uuid(target->global_id)==target->global_id&&layouts.count(target->table),"canonical receipt target is outside scope");
@@ -518,7 +534,7 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
                 bytes+=target->table.size()+target->global_id.size();charge(target->table.size()+target->global_id.size());
             } else check(rt=="null"&&it=="null","canonical source receipt target is corrupt");
             check(integer(row,"charge")==static_cast<int64_t>(bytes),"canonical receipt charge is corrupt");
-            fact.stored=canonical_receipt{{asked.original_id,static_cast<canonical_receipt_outcome>(outcome),target},position};
+            fact.stored=canonical_receipt{{asked.original_id,static_cast<canonical_receipt_outcome>(outcome),target,asked.namespace_id},position};
         }
         result.receipts.push_back(std::move(fact));
     }
@@ -565,10 +581,10 @@ owned_canonical_capture canonical_source_session_access::capture(lattice_db& own
     const canonical_store_binding& binding,const std::vector<source_relation>& scope,
     std::optional<int64_t> base,const std::vector<canonical_capture_request>& requests,
     const canonical_capture_limits& limits,const std::function<void(uint64_t)>& verify_generation,
-    const std::function<void(size_t,uint64_t)>& after_batch) {
+    const std::function<void(size_t,uint64_t)>& after_batch,const canonical_namespace_profile* namespaces) {
     owned_canonical_capture result;result.binding=binding;result.requested_base=base;
     auto captured=capture_canonical_impl(owner,binding,scope,base,requests,limits,after_batch,
-        &result.selection,verify_generation);
+        &result.selection,verify_generation,namespaces);
     result.head=captured.head;result.floor=captured.floor;
     if(result.selection!=source_capture_selection::requires_full_request)result.capture=std::move(captured);
     return result;

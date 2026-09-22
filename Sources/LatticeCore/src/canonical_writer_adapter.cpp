@@ -77,7 +77,18 @@ std::string demand(const std::string& condition, const std::string& entry_guard=
     if(!entry_guard.empty())return " SELECT lattice_canonical_require_v1(("+condition+") AND "+entry_guard+");";
     return " SELECT CASE WHEN ("+condition+") THEN 1 ELSE RAISE(ABORT,'canonical marker admission refused') END;";
 }
-std::string guard(const canonical_writer_profile& p, const std::string& entry_guard={}) {
+std::string namespace_condition(const canonical_namespace_entry& entry,bool local) {
+    return "(SELECT COUNT(*) FROM _lattice_canonical_namespace WHERE namespace_id="+literal(entry.namespace_id)+
+        " AND typeof(namespace_id)='blob' AND coverage_id="+literal(entry.coverage_id)+
+        " AND typeof(coverage_id)='blob' AND typeof(revision)='integer' AND revision="+std::to_string(entry.revision)+
+        " AND typeof(status)='integer' AND status=1 AND typeof(is_local)='integer' AND is_local="+std::to_string(local?1:0)+")=1";
+}
+std::string namespace_inventory_condition(const canonical_namespace_profile& p) {
+    auto out="(SELECT COUNT(*) FROM _lattice_canonical_namespace)="+std::to_string(p.entries.size());
+    for(const auto& entry:p.entries)out+=" AND "+namespace_condition(entry,entry.namespace_id==p.local_namespace);
+    return out;
+}
+std::string guard(const canonical_writer_profile& p, const std::string& entry_guard={},const canonical_namespace_profile* namespaces=nullptr) {
     const auto check=[&](const std::string& condition){return demand(condition,entry_guard);};
     const auto limits=" AND typeof(max_markers)='integer' AND typeof(max_marker_bytes)='integer'"
         " AND typeof(max_receipts)='integer' AND typeof(max_receipt_bytes)='integer'"
@@ -88,7 +99,7 @@ std::string guard(const canonical_writer_profile& p, const std::string& entry_gu
         " AND max_identity="+std::to_string(p.limits.identity_bytes)+" AND max_operation="+std::to_string(p.limits.operation_bytes);
     return check("lattice_canonical_guard_v1("+literal(p.binding.source)+","+literal(p.binding.epoch)+","+
         literal(p.binding.scope)+","+literal(p.binding.schema)+")=1")+
-        check("(SELECT COUNT(*) FROM _lattice_canonical_store WHERE id=1 AND version=1 AND source="+
+        check("(SELECT COUNT(*) FROM _lattice_canonical_store WHERE id=1 AND version="+std::to_string(namespaces?2:1)+" AND source="+
         literal(p.binding.source)+" AND epoch="+literal(p.binding.epoch)+" AND scope="+literal(p.binding.scope)+
         " AND schema_id="+literal(p.binding.schema)+" AND typeof(head)='integer' AND typeof(floor)='integer' AND floor>=0 AND head>=floor"
         " AND typeof(markers)='integer' AND markers BETWEEN 0 AND max_markers"
@@ -102,13 +113,14 @@ std::string guard(const canonical_writer_profile& p, const std::string& entry_gu
 // generated AuditLog identity until its receipt tail finishes.
 std::string mutation(const canonical_writer_profile& p,const std::string& table,
                      const std::string& identity,const std::string& original={},
-                     int64_t outcome=1, const std::string& entry_guard={}) {
+                     int64_t outcome=1, const std::string& entry_guard={},
+                     const canonical_namespace_profile* namespaces=nullptr,const std::string& imported_namespace={}) {
     const auto check=[&](const std::string& condition){return demand(condition,entry_guard);};
     const auto runtime=entry_guard.empty()?std::string{}:" AND "+entry_guard;
     const auto relation=literal(table), key="lattice_canonical_uuid_v1("+identity+")";
     const auto where="relation="+relation+" AND identity="+key;
     const auto charge=std::to_string(24+table.size()+36);
-    auto sql=guard(p,entry_guard)+check(key+" IS NOT NULL");
+    auto sql=guard(p,entry_guard,namespaces)+check(key+" IS NOT NULL");
     if(original.empty()) {
         const auto fresh="(NOT EXISTS(SELECT 1 FROM _lattice_canonical_touch WHERE "+where+"))";
         sql+=check("NOT EXISTS(SELECT 1 FROM _lattice_canonical_touch WHERE "+where+
@@ -122,17 +134,24 @@ std::string mutation(const canonical_writer_profile& p,const std::string& table,
         sql+=check("(SELECT COUNT(*) FROM _lattice_canonical_touch WHERE "+where+" AND position=(SELECT head FROM _lattice_canonical_store) AND charge="+charge+")=1");
     } else {
         const auto op="lattice_canonical_uuid_v1("+original+")";
-        const auto receipt_charge=std::to_string(32+36+table.size()+36);
+        const auto receipt_namespace=namespaces?(entry_guard.empty()?namespaces->local_namespace:imported_namespace):std::string{};
+        if(namespaces) {
+            bool found=false;for(const auto& entry:namespaces->entries)if(entry.namespace_id==receipt_namespace) {
+                sql+=check(namespace_condition(entry,entry.namespace_id==namespaces->local_namespace));found=true;
+            }
+            if(!found)refuse("canonical receipt namespace absent from admitted profile");
+        }
+        const auto receipt_charge=std::to_string(32+36+table.size()+36+receipt_namespace.size());
         // Generated local UUIDs cannot dedup AFTER a second model effect. A
         // collision refuses that whole statement instead of keeping the effect.
         sql+=check(op+" IS NOT NULL AND NOT EXISTS(SELECT 1 FROM _lattice_canonical_receipt WHERE original_id="+op+")");
         sql+=" UPDATE _lattice_canonical_store SET head=head+1,receipts=receipts+1,receipt_bytes=receipt_bytes+"+receipt_charge+
           " WHERE id=1 AND head<9223372036854775807 AND receipts<max_receipts AND "+receipt_charge+"<=max_receipt_bytes-receipt_bytes"+runtime+";";
         sql+=check("changes()=1");
-        sql+=" INSERT INTO _lattice_canonical_receipt(original_id,position,outcome,relation,identity,charge) SELECT "+op+",head,"+std::to_string(outcome)+","+
-          relation+","+key+","+receipt_charge+" FROM _lattice_canonical_store WHERE id=1"+runtime+";";
+        sql+=" INSERT INTO _lattice_canonical_receipt(original_id,position,outcome,relation,identity,charge"+std::string(namespaces?",namespace_id":"")+") SELECT "+op+",head,"+std::to_string(outcome)+","+
+          relation+","+key+","+receipt_charge+(namespaces?","+literal(receipt_namespace):"")+" FROM _lattice_canonical_store WHERE id=1"+runtime+";";
         sql+=check("changes()=1")+check("(SELECT COUNT(*) FROM _lattice_canonical_receipt WHERE original_id="+op+
-          " AND position=(SELECT head FROM _lattice_canonical_store) AND outcome="+std::to_string(outcome)+" AND relation="+relation+" AND identity="+key+" AND charge="+receipt_charge+")=1");
+          " AND position=(SELECT head FROM _lattice_canonical_store) AND outcome="+std::to_string(outcome)+" AND relation="+relation+" AND identity="+key+" AND charge="+receipt_charge+(namespaces?" AND namespace_id="+literal(receipt_namespace):"")+")=1");
     }
     return sql;
 }
@@ -157,6 +176,8 @@ struct canonical_writer_adapter::context {
     std::set<std::string> programs, relations;
     lattice_db* owner=nullptr; // identity only; upstream delivery holds the strong owner
     canonical_writer_profile profile;
+    std::optional<canonical_namespace_profile> namespaces;
+    const canonical_namespace_profile* namespace_profile()const {return namespaces?&*namespaces:nullptr;}
     // Built once from the exact table/index/program bytes validated at attach.
     // Immutable after publication; capture never accepts replacement scope.
     std::vector<sync_recovery::source_relation> source_relations;
@@ -253,13 +274,15 @@ std::string canonical_writer_adapter::uuid_key(const std::string& value) {
 std::unique_ptr<canonical_writer_adapter> canonical_writer_adapter::attach(lattice_db& owner,const canonical_writer_profile& profile) {
     return std::unique_ptr<canonical_writer_adapter>(new canonical_writer_adapter(owner,profile));
 }
+thread_local const std::function<void(lattice_db&)>* canonical_writer_adapter::namespace_before_write_test_hook_=nullptr;
 canonical_writer_adapter::~canonical_writer_adapter() {
     if(context_) {
         context_->active->store(false,std::memory_order_release);
     }
 }
 canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canonical_writer_profile& p,
-    const canonical_upstream_limits* upstream,const canonical_retention_limits* retention) {
+    const canonical_upstream_limits* upstream,const canonical_retention_limits* retention,
+    const canonical_namespace_profile* namespaces) {
     const auto& catalog=owner.recovery_schemas_;
     if(!catalog.valid())refuse("canonical owner schema catalog outside bounds or ambiguous");
     // The attachment owns its setup transaction. It cannot attach during caller
@@ -271,7 +294,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     if(p.models.empty() || p.models.size()>max_tables || p.limits.identity_bytes<64 || p.limits.operation_bytes<36)
         refuse("canonical unsupported scope/identity budget");
     for(const auto& name:p.models)if(!identifier(name))refuse("canonical invalid bounded model name");
-    canonical_change_store store(owner,p.binding,p.limits); // Validates before copying/registration.
+    canonical_change_store store(owner,p.binding,p.limits,namespaces); // Validates before copying/registration.
     writer_=owner.db_;
     {
         auto* mutex=sqlite3_db_mutex(writer_->internal_handle());sqlite3_mutex_enter(mutex);
@@ -300,7 +323,15 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     // The same attachment's revoked callback has connection-owned custody.
     context_=std::make_shared<context>();context_->connection=writer_->internal_handle();context_->binding=p.binding;
     context_->owner=&owner;context_->profile=p;
+    if(namespaces)context_->namespaces=*namespaces;
     if(upstream)context_->upstream=*upstream;
+    // An inert primitive ledger is not evidence of prior owned acceptance.
+    // V2 first enrollment requires no canonical metadata at all; only the
+    // complete exact retained profile may reopen below. No receipts are adopted.
+    const bool namespaced_reopen=namespaces && writer_->table_exists("_lattice_canonical_coverage");
+    if(namespaces && !namespaced_reopen &&
+       !writer_->query("SELECT 1 FROM main.sqlite_master WHERE substr(name,1,19)='_lattice_canonical_' LIMIT 1").empty())
+        refuse("canonical namespaced enrollment refuses preexisting unadmitted metadata");
     if(retention)prepare_retention(owner,*retention);
     const auto register_shared=[&] {
         auto* held=new std::shared_ptr<context>(context_);
@@ -328,7 +359,23 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         writer_->execute("PRAGMA recursive_triggers=ON");
         if(integer(writer_->query("PRAGMA recursive_triggers").at(0),"recursive_triggers")!=1)
             refuse("canonical REPLACE coverage needs recursive triggers");
+        if(namespaces && namespace_before_write_test_hook_)(*namespace_before_write_test_hook_)(owner);
         owner.begin_transaction();began=true;
+        if(namespaces) {
+            // Preflight is only a refusal optimization. BEGIN IMMEDIATE now
+            // excludes sibling writes: make the no-adoption decision here,
+            // before initialize() can audit an inert primitive ledger or any
+            // coverage/retention enrollment can write or clean up attempts.
+            if(recovery_writer_access::active_writer(owner)!=writer_.get())
+                refuse("canonical namespaced enrollment requires the actual owned WRITE");
+            if(writer_->table_exists("_lattice_canonical_coverage")!=namespaced_reopen ||
+               writer_->table_exists("_lattice_canonical_retention")!=namespaced_reopen)
+                refuse("canonical namespaced enrollment profile changed before owned WRITE");
+            if(!namespaced_reopen &&
+               !writer_->query("SELECT 1 FROM main.sqlite_master WHERE substr(name,1,19)='_lattice_canonical_' LIMIT 1").empty())
+                refuse("canonical namespaced enrollment refuses preexisting unadmitted metadata");
+            if(namespaced_reopen)retention_inventory_matches(*writer_,p,namespaces);
+        }
         const auto databases=writer_->query("SELECT name FROM pragma_database_list LIMIT 3");
         for(const auto& row:databases) {
             const auto name=string(row,"name");
@@ -389,6 +436,10 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             refuse("canonical prior keys do not match fixed UUID/scope profile");
         std::vector<program> originals,installed;
         std::string manifest="canonical-fixed-local-v1\nuuid-ascii-nocase-v1\n";
+        if(namespaces) {
+            manifest+="canonical-receipt-v2-fixed-64-256\nlocal:"+literal(namespaces->local_namespace)+"\n";
+            for(const auto& entry:namespaces->entries)manifest+=literal(entry.namespace_id)+":"+literal(entry.coverage_id)+":"+std::to_string(entry.revision)+"\n";
+        }
         if(!catalog.swift_digest.empty())manifest+="swift-owner-schema-v1:"+catalog.swift_digest+"\n";
         size_t existing=0;
         for(auto& [name,table]:tables) {
@@ -439,7 +490,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             const auto tail=demand("changes()=1")+
                 demand("(SELECT COUNT(*) FROM AuditLog WHERE id=last_insert_rowid() AND tableName='"+name+
                     "' AND typeof(globalRowId)='text' AND isFromRemote=0 AND synthesized=0)=1")+
-                mutation(p,name,target,original);
+                mutation(p,name,target,original,1,{},namespaces);
             if(table.link) {
                 owner.create_link_table_triggers(name,{},&old_sql);
                 owner.create_link_table_triggers(name,tail,&new_sql);
@@ -452,12 +503,12 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             for(const auto* event:{"INSERT","UPDATE","DELETE"}) {
                 const auto trigger="_lattice_canonical_"+name+"_"+event;
                 const auto identity=std::string(event)=="DELETE"?"OLD.globalId":"NEW.globalId";
-                installed.push_back({trigger,"CREATE TRIGGER "+trigger+" AFTER "+event+" ON "+name+" BEGIN"+mutation(p,name,identity)+" END"});
+                installed.push_back({trigger,"CREATE TRIGGER "+trigger+" AFTER "+event+" ON "+name+" BEGIN"+mutation(p,name,identity,{},1,{},namespaces)+" END"});
             }
             const auto identity_guard="_lattice_canonical_"+name+"_identity";
             auto same="CAST(OLD.globalId AS BLOB) IS CAST(NEW.globalId AS BLOB)";
             installed.push_back({identity_guard,"CREATE TRIGGER "+identity_guard+" BEFORE UPDATE ON "+name+" BEGIN"+
-                guard(p)+demand(same+(table.link?std::string{}:" AND OLD.id IS NEW.id"))+" END"});
+                guard(p,{},namespaces)+demand(same+(table.link?std::string{}:" AND OLD.id IS NEW.id"))+" END"});
             const auto indexes=writer_->query("SELECT CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN sql IS NULL THEN '' WHEN length(CAST(sql AS BLOB))<=262144 THEN sql END AS sql FROM main.sqlite_master WHERE type='index' AND tbl_name=? ORDER BY name LIMIT 33",{name});
             if(indexes.size()>32)refuse("canonical too many source indexes");
             std::string definitions=name+"\n"+table.table_sql+"\n";
@@ -481,7 +532,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         if(manifest.size()>max_sql)refuse("canonical manifest budget exceeded");
         context_->source_manifest=manifest;
         context_->source_descriptor_digest=picosha2::hash256_hex_string(manifest);
-        const bool reopen=writer_->table_exists("_lattice_canonical_coverage");
+        const bool reopen=namespaces?namespaced_reopen:writer_->table_exists("_lattice_canonical_coverage");
         if(reopen) {
             const auto shape=writer_->query("SELECT wr FROM pragma_table_list WHERE schema='main' AND name='_lattice_canonical_coverage'");
             if(shape.size()!=1 || integer(shape[0],"wr")!=1)refuse("canonical coverage must be WITHOUT ROWID");
@@ -542,12 +593,23 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
     const sync_recovery::canonical_capture_limits& limits,
     const std::function<void(size_t,uint64_t)>& after_batch,
     const std::function<void()>& before_decision,const std::function<void()>& after_decision,
-    const std::function<void(uint64_t)>& verify_retention_generation) {
+    const std::function<void(uint64_t)>& verify_retention_generation,
+    const canonical_namespace_admission* namespace_admission) {
     // No access to this after these copies: qualification callbacks may retire
     // the wrapper. They cannot release our actual owner/writer/context custody.
     auto state=context_;auto writer=writer_;
+    const auto held_admission=namespace_admission?std::optional<canonical_namespace_admission>(*namespace_admission):std::nullopt;
+    namespace_admission=held_admission?&*held_admission:nullptr;
     if(!owner || !state || state->owner!=owner.get() || binding!=state->binding)
         refuse("canonical source requires this admitted owner and exact binding");
+    if(bool(state->namespaces)!=bool(namespace_admission))refuse("canonical capture requires exact receipt profile admission");
+    if(namespace_admission) {
+        if(!limits.requests || limits.requests>4096 || requests.size()>limits.requests)
+            refuse("canonical namespaced request count exceeds finite capture policy");
+        validate_namespace_admission(owner,writer,state,*namespace_admission);
+        for(const auto& request:requests)if(request.namespace_id!=std::optional<std::string>(namespace_admission->namespace_.namespace_id))
+            refuse("canonical capture request namespace differs from admission");
+    }
     uint64_t revision;bool admitted;
     {
         std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
@@ -566,6 +628,7 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
                 state->active->load(std::memory_order_acquire);
         }
         if(!valid)refuse("canonical source owner, writer or attachment changed");
+        if(namespace_admission)validate_namespace_admission(owner,writer,state,*namespace_admission);
     };
     const auto verify_generation=[&](uint64_t generation) {
         decide(); // after the actual keeper pin, not an earlier guessed view
@@ -574,6 +637,10 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
             auto result=owner->query_at_generation(generation,sql,args);
             if(!result)refuse("canonical source descriptor view retired");return std::move(*result);
         };
+        if(state->namespaces) {
+            const auto catalog=query("SELECT "+namespace_inventory_condition(*state->namespaces)+" AS exact");
+            if(catalog.size()!=1 || integer(catalog[0],"exact")!=1)refuse("canonical source namespace catalog changed");
+        }
         const auto coverage=query("SELECT CASE WHEN typeof(id)='integer' THEN id END AS id,typeof(manifest)='blob' AND length(manifest)<=262144 AND manifest=? AS exact "
             "FROM main._lattice_canonical_coverage LIMIT 2",{bytes(state->source_manifest)});
         if(coverage.size()!=1 || integer(coverage[0],"id")!=1 || integer(coverage[0],"exact")!=1)
@@ -600,7 +667,7 @@ sync_recovery::owned_canonical_capture canonical_writer_adapter::capture_recover
         }
     };
     auto result=sync_recovery::canonical_source_session_access::capture(*owner,state->binding,state->source_relations,
-        base,requests,limits,verify_generation,after_batch);
+        base,requests,limits,verify_generation,after_batch,state->namespace_profile());
     result.descriptor_digest=state->source_descriptor_digest;
     if(before_decision)before_decision();
     decide();
@@ -665,17 +732,63 @@ std::unique_ptr<canonical_writer_adapter> canonical_writer_adapter::attach_retai
         refuse("canonical retained upstream requires explicit bounded profile and retained owner");
     return std::unique_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p,&upstream,&retention));
 }
+std::unique_ptr<canonical_writer_adapter> canonical_writer_adapter::attach_namespaced_upstream_for_qualification(
+    std::shared_ptr<lattice_db> owner,const canonical_namespaced_writer_profile& p,
+    canonical_upstream_limits upstream,canonical_retention_limits retention) {
+    if(!owner || !p.writer.upstream_requested || !upstream.entries || upstream.field_bytes<256 || !upstream.delivery_bytes ||
+       upstream.field_bytes>upstream.delivery_bytes || upstream.delivery_bytes>static_cast<size_t>(std::numeric_limits<int>::max()/8))
+        refuse("canonical namespaced qualification requires bounded retained upstream owner");
+    p.namespaces.validate();
+    return std::unique_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p.writer,&upstream,&retention,&p.namespaces));
+}
+void canonical_writer_adapter::validate_namespace_admission(const std::shared_ptr<lattice_db>& owner,
+    const std::shared_ptr<database>& writer,const std::shared_ptr<context>& state,const canonical_namespace_admission& admission) {
+    if(!owner || !state || !state->namespaces || owner!=admission.owner_ || writer!=admission.writer_ ||
+       admission.context_.get()!=state.get() || state->owner!=owner.get())refuse("canonical namespace admission belongs to another actual owner");
+    bool found=false;for(const auto& entry:state->namespaces->entries)if(entry==admission.namespace_)found=true;
+    if(!found || admission.replica_.empty())refuse("canonical namespace admission provenance differs");
+    std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+    if(owner->closed_.load() || owner->db_!=writer || owner->connection_revision_!=admission.revision_ ||
+       !state->active->load(std::memory_order_acquire) || writer->is_closed() || !matches_connection(*writer,state->connection))
+        refuse("canonical namespace admission physical session retired");
+}
+canonical_namespace_admission canonical_writer_adapter::admit_namespace_for_qualification(std::shared_ptr<lattice_db> owner,
+    const std::string& namespace_id,const std::string& replica_id) {
+    auto state=context_;auto writer=writer_;
+    if(!owner || !state || !state->namespaces || state->owner!=owner.get() || namespace_id.empty() || namespace_id.size()>256 ||
+        replica_id.empty() || replica_id.size()>256)refuse("canonical namespace qualification requires bounded actual profile");
+    canonical_namespace_admission result;bool found=false;
+    for(const auto& entry:state->namespaces->entries)if(entry.namespace_id==namespace_id){result.namespace_=entry;found=true;}
+    if(!found)refuse("canonical namespace is not enrolled");
+    result.owner_=owner;result.writer_=writer;result.context_=state;result.replica_=replica_id;
+    {std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);result.revision_=owner->connection_revision_;}
+    validate_namespace_admission(owner,writer,state,result);
+    // Qualification issuer only: no assertion of network/application identity.
+    return result;
+}
 bool canonical_writer_adapter::matches_connection(const database& writer,sqlite3* handle) noexcept {
     return writer.internal_handle()==handle;
 }
 std::vector<std::string> canonical_writer_adapter::apply_upstream_owned(std::shared_ptr<lattice_db> owner,
     const std::vector<audit_log_entry>& entries,const std::optional<std::string>& receiving_channel) {
+    return apply_upstream_impl(std::move(owner),entries,receiving_channel,nullptr);
+}
+std::vector<std::string> canonical_writer_adapter::apply_upstream_namespaced_owned(std::shared_ptr<lattice_db> owner,
+    const canonical_namespace_admission& admission,const std::vector<audit_log_entry>& entries,
+    const std::optional<std::string>& receiving_channel) {
+    return apply_upstream_impl(std::move(owner),entries,receiving_channel,&admission);
+}
+std::vector<std::string> canonical_writer_adapter::apply_upstream_impl(std::shared_ptr<lattice_db> owner,
+    const std::vector<audit_log_entry>& entries,const std::optional<std::string>& receiving_channel,
+    const canonical_namespace_admission* admission) {
     // Copy all adapter custody before any SQL/callback. The caller may revoke
     // and destroy this wrapper during a later observer without invalidating the
     // delivery's context or retained actual owner.
     auto state=context_;auto writer=writer_;
     if(!owner || !state || !state->upstream || state->owner!=owner.get())
         refuse("canonical upstream requires this attachment's retained actual owner");
+    if(bool(state->namespaces)!=bool(admission))refuse("canonical upstream requires exact receipt profile admission");
+    if(admission)validate_namespace_admission(owner,writer,state,*admission);
     uint64_t revision;
     {
         std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
@@ -683,13 +796,16 @@ std::vector<std::string> canonical_writer_adapter::apply_upstream_owned(std::sha
             refuse("canonical upstream attachment is retired");
         revision=owner->connection_revision_;
     }
-    canonical_upstream_delivery delivery(owner,std::move(writer),std::move(state),revision);
+    canonical_upstream_delivery delivery(owner,std::move(writer),std::move(state),revision,admission);
     delivery.validate_envelope(entries,receiving_channel);
     return owner->apply_remote_changes_impl_(entries,receiving_channel,&delivery);
 }
 canonical_upstream_delivery::canonical_upstream_delivery(std::shared_ptr<lattice_db> owner,
-    std::shared_ptr<database> writer,std::shared_ptr<canonical_writer_adapter::context> context,uint64_t revision)
-    :owner_(std::move(owner)),writer_(std::move(writer)),context_(std::move(context)),revision_(revision) {}
+    std::shared_ptr<database> writer,std::shared_ptr<canonical_writer_adapter::context> context,uint64_t revision,
+    const canonical_namespace_admission* admission)
+    :owner_(std::move(owner)),writer_(std::move(writer)),context_(std::move(context)),revision_(revision) {
+    if(admission)namespace_admission_=*admission;
+}
 void canonical_upstream_delivery::validate_chunk(lattice_db& owner,database& writer) const {
     // Called only after the owning loop acquired its gate/SQLite maintenance
     // locks and validated physical hook and publication revision. No raw handle
@@ -698,6 +814,11 @@ void canonical_upstream_delivery::validate_chunk(lattice_db& owner,database& wri
         !context_->active->load(std::memory_order_acquire) || writer.is_closed() ||
         !canonical_writer_adapter::matches_connection(writer,context_->connection))
         refuse("canonical upstream chunk capability is retired or mismatched");
+    // The apply loop holds publication here and already checks revision_.
+    // Never recursively acquire that nonrecursive mutex from this callback.
+    if(namespace_admission_ && (namespace_admission_->owner_!=owner_ || namespace_admission_->writer_!=writer_ ||
+       namespace_admission_->context_.get()!=context_.get() || namespace_admission_->revision_!=revision_))
+        refuse("canonical namespace chunk physical admission differs");
 }
 void canonical_upstream_delivery::validate_envelope(const std::vector<audit_log_entry>& entries,
     const std::optional<std::string>& channel) const {
@@ -841,7 +962,12 @@ void canonical_upstream_delivery::begin_entry(const audit_log_entry& entry) {
     original_=canonical_writer_adapter::uuid_key(entry.global_id);
     target_=canonical_writer_adapter::uuid_key(entry.global_row_id);
     entry_=&entry;previous_=current_;current_=this;
-    try {script(guard(context_->profile,entry_guard()));}
+    try {
+        if(namespace_admission_)canonical_writer_adapter::validate_namespace_admission(owner_,writer_,context_,*namespace_admission_);
+        script(guard(context_->profile,entry_guard(),context_->namespace_profile()));
+        if(namespace_admission_)script(demand(namespace_condition(namespace_admission_->namespace_,
+            namespace_admission_->namespace_.namespace_id==context_->namespaces->local_namespace),entry_guard()));
+    }
     catch(...) {end_entry();throw;}
 }
 void canonical_upstream_delivery::end_entry() noexcept {
@@ -853,13 +979,18 @@ bool canonical_upstream_delivery::entry_scope::duplicate() const {
     const auto rows=d.query("SELECT position,outcome,charge,"
         "CASE WHEN typeof(relation)='blob' AND length(relation)<=64 THEN relation END AS relation,"
         "CASE WHEN typeof(identity)='blob' AND length(identity)=36 THEN identity END AS identity "
+        +std::string(d.namespace_admission_?",CASE WHEN typeof(namespace_id)='blob' AND length(namespace_id) BETWEEN 1 AND 256 THEN namespace_id END AS namespace_id ":"")+
         "FROM main._lattice_canonical_receipt WHERE original_id=?",{bytes(d.original_)});
     if(rows.empty())return false;
     if(rows.size()!=1)refuse("canonical upstream duplicate receipt shape");
-    const auto& r=rows[0];const auto position=integer(r,"position"),outcome=integer(r,"outcome");
+    const auto& r=rows[0];
+    if(d.namespace_admission_ && (!std::holds_alternative<blob>(r.at("namespace_id")) ||
+       std::get<blob>(r.at("namespace_id"))!=bytes(d.namespace_admission_->namespace_.namespace_id)))
+        refuse("canonical original ID belongs to a different namespace");
+    const auto position=integer(r,"position"),outcome=integer(r,"outcome");
     const auto head=d.query("SELECT head FROM main._lattice_canonical_store WHERE id=1");
     if(head.size()!=1 || position<1 || position>integer(head[0],"head") || outcome<1 || outcome>3 ||
-        integer(r,"charge")!=static_cast<int64_t>(32+36+d.entry_->table_name.size()+36) ||
+        integer(r,"charge")!=static_cast<int64_t>(32+36+d.entry_->table_name.size()+36+(d.namespace_admission_?d.namespace_admission_->namespace_.namespace_id.size():0)) ||
         !std::holds_alternative<blob>(r.at("relation")) || std::get<blob>(r.at("relation"))!=bytes(d.entry_->table_name) ||
         !std::holds_alternative<blob>(r.at("identity")) || std::get<blob>(r.at("identity"))!=bytes(d.target_))
         refuse("canonical upstream retained receipt corrupt or different target");
@@ -919,13 +1050,14 @@ void canonical_upstream_delivery::entry_scope::accept(canonical_receipt_outcome 
     const auto before=d.query("SELECT head,receipts,receipt_bytes FROM main._lattice_canonical_store WHERE id=1");
     if(before.size()!=1)refuse("canonical upstream finalizer state missing");
     const int64_t head=integer(before[0],"head"),receipts=integer(before[0],"receipts"),receipt_bytes=integer(before[0],"receipt_bytes");
-    const int64_t charge=static_cast<int64_t>(32+36+d.entry_->table_name.size()+36);
+    const int64_t charge=static_cast<int64_t>(32+36+d.entry_->table_name.size()+36+(d.namespace_admission_?d.namespace_admission_->namespace_.namespace_id.size():0));
     if(head==INT64_MAX || receipts==INT64_MAX || receipt_bytes>INT64_MAX-charge)
         refuse("canonical upstream finalizer sequence/counter exhausted");
     d.finalizing_=true;
     try {
         d.script(mutation(d.context_->profile,d.entry_->table_name,"CAST("+literal(d.target_)+" AS TEXT)",
-            "CAST("+literal(d.original_)+" AS TEXT)",static_cast<int64_t>(outcome),d.entry_guard()));
+            "CAST("+literal(d.original_)+" AS TEXT)",static_cast<int64_t>(outcome),d.entry_guard(),d.context_->namespace_profile(),
+            d.namespace_admission_?d.namespace_admission_->namespace_.namespace_id:std::string{}));
         const auto after=d.query("SELECT head,receipts,receipt_bytes FROM main._lattice_canonical_store WHERE id=1");
         if(after.size()!=1 || integer(after[0],"head")!=head+1 || integer(after[0],"receipts")!=receipts+1 ||
             integer(after[0],"receipt_bytes")!=receipt_bytes+charge)

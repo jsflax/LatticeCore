@@ -238,6 +238,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp
     Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp
     Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp
+    Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp
     Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp
     Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
     Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp

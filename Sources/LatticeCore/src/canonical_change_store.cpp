@@ -2,6 +2,7 @@
 #include "recovery_writer_access.hpp"
 #include <limits>
 #include <map>
+#include <set>
 #include <utility>
 
 namespace lattice::detail {
@@ -39,7 +40,8 @@ int64_t marker_charge(const canonical_identity& i) {
 }
 int64_t receipt_charge(const canonical_receipt_request& r) {
     return 32 + static_cast<int64_t>(r.original_id.size()) +
-        (r.target ? static_cast<int64_t>(r.target->table.size() + r.target->global_id.size()) : 0);
+        (r.target ? static_cast<int64_t>(r.target->table.size() + r.target->global_id.size()) : 0) +
+        (r.namespace_id ? static_cast<int64_t>(r.namespace_id->size()) : 0);
 }
 bool fits(int64_t old, int64_t add, int64_t limit) {
     return old >= 0 && add >= 0 && old <= limit && add <= limit - old;
@@ -66,8 +68,19 @@ template<class F> auto atomic(database& db, F&& body) {
 }
 }
 
+void canonical_namespace_profile::validate() const {
+    valid_bytes(local_namespace,256);
+    if(entries.empty() || entries.size()>64)fail(code::invalid_argument,"canonical namespace catalog outside fixed v2 bounds");
+    std::set<std::string> unique;
+    for(const auto& entry:entries) {
+        valid_bytes(entry.namespace_id,256);valid_bytes(entry.coverage_id,256);
+        if(entry.revision<=0 || !unique.insert(entry.namespace_id).second)
+            fail(code::invalid_argument,"canonical namespace revision or duplicate identity");
+    }
+    if(!unique.count(local_namespace))fail(code::invalid_argument,"canonical source-local namespace not enrolled");
+}
 canonical_change_store::canonical_change_store(lattice_db& owner, const canonical_store_binding& binding,
-                                               canonical_store_limits limits)
+                                               canonical_store_limits limits,const canonical_namespace_profile* namespaces)
     : owner_(owner), limits_(limits) {
     for (const auto* s : {&binding.source, &binding.epoch, &binding.scope, &binding.schema}) valid_bytes(*s, 256);
     if (limits.markers < 0 || limits.marker_bytes < 0 || limits.receipts < 0 || limits.receipt_bytes < 0 ||
@@ -75,6 +88,7 @@ canonical_change_store::canonical_change_store(lattice_db& owner, const canonica
         limits.identity_bytes <= 0 || limits.identity_bytes > 256 ||
         limits.operation_bytes <= 0 || limits.operation_bytes > 256)
         fail(code::invalid_argument, "invalid canonical store limits");
+    if(namespaces){namespaces->validate();namespaces_=*namespaces;}
     binding_=binding; // copy only after every component has passed its hard cap
 }
 database& canonical_change_store::connection() const {
@@ -104,7 +118,7 @@ canonical_store_state canonical_change_store::state() const {
         "CASE WHEN typeof(scope)='blob' AND length(scope) BETWEEN 1 AND 256 THEN scope END AS scope,"
         "CASE WHEN typeof(schema_id)='blob' AND length(schema_id) BETWEEN 1 AND 256 THEN schema_id END AS schema_id "
         "FROM main._lattice_canonical_store LIMIT 2");
-    if (r.size() != 1 || integer(r[0],"id") != 1 || integer(r[0],"version") != 1)
+    if (r.size() != 1 || integer(r[0],"id") != 1 || integer(r[0],"version") != (namespaces_?2:1))
         fail(code::corrupt_state, "missing or unsupported canonical store");
     const auto& v = r[0];
     if (canonical_store_binding{decoded(v,"source"),decoded(v,"epoch"),decoded(v,"scope"),decoded(v,"schema_id")} != binding_)
@@ -130,12 +144,14 @@ void canonical_change_store::write_state(const canonical_store_state& old, const
 }
 void canonical_change_store::initialize() {
     auto& db = connection();
+    const auto namespace_found=db.query("SELECT name FROM main.sqlite_master WHERE name='_lattice_canonical_namespace'");
     const auto found = db.query("SELECT name FROM main.sqlite_master WHERE name IN "
         "('_lattice_canonical_store','_lattice_canonical_touch','_lattice_canonical_receipt','_lattice_canonical_touch_position')");
     if (!found.empty()) {
-        if (found.size() != 4) fail(code::corrupt_state, "partial canonical schema; migration refused");
+        if (found.size() != 4 || namespace_found.size()!=(namespaces_?1u:0u)) fail(code::corrupt_state, "partial canonical schema; migration refused");
         audit(); return;
     }
+    if(!namespace_found.empty())fail(code::corrupt_state,"orphan canonical namespace catalog");
     atomic(db, [&] {
         db.execute("CREATE TABLE main._lattice_canonical_store (id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,"
             "source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_id BLOB NOT NULL,"
@@ -147,8 +163,17 @@ void canonical_change_store::initialize() {
             "position INTEGER NOT NULL,charge INTEGER NOT NULL,PRIMARY KEY(relation,identity)) WITHOUT ROWID");
         db.execute("CREATE INDEX main._lattice_canonical_touch_position ON _lattice_canonical_touch(position,relation,identity)");
         db.execute("CREATE TABLE main._lattice_canonical_receipt (original_id BLOB PRIMARY KEY NOT NULL,"
-            "position INTEGER NOT NULL,outcome INTEGER NOT NULL,relation BLOB,identity BLOB,charge INTEGER NOT NULL) WITHOUT ROWID");
-        db.execute("INSERT INTO main._lattice_canonical_store VALUES(1,1,?,?,?,?,0,0,0,0,0,0,?,?,?,?,?,?,?)",
+            "position INTEGER NOT NULL,outcome INTEGER NOT NULL,relation BLOB,identity BLOB,charge INTEGER NOT NULL"+
+            std::string(namespaces_?",namespace_id BLOB NOT NULL":"")+") WITHOUT ROWID");
+        if(namespaces_) {
+            db.execute("CREATE TABLE main._lattice_canonical_namespace(namespace_id BLOB PRIMARY KEY NOT NULL,coverage_id BLOB NOT NULL,revision INTEGER NOT NULL,status INTEGER NOT NULL,is_local INTEGER NOT NULL) WITHOUT ROWID");
+            for(const auto& entry:namespaces_->entries) {
+                db.execute("INSERT INTO main._lattice_canonical_namespace VALUES(?,?,?,1,?)",
+                    {encoded(entry.namespace_id),encoded(entry.coverage_id),entry.revision,int64_t(entry.namespace_id==namespaces_->local_namespace)});
+                changed(db);
+            }
+        }
+        db.execute("INSERT INTO main._lattice_canonical_store VALUES(1,"+std::to_string(namespaces_?2:1)+",?,?,?,?,0,0,0,0,0,0,?,?,?,?,?,?,?)",
             {encoded(binding_.source),encoded(binding_.epoch),encoded(binding_.scope),encoded(binding_.schema),
              limits_.markers,limits_.marker_bytes,limits_.receipts,limits_.receipt_bytes,
              limits_.batch_identities,limits_.identity_bytes,limits_.operation_bytes});
@@ -157,6 +182,22 @@ void canonical_change_store::initialize() {
 }
 void canonical_change_store::audit() const {
     const auto s = state(); auto& db = connection();
+    if(namespaces_) {
+        const auto rows=db.query("SELECT CASE WHEN typeof(namespace_id)='blob' AND length(namespace_id) BETWEEN 1 AND 256 THEN namespace_id END AS namespace_id,"
+            "CASE WHEN typeof(coverage_id)='blob' AND length(coverage_id) BETWEEN 1 AND 256 THEN coverage_id END AS coverage_id,"
+            "CASE WHEN typeof(revision)='integer' THEN revision END AS revision,CASE WHEN typeof(status)='integer' THEN status END AS status,"
+            "CASE WHEN typeof(is_local)='integer' THEN is_local END AS is_local FROM main._lattice_canonical_namespace LIMIT 65");
+        if(rows.size()!=namespaces_->entries.size())fail(code::corrupt_state,"canonical namespace inventory differs");
+        std::set<std::string> seen;
+        for(const auto& row:rows) {
+            const auto id=decoded(row,"namespace_id");bool matched=false;
+            for(const auto& entry:namespaces_->entries)if(entry.namespace_id==id)
+                matched=decoded(row,"coverage_id")==entry.coverage_id && integer(row,"revision")==entry.revision;
+            if(!matched || !seen.insert(id).second || integer(row,"status")!=1 ||
+                integer(row,"is_local")!=int64_t(id==namespaces_->local_namespace))
+                fail(code::corrupt_state,"canonical namespace provenance differs");
+        }
+    }
     const auto tables = db.query("SELECT name,wr FROM pragma_table_list WHERE schema='main' AND name IN "
         "('_lattice_canonical_store','_lattice_canonical_touch','_lattice_canonical_receipt')");
     if (tables.size()!=3) fail(code::corrupt_state,"canonical metadata table missing");
@@ -169,7 +210,8 @@ void canonical_change_store::audit() const {
         "OR typeof(position)!='integer' OR position<=0 OR position>? OR typeof(outcome)!='integer' OR outcome NOT IN(1,2,3) "
         "OR (relation IS NULL)!=(identity IS NULL) OR (relation IS NOT NULL AND (typeof(relation)!='blob' OR length(relation) NOT BETWEEN 1 AND ? "
         "OR typeof(identity)!='blob' OR length(identity) NOT BETWEEN 1 AND ?)) OR typeof(charge)!='integer' "
-        "OR charge!=32+length(original_id)+COALESCE(length(relation),0)+COALESCE(length(identity),0) LIMIT 1",
+        "OR charge!=32+length(original_id)+COALESCE(length(relation),0)+COALESCE(length(identity),0)"+
+        std::string(namespaces_?"+length(namespace_id) OR typeof(namespace_id)!='blob' OR length(namespace_id) NOT BETWEEN 1 AND 256 OR NOT EXISTS(SELECT 1 FROM main._lattice_canonical_namespace n WHERE n.namespace_id=_lattice_canonical_receipt.namespace_id AND n.status=1)":"")+" LIMIT 1",
         {limits_.operation_bytes,s.head,limits_.identity_bytes,limits_.identity_bytes}).empty()) fail(code::corrupt_state,"malformed canonical receipt");
     const auto m = db.query("SELECT COUNT(*) AS n,COALESCE(SUM(charge),0) AS bytes FROM main._lattice_canonical_touch").at(0);
     const auto r = db.query("SELECT COUNT(*) AS n,COALESCE(SUM(charge),0) AS bytes FROM main._lattice_canonical_receipt").at(0);
@@ -194,6 +236,7 @@ std::optional<canonical_receipt> canonical_change_store::receipt(const std::stri
         "CASE WHEN typeof(charge)='integer' THEN charge END AS charge,(relation IS NULL AND identity IS NULL) AS no_target,"
         "CASE WHEN typeof(relation)='blob' AND length(relation) BETWEEN 1 AND ? THEN relation END AS relation,"
         "CASE WHEN typeof(identity)='blob' AND length(identity) BETWEEN 1 AND ? THEN identity END AS identity "
+        +std::string(namespaces_?",CASE WHEN typeof(namespace_id)='blob' AND length(namespace_id) BETWEEN 1 AND 256 THEN namespace_id END AS namespace_id ":"")+
         "FROM main._lattice_canonical_receipt WHERE original_id=?", {limits_.identity_bytes,limits_.identity_bytes,encoded(id)});
     if (rows.empty()) return std::nullopt;
     if (rows.size()!=1) fail(code::corrupt_state,"duplicate canonical receipt");
@@ -201,6 +244,11 @@ std::optional<canonical_receipt> canonical_change_store::receipt(const std::stri
     if (p<=0 || p>s.head || !valid_outcome(outcome)) fail(code::corrupt_state,"invalid canonical receipt outcome");
     canonical_receipt result{{id,static_cast<canonical_receipt_outcome>(outcome),std::nullopt},p};
     if (!integer(v,"no_target")) result.original.target=canonical_identity{decoded(v,"relation"),decoded(v,"identity")};
+    if(namespaces_) {
+        result.original.namespace_id=decoded(v,"namespace_id");
+        bool known=false;for(const auto& entry:namespaces_->entries)if(entry.namespace_id==*result.original.namespace_id)known=true;
+        if(!known)fail(code::corrupt_state,"canonical addressed receipt namespace is not enrolled");
+    }
     if (integer(v,"charge")!=receipt_charge(result.original)) fail(code::corrupt_state,"invalid canonical receipt charge");
     return result;
 }
@@ -208,7 +256,15 @@ canonical_record_result canonical_change_store::record(const std::vector<canonic
     const std::optional<canonical_receipt_request>& request) {
     const auto old=state();
     if (request) {
-        if (const auto prior=receipt(request->original_id)) return {prior->position,false,prior};
+        if(bool(request->namespace_id)!=bool(namespaces_))fail(code::invalid_argument,"canonical receipt profile mismatch");
+        if(namespaces_) {
+            bool admitted=false;for(const auto& n:namespaces_->entries)if(n.namespace_id==*request->namespace_id)admitted=true;
+            if(!admitted)fail(code::invalid_argument,"canonical receipt namespace not enrolled");
+        }
+        if (const auto prior=receipt(request->original_id)) {
+            if(prior->original.namespace_id!=request->namespace_id)fail(code::binding_mismatch,"original ID already belongs to another namespace");
+            return {prior->position,false,prior};
+        }
         if (!valid_outcome(static_cast<int64_t>(request->outcome))) fail(code::invalid_argument,"invalid receipt outcome");
         if (request->target) valid_identity(*request->target,limits_);
     }
@@ -244,8 +300,9 @@ canonical_record_result canonical_change_store::record(const std::vector<canonic
         if (request) {
             column_value_t table=nullptr, identity=nullptr;
             if (request->target) { table=encoded(request->target->table); identity=encoded(request->target->global_id); }
-            db.execute("INSERT INTO main._lattice_canonical_receipt VALUES(?,?,?,?,?,?)",
-                {encoded(request->original_id),next.head,static_cast<int64_t>(request->outcome),table,identity,receipt_charge(*request)});
+            std::vector<column_value_t> values{encoded(request->original_id),next.head,static_cast<int64_t>(request->outcome),table,identity,receipt_charge(*request)};
+            if(namespaces_)values.push_back(encoded(*request->namespace_id));
+            db.execute("INSERT INTO main._lattice_canonical_receipt VALUES(?,?,?,?,?,?"+std::string(namespaces_?",?":"")+")",values);
             changed(db); result=receipt(request->original_id);
             if (result!=std::optional<canonical_receipt>(canonical_receipt{*request,next.head}))
                 fail(code::corrupt_state,"canonical receipt insertion lost");

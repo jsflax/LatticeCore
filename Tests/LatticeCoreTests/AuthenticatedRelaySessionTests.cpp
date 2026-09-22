@@ -174,5 +174,16 @@ TEST_F(AuthenticatedRelaySession, FactoryFailureAndFinalCloseReleaseActualRouteE
     auto p=policy();p["models"]=json::array();auto bad=open(p,connection());EXPECT_FALSE(bad.valid());EXPECT_EQ(route->destroyed.load(),1);
     open();authorize();auto stop=setup.stop_token();setup.close_on_io();setup={};EXPECT_EQ(route->destroyed.load(),2);EXPECT_FALSE(stop.live());
 }
+TEST_F(AuthenticatedRelaySession, OwnedIdsOutliveResultsWithoutReleasingPublicationChargeEarly) {
+    open();authorize();const auto e=entry();auto result=setup.receive(frame(e));
+    auto stop=setup.stop_token();ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());
+    auto ids=result.take_ids();EXPECT_EQ(ids,std::vector<std::string>{e.global_id});
+    EXPECT_TRUE(result.ids().empty());EXPECT_TRUE(result.take_ids().empty());
+    EXPECT_EQ(result.status_code(),1);EXPECT_TRUE(result.publishable());EXPECT_FALSE(stop.drained());
+    auto copy=result;result={};EXPECT_FALSE(stop.drained());
+    stop.stop();EXPECT_FALSE(copy.publishable());EXPECT_FALSE(stop.drained());
+    copy={};EXPECT_TRUE(stop.drained());EXPECT_EQ(ids,std::vector<std::string>{e.global_id});
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+}
 }
 #endif

@@ -34,5 +34,8 @@ bool relay_recovery_stop::live()const noexcept{return value_&&value_->live();}
 bool relay_recovery_stop::drained()const noexcept{return !value_||value_->drained();}
 int32_t relay_recovery_result::status_code()const noexcept{return status_;}
 const std::vector<std::string>& relay_recovery_result::ids()const noexcept{return ids_;}
+std::vector<std::string> relay_recovery_result::take_ids()noexcept {
+    std::vector<std::string> result;result.swap(ids_);return result;
+}
 bool relay_recovery_result::publishable()const noexcept{return operation_&&operation_->publishable();}
 }

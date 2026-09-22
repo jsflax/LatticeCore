@@ -33,6 +33,9 @@ public:
     // A native error/partial result is never proof that effects did not commit.
     int32_t status_code()const noexcept SWIFT_NAME(statusCode());
     const std::vector<std::string>& ids()const noexcept;
+    // Transfer owned IDs across the Swift boundary without an interior pointer.
+    // The result keeps its counted operation until its final copy is released.
+    std::vector<std::string> take_ids()noexcept SWIFT_NAME(takeIDs());
     bool publishable()const noexcept;
 };
 // An unauthorized actual setup, not a transferable admission. Only the real

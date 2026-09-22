@@ -604,7 +604,8 @@ protected:
     std::optional<bool> try_has_export_protection();
     bool has_export_protection();
     void schedule_ack_retry(const std::vector<audit_log_entry>&);
-    std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false,uint64_t delivery_token=0);
+    std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false,uint64_t delivery_token=0,
+        std::function<void()> delivery_retry={});
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")

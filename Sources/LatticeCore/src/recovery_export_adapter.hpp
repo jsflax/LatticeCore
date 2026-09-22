@@ -31,6 +31,7 @@ class committed_export_frame {
     friend class recovery_export_adapter;
     friend class recovery_export_route;
     friend class recovery_server_export_page;
+    friend class recovery_receiver_route;
     std::shared_ptr<lattice_db> owner_;
     std::shared_ptr<recovery_continuous_work> continuous_work_;
     std::shared_ptr<const receiver_upload_view> upload_view_;

@@ -7,6 +7,7 @@
 
 namespace lattice::detail {
 class recovery_receiver_route;
+class committed_export_frame;
 
 // One instance per actual continuous physical session. Construction and route
 // registration belong to retained producer admission; neither an application
@@ -62,6 +63,9 @@ class recovery_receiver_route final : public std::enable_shared_from_this<recove
     friend class recovery_unknown_reconciliation;
     std::shared_ptr<const recovery_reconciliation_descriptor> pending_reconciliation()const;
     std::shared_ptr<recovery_continuous_route> reconciliation_work_route()const;
+    // Created from a real committed restricted frame before physical handoff.
+    // Only the synchronizer's matching delivery timeout may invoke it.
+    std::function<void()> delivery_timeout_retry(const committed_export_frame&,uint64_t);
     struct state;
     std::shared_ptr<state> state_;
     std::shared_ptr<recovery_receiver_controller> controller_;

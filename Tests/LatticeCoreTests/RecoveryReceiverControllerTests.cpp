@@ -381,5 +381,94 @@ TEST_F(RecoveryReceiverController, EnabledUniqueOriginalCapacityCountsSharedRows
     EXPECT_EQ(scalar(*receiver,"SELECT max_records AS n FROM _lattice_obligation_store"),20000);
 }
 
+TEST_F(RecoveryReceiverController, LateClaimedAckWhileFrozenPreservesBothCanonicalNamespaces) {
+    configure(2);auto armed=std::make_shared<std::atomic<bool>>(false);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,
+        [armed](const char* stage)->std::shared_ptr<void>{if(armed->load()&&std::strcmp(stage,"install")==0)throw db_error("fixture late ACK frozen checkpoint");return {};});
+    connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==2;}));
+    seed_local(1,500);const auto ids=originals();ASSERT_EQ(ids.size(),1u);
+    ASSERT_TRUE(until([&]{return held_originals(0)==ids&&held_originals(1)==ids;}));
+    for(size_t peer=0;peer<2;++peer){auto frame=std::find_if(held_uploads.begin(),held_uploads.end(),[&](const auto& f){return f.endpoint.matches(peers[peer].physical);});ASSERT_NE(frame,held_uploads.end());
+        auto accepted=peers[peer].setup.receive(frame->raw);ASSERT_EQ(accepted.status_code(),1);EXPECT_EQ(accepted.take_ids(),ids);}
+    armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);
+    const auto canonical=[this]{auto value=snapshot();for(const auto* table:{"_lattice_receive_guard","_lattice_receive_guard_store","_lattice_replication_slots"})value[table]=receiver->db().query(std::string("SELECT * FROM ")+table);return value;};
+    const auto before=canonical();
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NOT NULL"),2);
+    ASSERT_EQ(synchronizers[0]->get_progress().pending_upload,1);
+    struct Observed {Snapshot state; synchronizer::sync_progress progress;std::atomic<bool> done{false};};auto observed=std::make_shared<Observed>();
+    synchronizers[0]->set_on_sync_complete([this,ids,canonical,observed](const auto& actual){if(actual!=ids||observed->done.load())return;observed->state=canonical();observed->progress=synchronizers[0]->get_progress();observed->done.store(true);});
+    legacy_ack(0,ids);ASSERT_TRUE(until([&]{return observed->done.load();}));EXPECT_EQ(observed->state,before);EXPECT_EQ(observed->progress.pending_upload,0);EXPECT_EQ(observed->progress.acked,1);
+    const auto state=receiver->db().query("SELECT sync_id,is_synchronized FROM _lattice_sync_state WHERE audit_entry_id=(SELECT id FROM AuditLog LIMIT 1) ORDER BY sync_id");
+    ASSERT_EQ(state.size(),1u);EXPECT_EQ(std::get<std::string>(state[0].at("sync_id")),peers[0].channel);EXPECT_EQ(std::get<int64_t>(state[0].at("is_synchronized")),1);
+    EXPECT_EQ(synchronizers[1]->get_progress().pending_upload,1);EXPECT_EQ(phase(),2);
+    EXPECT_THROW(insert(*receiver,controller_uuid(501),"closed after delivery only"),db_error);
+    {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());for(const auto& error:errors)EXPECT_NE(error.find("fixture late ACK frozen checkpoint"),std::string::npos);}
+}
+
+TEST_F(RecoveryReceiverController, LateClaimedAckWhileInstalledPreservesExactPositiveReceiptAndGuard) {
+    configure();auto armed=std::make_shared<std::atomic<bool>>(false);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+        [armed](const char* stage){if(armed->load()&&std::strcmp(stage,"install-committed")==0)throw db_error("fixture late ACK installed checkpoint");},
+        [armed](const char* stage)->std::shared_ptr<void>{if(armed->load()&&std::strcmp(stage,"resume")==0)throw db_error("fixture late ACK installed checkpoint");return {};});
+    connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+    seed_local(1,510);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));ASSERT_EQ(held_uploads.size(),1u);
+    auto accepted=peers[0].setup.receive(held_uploads[0].raw);ASSERT_EQ(accepted.status_code(),1);EXPECT_EQ(accepted.take_ids(),ids);
+    armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),3);
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2 AND first_export IS NOT NULL AND ack_position IS NOT NULL"),1);
+    const auto canonical=[this]{auto value=snapshot();for(const auto* table:{"_lattice_receive_guard","_lattice_receive_guard_store","_lattice_replication_slots"})value[table]=receiver->db().query(std::string("SELECT * FROM ")+table);return value;};
+    const auto before=canonical();const auto delivery=receiver->db().query("SELECT * FROM _lattice_sync_state");ASSERT_EQ(delivery.size(),1u);
+    struct Observed {Snapshot state;synchronizer::sync_progress progress;std::atomic<bool> done{false};};auto observed=std::make_shared<Observed>();
+    synchronizers[0]->set_on_sync_complete([this,ids,canonical,observed](const auto& actual){if(actual!=ids||observed->done.load())return;observed->state=canonical();observed->progress=synchronizers[0]->get_progress();observed->done.store(true);});
+    legacy_ack(0,ids);ASSERT_TRUE(until([&]{return observed->done.load();}));EXPECT_EQ(observed->state,before);EXPECT_EQ(observed->progress.pending_upload,0);EXPECT_EQ(observed->progress.acked,1);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_sync_state"),delivery);EXPECT_EQ(phase(),3);
+    EXPECT_THROW(insert(*receiver,controller_uuid(511),"installed still closed"),db_error);
+    {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());for(const auto& error:errors)EXPECT_NE(error.find("fixture late ACK installed checkpoint"),std::string::npos);}
+}
+
+TEST_F(RecoveryReceiverController, LateClaimedAckAfterResumeDoesNotDowngradeSettledOriginal) {
+    configure();connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+    seed_local(1,520);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));ASSERT_EQ(held_uploads.size(),1u);
+    auto accepted=peers[0].setup.receive(held_uploads[0].raw);ASSERT_EQ(accepted.status_code(),1);EXPECT_EQ(accepted.take_ids(),ids);
+    request_recovery();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=2")==1;}));
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2 AND first_export IS NOT NULL AND ack_position IS NOT NULL"),1);
+    const auto canonical=[this]{auto value=snapshot();for(const auto* table:{"_lattice_receive_guard","_lattice_receive_guard_store","_lattice_replication_slots"})value[table]=receiver->db().query(std::string("SELECT * FROM ")+table);return value;};
+    const auto before=canonical();ASSERT_EQ(synchronizers[0]->get_progress().pending_upload,1);
+    struct Observed {Snapshot state;synchronizer::sync_progress progress;std::atomic<bool> done{false};};auto observed=std::make_shared<Observed>();
+    synchronizers[0]->set_on_sync_complete([this,ids,canonical,observed](const auto& actual){if(actual!=ids||observed->done.load())return;observed->state=canonical();observed->progress=synchronizers[0]->get_progress();observed->done.store(true);});
+    legacy_ack(0,ids);ASSERT_TRUE(until([&]{return observed->done.load();}));EXPECT_EQ(observed->state,before);EXPECT_EQ(observed->progress.pending_upload,0);EXPECT_EQ(observed->progress.acked,1);
+    EXPECT_EQ(held_originals(),ids);EXPECT_FALSE(has_error());
+}
+
+TEST_F(RecoveryReceiverController, RestrictedResendAckAfterRefreezePreservesExistingDeliveryMarkerAndUnknownHistory) {
+    configure();auto armed=std::make_shared<std::atomic<bool>>(false);auto saw_unknown=std::make_shared<std::atomic<bool>>(false);
+    const auto pause=std::make_shared<ControllerPause>();pauses.push_back(pause);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+        [armed,saw_unknown,pause](const char* stage){if(armed->load()&&std::strcmp(stage,"reconciliation-pending")==0&&!saw_unknown->exchange(true))pause->wait();},
+        [armed,saw_unknown](const char* stage)->std::shared_ptr<void>{if(armed->load()&&saw_unknown->load()&&std::strcmp(stage,"install")==0)throw db_error("fixture late restricted ACK refrozen checkpoint");return {};});
+    connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+    seed_local(1,530);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));ASSERT_EQ(held_uploads.size(),1u);
+    armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return pause->ready();}));ASSERT_EQ(phase(),2);
+    const auto frozen_attempt=scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity");
+    // The source really accepts only after the retained receipt pages said
+    // UNKNOWN. Queue its actual ACK, then release the worker; never wait for
+    // an ACK effect while this scheduler is held by the bounded test pause.
+    auto accepted=peers[0].setup.receive(held_uploads[0].raw);ASSERT_EQ(accepted.status_code(),1);EXPECT_EQ(accepted.take_ids(),ids);
+    legacy_ack(0,ids);pause->release();ASSERT_TRUE(until([&]{return held_originals().size()==2&&has_error();}));ASSERT_EQ(phase(),2);
+    EXPECT_EQ(held_originals(),(std::vector<std::string>{ids[0],ids[0]}));
+    EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),frozen_attempt+1);
+    ASSERT_EQ(synchronizers[0]->get_progress().pending_upload,1);ASSERT_EQ(synchronizers[0]->get_progress().acked,1);
+    const auto delivery=receiver->db().query("SELECT * FROM _lattice_sync_state");ASSERT_EQ(delivery.size(),1u);ASSERT_EQ(std::get<int64_t>(delivery[0].at("is_synchronized")),1);
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NOT NULL AND ack_position IS NULL"),1);
+    auto repeated=peers[0].setup.receive(held_uploads[1].raw);ASSERT_EQ(repeated.status_code(),1);EXPECT_EQ(repeated.take_ids(),ids);
+    const auto canonical=[this]{auto value=snapshot();for(const auto* table:{"_lattice_receive_guard","_lattice_receive_guard_store","_lattice_replication_slots"})value[table]=receiver->db().query(std::string("SELECT * FROM ")+table);return value;};
+    const auto before=canonical();
+    struct Observed {Snapshot state;synchronizer::sync_progress progress;std::atomic<bool> done{false};};auto observed=std::make_shared<Observed>();
+    synchronizers[0]->set_on_sync_complete([this,ids,canonical,observed](const auto& actual){if(actual!=ids||observed->done.load())return;observed->state=canonical();observed->progress=synchronizers[0]->get_progress();observed->done.store(true);});
+    legacy_ack(0,ids);ASSERT_TRUE(until([&]{return observed->done.load();}));EXPECT_EQ(observed->state,before);EXPECT_EQ(observed->progress.pending_upload,0);EXPECT_EQ(observed->progress.acked,2);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_sync_state"),delivery);
+    EXPECT_THROW(insert(*receiver,controller_uuid(531),"refrozen remains closed"),db_error);
+    {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());for(const auto& error:errors)EXPECT_NE(error.find("fixture late restricted ACK refrozen checkpoint"),std::string::npos);}
+}
+
 }
 #endif

@@ -322,6 +322,7 @@ void recovery_receiver_controller::turn() {
     {std::lock_guard lock(runtime.mutex);runtime.scheduled=false;if(runtime.running)return;runtime.running=true;}
     struct settlement {recovery_receiver_controller::state& value;std::function<void()> after;
         ~settlement(){{std::lock_guard lock(value.mutex);value.running=false;}if(after)try{after();}catch(...) {}}} settle{runtime,{}};
+    std::weak_ptr<lattice_db> observed_owner;
     try {
         struct connected {
             std::shared_ptr<recovery_receiver_route> route;
@@ -351,6 +352,7 @@ void recovery_receiver_controller::turn() {
         }
         if(connected_routes.size()!=runtime.policy.contributions.size())return;
         auto owner=connected_routes.begin()->second.route->state_->owner.lock();if(!owner||owner->is_closed())return;
+        observed_owner=owner;
         std::string common_domain;
         for(const auto& [channel,c]:connected_routes) {
             const auto key=domain(c.description);if(common_domain.empty())common_domain=key;
@@ -660,6 +662,11 @@ void recovery_receiver_controller::turn() {
         const auto error=std::current_exception();std::shared_ptr<state::pending> released;
         bool awaiting_delivery=false,retry_arrived=false;
         try{std::rethrow_exception(error);}catch(const delivery_retry_wait&){awaiting_delivery=true;}catch(...){}
+        // Observation only: the typed UNKNOWN wait has left its SQL and leaf
+        // scopes. A real timer can now race the catch's counter recheck.
+        if(awaiting_delivery)try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&
+            runtime.probe->owner==owner.get()&&runtime.probe->observed)
+                runtime.probe->observed("delivery-retry-wait-before-latch");}catch(...){}
         {std::lock_guard lock(runtime.mutex);
             // The actual timer may arrive after the UNKNOWN decision unlocks
             // but before this catch stores its wait. Preserve that admitted

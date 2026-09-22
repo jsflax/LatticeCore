@@ -1230,5 +1230,198 @@ TEST_F(RecoveryDeliveryTimeout, ThrowingActualRestrictedSendLaunchesNoWorkerAndC
     EXPECT_EQ(held_uploads.size(),1u);EXPECT_EQ(originals(),sent_ids);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL AND stage=0"),1);expect_failed_drain();
 }
+
+
+// Composed delivery regressions use the actual admitted owner, mounted source,
+// controller descriptor and physical route. The manual lane places the COMMIT
+// restriction on the same thread that executes the real ACK FIFO unit.
+class RecoveryComposedDelivery : public RecoveryRestrictedFirstClaim {
+protected:
+    std::shared_ptr<DeliveryTimeoutEvents> events=std::make_shared<DeliveryTimeoutEvents>();
+    std::vector<std::shared_ptr<DeliveryTimeoutGate>> gates;
+    std::vector<std::string> ids;
+    std::shared_ptr<DeliveryTimeoutGate> gate(){auto value=std::make_shared<DeliveryTimeoutGate>();gates.push_back(value);return value;}
+    Snapshot source_snapshot(){Snapshot value;
+        const auto tables=source->db().query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+        if(tables.size()>128)throw db_error("composed fixture source table bound");
+        for(const auto& row:tables){const auto& name=std::get<std::string>(row.at("name"));
+            if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';}))
+                throw db_error("composed fixture source table identity");
+            value[name]=source->db().query("SELECT * FROM \""+name+"\"");}
+        value["sqlite_schema"]=source->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");return value;
+    }
+    void start_frozen(){
+        configure(1,false);open_manual_receiver();
+        events->ordinary->first=gate();events->restricted->first=gate();events->restricted->following=gate();
+        const auto captured=events;
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[captured](const char* stage){
+            if(std::strcmp(stage,"install-committed")==0)detail::sync_background_test_hooks::ack=captured->ordinary->hooks();
+            if(std::strcmp(stage,"reconciliation-pending")==0){++captured->pending;detail::sync_background_test_hooks::ack=captured->restricted->hooks();}
+            if(std::strcmp(stage,"delivery-retry-admitted")==0)++captured->admitted;
+        });
+        connect();ASSERT_TRUE(drive([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+        auto configured=std::make_shared<std::atomic<bool>>(false);
+        manual->invoke([this,configured]{detail::recovery_receiver_cohort_test_access::next_ack_timeout(*synchronizers[0]);configured->store(true);});
+        ASSERT_TRUE(drive([&]{return configured->load();}));
+        seed_local(1,820);ids=originals();ASSERT_EQ(ids.size(),1u);
+        ASSERT_TRUE(drive([&]{return held_originals()==ids&&events->ordinary->started.load()==1;}));
+        legacy_ack(0,ids);
+        ASSERT_TRUE(drive([&]{return held_uploads.size()==2&&events->restricted->started.load()==1;}));
+        events->ordinary->first->release();ASSERT_TRUE(observe([&]{return events->ordinary->completed.load()==1;}));
+        ASSERT_TRUE(drive([&]{return phase()==2&&has_error();}));
+        {std::lock_guard lock(errors_mutex);ASSERT_EQ(errors.size(),1u);ASSERT_NE(errors[0].find("UNKNOWN persisted after one restricted pass"),std::string::npos);}
+        ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+        ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NOT NULL AND ack_position IS NULL"),1);
+        ASSERT_EQ(synchronizers[0]->get_progress().pending_upload,1);ASSERT_EQ(synchronizers[0]->get_progress().acked,1);
+    }
+    void TearDown()override{
+        for(const auto& value:gates)value->release();
+        RecoveryRestrictedFirstClaim::TearDown();
+        EXPECT_TRUE(observe([&]{return events->ordinary->started.load()==events->ordinary->completed.load()&&events->restricted->started.load()==events->restricted->completed.load();}));
+        for(const auto& value:gates)EXPECT_FALSE(value->timedOut());
+    }
+};
+TEST_F(RecoveryComposedDelivery, RestrictedLateAckWhileFrozenRetiresExactTimerWithoutCanonicalSettlement) {
+    start_frozen();ASSERT_FALSE(HasFatalFailure());
+    auto accepted=peers[0].setup.receive(held_uploads[1].raw);ASSERT_EQ(accepted.status_code(),1);ASSERT_EQ(accepted.take_ids(),ids);
+    ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),1);
+    const auto before=snapshot(),canonical=source_snapshot();const auto original_claims=claims();
+    const auto delivery=receiver->db().query("SELECT * FROM _lattice_sync_state");
+    const auto token=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]);ASSERT_NE(token,0u);
+    const auto progress=synchronizers[0]->get_progress();
+    auto completed=std::make_shared<std::atomic<unsigned>>(0);
+    synchronizers[0]->set_on_sync_complete([completed,expected=ids](const auto& actual){EXPECT_EQ(actual,expected);++*completed;});
+    legacy_ack(0,ids);ASSERT_TRUE(drive([&]{return completed->load()==1;}));
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(source_snapshot(),canonical);EXPECT_EQ(claims(),original_claims);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_sync_state"),delivery);
+    EXPECT_EQ(detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]),0u);
+    const auto after=synchronizers[0]->get_progress();EXPECT_EQ(after.pending_upload,0);EXPECT_EQ(after.acked,progress.acked+1);
+    EXPECT_EQ(after.total_upload,progress.total_upload);EXPECT_EQ(after.received,progress.received);EXPECT_EQ(after.sync_id,progress.sync_id);
+    // No queue drive or external request can create a substitute retry. Release
+    // the old real worker only after its actual ACK removed this registration.
+    events->restricted->first->release();ASSERT_TRUE(observe([&]{return events->restricted->completed.load()==1;}));
+    EXPECT_EQ(events->restricted->transitioned.load(),0u);EXPECT_EQ(events->admitted.load(),0u);
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(source_snapshot(),canonical);EXPECT_EQ(held_uploads.size(),2u);EXPECT_EQ(phase(),2);
+    EXPECT_EQ(completed->load(),1u);EXPECT_EQ(originals(),ids);
+}
+TEST_F(RecoveryComposedDelivery, RestrictedLateAckCommitDenialPreservesActualTokenProgressAndAllDurableState) {
+    start_frozen();ASSERT_FALSE(HasFatalFailure());
+    auto accepted=peers[0].setup.receive(held_uploads[1].raw);ASSERT_EQ(accepted.status_code(),1);ASSERT_EQ(accepted.take_ids(),ids);
+    ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),1);
+    const auto before=snapshot(),canonical=source_snapshot();const auto original_claims=claims();
+    const auto delivery=receiver->db().query("SELECT * FROM _lattice_sync_state");
+    const auto token=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]);ASSERT_NE(token,0u);
+    const auto progress=synchronizers[0]->get_progress();size_t prior_errors;{std::lock_guard lock(errors_mutex);prior_errors=errors.size();}
+    auto completed=std::make_shared<std::atomic<unsigned>>(0);synchronizers[0]->set_on_sync_complete([completed](const auto&){++*completed;});
+    std::atomic<unsigned> denied{0};legacy_ack(0,ids);
+    {
+        ControllerCommitFault fault(receiver.get(),denied);
+        ASSERT_TRUE(drive([&]{std::lock_guard lock(errors_mutex);return denied.load()==1&&errors.size()>prior_errors;}));
+    }
+    EXPECT_EQ(denied.load(),1u);EXPECT_EQ(completed->load(),0u);EXPECT_EQ(snapshot(),before);EXPECT_EQ(source_snapshot(),canonical);
+    EXPECT_EQ(claims(),original_claims);EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_sync_state"),delivery);
+    EXPECT_EQ(detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]),token);
+    const auto after=synchronizers[0]->get_progress();EXPECT_EQ(after.pending_upload,progress.pending_upload);EXPECT_EQ(after.total_upload,progress.total_upload);
+    EXPECT_EQ(after.acked,progress.acked);EXPECT_EQ(after.received,progress.received);EXPECT_EQ(after.sync_id,progress.sync_id);
+    EXPECT_EQ(events->restricted->completed.load(),0u);EXPECT_EQ(events->restricted->transitioned.load(),0u);EXPECT_EQ(events->admitted.load(),0u);
+    EXPECT_EQ(held_uploads.size(),2u);EXPECT_EQ(originals(),ids);EXPECT_EQ(phase(),2);
+}
+TEST_F(RecoveryDeliveryTimeout, ActualExpiryBetweenUnknownThrowAndCatchPreservesDemandAndOriginalFailure) {
+    const auto caught=gate(),next_caught=gate();auto waits=std::make_shared<std::atomic<unsigned>>(0);
+    events->observed=[caught,next_caught,waits](const char* stage){if(std::strcmp(stage,"delivery-retry-wait-before-latch")!=0)return;
+        const auto n=waits->fetch_add(1);if(n==0){caught->wait();throw db_error("observation must not replace typed UNKNOWN wait");}if(n==1)next_caught->wait();};
+    start();ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return caught->arrived.load()==1;}));ASSERT_EQ(phase(),2);ASSERT_FALSE(has_error());
+    const auto before=snapshot();const auto raw=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    events->restricted->first->release();ASSERT_TRUE(until([&]{return events->admitted.load()==1&&events->restricted->completed.load()==1;}));
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(held_uploads.size(),2u);EXPECT_FALSE(has_error());
+    caught->release();
+    ASSERT_TRUE(until([&]{return held_uploads.size()==3&&events->restricted->started.load()==2&&next_caught->arrived.load()==1;}));
+    EXPECT_EQ(events->admitted.load(),1u);EXPECT_FALSE(has_error());EXPECT_EQ(waits->load(),2u);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),raw);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+    EXPECT_EQ(held_originals(),(std::vector<std::string>{sent_ids[0],sent_ids[0],sent_ids[0]}));
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+    next_caught->release();ASSERT_TRUE(until([&]{return error_contains("UNKNOWN persisted after one restricted pass");}));
+    EXPECT_FALSE(error_contains("observation must not replace"));
+}
+TEST_F(RecoveryDeliveryTimeout, PhaseFourReconstructionPreservesPreviouslyAdmittedRetryForFreshUnknown) {
+    struct Observed {std::atomic<unsigned> denied{0},refreezes{0},phase4{0};};auto state=std::make_shared<Observed>();
+    events->scope=[this,state](const char* stage)->std::shared_ptr<void>{
+        if(std::strcmp(stage,"reconcile-refreeze")==0&&state->refreezes.fetch_add(1)==0)
+            return std::make_shared<ControllerCommitFault>(receiver.get(),state->denied);
+        return {};
+    };
+    events->observed=[this,state](const char* stage){if(std::strcmp(stage,"reconciliation-pending")==0&&phase()==4)++state->phase4;};
+    start();ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return state->denied.load()==1&&has_error();}));ASSERT_EQ(phase(),4);
+    const auto raw=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    events->restricted->first->release();ASSERT_TRUE(until([&]{return events->admitted.load()==1&&events->restricted->completed.load()==1;}));
+    ASSERT_EQ(phase(),4);ASSERT_EQ(held_uploads.size(),2u);
+    const auto attempt=scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity");
+    // This one real request replaces the failed descriptor. Reconstruction
+    // consumes external demand and sends once. The next fresh UNKNOWN can
+    // cancel back to phase4 only using the already-admitted timer revision.
+    // Its ID is still in flight, so no third restricted handoff is permitted.
+    request_recovery();
+    ASSERT_TRUE(until([&]{return state->phase4.load()==3&&phase()==4&&held_uploads.size()==3&&events->restricted->started.load()==2;}));
+    EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),attempt+1);
+    EXPECT_EQ(state->denied.load(),1u);EXPECT_EQ(events->admitted.load(),1u);
+    EXPECT_EQ(events->restricted->completed.load(),1u);EXPECT_EQ(synchronizers[0]->get_progress().pending_upload,1);
+    EXPECT_NE(detail::recovery_delivery_registration_test_access::token(*synchronizers[0],sent_ids[0]),0u);
+    EXPECT_EQ(held_originals(),(std::vector<std::string>{sent_ids[0],sent_ids[0],sent_ids[0]}));
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),raw);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+}
+
+TEST_F(RecoveryComposedDelivery, StaleParkedRestrictedFrameKeepsCohortUntilActualDisposalWithoutTimerOrError) {
+    configure(1,false);open_manual_receiver();events->ordinary->first=gate();events->restricted->first=gate();
+    auto captures=std::make_shared<std::atomic<unsigned>>(0),waiting=std::make_shared<std::atomic<unsigned>>(0),phase4=std::make_shared<std::atomic<unsigned>>(0);
+    auto park=std::make_shared<std::atomic<bool>>(true);const auto captured=events;
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this,captured,captures,waiting,phase4,park](const char* stage){
+        if(std::strcmp(stage,"install-committed")==0)detail::sync_background_test_hooks::ack=captured->ordinary->hooks();
+        if(std::strcmp(stage,"cohort-reserved")==0)++*captures;
+        if(std::strcmp(stage,"cohort-retained")==0)++*waiting;
+        if(std::strcmp(stage,"delivery-retry-admitted")==0)++captured->admitted;
+        if(std::strcmp(stage,"reconciliation-pending")==0){
+            detail::sync_background_test_hooks::ack=captured->restricted->hooks();
+            if(phase()==4){++*phase4;
+                first_claim_committed_action=[this,park]{if(park->exchange(false)){committed_snapshot=snapshot();writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);}};
+                detail::recovery_export_test_hooks::after_claim_commit=first_claim_committed;
+            }
+        }
+    });
+    connect();ASSERT_TRUE(drive([&]{return phase()==0;}));
+    auto configured=std::make_shared<std::atomic<bool>>(false);
+    manual->invoke([this,configured]{detail::recovery_receiver_cohort_test_access::next_ack_timeout(*synchronizers[0]);configured->store(true);});
+    ASSERT_TRUE(drive([&]{return configured->load();}));seed_local(1,830);ids=originals();ASSERT_EQ(ids.size(),1u);
+    ASSERT_TRUE(drive([&]{return held_originals()==ids&&events->ordinary->started.load()==1;}));legacy_ack(0,ids);
+    std::shared_ptr<detail::sync_discovery_operation> retained;
+    ASSERT_TRUE(drive([&]{retained=detail::recovery_receiver_cohort_test_access::retained_busy(*synchronizers[0]);return bool(retained);}));
+    ASSERT_TRUE(writer_hold);ASSERT_FALSE(committed_snapshot.empty());ASSERT_EQ(phase4->load(),1u);
+    const auto count=captures->load();const auto token=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]);ASSERT_NE(token,0u);
+    events->ordinary->first->release();ASSERT_TRUE(observe([&]{return events->ordinary->completed.load()==1;}));
+    // Retire this real descriptor while its committed frame is parked. No
+    // factory creates a replacement frame, grant or timeout callback here.
+    request_recovery();ASSERT_TRUE(drive([&]{return waiting->load()>0;}));EXPECT_EQ(captures->load(),count);
+    writer_hold->release();EXPECT_FALSE(writer_hold->timed_out);writer_hold.reset();
+    ASSERT_TRUE(drive([&]{return !detail::recovery_receiver_cohort_test_access::retained_busy(*synchronizers[0])&&
+        detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0])==0;}));
+    EXPECT_FALSE(has_error());EXPECT_EQ(events->restricted->started.load(),0u);EXPECT_EQ(events->admitted.load(),0u);
+    EXPECT_EQ(synchronizers[0]->get_progress().pending_upload,0);EXPECT_EQ(held_uploads.size(),1u);
+    EXPECT_EQ(snapshot(),committed_snapshot);EXPECT_EQ(captures->load(),count);EXPECT_EQ(phase4->load(),1u);
+    const auto original_claims=claims();const auto raw=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    // The queue released its ownership. This actual retained operation is the
+    // final frame custodian: only dropping it permits a replacement cohort.
+    retained.reset();
+    ASSERT_TRUE(drive([&]{return phase4->load()==2&&held_uploads.size()==2&&events->restricted->started.load()==1;}));
+    EXPECT_GT(captures->load(),count);EXPECT_FALSE(has_error());EXPECT_EQ(events->admitted.load(),0u);
+    EXPECT_EQ(claims(),original_claims);EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),raw);
+    EXPECT_EQ(held_originals(),(std::vector<std::string>{ids[0],ids[0]}));
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+}
 }
 #endif

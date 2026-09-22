@@ -1,6 +1,7 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
 #include "RetentionCustodyPhaseDiagnostics.hpp"
+#include "RetentionCustodyObservation.hpp"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include "../../Sources/LatticeCore/src/sync_recovery_values.hpp"
 #include <chrono>
@@ -249,6 +250,9 @@ TEST_F(CanonicalTransferRetention, DetectedMainPathMovementRefusesBeforeRegistry
     retention_fixture_diagnostics::phases diagnostics("CanonicalTransferRetention.DetectedMainPathMovementRefusesBeforeRegistryMutation");
     diagnostics.call("initial-owner-attach",[&]{attach();});
     auto ticket=diagnostics.call("initial-owner-reserve",[&]{return reserve();});TempDB moved{"canonical-retention-moved"};
+    const auto before=diagnostics.call("initial-retained-rows",[&]{return retention_fixture_observation::read(owner->db());});
+    const auto physical=diagnostics.call("initial-file-binding",[&]{return retention_fixture_observation::physical_binding::capture(file.path);});
+    {
     diagnostics.call("rename-main-to-moved",[&]{std::filesystem::rename(file.path,moved.path);});
     auto restoration=diagnostics.restored("restore-main-name");
     struct restore {
@@ -258,7 +262,13 @@ TEST_F(CanonicalTransferRetention, DetectedMainPathMovementRefusesBeforeRegistry
     const auto result=diagnostics.call("owner-reserve-under-main-movement",[&]{return adapter->reserve_recovery_owned(owner,{},10000);});
     diagnostics.settlement("owner-reserve-under-main-movement",result.settlement);
     EXPECT_NE(result.settlement.state,phase::committed);EXPECT_FALSE(result.reservation);
-    EXPECT_EQ(diagnostics.call("owner-attempt-count-under-main-movement",[&]{return count();}),1);
+    }
+    // The refusal is still observed under the moved pathname. Only restore and
+    // identity checks occur before comparing the full registry through a fresh
+    // READONLY connection; no canonical reattachment can erase stale attempts.
+    diagnostics.call("verify-restored-file-binding",[&]{physical.require_restored();});
+    const auto observed=diagnostics.call("fresh-retained-rows-after-restore",[&]{return retention_fixture_observation::fresh_read(physical);});
+    EXPECT_EQ(observed.profile,before.profile);EXPECT_EQ(observed.attempts,before.attempts);EXPECT_EQ(observed.attempts.size(),1u);
 }
 TEST_F(CanonicalTransferRetention, ExactReopenRejectsMissingAlteredAndExtraPersistentGuards) {
     for(int mode=0;mode!=3;++mode) {

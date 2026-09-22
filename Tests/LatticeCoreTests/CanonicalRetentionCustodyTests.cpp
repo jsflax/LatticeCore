@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "RetentionCustodyPhaseDiagnostics.hpp"
+#include "RetentionCustodyObservation.hpp"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include <chrono>
 #include <cerrno>
@@ -128,8 +129,10 @@ TEST_F(CanonicalRetentionCustody, MissingReplacedSymlinkAndRegularArtifactRefuse
     const auto path=diagnostics.call("initial-custody-path",[&]{return custody_path(*owner);});const auto saved=path.string()+".saved";
     const auto profile=diagnostics.call("initial-owner-profile-query",[&]{return owner->db().query("SELECT * FROM _lattice_canonical_retention");}),
         attempts=diagnostics.call("initial-owner-attempts-query",[&]{return owner->db().query("SELECT * FROM _lattice_canonical_attempt");});
+    const auto physical=diagnostics.call("initial-file-binding",[&]{return retention_fixture_observation::physical_binding::capture(file.path);});
     for(int mode=0;mode<4;++mode) {
         diagnostics.mode(mode==0?"0-missing":mode==1?"1-replaced-directory":mode==2?"2-symlink":"3-main-hardlink");
+        {
         diagnostics.call("rename-custody-to-saved",[&]{std::filesystem::rename(path,saved);});
         auto restoration=diagnostics.restored("restore-custody-name");RestoreName restore{saved,path};
         if(mode==1){ASSERT_EQ(diagnostics.call("create-replacement-directory",[&]{return mkdir(path.c_str(),0700);}),0);}
@@ -139,11 +142,24 @@ TEST_F(CanonicalRetentionCustody, MissingReplacedSymlinkAndRegularArtifactRefuse
         if(mode==3)diagnostics.call("create-custody-main-hardlink",[&]{std::filesystem::create_hard_link(file.path,path);});
         EXPECT_NE(diagnostics.call("owner-expire-under-fault",[&]{auto result=adapter->expire_recovery_owned(owner);diagnostics.settlement("owner-expire-under-fault",result);return result;}).state,phase::committed);
         EXPECT_THROW(diagnostics.call("sibling-attach-under-fault",[&]{return canonical_writer_adapter::attach_retention_for_qualification(sibling,p,limits);}),db_error);
-        EXPECT_EQ(diagnostics.call("sibling-profile-query-under-fault",[&]{return sibling->db().query("SELECT * FROM _lattice_canonical_retention");}),profile);
-        EXPECT_EQ(diagnostics.call("sibling-attempts-query-under-fault",[&]{return sibling->db().query("SELECT * FROM _lattice_canonical_attempt");}),attempts);
+        if(mode!=3) {
+            EXPECT_EQ(diagnostics.call("sibling-profile-query-under-fault",[&]{return sibling->db().query("SELECT * FROM _lattice_canonical_retention");}),profile);
+            EXPECT_EQ(diagnostics.call("sibling-attempts-query-under-fault",[&]{return sibling->db().query("SELECT * FROM _lattice_canonical_attempt");}),attempts);
+        }
+        }
+        diagnostics.call("verify-restored-file-binding",[&]{physical.require_restored();});
+        if(mode==3) {
+            // CI038 recorded the old sibling's read failing after the hardlink
+            // on macOS. Only filesystem restoration intervenes before this fresh
+            // WAL-aware observation; the original owner/custody remain alive.
+            const auto observed=diagnostics.call("fresh-retained-rows-after-restore",[&]{return retention_fixture_observation::fresh_read(physical);});
+            EXPECT_EQ(observed.profile,profile);EXPECT_EQ(observed.attempts,attempts);
+        }
     }
     diagnostics.mode("final");
     diagnostics.call("final-adapter-reset",[&]{adapter.reset();});
+    diagnostics.call("final-old-owners-reset",[&]{owner.reset();sibling.reset();});
+    diagnostics.call("final-fresh-owner-open",[&]{owner=custody_owner(file.str());});
     diagnostics.call("final-owner-reattach",[&]{attach();});
     EXPECT_EQ(diagnostics.call("final-owner-incarnation-query",[&]{return number(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention");}),2);
 }
@@ -165,6 +181,8 @@ TEST_F(CanonicalRetentionCustody, MalformedDirectoryModeAndMainHardlinkRefuseBef
     const auto path=diagnostics.call("initial-custody-path",[&]{return custody_path(*owner);});
     diagnostics.call("initial-adapter-reset",[&]{adapter.reset();});
     const auto before=diagnostics.call("initial-sibling-profile-query",[&]{return sibling->db().query("SELECT * FROM _lattice_canonical_retention");});
+    const auto attempts=diagnostics.call("initial-sibling-attempts-query",[&]{return sibling->db().query("SELECT * FROM _lattice_canonical_attempt");});
+    const auto physical=diagnostics.call("initial-file-binding",[&]{return retention_fixture_observation::physical_binding::capture(file.path);});
     ASSERT_EQ(diagnostics.call("chmod-custody-0755",[&]{return chmod(path.c_str(),0755);}),0);
     EXPECT_THROW(diagnostics.call("owner-attach-under-mode-fault",[&]{attach();}),db_error);
     ASSERT_EQ(diagnostics.call("restore-custody-mode-0700",[&]{return chmod(path.c_str(),0700);}),0);
@@ -172,8 +190,13 @@ TEST_F(CanonicalRetentionCustody, MalformedDirectoryModeAndMainHardlinkRefuseBef
     diagnostics.call("create-main-alias",[&]{std::filesystem::create_hard_link(file.path,alias);});
     EXPECT_THROW(diagnostics.call("owner-attach-under-main-alias",[&]{attach();}),db_error);
     diagnostics.call("remove-main-alias",[&]{std::filesystem::remove(alias);});
-    EXPECT_EQ(diagnostics.call("sibling-profile-query-after-restore",[&]{return sibling->db().query("SELECT * FROM _lattice_canonical_retention");}),before);
-    EXPECT_EQ(diagnostics.call("sibling-attempt-count-after-restore",[&]{return number(sibling->db(),"SELECT COUNT(*) FROM _lattice_canonical_attempt");}),1);
+    // The old sibling failed even after alias removal in CI038. Compare all
+    // original rows through a new read-only connection before any owner opens.
+    diagnostics.call("verify-restored-file-binding",[&]{physical.require_restored();});
+    const auto observed=diagnostics.call("fresh-retained-rows-after-restore",[&]{return retention_fixture_observation::fresh_read(physical);});
+    EXPECT_EQ(observed.profile,before);EXPECT_EQ(observed.attempts,attempts);EXPECT_EQ(observed.attempts.size(),1u);
+    diagnostics.call("final-old-owners-reset",[&]{owner.reset();sibling.reset();});
+    diagnostics.call("final-fresh-owner-open",[&]{owner=custody_owner(file.str());});
     diagnostics.call("final-owner-reattach",[&]{attach();});
     EXPECT_EQ(diagnostics.call("final-owner-incarnation-query",[&]{return number(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention");}),2);
 }

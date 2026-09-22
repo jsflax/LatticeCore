@@ -12,7 +12,12 @@ namespace lattice::detail {
 namespace sync_background_test_hooks {
 // Private bounded rendezvous copied at worker creation. Production is null.
 // Callbacks may only coordinate a test; completion must not throw.
-struct ack_schedule {std::function<void()> before_expiry,completed;};
+struct ack_schedule {
+    std::function<void()> before_expiry,completed;
+    // After timeout bookkeeping, before scheduling retry; no owner/ACK,
+    // in-flight, receiver, endpoint or SQL lock is held during this hook.
+    std::function<void()> after_timeout_transition;
+};
 extern thread_local std::shared_ptr<const ack_schedule> ack;
 // Source fixture rendezvous immediately before the late no-effect probe.
 extern thread_local std::function<void()> before_late_discovery;

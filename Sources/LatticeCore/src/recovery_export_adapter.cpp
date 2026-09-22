@@ -1,4 +1,5 @@
 #include "recovery_export_adapter.hpp"
+#include "recovery_receiver_source.hpp"
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -15,6 +16,7 @@ thread_local void (*after_claim_commit)()=nullptr;
 }
 namespace {
 [[noreturn]] void refuse(const char* message){throw db_error(message);}
+struct export_capacity_error : db_error {using db_error::db_error;};
 struct statement {
     sqlite3_stmt* p=nullptr;
     statement(sqlite3* db,const std::string& sql){
@@ -32,7 +34,7 @@ struct statement {
 };
 struct budget {
     const recovery_export_limits& limits;size_t used=0;
-    void charge(size_t n){if(n>limits.field_bytes||n>limits.raw_bytes-used)refuse("export raw byte budget exceeded before copy");used+=n;}
+    void charge(size_t n){if(n>limits.field_bytes||n>limits.raw_bytes-used)throw export_capacity_error("export raw byte budget exceeded before copy");used+=n;}
 };
 int64_t integer(statement& s,int at){if(sqlite3_column_type(s.p,at)!=SQLITE_INTEGER)refuse("export expected INTEGER");return sqlite3_column_int64(s.p,at);}
 std::string text(statement& s,int at,budget& b){
@@ -140,7 +142,7 @@ void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_tab
     }
 }
 size_t wire_bound(const audit_log_entry& e,size_t cap){
-    size_t n=512;auto add=[&](size_t bytes,size_t multiplier=1){if(n>cap||bytes>(cap-n)/multiplier)refuse("export wire budget exceeded before serialization");n+=bytes*multiplier;};
+    size_t n=512;auto add=[&](size_t bytes,size_t multiplier=1){if(n>cap||bytes>(cap-n)/multiplier)throw export_capacity_error("export wire budget exceeded before serialization");n+=bytes*multiplier;};
     for(const auto* s:{&e.global_id,&e.table_name,&e.operation,&e.global_row_id,&e.timestamp})add(s->size(),6);
     for(const auto& name:e.changed_fields_names){add(name.size(),6);add(4);}
     for(const auto& [name,p]:e.changed_fields){add(name.size(),6);add(80);
@@ -352,6 +354,7 @@ committed_export_frame::committed_export_frame(committed_export_frame&& other) n
 committed_export_frame& committed_export_frame::operator=(committed_export_frame&& other) noexcept {
     if(this==&other)return *this;
     continuous_work_=std::move(other.continuous_work_);
+    upload_view_=std::move(other.upload_view_);
     owner_=std::move(other.owner_);claims_=std::move(other.claims_);scopes_=std::move(other.scopes_);
     limits_=other.limits_;entries_=std::move(other.entries_);message_=std::move(other.message_);
     physical_generation_=std::exchange(other.physical_generation_,0);
@@ -373,9 +376,10 @@ std::optional<bool> recovery_export_adapter::try_protected_store(std::shared_ptr
 }
 std::optional<recovery_export_preparation> recovery_export_adapter::prepare_for_route(std::shared_ptr<lattice_db> owner,
     const std::shared_ptr<recovery_continuous_route>& route,const std::string& channel,uint64_t generation,size_t count,
-    const std::vector<int64_t>& in_flight,bool filtered,bool* discovery_busy){
+    const std::vector<int64_t>& in_flight,bool filtered,bool* discovery_busy,std::shared_ptr<const receiver_upload_view> upload_view){
+    if(upload_view){if(!upload_view->current())refuse("negotiated export source revoked before selection");count=std::min(count,upload_view->entries_);}
     auto work=recovery_continuous_producer::admit_work(route,owner,generation);
-    bool busy=false;auto prepared=prepare(std::move(owner),channel,generation,count,in_flight,filtered,{},std::nullopt,discovery_busy?&busy:nullptr,false,std::move(work));
+    bool busy=false;auto prepared=prepare(std::move(owner),channel,generation,count,in_flight,filtered,{},std::nullopt,discovery_busy?&busy:nullptr,false,std::move(work),std::move(upload_view));
     if(busy){*discovery_busy=true;return std::nullopt;}return prepared;
 }
 std::optional<recovery_export_preparation> recovery_export_adapter::try_prepare_pending(std::shared_ptr<lattice_db> owner,
@@ -402,7 +406,8 @@ recovery_export_preparation recovery_export_adapter::prepare_retained_page(std::
 }
 recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits,
-    std::optional<int64_t> history_after,bool* discovery_busy,bool retained_delete_page,std::shared_ptr<recovery_continuous_work> work){
+    std::optional<int64_t> history_after,bool* discovery_busy,bool retained_delete_page,std::shared_ptr<recovery_continuous_work> work,
+    std::shared_ptr<const receiver_upload_view> upload_view){
     recovery_export_preparation output;
     // Catch only this first no-effect classifier. A busy exception arising
     // later from reentrant work must never replay a claim or mutation stage.
@@ -411,8 +416,9 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         if(!discovery_busy)throw;
         *discovery_busy=true;return output;
     }
-    committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;frame.continuous_work_=std::move(work);
+    committed_export_frame frame;frame.owner_=owner;frame.physical_generation_=generation;frame.continuous_work_=std::move(work);frame.upload_view_=std::move(upload_view);
     const auto result=recovery_continuous_producer::export_owned(owner,frame.continuous_work_,[&](database& writer){
+        if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked before owned selection");
         auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);if(inventory.scopes.empty())return;
         limits_ok(limits,count,in_flight);if(!history_after&&(sync_id.empty()||sync_id.size()>4096))refuse("export invalid route channel");
         output.protected_store=true;if(filtered)refuse("protected export refuses legacy filter synthesis");
@@ -421,6 +427,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         auto* db=recovery_writer_access::active_handle(*owner,writer);
         recovery_obligation_store journal(owner,inventory.limits.obligations,inventory.limits.installations);
         const bool continuous_page=inventory.continuous&&static_cast<bool>(frame.continuous_work_);
+        if(frame.upload_view_&&(!continuous_page||history_after||retained_delete_page))refuse("negotiated export requires actual continuous pending route");
         std::vector<int64_t> pending,ids;
         if(history_after)ids=history_page(db,*history_after,count);
         else if(continuous_page)ids=continuous_pending_page(db,sync_id,inventory,journal,count,in_flight);
@@ -435,6 +442,45 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         // operation text alone or unselected DELETE is generated evidence.
         std::vector<const recovery_local_export_table*> tables;
         std::vector<std::vector<size_t>> scope_indexes;
+        std::string encoded="{\"auditLog\":[";
+        if(frame.upload_view_) {
+            std::vector<int64_t> selected;size_t deletes=0;
+            // Process only the fitting ordered prefix. A later local byte cap
+            // cannot consume the earlier prefix's opportunity to progress.
+            // Whole final envelopes use the mounted parser's event semantics;
+            // work is bounded by the local page cap and remote count clamp.
+            for(const auto id:ids) {
+                std::string reason;
+                try {
+                    auto row=read_audit(db,id,raw);const recovery_local_export_table* table=nullptr;std::vector<size_t> matches;
+                    for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& t:inventory.scopes[i].tables)if(t.name==row.entry.table_name){
+                        if(table&&(table->columns!=t.columns||table->no_history!=t.no_history||table->regular_link!=t.regular_link))refuse("export ambiguous contribution table");
+                        table=&t;matches.push_back(i);
+                    }
+                    if(!table)refuse("export original has no admitted whole-model contribution");
+                    for(const auto i:matches)history_original(db,inventory,inventory.scopes[i],journal,row.entry);
+                    // Ordinary uploads retain their missing NoHistory refusal;
+                    // no later DELETE outside this fitted prefix is evidence.
+                    decode_generated(db,row,*table,raw,false);wire_bound(row.entry,limits.wire_bytes);
+                    const auto json=row.entry.to_json();
+                    const size_t overhead=encoded.size()+(!frame.entries_.empty()?1:0)+2;
+                    if(overhead>frame.upload_view_->wire_||json.size()>frame.upload_view_->wire_-overhead)reason="wire bytes";
+                    else {
+                        auto candidate=encoded;if(!frame.entries_.empty())candidate+=',';candidate+=json;candidate+="]}";
+                        const size_t next_deletes=deletes+(row.entry.operation=="DELETE");
+                        if(frame.upload_view_->fits(candidate,frame.entries_.size()+1,next_deletes,reason)) {
+                            encoded.assign(candidate.data(),candidate.size()-2);deletes=next_deletes;selected.push_back(id);
+                            for(const auto i:matches)by_scope[i].push_back(row.entry.global_id);
+                            frame.entries_.push_back(row.entry);tables.push_back(table);scope_indexes.push_back(std::move(matches));originals.push_back(std::move(row));
+                            continue;
+                        }
+                    }
+                }catch(const export_capacity_error& error){reason=error.what();}
+                if(frame.entries_.empty())output.blocked_original="negotiated upload original PK "+std::to_string(id)+" cannot fit: "+reason;
+                break;
+            }
+            ids=std::move(selected);
+        } else {
         for(const auto id:ids){auto row=read_audit(db,id,raw);const recovery_local_export_table* table=nullptr;std::vector<size_t> matches;
             for(size_t i=0;i<inventory.scopes.size();++i)for(const auto& t:inventory.scopes[i].tables)if(t.name==row.entry.table_name){
                 if(table&&(!inventory.continuous||table->columns!=t.columns||table->no_history!=t.no_history||table->regular_link!=t.regular_link))refuse("export ambiguous contribution table");
@@ -443,6 +489,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
             if(!table)refuse("export original has no admitted whole-model contribution");
             if(history_after||continuous_page)for(const auto i:matches)history_original(db,inventory,inventory.scopes[i],journal,row.entry);
             tables.push_back(table);scope_indexes.push_back(std::move(matches));originals.push_back(std::move(row));
+        }
         }
         const auto later_delete=[&](size_t index){
             if(!retained_delete_page)return false;
@@ -454,12 +501,14 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
             }
             return false;
         };
-        std::string encoded="{\"auditLog\":[";
+        if(!frame.upload_view_){
         for(size_t i=0;i<originals.size();++i){auto& row=originals[i];
             decode_generated(db,row,*tables[i],raw,later_delete(i));wire_bound(row.entry,limits.wire_bytes-encoded.size()-2);
             const auto json=row.entry.to_json();if(json.size()+3>limits.wire_bytes-encoded.size())refuse("export encoded frame exceeds budget");
             if(!frame.entries_.empty())encoded+=',';encoded+=json;for(const auto index:scope_indexes[i])by_scope[index].push_back(row.entry.global_id);frame.entries_.push_back(row.entry);
         }
+        }
+        if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked before claims");
         encoded+="]}";if(frame.entries_.empty())return;
         std::vector<std::pair<recovery_obligation_address,recovery_obligation_entry>> expected_entries;
         std::vector<recovery_obligation_scope> expected_scopes;
@@ -477,7 +526,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         budget verify{limits};
         for(size_t i=0;i<originals.size();++i){const auto& before=originals[i];auto after=read_audit(db,before.entry.id,verify);
             if(!same_original(before,after))refuse("export original changed after claims");
-            if(retained_delete_page){
+            if(retained_delete_page||frame.upload_view_){
                 // Recheck both actual row absence/value and exact projection
                 // after reentrant claim hooks; read errors never prove absence.
                 decode_generated(db,after,*tables[i],verify,later_delete(i));
@@ -496,7 +545,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                 for(const auto& entry:frame.entries_)if(entry.table_name==table.name)
                     history_original(db,final_inventory,scope,journal,entry);
         }else if(continuous_page){
-            if(continuous_pending_page(db,sync_id,final_inventory,journal,count,in_flight)!=ids)
+            if(continuous_pending_page(db,sync_id,final_inventory,journal,frame.upload_view_?ids.size():count,in_flight)!=ids)
                 refuse("continuous export selected page changed during claims");
             for(const auto& scope:final_inventory.scopes)for(const auto& table:scope.tables)
                 for(const auto& entry:frame.entries_)if(entry.table_name==table.name)
@@ -504,10 +553,12 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         }else if(covered_pending(db,sync_id,final_inventory,journal,limits.coverage_candidates)!=pending)
             refuse("export coverage pending inventory changed during claims");
         frame.message_=transport_message::from_binary({encoded.begin(),encoded.end()});
+        if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked during claims");
     });
     require_committed(result);
     if(!frame.entries_.empty()){
         if(recovery_export_test_hooks::after_claim_commit)recovery_export_test_hooks::after_claim_commit();
+        if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked after committed claims");
         output.frame=std::move(frame);
     }
     return output;
@@ -577,6 +628,10 @@ bool recovery_export_route::handoff(committed_export_frame frame){
     if(frame.owner_->is_closed()||!lifetime_->protected_current(frame.physical_generation_))return false;
     std::shared_ptr<sync_transport> transport;
     {std::lock_guard<std::mutex> lock(mutex_);if(retired_||!open_||generation_!=frame.physical_generation_)return false;transport=transport_;}
+    if(frame.upload_view_) {
+        const auto platform=std::dynamic_pointer_cast<owned_platform_sync_transport>(transport);
+        return platform&&frame.upload_view_->send(*platform,frame.message_);
+    }
     transport->send(frame.message_);return true;
 }
 } // namespace lattice::detail

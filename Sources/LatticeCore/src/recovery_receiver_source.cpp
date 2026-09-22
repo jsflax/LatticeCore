@@ -148,7 +148,7 @@ bool receiver_source_binding::live(const std::shared_ptr<const record>& r)const 
 }
 void receiver_source_binding::invalidate(const std::shared_ptr<const record>& r) {
     std::shared_ptr<const record> retired;
-    {std::lock_guard lock(mutex_);if(current_==r)retired.swap(current_);}
+    {std::lock_guard lock(mutex_);if(current_==r){retired.swap(current_);upload_failure_="negotiated source describe revoked";}}
     // Last endpoint/provider/capture destruction must stay outside this leaf.
 }
 void receiver_source_binding::opened(const platform_transport_callbacks& attempt,uint64_t lifecycle,owned_platform_sync_transport& transport) {
@@ -157,7 +157,7 @@ void receiver_source_binding::opened(const platform_transport_callbacks& attempt
     next->request=uuid_t::generate().to_string();
     if(!live(next))reject("receiver source requires same actual system-TLS attempt and owner");
     std::shared_ptr<const record> retired;
-    {std::lock_guard lock(mutex_);if(!attempt.current_system_tls_for_owner())reject("receiver source attempt replaced before describe");retired.swap(current_);current_=next;}
+    {std::lock_guard lock(mutex_);if(!attempt.current_system_tls_for_owner())reject("receiver source attempt replaced before describe");retired.swap(current_);current_=next;upload_failure_.clear();upload_pending_=true;}
     const auto wire=json{{"kind","recoveryReady"},{"version",1},{"operation","describe"},{"requestID",next->request}}.dump();
     try {if(!live(next)||!transport.send_to_attempt(attempt,transport_message::from_string(wire)))reject("receiver source describe retired before send");}
     catch(...){invalidate(next);throw;}
@@ -187,7 +187,7 @@ bool receiver_source_binding::receive(const platform_transport_callbacks& attemp
         {std::lock_guard lock(mutex_);
             if(current_!=pending) {
                 if(current_&&current_->endpoint.matches(attempt)&&current_->lifecycle==lifecycle) {
-                    retired.swap(current_);reject("receiver source concurrent repeated describe");
+                    retired.swap(current_);upload_failure_="negotiated source describe revoked";reject("receiver source concurrent repeated describe");
                 }
                 return true; // a different physical attempt owns its own pending record
             }
@@ -199,5 +199,72 @@ bool receiver_source_binding::receive(const platform_transport_callbacks& attemp
 }
 bool receiver_source_binding::described()const {
     std::shared_ptr<const record> current;{std::lock_guard lock(mutex_);current=current_;}return current&&current->described&&live(current);
+}
+void receiver_source_binding::request_upload() {
+    std::lock_guard lock(mutex_);upload_pending_=true;
+    if(upload_revision_==UINT64_MAX){upload_failure_="negotiated upload demand exhausted";return;}
+    ++upload_revision_;
+}
+std::shared_ptr<const receiver_upload_view> receiver_source_binding::capture_upload(uint64_t generation) {
+    auto view=std::shared_ptr<receiver_upload_view>(new receiver_upload_view);
+    {std::lock_guard lock(mutex_);
+        if(!upload_failure_.empty())throw db_error(upload_failure_);
+        if(!current_||current_->lifecycle!=generation)reject("negotiated upload has no current physical attempt");
+        view->record_=current_;view->revision_=upload_revision_;
+    }
+    if(!live(view->record_))reject("negotiated upload source expired or retired");
+    if(!view->record_->described)return {};
+    view->binding_=shared_from_this();const auto& caps=view->record_->response.at("upload");
+    const auto cap=[&](const char* key,size_t local){return static_cast<size_t>(std::min<uint64_t>(caps.at(key).get<uint64_t>(),local));};
+    view->entries_=cap("maximumEntries",1000);view->wire_=cap("maximumWireBytes",8388608);
+    view->scalar_=cap("maximumScalarBytes",1048576);view->nodes_=cap("parserNodes",32768);
+    view->depth_=cap("parserDepth",16);view->deletes_=cap("maximumDeletes",1000);
+    if(!view->current())reject("negotiated upload source revoked during capture");return view;
+}
+bool receiver_source_binding::upload_pending(uint64_t generation)const {
+    std::shared_ptr<const record> record;
+    bool pending;
+    {std::lock_guard lock(mutex_);if(!upload_failure_.empty())throw db_error(upload_failure_);record=current_;pending=upload_pending_;}
+    if(record&&record->lifecycle==generation&&!live(record))reject("negotiated upload source expired or retired");
+    return pending;
+}
+void receiver_source_binding::finish_upload(const std::shared_ptr<const receiver_upload_view>& view,const std::string& failure) {
+    if(!view)return;
+    std::lock_guard lock(mutex_);if(current_!=view->record_)return;
+    if(!failure.empty()){upload_failure_=failure;upload_pending_=true;}
+    else if(upload_revision_==view->revision_)upload_pending_=false;
+}
+bool receiver_upload_view::current()const {
+    const auto binding=binding_.lock();if(!binding||!binding->live(record_))return false;
+    std::lock_guard lock(binding->mutex_);
+    return binding->current_==record_&&binding->upload_failure_.empty()&&record_->endpoint.current_system_tls_for_owner();
+}
+bool receiver_upload_view::fits(const std::string& wire,size_t entries,size_t deletes,std::string& reason)const {
+    if(entries>entries_){reason="entry count";return false;}
+    if(wire.size()>wire_){reason="wire bytes";return false;}
+    if(deletes>deletes_){reason="delete count";return false;}
+    // Use the exact mounted parser event semantics on the complete envelope.
+    // Only a bound refusal is a fitting-prefix decision. JSON/read/provenance
+    // errors still propagate; they can never prove absence or a safe prefix.
+    struct limit {};
+    size_t nodes=0;std::vector<std::set<std::string>> keys;
+    try {
+        const auto parsed=json::parse(wire,[&](int depth,json::parse_event_t event,json& value){
+            if(depth<0||static_cast<size_t>(depth)>depth_){reason="parser depth";throw limit{};}
+            if(++nodes>nodes_){reason="parser events";throw limit{};}
+            if(value.is_string()&&value.get_ref<const std::string&>().size()>scalar_){reason="decoded scalar bytes";throw limit{};}
+            if(event==json::parse_event_t::object_start)keys.emplace_back();
+            if(event==json::parse_event_t::key&&(keys.empty()||!keys.back().insert(value.get<std::string>()).second))reject("negotiated export duplicate JSON key");
+            if(event==json::parse_event_t::object_end)keys.pop_back();return true;
+        });
+        if(!parsed.is_object()||parsed.size()!=1||!parsed.contains("auditLog")||!parsed.at("auditLog").is_array()||parsed.at("auditLog").size()!=entries)
+            reject("negotiated export envelope differs");
+    }catch(const limit&){return false;}
+    return true;
+}
+bool receiver_upload_view::send(owned_platform_sync_transport& transport,const transport_message& message)const {
+    // Final admission. Later retirement can settle this already admitted send
+    // on the exact old endpoint, but can never select a replacement socket.
+    return current()&&transport.send_to_attempt(record_->endpoint,message);
 }
 }

@@ -720,6 +720,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 
 void synchronizer_base::request_upload(bool background) {
     if (is_destroyed_) return;
+    if(receiver_source_&&continuous_route_)receiver_source_->request_upload();
     const auto state=pacer_state_;
 #ifdef __EMSCRIPTEN__
     // Single-threaded build: no pacer thread. Legacy immediate dispatch —
@@ -1214,7 +1215,12 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
                 [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const transport_message& message) {
                     lifetime->platform_callback(lifecycle,attempt,[this,lifecycle,&attempt,&message] {
                         background_operation("transport message",[this,lifecycle,&attempt,&message] {
-                            if(receiver_source_&&receiver_source_->receive(attempt,lifecycle,message))return;
+                            if(receiver_source_&&receiver_source_->receive(attempt,lifecycle,message)) {
+                                // Release only this accepted physical record's
+                                // coalesced demand. Physical open ran once.
+                                if(continuous_route_&&receiver_source_->described())request_upload(true);
+                                return;
+                            }
                             on_transport_message(message);
                         });
                     });
@@ -1304,6 +1310,9 @@ void synchronizer_base::sync_now() {
     // caller's thread, unserialized with the scheduler that every other
     // upload pass runs on. Under immediate_scheduler (tests) the leading
     // edge dispatches inline, preserving synchronous semantics.
+    if(is_connected_&&receiver_source_&&continuous_route_&&
+       !receiver_source_->capture_upload(reconnect_lifecycle_.load()))
+        throw db_error("sync upload is pending authenticated source describe");
     request_upload();
 }
 
@@ -1315,7 +1324,8 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
     lifetime->queued(generation,[this,queue,generation,&should_dispatch] {
         if(!is_connected_||is_destroyed_)return;
         if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
-        bool pending=queue->pending(generation)||progress_pending_upload_.load(std::memory_order_relaxed)>0;
+        bool pending=(receiver_source_&&continuous_route_&&receiver_source_->upload_pending(generation))||
+            queue->pending(generation)||progress_pending_upload_.load(std::memory_order_relaxed)>0;
         if(!pending){std::lock_guard<std::mutex> lock(in_flight_mutex_);pending=!in_flight_ids_.empty();}
         if(!pending)pending=!db().db().query("SELECT 1 FROM AuditLog WHERE isSynchronized=0 LIMIT 1").empty();
         should_dispatch=pending;
@@ -1333,15 +1343,16 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
         // a fresh ticket; no raw is_destroyed test can resurrect its lifetime.
         const bool done=pass->done.load(std::memory_order_acquire);
         if(done&&pass->error)std::rethrow_exception(pass->error);
-        bool admitted=false,connected=false;int64_t pending=0;std::string label;
+        bool admitted=false,connected=false,negotiated_pending=false;int64_t pending=0;std::string label;
         const bool expired=std::chrono::steady_clock::now()>=deadline;
-        lifetime->queued(generation,[this,&admitted,&connected,&pending,&label,expired] {
+        lifetime->queued(generation,[this,generation,&admitted,&connected,&pending,&negotiated_pending,&label,expired] {
             admitted=true;connected=is_connected_.load()&&!is_destroyed_.load();
             pending=progress_pending_upload_.load(std::memory_order_relaxed);
+            if(connected&&receiver_source_&&continuous_route_)negotiated_pending=receiver_source_->upload_pending(generation);
             if(expired)label=log_id();
         });
         if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
-        if(!admitted||!connected||(done&&pending<=0&&!queue->pending(generation)))return;
+        if(!admitted||!connected||(done&&pending<=0&&!negotiated_pending&&!queue->pending(generation)))return;
         if(expired){LOG_INFO("synchronizer","[%s] drain: deadline reached with pending=%lld — disconnecting anyway",label.c_str(),static_cast<long long>(pending));return;}
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -2756,6 +2767,13 @@ void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& e
             {
                 std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
                 for (const auto& id : sent_ids) released += self->in_flight_ids_.erase(id);
+                // Publish finite opted-route demand before exposing zero
+                // progress. This counter-only receiver leaf never enters
+                // lifetime/endpoint/SQL locks or invokes callbacks. Keeping
+                // the in-flight lock here makes older empty selections lose
+                // their revision and newer ones observe the released IDs.
+                if(released&&self->receiver_source_&&self->continuous_route_)
+                    self->receiver_source_->request_upload();
                 self->progress_pending_upload_.store(
                     static_cast<int64_t>(self->in_flight_ids_.size()), std::memory_order_relaxed);
             }
@@ -2768,6 +2786,7 @@ void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& e
         }
         // Inline upload may retire this synchronizer. No ACK leaf lock may be
         // held across that call; the separate cell admits/retains the owner.
+        if(request&&test_schedule&&test_schedule->after_timeout_transition)test_schedule->after_timeout_transition();
         if(request)lifetime->queued(generation,[self]{self->request_upload(true);});
         }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,{},std::current_exception(),"ACK retry worker");}
     }).detach();
@@ -2796,6 +2815,15 @@ bool synchronizer_base::upload_protected_entries(bool* discovery_busy) {
 #else
     const auto owner=owned_db_;const auto route=recovery_export_route_;const auto lifetime=callback_lifetime_;
     const auto generation=reconnect_lifecycle_.load();const auto channel=config_.sync_id;
+    const auto source=continuous_route_?receiver_source_:nullptr;
+    std::shared_ptr<const detail::receiver_upload_view> upload_view;
+    if(source) {
+        upload_view=source->capture_upload(generation);
+        if(!upload_view) {
+            if(!discovery_busy)throw db_error("sync upload is pending authenticated source describe");
+            return true; // Demand lives in the source cell, not a busy retry.
+        }
+    }
     const bool filtered=config_.sync_filter.has_value();
     const size_t chunk=std::min<size_t>(config_.chunk_size,1000);
     std::vector<int64_t> in_flight;
@@ -2808,13 +2836,18 @@ bool synchronizer_base::upload_protected_entries(bool* discovery_busy) {
     }
     const size_t count=std::min(chunk,2000-in_flight.size());
     std::optional<detail::recovery_export_preparation> result;
-    result=detail::recovery_export_adapter::prepare_for_route(owner,continuous_route_,channel,generation,count,in_flight,filtered,discovery_busy);
+    result=detail::recovery_export_adapter::prepare_for_route(owner,continuous_route_,channel,generation,count,in_flight,filtered,discovery_busy,upload_view);
     if(!result){*discovery_busy=true;return false;}
     auto& prepared=*result;
     // The owned operation can deliver callbacks. Only independent retained
     // route state is touched before deciding whether owner access is still live.
     if(!lifetime->current(generation)||!route->current(generation))return true;
     if(!prepared.protected_store)return false;
+    if(!prepared.blocked_original.empty()) {
+        if(source)source->finish_upload(upload_view,prepared.blocked_original);
+        throw db_error(prepared.blocked_original);
+    }
+    if(source&&!prepared.frame)source->finish_upload(upload_view);
     if(prepared.frame)send_entries(std::move(*prepared.frame));
     return true; // No owner access after the reentrant transport call.
 #endif
@@ -3015,6 +3048,9 @@ void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::st
         if(matched.empty())return;
         detail::recovery_export_adapter::acknowledge_legacy(owner,config_.sync_id,matched);
         if(!route->current(generation))return;
+        // Close the zero-in-flight / queued-next-selection drain window before
+        // clearing this ACK batch. The next actual empty selection settles it.
+        if(receiver_source_&&continuous_route_)receiver_source_->request_upload();
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:matched)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
         progress_acked_.fetch_add(static_cast<int64_t>(matched.size()));ack_resend_failures_.store(0);
         schedule_background("ACK continuation",[this,route,generation]{if(!route->current(generation))return;background_upload();});

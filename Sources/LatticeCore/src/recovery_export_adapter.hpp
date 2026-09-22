@@ -21,12 +21,14 @@ class recovery_export_adapter;
 class recovery_export_route;
 class recovery_server_export_endpoint;
 class recovery_server_export_page;
+class receiver_upload_view;
 class committed_export_frame {
     friend class recovery_export_adapter;
     friend class recovery_export_route;
     friend class recovery_server_export_page;
     std::shared_ptr<lattice_db> owner_;
     std::shared_ptr<recovery_continuous_work> continuous_work_;
+    std::shared_ptr<const receiver_upload_view> upload_view_;
     std::vector<recovery_obligation_export_ticket> claims_;
     std::vector<recovery_local_export_scope> scopes_;
     recovery_obligation_producer_discovery_limits limits_{};
@@ -74,12 +76,15 @@ public:
 struct recovery_export_preparation {
     bool protected_store=false;
     std::optional<committed_export_frame> frame;
+    // A bounded refusal about the first pending local PK; never an empty page,
+    // skipped original, receipt, or authorization decision.
+    std::string blocked_original;
 };
 class recovery_export_adapter {
     friend class ::lattice::synchronizer_base;
     static std::optional<recovery_export_preparation> prepare_for_route(std::shared_ptr<lattice_db>,
         const std::shared_ptr<recovery_continuous_route>&,const std::string&,uint64_t,size_t,
-        const std::vector<int64_t>&,bool,bool*);
+        const std::vector<int64_t>&,bool,bool*,std::shared_ptr<const receiver_upload_view> = {});
     friend class recovery_export_route;
     friend class recovery_server_export_endpoint;
     friend class recovery_server_export_page;
@@ -88,7 +93,8 @@ class recovery_export_adapter {
     static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
         const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr,
-        bool retained_delete_page=false,std::shared_ptr<recovery_continuous_work> = {});
+        bool retained_delete_page=false,std::shared_ptr<recovery_continuous_work> = {},
+        std::shared_ptr<const receiver_upload_view> = {});
 public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.

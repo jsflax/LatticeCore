@@ -409,6 +409,7 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     const auto state=owner.recovery_continuous_->state;
     sync_config config;config.websocket_url=owner.config_.websocket_url;config.authorization_token=owner.config_.authorization_token;
     config.sync_id="wss:"+config.websocket_url;config.sync_filter=owner.config_.sync_filter;config.is_observer=owner.config_.sync_is_observer;
+    config.recovery_source_expectation=owner.config_.recovery_source_expectation;
     owner.config_.tuning.apply(config);
     for(const auto& route:state->policy.routes)config.all_active_sync_ids.push_back(route.sync_id);
     bool admitted=false;for(const auto& route:state->policy.routes)if(route.sync_id==config.sync_id&&route.endpoint==config.websocket_url)admitted=true;

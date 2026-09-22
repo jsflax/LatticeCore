@@ -225,7 +225,7 @@ using UniqueSyncTransport = std::unique_ptr<sync_transport>;
 // value owns only its callback cell and the exact connect attempt. It is safe
 // to retain after the transport is deleted; stale events then do nothing.
 // This is lifetime provenance, NOT authenticated source/recovery authority.
-namespace detail { struct platform_transport_test_access; struct platform_attempt_owner_test_access; class sync_callback_lifetime; class receiver_source_binding; }
+namespace detail { struct platform_transport_test_access; struct platform_attempt_owner_test_access; class sync_callback_lifetime; class receiver_source_binding; class receiver_upload_view; }
 class owned_platform_sync_transport;
 class platform_tls_test_driver; // observation-only test-support product
 class platform_transport_callbacks {
@@ -275,6 +275,7 @@ class platform_transport_callbacks {
     friend struct detail::platform_attempt_owner_test_access;
     friend class detail::sync_callback_lifetime;
     friend class detail::receiver_source_binding;
+    friend class detail::receiver_upload_view;
     friend class platform_tls_test_driver;
     bool current_system_tls_for_owner()const noexcept {
         return cell_&&generation_&&cell_->verified_tls_attempt.load(std::memory_order_acquire)==generation_&&

@@ -1211,15 +1211,15 @@ protected:
 #endif
         source=swift_lattice_ref::shared_for_lattice(source_ref->get());if(!source)throw db_error("NoHistory source owner missing");
         if(auto* n=instance_registry::instance().get_or_create_notifier(source_file.str()))n->stop_listening();
-        const auto source_id=uuid_t::generate().to_string(),epoch=uuid_t::generate().to_string(),mount_id=uuid_t::generate().to_string(),user=uuid_t::generate().to_string();
+        const auto source_id=::lattice::uuid_t::generate().to_string(),epoch=::lattice::uuid_t::generate().to_string(),mount_id=::lattice::uuid_t::generate().to_string(),user=::lattice::uuid_t::generate().to_string();
         for(size_t i=0;i<2;++i){
             negotiated_json recipe={{"version",1},{"authority","actual-nohistory-service"},{"sourceID",source_id},{"epoch",epoch},{"localNamespace","local"},
                 {"namespaces",negotiated_json::array({{{"namespaceID","local"},{"coverageID","local-v1"},{"revision",1}},{{"namespaceID","app-0"},{"coverageID","app-0-v1"},{"revision",1}},{{"namespaceID","app-1"},{"coverageID","app-1-v1"},{"revision",1}}})},
                 {"receiptNamespace","app-"+std::to_string(i)},{"models",negotiated_json::array({"ContinuousNoHistoryRow"})},{"walFull",true},{"maximumAuthorizationMilliseconds",600000},
                 {"upload",{{"tables",negotiated_json::array()},{"unlisted","allow"},{"maximumDeletes",delete_cap}}}};
             if(deny_delete)recipe["upload"]["tables"]=negotiated_json::array({{{"table","ContinuousNoHistoryRow"},{"operations",negotiated_json::array({"INSERT","UPDATE"})}}});
-            negotiated_json connection={{"mount",mount_id},{"connection",uuid_t::generate().to_string()},{"channel",policy.routes[i].sync_id},{"authenticatedUserID",user},
-                {"peer",{{"replicaID","nohistory-peer-"+std::to_string(i)},{"receiverIncarnation",uuid_t::generate().to_string()},{"channelIncarnation",uuid_t::generate().to_string()}}}};
+            negotiated_json connection={{"mount",mount_id},{"connection",::lattice::uuid_t::generate().to_string()},{"channel",policy.routes[i].sync_id},{"authenticatedUserID",user},
+                {"peer",{{"replicaID","nohistory-peer-"+std::to_string(i)},{"receiverIncarnation",::lattice::uuid_t::generate().to_string()},{"channelIncarnation",::lattice::uuid_t::generate().to_string()}}}};
             auto setup=source_ref->open_relay_recovery_setup(recipe.dump(),connection.dump(),new no_history_source_route,no_history_source_route::current,no_history_source_route::destroy);
             if(!setup.valid())throw db_error("NoHistory actual source setup failed: "+last_bridge_error());
             auto descriptor=negotiated_json::parse(setup.descriptor());

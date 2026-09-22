@@ -60,6 +60,7 @@ struct sync_discovery_operation {
         std::shared_ptr<sync_upload_exclusion> upload_exclusion;
 };
 class sync_discovery_deferral {
+    friend struct recovery_receiver_cohort_test_access;
 public:
     using clock=std::chrono::steady_clock;
     using kind=sync_discovery_kind;

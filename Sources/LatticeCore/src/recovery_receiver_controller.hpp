@@ -39,6 +39,8 @@ class recovery_receiver_controller final : public std::enable_shared_from_this<r
     void turn();
     void dropped_turn()noexcept;
     void retire(recovery_receiver_route*)noexcept;
+    static bool reconciliation_route_current(const std::shared_ptr<const recovery_reconciliation_descriptor>&,
+        const std::shared_ptr<recovery_continuous_route>&,const std::shared_ptr<lattice_db>&,uint64_t);
     static void verify_reconciliation_route(const std::shared_ptr<const recovery_reconciliation_descriptor>&,
         const std::shared_ptr<recovery_continuous_route>&,const std::shared_ptr<lattice_db>&,uint64_t,
         const std::vector<std::string>* ordered_originals=nullptr);
@@ -56,6 +58,7 @@ public:
 // accepts control bytes only from its current verified physical source record.
 // Destruction and queued work follow the existing owner/lifetime scheduler.
 class recovery_receiver_route final : public std::enable_shared_from_this<recovery_receiver_route> {
+    friend struct recovery_receiver_cohort_test_access;
     friend class recovery_receiver_controller;
     friend class recovery_continuous_producer;
     friend class ::lattice::synchronizer_base;

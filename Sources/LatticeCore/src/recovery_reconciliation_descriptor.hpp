@@ -15,6 +15,7 @@ struct recovery_reconciliation_reservation;
 // and never grants ordinary DML or authority to reconstruct an UNSENT proof.
 class recovery_reconciliation_descriptor final {
     friend class recovery_receiver_controller;
+    friend class recovery_continuous_producer;
     friend class recovery_receiver_route;
     friend class recovery_unknown_reconciliation;
     struct contribution {
@@ -25,6 +26,9 @@ class recovery_reconciliation_descriptor final {
         std::shared_ptr<receiver_source_binding> source;
         receiver_source_binding::recovery_view view;
     };
+    // First data member, destroyed LAST: physical capacity is released only
+    // after all Q/journal/source/worker payloads below have been destroyed.
+    std::shared_ptr<const recovery_reconciliation_cohort> cohort_;
     // One passive progress cell per immutable descriptor; its back-reference is weak.
     mutable std::mutex worker_mutex_;
     mutable std::shared_ptr<recovery_unknown_reconciliation> worker_;

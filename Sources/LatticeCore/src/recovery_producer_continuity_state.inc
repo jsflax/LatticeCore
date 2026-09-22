@@ -1,6 +1,7 @@
 // Included in recovery_local_producer.cpp. No public setter exposes either
 // enrollment or metadata mutation admission. File descriptors below are ONLY
 // directory descriptors, including failure cleanup (never main/WAL/SHM).
+struct recovery_reconciliation_cohort {}; // Passive payload-destruction fence.
 struct recovery_continuous_state {
     recovery_continuous_policy policy;
     blob manifest;
@@ -14,6 +15,9 @@ struct recovery_continuous_state {
     int64_t incarnation=0,barrier=0,attempt=0;
     std::set<std::string> generated_names;
     std::weak_ptr<recovery_receiver_controller> controller;
+    // Physical custody survives controller/route turnover while old work still
+    // owns a cohort. Never clear this slot on request/source replacement.
+    std::weak_ptr<const recovery_reconciliation_cohort> reconciliation_cohort;
     int64_t parent_device=0,parent_inode=0,container_device=0,container_inode=0;
 #if defined(__APPLE__) || defined(__linux__)
     int parent_fd=-1,container_fd=-1;

@@ -500,6 +500,30 @@ std::shared_ptr<recovery_receiver_route> recovery_continuous_producer::attach_re
     {std::lock_guard<std::mutex> lock(state->mutex);controller=state->controller.lock();if(!controller){controller=candidate;state->controller=controller;}}
     return controller->attach(std::move(owner),route,source,transport,scheduler,lifetime);
 }
+recovery_continuous_producer::cohort_admission recovery_continuous_producer::controller_cohort(
+    const recovery_receiver_controller& controller,const std::shared_ptr<lattice_db>& owner,
+    const std::shared_ptr<recovery_reconciliation_descriptor>& candidate) {
+    if(!owner||owner->is_closed()||!owner->recovery_continuous_)refuse("controller cohort lost actual owner");
+    const auto state=owner->recovery_continuous_->state;
+    if(!continuous_receiver_enabled(*state))refuse("controller cohort requires enabled profile");
+    // Only an empty off-lock shell can enter this private first registration.
+    if(candidate){if(candidate->cohort_)refuse("controller cohort shell already registered");candidate->cohort_=std::make_shared<recovery_reconciliation_cohort>();}
+    std::weak_ptr<const recovery_reconciliation_cohort> expired;
+    {
+        std::lock_guard lock(state->mutex);
+        if(state->controller.lock().get()!=&controller)refuse("controller cohort physical registration changed");
+        if(!state->reconciliation_cohort.expired())return cohort_admission::retained;
+        if(candidate){expired=std::move(state->reconciliation_cohort);state->reconciliation_cohort=candidate->cohort_;}
+    }
+    // Even an expired weak control block is released outside the physical leaf.
+    return cohort_admission::available;
+}
+bool recovery_continuous_producer::reconciliation_work_current(
+    const std::shared_ptr<recovery_continuous_work>& work,const std::shared_ptr<lattice_db>& owner) {
+    if(!work||!work->reconciliation_||work->owner_!=owner||!owner||!owner->recovery_continuous_||
+       work->state_!=owner->recovery_continuous_->state)refuse("restricted export lost counted descriptor custody");
+    return recovery_receiver_controller::reconciliation_route_current(work->reconciliation_,work->restricted_route_,owner,work->physical_);
+}
 recovery_install_result recovery_continuous_producer::controller_owned(const recovery_receiver_controller& controller,
     std::shared_ptr<lattice_db> owner,const std::function<void(database&)>& body) {
     return recovery_writer_access::install(owner,[&](database& db){

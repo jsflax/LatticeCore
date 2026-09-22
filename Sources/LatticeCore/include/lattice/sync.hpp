@@ -34,7 +34,7 @@ struct sync_drain_result {
 };
 // Forward declaration
 class lattice_db;
-namespace detail {class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;}
+namespace detail {class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -417,6 +417,7 @@ protected:
     // refuses a route before init_sync reaches the instance counter.
     bool counted_instance_=false;
     friend struct detail::recovery_export_test_access;
+    friend struct detail::recovery_receiver_cohort_test_access;
     friend struct detail::sync_discovery_test_access;
     friend struct sync_discovery_admission_test_access;
 

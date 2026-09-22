@@ -811,6 +811,11 @@ std::optional<bool> recovery_export_route::try_handoff(committed_export_frame& f
 bool recovery_export_route::handoff_impl(committed_export_frame& frame,bool* busy){
     if(frame.consumed_||!frame.owner_||frame.entries_.empty()||frame.claims_.empty())refuse("export permit already consumed or missing custody");
     if(!current(frame.physical_generation_)||frame.owner_->is_closed()){frame.consumed_=true;return false;}
+    // A superseded descriptor must be disposable even when the owned writer
+    // remains BUSY. The later owned check still validates all current claims.
+    if(frame.reconciliation_&&!recovery_continuous_producer::reconciliation_work_current(frame.continuous_work_,frame.owner_)){
+        frame.consumed_=true;return false;
+    }
     try {recovery_export_adapter::revalidate_claimed_frame(frame,busy);}
     catch(...){frame.consumed_=true;throw;}
     if(busy&&*busy)return false;

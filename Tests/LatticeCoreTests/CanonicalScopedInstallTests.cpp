@@ -532,12 +532,21 @@ TEST_F(CanonicalScopedInstall, GuardedPostcommitNotificationFailureKeepsExactIns
 }
 TEST_F(CanonicalScopedInstall, GuardedFileReopenRetainsCanonicalMarkerAndExactRetry) {
     TempDB path("canonical-receive-completion");reset(path.str());auto e=add();requested(e,0);x.content={person(A,"reopen")};
-    const auto before=recovery_guard().second;staged();const auto audit=table("AuditLog");owner->close();owner=std::make_shared<StagedOwner>(path.str());
-    ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));owner->close();owner=std::make_shared<StagedOwner>(path.str());
+    const auto before=recovery_guard().second;staged();const auto audit=table("AuditLog");ASSERT_EQ(audit.size(),1u);
+    owner->close();owner=std::make_shared<StagedOwner>(path.str());EXPECT_EQ(table("AuditLog"),audit);
+    ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));EXPECT_EQ(table("AuditLog"),audit);
+    ASSERT_EQ(number("SELECT COUNT(*) FROM _lattice_replication_slots"),1);
+    ASSERT_EQ(number("SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id='staged-channel' AND is_synchronized=1"),1);
+    // Existing open-time healing collapses only this all-live-slots-confirmed
+    // bookkeeping. The original row's identity/body must remain exact.
+    auto healed=audit;healed[0]["isSynchronized"]=int64_t{1};
+    owner->close();owner=std::make_shared<StagedOwner>(path.str());
     const auto stable=guarded_snapshot();const auto result=install_staged_canonical_range(guarded(before));ASSERT_TRUE(committed(result));
-    EXPECT_EQ(result.installation->disposition,receive_install_disposition::already_installed);EXPECT_EQ(guarded_snapshot(),stable);EXPECT_EQ(table("AuditLog"),audit);
+    EXPECT_EQ(result.installation->disposition,receive_install_disposition::already_installed);EXPECT_EQ(guarded_snapshot(),stable);EXPECT_EQ(table("AuditLog"),healed);
+    EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id='staged-channel'"),0);
     EXPECT_THROW(receive_delivery_guard_access::legacy_checkpoint(*owner,address.channel),lattice::db_error);owner->close();
 }
+
 TEST_F(CanonicalScopedInstall, GuardedSuccessorInstallationAdvancesCanonicalGenerationOnce) {
     x.content={person(A)};const auto before=recovery_guard().second;staged();ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
     const auto first=receive_delivery_guard_access::read(*owner,address.channel);next();++x.m.head;x.content={person(A,"successor")};staged();
@@ -575,6 +584,24 @@ TEST_F(CanonicalScopedInstall, GuardedTempTriggersCannotRewriteOutboundStateDuri
         EXPECT_EQ(query("SELECT name,sql FROM temp.sqlite_schema ORDER BY name"),temp_schema);
         owner->db().execute("DROP TRIGGER temp._guard_temp_metadata");ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));
     }
+}
+
+TEST_F(CanonicalScopedInstall, GuardedReopenCannotCollapseOriginalWithoutSecondLiveChannelAck) {
+    TempDB path("canonical-receive-pending-channel");reset(path.str());auto e=add();requested(e,0);x.content={person(A,"reopen")};
+    owned([&](auto& db){const auto other=receive_delivery_guard_access::begin(*owner,db,"other-channel");
+        receive_delivery_guard_access::finish(*owner,db,other,other.admitted,std::string("other-prefix"),false,true);});
+    const auto before=recovery_guard().second;
+    staged();const auto audit=table("AuditLog");ASSERT_EQ(audit.size(),1u);ASSERT_EQ(std::get<int64_t>(audit[0].at("isSynchronized")),0);
+    ASSERT_TRUE(committed(install_staged_canonical_range(guarded(before))));EXPECT_EQ(table("AuditLog"),audit);
+    ASSERT_EQ(number("SELECT COUNT(*) FROM _lattice_replication_slots"),2);
+    ASSERT_EQ(number("SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id='staged-channel' AND is_synchronized=1"),1);
+    ASSERT_EQ(number("SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id='other-channel' AND is_synchronized=1"),0);
+    owner->close();owner=std::make_shared<StagedOwner>(path.str());
+    EXPECT_EQ(table("AuditLog"),audit);EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id='staged-channel' AND is_synchronized=1"),1);
+    EXPECT_EQ(number("SELECT COUNT(*) FROM _lattice_sync_state WHERE sync_id='other-channel' AND is_synchronized=1"),0);
+    const auto stable=guarded_snapshot();const auto retry=install_staged_canonical_range(guarded(before));ASSERT_TRUE(committed(retry));
+    EXPECT_EQ(retry.installation->disposition,receive_install_disposition::already_installed);EXPECT_EQ(guarded_snapshot(),stable);
+    EXPECT_EQ(receive_delivery_guard_access::legacy_checkpoint(*owner,"other-channel"),std::optional<std::string>{"other-prefix"});owner->close();
 }
 
 TEST_F(CanonicalScopedInstall, CommittedInspectionAfterReleasePreservesLateOriginalAndAllRows) {

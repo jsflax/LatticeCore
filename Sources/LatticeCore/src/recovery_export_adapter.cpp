@@ -280,6 +280,45 @@ std::vector<int64_t> covered_pending(sqlite3* db,const std::string& channel,
     }
     return {pending.begin(),pending.end()};
 }
+// Actual continuous routes have exclusive generated coverage from enrollment.
+// Unlike qualification's full pending-body audit, they may select a finite
+// page and validate just that page's originals/stamps under the owned frame.
+// The scan/sort input is still bounded by the entire admitted journal cap,
+// including duplicate contributions, settled rows and ACKed open obligations.
+std::vector<int64_t> continuous_pending_page(sqlite3* db,const std::string& channel,
+    const recovery_local_export_inventory& inventory,recovery_obligation_store& journal,
+    size_t count,const std::vector<int64_t>& in_flight){
+    const auto cap=inventory.limits.obligations.records;
+    if(!inventory.continuous||cap<=0||cap>100000)refuse("continuous export requires bounded admitted journal");
+    const auto usage=journal.usage();
+    // Before ORDER BY can sort, prove its full input cardinality against the
+    // protected stored counter. This copies one scalar, never journal bodies.
+    {statement total(db,"SELECT COUNT(*) FROM (SELECT 1 FROM main._lattice_obligation_entry LIMIT ?)");
+     total.integer(1,cap+1);
+     if(!total.next())refuse("continuous export journal count unavailable");
+     const auto records=integer(total,0);
+     if(records<0||records>cap||records!=usage.records||total.next())refuse("continuous export journal count contradicts admitted cap");}
+    coverage_indexes(db);
+    const std::set<int64_t> sending(in_flight.begin(),in_flight.end());
+    statement query(db,"SELECT audit_id FROM main._lattice_obligation_entry WHERE stage=0 ORDER BY audit_id LIMIT ?");
+    query.integer(1,cap+1);
+    std::vector<int64_t> selected;int64_t previous=0,scanned=0;
+    while(query.next()){
+        if(++scanned>cap)refuse("continuous export raw scan exceeded admitted journal");
+        const auto id=integer(query,0);if(id<=0||id<previous)refuse("continuous export invalid ordered original");
+        if(id==previous)continue;previous=id;
+        if(sending.count(id))continue;
+        statement state(db,"SELECT is_synchronized FROM main._lattice_sync_state WHERE audit_entry_id=? AND sync_id=? LIMIT 2");
+        state.integer(1,id);state.text(2,channel);
+        if(state.next()){
+            const auto value=integer(state,0);
+            if((value!=0&&value!=1)||state.next())refuse("continuous export invalid channel state");
+            if(value==1)continue; // Route ACK excludes delivery, never settles Q.
+        }
+        selected.push_back(id);if(selected.size()==count)break;
+    }
+    return selected;
+}
 // Unlike pending coverage, this selector does not exclude any addressed row.
 // The integer PK range + LIMIT bounds materialization to the requested page;
 // larger retained history is paged, not silently treated as unsupported/empty.
@@ -381,8 +420,10 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         frame.scopes_=inventory.scopes;frame.limits_=inventory.limits;
         auto* db=recovery_writer_access::active_handle(*owner,writer);
         recovery_obligation_store journal(owner,inventory.limits.obligations,inventory.limits.installations);
+        const bool continuous_page=inventory.continuous&&static_cast<bool>(frame.continuous_work_);
         std::vector<int64_t> pending,ids;
         if(history_after)ids=history_page(db,*history_after,count);
+        else if(continuous_page)ids=continuous_pending_page(db,sync_id,inventory,journal,count,in_flight);
         else {
             pending=covered_pending(db,sync_id,inventory,journal,limits.coverage_candidates);
             const std::set<int64_t> sending(in_flight.begin(),in_flight.end());
@@ -400,7 +441,7 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                 table=&t;matches.push_back(i);
             }
             if(!table)refuse("export original has no admitted whole-model contribution");
-            if(history_after)for(const auto i:matches)history_original(db,inventory,inventory.scopes[i],journal,row.entry);
+            if(history_after||continuous_page)for(const auto i:matches)history_original(db,inventory,inventory.scopes[i],journal,row.entry);
             tables.push_back(table);scope_indexes.push_back(std::move(matches));originals.push_back(std::move(row));
         }
         const auto later_delete=[&](size_t index){
@@ -451,6 +492,12 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         }
         if(history_after){
             if(history_page(db,*history_after,count)!=ids)refuse("export history page changed during claims");
+            for(const auto& scope:final_inventory.scopes)for(const auto& table:scope.tables)
+                for(const auto& entry:frame.entries_)if(entry.table_name==table.name)
+                    history_original(db,final_inventory,scope,journal,entry);
+        }else if(continuous_page){
+            if(continuous_pending_page(db,sync_id,final_inventory,journal,count,in_flight)!=ids)
+                refuse("continuous export selected page changed during claims");
             for(const auto& scope:final_inventory.scopes)for(const auto& table:scope.tables)
                 for(const auto& entry:frame.entries_)if(entry.table_name==table.name)
                     history_original(db,final_inventory,scope,journal,entry);

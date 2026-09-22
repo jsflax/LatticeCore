@@ -2,6 +2,7 @@
 #include "sync_immediate_scheduler.hpp"
 #include "recovery_receiver_source.hpp"
 #include "sync_discovery_deferral.hpp"
+#include "sync_upload_exclusion.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "receive_delivery_guard.hpp"
 #include "recovery_export_adapter.hpp"
@@ -608,7 +609,7 @@ struct sync_upload_continuation {
     std::string channel;
     std::vector<audit_log_entry> entries;
     std::optional<committed_export_frame> protected_frame;
-    bool protected_in_flight=false;
+    std::shared_ptr<sync_upload_exclusion> protected_exclusion;
 };
 }
 namespace {
@@ -648,6 +649,11 @@ struct discovery_charge {
 // ============================================================================
 // synchronizer_base implementation
 // ============================================================================
+
+synchronizer_base::synchronizer_base()
+    :upload_tracking_(std::make_shared<detail::sync_upload_tracking>()),
+     in_flight_mutex_(upload_tracking_->mutex),in_flight_ids_(upload_tracking_->ids),
+     progress_pending_upload_(upload_tracking_->pending) {}
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched) {
     continuous_route_=detail::recovery_continuous_producer::admit_route(owned_db_,config,false);
@@ -1184,6 +1190,7 @@ uint64_t synchronizer_base::advance_reconnect_lifecycle(bool enabled) {
     do {
         next = ((prior & ~uint64_t{1}) + 2) | (enabled ? uint64_t{1} : uint64_t{0});
     } while (!reconnect_lifecycle_.compare_exchange_weak(prior, next));
+    {std::lock_guard<std::mutex> lock(in_flight_mutex_);upload_tracking_->generation=reconnect_lifecycle_.load(std::memory_order_acquire);}
     if(callback_lifetime_)callback_lifetime_->publish_generation(next);
     if(discovery_deferral_)discovery_deferral_->cancel(next);
     if(recovery_export_route_)recovery_export_route_->publish(next,false);
@@ -2924,6 +2931,7 @@ bool synchronizer_base::upload_protected_entries(detail::sync_upload_continuatio
     }
     if(source&&!prepared.frame)source->finish_upload(upload_view);
     if(prepared.frame){
+        continuation.generation=generation;
         continuation.protected_frame.emplace(std::move(*prepared.frame));
         return send_committed_entries(continuation,work,discovery_busy);
     }
@@ -2933,17 +2941,20 @@ bool synchronizer_base::upload_protected_entries(detail::sync_upload_continuatio
 
 bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation& continuation,detail::sync_discovery_operation* work,bool* discovery_busy) {
     auto& frame=*continuation.protected_frame;
-    const auto route=recovery_export_route_;const auto generation=reconnect_lifecycle_.load();
+    const auto route=recovery_export_route_;
     std::vector<std::string> ids;ids.reserve(frame.entries().size());
     auto retry=prepare_ack_retry(frame.entries(),true);
     for(const auto& entry:frame.entries())ids.push_back(entry.global_id);
-    if(!continuation.protected_in_flight){
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        for(const auto& entry:frame.entries())in_flight_ids_[entry.global_id]=entry.id;
-        progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));
+    if(!continuation.protected_exclusion){
+        std::vector<std::pair<std::string,int64_t>> registrations;registrations.reserve(frame.entries().size());
+        for(const auto& entry:frame.entries())registrations.emplace_back(entry.global_id,entry.id);
+        continuation.protected_exclusion=detail::sync_upload_exclusion::create(upload_tracking_,continuation.generation,std::move(registrations));
+        if(work&&!discovery_deferral_->attach_exclusion(work,continuation.protected_exclusion)) {
+            continuation.protected_exclusion->release();throw db_error("upload continuation retired before exclusion admission");
+        }
         progress_total_upload_.fetch_add(static_cast<int64_t>(ids.size()));
-        continuation.protected_in_flight=true;
     }
+    const auto exclusion=continuation.protected_exclusion;
     try {
         const auto sent=discovery_busy?route->try_handoff(frame):std::optional<bool>(route->handoff(std::move(frame)));
         if(!sent){
@@ -2951,20 +2962,18 @@ bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation&
             // keeps its existing frame limits and does not reserve queue bytes.
             discovery_charge charge;charge.entries(frame.entries());
             charge.add(frame.retained_metadata_bytes(detail::sync_discovery_deferral::byte_limit));
+            charge.add(exclusion->retained_bytes(detail::sync_discovery_deferral::byte_limit));
             if(!work||!discovery_deferral_->resize(work,charge.bytes))
                 throw db_error("committed export frame exceeds discovery retention budget; claimed originals remain pending");
             work->coalescible.store(false,std::memory_order_release);
             *discovery_busy=true;return false; // Exact frame, claims and in-flight exclusion survive.
         }
-        if(*sent){retry();return true;} // Only captured inputs after possibly reentrant send.
+        if(*sent){exclusion->handed_off();retry();return true;} // Only passive/captured inputs after reentrant send.
     }
     catch(...) {
-        if(route->current(generation)){std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:ids)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
-        throw;
+        exclusion->release();throw;
     }
-    if(!route->current(generation))return true;
-    {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:ids)in_flight_ids_.erase(id);progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));}
-    return true;
+    exclusion->release();return true;
 }
 
 void synchronizer_base::upload_pending_changes() {

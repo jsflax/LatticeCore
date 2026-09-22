@@ -34,7 +34,7 @@ struct sync_drain_result {
 };
 // Forward declaration
 class lattice_db;
-namespace detail {class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;enum class sync_discovery_kind;struct sync_discovery_test_access;}
+namespace detail {class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -329,7 +329,7 @@ public:
     virtual ~synchronizer_base();
 
 protected:
-    synchronizer_base() = default;
+    synchronizer_base();
 
 public:
     // Non-copyable, non-moveable
@@ -515,8 +515,9 @@ protected:
     // audit row — they must never gate the upload floor).
     // Prevents upload_pending_changes from re-sending entries on each cycle.
     // Accessed from scheduler thread (upload) and WebSocket/IPC thread (ACK) — needs mutex.
-    std::mutex in_flight_mutex_;
-    std::unordered_map<std::string, int64_t> in_flight_ids_;
+    std::shared_ptr<detail::sync_upload_tracking> upload_tracking_;
+    std::mutex& in_flight_mutex_;
+    std::unordered_map<std::string, int64_t>& in_flight_ids_;
 
     // Upload-floor bookkeeping (guarded by in_flight_mutex_). open_audit_ids_
     // holds every real audit id enumerated but not yet resolved (ACKed or
@@ -556,7 +557,7 @@ protected:
     on_progress_handler on_progress_;
 
     // Progress tracking
-    std::atomic<int64_t> progress_pending_upload_{0};
+    std::atomic<int64_t>& progress_pending_upload_;
     std::atomic<int64_t> progress_total_upload_{0};
     std::atomic<int64_t> progress_acked_{0};
     std::atomic<int64_t> progress_received_{0};

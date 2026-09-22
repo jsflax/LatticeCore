@@ -1,4 +1,5 @@
 #pragma once
+#include "sync_upload_exclusion.hpp"
 #include <array>
 #include <algorithm>
 #include <limits>
@@ -56,6 +57,7 @@ struct sync_discovery_operation {
         unsigned attempts=0;
         std::atomic<bool> coalescible{true};
         std::shared_ptr<sync_discovery_completion> completion;
+        std::shared_ptr<sync_upload_exclusion> upload_exclusion;
 };
 class sync_discovery_deferral {
 public:
@@ -127,14 +129,21 @@ public:
         if(closed_||failed_||addressed.generation!=generation_||addressed.serial!=serial_||active_||!dispatched_||!count_)return {};
         dispatched_=false;
         if(now>=slots_[head_]->deadline) {
-            failed_=true;changed();const auto completion=slots_[head_]->completion;lock.unlock();
-            if(completion)completion->cancel(sync_discovery_completion::outcome::expired);return {};
+            failed_=true;changed();const auto completion=slots_[head_]->completion;const auto exclusion=slots_[head_]->upload_exclusion;lock.unlock();
+            if(completion)completion->cancel(sync_discovery_completion::outcome::expired);
+            if(exclusion)exclusion->release();return {};
         }
         if(slots_[head_]->completion&&!slots_[head_]->completion->start()) {
             bytes_-=slots_[head_]->charge;released=std::move(slots_[head_]);head_=(head_+1)%capacity;--count_;next_=now;changed();
+            lock.unlock();if(released->upload_exclusion)released->upload_exclusion->release();
             return {}; // released capture destructs after leaf unlock
         }
         active_=true;return slots_[head_];
+    }
+    bool attach_exclusion(operation* work,std::shared_ptr<sync_upload_exclusion> exclusion) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(closed_||failed_||!active_||!count_||slots_[head_].get()!=work||slots_[head_]->upload_exclusion)return false;
+        slots_[head_]->upload_exclusion=std::move(exclusion);return true;
     }
     // Increase retention charge only before returning a newly staged busy
     // continuation. Failure leaves the old charge and requires a stage-local
@@ -151,7 +160,7 @@ private:
     settlement settle(ticket addressed,const std::shared_ptr<operation>& work,bool done,
                       clock::time_point now,bool retain_dispatch) {
         std::shared_ptr<operation> released;
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if(addressed.generation!=generation_||addressed.serial!=serial_||!active_||!count_||slots_[head_]!=work)return {};
         active_=false;
         if(done) {
@@ -170,7 +179,10 @@ private:
         // A BUSY result, terminal failure or quantum boundary releases it.
         const bool continued=done&&retain_dispatch&&count_&&!failed_&&!closed_;
         if(continued)dispatched_=true;
-        changed();return {failed_,continued?ticket{addressed.generation,addressed.serial,slots_[head_]->completion}:ticket{}};
+        changed();const auto result=settlement{failed_,continued?ticket{addressed.generation,addressed.serial,slots_[head_]->completion}:ticket{}};
+        const auto exclusion=work->upload_exclusion;lock.unlock();
+        if((done||result.failed)&&exclusion)exclusion->release();
+        return result;
     }
 public:
     bool finish(ticket addressed,const std::shared_ptr<operation>& work,bool done,clock::time_point now) {
@@ -192,9 +204,13 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);return generation_==generation&&failed_;
     }
     bool take_failure(uint64_t generation) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if(generation_!=generation||!failed_||reported_)return false;
-        reported_=true;return true;
+        std::array<std::shared_ptr<sync_upload_exclusion>,capacity> released;
+        {std::lock_guard<std::mutex> lock(mutex_);
+         if(generation_!=generation||!failed_||reported_)return false;
+         reported_=true;
+         // Active foreign send retains its lease until its own settlement.
+         for(size_t i=active_?1:0;i<count_;++i)released[i]=slots_[(head_+i)%capacity]->upload_exclusion;}
+        for(const auto& exclusion:released)if(exclusion)exclusion->release();return true;
     }
     bool pending(uint64_t generation)const {
         std::lock_guard<std::mutex> lock(mutex_);return generation_==generation&&count_!=0;
@@ -208,7 +224,7 @@ public:
          released.swap(slots_);head_=count_=bytes_=0;active_=dispatched_=failed_=reported_=false;
          generation_=generation;closed_=closed_||close||serial_==std::numeric_limits<uint64_t>::max();
          if(!closed_)++serial_;changed();}
-        for(const auto& work:released)if(work&&work->completion)work->completion->cancel();
+        for(const auto& work:released)if(work){if(work->completion)work->completion->cancel();if(work->upload_exclusion)work->upload_exclusion->release();}
         // Captures may retire owners. Release them outside the leaf lock.
     }
 };

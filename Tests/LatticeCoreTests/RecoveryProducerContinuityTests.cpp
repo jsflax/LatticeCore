@@ -1337,3 +1337,90 @@ TEST_F(RecoveryNegotiatedNoHistory, AnotherContributionCannotRewriteWitnessFirst
     EXPECT_NE(errors.back().find("continuous delete proof contribution changed after claims"),std::string::npos);
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include "../../Sources/LatticeCore/src/sync_upload_exclusion.hpp"
+#include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
+namespace {
+// The real route and public drain run unchanged. Only scheduler admission is
+// caller-inline for the drain's documented first pass with an elapsed deadline.
+class RecoveryDrainHandoff:public RecoveryNegotiatedExport {
+protected:
+    void describe_without_pumping(){
+        EXPECT_TRUE(platform->attempts[0]->current().trigger_on_message(
+            transport_message::from_string(response(0,caps()).dump())));
+    }
+    sync_drain_result first_drain(){
+        sync_drain_result result;
+        queue->with_inline([&]{result=senders[0]->drain_checked(std::chrono::steady_clock::now());});
+        return result;
+    }
+};
+}
+TEST_F(RecoveryDrainHandoff, ExpiredPresendDrainReleasesOnlyItsExclusionAndSameOwnerMakesFreshProgress) {
+    negotiated_ack_pause pause(senders,factory);open();owner->add(ContinuousSharedRow{"expired-before-handoff"});start();describe_without_pumping();
+    auto* physical=canonical_writer_custody_test_access::fault_handle(owner->db());std::unique_ptr<negotiated_writer_hold> held;
+    decltype(snapshot()) committed;size_t commits=0;
+    negotiated_hook_scope hold([&]{if(++commits==1){committed=snapshot();held=std::make_unique<negotiated_writer_hold>(physical);}});
+    const auto result=first_drain();ASSERT_TRUE(held);ASSERT_EQ(commits,1u);
+    EXPECT_EQ(result.state,sync_drain_state::deadline_pending);EXPECT_FALSE(result.error);EXPECT_TRUE(senders[0]->is_connected());
+    EXPECT_EQ(senders[0]->get_progress().pending_upload,1);EXPECT_TRUE(audit_wire().empty());
+    {std::lock_guard lock(pause.held->mutex);EXPECT_EQ(pause.held->started,0u);}
+    // Pump actual cancellation while the writer remains unavailable. A later
+    // background turn cannot hide leaked IDs with a successful send or ACK.
+    const bool disposed=pump_until_ack();held.reset();
+    ASSERT_TRUE(disposed);EXPECT_EQ(snapshot(),committed);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto claims=owner->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY channel,original");
+    senders[0]->sync_now();ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(commits,2u);EXPECT_EQ(claimed(),2);
+    EXPECT_EQ(owner->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY channel,original"),claims);
+    const auto batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),1u);ASSERT_EQ(batches[0].size(),1u);
+    factory->wires[0]->ack(batches[0]);ASSERT_TRUE(pump_until_ack());pause.acknowledged();queue->drain();
+    EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),originals);
+    EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),1);EXPECT_TRUE(errors.empty());
+}
+TEST_F(RecoveryDrainHandoff, ExpiredDrainAfterActualHandoffKeepsInFlightUntilGenuineAck) {
+    negotiated_ack_pause pause(senders,factory);open();owner->add(ContinuousSharedRow{"sent-before-deadline"});start();describe_without_pumping();
+    const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto result=first_drain();EXPECT_EQ(result.state,sync_drain_state::deadline_pending);EXPECT_FALSE(result.error);
+    const auto first=factory->wires[0]->audit_batches();ASSERT_EQ(first.size(),1u);ASSERT_EQ(first[0].size(),1u);
+    EXPECT_EQ(senders[0]->get_progress().pending_upload,1);queue->drain();senders[0]->sync_now();queue->drain();
+    EXPECT_EQ(factory->wires[0]->audit_batches(),first);EXPECT_EQ(senders[0]->get_progress().pending_upload,1);
+    EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),0);
+    factory->wires[0]->ack(first[0]);ASSERT_TRUE(pump_until_ack());pause.acknowledged();queue->drain();
+    EXPECT_EQ(claimed(),2);EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),originals);
+    EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),1);EXPECT_TRUE(errors.empty());
+}
+TEST_F(RecoveryDrainHandoff, RetiringExpiredPresendDrainPreservesUnknownAndCreatesNoAckWorker) {
+    negotiated_worker_observation workers;open();owner->add(ContinuousSharedRow{"retire-expired-drain"});start();describe_without_pumping();
+    auto* physical=canonical_writer_custody_test_access::fault_handle(owner->db());std::unique_ptr<negotiated_writer_hold> held;decltype(snapshot()) committed;
+    negotiated_hook_scope hold([&]{committed=snapshot();held=std::make_unique<negotiated_writer_hold>(physical);});
+    const auto result=first_drain();ASSERT_TRUE(held);EXPECT_EQ(result.state,sync_drain_state::deadline_pending);
+    senders[0]->disconnect();held.reset();queue->drain();EXPECT_EQ(senders[0]->get_progress().pending_upload,0);
+    EXPECT_EQ(snapshot(),committed);EXPECT_EQ(claimed(),2);EXPECT_TRUE(audit_wire().empty());
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    senders.clear();const auto frozen=freeze();ASSERT_TRUE(frozen.unsent);EXPECT_TRUE(frozen.unsent->canonical_originals().empty());
+}
+TEST(RecoveryUploadExclusion, OldTokenCannotEraseReplacementOrTransferredAckOwnership) {
+    auto state=std::make_shared<sync_upload_tracking>();auto old=sync_upload_exclusion::create(state,1,{{"same-original",7}});
+    {std::lock_guard lock(state->mutex);state->ids.clear();state->generation=3;} // actual lifecycle clearing can precede an old turn's release
+    EXPECT_THROW(sync_upload_exclusion::create(state,1,{{"retired-original",8}}),std::runtime_error);
+    auto current=sync_upload_exclusion::create(state,3,{{"same-original",7}});old->release();old.reset();
+    {std::lock_guard lock(state->mutex);EXPECT_EQ(state->ids.at("same-original"),7);EXPECT_EQ(state->pending.load(),1);}
+    current->handed_off();current->release();current.reset();
+    {std::lock_guard lock(state->mutex);EXPECT_EQ(state->ids.at("same-original"),7);EXPECT_TRUE(state->pre_handoff.empty());}
+    std::weak_ptr<sync_upload_tracking> weak=state;state.reset();EXPECT_TRUE(weak.expired());
+}
+TEST(RecoveryUploadExclusion, ExhaustedQueueDisposesPresendExclusionWhileRetainingItsClaimedWork) {
+    sync_discovery_deferral queue;auto state=std::make_shared<sync_upload_tracking>();
+    auto work=std::make_shared<sync_discovery_operation>();work->type=sync_discovery_kind::drain_upload;work->label="real exclusion owner";work->generation=1;work->charge=1024;
+    auto lease=sync_upload_exclusion::create(state,1,{{"claimed-original",9}});auto now=sync_discovery_deferral::clock::now();
+    auto ticket=queue.push_and_dispatch(work,now).reserved;ASSERT_EQ(queue.begin(ticket,now),work);ASSERT_TRUE(queue.attach_exclusion(work.get(),lease));
+    EXPECT_FALSE(queue.finish(ticket,work,false,now));now+=std::chrono::seconds(5);
+    ticket=queue.dispatch(now);EXPECT_EQ(queue.begin(ticket,now),nullptr);EXPECT_TRUE(queue.failed(1));EXPECT_TRUE(queue.pending(1));
+    EXPECT_EQ(state->pending.load(),0);{std::lock_guard lock(state->mutex);EXPECT_TRUE(state->ids.empty());EXPECT_TRUE(state->pre_handoff.empty());}
+    // This only relinquishes volatile exclusion; payload/UNKNOWN remains in the
+    // failed queue until explicit route disposition. No ACK or SQL is fabricated.
+    queue.cancel(3,true);lease.reset();work.reset();EXPECT_FALSE(queue.pending(3));
+}
+#endif

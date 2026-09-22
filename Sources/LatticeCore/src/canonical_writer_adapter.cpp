@@ -768,10 +768,17 @@ void canonical_writer_adapter::validate_namespace_admission(const std::shared_pt
     bool found=false;for(const auto& entry:state->namespaces->entries)if(entry==admission.namespace_)found=true;
     if(!found || admission.replica_.empty())refuse("canonical namespace admission provenance differs");
     if(admission.authenticated_ && !admission.authenticated_->live())refuse("authenticated relay session retired");
+    if(admission.ready_operation_current_ && !admission.ready_operation_current_->load(std::memory_order_acquire))
+        refuse("authenticated READY operation superseded before owned effect");
     std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
     if(owner->closed_.load() || owner->db_!=writer || owner->connection_revision_!=admission.revision_ ||
        !state->active->load(std::memory_order_acquire) || writer->is_closed() || !matches_connection(*writer,state->connection))
         refuse("canonical namespace admission physical session retired");
+}
+canonical_namespace_admission canonical_writer_adapter::ready_operation_admission(
+    const canonical_namespace_admission& admitted,std::shared_ptr<const std::atomic<bool>> current) {
+    if(!admitted.authenticated_ || !current)refuse("READY operation requires actual authenticated admission");
+    auto result=admitted;result.ready_operation_current_=std::move(current);return result;
 }
 canonical_namespace_admission canonical_writer_adapter::admit_authenticated_session(std::shared_ptr<lattice_db> owner,
     const std::string& ns,const std::string& replica,std::shared_ptr<authenticated_session_fence> fence) {
@@ -811,6 +818,8 @@ std::string canonical_writer_adapter::authenticated_descriptor_digest()const{ret
 const recovery_owner_schema& canonical_writer_adapter::authenticated_catalog(const lattice_db& owner) noexcept {
     return owner.recovery_declarations();
 }
+std::shared_ptr<instance_guard> canonical_writer_adapter::authenticated_owner_guard(const lattice_db& owner) noexcept{return owner.guard_;}
+std::shared_ptr<const std::atomic<bool>> canonical_writer_adapter::authenticated_active_guard()const noexcept{return context_->active;}
 canonical_namespace_admission canonical_writer_adapter::admit_namespace_for_qualification(std::shared_ptr<lattice_db> owner,
     const std::string& namespace_id,const std::string& replica_id) {
     auto state=context_;auto writer=writer_;

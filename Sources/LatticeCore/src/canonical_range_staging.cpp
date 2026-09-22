@@ -84,8 +84,8 @@ canonical_range_staging::canonical_range_staging(std::shared_ptr<lattice_db> own
     for(auto n:{limits.channels,limits.content_pages,limits.identities,limits.content_bytes,limits.receipt_pages,limits.receipts,limits.receipt_bytes,limits.stored_bytes})if(n<0)fail(code::invalid_argument,"negative canonical staging limit");
     const auto& b=codec.maximum;const auto& v=codec.values;
     if(!b.frame_bytes||b.frame_bytes>16*1024*1024||!b.payload_bytes||b.payload_bytes>b.frame_bytes||!b.items_per_page||b.items_per_page>4096||
-        !codec.depth||codec.depth>64||!codec.nodes||codec.nodes>65536||codec.string_bytes<64||codec.string_bytes>b.frame_bytes||
-        codec.request_entries>4096||codec.request_targets>4096||codec.request_target_bytes>16*1024*1024||!codec.restart_bytes||codec.restart_bytes>16*1024*1024||!codec.lease_ms||codec.lease_ms>static_cast<uint64_t>(max_int)||
+        !codec.depth||codec.depth>64||!codec.nodes||codec.nodes>262144||codec.string_bytes<64||codec.string_bytes>b.frame_bytes||
+        codec.request_entries>8192||codec.request_targets>8192||codec.request_target_bytes>16*1024*1024||!codec.restart_bytes||codec.restart_bytes>16*1024*1024||!codec.lease_ms||codec.lease_ms>static_cast<uint64_t>(max_int)||
         !v.raw_bytes||v.raw_bytes>16*1024*1024||!v.fields||v.fields>4096||!v.name_bytes||v.name_bytes>256||v.value_bytes>v.raw_bytes||v.decoded_bytes>v.raw_bytes)
         fail(code::invalid_argument,"invalid canonical staging codec limits");
     for(auto n:{b.content_pages,b.content_identities,b.content_bytes,b.receipt_pages,b.receipts,b.receipt_bytes})count(n);

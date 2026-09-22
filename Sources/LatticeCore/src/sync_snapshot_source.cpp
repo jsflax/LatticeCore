@@ -340,8 +340,8 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     const canonical_namespace_profile* namespaces=nullptr) {
     validate_budget(b.rows);
     if(namespaces)namespaces->validate();
-    check(!scope.empty()&&scope.size()<=b.rows.tables&&b.requests>0&&b.requests<=4096&&
-        b.requested_targets>0&&b.requested_targets<=4096&&b.marker_batch>0&&b.marker_batch<=4096&&
+    check(!scope.empty()&&scope.size()<=b.rows.tables&&b.requests>0&&b.requests<=8192&&
+        b.requested_targets>0&&b.requested_targets<=8192&&b.marker_batch>0&&b.marker_batch<=4096&&
         requests.size()<=b.requests,"invalid canonical capture limits");
     const auto& l=b.store;
     check(l.markers>=0&&l.marker_bytes>=0&&l.receipts>=0&&l.receipt_bytes>=0&&l.batch_identities>0&&

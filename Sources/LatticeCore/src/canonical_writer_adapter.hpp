@@ -59,6 +59,7 @@ class canonical_namespace_admission {
     canonical_namespace_entry namespace_;
     std::string replica_;
     std::shared_ptr<authenticated_session_fence> authenticated_;
+    std::shared_ptr<const std::atomic<bool>> ready_operation_current_;
     canonical_namespace_admission() = default;
 public:
     canonical_namespace_admission(const canonical_namespace_admission&) = default;
@@ -92,11 +93,18 @@ class canonical_writer_adapter {
         const canonical_namespace_admission&);
     canonical_namespace_admission admit_authenticated_session(std::shared_ptr<lattice_db>,
         const std::string&,const std::string&,std::shared_ptr<authenticated_session_fence>);
+    static canonical_namespace_admission ready_operation_admission(const canonical_namespace_admission&,
+        std::shared_ptr<const std::atomic<bool>>);
     std::string authenticated_descriptor_digest()const;
     static const recovery_owner_schema& authenticated_catalog(const lattice_db&) noexcept;
+    static std::shared_ptr<instance_guard> authenticated_owner_guard(const lattice_db&) noexcept;
+    std::shared_ptr<const std::atomic<bool>> authenticated_active_guard()const noexcept;
     static std::shared_ptr<canonical_writer_adapter> open_authenticated_source(std::shared_ptr<lattice_db>,
         const canonical_namespaced_writer_profile&,canonical_upstream_limits,canonical_retention_limits,
         const canonical_ready_profile&,bool);
+    recovery_install_result expire_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&);
+    recovery_install_result discard_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_range::attempt&,const canonical_range::request&);
     std::vector<std::string> apply_upstream_impl(std::shared_ptr<lattice_db>,
         const std::vector<audit_log_entry>&, const std::optional<std::string>&,
         const canonical_namespace_admission*);

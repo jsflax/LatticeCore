@@ -8892,6 +8892,7 @@ inline void lattice_db::close() {
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
         closed_.store(true, std::memory_order_seq_cst);
+        guard_->alive.store(false, std::memory_order_seq_cst);
         ++connection_revision_;
         writer = db_; reader = read_db_; xproc = xproc_read_db_;
     }
@@ -8943,9 +8944,10 @@ inline void lattice_db::close() {
 }
 
 inline lattice_db::~lattice_db() {
+    closed_.store(true, std::memory_order_seq_cst);
+    guard_->alive.store(false, std::memory_order_seq_cst);
     managed_observers_.retire();
     deactivate_projection_pressure();
-    closed_.store(true, std::memory_order_seq_cst);
     shutdown_projection_reads();
     auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
     LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",

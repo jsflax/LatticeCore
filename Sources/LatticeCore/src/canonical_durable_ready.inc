@@ -50,7 +50,7 @@ void validate_ready_profile(const canonical_ready_profile& p,const canonical_wri
     if(p.authority.empty() || p.authority.size()>256 || p.transfers<=0 || p.transfers>64 || p.bindings<=0 || p.bindings>1024 ||
        p.charged_bytes<=0 || p.charged_bytes>512LL*1024*1024 || p.transfer_bytes<4096 || p.transfer_bytes>p.charged_bytes ||
        p.package.retained_wire_bytes==0 || p.package.retained_wire_bytes>static_cast<uint64_t>(p.transfer_bytes) ||
-       p.package.frames<2 || p.package.frames>65536 || p.package.codec.maximum.frame_bytes>1024*1024 ||
+       p.package.frames<2 || p.package.frames>65536 || p.package.codec.maximum.frame_bytes>4*1024*1024 ||
        p.package.codec.lease_ms>static_cast<uint64_t>(retention.duration_ms) || p.capture.store!=source.limits)
         refuse("canonical READY invalid bounded persistent policy");
     const auto& c=p.capture;const auto& s=c.rows;const auto& v=s.wire;
@@ -58,7 +58,7 @@ void validate_ready_profile(const canonical_ready_profile& p,const canonical_wri
        !v.rows_per_page || v.rows_per_page>4096 || !v.pages || v.pages>65536 || !v.total_rows || v.total_rows>1048576 ||
        !v.total_bytes || v.total_bytes>static_cast<uint64_t>(p.transfer_bytes) || !v.depth || v.depth>64 || !v.nodes || v.nodes>65536 ||
        !s.tables || s.tables>64 || !s.columns_per_table || s.columns_per_table>128 || !s.indexes_per_table || s.indexes_per_table>128 ||
-       !c.requests || c.requests>4096 || !c.requested_targets || c.requested_targets>4096 || !c.marker_batch || c.marker_batch>4096)
+       !c.requests || c.requests>8192 || !c.requested_targets || c.requested_targets>8192 || !c.marker_batch || c.marker_batch>4096)
         refuse("canonical READY capture policy outside hard caps");
     cr::attempt a{"00000000-0000-4000-8000-000000000001","00000000-0000-4000-8000-000000000002","qualification",1,
                   "00000000-0000-4000-8000-000000000003"};
@@ -594,6 +594,31 @@ recovery_install_result canonical_writer_adapter::abandon_ready_owned(std::share
         if(integer(row,"sequence")!=held.sequence_ || std::get<cr::request>(ready_request(row,*state->ready).body).request_digest!=held.request_digest_)
             refuse("canonical READY source disposal identity differs");
         dispose_ready(actual,*state->ready,row);
+    });
+}
+recovery_install_result canonical_writer_adapter::expire_authenticated_ready(std::shared_ptr<lattice_db> owner,
+    const canonical_namespace_admission& admission) {
+    auto state=context_;auto writer=writer_;auto session=retention_;const auto held=admission;
+    return retention_owned(owner,writer,state,session,retention_expire,[&](database& actual,retention_session& clock){
+        validate_namespace_admission(owner,writer,state,held);
+        if(!state->ready)refuse("canonical READY expiry profile unavailable");
+        // Only this physical incarnation's expired leases are comparable.
+        // Completed prior-incarnation capsules retain exact resume/discard.
+        expire_ready_rows(actual,*state,clock);expire_retention(actual,clock.now());
+        validate_namespace_admission(owner,writer,state,held);
+    });
+}
+recovery_install_result canonical_writer_adapter::discard_authenticated_ready(std::shared_ptr<lattice_db> owner,
+    const canonical_namespace_admission& admission,const cr::attempt& attempt,const cr::request& request) {
+    auto state=context_;auto writer=writer_;auto session=retention_;const auto held=admission;
+    return retention_owned(owner,writer,state,session,ready_abandon,[&](database& actual,retention_session&){
+        validate_namespace_admission(owner,writer,state,held);
+        if(!state->ready || request.source!=ready_source(state->profile,*state->ready))refuse("canonical READY disposal source differs");
+        const auto& p=*state->ready;const auto raw=cr::encode({attempt,ready_route,request},p.package.codec);
+        (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
+        const auto row=ready_row(actual,p,ready_binding(held.namespace_.namespace_id,held.replica_,attempt));
+        ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_);
+        dispose_ready(actual,p,row);validate_namespace_admission(owner,writer,state,held);
     });
 }
 recovery_install_result canonical_writer_adapter::expire_ready_owned(std::shared_ptr<lattice_db> owner) {

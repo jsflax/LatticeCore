@@ -59,8 +59,8 @@ void wire_budget(const wire_limits& b){
 }
 void budgets(const limits& b){
     wire_budget(b.maximum);
-    check(b.depth>0&&b.depth<=64&&b.nodes>0&&b.nodes<=65536&&b.string_bytes>=64&&b.string_bytes<=b.maximum.frame_bytes,"invalid canonical parser budget");
-    check(b.request_entries<=4096&&b.request_targets<=4096&&b.request_target_bytes<=frame_max&&b.restart_bytes>0&&b.restart_bytes<=frame_max&&b.lease_ms>0&&b.lease_ms<=maximum,"invalid canonical metadata budget");
+    check(b.depth>0&&b.depth<=64&&b.nodes>0&&b.nodes<=262144&&b.string_bytes>=64&&b.string_bytes<=b.maximum.frame_bytes,"invalid canonical parser budget");
+    check(b.request_entries<=8192&&b.request_targets<=8192&&b.request_target_bytes<=frame_max&&b.restart_bytes>0&&b.restart_bytes<=frame_max&&b.lease_ms>0&&b.lease_ms<=maximum,"invalid canonical metadata budget");
     const auto& v=b.values;
     check(v.raw_bytes>0&&v.raw_bytes<=frame_max&&v.fields>0&&v.fields<=4096&&v.name_bytes>0&&v.name_bytes<=256&&v.value_bytes<=v.raw_bytes&&v.decoded_bytes<=v.raw_bytes,"invalid canonical value budget");
 }

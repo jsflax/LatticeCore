@@ -7,6 +7,7 @@
 #include <thread>
 #include <csignal>
 #include <cstdio>
+#include <deque>
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 #include <unistd.h>
 #endif
@@ -1029,6 +1030,180 @@ TEST(Sync, DuplicateEntrySkipped) {
     lattice::apply_remote_changes(db, {entry});
     EXPECT_EQ(db.objects<TestPerson>().size(), 1u);
 }
+
+// ----------------------------------------------------------------------------
+// Explicit lifecycle changes invalidate retries that have not started dialing.
+// ----------------------------------------------------------------------------
+
+#ifndef __EMSCRIPTEN__
+namespace {
+class reconnect_manual_scheduler final : public lattice::scheduler {
+    mutable std::mutex mutex_;
+    std::deque<std::function<void()>> pending_;
+    std::thread::id executing_;
+    bool stopped_ = false;
+public:
+    void invoke(std::function<void()>&& fn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!stopped_) pending_.push_back(std::move(fn));
+    }
+    bool is_on_thread() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return executing_ == std::this_thread::get_id();
+    }
+    bool is_same_as(const lattice::scheduler* other) const noexcept override {
+        return this == other;
+    }
+    bool can_invoke() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !stopped_;
+    }
+    void shutdown() override {
+        std::deque<std::function<void()>> retired;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopped_ = true;
+            pending_.swap(retired);
+        }
+        // Destroy captures outside the queue lock, like production schedulers.
+    }
+    size_t pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pending_.size();
+    }
+    bool run_one() {
+        std::function<void()> fn;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_.empty()) return false;
+            fn = std::move(pending_.front());
+            pending_.pop_front();
+            executing_ = std::this_thread::get_id();
+        }
+        try { fn(); }
+        catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            executing_ = {};
+            throw;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        executing_ = {};
+        return true;
+    }
+};
+
+// No socket or network. connect deliberately stays CONNECTING so the tests
+// cannot accidentally rely on is_connected_ to suppress an obsolete retry.
+class reconnect_controlled_transport final : public lattice::sync_transport {
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_error_handler on_error_;
+    const bool redialable_;
+    size_t connects_ = 0;
+public:
+    explicit reconnect_controlled_transport(bool redialable) : redialable_(redialable) {}
+    void connect(const std::string&, const std::map<std::string, std::string>&) override {
+        ++connects_;
+        state_ = lattice::transport_state::connecting;
+    }
+    void disconnect() override { state_ = lattice::transport_state::closed; }
+    lattice::transport_state state() const override { return state_; }
+    bool supports_reconnect() const override { return redialable_; }
+    void send(const lattice::transport_message&) override {}
+    void set_on_open(on_open_handler) override {}
+    void set_on_message(on_message_handler) override {}
+    void set_on_error(on_error_handler handler) override { on_error_ = std::move(handler); }
+    void set_on_close(on_close_handler) override {}
+    void fail() {
+        state_ = lattice::transport_state::closed;
+        if (on_error_) on_error_("controlled connection failure");
+    }
+    size_t connects() const { return connects_; }
+};
+
+struct reconnect_controlled_case {
+    std::shared_ptr<reconnect_manual_scheduler> queue = std::make_shared<reconnect_manual_scheduler>();
+    reconnect_controlled_transport* transport = nullptr;
+    std::unique_ptr<lattice::synchronizer> sync;
+    explicit reconnect_controlled_case(bool wss = true, bool redialable = true) {
+        auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(":memory:", queue));
+        lattice::sync_config config;
+        config.websocket_url = wss ? "ws://test.invalid/controlled-retry" : "";
+        config.sync_id = "controlled-retry";
+        config.all_active_sync_ids = {config.sync_id};
+        config.base_delay_seconds = 0;
+        config.max_delay_seconds = 0;
+        config.upload_coalesce_ms = 0;
+        config.checkpoint_passive_interval_ms = 0; // no pacer thread
+        auto owned_transport = std::make_unique<reconnect_controlled_transport>(redialable);
+        transport = owned_transport.get();
+        sync = std::make_unique<lattice::synchronizer>(std::move(db), config,
+                                                    std::move(owned_transport));
+    }
+};
+} // namespace
+
+TEST(Sync, QueuedReconnectCannotUndoExplicitDisconnect) {
+    reconnect_controlled_case test;
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 1u);
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->disconnect();
+    ASSERT_TRUE(test.queue->run_one()); // execute the already-admitted retry
+    EXPECT_EQ(test.transport->connects(), 1u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::closed);
+    EXPECT_FALSE(test.sync->is_connected());
+    // Old queued work must not silently re-enable admission for a later error.
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+
+TEST(Sync, QueuedReconnectCannotJoinAnExplicitReplacement) {
+    reconnect_controlled_case test;
+    test.sync->connect();
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->disconnect();
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 2u);
+    ASSERT_EQ(test.transport->state(), lattice::transport_state::connecting);
+    ASSERT_FALSE(test.sync->is_connected());
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 2u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::connecting);
+    // A failure belonging to the current lifecycle still gets its own retry.
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 3u);
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+
+TEST(Sync, ExplicitConnectInvalidatesAnOlderQueuedReconnect) {
+    reconnect_controlled_case test(false); // injected/IPC dialer policy
+    test.sync->connect();
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->connect(); // replacement without a preceding explicit stop
+    ASSERT_EQ(test.transport->connects(), 2u);
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 2u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::connecting);
+}
+
+TEST(Sync, ExplicitConnectPreservesNonRedialableTransportPolicy) {
+    reconnect_controlled_case test(false, false);
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 1u); // initial connect remains allowed
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+    test.sync->disconnect();
+    test.sync->connect();
+    EXPECT_EQ(test.transport->connects(), 2u);
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // Backoff: flapping endpoint must walk the exponential ladder

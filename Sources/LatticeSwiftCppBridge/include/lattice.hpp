@@ -18,6 +18,7 @@
 #include <bulk_mutation.hpp>
 #include <projection.hpp>
 #include <recovery_export.hpp>
+#include <recovery_relay.hpp>
 #include <list.hpp>
 #include <error.hpp>
 
@@ -3771,6 +3772,14 @@ public:
         void* context,int32_t(*enqueue)(void*,const uint8_t*,size_t,uint64_t),
         void(*destroy)(void*),const server_export_limits& limits) const noexcept
         SWIFT_NAME(makeServerExportEndpointForQualification(context:enqueue:destroy:limits:));
+
+    // Real relay setup only: current/destroy retain the actual SDK connection
+    // cell. No qualified admission is exposed; the exact live setup consumes
+    // its application authorization once. Null destroy leaves caller custody;
+    // a nonnull nonthrowing destroy transfers context on every outcome.
+    relay_recovery_setup open_relay_recovery_setup(const std::string& policy,const std::string& connection,
+        void* context,int32_t(*current)(void*),void(*destroy)(void*))const noexcept
+        SWIFT_NAME(openRelayRecoverySetup(policy:connection:context:current:destroy:));
 
     // CRUD
     void add(const dynamic_object_ref& ref, cxx_error& err) const { impl().add(ref, err); }

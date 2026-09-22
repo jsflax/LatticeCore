@@ -1,4 +1,5 @@
 #include "canonical_writer_adapter.hpp"
+#include "recovery_authenticated_session.hpp"
 #include "recovery_writer_access.hpp"
 #include "vendor/picosha2/picosha2.h"
 #include <atomic>
@@ -766,11 +767,47 @@ void canonical_writer_adapter::validate_namespace_admission(const std::shared_pt
        admission.context_.get()!=state.get() || state->owner!=owner.get())refuse("canonical namespace admission belongs to another actual owner");
     bool found=false;for(const auto& entry:state->namespaces->entries)if(entry==admission.namespace_)found=true;
     if(!found || admission.replica_.empty())refuse("canonical namespace admission provenance differs");
+    if(admission.authenticated_ && !admission.authenticated_->live())refuse("authenticated relay session retired");
     std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
     if(owner->closed_.load() || owner->db_!=writer || owner->connection_revision_!=admission.revision_ ||
        !state->active->load(std::memory_order_acquire) || writer->is_closed() || !matches_connection(*writer,state->connection))
         refuse("canonical namespace admission physical session retired");
 }
+canonical_namespace_admission canonical_writer_adapter::admit_authenticated_session(std::shared_ptr<lattice_db> owner,
+    const std::string& ns,const std::string& replica,std::shared_ptr<authenticated_session_fence> fence) {
+    if(!fence || !fence->live())refuse("authenticated relay setup has not been authorized");
+    // This private issuer is reached only through the actual mounted setup's
+    // exact authorization consumption. It never invokes the fixture issuer.
+    canonical_namespace_admission result;auto state=context_;auto writer=writer_;
+    if(!owner || !state || !state->namespaces || state->owner!=owner.get() || replica.empty() || replica.size()>256)
+        refuse("authenticated relay actual owner or replica unavailable");
+    bool found=false;for(const auto& entry:state->namespaces->entries)if(entry.namespace_id==ns){result.namespace_=entry;found=true;}
+    if(!found)refuse("authenticated relay namespace is not enrolled");
+    result.owner_=owner;result.writer_=writer;result.context_=state;result.replica_=replica;result.authenticated_=std::move(fence);
+    {std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);result.revision_=owner->connection_revision_;}
+    validate_namespace_admission(owner,writer,state,result);return result;
+}
+// Only the real relay setup calls this production entry. Durability is an
+// explicit opt-in of that mount, before protected enrollment; ordinary opens
+// and qualification attachment retain their existing behavior.
+std::shared_ptr<canonical_writer_adapter> canonical_writer_adapter::open_authenticated_source(
+    std::shared_ptr<lattice_db> owner,const canonical_namespaced_writer_profile& p,
+    canonical_upstream_limits upstream,canonical_retention_limits retention,
+    const canonical_ready_profile& ready,bool wal_full) {
+    if(!owner || !wal_full || owner->is_closed() || owner->config_.read_only ||
+       owner->config_.is_sync_enabled() || owner->config_.is_ipc_enabled() || owner->db_->is_in_transaction())
+        refuse("authenticated relay source requires explicit idle WAL/FULL owner");
+    auto writer=owner->db_;
+    // Do not rewrite pragmas on an already protected/reopened source. The
+    // constructor independently verifies the actual durability and custody.
+    const auto mode=writer->query("PRAGMA main.journal_mode");
+    if(mode.size()!=1 || string(mode[0],"journal_mode")!="wal")refuse("authenticated relay source requires file WAL");
+    const auto sync=integer(writer->query("PRAGMA main.synchronous").at(0),"synchronous");
+    if(sync!=2 && sync!=3)writer->execute("PRAGMA main.synchronous=FULL");
+    p.namespaces.validate();validate_ready_profile(ready,p.writer,retention);
+    return std::shared_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p.writer,&upstream,&retention,&p.namespaces,&ready));
+}
+std::string canonical_writer_adapter::authenticated_descriptor_digest()const{return context_->source_descriptor_digest;}
 canonical_namespace_admission canonical_writer_adapter::admit_namespace_for_qualification(std::shared_ptr<lattice_db> owner,
     const std::string& namespace_id,const std::string& replica_id) {
     auto state=context_;auto writer=writer_;
@@ -838,6 +875,8 @@ void canonical_upstream_delivery::validate_chunk(lattice_db& owner,database& wri
     if(namespace_admission_ && (namespace_admission_->owner_!=owner_ || namespace_admission_->writer_!=writer_ ||
        namespace_admission_->context_.get()!=context_.get() || namespace_admission_->revision_!=revision_))
         refuse("canonical namespace chunk physical admission differs");
+    if(namespace_admission_ && namespace_admission_->authenticated_ && !namespace_admission_->authenticated_->live())
+        refuse("authenticated relay chunk admission retired");
 }
 void canonical_upstream_delivery::validate_envelope(const std::vector<audit_log_entry>& entries,
     const std::optional<std::string>& channel) const {

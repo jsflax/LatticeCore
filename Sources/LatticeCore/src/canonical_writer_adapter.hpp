@@ -11,6 +11,8 @@
 namespace lattice::detail {
 class canonical_upstream_delivery;
 class canonical_namespace_admission;
+class authenticated_relay_setup;
+class authenticated_session_fence;
 struct canonical_source_session_test_access;
 struct canonical_retention_test_access;
 namespace canonical_upstream_test_hooks {
@@ -41,9 +43,10 @@ struct canonical_namespaced_writer_profile {
     canonical_writer_profile writer;
     canonical_namespace_profile namespaces;
 };
-// Opaque qualification admission only. The explicitly named fixture issuer
-// below binds supplied test identities to the actual owner; it does not
-// authenticate them. The trusted application/TLS issuer remains unimplemented.
+// Opaque actual-owner admission. The named fixture issuer below remains
+// qualification-only. The private real relay setup separately binds its
+// registered-peer application outcome and live physical session; neither
+// path establishes the receiver's trusted platform TLS/source authority.
 // Copies retain the actual physical owner but cannot survive its retirement.
 class canonical_namespace_admission {
     friend class canonical_writer_adapter;
@@ -54,6 +57,7 @@ class canonical_namespace_admission {
     uint64_t revision_=0;
     canonical_namespace_entry namespace_;
     std::string replica_;
+    std::shared_ptr<authenticated_session_fence> authenticated_;
     canonical_namespace_admission() = default;
 public:
     canonical_namespace_admission(const canonical_namespace_admission&) = default;
@@ -63,6 +67,7 @@ struct canonical_upstream_limits {
     size_t entries, field_bytes, delivery_bytes; // explicit finite caller budgets
 };
 class canonical_writer_adapter {
+    friend class authenticated_relay_setup;
     friend void require_canonical_relation(database&, const std::string&);
     friend class canonical_upstream_delivery;
     struct context;
@@ -83,6 +88,12 @@ class canonical_writer_adapter {
     static void validate_namespace_admission(const std::shared_ptr<lattice_db>&,
         const std::shared_ptr<database>&, const std::shared_ptr<context>&,
         const canonical_namespace_admission&);
+    canonical_namespace_admission admit_authenticated_session(std::shared_ptr<lattice_db>,
+        const std::string&,const std::string&,std::shared_ptr<authenticated_session_fence>);
+    std::string authenticated_descriptor_digest()const;
+    static std::shared_ptr<canonical_writer_adapter> open_authenticated_source(std::shared_ptr<lattice_db>,
+        const canonical_namespaced_writer_profile&,canonical_upstream_limits,canonical_retention_limits,
+        const canonical_ready_profile&,bool);
     std::vector<std::string> apply_upstream_impl(std::shared_ptr<lattice_db>,
         const std::vector<audit_log_entry>&, const std::optional<std::string>&,
         const canonical_namespace_admission*);

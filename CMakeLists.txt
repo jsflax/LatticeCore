@@ -84,6 +84,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/recovery_install_transaction.cpp
     Sources/LatticeCore/src/canonical_change_store.cpp
     Sources/LatticeCore/src/canonical_writer_adapter.cpp
+    Sources/LatticeCore/src/recovery_authenticated_session.cpp
     Sources/LatticeCore/src/sync_recovery_protocol.cpp
     Sources/LatticeCore/src/sync_canonical_range.cpp
     Sources/LatticeCore/src/canonical_range_staging.cpp
@@ -124,6 +125,7 @@ add_library(LatticeSwiftCppBridge STATIC
     Sources/LatticeSwiftCppBridge/src/bulk_mutation.cpp
     Sources/LatticeSwiftCppBridge/src/projection.cpp
     Sources/LatticeSwiftCppBridge/src/recovery_export.cpp
+    Sources/LatticeSwiftCppBridge/src/recovery_relay.cpp
     Sources/LatticeSwiftCppBridge/src/dynamic_object.cpp
     Sources/LatticeSwiftCppBridge/src/managed_object.cpp
     Sources/LatticeSwiftCppBridge/src/unmanaged_object.cpp
@@ -240,6 +242,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp
     Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp
     Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp
+    Tests/LatticeCoreTests/AuthenticatedRelaySessionTests.cpp
     Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp
     Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
     Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp

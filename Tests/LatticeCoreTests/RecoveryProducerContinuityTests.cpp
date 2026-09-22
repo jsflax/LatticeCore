@@ -112,6 +112,25 @@ void known_commit(const recovery_install_result& result) {
     if(result.postcommit_error)std::rethrow_exception(result.postcommit_error);
 }
 int64_t number(database& db,const std::string& sql){return std::get<int64_t>(db.query(sql).at(0).at("n"));}
+// Failure-only diagnostics for the actual read-only constructor. Do not add a
+// preliminary SQLite open, change flags, or manufacture missing WAL sidecars.
+database diagnostic_readonly_open(const std::string& path,const char* phase) {
+    try { return database(path,database::open_mode::read_only); }
+    catch(const db_error& original) {
+        std::string context="readonly fixture phase="+std::string(phase)+" path="+path;
+        for(const auto& suffix:{std::string(),std::string("-wal"),std::string("-shm")}) {
+            std::error_code status_error,size_error;
+            const auto state=std::filesystem::symlink_status(path+suffix,status_error);
+            const auto size=std::filesystem::file_size(path+suffix,size_error);
+            context+=" [after-failure suffix="+(suffix.empty()?std::string("main"):suffix)+
+                " type="+std::to_string(static_cast<int>(state.type()))+
+                " permissions="+std::to_string(static_cast<unsigned>(state.permissions()))+
+                " status_error="+std::to_string(status_error.value())+
+                " size="+std::to_string(size)+" size_error="+std::to_string(size_error.value())+"]";
+        }
+        throw db_error(context+": "+original.what());
+    }
+}
 struct continuity_fault {
     recovery_local_producer_test_hooks::authorizer_fault fault;
     const recovery_local_producer_test_hooks::authorizer_fault* prior;
@@ -659,7 +678,7 @@ TEST_F(RecoveryProducerContinuity, ReadOnlyCopiedAndAliasedProtectedFilesStillRe
     TempDB copied{"continuous_readonly_copy"};
     std::filesystem::copy_file(config().path,copied.str(),std::filesystem::copy_options::overwrite_existing);
     {
-        database copy(copied.str(),database::open_mode::read_only);
+        database copy=diagnostic_readonly_open(copied.str(),"copied-main");
         EXPECT_EQ(number(copy,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
         EXPECT_THROW(copy.handle(),db_error);
         EXPECT_THROW(query_audit_log(copy),db_error);
@@ -669,7 +688,7 @@ TEST_F(RecoveryProducerContinuity, ReadOnlyCopiedAndAliasedProtectedFilesStillRe
     const auto alias=container.parent_path()/(unique.path.filename().string()+"-readonly-alias");
     std::filesystem::create_directory_symlink(container,alias);
     struct remove_alias {std::filesystem::path path;~remove_alias(){std::error_code error;std::filesystem::remove(path,error);}} cleanup{alias};
-    database reader((alias/"store.sqlite").string(),database::open_mode::read_only);
+    database reader=diagnostic_readonly_open((alias/"store.sqlite").string(),"aliased-main");
     EXPECT_EQ(number(reader,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
     EXPECT_THROW(reader.handle(),db_error);
     EXPECT_THROW(events_after(reader,std::nullopt),db_error);

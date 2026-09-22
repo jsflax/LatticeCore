@@ -1,3 +1,4 @@
+#include "recovery_producer_continuity.hpp"
 // lattice.cpp - Implementation moved to header (templates)
 // This file kept for potential non-template implementations
 
@@ -5,12 +6,181 @@
 #include "lattice/ipc.hpp"
 #include <cstdlib>
 #include <set>
+#include <limits>
+#include <exception>
 #include <unordered_set>
+#include <cstring>
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 namespace lattice {
+
+namespace {
+// Maintenance already refuses contended topology. Do the same for its old
+// writer rather than wait under topology behind a legacy SQLite callback.
+struct managed_writer_publication_hold {
+    sqlite3_mutex* mutex;
+    managed_writer_publication_hold(sqlite3* connection, const std::atomic<size_t>& active)
+        : mutex(connection ? sqlite3_db_mutex(connection) : nullptr) {
+#ifndef __EMSCRIPTEN__
+        if (connection && !mutex) throw db_error("writer maintenance requires a serialized connection");
+#endif
+        if (sqlite3_mutex_try(mutex) != SQLITE_OK)
+            throw db_error("writer maintenance refused while writer is busy");
+        if (active.load(std::memory_order_acquire) != 0) {
+            sqlite3_mutex_leave(mutex);
+            throw db_error("writer maintenance refused during managed scalar delivery");
+        }
+    }
+    ~managed_writer_publication_hold() { sqlite3_mutex_leave(mutex); }
+    managed_writer_publication_hold(const managed_writer_publication_hold&) = delete;
+    managed_writer_publication_hold& operator=(const managed_writer_publication_hold&) = delete;
+};
+}
+
+thread_local detail::managed_route_scope* detail::managed_route_scope::current_ = nullptr;
+
+bool detail::managed_route_scope::active_for(const database* db) noexcept {
+    for (auto* frame = current_; frame; frame = frame->previous_)
+        if (frame->db_ == db) return true;
+    return false;
+}
+
+bool detail::managed_route_scope::active_for(const lattice_db* owner) noexcept {
+    for (auto* frame = current_; frame; frame = frame->previous_)
+        if (frame->owner_ == owner) return true;
+    return false;
+}
+
+detail::managed_route_scope::managed_route_scope(database* db, lattice_db* owner,
+    const std::string& table, int64_t token, const std::weak_ptr<database>& captured_writer, bool vector_write) {
+    // Explicitly assigned ownerless fields retain their raw database contract.
+    if (!db || !owner) return;
+    if (vector_write && active_for(db))
+        throw db_error("managed field: reentrant vector mutation during scalar access");
+    // Keep the common main-model getter free of parsing, atomics and locks.
+    if (token == 0 && table.find('.') == std::string::npos &&
+        (table.empty() || table.front() != '"')) return;
+    const auto route = managed_route(table);
+    if (token == 0 && (route.schema_sql == "main" || route.schema_sql == "\"main\"")) return;
+    if (token <= 0) throw db_error("managed field: missing attachment generation");
+
+    // Lock the captured weak control block, not a current writer found by
+    // raw address. Expired old handles cannot revive after allocator reuse.
+    writer_owner_ = captured_writer.lock();
+    if (!writer_owner_ || writer_owner_.get() != db)
+        throw db_error("managed field: detached or retired attachment writer");
+
+    // Memory vec0 maintenance owns its existing store gate before SQLite.
+    // A SQLite callback already inside a scalar scope must not wait for it.
+#ifdef __EMSCRIPTEN__
+    const bool vector_gate_needed = vector_write;
+#else
+    const bool vector_gate_needed = vector_write && owner->config_.is_in_memory();
+#endif
+    if (vector_gate_needed) {
+        if (active_for(db))
+            throw db_error("managed field: reentrant vector mutation during scalar access");
+        auto& gate = owner->store_write_gate_ ? *owner->store_write_gate_ : owner->vec0_memory_maintenance_gate_;
+        vector_gate_ = std::unique_lock<std::recursive_timed_mutex>(gate);
+    }
+    auto* mutex = sqlite3_db_mutex(db->internal_handle());
+#ifndef __EMSCRIPTEN__
+    if (!mutex) throw db_error("managed field: attachment writer is not serialized");
+#endif
+    sqlite3_mutex_enter(mutex);
+    try {
+        if (owner->closed_.load() || db->is_closed())
+            throw db_error("managed field: attachment writer is closed");
+        auto view = std::atomic_load(&owner->managed_attachment_view_);
+        const lattice_db::managed_attachment_binding* current = nullptr;
+        if (view) for (const auto& binding : *view) {
+            if (binding->token == token && !binding->writer.owner_before(captured_writer) &&
+                !captured_writer.owner_before(binding->writer) &&
+                binding->valid.load(std::memory_order_acquire)) {
+                current = binding.get();
+                break;
+            }
+        }
+        if (!current || (route.schema_sql != managed_quote_identifier(current->alias) &&
+                         route.schema_sql != current->alias))
+            throw db_error("managed field: detached or stale attachment route");
+        // Like checked bulk mutation, detect an unbookkept different-file
+        // binding. No PRAGMA/authorizer action is added to a scalar read.
+        // Raw same-file detach/reattach cannot establish a new Core token.
+        const char* filename = sqlite3_db_filename(db->internal_handle(), current->alias.c_str());
+        if (!filename) throw db_error("managed field: attachment is missing");
+        std::string actual(filename);
+        if (actual != current->filename) {
+            std::error_code error;
+            const auto canonical = actual.empty() ? std::filesystem::path{} :
+                std::filesystem::weakly_canonical(actual, error);
+            if (error || canonical.string() != current->filename)
+                throw db_error("managed field: attachment physical database changed");
+        }
+        db_ = db;
+        owner_ = owner;
+        mutex_ = mutex;
+        exceptions_ = std::uncaught_exceptions();
+        previous_ = current_;
+        owner_->active_managed_attachment_operations_.fetch_add(1, std::memory_order_acq_rel);
+        current_ = this;
+    } catch (...) {
+        sqlite3_mutex_leave(mutex);
+        throw;
+    }
+}
+
+detail::managed_route_scope::~managed_route_scope() noexcept(false) {
+    if (!db_) return;
+    struct complete_operation {
+        std::atomic<size_t>& active;
+        ~complete_operation() { active.fetch_sub(1, std::memory_order_release); }
+    } complete{owner_->active_managed_attachment_operations_};
+    current_ = previous_;
+    sqlite3_mutex_leave(mutex_);
+    if (vector_gate_.owns_lock()) vector_gate_.unlock();
+    // Nested scopes leave delivery to their outer successful scope. A failed
+    // operation retains the existing query/update exception-tail behavior.
+    if (std::uncaught_exceptions() == exceptions_) db_->drain_if_settled();
+}
+
+void lattice_db::publish_managed_attachment(const std::string& alias, const std::string& path,
+    int64_t token, const std::shared_ptr<database>& writer) {
+    auto next = std::make_shared<managed_attachment_view>();
+    if (auto old = std::atomic_load(&managed_attachment_view_)) {
+        for (const auto& binding : *old)
+            if (binding->valid.load(std::memory_order_acquire)) next->push_back(binding);
+    }
+    std::string filename;
+    if (!configuration::path_is_memory(path)) {
+        std::error_code error;
+        filename = std::filesystem::weakly_canonical(path, error).string();
+        if (error) throw db_error("cannot capture managed attachment filename");
+    }
+    next->push_back(std::make_shared<managed_attachment_binding>(alias, filename, token, writer));
+    std::atomic_store(&managed_attachment_view_, std::shared_ptr<const managed_attachment_view>(std::move(next)));
+}
+
+std::shared_ptr<const lattice_db::managed_attachment_view> lattice_db::managed_view_for_writer(
+    const std::shared_ptr<database>& writer) const {
+    auto next = std::make_shared<managed_attachment_view>();
+    // Rebuild from authoritative topology, including close_write followed by
+    // reopen, when the retired writer's published view has already been cleared.
+    for (const auto& [alias, path] : attached_dbs_) {
+        auto token = attached_route_tokens_.find(alias);
+        if (token == attached_route_tokens_.end()) continue;
+        std::string filename;
+        if (!configuration::path_is_memory(path)) {
+            std::error_code error;
+            filename = std::filesystem::weakly_canonical(path, error).string();
+            if (error) throw db_error("cannot restore managed attachment filename");
+        }
+        next->push_back(std::make_shared<managed_attachment_binding>(alias, filename, token->second, writer));
+    }
+    return next;
+}
 
 // Single definition of the global log level (declared extern in log.hpp).
 // Seed from the LATTICE_LOG_LEVEL env var (0=off..4=debug) so logging can be
@@ -64,6 +234,317 @@ cross_process_notifier* instance_registry::get_or_create_notifier(const std::str
     return raw;
 }
 
+void lattice_db::projection_pressure_map_deleter::operator()(const projection_pressure_map* value) const noexcept {
+    delete value;
+}
+
+void lattice_db::publish_projection_pressure(std::unique_ptr<const projection_pressure_map> next) {
+    // Caller serializes publishers with attach_mutex_ (or is constructing the
+    // instance before hooks exist). No SQLite/registry/service lock is held.
+    const unsigned old = projection_pressure_slot_.load();
+    const unsigned fresh = 1 - old;
+    projection_pressure_owners_[fresh].reset(next.release());
+    projection_pressure_maps_[fresh].store(projection_pressure_owners_[fresh].get());
+    projection_pressure_slot_.store(fresh);
+    // New readers use fresh. A stale pre-increment reader rechecks the slot
+    // before dereferencing; validated old readers keep this count nonzero.
+    while (projection_pressure_readers_[old].load() != 0) std::this_thread::yield();
+    projection_pressure_maps_[old].store(nullptr);
+    projection_pressure_owners_[old].reset();
+}
+void lattice_db::replace_projection_pressure_source(const std::string& schema,
+                                                   std::shared_ptr<projection_pressure_source> source) {
+    const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
+    auto next = current ? std::make_unique<projection_pressure_map>(*current) : std::make_unique<projection_pressure_map>();
+    auto prior = next->find(schema);
+    auto retired = prior == next->end() ? std::shared_ptr<projection_pressure_source>{} : prior->second;
+    if (source) { source->active.store(true); (*next)[schema] = std::move(source); }
+    else next->erase(schema);
+    publish_projection_pressure(std::move(next));
+    if (retired) retired->active.store(false);
+}
+void lattice_db::raise_projection_pressure(const char* schema) noexcept {
+    for (;;) {
+        const unsigned slot = projection_pressure_slot_.load();
+        projection_pressure_readers_[slot].fetch_add(1);
+        if (slot != projection_pressure_slot_.load()) {
+            projection_pressure_readers_[slot].fetch_sub(1); continue;
+        }
+        const auto* map = projection_pressure_maps_[slot].load();
+        if (map) {
+            const auto found = map->find(schema ? schema : "main");
+            if (found != map->end()) found->second->raise();
+        }
+        projection_pressure_readers_[slot].fetch_sub(1);
+        return;
+    }
+}
+std::vector<std::shared_ptr<projection_pressure_source>> lattice_db::projection_pressure_sources() const {
+    for (;;) {
+        const unsigned slot = projection_pressure_slot_.load();
+        projection_pressure_readers_[slot].fetch_add(1);
+        if (slot != projection_pressure_slot_.load()) {
+            projection_pressure_readers_[slot].fetch_sub(1); continue;
+        }
+        struct release { std::atomic<uint64_t>& readers; ~release() { readers.fetch_sub(1); } } release{projection_pressure_readers_[slot]};
+        std::vector<std::shared_ptr<projection_pressure_source>> sources;
+        const auto* map = projection_pressure_maps_[slot].load();
+        if (map) for (const auto& [_, source] : *map) sources.push_back(source);
+        return sources;
+    }
+}
+void lattice_db::setup_projection_pressure() {
+    if (config_.is_in_memory()) return;
+    // Best effort: legacy opens keep working on unsupported VFS/filesystems.
+    // Projected reads later require a validated identity before admission.
+    try {
+        auto source = make_projection_pressure_source(db_->physical_identity());
+        if (source) {
+            std::lock_guard<std::mutex> lock(attach_mutex_);
+            if (wal_eviction_pending_.load()) source->raise();
+            replace_projection_pressure_source("main", std::move(source));
+        }
+    } catch (...) {}
+}
+void lattice_db::deactivate_projection_pressure() {
+    std::lock_guard<std::mutex> lock(attach_mutex_);
+    // Publisher serialization keeps this map alive; destruction/close needs
+    // neither allocation nor a reader grace section to deactivate its atoms.
+    const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
+    if (current) for (const auto& [_, source] : *current) source->active.store(false);
+}
+
+std::shared_ptr<database> lattice_db::borrow_read_connection() {
+    std::shared_ptr<database> writer, reader;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        writer = db_;
+        reader = read_db_;
+    }
+    // No SQLite call under the publication mutex. A retired fallback writer
+    // stays owned through this test and the caller's entire query.
+    if (reader && writer &&
+        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id() &&
+        writer->is_in_transaction()) {
+        return writer;
+    }
+    if (reader) return reader;
+    if (writer) return writer;
+    throw db_error("read connection unavailable during maintenance");
+}
+
+std::shared_ptr<database> lattice_db::borrow_xproc_read_connection() {
+    std::shared_ptr<database> writer, reader, xproc;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        writer = db_;
+        reader = read_db_;
+        xproc = xproc_read_db_;
+    }
+    if (xproc) return xproc;
+    if (reader && writer &&
+        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id() &&
+        writer->is_in_transaction()) {
+        return writer;
+    }
+    if (reader) return reader;
+    if (writer) return writer;
+    throw db_error("xproc read connection unavailable during maintenance");
+}
+
+std::vector<database::row_t> lattice_db::query_read(
+    const std::string& sql, const std::vector<column_value_t>& params) {
+    auto connection = borrow_read_connection();
+    return connection->query(sql, params);
+}
+
+std::vector<database::row_t> lattice_db::query_xproc(
+    const std::string& sql, const std::vector<column_value_t>& params) {
+    auto connection = borrow_xproc_read_connection();
+    return connection->query(sql, params);
+}
+
+void lattice_db::close_read_db() {
+    std::shared_ptr<database> reader, xproc;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        ++connection_revision_;
+        reader.swap(read_db_);
+        xproc.swap(xproc_read_db_);
+    }
+    // In particular, do not wait for an xproc borrower: its next statement can
+    // need the writer mutex already held by the maintenance caller.
+}
+
+void lattice_db::close_write_db() {
+    if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer close refused during owned recovery install");
+    if (detail::managed_route_scope::active_for(this) ||
+        active_managed_attachment_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer close refused during managed scalar access or delivery");
+    // Preserve broad projection cancellation/grace before retiring the writer.
+    pause_projection_reads();
+    retire_all_read_generations();
+    deactivate_projection_pressure();
+    std::shared_ptr<database> writer;
+    uint64_t revision;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        writer = db_;
+        revision = connection_revision_;
+    }
+    {
+        std::unique_lock<std::mutex> attach_lock(attach_mutex_, std::try_to_lock);
+        if (!attach_lock.owns_lock())
+            throw db_error("writer close refused while attachment topology is busy");
+        managed_writer_publication_hold publication(
+            writer ? writer->internal_handle() : nullptr, active_managed_attachment_operations_);
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        if (revision != connection_revision_ || db_ != writer)
+            throw db_error("writer close invalidated by concurrent maintenance");
+        ++connection_revision_;
+        db_.reset();
+        std::atomic_store(&managed_attachment_view_, std::shared_ptr<const managed_attachment_view>{});
+    }
+    wal_eviction_pending_.store(false);
+    // No publication/attachment/writer lock survives the retired owner's release.
+}
+
+std::vector<std::shared_ptr<database>> lattice_db::view_handles() {
+    std::vector<std::shared_ptr<database>> handles;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        if (db_) handles.push_back(db_);
+        if (read_db_) handles.push_back(read_db_);
+    }
+    return handles;
+}
+
+void lattice_db::restore_attached_views(database& connection) {
+    // Caller holds attachment admission; this connection is not published.
+    if (!attachment_topology_valid_)
+        throw db_error("cannot reopen an incomplete attachment topology");
+    for (const auto& [alias, path] : attached_dbs_) {
+        std::string quoted = "\"";
+        for (char c : alias) { quoted += c; if (c == '"') quoted += '"'; }
+        quoted += '"';
+        connection.execute("ATTACH DATABASE ? AS " + quoted, {path});
+        const auto expected = attached_projection_identities_.find(alias);
+        if (expected != attached_projection_identities_.end() && expected->second) {
+            auto actual = connection.physical_identity(alias, {}, true);
+            if (!actual || !(*actual == *expected->second))
+                throw db_error("attached physical file changed during connection maintenance");
+        }
+    }
+    for (const auto& [_, sql] : attached_view_sql_) connection.execute(sql);
+}
+
+void lattice_db::reopen_write_db() {
+    if(recovery_continuous_)throw db_error("continuous writer replacement requires a new admitted facade");
+    if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer reopen refused during owned recovery install");
+    if (detail::managed_route_scope::active_for(this) ||
+        active_managed_attachment_operations_.load(std::memory_order_acquire) != 0)
+        throw db_error("writer reopen refused during managed scalar access or delivery");
+    pause_projection_reads();
+    retire_all_read_generations();
+    uint64_t revision;
+    std::shared_ptr<database> previous_writer;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        if (closed_.load(std::memory_order_seq_cst))
+            throw db_error("cannot reopen a closed lattice");
+        revision = connection_revision_;
+        previous_writer = db_;
+    }
+    auto staged = std::make_shared<database>(config_.path,
+        database::open_mode::read_write, config_.busy_timeout_ms);
+    register_sql_functions(*staged);
+    {
+        // Never wait behind topology while a caller may own the writer mutex.
+        std::unique_lock<std::mutex> attach_lock(attach_mutex_, std::try_to_lock);
+        if (!attach_lock.owns_lock())
+            throw db_error("connection reopen refused while attachment topology is busy");
+        const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
+        if (current) for (const auto& [_, source] : *current) source->active.store(false);
+        restore_attached_views(*staged);
+        detail::prepare_recovery_local_producer(*this, staged);
+        // This overload installs only hooks; pressure setup below runs after
+        // publication and outside attachment admission, as on the broad base.
+        setup_change_hook(*staged);
+        auto managed_view = managed_view_for_writer(staged);
+        managed_writer_publication_hold publication(
+            previous_writer ? previous_writer->internal_handle() : nullptr,
+            active_managed_attachment_operations_);
+        {
+            std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+            if (closed_.load(std::memory_order_seq_cst) || revision != connection_revision_ ||
+                db_ != previous_writer)
+                throw db_error("write reopen invalidated by concurrent maintenance");
+            ++connection_revision_;
+            if (previous_writer) {
+                if (auto allowed = std::atomic_load(&previous_writer->local_producer_write_allowed_))
+                    allowed->store(false, std::memory_order_release);
+            }
+            staged.swap(db_);
+            detail::publish_recovery_local_producer(*this, *db_);
+            std::atomic_store(&managed_attachment_view_, std::move(managed_view));
+        }
+        wal_eviction_pending_.store(false);
+    }
+    staged.reset();
+    previous_writer.reset(); // release the retired writer off all acquired locks
+    setup_projection_pressure();
+    {
+        std::lock_guard<std::mutex> lock(attach_mutex_);
+        const auto* current = projection_pressure_maps_[projection_pressure_slot_.load()].load();
+        if (current) for (const auto& [schema, source] : *current) {
+            if (schema != "main") {
+                source->acknowledge(source->raised.load());
+                source->active.store(true);
+            }
+        }
+    }
+    // Any failed reopen keeps admission paused; success creates a fresh service.
+    resume_projection_reads();
+}
+
+void lattice_db::reopen_read_db() {
+    if (config_.is_in_memory()) return;
+    if (config_.read_only) { request_recovery_refresh(); return; }
+    uint64_t revision;
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        if (closed_.load(std::memory_order_seq_cst))
+            throw db_error("cannot reopen a closed lattice");
+        revision = connection_revision_;
+    }
+    // No half-pair publication if either open or topology restoration fails.
+    auto reader = std::make_shared<database>(config_.path,
+        database::open_mode::read_only, config_.busy_timeout_ms);
+    auto xproc = std::make_shared<database>(config_.path,
+        database::open_mode::read_only, config_.busy_timeout_ms);
+    // A maintenance caller can already own the writer SQLite mutex. Never
+    // wait behind attach while it may be waiting for that writer. A busy
+    // topology is an explicit failed reopen, with prior publication intact.
+    std::unique_lock<std::mutex> attach_lock(attach_mutex_, std::try_to_lock);
+    if (!attach_lock.owns_lock())
+        throw db_error("connection reopen refused while attachment topology is busy");
+    restore_attached_views(*reader);
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        if (closed_.load(std::memory_order_seq_cst) || revision != connection_revision_)
+            throw db_error("read reopen invalidated by concurrent maintenance");
+        ++connection_revision_;
+        reader.swap(read_db_);
+        xproc.swap(xproc_read_db_);
+    }
+    attach_lock.unlock();
+    // Keep the prior acknowledged witness. Reopen must catch a missed install,
+    // never seed its local cursor to the latest generation without delivery.
+    request_recovery_refresh();
+}
+
 void lattice_db::setup_change_hook(database& connection) {
     LOG_DEBUG("setup_change_hook", "Setting up hooks for path: %s", config_.path.c_str());
 
@@ -84,10 +565,19 @@ void lattice_db::setup_change_hook(database& connection) {
     }
 
     // Update hook - buffers changes (called for each row change)
-    sqlite3_update_hook(connection.handle(),
+    // Installation/replacement follows the existing writer ownership rules.
+    // Retain the registered address through moves; destructor uninstalls the
+    // hook before releasing this connection-owned context.
+    if (!connection.lattice_update_hook_context_)
+        connection.lattice_update_hook_context_ = std::make_unique<database::lattice_update_hook_context>();
+    auto& hook_context = *connection.lattice_update_hook_context_;
+    hook_context.owner = this;
+    hook_context.connection = connection.internal_handle();
+    sqlite3_update_hook(connection.internal_handle(),
         [](void* user_data, int operation, const char* db_name, const char* table_name, sqlite3_int64 rowid) {
-            auto* self = static_cast<lattice_db*>(user_data);
-            database::update_hook_scope callback_scope(*self->db_);
+            auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
+            auto* self = context->owner;
+            database::update_hook_scope callback_scope(context->connection);
 
             std::string op;
             switch (operation) {
@@ -119,7 +609,10 @@ void lattice_db::setup_change_hook(database& connection) {
 #else
                 const bool use_deferred_drain = self->config_.is_in_memory();
 #endif
-                if (use_deferred_drain) {
+                if (use_deferred_drain || context->recovery_delivery_deferred) {
+                    // Private recovery batches capture actual AuditLog INSERTs
+                    // on every storage kind. Deriving them later from a model
+                    // row would mistake an old audit for a suppressed write.
                     // Deferred delivery (docs/design-deferred-memory-delivery.md):
                     // buffer the AuditLog INSERT like any other row and let the
                     // post-statement drain deliver it once the transaction
@@ -129,7 +622,7 @@ void lattice_db::setup_change_hook(database& connection) {
                     if (operation == SQLITE_INSERT) {
                         LOG_DEBUG("update_hook", "AuditLog change (in-memory), buffering for txn-settled drain");
                         self->append_to_change_buffer("AuditLog", "INSERT",
-                                                      static_cast<int64_t>(rowid), "");
+                                                      static_cast<int64_t>(rowid), "", db_name && std::strcmp(db_name, "main") == 0);
                         self->db_->mark_txn_dirty();
                     }
                 } else {
@@ -142,11 +635,15 @@ void lattice_db::setup_change_hook(database& connection) {
                     // observer callbacks — both on this instance and on other
                     // same-process instances sharing the same database file.
                     if (operation == SQLITE_INSERT) {
-                        instance_registry::instance().for_each_alive(self->config_.path,
-                            [rowid](lattice_db* inst) {
-                                inst->last_seen_audit_id_.store(
-                                    static_cast<int64_t>(rowid), std::memory_order_release);
-                            });
+                        if (context->entry_cursor_active && db_name &&
+                            std::strcmp(db_name, "main") == 0) {
+                            // A rolled-back entry may free this ID for an
+                            // external writer. Publish only after RELEASE.
+                            context->entry_cursor_last = static_cast<int64_t>(rowid);
+                            context->entry_cursor_present = true;
+                        } else {
+                            self->publish_local_audit_id_(static_cast<int64_t>(rowid));
+                        }
                     }
                 }
                 return;
@@ -165,7 +662,17 @@ void lattice_db::setup_change_hook(database& connection) {
             // Get the globalId for this row (only for model tables)
             std::string global_id;
             if (!is_link_table && operation != SQLITE_DELETE) {
-                std::string sql = "SELECT globalId FROM " + table + " WHERE id = ?";
+                // The update hook identifies a physical schema. A logical
+                // attached-union view can contain the same local id from
+                // another store, so resolve only the row that SQLite changed.
+                const auto quote_identifier = [](const std::string& name) {
+                    std::string quoted = "\"";
+                    for (const char c : name) { quoted += c; if (c == '\"') quoted += '\"'; }
+                    return quoted + '\"';
+                };
+                const std::string schema = db_name ? db_name : "main";
+                const std::string sql = "SELECT globalId FROM " + quote_identifier(schema) +
+                    "." + quote_identifier(table) + " WHERE id = ?";
                 auto rows = self->db_->query(sql, {static_cast<int64_t>(rowid)});
                 if (!rows.empty()) {
                     auto it = rows[0].find("globalId");
@@ -178,7 +685,8 @@ void lattice_db::setup_change_hook(database& connection) {
             // Buffer the change instead of notifying immediately
             LOG_DEBUG("update_hook", "Buffering change: table=%s op=%s rowid=%lld globalId=%s",
                    table.c_str(), op.c_str(), (long long)rowid, global_id.c_str());
-            self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id);
+            self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id,
+                db_name && std::strcmp(db_name, "main") == 0);
 
             // For in-memory databases the WAL hook won't fire, so mark the
             // connection dirty; the post-statement drain in db.cpp flushes at
@@ -198,13 +706,54 @@ void lattice_db::setup_change_hook(database& connection) {
             }
 #endif
         },
-        this
+        connection.lattice_update_hook_context_.get()
     );
 
+    // Revoke continuation admission before COMMIT can open a successor. This
+    // hook runs for every actual write transaction, including BEGIN IMMEDIATE
+    // with no changed pages. It deliberately does not mark a commit successful:
+    // SQLite can still fail after this point. WAL/rollback retain that role.
+    sqlite3_commit_hook(connection.internal_handle(),
+        [](void* user_data) -> int {
+            auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
+            if (auto* settlement = context->sync_chunk) {
+                settlement->commit_attempted = true;
+                if (settlement->policy == database::sync_apply_chunk_state::commit_policy::owner_body) {
+                    // Enforce the private body's existing no-settlement
+                    // contract. SQLite invokes rollback after this veto.
+                    // No SQL, allocation, or application callback here.
+                    settlement->premature_commit = true;
+                    return 1;
+                }
+            }
+            return 0;
+        },
+        connection.lattice_update_hook_context_.get());
+
     // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
-    sqlite3_wal_hook(connection.handle(),
-        [](void* user_data, sqlite3*, const char*, int nframes) -> int {
-            auto* self = static_cast<lattice_db*>(user_data);
+    sqlite3_wal_hook(connection.internal_handle(),
+        [](void* user_data, sqlite3* connection, const char* schema, int nframes) -> int {
+            auto* context = static_cast<database::lattice_update_hook_context*>(user_data);
+            auto* self = context->owner;
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+            sync_commit_probe_detail::record(self, connection, schema);
+#endif
+            bool unexpected_owned_commit = false;
+            if (context->connection == connection && schema && std::strcmp(schema, "main") == 0) {
+                auto* settlement = context->sync_chunk;
+                unexpected_owned_commit = settlement && settlement->policy ==
+                    database::sync_apply_chunk_state::commit_policy::owner_body;
+                context->note_settled(true);
+                // An unsupported replaced commit hook may have bypassed the
+                // veto. Record only the physical outcome; never publish an
+                // unvalidated private batch or retain its reservation across
+                // a later successor. No general hook-replacement guarantee.
+                if (unexpected_owned_commit && context->consume_recovery_reservation(settlement)) {
+                    std::lock_guard<std::mutex> lock(self->change_buffer_mutex_);
+                    self->change_buffer_.clear();
+                    self->recovery_change_buffer_reserved_ = false;
+                }
+            }
 
             // WAL-threshold keeper eviction (results spec §3.4): nframes is
             // the log's total frame count after this commit. Crossing the
@@ -217,8 +766,13 @@ void lattice_db::setup_change_hook(database& connection) {
                                           .load(std::memory_order_relaxed);
             if (threshold > 0 &&
                 static_cast<int64_t>(nframes) * self->wal_page_size_ > threshold) {
-                self->wal_eviction_pending_.store(true, std::memory_order_relaxed);
+                self->raise_projection_pressure(schema);
+                self->wal_eviction_pending_.store(true, std::memory_order_seq_cst);
             }
+
+            // The private recovery call owns this commit's detached tail.
+            // Generic dirty-state drain must never consume that batch.
+            if (context->recovery_delivery_deferred || unexpected_owned_commit) return SQLITE_OK;
 
             const bool delivered = self->flush_changes();
             if (!delivered) {
@@ -233,7 +787,7 @@ void lattice_db::setup_change_hook(database& connection) {
             }
             return SQLITE_OK;
         },
-        this
+        connection.lattice_update_hook_context_.get()
     );
 
     // Transaction-settled drain + rollback discard
@@ -253,11 +807,29 @@ void lattice_db::setup_change_hook(database& connection) {
     // sqlite3_rollback_hook's C frame: hook bodies are atomics-only by
     // contract, and every lock on this path (change_buffer_mutex_, the
     // hook-list and registry mutexes) is a leaf lock never held across SQL.
-    connection.set_txn_hooks(
+    connection.set_txn_hooks_owned_(
         [this] { flush_changes(); },
-        [this] {
-            discard_change_buffer();
+        [this, context = connection.lattice_update_hook_context_.get()] {
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+            sync_commit_probe_detail::rolled_back(this, context->connection);
+#endif
+            auto* settlement = context->sync_chunk;
+            context->note_settled(false);
+            // Retire the original transaction's event/cursor reservation in
+            // the rollback callback, BEFORE any subsequent body statement can
+            // begin a successor. Teardown may no longer clear its dirty state.
+            if (context->consume_recovery_reservation(settlement)) {
+                std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+                change_buffer_.clear();
+                recovery_change_buffer_reserved_ = false;
+            } else discard_change_buffer();
             fire_invalidation_hooks({}, invalidation_reason::rollback);
+        });
+}
+void lattice_db::publish_local_audit_id_(int64_t row_id) {
+    instance_registry::instance().for_each_alive(config_.path,
+        [row_id](lattice_db* inst) {
+            inst->last_seen_audit_id_.store(row_id, std::memory_order_release);
         });
 }
 void lattice_db::setup_cross_process_notifier() {
@@ -286,6 +858,10 @@ void lattice_db::handle_cross_process_notification() {
     // Used to diagnose whether xproc notifications cause main-thread stalls.
     static bool disabled = (std::getenv("LATTICE_DISABLE_XPROC") != nullptr);
     if (disabled) return;
+
+    // Recovery has a durable witness independent of outgoing AuditLog. Queue
+    // its private drain before the legacy empty-audit exit.
+    request_recovery_refresh();
 
     auto cursor = last_seen_audit_id_.load(std::memory_order_acquire);
     LOG_DEBUG("xproc", "Cross-process notification received, last_seen=%lld", (long long)cursor);
@@ -556,6 +1132,32 @@ static std::set<std::pair<std::string, std::string>>& active_sync_keys() {
     return *s;
 }
 
+struct detail::sync_policy_reservation {
+    const std::string policy;
+    explicit sync_policy_reservation(std::string value):policy(std::move(value)){}
+};
+static std::shared_ptr<const detail::sync_policy_reservation> reserve_sync_policy(
+    const std::string& path,const std::string& url,const std::string& policy) {
+    // Match the existing process-local sync key spelling. This is policy
+    // agreement, not filesystem custody or cross-process authorization.
+    using key=std::pair<std::string,std::string>;
+    using reservations=std::map<key,std::weak_ptr<const detail::sync_policy_reservation>>;
+    static auto* entries=new reservations();
+    std::lock_guard<std::mutex> lock(sync_registry_mutex());
+    for(auto i=entries->begin();i!=entries->end();) {
+        if(i->second.expired())i=entries->erase(i);else ++i;
+    }
+    auto& slot=(*entries)[{path,url}];
+    auto current=slot.lock();
+    if(current) {
+        if(current->policy!=policy)throw db_error("WSS owners have different recovery source expectations");
+        return current;
+    }
+    auto admitted=std::make_shared<const detail::sync_policy_reservation>(policy);
+    slot=admitted;
+    return admitted;
+}
+
 bool lattice_db::try_register_sync_key(const std::string& path, const std::string& key) {
     std::lock_guard<std::mutex> lock(sync_registry_mutex());
     return active_sync_keys().emplace(path, key).second;
@@ -580,10 +1182,17 @@ static std::vector<std::string> collect_all_sync_ids(const configuration& config
 }
 
 void lattice_db::setup_sync_if_configured() {
+    if(recovery_continuous_) {if(config_.is_sync_enabled())detail::recovery_continuous_producer::setup_configured_route(*this);return;}
     if (!config_.is_sync_enabled()) {
         return;
     }
 
+    // Reserve before flock, instance registration or synchronizer publication.
+    // A same-policy dormant owner keeps this token for its eventual handoff;
+    // an in-flight constructor is visible even before its lattice is registered.
+    if(!sync_policy_)sync_policy_=reserve_sync_policy(config_.path,config_.websocket_url,config_.recovery_source_expectation);
+    bool registered_key=false;
+    try {
 #ifndef __EMSCRIPTEN__
     // Cross-process flock: only one in-process lattice_db at a time may
     // own the WSS synchronizer for a given path. If the lock is held, we
@@ -646,11 +1255,13 @@ void lattice_db::setup_sync_if_configured() {
         LOG_DEBUG("lattice_db", "Synchronizer already active for this path, skipping");
         return;
     }
+    registered_key=true;
 
     // Create sync config from our configuration
     sync_config sync_cfg;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
+    sync_cfg.recovery_source_expectation = config_.recovery_source_expectation;
     sync_cfg.sync_filter = config_.sync_filter;
 
     // Always use per-synchronizer sync state
@@ -721,9 +1332,26 @@ void lattice_db::setup_sync_if_configured() {
 
     // Auto-connect (like Swift's Lattice.init)
     synchronizer_->connect();
+    } catch (...) {
+        // Constructor failure does not run lattice_db's destructor. Release
+        // only this setup's key/flock before permitting a transport retry. All
+        // transport teardown and capture destruction remain outside the leaf.
+        const auto failure=std::current_exception();
+        synchronizer_.reset();
+        if(registered_key)unregister_sync_key(config_.path,config_.websocket_url);
+#ifndef __EMSCRIPTEN__
+        if(sync_lock_fd_>=0) {
+            ::flock(sync_lock_fd_,LOCK_UN);::close(sync_lock_fd_);sync_lock_fd_=-1;
+        }
+#endif
+        // A surviving dormant owner keeps its policy for retry. If this is a
+        // throwing owner constructor, normal member unwinding releases it.
+        std::rethrow_exception(failure);
+    }
 }
 
 void lattice_db::setup_ipc_if_configured() {
+    if(config_.is_ipc_enabled())detail::recovery_continuous_producer::require_no_continuous_route(*this);
 #ifndef __EMSCRIPTEN__
     if (!config_.is_ipc_enabled()) {
         return;
@@ -851,14 +1479,15 @@ void lattice_db::setup_ipc_if_configured() {
 #endif // !__EMSCRIPTEN__
 }
 
-static std::vector<std::string> get_column_names(database* db, const std::string& schema, const std::string& table_name) {
-    auto rows = db->query("PRAGMA " + schema + ".table_info(" + table_name + ")");
-    std::vector<std::string> cols;
-    for (const auto& row : rows) {
-        auto it = row.find("name");
-        if (it != row.end() && std::holds_alternative<std::string>(it->second))
-            cols.push_back(std::get<std::string>(it->second));
-    }
+std::vector<std::string> lattice_db::attachment_column_names(
+    database* db, const std::string& schema_sql, const std::string& table_name) {
+    // schema_sql is main or a caller-built escaped attachment qualifier.
+    // PRAGMA's argument is a string literal, not an unquoted model identifier.
+    std::string argument = "'";
+    for (char c : table_name) { argument += c; if (c == '\'') argument += '\''; }
+    argument += "'";
+    auto cols = db->query_attachment_text_metadata(
+        "PRAGMA " + schema_sql + ".table_info(" + argument + ")", "name");
     std::sort(cols.begin(), cols.end());
     return cols;
 }
@@ -889,193 +1518,53 @@ constexpr const char* kAttachTableFilter =
     "AND name NOT LIKE '\\_%%' ESCAPE '\\' "
     "AND name NOT IN ('AuditLog')";
 
-std::unordered_set<std::string> model_tables(lattice::database* db, const char* master) {
+} // namespace
+
+std::unordered_set<std::string> lattice_db::attachment_model_tables(database* db, const char* master) {
     char sql[512];
     snprintf(sql, sizeof(sql), kAttachTableFilter, master);
     std::unordered_set<std::string> out;
-    for (const auto& row : db->query(sql)) {
-        auto it = row.find("name");
-        if (it != row.end() && std::holds_alternative<std::string>(it->second))
-            out.insert(std::get<std::string>(it->second));
-    }
+    for (auto& name : db->query_attachment_text_metadata(sql, "name"))
+        out.insert(std::move(name));
     return out;
-}
-} // namespace
-
-std::shared_ptr<database> lattice_db::borrow_read_connection() {
-    std::shared_ptr<database> writer, reader;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        writer = db_;
-        reader = read_db_;
-    }
-    // No SQLite call under the publication mutex. A retired fallback writer
-    // stays owned through this test and the caller's entire query.
-    if (reader && writer &&
-        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id() &&
-        writer->is_in_transaction()) {
-        return writer;
-    }
-    if (reader) return reader;
-    if (writer) return writer;
-    throw db_error("read connection unavailable during maintenance");
-}
-
-std::shared_ptr<database> lattice_db::borrow_xproc_read_connection() {
-    std::shared_ptr<database> writer, reader, xproc;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        writer = db_;
-        reader = read_db_;
-        xproc = xproc_read_db_;
-    }
-    if (xproc) return xproc;
-    if (reader && writer &&
-        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id() &&
-        writer->is_in_transaction()) {
-        return writer;
-    }
-    if (reader) return reader;
-    if (writer) return writer;
-    throw db_error("xproc read connection unavailable during maintenance");
-}
-
-std::vector<database::row_t> lattice_db::query_read(
-    const std::string& sql, const std::vector<column_value_t>& params) {
-    auto connection = borrow_read_connection();
-    return connection->query(sql, params);
-}
-
-std::vector<database::row_t> lattice_db::query_xproc(
-    const std::string& sql, const std::vector<column_value_t>& params) {
-    auto connection = borrow_xproc_read_connection();
-    return connection->query(sql, params);
-}
-
-void lattice_db::close_read_db() {
-    std::shared_ptr<database> reader, xproc;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        ++connection_revision_;
-        reader.swap(read_db_);
-        xproc.swap(xproc_read_db_);
-    }
-    // In particular, do not wait for an xproc borrower: its next statement can
-    // need the writer mutex already held by the maintenance caller.
-}
-
-void lattice_db::close_write_db() {
-    std::shared_ptr<database> writer;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        ++connection_revision_;
-        writer.swap(db_);
-    }
-    // Attachment operations own their handle snapshot. Retirement need not
-    // take attach_mutex_ (a maintenance caller may already hold SQLite).
-}
-
-std::vector<std::shared_ptr<database>> lattice_db::view_handles() {
-    std::vector<std::shared_ptr<database>> handles;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        if (db_) handles.push_back(db_);
-        if (read_db_) handles.push_back(read_db_);
-    }
-    return handles;
-}
-
-void lattice_db::restore_attached_views(database& connection) {
-    // Caller holds attach_mutex_; this connection is not published yet.
-    for (const auto& [alias, path] : attached_dbs_) {
-        std::string escaped_path, escaped_alias;
-        for (char c : path) {
-            escaped_path += c;
-            if (c == '\'') escaped_path += '\'';
-        }
-        for (char c : alias) {
-            escaped_alias += c;
-            if (c == '"') escaped_alias += '"';
-        }
-        connection.execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
-    }
-    for (const auto& [name, sql] : attached_view_sql_) connection.execute(sql);
-}
-
-void lattice_db::reopen_write_db() {
-    uint64_t revision;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        if (closed_.load(std::memory_order_seq_cst))
-            throw db_error("cannot reopen a closed lattice");
-        revision = connection_revision_;
-    }
-    // Declared before the attach guard: error cleanup and retired-owner
-    // destruction must run after that guard is released.
-    auto staged = std::make_shared<database>(config_.path,
-        database::open_mode::read_write, config_.busy_timeout_ms);
-    register_sql_functions(*staged);
-    // A maintenance caller can already own the writer SQLite mutex. Never
-    // wait behind attach while it may be waiting for that writer. A busy
-    // topology is an explicit failed reopen, with prior publication intact.
-    std::unique_lock<std::mutex> attach_lock(attach_mutex_, std::try_to_lock);
-    if (!attach_lock.owns_lock())
-        throw db_error("connection reopen refused while attachment topology is busy");
-    restore_attached_views(*staged);
-    setup_change_hook(*staged);
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        if (closed_.load(std::memory_order_seq_cst) || revision != connection_revision_)
-            throw db_error("write reopen invalidated by concurrent maintenance");
-        ++connection_revision_;
-        staged.swap(db_);
-    }
-}
-
-void lattice_db::reopen_read_db() {
-    if (config_.is_in_memory() || config_.read_only) return;
-    uint64_t revision;
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        if (closed_.load(std::memory_order_seq_cst))
-            throw db_error("cannot reopen a closed lattice");
-        revision = connection_revision_;
-    }
-    // No half-pair publication if either open or topology restoration fails.
-    auto reader = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
-    auto xproc = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
-    // A maintenance caller can already own the writer SQLite mutex. Never
-    // wait behind attach while it may be waiting for that writer. A busy
-    // topology is an explicit failed reopen, with prior publication intact.
-    std::unique_lock<std::mutex> attach_lock(attach_mutex_, std::try_to_lock);
-    if (!attach_lock.owns_lock())
-        throw db_error("connection reopen refused while attachment topology is busy");
-    restore_attached_views(*reader);
-    {
-        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
-        if (closed_.load(std::memory_order_seq_cst) || revision != connection_revision_)
-            throw db_error("read reopen invalidated by concurrent maintenance");
-        ++connection_revision_;
-        reader.swap(read_db_);
-        xproc.swap(xproc_read_db_);
-    }
 }
 
 void lattice_db::attach(lattice_db &lattice) {
-    // Serialize attach/detach: the already-attached consult below is
-    // check-then-act, and view regeneration must not interleave with a
-    // concurrent attach/detach on another thread.
-    std::vector<std::shared_ptr<database>> handles;
-    std::shared_ptr<database> other;
-    std::lock_guard<std::mutex> attach_lock(attach_mutex_);
+    attach_with_metadata(lattice, {});
+}
+
+void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const void> metadata) {
+    if(recovery_continuous_||lattice.recovery_continuous_)throw db_error("continuous attachment topology requires admitted same-file facades");
+    if (detail::managed_route_scope::active_for(this))
+        throw db_error("attach: topology mutation during managed scalar access");
+    std::shared_ptr<database> other, writer;
     {
         std::lock_guard<std::mutex> lock(lattice.connection_ownership_mutex_);
         other = lattice.db_;
     }
-    if (!other) {
-        throw std::runtime_error("attach: the database being attached is closed");
+    std::vector<std::shared_ptr<database>> handles;
+    // Resolve source metadata BEFORE taking recipient locks; no foreign parent
+    // or SQLite lock can nest beneath this recipient's topology/service locks.
+    std::shared_ptr<const physical_store_identity> source_identity;
+    std::shared_ptr<projection_pressure_source> pressure_source;
+    try {
+        if (other) source_identity = other->physical_identity("main", {}, true);
+        pressure_source = make_projection_pressure_source(source_identity);
+        if (pressure_source) pressure_source->active.store(false);
+    } catch (...) {} // Unsupported identity must not break legacy attachment.
+    // Serialize attach/detach: the already-attached consult below is
+    // check-then-act, and view regeneration must not interleave with a
+    // concurrent attach/detach on another thread.
+    std::lock_guard<std::mutex> attach_lock(attach_mutex_);
+    handles = view_handles();
+    {
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        writer = db_;
+    }
+
+    if (closed_.load() || !writer || !other || handles.empty() ||
+        handles.front().get() != writer.get()) {
+        throw std::runtime_error("attach: a database is closed");
     }
 
     const std::string alias = attach_alias_for(lattice.config_.path);
@@ -1084,7 +1573,11 @@ void lattice_db::attach(lattice_db &lattice) {
     // different path is a caller error.
     for (const auto& [existing_alias, existing_path] : attached_dbs_) {
         if (existing_alias == alias) {
-            if (existing_path == lattice.config_.path) return;
+            if (existing_path == lattice.config_.path) {
+                if (!attached_route_tokens_.count(alias))
+                    throw std::runtime_error("attach: incomplete prior topology change; detach before retry");
+                return;
+            }
             throw std::runtime_error(
                 "attach: alias '" + alias + "' is already attached to a different database (" +
                 existing_path + ")");
@@ -1095,16 +1588,25 @@ void lattice_db::attach(lattice_db &lattice) {
     // lattice's schema through ITS OWN connection — a mismatch throws with
     // this lattice untouched (no dangling ATTACH, no half-created views).
     {
-        handles = view_handles();
         if (handles.empty()) {
             throw std::runtime_error("attach: this database is closed");
         }
-        auto main_set = model_tables(handles.front().get(), "main.sqlite_master");
-        auto other_set = model_tables(other.get(), "main.sqlite_master");
+        auto main_set = attachment_model_tables(handles.front().get(), "main.sqlite_master");
+        auto other_set = attachment_model_tables(other.get(), "main.sqlite_master");
+        auto validate_metadata_names = [](const auto& columns, const std::string& table) {
+            for (const auto& name : columns) {
+                if (name == "_source" || name == "_lattice_attach_token")
+                    throw std::runtime_error("attach: reserved routing column '" + name +
+                                             "' in model table '" + table + "'");
+            }
+        };
+        for (const auto& table_name : main_set)
+            validate_metadata_names(attachment_column_names(handles.front().get(), "main", table_name), table_name);
         for (const auto& table_name : other_set) {
+            auto other_cols = attachment_column_names(other.get(), "main", table_name);
+            validate_metadata_names(other_cols, table_name);
             if (!main_set.count(table_name)) continue;
-            auto main_cols = get_column_names(handles.front().get(), "main", table_name);
-            auto other_cols = get_column_names(other.get(), "main", table_name);
+            auto main_cols = attachment_column_names(handles.front().get(), "main", table_name);
             if (main_cols != other_cols) {
                 LOG_ERROR("db", "Schema mismatch for table '%s' between main and attached DB '%s'",
                           table_name.c_str(), alias.c_str());
@@ -1117,8 +1619,9 @@ void lattice_db::attach(lattice_db &lattice) {
 
     // ATTACH on every view-bearing handle (null-tolerant — sync-enabled and
     // in-memory lattices have no read_db_; the old code null-dereferenced).
-    // SQLite's own duplicate-alias error is treated as idempotent success:
-    // belt to the bookkeeping check's suspenders.
+    // Bookkeeping already handles idempotence. An unbookkept duplicate alias
+    // may be a partial earlier attach or a raw SQL binding to another file;
+    // let SQLite reject it rather than minting provenance for the wrong file.
     // Escape single quotes in the path for the SQL literal (paths and named-
     // memory names are caller-controlled strings).
     std::string escaped_path;
@@ -1127,42 +1630,83 @@ void lattice_db::attach(lattice_db &lattice) {
         escaped_path += c;
         if (c == '\'') escaped_path += '\'';
     }
-    for (const auto& handle : handles) {
-        try {
+    if (next_attachment_token_ == std::numeric_limits<int64_t>::max())
+        throw std::runtime_error("attach: attachment generation exhausted");
+    const int64_t token = next_attachment_token_++;
+    attachment_topology_valid_ = false;
+    cancel_projection_reads(projection_status::snapshot_expired);
+    try {
+        // Publish before ATTACH permits writes to this alias. No hook takes
+        // topology locks or observes a map being mutated.
+        if (pressure_source) replace_projection_pressure_source(alias, pressure_source);
+        std::shared_ptr<const physical_store_identity> actual_identity;
+        for (const auto& handle : handles) {
             std::string escaped_alias;
             escaped_alias.reserve(alias.size());
             for (char c : alias) {
                 escaped_alias += c;
                 if (c == '\"') escaped_alias += '\"';
             }
-            handle->execute("ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"");
-        } catch (const db_error& e) {
-            if (std::string(e.what()).find("already in use") == std::string::npos) throw;
+            const std::string attach_sql = "ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"";
+            if (handle.get() == writer.get())
+                actual_identity = handle->attach_and_capture_identity(attach_sql, alias);
+            else
+                handle->execute(attach_sql);
         }
-    }
 
-    attached_dbs_.emplace_back(alias, lattice.config_.path);
-    attached_aliases_.push_back(alias);
-    rebuild_attached_views(handles);
+        if (source_identity && actual_identity && *source_identity == *actual_identity)
+            attached_projection_identities_[alias] = source_identity;
+        else {
+            attached_projection_identities_[alias] = {};
+            replace_projection_pressure_source(alias, {});
+        }
+        attached_route_tokens_[alias] = token;
+        attached_dbs_.emplace_back(alias, lattice.config_.path);
+        attached_aliases_.push_back(alias);
+        rebuild_attached_views(handles);
+        if (metadata) attached_route_metadata_[token] = std::move(metadata);
+        publish_managed_attachment(alias, lattice.config_.path, token, writer);
+        attachment_topology_valid_ = true;
+    } catch (...) {
+        // Existing attach is not cross-connection atomic. A partially changed
+        // topology must never authorize a checked mutation through this alias.
+        invalidate_attachment_route(alias);
+        attached_projection_identities_.erase(alias);
+        replace_projection_pressure_source(alias, {});
+        throw;
+    }
 }
 
 void lattice_db::detach(lattice_db &lattice) {
+    if (detail::managed_route_scope::active_for(this))
+        throw db_error("detach: topology mutation during managed scalar access");
     // Resolve by PATH, not by recomputed alias: alias derivation truncates at
     // the filename stem, so two different paths (or dotted memory names) can
     // share an alias — a never-attached path must be a clean no-op, never a
     // detach of a same-stem victim.
     std::string alias;
+    int64_t token = -1;
     {
         std::lock_guard<std::mutex> attach_lock(attach_mutex_);
         auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
             [&](const auto& entry) { return entry.second == lattice.config_.path; });
         if (it == attached_dbs_.end()) return;  // not attached: idempotent no-op
         alias = it->first;
+        auto route = attached_route_tokens_.find(alias);
+        if (route != attached_route_tokens_.end()) token = route->second;
     }
-    detach_alias(alias);
+    detach_alias_if_current(alias, lattice.config_.path, token);
 }
 
 void lattice_db::detach_alias(const std::string& alias) {
+    detach_alias_if_current(alias, std::nullopt, std::nullopt);
+}
+
+void lattice_db::detach_alias_if_current(const std::string& alias,
+                                        const std::optional<std::string>& expected_path,
+                                        std::optional<int64_t> expected_token) {
+    if (detail::managed_route_scope::active_for(this))
+        throw db_error("detach: topology mutation during managed scalar access");
     std::vector<std::shared_ptr<database>> handles;
     std::lock_guard<std::mutex> attach_lock(attach_mutex_);
     handles = view_handles();
@@ -1170,6 +1714,16 @@ void lattice_db::detach_alias(const std::string& alias) {
     auto it = std::find_if(attached_dbs_.begin(), attached_dbs_.end(),
         [&](const auto& entry) { return entry.first == alias; });
     if (it == attached_dbs_.end()) return;  // idempotent no-op
+    auto route = attached_route_tokens_.find(alias);
+    const int64_t token = route == attached_route_tokens_.end() ? -1 : route->second;
+    if ((expected_path && it->second != *expected_path) ||
+        (expected_token && token != *expected_token)) return;
+
+    // Invalidate before the first side effect, including when a later DROP or
+    // DETACH fails. Old row handles stay invalid after an alias is reused.
+    attachment_topology_valid_ = false;
+    cancel_projection_reads(projection_status::snapshot_expired);
+    invalidate_attachment_route(alias);
 
     // Views reference the alias — drop them all first (regeneration for the
     // remaining aliases happens after the DETACH).
@@ -1200,11 +1754,14 @@ void lattice_db::detach_alias(const std::string& alias) {
         }
     }
 
+    attached_projection_identities_.erase(alias);
+    replace_projection_pressure_source(alias, {});
     attached_dbs_.erase(it);
     attached_aliases_.erase(
         std::remove(attached_aliases_.begin(), attached_aliases_.end(), alias),
         attached_aliases_.end());
     rebuild_attached_views(handles);
+    attachment_topology_valid_ = true;
 }
 
 // Caller holds attach_mutex_. Drops every view attach created, then
@@ -1213,17 +1770,18 @@ void lattice_db::detach_alias(const std::string& alias) {
 // second alias sharing a table name silently never joined the union view)
 // and restores main-table visibility after the last detach.
 void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<database>>& handles) {
+    attached_view_sql_.clear();
+    std::map<std::string, std::string> rebuilt_sql;
     for (const auto& handle : handles) {
         for (const auto& view : attached_view_names_) {
             handle->execute("DROP VIEW IF EXISTS \"" + view + "\"");
         }
     }
     attached_view_names_.clear();
-    attached_view_sql_.clear();
     if (attached_dbs_.empty()) return;
 
     for (const auto& handle : handles) {
-        auto main_set = model_tables(handle.get(), "main.sqlite_master");
+        auto main_set = attachment_model_tables(handle.get(), "main.sqlite_master");
 
         // table → arms. An arm is (schema-qualifier, _source label).
         std::map<std::string, std::vector<std::pair<std::string, std::string>>> arms;
@@ -1231,71 +1789,76 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
             const std::string quoted = quoted_attach_alias(alias);
             char master[600];
             snprintf(master, sizeof(master), "%s.sqlite_master", quoted.c_str());
-            for (const auto& table_name : model_tables(handle.get(), master)) {
+            for (const auto& table_name : attachment_model_tables(handle.get(), master)) {
                 arms[table_name].emplace_back(quoted, quoted);
             }
         }
 
         for (const auto& [table_name, alias_arms] : arms) {
             const bool in_main = main_set.count(table_name) > 0;
-            std::string sql;
-            if (!in_main && alias_arms.size() == 1) {
-                // Attached-only table with a single source: plain passthrough
-                // (matches the historical view shape — no _source column).
-                sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name +
-                      " AS SELECT * FROM " + alias_arms.front().first + "." + table_name;
-            } else {
-                // UNION ALL matches columns BY POSITION, and each database's
-                // physical column order is whatever its create-time schema
-                // iteration produced (an unordered map — effectively random
-                // per file). `SELECT *` arms therefore SCRAMBLE values across
-                // same-named columns whenever two files disagree — observed
-                // live: a WHERE over the view read an attached row's
-                // modifiedAt as deletedAt and filtered every spoke row out
-                // of recall. Project every arm's columns explicitly, in one
-                // canonical order, so the view maps by NAME. A column
-                // missing from some arm then fails view creation loudly
-                // instead of scrambling silently.
-                const std::string first_schema =
-                    in_main ? "main" : alias_arms.front().first;
-                auto ordered_cols = [&]() {
-                    auto rows = handle->query(
-                        "PRAGMA " + first_schema + ".table_info(" + table_name + ")");
-                    std::string cols;
-                    for (const auto& row : rows) {
-                        auto it = row.find("name");
-                        if (it == row.end() ||
-                            !std::holds_alternative<std::string>(it->second)) continue;
-                        if (!cols.empty()) cols += ", ";
-                        cols += "\"" + std::get<std::string>(it->second) + "\"";
-                    }
-                    return cols;
-                }();
-                sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
-                bool first = true;
-                if (in_main) {
-                    sql += "SELECT " + ordered_cols + ", 'main' AS _source FROM main." + table_name;
-                    first = false;
+            // UNION ALL matches columns BY POSITION, and each database's
+            // physical column order is whatever its create-time schema
+            // iteration produced (an unordered map — effectively random
+            // per file). `SELECT *` arms therefore SCRAMBLE values across
+            // same-named columns whenever two files disagree — observed
+            // live: a WHERE over the view read an attached row's
+            // modifiedAt as deletedAt and filtered every spoke row out
+            // of recall. Project every arm's columns explicitly, in one
+            // canonical order, so the view maps by NAME. A column
+            // missing from some arm then fails view creation loudly
+            // instead of scrambling silently.
+            const std::string first_schema =
+                in_main ? "main" : alias_arms.front().first;
+            auto ordered_cols = [&]() {
+                // Preserve physical column order here; only comparison above sorts.
+                std::string argument = "'";
+                for (char c : table_name) { argument += c; if (c == '\'') argument += '\''; }
+                argument += "'";
+                const auto names = handle->query_attachment_text_metadata(
+                    "PRAGMA " + first_schema + ".table_info(" + argument + ")", "name");
+                std::string cols;
+                for (const auto& name : names) {
+                    if (!cols.empty()) cols += ", ";
+                    cols += "\"" + name + "\"";
                 }
-                for (const auto& [qualifier, label] : alias_arms) {
-                    if (!first) sql += " UNION ALL ";
-                    // The label is caller-controlled (derived from the attached
-                    // path) — escape single quotes for the SQL string literal.
-                    std::string escaped_label;
-                    escaped_label.reserve(label.size());
-                    for (char c : label) {
-                        escaped_label += c;
-                        if (c == '\'') escaped_label += '\'';
-                    }
-                    sql += "SELECT " + ordered_cols + ", '" + escaped_label + "' AS _source FROM " + qualifier + "." + table_name;
-                    first = false;
+                return cols;
+            }();
+            std::string sql = "CREATE TEMP VIEW IF NOT EXISTS " + table_name + " AS ";
+            bool first = true;
+            if (in_main) {
+                sql += "SELECT " + ordered_cols + ", 'main' AS _source, 0 AS _lattice_attach_token FROM main." + table_name;
+                first = false;
+            }
+            for (const auto& [qualifier, label] : alias_arms) {
+                if (!first) sql += " UNION ALL ";
+                // The label is caller-controlled (derived from the attached
+                // path) — escape single quotes for the SQL string literal.
+                std::string escaped_label;
+                escaped_label.reserve(label.size());
+                for (char c : label) {
+                    escaped_label += c;
+                    if (c == '\'') escaped_label += '\'';
                 }
+                // qualifier/label are escaped SQL identifiers. Resolve the
+                // token from that same spelling; absent means failed topology.
+                int64_t token = -1;
+                for (const auto& [alias, candidate] : attached_route_tokens_) {
+                    std::string quoted = "\"";
+                    for (char c : alias) { quoted += c; if (c == '\"') quoted += '\"'; }
+                    quoted += "\"";
+                    if (quoted == qualifier) { token = candidate; break; }
+                }
+                sql += "SELECT " + ordered_cols + ", '" + escaped_label +
+                       "' AS _source, " + std::to_string(token) +
+                       " AS _lattice_attach_token FROM " + qualifier + "." + table_name;
+                first = false;
             }
             handle->execute(sql);
             attached_view_names_.insert(table_name);
-            attached_view_sql_[table_name] = sql;
+            rebuilt_sql[table_name] = sql;
         }
     }
+    attached_view_sql_ = std::move(rebuilt_sql);
 }
 
 // ============================================================================
@@ -1358,14 +1921,21 @@ void managed<std::vector<geo_bounds*>>::push_back(const geo_bounds& bounds) {
         lattice->ensure_geo_bounds_list_table(table_name, column_name);
     }
 
-    // Insert into list table using insert() which returns the row id
-    primary_key_t new_row_id = db->insert(list_table_, {
-        {"parent_id", parent_global_id_},
-        {"minLat", bounds.min_lat},
-        {"maxLat", bounds.max_lat},
-        {"minLon", bounds.min_lon},
-        {"maxLon", bounds.max_lon}
-    });
+    // list_table_ is already a physical, schema-qualified target. insert()
+    // prefixes main for logical model names. RETURNING also captures this
+    // row's identity before the settled tail can invoke callbacks that write.
+    const auto inserted = db->query(
+        "INSERT INTO " + list_table_ +
+        " (parent_id, minLat, maxLat, minLon, maxLon) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        {parent_global_id_, bounds.min_lat, bounds.max_lat, bounds.min_lon, bounds.max_lon});
+    if (inserted.size() != 1) {
+        throw db_error("Geo bounds insert did not return one row id");
+    }
+    const auto id = inserted[0].find("id");
+    if (id == inserted[0].end() || !std::holds_alternative<int64_t>(id->second)) {
+        throw db_error("Geo bounds insert returned an invalid row id");
+    }
+    const primary_key_t new_row_id = std::get<int64_t>(id->second);
 
     // Create cached wrapper
     auto wrapper = std::make_shared<managed<geo_bounds*>>(bounds);

@@ -3,16 +3,23 @@
 #ifdef __cplusplus
 
 #include <LatticeCore.hpp>
+#include <lattice/spatial_query.hpp>
 #include <bridging.hpp>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <concepts>
 #include <filesystem>
 #include <future>
+#include <set>
 #include <thread>
-#include <sqlite-vec.h>
 
 #include <dynamic_object.hpp>
+#include <bulk_mutation.hpp>
+#include <projection.hpp>
+#include <recovery_export.hpp>
+#include <recovery_relay.hpp>
+#include <recovery_continuity.hpp>
 #include <list.hpp>
 #include <error.hpp>
 
@@ -485,6 +492,8 @@ struct swift_configuration : public configuration {
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
 
+    void set_recovery_source_expectation(const std::string& value) { recovery_source_expectation=value; }
+
     void set_sync_filter(const SyncFilterVector& filter) {
         sync_filter = std::vector<sync_filter_entry>(filter.begin(), filter.end());
     }
@@ -522,6 +531,7 @@ private:
     std::unordered_map<size_t, std::unordered_map<std::string, SchemaPair>> migration_schemas_;
 
     friend class swift_lattice;
+    friend class swift_lattice_ref;
 };
 
 // Internal implementation - inherits from lattice_db
@@ -537,6 +547,9 @@ public:
     // Construct with swift_configuration (includes row migration callback)
     swift_lattice(const swift_configuration& config, const SchemaVector& schemas);
     swift_lattice(swift_configuration&& config, const SchemaVector& schemas);
+
+    /// Strict inner API; callers must own the active Core transaction.
+    int64_t apply_selected_mutations(const selected_mutation_batch& batch);
 
     // Get properties for a table (used when hydrating objects)
     const SwiftSchema* get_properties_for_table(const std::string& table_name) const {
@@ -664,12 +677,18 @@ public:
     }
 
 private:
+    friend class swift_lattice_ref;
+    swift_lattice(const swift_configuration&,const SchemaVector&,
+        const std::shared_ptr<detail::recovery_continuous_admission>&);
     /// Best-effort schema reconstruction for databases written before the
     /// snapshot existed. Enumerates user tables from sqlite_master, reads column
     /// types via PRAGMA table_info, and detects link / vec / fts / geo sidecars.
     SchemaVector reconstruct_swift_schema_fallback();
     // Stored schemas for hydration
     std::unordered_map<std::string, SwiftSchema> schemas_;
+    // Immutable source-only schemas, owned by one attachment lifetime.
+    // Guarded by Core attach_mutex_; never merges into this store's schemas_.
+    using attached_schema_map = std::unordered_map<std::string, SwiftSchema>;
     // Stored constraints per table
     std::unordered_map<std::string, ConstraintVector> constraints_;
     // Union table descriptors (union_table_name -> descriptor)
@@ -684,10 +703,12 @@ private:
     // Background vec0 gap healing dispatched after open (off the open path).
     std::future<void> vec0_reconcile_future_;
 
-    void ensure_swift_tables(const SchemaVector& schemas);
+    void ensure_swift_tables(const SchemaVector& schemas,bool publish_background=true);
     /// Fingerprint of the Swift-declared schemas covering every DDL-driving
     /// attribute (properties, constraints, unions). See kLatticeSchemaFormatEpoch.
     std::string compute_swift_fingerprint_key(const SchemaVector& schemas) const;
+    static std::string compute_swift_fingerprint_key_for(int32_t target_version,const SchemaVector& schemas);
+    static detail::recovery_owner_schema recovery_catalog(const swift_configuration&,const SchemaVector&);
     /// Populate schemas_/constraints_/union_schemas_ and the core link-table
     /// registries with zero SQL writes (write-free fast path).
     void populate_swift_in_memory_state(const SchemaVector& schemas);
@@ -790,7 +811,7 @@ public:
         last_bridge_error().clear();
         try {
         auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
-        return hydrate_swift_rows(rows, table_name);
+        return hydrate_swift_rows(std::move(rows), table_name);
         } catch (const std::exception& e) {
             last_bridge_error() = e.what();
             LOG_ERROR("query", "objects(%s) failed: %s", table_name.c_str(), e.what());
@@ -1381,7 +1402,7 @@ public:
     //     exception can reach Swift through this surface.
     //   - Generation-scoped reads route the SAME SQL builders the live read
     //     paths use (lattice_db::build_query_rows_sql / build_count_sql /
-    //     build_bbox_rows_sql) through lattice_db::query_at_generation, so
+    //     build_bbox_shape_query) through lattice_db::query_at_generation, so
     //     the statement text is identical either way.
     // ========================================================================
 
@@ -1401,29 +1422,46 @@ private:
     }
 
     /// Shared hydration for row-shaped query results (objects / objects_at /
-    /// bbox variants): hydrate + populate stored schema properties.
+    /// bbox variants): hydrate + populate stored schema properties. Keep the
+    /// actual query image separately for position metadata; moving each row
+    /// avoids a second copy of its strings/blobs. This never seeds the mutable
+    /// row cache or contributes fields to a later write.
     std::vector<managed<swift_dynamic_object>> hydrate_swift_rows(
-        const std::vector<std::unordered_map<std::string, column_value_t>>& rows,
+        std::vector<database::row_t>&& rows,
         const std::string& table_name) {
         std::vector<managed<swift_dynamic_object>> results;
         results.reserve(rows.size());
         const SwiftSchema* props = get_properties_for_table(table_name);
-        for (const auto& row : rows) {
+        for (auto& row : rows) {
             auto obj = hydrate<swift_dynamic_object>(row, table_name);
             if (props) {
                 obj.properties_ = *props;
                 obj.source.properties = *props;
             }
+            obj.query_row_image_ = std::make_shared<const database::row_t>(std::move(row));
             results.push_back(std::move(obj));
         }
         return results;
     }
 
-    /// R*Tree bbox row-query SQL — factored from objects_within_bbox so the
-    /// generation-scoped variant routes the SAME builder (spec Commit 4).
-    /// `is_list` is resolved by the caller with one table_exists check on the
-    /// live connection: table SHAPE is DDL-stable across generations.
-    static std::string build_bbox_rows_sql(
+    struct bbox_query_plan {
+        std::string sql;
+        ColumnValueVector parameters;
+    };
+
+    /// Diagnostics are best-effort at the Swift exception boundary. Recording
+    /// an allocation failure must not itself allocate successfully to be safe.
+    static void record_bbox_failure(const char* message) noexcept {
+        try { last_bridge_error() = message; }
+        catch (...) {} // Preserve the sentinel return even if diagnostic text is lost.
+    }
+
+    /// Metadata is inspected through the SAME query connection as the rows.
+    /// A keeper acquired before ATTACH has only its main schema; consulting
+    /// the writer's attachment vectors here would change that old snapshot.
+    template <typename Query>
+    static bbox_query_plan build_bbox_shape_query(
+        Query&& query,
         const std::string& table_name,
         const std::string& geo_column,
         double min_lat, double max_lat,
@@ -1433,47 +1471,146 @@ private:
         OptionalInt64 limit,
         OptionalInt64 offset,
         const OptionalString& group_by,
-        bool is_list) {
-        std::string list_table = "_" + table_name + "_" + geo_column;
-        std::string list_rtree = list_table + "_rtree";
-        std::string single_rtree = "_" + table_name + "_" + geo_column + "_rtree";
+        const OptionalString& distinct_by) {
+        if (!std::isfinite(min_lat) || !std::isfinite(max_lat) || !std::isfinite(min_lon) || !std::isfinite(max_lon) ||
+            min_lat > max_lat || min_lon > max_lon || (limit && *limit < -1) || (offset && *offset < 0))
+            throw std::invalid_argument("invalid spatial bounds or pagination");
+        const auto model = spatial_quoted_identifier(table_name);
+        const auto sidecar = "_" + table_name + "_" + geo_column;
+        (void)spatial_quoted_identifier(geo_column);
+        bool routed = false;
+        bool found_table = false;
+        std::set<std::string> columns;
+        for (const auto& row : query("PRAGMA table_info(" + model + ")", {})) {
+            auto name = row.find("name");
+            if (name == row.end() || !std::holds_alternative<std::string>(name->second)) continue;
+            found_table = true;
+            const auto& column = std::get<std::string>(name->second);
+            columns.insert(column);
+            routed = routed || column == "_source";
+        }
+        if (!found_table) throw db_error("spatial model table is missing");
+        auto group_column = [&](const OptionalString& column) -> OptionalString {
+            if (!column || column->empty()) return std::nullopt;
+            // Typed Swift fields get identifier quoting (including spaces).
+            // Existing native bbox accepted SQL grouping fragments; retain
+            // qualified identifiers/expressions rather than narrowing that API.
+            return columns.count(*column) ? spatial_quoted_identifier(*column) : *column;
+        };
+        const auto group = group_column(group_by), distinct = group_column(distinct_by);
+        auto table_exists = [&](const std::string& schema, const std::string& name) {
+            return !query("SELECT 1 FROM " + spatial_quoted_identifier(schema) +
+                ".sqlite_master WHERE type='table' AND name=? LIMIT 1", {name}).empty();
+        };
+        std::vector<spatial_query_arm> arms;
+        for (const auto& row : query("PRAGMA database_list", {})) {
+            auto name = row.find("name");
+            if (name == row.end() || !std::holds_alternative<std::string>(name->second)) continue;
+            const auto& schema = std::get<std::string>(name->second);
+            if (schema == "temp" || (!routed && schema != "main") || !table_exists(schema, table_name)) continue;
+            if (!table_exists(schema, sidecar + "_rtree"))
+                throw db_error("spatial index is missing from a physical store");
+            arms.push_back({schema, table_exists(schema, sidecar)});
+        }
+        if (arms.empty()) throw db_error("spatial model has no physical table/index");
+        auto predicate = build_spatial_membership_predicate(table_name, geo_column, arms, routed,
+            {"?1", "?2", "?3", "?4"});
+        if (where_clause && !where_clause->empty()) predicate += " AND (" + *where_clause + ')';
+        std::string from = model;
+        if (group && distinct) {
+            from = "(SELECT " + model + ".* FROM " + model + " WHERE " + predicate +
+                " GROUP BY " + *distinct + ") AS " + model;
+            predicate.clear();
+        }
+        std::string sql = "SELECT " + model + ".* FROM " + from;
+        if (!predicate.empty()) sql += " WHERE " + predicate;
+        if (group) sql += " GROUP BY " + *group;
+        else if (distinct) sql += " GROUP BY " + *distinct;
+        if (order_by && !order_by->empty()) sql += " ORDER BY " + *order_by;
+        if (limit || offset) sql += " LIMIT " + std::to_string(limit.value_or(-1));
+        if (offset) sql += " OFFSET " + std::to_string(*offset);
+        return {std::move(sql), {min_lat, max_lat, min_lon, max_lon}};
+    }
 
-        std::string sql;
-        if (is_list) {
-            // Geo bounds list: join through list table's R*Tree
-            sql = "SELECT DISTINCT " + table_name + ".* FROM " + table_name +
-                  " JOIN " + list_table + " lt ON " + table_name + ".globalId = lt.parent_id" +
-                  " JOIN " + list_rtree + " r ON lt.id = r.id" +
-                  " WHERE r.minLat <= " + std::to_string(max_lat) +
-                  " AND r.maxLat >= " + std::to_string(min_lat) +
-                  " AND r.minLon <= " + std::to_string(max_lon) +
-                  " AND r.maxLon >= " + std::to_string(min_lon);
-        } else {
-            // Single geo_bounds: join main table's R*Tree directly
-            sql = "SELECT " + table_name + ".* FROM " + table_name +
-                  " JOIN " + single_rtree + " r ON " + table_name + ".id = r.id" +
-                  " WHERE r.minLat <= " + std::to_string(max_lat) +
-                  " AND r.maxLat >= " + std::to_string(min_lat) +
-                  " AND r.minLon <= " + std::to_string(max_lon) +
-                  " AND r.maxLon >= " + std::to_string(min_lon);
+    /// SQLite's connection mutex is recursive. This holds the actual live
+    /// topology stable across metadata and SELECT without acquiring parent or
+    /// foreign topology locks beneath it. Hydration runs after release.
+    struct bbox_connection_guard {
+        sqlite3_mutex* mutex;
+        explicit bbox_connection_guard(database& connection) {
+            if (connection.is_closed() || !connection.internal_handle()) throw db_error("spatial connection is closed");
+            mutex = sqlite3_db_mutex(connection.internal_handle());
+            sqlite3_mutex_enter(mutex);
         }
+        ~bbox_connection_guard() { sqlite3_mutex_leave(mutex); }
+        bbox_connection_guard(const bbox_connection_guard&) = delete;
+        bbox_connection_guard& operator=(const bbox_connection_guard&) = delete;
+    };
 
-        if (where_clause.has_value() && !where_clause.value().empty()) {
-            sql += " AND (" + where_clause.value() + ")";
+    /// The guard spans metadata + rows. database::query may drain a settled
+    /// write's deferred callbacks, so it must not run under this extra lock.
+    /// This narrow collector accepts read-only statements and never drains or
+    /// invokes lifecycle/observation hooks. Normal write paths are untouched.
+    static std::vector<database::row_t> query_bbox_locked(database& connection,
+        const std::string& sql, const ColumnValueVector& parameters) {
+        sqlite3_stmt* statement = nullptr;
+        struct finalize { sqlite3_stmt*& statement; ~finalize() { if (statement) sqlite3_finalize(statement); } } cleanup{statement};
+        const char* tail = nullptr;
+        database::record_statement();
+        if (sqlite3_prepare_v2(connection.internal_handle(), sql.c_str(), -1, &statement, &tail) != SQLITE_OK)
+            throw db_error(sqlite3_errmsg(connection.internal_handle()));
+        while (tail && *tail && std::isspace(static_cast<unsigned char>(*tail))) ++tail;
+        if (!statement || (tail && *tail) || !sqlite3_stmt_readonly(statement) ||
+            sqlite3_bind_parameter_count(statement) != static_cast<int>(parameters.size()))
+            throw db_error("spatial query requires one read-only statement with matching bindings");
+        for (size_t i = 0; i != parameters.size(); ++i) {
+            const int index = static_cast<int>(i + 1);
+            const int result = std::visit([&](const auto& value) -> int {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, std::nullptr_t>) return sqlite3_bind_null(statement, index);
+                else if constexpr (std::is_same_v<T, int64_t>) return sqlite3_bind_int64(statement, index, value);
+                else if constexpr (std::is_same_v<T, double>) return sqlite3_bind_double(statement, index, value);
+                else if constexpr (std::is_same_v<T, std::string>)
+                    return sqlite3_bind_text64(statement, index, value.data(), value.size(), SQLITE_TRANSIENT, SQLITE_UTF8);
+                else return value.empty() ? sqlite3_bind_zeroblob(statement, index, 0) :
+                    sqlite3_bind_blob64(statement, index, value.data(), value.size(), SQLITE_TRANSIENT);
+            }, parameters[i]);
+            if (result != SQLITE_OK) throw db_error("spatial parameter binding failed");
         }
-        if (group_by.has_value() && !group_by.value().empty()) {
-            sql += " GROUP BY " + group_by.value();
+        std::vector<std::string> columns;
+        for (int i = 0; i != sqlite3_column_count(statement); ++i) {
+            const auto* name = sqlite3_column_name(statement, i);
+            if (!name) throw db_error("spatial column name allocation failed");
+            columns.emplace_back(name);
         }
-        if (order_by.has_value() && !order_by.value().empty()) {
-            sql += " ORDER BY " + order_by.value();
+        std::vector<database::row_t> rows;
+        int result;
+        while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+            database::row_t row;
+            for (int i = 0; i != static_cast<int>(columns.size()); ++i) {
+                column_value_t value;
+                switch (sqlite3_column_type(statement, i)) {
+                    case SQLITE_INTEGER: value = static_cast<int64_t>(sqlite3_column_int64(statement, i)); break;
+                    case SQLITE_FLOAT: value = sqlite3_column_double(statement, i); break;
+                    case SQLITE_TEXT: {
+                        const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(statement, i));
+                        if (!text) throw db_error("spatial text allocation failed");
+                        value = std::string(text, sqlite3_column_bytes(statement, i)); break;
+                    }
+                    case SQLITE_BLOB: {
+                        const auto* blob = static_cast<const uint8_t*>(sqlite3_column_blob(statement, i));
+                        const int length = sqlite3_column_bytes(statement, i);
+                        if (length && !blob) throw db_error("spatial blob allocation failed");
+                        value = length ? std::vector<uint8_t>(blob, blob + length) : std::vector<uint8_t>{}; break;
+                    }
+                    default: value = nullptr; break;
+                }
+                row.emplace(columns[static_cast<size_t>(i)], std::move(value));
+            }
+            rows.push_back(std::move(row));
         }
-        if (limit.has_value()) {
-            sql += " LIMIT " + std::to_string(limit.value());
-        }
-        if (offset.has_value()) {
-            sql += " OFFSET " + std::to_string(offset.value());
-        }
-        return sql;
+        if (result != SQLITE_DONE) throw db_error(sqlite3_errmsg(connection.internal_handle()));
+        return rows;
     }
 
 public:
@@ -1503,7 +1640,8 @@ public:
     // `reason` maps invalidation_reason: 0 = commit (payload = the batch's
     // changed table names, EMPTY for bookkeeping-only commits), 1 = rollback
     // (no change batch — re-capture at next access), 2 = advance (re-pin at
-    // next access; §3.3/§3.4). The pointer arrays are valid only for the
+    // next access; §3.3/§3.4), 3 = recovery (payload-free all-content dirty).
+    // The pointer arrays are valid only for the
     // duration of the callback.
     uint64_t add_invalidation_hook(void* context,
                                    void (*callback)(void* ctx,
@@ -1570,6 +1708,22 @@ public:
 
     void remove_invalidation_hook(uint64_t token) {
         lattice_db::remove_invalidation_hook(token);
+    }
+
+    /// Payload-free recovery wake. File owners opt into background witness
+    /// preparation and periodic retry; callback delivery uses their scheduler.
+    /// The context is consumed even when registration refuses (returns zero).
+    /// No AuditLog/CollectionChange history is manufactured by this signal.
+    uint64_t add_recovery_refresh_observer(void* context, void (*callback)(void*),
+                                           void (*destroy)(void*) = nullptr) noexcept {
+        try {
+            auto shared = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
+            if (!callback) return 0;
+            return lattice_db::add_recovery_refresh_observer([shared, callback] { callback(shared.get()); });
+        } catch (...) { return 0; }
+    }
+    void remove_recovery_refresh_observer(uint64_t token) noexcept {
+        try { lattice_db::remove_recovery_refresh_observer(token); } catch (...) {}
     }
 
     // ---- Read-generation pool (§2.2/§3) ----
@@ -1699,7 +1853,7 @@ public:
                 generation_read_stale_tl() = true;
                 return {};
             }
-            return hydrate_swift_rows(*rows, table_name);
+            return hydrate_swift_rows(std::move(*rows), table_name);
         } catch (...) {
             generation_read_stale_tl() = true;
             return {};
@@ -1754,21 +1908,36 @@ public:
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBoxAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
+        return objects_within_bbox_shape_at(generation_id, table_name, geo_column,
+            min_lat, max_lat, min_lon, max_lon, where_clause, order_by, limit, offset, group_by, std::nullopt);
+    }
+
+    std::vector<managed<swift_dynamic_object>> objects_within_bbox_shape_at(
+        uint64_t generation_id,
+        const std::string& table_name, const std::string& geo_column,
+        double min_lat, double max_lat, double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt, OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt, OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt)
+        SWIFT_NAME(objectsWithinBBoxShapeAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
         generation_read_stale_tl() = false;
+        last_bridge_error().clear();
         try {
-            bool is_list = db().table_exists("_" + table_name + "_" + geo_column);
-            auto rows = query_at_generation(
-                generation_id,
-                build_bbox_rows_sql(table_name, geo_column, min_lat, max_lat,
-                                    min_lon, max_lon, where_clause, order_by,
-                                    limit, offset, group_by, is_list));
-            if (!rows) {
-                generation_read_stale_tl() = true;
-                return {};
-            }
-            return hydrate_swift_rows(*rows, table_name);
+            auto query = [&](const std::string& sql, const ColumnValueVector& params) {
+                auto rows = query_at_generation(generation_id, sql, params);
+                if (!rows) throw db_error("spatial read generation is stale");
+                return std::move(*rows);
+            };
+            auto plan = build_bbox_shape_query(query, table_name, geo_column, min_lat, max_lat,
+                min_lon, max_lon, where_clause, order_by, limit, offset, group_by, distinct_by);
+            return hydrate_swift_rows(query(plan.sql, plan.parameters), table_name);
+        } catch (const std::exception& error) {
+            generation_read_stale_tl() = true;
+            record_bbox_failure(error.what());
+            return {};
         } catch (...) {
             generation_read_stale_tl() = true;
+            record_bbox_failure("spatial generation read failed");
             return {};
         }
     }
@@ -1937,23 +2106,34 @@ public:
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
-        // Swift-facing read API: never throws into Swift (interop cannot
-        // catch C++ exceptions — an escape is a process trap). Empty on
-        // failure, e.g. transient SQLITE_NOMEM under page-cache purge.
+        return objects_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+            where_clause, order_by, limit, offset, group_by, std::nullopt);
+    }
+
+    std::vector<managed<swift_dynamic_object>> objects_within_bbox_shape(
+        const std::string& table_name, const std::string& geo_column,
+        double min_lat, double max_lat, double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt, OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt, OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt)
+        SWIFT_NAME(objectsWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
         last_bridge_error().clear();
         try {
-        // Check if this is a geo_bounds list (separate table) or single geo_bounds (inline columns)
-        bool is_list = db().table_exists("_" + table_name + "_" + geo_column);
-
-        // Build spatial query SQL using R*Tree — shared with the
-        // generation-scoped objects_within_bbox_at (Commit 4).
-        auto rows = db().query(build_bbox_rows_sql(
-            table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
-            where_clause, order_by, limit, offset, group_by, is_list));
-        return hydrate_swift_rows(rows, table_name);
-        } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
-            LOG_ERROR("query", "objects_within_bbox failed: %s", e.what());
+            std::vector<database::row_t> rows;
+            {
+                auto& connection = db();
+                bbox_connection_guard guard(connection);
+                auto query = [&](const std::string& sql, const ColumnValueVector& params) { return query_bbox_locked(connection, sql, params); };
+                auto plan = build_bbox_shape_query(query, table_name, geo_column, min_lat, max_lat,
+                    min_lon, max_lon, where_clause, order_by, limit, offset, group_by, distinct_by);
+                rows = query(plan.sql, plan.parameters);
+            }
+            return hydrate_swift_rows(std::move(rows), table_name);
+        } catch (const std::exception& error) {
+            record_bbox_failure(error.what());
+            return {};
+        } catch (...) {
+            record_bbox_failure("spatial read failed");
             return {};
         }
     }
@@ -1966,50 +2146,35 @@ public:
         double min_lon, double max_lon,
         OptionalString where_clause = std::nullopt)
         SWIFT_NAME(countWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
-        // Never throws into Swift — 0 on failure.
+        return count_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+            where_clause, std::nullopt, std::nullopt);
+    }
+
+    int64_t count_within_bbox_shape(
+        const std::string& table_name, const std::string& geo_column,
+        double min_lat, double max_lat, double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt,
+        OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt)
+        SWIFT_NAME(countWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:groupBy:distinctBy:)) {
         last_bridge_error().clear();
         try {
-        std::string list_table = "_" + table_name + "_" + geo_column;
-        std::string list_rtree = list_table + "_rtree";
-        std::string single_rtree = "_" + table_name + "_" + geo_column + "_rtree";
-
-        bool is_list = db().table_exists(list_table);
-
-        std::string sql;
-        if (is_list) {
-            sql = "SELECT COUNT(DISTINCT " + table_name + ".id) FROM " + table_name +
-                  " JOIN " + list_table + " lt ON " + table_name + ".globalId = lt.parent_id" +
-                  " JOIN " + list_rtree + " r ON lt.id = r.id" +
-                  " WHERE r.minLat <= " + std::to_string(max_lat) +
-                  " AND r.maxLat >= " + std::to_string(min_lat) +
-                  " AND r.minLon <= " + std::to_string(max_lon) +
-                  " AND r.maxLon >= " + std::to_string(min_lon);
-        } else {
-            sql = "SELECT COUNT(*) FROM " + table_name +
-                  " JOIN " + single_rtree + " r ON " + table_name + ".id = r.id" +
-                  " WHERE r.minLat <= " + std::to_string(max_lat) +
-                  " AND r.maxLat >= " + std::to_string(min_lat) +
-                  " AND r.minLon <= " + std::to_string(max_lon) +
-                  " AND r.maxLon >= " + std::to_string(min_lon);
-        }
-
-        if (where_clause.has_value() && !where_clause.value().empty()) {
-            sql += " AND (" + where_clause.value() + ")";
-        }
-
-        auto rows = db().query(sql);
-        if (!rows.empty()) {
-            auto& row = rows[0];
-            for (const auto& [key, value] : row) {
-                if (std::holds_alternative<int64_t>(value)) {
-                    return std::get<int64_t>(value);
-                }
+            auto& connection = db();
+            bbox_connection_guard guard(connection);
+            auto query = [&](const std::string& sql, const ColumnValueVector& params) { return query_bbox_locked(connection, sql, params); };
+            auto plan = build_bbox_shape_query(query, table_name, geo_column, min_lat, max_lat,
+                min_lon, max_lon, where_clause, std::nullopt, std::nullopt, std::nullopt, group_by, distinct_by);
+            const auto rows = query("SELECT COUNT(*) AS cnt FROM (" + plan.sql + ") AS " + spatial_quoted_identifier(table_name), plan.parameters);
+            if (!rows.empty()) {
+                auto count = rows.front().find("cnt");
+                if (count != rows.front().end() && std::holds_alternative<int64_t>(count->second))
+                    return std::get<int64_t>(count->second);
             }
-        }
-        return 0;
-        } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
-            LOG_ERROR("query", "count_within_bbox failed: %s", e.what());
+            return 0;
+        } catch (const std::exception& error) {
+            record_bbox_failure(error.what());
+            return 0;
+        } catch (...) {
+            record_bbox_failure("spatial count failed");
             return 0;
         }
     }
@@ -3134,6 +3299,7 @@ template <typename ConfigT>
         int32_t schema_version;     // Target schema version (differentiates pre/post migration)
         std::string ipc_fingerprint; // Channels + socket paths + sync filter (see ipc_targets_fingerprint)
         std::string tuning_fingerprint; // sync_tuning overlay (different tuning must not share an instance)
+        std::string recovery_expectation; // never reuse a cached owner for changed source policy
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if (path != other.path) return path < other.path;
@@ -3142,6 +3308,7 @@ template <typename ConfigT>
             if (schema_version != other.schema_version) return schema_version < other.schema_version;
             if (ipc_fingerprint != other.ipc_fingerprint) return ipc_fingerprint < other.ipc_fingerprint;
             if (tuning_fingerprint != other.tuning_fingerprint) return tuning_fingerprint < other.tuning_fingerprint;
+            if (recovery_expectation != other.recovery_expectation) return recovery_expectation < other.recovery_expectation;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -3157,6 +3324,7 @@ template <typename ConfigT>
             if (schema_version != other.schema_version) return false;
             if (ipc_fingerprint != other.ipc_fingerprint) return false;
             if (tuning_fingerprint != other.tuning_fingerprint) return false;
+            if (recovery_expectation != other.recovery_expectation) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -3210,7 +3378,7 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config)};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,
@@ -3547,6 +3715,12 @@ public:
                                      cxx_error& err) SWIFT_NAME(create(swiftConfig:schemas:error:)) LATTICE_SLREF_UNRETAINED;
 
 
+    // Explicit fresh-only opt-in; every facade retains the actual derived owner.
+    static LATTICE_SLREF_RET create_continuous(const swift_configuration&,const SchemaVector&,
+        const continuous_policy&,continuous_result&) SWIFT_NAME(createContinuous(swiftConfig:schemas:policy:result:)) LATTICE_SLREF_UNRETAINED;
+    continuous_result begin_continuous(int64_t attempt) const noexcept SWIFT_NAME(beginContinuous(attempt:));
+    continuous_result inspect_continuous() const noexcept SWIFT_NAME(inspectContinuous());
+
     // Access the underlying swift_lattice (returns pointer for Swift interop)
     swift_lattice* get() { return impl_.get(); }
     const swift_lattice* get() const { return impl_.get(); }
@@ -3589,6 +3763,39 @@ public:
     //      Swift side can hold the handle in a `let` (shallow const — calling
     //      non-const swift_lattice methods through the shared_ptr member is
     //      legal in a const method). ----
+
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+    // Opt-in harness adapter only; absent from ordinary modules and binaries.
+    int32_t sync_commit_probe_arm(uint64_t operation, uint64_t attempt) const noexcept
+        SWIFT_NAME(syncCommitProbeArm(operation:attempt:)) {
+        if (!impl_) return 3;
+        return impl_->sync_commit_probe_arm(operation, attempt);
+    }
+    sync_commit_probe_receipt sync_commit_probe_finish(uint64_t operation,
+                                                       uint64_t attempt) const noexcept
+        SWIFT_NAME(syncCommitProbeFinish(operation:attempt:)) {
+        if (!impl_) return {};
+        return impl_->sync_commit_probe_finish(operation, attempt);
+    }
+#endif
+
+    // Mechanical qualification only. Retains THIS ref's actual impl_ on both
+    // FRT/value paths. A valid nonthrowing destroy callback is the context
+    // transfer precondition: null destroy refuses and leaves caller custody;
+    // otherwise context is consumed on every outcome. Native handles
+    // must be prepared/consumed/closed/released on the caller's IO lane.
+    server_export_endpoint make_server_export_endpoint_for_qualification(
+        void* context,int32_t(*enqueue)(void*,const uint8_t*,size_t,uint64_t),
+        void(*destroy)(void*),const server_export_limits& limits) const noexcept
+        SWIFT_NAME(makeServerExportEndpointForQualification(context:enqueue:destroy:limits:));
+
+    // Real relay setup only: current/destroy retain the actual SDK connection
+    // cell. No qualified admission is exposed; the exact live setup consumes
+    // its application authorization once. Null destroy leaves caller custody;
+    // a nonnull nonthrowing destroy transfers context on every outcome.
+    relay_recovery_setup open_relay_recovery_setup(const std::string& policy,const std::string& connection,
+        void* context,int32_t(*current)(void*),void(*destroy)(void*))const noexcept
+        SWIFT_NAME(openRelayRecoverySetup(policy:connection:context:current:destroy:));
 
     // CRUD
     void add(const dynamic_object_ref& ref, cxx_error& err) const { impl().add(ref, err); }
@@ -3733,6 +3940,23 @@ public:
     }
     void optimize() const { impl().optimize(); }
 
+    projection_operation start_projection(const projection_request& request) const
+        SWIFT_NAME(startProjection(_:)) {
+        return sealed([&] {
+            if (request.failed_) {
+                projection_query invalid;
+                invalid.max_rows = -1;
+                return projection_operation(impl().start_projection(invalid));
+            }
+            return projection_operation(impl().start_projection(request.query_));
+        });
+    }
+
+    int64_t apply_selected_mutations(const selected_mutation_batch& batch) const
+        SWIFT_NAME(applySelectedMutations(_:)) {
+        return sealed([&] { return impl().apply_selected_mutations(batch); });
+    }
+
     // Transactions — begin_transaction throws db_error when the busy
     // timeout lapses or an allocation fails under memory pressure; that
     // escaped into Swift and killed the Engram MCP server twice on
@@ -3745,6 +3969,10 @@ public:
     void commit() const { sealed([&] { impl().commit(); }); }
     void rollback() const { sealed([&] { impl().rollback(); }); }
     void close() const { impl().close(); }
+    bool is_closed() const SWIFT_NAME(isClosed()) { return impl().is_closed(); }
+    bool has_attached_stores() const SWIFT_NAME(hasAttachedStores()) {
+        return impl().has_attached_stores();
+    }
 
     // Sync status
     bool is_sync_agent() const { return impl().is_sync_agent(); }
@@ -3774,6 +4002,26 @@ public:
         OptionalString where_clause = std::nullopt) const
         SWIFT_NAME(countWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
         return impl().count_within_bbox(table_name, geo_column, min_lat, max_lat, min_lon, max_lon, where_clause);
+    }
+
+    std::vector<managed<swift_dynamic_object>> objects_within_bbox_shape(
+        const std::string& table_name, const std::string& geo_column,
+        double min_lat, double max_lat, double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt, OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt, OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt) const
+        SWIFT_NAME(objectsWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
+        return impl().objects_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+            where_clause, order_by, limit, offset, group_by, distinct_by);
+    }
+    int64_t count_within_bbox_shape(
+        const std::string& table_name, const std::string& geo_column,
+        double min_lat, double max_lat, double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt,
+        OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt) const
+        SWIFT_NAME(countWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:groupBy:distinctBy:)) {
+        return impl().count_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+            where_clause, group_by, distinct_by);
     }
 
     // Combined proximity
@@ -3879,6 +4127,14 @@ public:
         impl().remove_object_observer(table_name, row_id, observer_id);
     }
 
+    uint64_t add_recovery_refresh_observer(void* context, void (*callback)(void*),
+                                           void (*destroy)(void*) = nullptr) const {
+        return impl().add_recovery_refresh_observer(context, callback, destroy);
+    }
+    void remove_recovery_refresh_observer(uint64_t token) const {
+        impl().remove_recovery_refresh_observer(token);
+    }
+
     int64_t pending_sync_entry_count() const { return impl().pending_sync_entry_count(); }
 
     // Sync callbacks (C trampolines)
@@ -3915,6 +4171,61 @@ public:
     //      #if LATTICE_HAS_FRT split to fall out of sync — the ATT-3
     //      forwarding lesson). See the swift_lattice section for contracts
     //      (§2.3 callback restrictions, sentinel + stale-flag semantics). ----
+    /// Payload-free registration for bounded latest-state observers. The
+    /// context is consumed on EVERY path, including failed registration.
+    /// No table names, changed-field strings or row batches are copied by this
+    /// trampoline. The callback inherits the synchronous leaf-lock-only hook
+    /// contract; it must only mark bounded state dirty, never query or deliver
+    /// user code. Removal does not revoke a callback already copied by Core.
+    uint64_t add_coarse_invalidation_hook(
+        void* context, void (*callback)(void*, int),
+        void (*destroy)(void*) = nullptr) const noexcept {
+        try {
+            return sealed([&]() -> uint64_t {
+                // shared_ptr invokes the deleter even if its control-block
+                // allocation fails, so Swift must never release this context
+                // again after calling the bridge.
+                auto owned = std::shared_ptr<void>(context, destroy ? destroy : [](void*) {});
+                if (!callback) throw std::invalid_argument("missing coarse invalidation callback");
+                if (!valid()) throw std::runtime_error("Lattice reference is empty");
+                if (impl().is_closed()) throw std::runtime_error("Lattice is closed");
+                const auto token = impl().add_invalidation_hook_detailed(
+                    [owned = std::move(owned), callback](
+                        const std::vector<lattice_db::invalidation_table_change>&,
+                        lattice_db::invalidation_reason reason) noexcept {
+                        try { callback(owned.get(), static_cast<int>(reason)); }
+                        catch (...) { /* Never unwind SQLite's C hook frame. */ }
+                    });
+                // Cover a close that completed between the admission check
+                // and Core's hook insertion. Close can still race immediately
+                // after this check, as with any returned registration: the
+                // owning subscription must reconcile database lifecycle.
+                if (impl().is_closed()) {
+                    impl().remove_invalidation_hook(token);
+                    throw std::runtime_error("Lattice closed during invalidation registration");
+                }
+                return token;
+            });
+        } catch (...) {
+            // sealed records ordinary std::exception failures. Its diagnostic
+            // allocation (or a foreign exception) must not escape into Swift;
+            // zero is independently an unconditional registration failure.
+            return 0;
+        }
+    }
+
+    /// Idempotent leaf bookkeeping. Callers close their admission gate before
+    /// removal, since an already copied hook can still run after this returns.
+    bool remove_coarse_invalidation_hook(uint64_t token) const noexcept {
+        try {
+            return sealed([&] {
+                if (!valid()) return false;
+                impl().remove_invalidation_hook(token);
+                return true;
+            });
+        } catch (...) { return false; }
+    }
+
     uint64_t add_invalidation_hook(void* context,
                                    void (*callback)(void* ctx,
                                                     const char* const* changed_tables,
@@ -4001,6 +4312,17 @@ public:
         return impl().objects_within_bbox_at(generation_id, table_name, geo_column,
                                              min_lat, max_lat, min_lon, max_lon,
                                              where_clause, order_by, limit, offset, group_by);
+    }
+    std::vector<managed<swift_dynamic_object>> objects_within_bbox_shape_at(
+        uint64_t generation_id,
+        const std::string& table_name, const std::string& geo_column,
+        double min_lat, double max_lat, double min_lon, double max_lon,
+        OptionalString where_clause = std::nullopt, OptionalString order_by = std::nullopt,
+        OptionalInt64 limit = std::nullopt, OptionalInt64 offset = std::nullopt,
+        OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt) const
+        SWIFT_NAME(objectsWithinBBoxShapeAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
+        return impl().objects_within_bbox_shape_at(generation_id, table_name, geo_column,
+            min_lat, max_lat, min_lon, max_lon, where_clause, order_by, limit, offset, group_by, distinct_by);
     }
     std::vector<int64_t> query_ids_at(const std::string& table_name,
                                       OptionalString where_clause = std::nullopt,

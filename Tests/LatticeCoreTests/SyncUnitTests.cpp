@@ -7,6 +7,7 @@
 #include <thread>
 #include <csignal>
 #include <cstdio>
+#include <deque>
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 #include <unistd.h>
 #endif
@@ -1031,6 +1032,180 @@ TEST(Sync, DuplicateEntrySkipped) {
 }
 
 // ----------------------------------------------------------------------------
+// Explicit lifecycle changes invalidate retries that have not started dialing.
+// ----------------------------------------------------------------------------
+
+#ifndef __EMSCRIPTEN__
+namespace {
+class reconnect_manual_scheduler final : public lattice::scheduler {
+    mutable std::mutex mutex_;
+    std::deque<std::function<void()>> pending_;
+    std::thread::id executing_;
+    bool stopped_ = false;
+public:
+    void invoke(std::function<void()>&& fn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!stopped_) pending_.push_back(std::move(fn));
+    }
+    bool is_on_thread() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return executing_ == std::this_thread::get_id();
+    }
+    bool is_same_as(const lattice::scheduler* other) const noexcept override {
+        return this == other;
+    }
+    bool can_invoke() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !stopped_;
+    }
+    void shutdown() override {
+        std::deque<std::function<void()>> retired;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopped_ = true;
+            pending_.swap(retired);
+        }
+        // Destroy captures outside the queue lock, like production schedulers.
+    }
+    size_t pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pending_.size();
+    }
+    bool run_one() {
+        std::function<void()> fn;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_.empty()) return false;
+            fn = std::move(pending_.front());
+            pending_.pop_front();
+            executing_ = std::this_thread::get_id();
+        }
+        try { fn(); }
+        catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            executing_ = {};
+            throw;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        executing_ = {};
+        return true;
+    }
+};
+
+// No socket or network. connect deliberately stays CONNECTING so the tests
+// cannot accidentally rely on is_connected_ to suppress an obsolete retry.
+class reconnect_controlled_transport final : public lattice::sync_transport {
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_error_handler on_error_;
+    const bool redialable_;
+    size_t connects_ = 0;
+public:
+    explicit reconnect_controlled_transport(bool redialable) : redialable_(redialable) {}
+    void connect(const std::string&, const std::map<std::string, std::string>&) override {
+        ++connects_;
+        state_ = lattice::transport_state::connecting;
+    }
+    void disconnect() override { state_ = lattice::transport_state::closed; }
+    lattice::transport_state state() const override { return state_; }
+    bool supports_reconnect() const override { return redialable_; }
+    void send(const lattice::transport_message&) override {}
+    void set_on_open(on_open_handler) override {}
+    void set_on_message(on_message_handler) override {}
+    void set_on_error(on_error_handler handler) override { on_error_ = std::move(handler); }
+    void set_on_close(on_close_handler) override {}
+    void fail() {
+        state_ = lattice::transport_state::closed;
+        if (on_error_) on_error_("controlled connection failure");
+    }
+    size_t connects() const { return connects_; }
+};
+
+struct reconnect_controlled_case {
+    std::shared_ptr<reconnect_manual_scheduler> queue = std::make_shared<reconnect_manual_scheduler>();
+    reconnect_controlled_transport* transport = nullptr;
+    std::unique_ptr<lattice::synchronizer> sync;
+    explicit reconnect_controlled_case(bool wss = true, bool redialable = true) {
+        auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(":memory:", queue));
+        lattice::sync_config config;
+        config.websocket_url = wss ? "ws://test.invalid/controlled-retry" : "";
+        config.sync_id = "controlled-retry";
+        config.all_active_sync_ids = {config.sync_id};
+        config.base_delay_seconds = 0;
+        config.max_delay_seconds = 0;
+        config.upload_coalesce_ms = 0;
+        config.checkpoint_passive_interval_ms = 0; // no pacer thread
+        auto owned_transport = std::make_unique<reconnect_controlled_transport>(redialable);
+        transport = owned_transport.get();
+        sync = std::make_unique<lattice::synchronizer>(std::move(db), config,
+                                                    std::move(owned_transport));
+    }
+};
+} // namespace
+
+TEST(Sync, QueuedReconnectCannotUndoExplicitDisconnect) {
+    reconnect_controlled_case test;
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 1u);
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->disconnect();
+    ASSERT_TRUE(test.queue->run_one()); // execute the already-admitted retry
+    EXPECT_EQ(test.transport->connects(), 1u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::closed);
+    EXPECT_FALSE(test.sync->is_connected());
+    // Old queued work must not silently re-enable admission for a later error.
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+
+TEST(Sync, QueuedReconnectCannotJoinAnExplicitReplacement) {
+    reconnect_controlled_case test;
+    test.sync->connect();
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->disconnect();
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 2u);
+    ASSERT_EQ(test.transport->state(), lattice::transport_state::connecting);
+    ASSERT_FALSE(test.sync->is_connected());
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 2u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::connecting);
+    // A failure belonging to the current lifecycle still gets its own retry.
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 3u);
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+
+TEST(Sync, ExplicitConnectInvalidatesAnOlderQueuedReconnect) {
+    reconnect_controlled_case test(false); // injected/IPC dialer policy
+    test.sync->connect();
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->connect(); // replacement without a preceding explicit stop
+    ASSERT_EQ(test.transport->connects(), 2u);
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 2u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::connecting);
+}
+
+TEST(Sync, ExplicitConnectPreservesNonRedialableTransportPolicy) {
+    reconnect_controlled_case test(false, false);
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 1u); // initial connect remains allowed
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+    test.sync->disconnect();
+    test.sync->connect();
+    EXPECT_EQ(test.transport->connects(), 2u);
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+#endif
+
+// ----------------------------------------------------------------------------
 // Backoff: flapping endpoint must walk the exponential ladder
 // ----------------------------------------------------------------------------
 
@@ -2032,5 +2207,528 @@ TEST(Sync, ImmediateQueueSerializesFilterAndACKDuringUpload) {
                 sync.get_progress().pending_upload == 0, "final send/ACK serialization or pending state invalid");
         sync.disconnect(); // Lifecycle changes occur only after both callers joined.
     });
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct PlatformTransportProbe {
+    std::vector<lattice::platform_transport_callbacks> attempts;
+    std::vector<std::string> urls;
+    std::vector<lattice::HeadersMap> headers;
+    std::vector<lattice::platform_transport_callbacks> sends;
+    int disconnects = 0, destroys = 0;
+    bool all_retired_at_destroy = false;
+    std::unique_ptr<lattice::sync_transport> make() {
+        return std::unique_ptr<lattice::sync_transport>(lattice::make_owned_platform_sync_transport(
+            this,
+            [](void* p, const void* url, const void* headers, const void* callbacks) {
+                auto& probe = *static_cast<PlatformTransportProbe*>(p);
+                probe.urls.push_back(*static_cast<const std::string*>(url));
+                probe.headers.push_back(*static_cast<const lattice::HeadersMap*>(headers));
+                probe.attempts.push_back(*static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+            },
+            [](void* p) { ++static_cast<PlatformTransportProbe*>(p)->disconnects; },
+            [](void* p, const void*, const void* callbacks) {
+                static_cast<PlatformTransportProbe*>(p)->sends.push_back(
+                    *static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+            },
+            [](void* p) {
+                auto& probe = *static_cast<PlatformTransportProbe*>(p);
+                ++probe.destroys;
+                probe.all_retired_at_destroy = std::all_of(probe.attempts.begin(), probe.attempts.end(),
+                    [](const auto& endpoint) { return !endpoint.is_current(); });
+            }));
+    }
+};
+
+void platform_attempt_fences() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int opens = 0, messages = 0, errors = 0, closes = 0;
+    owner->set_on_open([&] { ++opens; });
+    owner->set_on_message([&](const auto&) { ++messages; });
+    owner->set_on_error([&](const auto&) { ++errors; });
+    owner->set_on_close([&](int, const auto&) { ++closes; });
+    owner->connect("wss://first", {{"Authorization", "fixture-only"}});
+    auto first = probe.attempts.back();
+    EXPECT_FALSE(first.trigger_on_message(lattice::transport_message::from_string("before-open")));
+    ASSERT_TRUE(first.trigger_on_open());
+    EXPECT_FALSE(first.trigger_on_open());
+    owner->send(lattice::transport_message::from_string("one"));
+    ASSERT_EQ(probe.sends.size(), 1u);
+    EXPECT_TRUE(probe.sends.front().matches(first));
+    owner->connect("wss://second");
+    auto second = probe.attempts.back();
+    EXPECT_FALSE(first.matches(second));
+    EXPECT_FALSE(first.is_current());
+    EXPECT_FALSE(first.trigger_on_open());
+    EXPECT_FALSE(first.trigger_on_message(lattice::transport_message::from_string("stale")));
+    EXPECT_FALSE(first.trigger_on_error("stale send completion"));
+    EXPECT_FALSE(first.trigger_on_close(1006, "stale close"));
+    ASSERT_TRUE(second.trigger_on_open());
+    ASSERT_TRUE(second.trigger_on_message(lattice::transport_message::from_string("current")));
+    EXPECT_EQ(owner->state(), lattice::transport_state::open);
+    EXPECT_EQ(opens, 2); EXPECT_EQ(messages, 1); EXPECT_EQ(errors, 0); EXPECT_EQ(closes, 0);
+    EXPECT_EQ(probe.urls, (std::vector<std::string>{"wss://first", "wss://second"}));
+    EXPECT_EQ(probe.headers.front().at("Authorization"), "fixture-only");
+}
+
+void platform_disconnect_reconnect() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int opens = 0; owner->set_on_open([&] { ++opens; });
+    owner->connect("ws://fixture");
+    auto first = probe.attempts.back(); ASSERT_TRUE(first.trigger_on_open());
+    owner->disconnect();
+    EXPECT_EQ(probe.disconnects, 1);
+    EXPECT_EQ(owner->state(), lattice::transport_state::closed);
+    EXPECT_FALSE(first.is_current());
+    EXPECT_FALSE(first.trigger_on_error("cancel completion"));
+    owner->send(lattice::transport_message::from_string("closed"));
+    EXPECT_TRUE(probe.sends.empty());
+    owner->connect("ws://fixture");
+    auto second = probe.attempts.back();
+    EXPECT_FALSE(first.matches(second));
+    EXPECT_TRUE(second.trigger_on_open());
+    owner->send(lattice::transport_message::from_string("reconnected"));
+    ASSERT_EQ(probe.sends.size(), 1u);
+    EXPECT_TRUE(probe.sends.back().matches(second));
+    EXPECT_EQ(opens, 2);
+}
+
+void platform_retained_endpoint_after_delete() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int calls = 0;
+    auto capture = std::make_shared<int>(7); std::weak_ptr<int> weak = capture;
+    owner->set_on_message([&, capture](const auto&) { ++calls; });
+    capture.reset();
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    owner.reset();
+    EXPECT_EQ(probe.destroys, 1);
+    EXPECT_TRUE(probe.all_retired_at_destroy);
+    EXPECT_TRUE(weak.expired());
+    EXPECT_FALSE(endpoint.is_current());
+    EXPECT_FALSE(endpoint.trigger_on_message(lattice::transport_message::from_string("after-delete")));
+    EXPECT_FALSE(endpoint.trigger_on_open());
+    EXPECT_FALSE(endpoint.trigger_on_error("after-delete"));
+    EXPECT_FALSE(endpoint.trigger_on_close(1000, "after-delete"));
+    EXPECT_EQ(calls, 0);
+    lattice::platform_transport_callbacks empty;
+    EXPECT_FALSE(empty.is_current()); EXPECT_FALSE(empty.matches(endpoint));
+    EXPECT_FALSE(empty.trigger_on_open());
+}
+
+void platform_callback_can_destroy_transport() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    int calls = 0;
+    owner->set_on_message([&](const auto&) {
+        ++calls;
+        EXPECT_TRUE(endpoint.is_current());
+        owner.reset();
+        EXPECT_FALSE(endpoint.is_current());
+        EXPECT_EQ(probe.destroys, 1);
+    });
+    EXPECT_TRUE(endpoint.trigger_on_message(lattice::transport_message::from_string("retire")));
+    EXPECT_EQ(calls, 1);
+    EXPECT_FALSE(endpoint.trigger_on_message(lattice::transport_message::from_string("late")));
+}
+
+void platform_terminal_event_once() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int errors = 0, closes = 0;
+    owner->set_on_error([&](const auto&) { ++errors; });
+    owner->set_on_close([&](int, const auto&) { ++closes; });
+    owner->connect("ws://fixture");
+    auto first = probe.attempts.back();
+    EXPECT_TRUE(first.trigger_on_error("handshake refused"));
+    EXPECT_FALSE(first.trigger_on_open());
+    EXPECT_FALSE(first.trigger_on_close(1006, "duplicate failure"));
+    EXPECT_FALSE(first.trigger_on_error("duplicate error"));
+    owner->connect("ws://fixture");
+    auto second = probe.attempts.back(); ASSERT_TRUE(second.trigger_on_open());
+    EXPECT_TRUE(second.trigger_on_close(1000, "closed"));
+    EXPECT_FALSE(second.trigger_on_error("late receive error"));
+    EXPECT_EQ(errors, 1); EXPECT_EQ(closes, 1);
+    EXPECT_EQ(owner->state(), lattice::transport_state::closed);
+}
+
+void platform_admitted_callback_can_settle_after_retirement() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    std::mutex mutex; std::condition_variable ready;
+    bool entered = false, release = false, completed = false, timed_out = false;
+    owner->set_on_message([&](const auto&) {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true; ready.notify_all();
+        if (!ready.wait_for(lock, std::chrono::seconds(5), [&] { return release; })) timed_out = true;
+        completed = true;
+    });
+    std::thread thread([&] { endpoint.trigger_on_message(lattice::transport_message::from_string("admitted")); });
+    struct Cleanup {
+        std::mutex& mutex; std::condition_variable& ready; bool& release; std::thread& thread;
+        ~Cleanup() { { std::lock_guard<std::mutex> lock(mutex); release = true; } ready.notify_all(); if (thread.joinable()) thread.join(); }
+    } cleanup{mutex, ready, release, thread};
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }));
+    }
+    owner.reset();
+    EXPECT_EQ(probe.destroys, 1);
+    EXPECT_FALSE(endpoint.trigger_on_message(lattice::transport_message::from_string("new-admission")));
+    { std::lock_guard<std::mutex> lock(mutex); release = true; }
+    ready.notify_all(); thread.join();
+    EXPECT_TRUE(completed); EXPECT_FALSE(timed_out);
+}
+
+void platform_capture_destruction_outside_lock() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    struct Reenter {
+        lattice::platform_transport_callbacks endpoint; int* destroyed;
+        ~Reenter() { (void)endpoint.is_current(); ++*destroyed; }
+    };
+    int destroyed = 0;
+    auto capture = std::make_shared<Reenter>(); capture->endpoint = endpoint; capture->destroyed = &destroyed;
+    owner->set_on_message([capture](const auto&) {});
+    capture.reset();
+    owner->set_on_message({});
+    EXPECT_EQ(destroyed, 1);
+    auto last = std::make_shared<Reenter>(); last->endpoint = endpoint; last->destroyed = &destroyed;
+    owner->set_on_error([last](const auto&) {}); last.reset();
+    owner.reset();
+    EXPECT_EQ(destroyed, 2);
+}
+} // namespace
+TEST(PlatformTransport, OldAttemptCannotDeliverToReplacement) { bounded_mock_case(platform_attempt_fences); }
+TEST(PlatformTransport, ExplicitDisconnectAllowsFreshReconnect) { bounded_mock_case(platform_disconnect_reconnect); }
+TEST(PlatformTransport, RetainedEndpointAfterNativeDeleteIsInert) { bounded_mock_case(platform_retained_endpoint_after_delete); }
+TEST(PlatformTransport, CallbackCanDeleteNativeTransport) { bounded_mock_case(platform_callback_can_destroy_transport); }
+TEST(PlatformTransport, TerminalEventClosesOnlyItsAttemptOnce) { bounded_mock_case(platform_terminal_event_once); }
+TEST(PlatformTransport, AlreadyAdmittedCallbackSettlesWithoutBlockingRetirement) { bounded_mock_case(platform_admitted_callback_can_settle_after_retirement); }
+TEST(PlatformTransport, HandlerCapturesAreDestroyedOutsideCellLock) { bounded_mock_case(platform_capture_destruction_outside_lock); }
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace lattice::detail {
+struct platform_transport_test_access {
+    static void before_error(const platform_transport_callbacks& endpoint, std::function<void()> callback) {
+        std::lock_guard<std::mutex> lock(endpoint.cell_->mutex);
+        endpoint.cell_->before_error_delivery.swap(callback);
+    }
+};
+}
+namespace {
+void platform_admitted_old_error_preserves_replacement_owner() {
+    PlatformTransportProbe probe;
+    auto transport = probe.make(); ASSERT_NE(transport, nullptr);
+    TempDB file{"platform_owner_generation"};
+    auto database = std::make_unique<lattice::lattice_db>(lattice::configuration(file.str()));
+    lattice::sync_config config;
+    config.websocket_url = "ws://fixture/generation";
+    config.sync_id = "platform-generation";
+    config.all_active_sync_ids = {config.sync_id};
+    config.max_reconnect_attempts = 0;
+    config.upload_coalesce_ms = 0;
+    lattice::synchronizer sync(std::move(database), config, std::move(transport));
+    std::atomic<int> errors{0};
+    sync.set_on_error([&](const std::string&) { ++errors; });
+    sync.connect();
+    ASSERT_EQ(probe.attempts.size(), 1u);
+    auto first = probe.attempts.front(); ASSERT_TRUE(first.trigger_on_open());
+    ASSERT_TRUE(sync.is_connected());
+    std::mutex mutex; std::condition_variable ready;
+    bool entered = false, release = false, timed_out = false;
+    lattice::detail::platform_transport_test_access::before_error(first, [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true; ready.notify_all();
+        if (!ready.wait_for(lock, std::chrono::seconds(5), [&] { return release; })) timed_out = true;
+    });
+    std::thread delivery([&] { first.trigger_on_error("old admitted completion"); });
+    struct Cleanup {
+        std::mutex& mutex; std::condition_variable& ready; bool& release; std::thread& delivery;
+        ~Cleanup() { { std::lock_guard<std::mutex> lock(mutex); release = true; } ready.notify_all(); if (delivery.joinable()) delivery.join(); }
+    } cleanup{mutex, ready, release, delivery};
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }));
+    }
+    // The real endpoint has copied the old handler and released its mutex.
+    // Reconnect the same REAL synchronizer before that handler reaches owner
+    // admission; its captured old lifecycle must not become the current one.
+    lattice::detail::platform_transport_test_access::before_error(first, {});
+    sync.connect();
+    ASSERT_EQ(probe.attempts.size(), 2u);
+    auto second = probe.attempts.back(); ASSERT_TRUE(second.trigger_on_open());
+    ASSERT_TRUE(sync.is_connected());
+    { std::lock_guard<std::mutex> lock(mutex); release = true; }
+    ready.notify_all(); delivery.join();
+    EXPECT_FALSE(timed_out);
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_TRUE(second.is_current());
+    EXPECT_TRUE(sync.is_connected());
+    sync.disconnect();
+}
+}
+TEST(PlatformTransport, AdmittedOldErrorCannotBorrowReplacementOwnerGeneration) {
+    bounded_mock_case(platform_admitted_old_error_preserves_replacement_owner);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace lattice::detail {
+struct platform_attempt_owner_test_access {
+    static void before_message(const platform_transport_callbacks& endpoint, std::function<void()> callback) {
+        std::lock_guard<std::mutex> lock(endpoint.cell_->mutex);
+        endpoint.cell_->before_message_delivery.swap(callback);
+    }
+};
+}
+namespace {
+struct RetryPlatformProbe : PlatformTransportProbe {
+    // Foreign platform connect runs outside the native endpoint leaf. Only
+    // the owned stop-race fixture supplies this normally empty rendezvous.
+    std::function<void()> after_connect;
+    std::unique_ptr<lattice::sync_transport> make() {
+        return std::unique_ptr<lattice::sync_transport>(lattice::make_owned_platform_sync_transport(
+            this,
+            [](void* p, const void* url, const void* headers, const void* callbacks) {
+                auto& probe = *static_cast<RetryPlatformProbe*>(p);
+                probe.urls.push_back(*static_cast<const std::string*>(url));
+                probe.headers.push_back(*static_cast<const lattice::HeadersMap*>(headers));
+                probe.attempts.push_back(*static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+                if (probe.after_connect) probe.after_connect();
+            },
+            [](void* p) { ++static_cast<RetryPlatformProbe*>(p)->disconnects; },
+            [](void* p, const void*, const void* callbacks) {
+                static_cast<RetryPlatformProbe*>(p)->sends.push_back(
+                    *static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+            },
+            [](void* p) {
+                auto& probe = *static_cast<RetryPlatformProbe*>(p); ++probe.destroys;
+                probe.all_retired_at_destroy = std::all_of(probe.attempts.begin(), probe.attempts.end(),
+                    [](const auto& endpoint) { return !endpoint.is_current(); });
+            }));
+    }
+};
+struct PlatformRetryCase {
+    TempDB file{"platform_retry_owner"};
+    std::shared_ptr<reconnect_manual_scheduler> queue = std::make_shared<reconnect_manual_scheduler>();
+    RetryPlatformProbe probe;
+    lattice::lattice_db* database = nullptr;
+    std::atomic<int> errors{0};
+    std::unique_ptr<lattice::synchronizer> sync;
+    PlatformRetryCase() {
+        auto owned = std::make_unique<lattice::lattice_db>(lattice::configuration(file.str(), queue));
+        database = owned.get();
+        lattice::sync_config config;
+        config.websocket_url = "wss://fixture/automatic-retry";
+        config.sync_id = "wss:platform-automatic-retry";
+        config.all_active_sync_ids = {config.sync_id};
+        config.base_delay_seconds = 0; config.max_delay_seconds = 0;
+        config.max_reconnect_attempts = 2;
+        config.upload_coalesce_ms = 0; config.checkpoint_passive_interval_ms = 0;
+        sync = std::make_unique<lattice::synchronizer>(std::move(owned), config, probe.make());
+        sync->set_on_error([this](const std::string&) { ++errors; });
+        sync->connect();
+    }
+    void drain() {
+        for (size_t n=0;n<256;++n) if (!queue->run_one()) return;
+        throw lattice::db_error("platform retry fixture turn budget exceeded");
+    }
+    auto snapshot() {
+        std::vector<std::vector<lattice::database::row_t>> result;
+        for (const auto* table : {"TestPerson", "AuditLog", "_lattice_sync_state", "_lattice_receive_guard", "_lattice_receive_guard_store"})
+            result.push_back(database->db().query(std::string("SELECT * FROM ")+table+" ORDER BY 1"));
+        return result;
+    }
+};
+struct HeldPlatformMessage {
+    std::mutex mutex; std::condition_variable ready;
+    bool entered=false, release=false, timed_out=false, endpoint_admitted=false;
+    std::thread delivery;
+    HeldPlatformMessage(const lattice::platform_transport_callbacks& endpoint, lattice::transport_message message) {
+        lattice::detail::platform_attempt_owner_test_access::before_message(endpoint,[this] {
+            std::unique_lock<std::mutex> lock(mutex); entered=true; ready.notify_all();
+            if (!ready.wait_for(lock,std::chrono::seconds(5),[this] { return release; })) timed_out=true;
+        });
+        delivery=std::thread([this,endpoint,message=std::move(message)] { endpoint_admitted=endpoint.trigger_on_message(message); });
+    }
+    bool wait() { std::unique_lock<std::mutex> lock(mutex); return ready.wait_for(lock,std::chrono::seconds(5),[this] { return entered; }); }
+    void finish() { { std::lock_guard<std::mutex> lock(mutex); release=true; } ready.notify_all(); if(delivery.joinable())delivery.join(); }
+    ~HeldPlatformMessage() { finish(); }
+};
+void platform_automatic_retry_rejects_old_message(bool valid) {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open()); test.drain();
+    ASSERT_TRUE(test.sync->is_connected());
+    lattice::lattice_db source{lattice::configuration(":memory:")};
+    source.add(TestPerson{"ActualOriginalHeldBeforeOwnerAdmission",42,std::nullopt});
+    const auto originals=lattice::query_audit_log(source.db());
+    ASSERT_EQ(originals.size(),1u);
+    const auto payload=lattice::transport_message::from_string(valid ?
+        lattice::server_sent_event::make_audit_log(originals).to_json() : "malformed old physical attempt");
+    HeldPlatformMessage held(first,payload);
+    ASSERT_TRUE(held.wait());
+    lattice::detail::platform_attempt_owner_test_access::before_message(first,{});
+    // Actual terminal callback schedules the real automatic retry. There is
+    // no public connect(), lifecycle advance, mocked owner or manual redial.
+    ASSERT_TRUE(first.trigger_on_close(1006,"automatic retry trigger"));
+    EXPECT_FALSE(first.trigger_on_error("duplicate terminal"));
+    test.drain();
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    const auto second=test.probe.attempts.back();
+    ASSERT_FALSE(first.matches(second));
+    ASSERT_TRUE(second.trigger_on_open()); test.drain();
+    ASSERT_TRUE(test.sync->is_connected());
+    const auto before=test.snapshot();const auto sends=test.probe.sends.size();
+    held.finish();test.drain();
+    EXPECT_TRUE(held.endpoint_admitted); EXPECT_FALSE(held.timed_out);
+    EXPECT_EQ(test.snapshot(),before); EXPECT_EQ(test.errors.load(),0);
+    EXPECT_EQ(test.probe.sends.size(),sends);
+    EXPECT_TRUE(second.is_current()); EXPECT_TRUE(test.sync->is_connected());
+    // Positive control: exactly the same payload on the replacement reaches
+    // the real parser/intake and either notifies once or installs its original.
+    ASSERT_TRUE(second.trigger_on_message(payload)); test.drain();
+    if(valid) {
+        const auto rows=test.database->db().query("SELECT name FROM TestPerson");
+        ASSERT_EQ(rows.size(),1u);
+        EXPECT_EQ(std::get<std::string>(rows[0].at("name")),"ActualOriginalHeldBeforeOwnerAdmission");
+        const auto imported=test.database->db().query("SELECT globalId FROM AuditLog WHERE globalId=?",{originals[0].global_id});
+        ASSERT_EQ(imported.size(),1u);
+        EXPECT_EQ(std::get<std::string>(imported[0].at("globalId")),originals[0].global_id);
+        EXPECT_EQ(test.errors.load(),0);
+        EXPECT_GT(test.probe.sends.size(),sends);
+    } else EXPECT_EQ(test.errors.load(),1);
+    test.sync->disconnect();
+}
+void platform_queued_automatic_retry_cannot_undo_stop() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    HeldPlatformMessage held(first,lattice::transport_message::from_string("stopped old message"));
+    ASSERT_TRUE(held.wait());
+    lattice::detail::platform_attempt_owner_test_access::before_message(first,{});
+    ASSERT_TRUE(first.trigger_on_close(1006,"queued retry"));
+    ASSERT_GT(test.queue->pending(),0u);
+    test.sync->disconnect();test.drain();
+    held.finish();test.drain();
+    EXPECT_TRUE(held.endpoint_admitted);EXPECT_FALSE(held.timed_out);
+    EXPECT_EQ(test.probe.attempts.size(),1u);
+    EXPECT_FALSE(test.sync->is_connected());EXPECT_FALSE(first.is_current());
+    EXPECT_EQ(test.errors.load(),0);
+    EXPECT_FALSE(first.trigger_on_error("late terminal cannot restart"));
+    test.drain();EXPECT_EQ(test.probe.attempts.size(),1u);
+}
+void platform_admitted_retry_dial_settles_after_stop_without_reenabling() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    std::mutex mutex;std::condition_variable ready;
+    bool entered=false,release=false,timed_out=false;
+    test.probe.after_connect=[&] {
+        std::unique_lock<std::mutex> lock(mutex);entered=true;ready.notify_all();
+        if(!ready.wait_for(lock,std::chrono::seconds(5),[&] {return release;}))timed_out=true;
+    };
+    ASSERT_TRUE(first.trigger_on_close(1006,"retry dial held in actual platform"));
+    std::thread retry([&] {test.drain();});
+    struct Cleanup {
+        std::mutex& mutex;std::condition_variable& ready;bool& release;std::thread& retry;
+        ~Cleanup(){{std::lock_guard<std::mutex> lock(mutex);release=true;}ready.notify_all();if(retry.joinable())retry.join();}
+    } cleanup{mutex,ready,release,retry};
+    {std::unique_lock<std::mutex> lock(mutex);ASSERT_TRUE(ready.wait_for(lock,std::chrono::seconds(5),[&] {return entered;}));}
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    const auto second=test.probe.attempts.back();
+    // The actual retry has published its endpoint and entered the foreign
+    // dial. Stop may let that admitted call return, but cannot be resurrected.
+    test.sync->disconnect();
+    EXPECT_FALSE(second.trigger_on_open());
+    EXPECT_FALSE(second.trigger_on_message(lattice::transport_message::from_string("stopped dial")));
+    EXPECT_FALSE(second.trigger_on_error("stopped completion"));
+    {std::lock_guard<std::mutex> lock(mutex);release=true;}ready.notify_all();retry.join();
+    EXPECT_FALSE(timed_out);test.drain();
+    EXPECT_EQ(test.probe.attempts.size(),2u);EXPECT_FALSE(test.sync->is_connected());
+    EXPECT_EQ(test.errors.load(),0);EXPECT_FALSE(first.is_current());EXPECT_FALSE(second.is_current());
+    test.probe.after_connect={};
+}
+}
+TEST(PlatformTransport, AutomaticRetryRejectsOldMalformedMessageBeforeOwnerAdmission) {
+    bounded_mock_case([] { platform_automatic_retry_rejects_old_message(false); });
+}
+TEST(PlatformTransport, AutomaticRetryRejectsOldOriginalBeforeOwnerAdmission) {
+    bounded_mock_case([] { platform_automatic_retry_rejects_old_message(true); });
+}
+TEST(PlatformTransport, QueuedAutomaticRetryAndHeldOldMessageCannotUndoStop) {
+    bounded_mock_case(platform_queued_automatic_retry_cannot_undo_stop);
+}
+TEST(PlatformTransport, AdmittedAutomaticRetryDialCanSettleWithoutUndoingConcurrentStop) {
+    bounded_mock_case(platform_admitted_retry_dial_settles_after_stop_without_reenabling);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+void platform_current_terminal_identity_notifies_once_and_retries() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    ASSERT_TRUE(first.trigger_on_error("one current terminal"));
+    EXPECT_FALSE(first.trigger_on_error("duplicate error"));
+    EXPECT_FALSE(first.trigger_on_close(1006,"duplicate close"));
+    test.drain();
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    EXPECT_EQ(test.errors.load(),1);
+    const auto second=test.probe.attempts.back();
+    ASSERT_TRUE(second.trigger_on_open());test.drain();
+    EXPECT_TRUE(test.sync->is_connected());EXPECT_EQ(test.errors.load(),1);
+    test.sync->disconnect();
+}
+}
+TEST(PlatformTransport, CurrentClosedAttemptDeliversExactlyOneTerminalOwnerNotification) {
+    bounded_mock_case(platform_current_terminal_identity_notifies_once_and_retries);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+void platform_closed_attempt_rejects_message_before_queued_retry_dials() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    HeldPlatformMessage held(first,lattice::transport_message::from_string("closed attempt before retry"));
+    ASSERT_TRUE(held.wait());
+    lattice::detail::platform_attempt_owner_test_access::before_message(first,{});
+    ASSERT_TRUE(first.trigger_on_close(1006,"closed before owner admission"));
+    // Keep the automatic retry queued: this refusal comes from A's live
+    // fence closing, not from an already published replacement B.
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    held.finish();
+    EXPECT_TRUE(held.endpoint_admitted);EXPECT_FALSE(held.timed_out);
+    test.drain();
+    EXPECT_EQ(test.errors.load(),0);
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    ASSERT_TRUE(test.probe.attempts.back().trigger_on_open());test.drain();
+    EXPECT_TRUE(test.sync->is_connected());
+    test.sync->disconnect();
+}
+}
+TEST(PlatformTransport, ClosedAttemptRejectsHeldMessageBeforeAutomaticRetryDials) {
+    bounded_mock_case(platform_closed_attempt_rejects_message_before_queued_retry_dials);
 }
 #endif

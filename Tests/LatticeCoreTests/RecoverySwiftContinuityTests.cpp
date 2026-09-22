@@ -45,7 +45,7 @@ std::unique_ptr<swift_lattice_ref> open_swift_continuous(const swift_configurati
 void require_swift_commit(const continuous_result& result) {
     if(result.phase()!=2||result.has_error())throw db_error("Swift continuity: "+result.primary_error()+result.cleanup_error()+result.postcommit_error()+result.notification_error());
 }
-int64_t scalar(swift_lattice& owner,const std::string& sql) {return std::get<int64_t>(owner.db().query(sql).at(0).at("n"));}
+int64_t scalar(::lattice::swift_lattice& owner,const std::string& sql) {return std::get<int64_t>(owner.db().query(sql).at(0).at("n"));}
 class swift_continuity_transport final:public sync_transport {
     std::atomic<transport_state> state_{transport_state::closed};
 public:
@@ -103,7 +103,7 @@ TEST_F(RecoverySwiftContinuity, ActualDerivedOwnerAndManagedRowsRetainCompleteCa
 }
 TEST_F(RecoverySwiftContinuity, ManagedDynamicObjectRetainsActualOwnerAfterFacadeRelease) {
     auto& ref=open();insert(ref);auto rows=ref.get()->objects("ContinuousSwiftRow");ASSERT_EQ(rows.size(),1u);
-    dynamic_object held(rows[0]);std::weak_ptr<swift_lattice> weak=held.lattice;
+    dynamic_object held(rows[0]);std::weak_ptr<::lattice::swift_lattice> weak=held.lattice;
     ASSERT_TRUE(held.lattice);EXPECT_EQ(held.lattice.get(),ref.get());facades.clear();
     EXPECT_FALSE(weak.expired());EXPECT_EQ(held.get_string("value"),"before");
     held.lattice->close();
@@ -158,7 +158,7 @@ TEST_F(RecoverySwiftContinuity, MigrationAndOversizedRecipeRefuseBeforeContainer
 }
 TEST_F(RecoverySwiftContinuity, OrdinarySwiftFactoryAndLegacyNativeCannotReattach) {
     auto& ref=open();insert(ref);const auto before=snapshot(ref);
-    EXPECT_THROW((swift_lattice(config(),schemas)),db_error);
+    EXPECT_THROW((::lattice::swift_lattice(config(),schemas)),db_error);
     EXPECT_THROW((lattice_db(config())),db_error);
     EXPECT_EQ(before,snapshot(ref));
 }
@@ -166,7 +166,7 @@ TEST_F(RecoverySwiftContinuity, ConfiguredWSSFacadeOwnsSameDerivedSchemaBeforeRo
     auto c=config();c.websocket_url=policy.routes[0].endpoint;
     continuous_result result;auto ref=open_swift_continuous(c,schemas,policy,result);require_swift_commit(result);
     ASSERT_TRUE(ref&&ref->valid());facades.push_back(std::move(ref));stop_notifier();
-    std::vector<std::shared_ptr<swift_lattice>> owners;
+    std::vector<std::shared_ptr<::lattice::swift_lattice>> owners;
     instance_registry::instance().for_each_alive(facades.front()->get()->config().path,[&](lattice_db* raw){auto actual=swift_lattice_ref::shared_for_lattice(raw);if(actual)owners.push_back(actual);});
     ASSERT_EQ(owners.size(),2u);EXPECT_NE(owners[0],owners[1]);
     for(const auto& owner:owners){ASSERT_TRUE(owner->get_properties_for_table("ContinuousSwiftRow"));EXPECT_TRUE(owner->get_properties_for_table("ContinuousSwiftRow")->at("note").no_history);}

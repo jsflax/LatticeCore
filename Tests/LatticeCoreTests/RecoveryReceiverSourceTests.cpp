@@ -202,6 +202,13 @@ TEST(RecoveryReceiverSource, OrdinaryOptedRouteAuditAndAckStillReachActualOwner)
     ASSERT_TRUE(remote.has_value());
     EXPECT_EQ(std::string(remote->name),"remote-through-described-source");
     EXPECT_TRUE(f.described());
+    // The positive per-channel marker remains while another actual live slot
+    // has not acknowledged this original. A lone channel instead collapses it.
+    lattice::register_replication_slot(f.sync->actual_owner().db(),"receiver-other-unacked");
+    const auto slots=f.sync->actual_owner().db().query("SELECT sync_id FROM _lattice_replication_slots ORDER BY sync_id");
+    ASSERT_EQ(slots.size(),2u);
+    EXPECT_EQ(std::get<std::string>(slots[0].at("sync_id")),"receiver-other-unacked");
+    EXPECT_EQ(std::get<std::string>(slots[1].at("sync_id")),"receiver-source");
     f.sync->actual_owner().add(TestPerson{"local-to-ack",43,std::nullopt});
     const auto pending=lattice::query_audit_log(f.sync->actual_owner().db());
     const auto local=std::find_if(pending.begin(),pending.end(),[](const auto& entry){return !entry.is_from_remote;});
@@ -212,6 +219,9 @@ TEST(RecoveryReceiverSource, OrdinaryOptedRouteAuditAndAckStillReachActualOwner)
     const auto state=f.sync->actual_owner().db().query("SELECT is_synchronized FROM _lattice_sync_state WHERE sync_id=? AND audit_entry_id=?",{std::string("receiver-source"),local->id});
     ASSERT_EQ(state.size(),1u);
     EXPECT_EQ(std::get<int64_t>(state.front().at("is_synchronized")),1);
+    EXPECT_TRUE(f.sync->actual_owner().db().query("SELECT 1 FROM _lattice_sync_state WHERE sync_id=? AND audit_entry_id=? AND is_synchronized=1",{std::string("receiver-other-unacked"),local->id}).empty());
+    const auto original=f.sync->actual_owner().db().query("SELECT isSynchronized FROM AuditLog WHERE id=?",{local->id});
+    ASSERT_EQ(original.size(),1u);EXPECT_EQ(std::get<int64_t>(original[0].at("isSynchronized")),0);
     EXPECT_TRUE(f.described());
     EXPECT_EQ(f.errors.load(),0);
 }
@@ -332,5 +342,28 @@ TEST(RecoveryReceiverSource, DestroyedDormantOwnerDoesNotLeakPolicyReservation) 
     }
     first.reset();auto replacement=std::make_unique<lattice::lattice_db>(owner_policy(file.str(),true));
     EXPECT_TRUE(replacement->is_sync_agent());EXPECT_EQ(installed.factory->calls.load(),2u);replacement->close();
+}
+#endif
+
+#ifndef __EMSCRIPTEN__
+TEST(RecoveryReceiverSource, OrdinaryOptedSingleChannelAckCollapsesExactAuditPostimage) {
+    Fixture f;f.open();f.receive(f.response());ASSERT_TRUE(f.described());
+    auto& owner=f.sync->actual_owner();
+    const auto slots=owner.db().query("SELECT sync_id FROM _lattice_replication_slots ORDER BY sync_id");
+    ASSERT_EQ(slots.size(),1u);EXPECT_EQ(std::get<std::string>(slots[0].at("sync_id")),"receiver-source");
+    owner.add(TestPerson{"single-channel-to-ack",44,std::nullopt});
+    const auto audit=owner.db().query("SELECT * FROM AuditLog ORDER BY id");ASSERT_EQ(audit.size(),1u);
+    ASSERT_EQ(std::get<int64_t>(audit[0].at("isSynchronized")),0);
+    ASSERT_EQ(std::get<int64_t>(audit[0].at("isFromRemote")),0);
+    const auto models=owner.db().query("SELECT * FROM TestPerson ORDER BY id");
+    const auto id=std::get<int64_t>(audit[0].at("id"));const auto original=std::get<std::string>(audit[0].at("globalId"));
+    const auto ack=lattice::server_sent_event::make_ack({original}).to_json();ASSERT_EQ(json::parse(ack).at("kind"),"ack");
+    ASSERT_TRUE(f.probe.attempt(0).trigger_on_message(lattice::transport_message::from_string(ack)));
+    auto expected=audit;expected[0]["isSynchronized"]=int64_t{1};
+    EXPECT_EQ(owner.db().query("SELECT * FROM AuditLog ORDER BY id"),expected);
+    EXPECT_TRUE(owner.db().query("SELECT * FROM _lattice_sync_state WHERE audit_entry_id=?",{id}).empty());
+    EXPECT_EQ(owner.db().query("SELECT * FROM TestPerson ORDER BY id"),models);
+    EXPECT_EQ(owner.db().query("SELECT sync_id FROM _lattice_replication_slots ORDER BY sync_id"),slots);
+    EXPECT_TRUE(f.described());EXPECT_EQ(f.errors.load(),0);
 }
 #endif

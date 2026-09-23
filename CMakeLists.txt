@@ -195,6 +195,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
+    Tests/LatticeCoreTests/WALCheckpointTests.cpp
     Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
@@ -227,6 +228,34 @@ set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 
 include(GoogleTest)
 gtest_discover_tests(LatticeCoreTests)
+
+# Deterministic checkpoint/COMMIT interleaving: rename sqlite3_step only in a
+# separate test copy of db.cpp. Neither LatticeCore nor its consumers receive
+# the wrapper or its compile definitions.
+add_library(LatticeCheckpointInterposedDB OBJECT
+    Sources/LatticeCore/src/db.cpp
+)
+target_include_directories(LatticeCheckpointInterposedDB PRIVATE
+    Sources/LatticeCore/include
+)
+target_compile_definitions(LatticeCheckpointInterposedDB PRIVATE
+    SQLITE_CORE
+    sqlite3_step=lattice_checkpoint_test_step
+)
+target_link_libraries(LatticeCheckpointInterposedDB PRIVATE SqliteVec SQLite::SQLite3)
+
+add_executable(LatticeCheckpointRegressionTests
+    Tests/LatticeCoreTests/WALCheckpointTests.cpp
+    $<TARGET_OBJECTS:LatticeCheckpointInterposedDB>
+)
+target_include_directories(LatticeCheckpointRegressionTests PRIVATE
+    Sources/LatticeCore/include
+)
+target_compile_definitions(LatticeCheckpointRegressionTests PRIVATE
+    LATTICE_CHECKPOINT_STEP_INTERPOSITION
+)
+target_link_libraries(LatticeCheckpointRegressionTests PRIVATE SqliteVec SQLite::SQLite3 gtest_main)
+gtest_discover_tests(LatticeCheckpointRegressionTests TEST_PREFIX "CheckpointRegression.")
 
 # =============================================================================
 # LatticeCAPITests - behavioral tests against the C ABI (links the C surface)

@@ -164,8 +164,9 @@ public:
     /// before the keeper transaction can close (results spec §3.4).
     void interrupt();
 
-    /// Result of a wal_checkpoint() call. rc is the PRAGMA's SQLite result
-    /// code; busy is 1 when the checkpoint could not complete because a
+    /// Result of a wal_checkpoint() call, retaining PRAGMA-style status:
+    /// rc is SQLITE_OK for an ordinary or busy checkpoint, SQLITE_ERROR for
+    /// other checkpoint errors; busy is 1 when it could not complete because a
     /// reader/writer held the WAL; log_frames/checkpointed mirror the PRAGMA
     /// row (-1 when unavailable).
     struct checkpoint_result {

@@ -733,34 +733,42 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
     if (closed_.load(std::memory_order_acquire) || mode_ != open_mode::read_write || !db_) {
         return result;
     }
-    // PRAGMA (not the C API) so the (busy, log, checkpointed) row comes back
-    // through the ordinary query path; same style as the Swift bridge's
-    // checkpoint(). Bound the wait: TRUNCATE holds the writer lock while
-    // waiting out readers, so a held snapshot must fail fast (retry next
-    // cycle) rather than stall every writer behind it.
-    sqlite3_busy_timeout(db_, truncate ? busy_budget_ms : 0);
-    try {
-        auto rows = query(truncate ? "PRAGMA wal_checkpoint(TRUNCATE)"
-                                   : "PRAGMA wal_checkpoint(PASSIVE)");
-        result.rc = SQLITE_OK;
-        if (!rows.empty()) {
-            auto get = [&](const char* key) -> int64_t {
-                auto it = rows[0].find(key);
-                if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    return std::get<int64_t>(it->second);
-                }
-                return -1;
-            };
-            result.busy = static_cast<int>(get("busy"));
-            result.log_frames = get("log");
-            result.checkpointed = get("checkpointed");
+    // A PRAGMA checkpoint leaves a non-readonly VM active after SQLITE_ROW,
+    // until query() steps again and finalizes it. Maintenance and application
+    // writes share this FULLMUTEX connection: another thread can COMMIT in
+    // that inter-call gap and fail with "SQL statements in progress". The
+    // C API performs the checkpoint without leaving a prepared VM behind.
+    // Keep timeout installation/restoration inside the same recursive SQLite
+    // connection mutex, so a concurrent statement cannot inherit this budget.
+    struct connection_lock {
+        sqlite3_mutex* mutex;
+        explicit connection_lock(sqlite3* db) : mutex(sqlite3_db_mutex(db)) {
+            sqlite3_mutex_enter(mutex);
         }
-    } catch (const std::exception& e) {
+        ~connection_lock() { sqlite3_mutex_leave(mutex); }
+    } lock(db_);
+    g_statement_count.fetch_add(1, std::memory_order_relaxed);
+    ++t_statement_count;  // retain the former query() maintenance accounting
+    sqlite3_busy_timeout(db_, truncate ? busy_budget_ms : 0);
+    int log_frames = -1;
+    int checkpointed = -1;
+    // nullptr matches the old unqualified PRAGMA: include attached databases.
+    const int rc = sqlite3_wal_checkpoint_v2(
+        db_, nullptr, truncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE,
+        &log_frames, &checkpointed);
+    sqlite3_busy_timeout(db_, busy_timeout_ms_);
+    // Preserve the existing PRAGMA-style contract: BUSY is a successful
+    // status row (busy=1), while other errors leave the default frame values.
+    if (rc == SQLITE_OK || rc == SQLITE_BUSY) {
+        result.rc = SQLITE_OK;
+        result.busy = rc == SQLITE_BUSY ? 1 : 0;
+        result.log_frames = log_frames;
+        result.checkpointed = checkpointed;
+    } else {
         result.rc = SQLITE_ERROR;
-        LOG_DEBUG("db", "wal_checkpoint(%s) failed: %s, path=%s",
-                  truncate ? "TRUNCATE" : "PASSIVE", e.what(), path_.c_str());
+        LOG_DEBUG("db", "wal_checkpoint(%s) failed: rc=%d, %s, path=%s",
+                  truncate ? "TRUNCATE" : "PASSIVE", rc, sqlite3_errmsg(db_), path_.c_str());
     }
-    sqlite3_busy_timeout(db_, busy_timeout_ms_);  // restore statement-level timeout
     return result;
 #endif
 }

@@ -170,6 +170,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
+    Tests/LatticeCoreTests/BridgeLinkSnapshotTests.cpp
 )
 target_link_libraries(LatticeCoreTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
 target_include_directories(LatticeCoreTests PRIVATE Tests/LatticeCoreTests)

@@ -193,24 +193,24 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
         const property_descriptor& property = managed_.properties_.at(name);
         auto base = static_cast<model_base>(managed_);
         m.bind_to_parent(&base, property);
-        // Nil to-one link: no related row exists. get_value() is null here, so
-        // m->table_name() (and the std::move(m) below) would dereference a null
-        // pointer. Return an empty (unmanaged) object instead — callers test
-        // is_managed()/hasLattice and treat that as "no linked object".
-        if (!m.has_value()) {
+        // Resolve once: a replicated unlink may change the relationship between
+        // queries. The local wrapper owns this managed target until it is copied
+        // below, even if the link disappears in another connection meanwhile.
+        auto* target = m.get_value();
+        if (!target) {
             return dynamic_object{};
         }
         // Target table may be absent from the schema (e.g. a partially
         // reconstructed dynamic schema); guard the deref.
-        const SwiftSchema* schema = lattice->get_properties_for_table(m->table_name());
+        const SwiftSchema* schema = lattice->get_properties_for_table(target->table_name());
         if (schema) {
             for (auto& [col_name, column_type] : *schema) {
-                m->properties_[col_name] = column_type;
-                m->property_types_[col_name] = column_type.type;
-                m->property_names_.push_back(col_name);
+                target->properties_[col_name] = column_type;
+                target->property_types_[col_name] = column_type.type;
+                target->property_names_.push_back(col_name);
             }
         }
-        return std::move(m);
+        return dynamic_object(*target);
     } else {
         if (unmanaged_.link_values.count(name)) {
             return std::move(*unmanaged_.link_values.at(name));

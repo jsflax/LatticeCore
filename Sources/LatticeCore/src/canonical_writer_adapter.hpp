@@ -105,6 +105,8 @@ class canonical_writer_adapter {
     static const recovery_owner_schema& authenticated_catalog(const lattice_db&) noexcept;
     static std::shared_ptr<instance_guard> authenticated_owner_guard(const lattice_db&) noexcept;
     static std::shared_ptr<const physical_store_identity> authenticated_physical_identity(lattice_db&);
+    static std::shared_ptr<const physical_store_identity> try_authenticated_physical_identity(lattice_db&,
+        void*,int32_t(*current)(void*),int32_t(*admissible)(void*),bool& pre_effect_busy);
     std::shared_ptr<const std::atomic<bool>> authenticated_active_guard()const noexcept;
     static std::shared_ptr<canonical_writer_adapter> open_authenticated_source(std::shared_ptr<lattice_db>,
         const canonical_namespaced_writer_profile&,canonical_upstream_limits,canonical_retention_limits,

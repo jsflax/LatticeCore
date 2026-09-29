@@ -17,6 +17,16 @@ relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup(const std::str
     }catch(...){relay_failure();return {};}
 }
 bool relay_recovery_setup::valid()const noexcept{return bool(value_);}
+relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup_automatic(const std::string& policy,const std::string& connection,
+    void* context,int32_t(*current)(void*),int32_t(*admissible)(void*),void(*destroy)(void*))const noexcept {
+    last_bridge_error().clear();
+    try {
+        relay_recovery_setup result;
+        result.value_=detail::authenticated_relay_setup::open_automatic(impl_,policy,connection,context,current,admissible,destroy,
+            result.pending_before_enrollment_);
+        return result;
+    }catch(...){relay_failure();return {};}
+}
 int32_t swift_lattice_ref::migrate_relay_receipt_coverage_file(const std::string& path,const SchemaVector& schemas,
     int64_t schema_version,int32_t busy_timeout_ms,const std::string& prior,const std::string& next)noexcept {
     last_bridge_error().clear();

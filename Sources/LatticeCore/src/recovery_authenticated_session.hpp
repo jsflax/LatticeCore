@@ -83,6 +83,8 @@ class authenticated_relay_setup {
     friend struct authenticated_ready_test_access;
     static thread_local const std::function<void()>* ready_before_owned_test_hook_;
     static thread_local const std::function<void()>* admin_before_open_test_hook_;
+    // Passive friend-only observation; cannot inject work or skip validation.
+    static thread_local uint64_t* setup_registry_entries_test_counter_;
     struct source_file_administration;
     static std::unique_ptr<source_file_administration> open_administrative_file(const std::string&,
         recovery_owner_schema,int64_t,int);
@@ -94,6 +96,10 @@ class authenticated_relay_setup {
     static std::shared_ptr<authenticated_relay_setup> open(std::shared_ptr<lattice_db>,
         const std::string& source_policy,const std::string& connection,
         void*,int32_t(*)(void*),void(*)(void*));
+    static std::shared_ptr<authenticated_relay_setup> open_automatic(std::shared_ptr<lattice_db>,
+        const std::string&,const std::string&,void*,int32_t(*)(void*),int32_t(*)(void*),void(*)(void*),bool&);
+    static std::shared_ptr<authenticated_relay_setup> open_impl(std::shared_ptr<lattice_db>,
+        const std::string&,const std::string&,void*,int32_t(*)(void*),void(*)(void*),int32_t(*)(void*),bool*);
     // Explicit administration of the real resolved mount owner, never an
     // issuer. False is only pre-SQL quiescence contention; exceptions do not
     // imply durable absence and ordinary open never invokes this transition.

@@ -530,6 +530,15 @@ private:
         const std::string& schema,
         const std::shared_ptr<database_read_control>& control,
         const char*& failure, physical_identity_details* details = nullptr) const;
+    struct physical_identity_attempt {
+        enum class status { captured, mutex_busy, refused };
+        status state = status::refused;
+        std::shared_ptr<const physical_store_identity> identity;
+        const char* failure = nullptr;
+    };
+    // Automatic source setup only. One mutex try, no wait/cached fast path/SQL/retry;
+    // successful acquisition uses the same complete current-file checks.
+    physical_identity_attempt try_current_physical_identity(const std::string& schema) const;
     // Attachment schema metadata only. Run the existing single read statement
     // inside one SQLite execution scope; keep original SQLite types and names.
     std::vector<std::string> query_attachment_text_metadata(

@@ -1097,6 +1097,45 @@ std::shared_ptr<const physical_store_identity> canonical_writer_adapter::authent
         refuse("authenticated physical store identity unavailable: owner_retired_after_capture");
     return identity;
 }
+std::shared_ptr<const physical_store_identity> canonical_writer_adapter::try_authenticated_physical_identity(
+    lattice_db& owner,void* context,int32_t(*current)(void*),int32_t(*admissible)(void*),bool& pre_effect_busy) {
+    pre_effect_busy=false;
+    std::shared_ptr<database> writer;
+    uint64_t revision=0;
+    {
+        std::lock_guard lock(owner.connection_ownership_mutex_);
+        if(owner.closed_.load(std::memory_order_acquire)||!owner.guard_->alive.load(std::memory_order_seq_cst))
+            refuse("authenticated physical owner retired");
+        writer=owner.db_;revision=owner.connection_revision_;
+    }
+    if(!writer)refuse("authenticated physical store identity unavailable: missing_writer");
+    // These callbacks only veto this attempt. They run on the calling IO
+    // lane, outside owner/SQLite/registry locks, and carry no authority.
+    const auto eligible=[&] {
+        if(!current||!admissible||current(context)!=1||admissible(context)!=1)
+            refuse("automatic relay setup admission retired or vetoed");
+        if(owner.closed_.load(std::memory_order_acquire)||!owner.guard_->alive.load(std::memory_order_seq_cst))
+            refuse("authenticated physical owner retired");
+    };
+    eligible();
+    const auto attempt=writer->try_current_physical_identity("main");
+    // The helper has released SQLite. Finish owner revalidation before the
+    // last off-lock route/deadline veto, immediately before registry entry.
+    {
+        std::lock_guard lock(owner.connection_ownership_mutex_);
+        if(owner.closed_.load(std::memory_order_acquire)||!owner.guard_->alive.load(std::memory_order_seq_cst)||
+           owner.db_!=writer||owner.connection_revision_!=revision)
+            refuse("authenticated physical owner changed during capture");
+    }
+    eligible();
+    if(attempt.state==database::physical_identity_attempt::status::mutex_busy) {
+        pre_effect_busy=true;return {};
+    }
+    if(!attempt.identity)
+        throw db_error("authenticated physical store identity unavailable: "+
+            std::string(attempt.failure?attempt.failure:"unclassified"));
+    return attempt.identity;
+}
 std::shared_ptr<const std::atomic<bool>> canonical_writer_adapter::authenticated_active_guard()const noexcept{return context_->active;}
 canonical_namespace_admission canonical_writer_adapter::admit_namespace_for_qualification(std::shared_ptr<lattice_db> owner,
     const std::string& namespace_id,const std::string& replica_id) {

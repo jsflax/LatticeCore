@@ -99,9 +99,13 @@ public:
 class relay_recovery_setup {
     friend class swift_lattice_ref;
     std::shared_ptr<detail::authenticated_relay_setup> value_;
+    bool pending_before_enrollment_=false;
 public:
     relay_recovery_setup()=default;
     bool valid()const noexcept;
+    // Finite no-effect result for the separate automatic entrypoint only.
+    // False on every ordinary call and every post-boundary failure.
+    bool pending_before_enrollment()const noexcept SWIFT_NAME(pendingBeforeEnrollment()){return pending_before_enrollment_;}
     std::string descriptor()const noexcept;
     relay_recovery_stop stop_token()const noexcept SWIFT_NAME(stopToken());
     bool finish_authorization(const std::string&)const noexcept SWIFT_NAME(finishAuthorization(_:));

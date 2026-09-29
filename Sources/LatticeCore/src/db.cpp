@@ -175,6 +175,27 @@ std::shared_ptr<const physical_store_identity> database::physical_identity_locke
 }
 
 
+database::physical_identity_attempt database::try_current_physical_identity(const std::string& schema) const {
+    physical_identity_attempt result;
+#if defined(__EMSCRIPTEN__) || (!defined(__APPLE__) && !defined(__linux__))
+    result.failure = "unsupported_platform";
+#else
+    if (!db_) { result.failure = "missing_handle"; return result; }
+    auto* mutex = sqlite3_db_mutex(db_);
+    if (!mutex) { result.failure = "missing_connection_mutex"; return result; }
+    const int rc = sqlite3_mutex_try(mutex);
+    if (rc != SQLITE_OK) {
+        if (rc == SQLITE_BUSY) result.state = physical_identity_attempt::status::mutex_busy;
+        else result.failure = "metadata_mutex_unavailable";
+        return result;
+    }
+    struct unlock { sqlite3_mutex* mutex; ~unlock() { sqlite3_mutex_leave(mutex); } } unlock{mutex};
+    result.identity = physical_identity_locked_observed(schema, {}, result.failure);
+    if (result.identity) result.state = physical_identity_attempt::status::captured;
+#endif
+    return result;
+}
+
 std::shared_ptr<const physical_store_identity> database::attach_and_capture_identity(
     const std::string& attach_sql, const std::string& schema) {
     if (closed_.load(std::memory_order_acquire)) return {};

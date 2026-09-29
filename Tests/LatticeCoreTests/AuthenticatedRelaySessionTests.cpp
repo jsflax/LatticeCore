@@ -18,10 +18,12 @@
 #include <cstdio>
 #include <chrono>
 #include <thread>
+#include <condition_variable>
 
 #if defined(__APPLE__) || defined(__linux__)
 namespace lattice::detail {
 struct authenticated_ready_test_access {
+    static uint64_t* setup_entries(uint64_t* value) {auto* prior=authenticated_relay_setup::setup_registry_entries_test_counter_;authenticated_relay_setup::setup_registry_entries_test_counter_=value;return prior;}
     static void before_owned(const std::function<void()>* hook) {authenticated_relay_setup::ready_before_owned_test_hook_=hook;}
     static void before_admin_open(const std::function<void()>* hook) {authenticated_relay_setup::admin_before_open_test_hook_=hook;}
 };
@@ -2370,6 +2372,224 @@ TEST_F(AuthenticatedReadySession, PrepareExceptionRetiresWorkspaceWhileItsConsum
     const auto answer=json::parse(current.wire());EXPECT_EQ(answer.at("publication").at("state"),"committed");EXPECT_EQ(answer.at("leaseAvailable"),true);
     EXPECT_TRUE(charge.valid());EXPECT_FALSE(setup.stop_token().drained());EXPECT_EQ(original_error,"relay unexpected object shape");
     current={};EXPECT_TRUE(setup.stop_token().drained());charge={};EXPECT_TRUE(setup.stop_token().reserve_ready(raw.size()).valid());
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+struct AutomaticSetupRouteState {
+    std::atomic<bool> current{true}, admissible{true};
+    std::atomic<unsigned> current_calls{0}, admission_calls{0}, destroyed{0}, wrong_thread{0};
+    unsigned veto_on_call=0, retire_on_current_call=0;
+    const std::thread::id io=std::this_thread::get_id();
+};
+struct AutomaticSetupRoute {
+    std::shared_ptr<AutomaticSetupRouteState> state;
+    static void check_thread(const std::shared_ptr<AutomaticSetupRouteState>& s) {
+        if(std::this_thread::get_id()!=s->io)++s->wrong_thread;
+    }
+    static int32_t current(void* raw) {
+        const auto& s=static_cast<AutomaticSetupRoute*>(raw)->state;check_thread(s);
+        const auto call=++s->current_calls;
+        if(s->retire_on_current_call&&call>=s->retire_on_current_call)s->current=false;
+        return s->current?1:0;
+    }
+    static int32_t admissible(void* raw) {
+        const auto& s=static_cast<AutomaticSetupRoute*>(raw)->state;check_thread(s);
+        const auto call=++s->admission_calls;
+        return s->admissible&&(!s->veto_on_call||call<s->veto_on_call)?1:0;
+    }
+    static void destroy(void* raw) {
+        auto* value=static_cast<AutomaticSetupRoute*>(raw);check_thread(value->state);
+        ++value->state->destroyed;delete value;
+    }
+};
+struct SetupRegistryEntries {
+    uint64_t count=0;
+    uint64_t* prior=detail::authenticated_ready_test_access::setup_entries(&count);
+    ~SetupRegistryEntries(){detail::authenticated_ready_test_access::setup_entries(prior);}
+};
+class ActualSetupMutexHold {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool acquired=false,released=false;
+    std::thread worker;
+public:
+    explicit ActualSetupMutexHold(sqlite3_mutex* target) {
+        // Start only after every field has been initialized.
+        worker=std::thread([this,target]{
+            sqlite3_mutex_enter(target);
+            {std::unique_lock lock(mutex);acquired=true;changed.notify_all();changed.wait(lock,[&]{return released;});}
+            sqlite3_mutex_leave(target);
+        });
+    }
+    bool ready(){std::unique_lock lock(mutex);return changed.wait_for(lock,std::chrono::seconds(2),[&]{return acquired;});}
+    ~ActualSetupMutexHold(){
+        {std::lock_guard lock(mutex);released=true;}changed.notify_all();worker.join();
+    }
+};
+class AutomaticRelaySetup:public AuthenticatedRelaySession {
+protected:
+    relay_recovery_setup attempt(const std::shared_ptr<AutomaticSetupRouteState>& state,const json& p,const json& c) {
+        return ref->open_relay_recovery_setup_automatic(p.dump(),c.dump(),new AutomaticSetupRoute{state},
+            AutomaticSetupRoute::current,AutomaticSetupRoute::admissible,AutomaticSetupRoute::destroy);
+    }
+    relay_recovery_setup attempt(const std::shared_ptr<AutomaticSetupRouteState>& state){return attempt(state,policy(),connection());}
+    sqlite3_mutex* actual_mutex(){return sqlite3_db_mutex(detail::canonical_writer_custody_test_access::fault_handle(owner->db()));}
+    auto schema(){return owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name");}
+};
+
+TEST_F(AutomaticRelaySetup, ActualHeldMutexReturnsOnlyPreEffectBusyThenSameOwnerEnrollsOnce) {
+    SetupRegistryEntries entries;const auto before=schema();
+    const auto actual_owner=owner.get();const auto p=policy(),c=connection();
+    auto first=std::make_shared<AutomaticSetupRouteState>();
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+        const auto statements=database::thread_statement_count();
+        const auto busy=attempt(first,p,c);
+        EXPECT_EQ(database::thread_statement_count(),statements);
+        EXPECT_FALSE(busy.valid());EXPECT_TRUE(busy.pending_before_enrollment());EXPECT_TRUE(last_bridge_error().empty());
+        EXPECT_EQ(entries.count,0u);EXPECT_EQ(first->admission_calls,2u);EXPECT_EQ(first->destroyed,1u);
+        EXPECT_EQ(first->wrong_thread,0u);
+    }
+    EXPECT_EQ(schema(),before);EXPECT_EQ(owner.get(),actual_owner);
+    auto second=std::make_shared<AutomaticSetupRouteState>();setup=attempt(second,p,c);
+    ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_FALSE(setup.pending_before_enrollment());EXPECT_EQ(entries.count,1u);
+    EXPECT_EQ(second->destroyed,0u);EXPECT_EQ(setup.receive(frame(entry())).status_code(),2);
+    ASSERT_TRUE(setup.finish_authorization(outcome(setup).dump()));
+    const auto e=entry();auto accepted=setup.receive(frame(e));ASSERT_EQ(accepted.status_code(),1);
+    EXPECT_EQ(accepted.ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(receipts().size(),1u);
+    accepted={};setup.close_on_io();setup={};EXPECT_EQ(second->destroyed,1u);EXPECT_EQ(second->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, FalseInitialVetoIsTerminalEvenWithActualMutexBusy) {
+    SetupRegistryEntries entries;const auto before=schema();auto state=std::make_shared<AutomaticSetupRouteState>();state->admissible=false;
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto result=attempt(state);
+        EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+        EXPECT_EQ(state->admission_calls,1u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+        EXPECT_EQ(last_bridge_error(),"automatic relay setup admission retired or vetoed");
+    }
+    EXPECT_EQ(schema(),before);
+}
+
+TEST_F(AutomaticRelaySetup, VetoAfterActualCapturePreventsRegistryEntryAndSQL) {
+    SetupRegistryEntries entries;const auto before=schema();auto state=std::make_shared<AutomaticSetupRouteState>();state->veto_on_call=2;
+    const auto statements=database::thread_statement_count();
+    const auto result=attempt(state);
+    EXPECT_EQ(database::thread_statement_count(),statements);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_EQ(last_bridge_error(),"automatic relay setup admission retired or vetoed");EXPECT_EQ(schema(),before);
+}
+
+TEST_F(AutomaticRelaySetup, VetoRacingActualBusyResultCannotBecomePending) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();state->veto_on_call=2;
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto result=attempt(state);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_EQ(last_bridge_error(),"automatic relay setup admission retired or vetoed");
+}
+
+TEST_F(AutomaticRelaySetup, ActualRouteRetirementRacingBusyTakesPrecedenceOverPending) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();state->retire_on_current_call=3;
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto result=attempt(state);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_FALSE(state->current);EXPECT_EQ(state->current_calls,3u);EXPECT_EQ(state->admission_calls,1u);
+    EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, ClosedActualOwnerIsTerminalBeforeCapture) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();owner->close();
+    const auto result=attempt(state);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(state->admission_calls,0u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_EQ(last_bridge_error(),"authenticated physical owner retired");
+}
+
+TEST_F(AutomaticRelaySetup, MissingAdmissionCallbackAndMalformedPolicyNeverBecomeBusy) {
+    SetupRegistryEntries entries;auto missing=std::make_shared<AutomaticSetupRouteState>();
+    const auto no_callback=ref->open_relay_recovery_setup_automatic(policy().dump(),connection().dump(),new AutomaticSetupRoute{missing},
+        AutomaticSetupRoute::current,nullptr,AutomaticSetupRoute::destroy);
+    EXPECT_FALSE(no_callback.valid());EXPECT_FALSE(no_callback.pending_before_enrollment());EXPECT_EQ(missing->destroyed,1u);
+    auto malformed=std::make_shared<AutomaticSetupRouteState>();auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+        const auto invalid=ref->open_relay_recovery_setup_automatic("{",connection().dump(),new AutomaticSetupRoute{malformed},
+            AutomaticSetupRoute::current,AutomaticSetupRoute::admissible,AutomaticSetupRoute::destroy);
+        EXPECT_FALSE(invalid.valid());EXPECT_FALSE(invalid.pending_before_enrollment());EXPECT_EQ(malformed->destroyed,1u);
+        EXPECT_EQ(malformed->admission_calls,0u);EXPECT_EQ(entries.count,0u);
+    }
+    EXPECT_EQ(missing->wrong_thread,0u);EXPECT_EQ(malformed->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, NullDestroyKeepsCallerCustodyAndNoPendingClaim) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();auto* context=new AutomaticSetupRoute{state};
+    const auto result=ref->open_relay_recovery_setup_automatic(policy().dump(),connection().dump(),context,
+        AutomaticSetupRoute::current,AutomaticSetupRoute::admissible,nullptr);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(state->destroyed,0u);
+    EXPECT_EQ(entries.count,0u);AutomaticSetupRoute::destroy(context);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, PostRegistryIdleOwnerRefusalIsTerminalAndNeverReplayed) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();
+    owner->db().begin_transaction();
+    const auto result=attempt(state);const auto error=last_bridge_error();
+    owner->db().rollback();
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,1u);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_NE(error.find("explicit idle WAL/FULL owner"),std::string::npos);
+    auto fresh=std::make_shared<AutomaticSetupRouteState>();setup=attempt(fresh);
+    ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_EQ(entries.count,2u);EXPECT_FALSE(setup.pending_before_enrollment());
+}
+
+TEST_F(AutomaticRelaySetup, StrictLegacyBusyRemainsInvalidWithoutAutomaticPending) {
+    SetupRegistryEntries entries;auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+    const auto strict=open(policy(),connection());
+    EXPECT_FALSE(strict.valid());EXPECT_FALSE(strict.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(last_bridge_error(),"authenticated physical store identity unavailable: metadata_busy");EXPECT_EQ(route->destroyed,1);
+}
+
+TEST_F(AutomaticRelaySetup, SuccessfulSessionIgnoresLaterAdmissionVetoButCurrentRouteStillFences) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();setup=attempt(state);
+    ASSERT_TRUE(setup.valid())<<last_bridge_error();ASSERT_TRUE(setup.finish_authorization(outcome(setup).dump()));
+    ASSERT_EQ(state->admission_calls,2u);state->admissible=false;
+    const auto e=entry();auto accepted=setup.receive(frame(e));ASSERT_EQ(accepted.status_code(),1);
+    EXPECT_EQ(accepted.ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(state->admission_calls,2u);
+    const auto preserved=receipts();ASSERT_EQ(preserved.size(),1u);state->current=false;
+    const auto retired=setup.receive(frame(entry(2)));EXPECT_EQ(retired.status_code(),2);EXPECT_EQ(receipts(),preserved);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(entries.count,1u);accepted={};setup.close_on_io();setup={};
+    EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, ActualFileSubstitutionAfterBusyCannotUseTheCachedIdentity) {
+    SetupRegistryEntries entries;auto first=std::make_shared<AutomaticSetupRouteState>();auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto busy=attempt(first);
+        ASSERT_TRUE(busy.pending_before_enrollment());EXPECT_FALSE(busy.valid());
+    }
+    TempDB successor("automatic_setup_successor"),moved("automatic_setup_original");
+    {database replacement(successor.str());replacement.execute("CREATE TABLE ForeignValue(id INTEGER)");}
+    struct restore_path {
+        std::filesystem::path from,to;
+        restore_path(std::filesystem::path a,std::filesystem::path b):from(std::move(a)),to(std::move(b)){std::filesystem::rename(from,to);}
+        ~restore_path(){std::error_code ignored;std::filesystem::rename(to,from,ignored);}
+    };
+    auto state=std::make_shared<AutomaticSetupRouteState>();relay_recovery_setup result;std::string error;
+    {
+        restore_path original(file.path,moved.path),other(successor.path,file.path);
+        result=attempt(state);error=last_bridge_error();
+    }
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_NE(error.find("authenticated physical store identity unavailable:"),std::string::npos);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
 }
 }
 #endif

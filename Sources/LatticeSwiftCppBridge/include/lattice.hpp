@@ -3825,6 +3825,12 @@ public:
     relay_recovery_setup open_relay_recovery_setup(const std::string& policy,const std::string& connection,
         void* context,int32_t(*current)(void*),void(*destroy)(void*))const noexcept
         SWIFT_NAME(openRelayRecoverySetup(policy:connection:context:current:destroy:));
+    // Package automatic setup: one current-identity mutex try, no retry. The
+    // separate nonthrowing admissible callback only vetoes pre-effect entry;
+    // it never changes the ordinary current callback or retained session.
+    relay_recovery_setup open_relay_recovery_setup_automatic(const std::string& policy,const std::string& connection,
+        void* context,int32_t(*current)(void*),int32_t(*admissible)(void*),void(*destroy)(void*))const noexcept
+        SWIFT_NAME(openRelayRecoverySetupAutomatic(policy:connection:context:current:admissible:destroy:));
     // Package administration of the actual resolved relay owner. 1 is known
     // migrated, 2 is no-effect quiescence contention, 4 is an error with no
     // assertion of rollback/absence. This never creates a session admission.

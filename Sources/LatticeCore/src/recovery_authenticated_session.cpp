@@ -572,9 +572,22 @@ bool authenticated_relay_setup::migrate_receipt_coverage(std::shared_ptr<lattice
 }
 std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::shared_ptr<lattice_db> owner,
     const std::string& policy,const std::string& connection,void* context,int32_t(*current)(void*),void(*destroy)(void*)) {
+    return open_impl(std::move(owner),policy,connection,context,current,destroy,nullptr,nullptr);
+}
+thread_local uint64_t* authenticated_relay_setup::setup_registry_entries_test_counter_=nullptr;
+std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open_automatic(std::shared_ptr<lattice_db> owner,
+    const std::string& policy,const std::string& connection,void* context,int32_t(*current)(void*),
+    int32_t(*admissible)(void*),void(*destroy)(void*),bool& pre_effect_busy) {
+    pre_effect_busy=false;
+    return open_impl(std::move(owner),policy,connection,context,current,destroy,admissible,&pre_effect_busy);
+}
+std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open_impl(std::shared_ptr<lattice_db> owner,
+    const std::string& policy,const std::string& connection,void* context,int32_t(*current)(void*),void(*destroy)(void*),
+    int32_t(*admissible)(void*),bool* pre_effect_busy) {
     // A supplied nonthrowing destroy transfers route custody on EVERY outcome.
     if(!destroy)reject("relay route destroy required before ownership transfer");
     std::shared_ptr<void> retained(context,destroy);
+    if(pre_effect_busy&&!admissible)reject("automatic relay setup admission callback required");
     if(!owner||!context||!current||current(context)!=1)reject("relay actual live route required");
     auto r=recipe(canonical_writer_adapter::authenticated_catalog(*owner),bounded(policy,policy_bytes));auto c=bounded(connection,connection_bytes);
     shape(c,{"mount","connection","channel","authenticatedUserID","peer"});
@@ -583,7 +596,12 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
     (void)text(c.at("peer"),"replicaID");c["peer"]["receiverIncarnation"]=uuid(c.at("peer"),"receiverIncarnation");c["peer"]["channelIncarnation"]=uuid(c.at("peer"),"channelIncarnation");
     const auto owner_guard=canonical_writer_adapter::authenticated_owner_guard(*owner);
     if(!owner_guard)reject("relay actual owner identity unavailable");
-    const auto physical=canonical_writer_adapter::authenticated_physical_identity(*owner);
+    bool busy_before_registry=false;
+    const auto physical=pre_effect_busy?
+        canonical_writer_adapter::try_authenticated_physical_identity(*owner,context,current,admissible,busy_before_registry):
+        canonical_writer_adapter::authenticated_physical_identity(*owner);
+    if(busy_before_registry){*pre_effect_busy=true;return {};}
+    if(setup_registry_entries_test_counter_)++*setup_registry_entries_test_counter_;
     const physical_key key{physical->device,physical->inode};
     std::shared_ptr<authenticated_mounted_source> source;
     std::shared_ptr<authenticated_ready_budget> budget;

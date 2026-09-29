@@ -25,7 +25,12 @@ extern thread_local std::function<void()> before_late_discovery;
 extern thread_local std::function<void()> before_drain_admission;
 // Copied at pacer creation. Tests may hold initial startup, then pause its
 // final false predicate under the wait mutex. Production is null; no throwing.
-struct pacer_wait_schedule {std::function<void()> starting,before_wait;};
+struct pacer_wait_schedule {
+    std::function<void()> starting,before_wait;
+    // Passive rendezvous before discovery on an actual due receiver tick.
+    // No owner, pacer, receiver, endpoint or SQL lock is held here.
+    std::function<void()> before_receiver_discovery;
+};
 extern thread_local std::shared_ptr<const pacer_wait_schedule> pacer_wait;
 }
 

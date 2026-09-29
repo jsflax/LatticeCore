@@ -2218,3 +2218,111 @@ TEST_F(TerminalReceiverController, LateOnlyDrainKeepsOriginalReadAdmissionDeadli
 }
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+class PacerCallbackSynchronizer final : public synchronizer {
+public:
+    using synchronizer::synchronizer;
+    auto discovery_observation()const{return std::make_pair(discovery_deferral_,reconnect_lifecycle_.load());}
+};
+struct PacerCallbackOwner {
+    std::mutex mutex;std::unique_ptr<PacerCallbackSynchronizer> sync;
+    void retire(){std::unique_ptr<PacerCallbackSynchronizer> old;{std::lock_guard lock(mutex);old=std::move(sync);}old.reset();}
+    ~PacerCallbackOwner(){retire();}
+};
+struct PacerCallbackObservation {
+    std::shared_ptr<ControllerPause> pause=std::make_shared<ControllerPause>();
+    std::atomic<bool> armed{false},cancelled{false};std::atomic<unsigned> ticks{0};
+    std::thread::id tick_thread;std::promise<void> completed,pacer_exited;
+    std::mutex mutex;std::vector<std::string> errors,received;
+    bool same_tick=false,capture_alive=false;unsigned capture_uses=0;
+};
+struct PacerCallbackCapture {unsigned uses=0;};
+struct ObservedReceiverPacerSchedule : detail::sync_background_test_hooks::pacer_wait_schedule {
+    std::shared_ptr<PacerCallbackObservation> observation;
+    ~ObservedReceiverPacerSchedule(){observation->pacer_exited.set_value();}
+};
+struct PacerCallbackCleanup {
+    std::shared_ptr<PacerCallbackOwner> owner;std::shared_ptr<PacerCallbackObservation> observation;
+    ~PacerCallbackCleanup(){observation->cancelled.store(true);observation->pause->release();owner->retire();}
+};
+TEST_F(RecoveryReceiverController, ActualDueReceiverPacerRetiresDuringDeferredPhysicalAckCompletion) {
+    configure(1,false);
+    // Select the real public inline scheduler at factory creation. The native
+    // synchronizer adapter keeps idle invokes on the actual pacer thread.
+    swift_configuration configuration((container/"store.sqlite").string(),std::make_shared<immediate_scheduler>());
+    configuration.audit_retention_seconds=0;configuration.busy_timeout_ms=100;continuous_result result;
+#if LATTICE_HAS_FRT
+    receiver_ref.reset(swift_lattice_ref::create_continuous(configuration,{controller_schema()},policy,result));
+#else
+    receiver_ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create_continuous(configuration,{controller_schema()},policy,result));
+#endif
+    ASSERT_EQ(result.phase(),2);ASSERT_FALSE(result.has_error());
+    receiver=swift_lattice_ref::shared_for_lattice(receiver_ref->get());ASSERT_TRUE(receiver);
+    if(auto* notifier=instance_registry::instance().get_or_create_notifier(receiver->config().path))notifier->stop_listening();
+    auto observation=std::make_shared<PacerCallbackObservation>();auto done=observation->completed.get_future();
+    auto exited=observation->pacer_exited.get_future();auto owner=std::make_shared<PacerCallbackOwner>();
+    PacerCallbackCleanup cleanup{owner,observation};
+    auto schedule=std::make_shared<ObservedReceiverPacerSchedule>();schedule->observation=observation;
+    schedule->before_receiver_discovery=[observation]{if(!observation->armed.exchange(false))return;
+        observation->tick_thread=std::this_thread::get_id();++observation->ticks;observation->pause->wait();};
+    sync_config config;config.websocket_url=peers[0].endpoint;config.authorization_token="registered-token";
+    config.sync_id=peers[0].channel;config.all_active_sync_ids={config.sync_id};
+    config.recovery_source_expectation=peers[0].expectation.dump();config.checkpoint_passive_interval_ms=0;config.upload_coalesce_ms=0;
+    {
+        struct Restore {std::shared_ptr<const detail::sync_background_test_hooks::pacer_wait_schedule> prior;
+            ~Restore(){detail::sync_background_test_hooks::pacer_wait=std::move(prior);}} restore{detail::sync_background_test_hooks::pacer_wait};
+        detail::sync_background_test_hooks::pacer_wait=schedule;
+        owner->sync=std::make_unique<PacerCallbackSynchronizer>(std::static_pointer_cast<lattice_db>(receiver),config);
+    }
+    schedule.reset(); // Only the actual native pacer now owns this exit witness.
+    auto* const actual=owner->sync.get();
+    actual->set_on_error([observation](const auto& error){std::lock_guard lock(observation->mutex);observation->errors.push_back(error);});
+    actual->connect();const auto [queue,generation]=actual->discovery_observation();
+    ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(1,9801);
+    const auto ids=originals();ASSERT_EQ(ids.size(),1u);ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    ASSERT_EQ(held_uploads.size(),1u);const auto endpoint=peers[0].physical;
+    auto accepted=peers[0].setup.receive(held_uploads[0].raw);ASSERT_EQ(accepted.status_code(),1);ASSERT_EQ(accepted.take_ids(),ids);
+    const auto before=snapshot();const auto source_rows=source->db().query("SELECT * FROM ControllerRow ORDER BY id");
+    const auto receipts=source->db().query("SELECT * FROM _lattice_canonical_receipt");
+    ASSERT_FALSE(queue->pending(generation));ASSERT_EQ(actual->get_progress().pending_upload,1);
+    auto capture=std::make_shared<PacerCallbackCapture>();const std::weak_ptr<PacerCallbackCapture> weak_capture=capture;
+    const std::weak_ptr<PacerCallbackOwner> weak_owner=owner;
+    actual->set_on_sync_complete([observation,weak_owner,weak_capture,capture=std::move(capture)](const auto& received) {
+        // These independent locals survive destruction of the synchronizer and
+        // its member handler. A missing invocation copy expires weak_capture.
+        const auto report=observation;const auto watched=weak_capture;const auto retiring=weak_owner.lock();
+        if(report->cancelled.load())return;
+        report->same_tick=std::this_thread::get_id()==report->tick_thread;report->received=received;
+        if(retiring)retiring->retire();
+        report->capture_alive=!watched.expired();
+        if(report->capture_alive)report->capture_uses=++capture->uses;
+        report->completed.set_value();
+    });
+    observation->armed.store(true);
+    ASSERT_TRUE(until([&]{return observation->pause->ready();}));ASSERT_EQ(observation->ticks.load(),1u);
+    {
+        FirstClaimWriterHold held(*receiver);legacy_ack(0,ids);
+        // The real physical ACK's initial writer probe is deferred, not a
+        // fixture-created operation or synthetic discovery completion.
+        ASSERT_TRUE(queue->pending(generation));EXPECT_EQ(done.wait_for(std::chrono::milliseconds(0)),std::future_status::timeout);
+        const auto due=queue->wake_at();ASSERT_LE(due,std::chrono::steady_clock::now()+std::chrono::milliseconds(100));
+        held.release();EXPECT_FALSE(held.timed_out);
+        std::this_thread::sleep_until(due); // Preserve the actual five-ms first retry.
+    }
+    observation->pause->release();
+    ASSERT_EQ(done.wait_for(std::chrono::seconds(5)),std::future_status::ready);
+    ASSERT_EQ(exited.wait_for(std::chrono::seconds(5)),std::future_status::ready);
+    EXPECT_TRUE(observation->same_tick);EXPECT_TRUE(observation->capture_alive);EXPECT_EQ(observation->capture_uses,1u);
+    EXPECT_EQ(observation->received,ids);EXPECT_EQ(observation->ticks.load(),1u);EXPECT_FALSE(observation->pause->timedOut());
+    EXPECT_TRUE(weak_capture.expired());{std::lock_guard lock(owner->mutex);EXPECT_FALSE(owner->sync);}
+    EXPECT_FALSE(endpoint.is_current());EXPECT_FALSE(endpoint.trigger_on_message(transport_message::from_string(server_sent_event::make_ack(ids).to_json())));
+    EXPECT_FALSE(queue->pending(generation));EXPECT_EQ(snapshot(),before);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),1);
+    EXPECT_EQ(source->db().query("SELECT * FROM ControllerRow ORDER BY id"),source_rows);
+    EXPECT_EQ(source->db().query("SELECT * FROM _lattice_canonical_receipt"),receipts);
+    {std::lock_guard lock(observation->mutex);EXPECT_TRUE(observation->errors.empty());}
+}
+}
+#endif

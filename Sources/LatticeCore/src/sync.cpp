@@ -1059,7 +1059,7 @@ void synchronizer_base::start_pacer() {
             if(upload)state->next_allowed_tick=now+coalesce;
             lock.unlock();
             const auto generation=lifetime->dispatch_generation();
-            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload,receiver_ready] {
+            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload,receiver_ready,wait_schedule] {
                 on_error_handler error;
                 try {
                     error=on_error_;
@@ -1070,8 +1070,12 @@ void synchronizer_base::start_pacer() {
                     if(!lifetime->current(generation))return;
                     if(upload)background_upload();
                     if(!lifetime->current(generation))return;
+                    if(receiver_ready&&wait_schedule&&wait_schedule->before_receiver_discovery) {
+                        wait_schedule->before_receiver_discovery();
+                        if(!lifetime->current(generation))return;
+                    }
                     pump_discovery();
-                    if(receiver_ready&&receiver_controller_&&lifetime->current(generation))receiver_controller_->wake();
+                    if(receiver_ready&&lifetime->current(generation)&&receiver_controller_)receiver_controller_->wake();
                 }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,std::move(error),std::current_exception(),"pacer maintenance/discovery");}
             });
             lock.lock(); // Only independently retained state after owner callbacks.
@@ -1703,9 +1707,8 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 if(!protected_store)return false;
                 mark_as_synced_after_discovery(ids,*protected_store);
                 if(!route->current(generation))return true;
-                if (on_sync_complete_) {
-                    on_sync_complete_(ids);
-                }
+                const auto completed=on_sync_complete_;
+                if(completed)completed(ids); // The callback may retire or replace its owner.
                 return true;
             });
 

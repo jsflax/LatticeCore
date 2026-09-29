@@ -2805,3 +2805,55 @@ TEST(SyncCallbackRetirement, CurrentClosePreservesProgressNotificationAndAutomat
     bounded_mock_case([]{ordinary_terminal_callback_retirement(false,OrdinaryTerminalRetirement::none);});
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct AckCompletionCapture {unsigned after_retirement=0;};
+void actual_ack_completion_keeps_capture(bool replace_handler) {
+    PlatformTransportProbe probe;
+    auto database=std::make_unique<lattice::lattice_db>(lattice::configuration(":memory:"));
+    database->add(TestPerson{"completion capture original",37,std::nullopt});
+    const auto originals=lattice::query_audit_log(database->db());ASSERT_EQ(originals.size(),1u);
+    const std::vector<std::string> ids{originals.front().global_id};
+    lattice::sync_config config;config.websocket_url="ws://fixture/ack-completion-retirement";
+    config.sync_id="ack-completion-retirement";config.all_active_sync_ids={config.sync_id};
+    config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;
+    auto sync=std::make_unique<lattice::synchronizer>(std::move(database),config,probe.make());
+    sync->connect();ASSERT_EQ(probe.attempts.size(),1u);const auto endpoint=probe.attempts.front();
+    ASSERT_TRUE(endpoint.trigger_on_open());ASSERT_EQ(sync->get_progress().pending_upload,1);
+    ASSERT_EQ(probe.sends.size(),1u);
+    auto capture=std::make_shared<AckCompletionCapture>();const std::weak_ptr<AckCompletionCapture> weak=capture;
+    unsigned calls=0,replacement_calls=0,capture_uses=0;bool alive_after=false;std::vector<std::string> received;
+    sync->set_on_sync_complete([&,capture=std::move(capture)](const auto& actual) {
+        // Resolve all outside targets before a deliberately destructive call.
+        // On the unfixed path, weak expiration is observable without touching
+        // the destroyed callable again; only a live copy accesses its capture.
+        auto* const owner=&sync;auto* const observed=&alive_after;auto* const watched=&weak;
+        auto* const replaced=&replacement_calls;auto* const used=&capture_uses;const bool replace=replace_handler;
+        ++calls;received=actual;
+        if(replace)(*owner)->set_on_sync_complete([replaced](const auto&){++*replaced;});
+        else owner->reset();
+        *observed=!watched->expired();
+        if(*observed)*used=++capture->after_retirement;
+    });
+    ASSERT_FALSE(weak.expired());
+    const auto frame=lattice::transport_message::from_string(lattice::server_sent_event::make_ack(ids).to_json());
+    ASSERT_TRUE(endpoint.trigger_on_message(frame));
+    EXPECT_EQ(calls,1u);EXPECT_EQ(received,ids);EXPECT_TRUE(alive_after);EXPECT_EQ(capture_uses,1u);
+    EXPECT_TRUE(weak.expired()); // The invocation copy has now really retired.
+    if(replace_handler) {
+        ASSERT_TRUE(sync);EXPECT_EQ(sync->get_progress().pending_upload,0);
+        ASSERT_TRUE(endpoint.trigger_on_message(frame));EXPECT_EQ(replacement_calls,1u);EXPECT_EQ(calls,1u);
+        sync.reset();
+    } else EXPECT_FALSE(sync);
+    EXPECT_EQ(probe.destroys,1);EXPECT_TRUE(probe.all_retired_at_destroy);
+    EXPECT_FALSE(endpoint.trigger_on_message(frame));EXPECT_EQ(calls,1u);
+}
+}
+TEST(SyncCallbackRetirement, ActualAckCompletionCanDeleteOwnerAndContinueUsingItsCapture) {
+    bounded_mock_case([]{actual_ack_completion_keeps_capture(false);});
+}
+TEST(SyncCallbackRetirement, ActualAckCompletionCanReplaceItselfAndContinueUsingItsCapture) {
+    bounded_mock_case([]{actual_ack_completion_keeps_capture(true);});
+}
+#endif

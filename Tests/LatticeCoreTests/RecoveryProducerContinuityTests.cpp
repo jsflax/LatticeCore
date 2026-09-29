@@ -1351,7 +1351,7 @@ protected:
         if(mixed){EXPECT_EQ(update->changed_fields_names,(std::vector<std::string>{"title"}));EXPECT_EQ(std::get<std::string>(update->changed_fields.at("title").value),"historical-title");}
         else EXPECT_TRUE(update->changed_fields_names.empty());
         auto accepted=sessions[0].receive(audit_wire()[0]);ASSERT_EQ(accepted.status_code(),1);ASSERT_EQ(accepted.ids().size(),first.size());
-        const auto update_receipt=source->db().query("SELECT outcome FROM _lattice_canonical_receipt WHERE original_id=CAST(? AS BLOB) AND namespace_id=CAST('app-0' AS BLOB)",{update_id});
+        const auto update_receipt=source->db().query("SELECT outcome FROM _lattice_canonical_receipt WHERE original_id=CAST(? AS BLOB) AND namespace_id=CAST('app-0' AS BLOB)",{detail::canonical_writer_adapter::uuid_key(update_id)});
         ASSERT_EQ(update_receipt.size(),1u);EXPECT_EQ(std::get<int64_t>(update_receipt[0].at("outcome")),mixed?1:2);
         const auto receipts=source_receipts();const auto rows=source->db().query("SELECT title,body FROM ContinuousNoHistoryRow WHERE globalId=?",{target});ASSERT_EQ(rows.size(),1u);
         EXPECT_EQ(std::get<std::string>(rows[0].at("title")),mixed?"historical-title":"seed-title");EXPECT_EQ(std::get<std::string>(rows[0].at("body")),"seed-body");

@@ -664,7 +664,7 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
     if (params.empty()) {
         // Fast path for parameterless queries
         char* errmsg = nullptr;
-        int rc;
+        int rc, failure_extended_code, failure_system_errno;
         {
             auto* mutex=sqlite3_db_mutex(db_);sqlite3_mutex_enter(mutex);
             struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
@@ -672,13 +672,19 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
             if(channel_reset_unsettled_.load(std::memory_order_acquire)&&!explicit_rollback)
                 throw db_error("channel reset unsettled; explicit rollback required");
             rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errmsg);
-            if(rc==SQLITE_OK&&explicit_rollback&&sqlite3_get_autocommit(db_)!=0)
+            if(rc!=SQLITE_OK) {
+                // Preserve this failure while the existing connection mutex
+                // still owns it, before cleanup or any metadata lookup.
+                failure_extended_code=sqlite3_extended_errcode(db_);
+                failure_system_errno=sqlite3_system_errno(db_);
+            } else if(explicit_rollback&&sqlite3_get_autocommit(db_)!=0)
                 channel_reset_unsettled_.store(false,std::memory_order_release);
         }
         if (rc != SQLITE_OK) {
             std::string error = errmsg ? errmsg : "Unknown error";
             sqlite3_free(errmsg);
-            LOG_ERROR("db", "SQL execution failed: %s (SQL: %s)", error.c_str(), sql.c_str());
+            LOG_ERROR("db", "SQL execution failed: %s (SQL: %s) [rc=%d extended_code=%d system_errno=%d sqlite_version=%s sqlite_source_id=%s]",
+                error.c_str(), sql.c_str(), rc, failure_extended_code, failure_system_errno, sqlite3_libversion(), sqlite3_sourceid());
             discard_if_rolled_back();
             throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
         }

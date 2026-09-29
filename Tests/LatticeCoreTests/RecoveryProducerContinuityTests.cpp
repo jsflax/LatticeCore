@@ -3,6 +3,9 @@
 #include "../../Sources/LatticeCore/src/recovery_producer_continuity.hpp"
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include <deque>
+#include <array>
+#include <cerrno>
+#include <optional>
 #include <condition_variable>
 #include <cstdlib>
 #include <future>
@@ -11,6 +14,7 @@
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 #include <spawn.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
@@ -151,21 +155,46 @@ void known_commit(const recovery_install_result& result) {
 int64_t number(database& db,const std::string& sql){return std::get<int64_t>(db.query(sql).at(0).at("n"));}
 // Failure-only diagnostics for the actual read-only constructor. Do not add a
 // preliminary SQLite open, change flags, or manufacture missing WAL sidecars.
-database diagnostic_readonly_open(const std::string& path,const char* phase) {
+database diagnostic_readonly_open(const std::string& path,const char* phase,const std::string& source_path={}) {
     try { return database(path,database::open_mode::read_only); }
     catch(const db_error& original) {
-        std::string context="readonly fixture phase="+std::string(phase)+" path="+path;
-        for(const auto& suffix:{std::string(),std::string("-wal"),std::string("-shm")}) {
-            std::error_code status_error,size_error;
-            const auto state=std::filesystem::symlink_status(path+suffix,status_error);
-            const auto size=std::filesystem::file_size(path+suffix,size_error);
-            context+=" [after-failure suffix="+(suffix.empty()?std::string("main"):suffix)+
-                " type="+std::to_string(static_cast<int>(state.type()))+
-                " permissions="+std::to_string(static_cast<unsigned>(state.permissions()))+
-                " status_error="+std::to_string(status_error.value())+
-                " size="+std::to_string(size)+" size_error="+std::to_string(size_error.value())+"]";
-        }
-        throw db_error(context+": "+original.what());
+        const auto original_failure=std::current_exception();std::optional<db_error> diagnostic;
+        try {
+            const auto bounded=[](const std::string& text){return text.substr(0,1024)+(text.size()>1024?"...<truncated>":"");};
+            std::string context="readonly fixture phase="+std::string(phase)+" path="+bounded(path);
+            const auto describe=[&](const std::string& label,const std::filesystem::path& target){
+                std::error_code status_error,size_error;
+                const auto state=std::filesystem::symlink_status(target,status_error);
+                const auto size=std::filesystem::file_size(target,size_error);
+                struct stat info{};const int stat_result=::stat(target.c_str(),&info);const int stat_error=stat_result==0?0:errno;
+                context+=" [after-failure label="+label+" path="+bounded(target.string())+
+                    " type="+std::to_string(static_cast<int>(state.type()))+
+                    " permissions="+std::to_string(static_cast<unsigned>(state.permissions()))+
+                    " status_error="+std::to_string(status_error.value())+
+                    " size="+std::to_string(size)+" size_error="+std::to_string(size_error.value())+
+                    " target_stat_error="+std::to_string(stat_error)+
+                    " target_mode="+std::to_string(static_cast<uint64_t>(info.st_mode))+
+                    " target_uid="+std::to_string(static_cast<uint64_t>(info.st_uid))+
+                    " target_gid="+std::to_string(static_cast<uint64_t>(info.st_gid))+"]";
+            };
+            const auto header=[&](const char* label,const std::string& file){
+                std::array<unsigned char,100> bytes{};const int fd=::open(file.c_str(),O_RDONLY|O_CLOEXEC);const int open_error=fd<0?errno:0;
+                struct close_header {int fd;~close_header(){if(fd>=0)::close(fd);}} cleanup{fd};
+                const auto count=fd<0?ssize_t{0}: ::read(fd,bytes.data(),bytes.size());const int read_error=count<0?errno:0;
+                std::string hex;hex.reserve(200);constexpr char digits[]="0123456789abcdef";
+                for(ssize_t n=0;n<count;++n){const auto byte=bytes[static_cast<size_t>(n)];hex+=digits[byte>>4];hex+=digits[byte&15];}
+                context+=" [after-failure header="+std::string(label)+" open_error="+std::to_string(open_error)+
+                    " bytes="+std::to_string(count)+" read_error="+std::to_string(read_error)+" hex="+hex+"]";
+            };
+            for(const auto& suffix:{std::string(),std::string("-wal"),std::string("-shm")})
+                describe("reader-"+(suffix.empty()?std::string("main"):suffix),path+suffix);
+            describe("reader-parent",std::filesystem::path(path).parent_path());header("reader-main",path);
+            if(!source_path.empty()){
+                describe("source-main",source_path);describe("source-parent",std::filesystem::path(source_path).parent_path());header("source-main",source_path);
+            }
+            diagnostic.emplace(context+": "+original.what());
+        }catch(...){std::rethrow_exception(original_failure);} // diagnostics never replace the original failure
+        throw *diagnostic;
     }
 }
 struct continuity_fault {
@@ -726,7 +755,7 @@ TEST_F(RecoveryProducerContinuity, ReadOnlyCopiedAndAliasedProtectedFilesStillRe
     TempDB copied{"continuous_readonly_copy"};
     std::filesystem::copy_file(config().path,copied.str(),std::filesystem::copy_options::overwrite_existing);
     {
-        database copy=diagnostic_readonly_open(copied.str(),"copied-main");
+        database copy=diagnostic_readonly_open(copied.str(),"copied-main",config().path);
         EXPECT_EQ(number(copy,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
         EXPECT_THROW(copy.handle(),db_error);
         EXPECT_THROW(query_audit_log(copy),db_error);
@@ -736,7 +765,7 @@ TEST_F(RecoveryProducerContinuity, ReadOnlyCopiedAndAliasedProtectedFilesStillRe
     const auto alias=container.parent_path()/(unique.path.filename().string()+"-readonly-alias");
     std::filesystem::create_directory_symlink(container,alias);
     struct remove_alias {std::filesystem::path path;~remove_alias(){std::error_code error;std::filesystem::remove(path,error);}} cleanup{alias};
-    database reader=diagnostic_readonly_open((alias/"store.sqlite").string(),"aliased-main");
+    database reader=diagnostic_readonly_open((alias/"store.sqlite").string(),"aliased-main",config().path);
     EXPECT_EQ(number(reader,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
     EXPECT_THROW(reader.handle(),db_error);
     EXPECT_THROW(events_after(reader,std::nullopt),db_error);

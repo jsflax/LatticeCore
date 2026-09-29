@@ -325,7 +325,7 @@ struct authenticated_ready_fence {
     explicit authenticated_ready_fence(int64_t value):deadline(value){}
     bool live()const noexcept{return admitted->load(std::memory_order_acquire)&&current.load(std::memory_order_acquire)&&authenticated_session_fence::now()<deadline;}
 };
-authenticated_ready_charge::~authenticated_ready_charge(){if(budget_){std::lock_guard lock(budget_->mutex);--budget_->requests;budget_->bytes-=charged_;budget_->workspace-=workspace_;}}
+authenticated_ready_charge::~authenticated_ready_charge(){if(budget_){std::lock_guard lock(budget_->mutex);--budget_->requests;budget_->bytes-=charged_;}}
 namespace {
 struct registry_slot {
     std::weak_ptr<authenticated_mounted_source> value;
@@ -760,6 +760,15 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
     auto operation=std::shared_ptr<authenticated_relay_operation>(new authenticated_relay_operation(nullptr));
     {std::lock_guard lock(s->fence->mutex_);if(!s->fence->live()||s->fence->active_>=16)return {2,{},{}};
         ++s->fence->active_;operation->fence_=s->fence;operation->charge_=charge;}
+    // Capture/package workspace belongs to this synchronous call. Declare its
+    // reservation before every parsed/request/result local so it retires last.
+    // The separate input/reply charge and counted operation still follow the
+    // returned response through its final publication or disposal.
+    struct workspace_reservation {
+        std::shared_ptr<authenticated_ready_budget> budget;
+        uint64_t bytes=0;
+        ~workspace_reservation(){if(bytes){std::lock_guard lock(budget->mutex);budget->workspace-=bytes;}}
+    } workspace{s->source->ready_budget};
     const auto control=bounded(raw,authenticated_ready_budget::input_limit,authenticated_ready_budget::reply_limit);
     if(!control.contains("kind")||control.at("kind")!="recoveryReady") {
         if(raw.size()>frame_bytes)reject("relay ordinary frame bound");return {};
@@ -803,14 +812,14 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
     struct maintenance_kick {std::shared_ptr<authenticated_mounted_source> source;~maintenance_kick(){if(source)authenticated_ready_maintenance::kick(source);}} maintenance{op=="inspect"||op=="predecessor"?nullptr:s->source};
     if(op!="inspect"&&op!="predecessor")authenticated_ready_maintenance::kick(s->source);
     if(op=="prepare") {
-        // Finite source-wide charge for retained capture, canonical vectors,
-        // capsule strings and request copies. This is explicit logical storage
-        // accounting, not allocator/container/SQLite/NIO RSS measurement.
+        // Finite source-wide charge while capture, canonical vectors, capsule
+        // strings and request copies are live in this call. This is logical
+        // storage accounting, not allocator/container/SQLite/NIO RSS measurement.
         const auto& p=s->recipe.ready;
-        const uint64_t workspace=3*p.capture.rows.wire.total_bytes+2*p.package.retained_wire_bytes+8*p.package.codec.maximum.frame_bytes;
-        std::lock_guard lock(charge->budget_->mutex);
-        if(workspace>authenticated_ready_budget::max_workspace-charge->budget_->workspace)reject("READY source capture workspace unavailable");
-        charge->workspace_=workspace;charge->budget_->workspace+=workspace;
+        const uint64_t bytes=3*p.capture.rows.wire.total_bytes+2*p.package.retained_wire_bytes+8*p.package.codec.maximum.frame_bytes;
+        std::lock_guard lock(workspace.budget->mutex);
+        if(bytes>authenticated_ready_budget::max_workspace-workspace.budget->workspace)reject("READY source capture workspace unavailable");
+        workspace.bytes=bytes;workspace.budget->workspace+=bytes;
     }
     if(op=="predecessor")shape(control,{"kind","version","operation","requestID","routeGeneration","request","priorProfile"});
     else if(op=="discard"||op=="inspect")shape(control,{"kind","version","operation","requestID","routeGeneration","request"});

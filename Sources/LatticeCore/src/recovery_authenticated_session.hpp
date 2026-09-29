@@ -19,7 +19,7 @@ class authenticated_ready_charge {
     friend class authenticated_session_fence;
     friend class authenticated_relay_setup;
     std::shared_ptr<authenticated_ready_budget> budget_;
-    uint64_t input_=0,charged_=0,workspace_=0;
+    uint64_t input_=0,charged_=0;
     std::atomic<bool> consumed_{false};
     authenticated_ready_charge()=default;
 public:

@@ -46,6 +46,16 @@ struct canonical_ready_profile {
     // reinterpretation of an old persisted policy/lease deadline.
     std::optional<int64_t> orphan_resume_grace_ms;
 };
+// Private administrative outcome. The record proves a policy transition only,
+// never historical request publication, receipt absence, a lease or installation.
+enum class canonical_ready_adoption_disposition { applied, verified_existing };
+struct canonical_ready_adoption_result {
+    recovery_install_result settlement;
+    std::optional<std::string> record;
+    // Describes this owned operation only. verified_existing reports its own
+    // no-change audit COMMIT, never the settlement of an earlier invocation.
+    std::optional<canonical_ready_adoption_disposition> disposition;
+};
 // Durable lookup identity only. Possession cannot read a frame, grant a lease,
 // acknowledge installation, settle a receipt or authorize a peer.
 class canonical_ready_identity {

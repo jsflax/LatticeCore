@@ -1,4 +1,5 @@
 #include "recovery_authenticated_session.hpp"
+#include "canonical_ready_named_profile.hpp"
 #include "recovery_receipt_json.hpp"
 #include "lattice/lattice.hpp"
 #include "vendor/picosha2/picosha2.h"
@@ -115,24 +116,18 @@ source_recipe recipe(const recovery_owner_schema& catalog,const json& j) {
     for(const auto& n:p.namespaces.entries)if(n.namespace_id==r.selected_namespace)selected=true;
     if(!selected||r.selected_namespace==p.namespaces.local_namespace)reject("relay peer namespace must be enrolled and distinct from local");
     if(p.namespaces.coverage && std::find(p.namespaces.coverage->namespaces.begin(),p.namespaces.coverage->namespaces.end(),r.selected_namespace)==p.namespaces.coverage->namespaces.end())reject("relay selected namespace is outside receipt cohort");
-    auto& ready=r.ready;ready.authority=text(j,"authority");ready.transfers=16;ready.bindings=1024;ready.charged_bytes=67108864;ready.transfer_bytes=2097152;
-    ready.package={{{16384,4096,2,256,4096,1048576,256,256,262144},16,4096,4096,256,256,65536,131072,3600000,{4096,32,256,2048,4096}},1572864,514};
-    ready.capture={{{65536,16,4096,8192,2,2048,4096,1048576},16,32,32},p.writer.limits,256,256,32};
     if(j.contains("readyProfile")) {
         r.ready_name=text(j,"readyProfile",32);
-        if(r.ready_name!="bounded48MiBV1"&&r.ready_name!="bounded48MiBOrphanV1")reject("relay explicit READY profile unknown");
-        ready.transfers=8;ready.charged_bytes=536870912;ready.transfer_bytes=50331648;
-        ready.package={{{4194304,16384,64,512,16384,33554432,256,8192,8388608},
-            16,262144,32768,8192,8192,2097152,4194304,3600000,{16384,64,256,4096,16384}},41943040,770};
-        ready.capture={{{262144,16,16384,16384,64,256,16384,33554432},16,32,32},p.writer.limits,8192,8192,256};
+        // The historical default remains implicit only. All old accepted
+        // explicit names keep their exact bytes and numeric envelopes.
+        if(r.ready_name!="bounded48MiBV1"&&r.ready_name!="bounded48MiBOrphanV1"&&r.ready_name!="boundedV1OrphanV1")
+            reject("relay explicit READY profile unknown");
     }
-    if(r.ready_name=="bounded48MiBOrphanV1")ready.orphan_resume_grace_ms=number(j,"orphanResumeGraceMilliseconds",1,3600000);
+    std::optional<int64_t> grace;
+    if(r.ready_name=="bounded48MiBOrphanV1"||r.ready_name=="boundedV1OrphanV1")
+        grace=number(j,"orphanResumeGraceMilliseconds",1,3600000);
     else if(j.contains("orphanResumeGraceMilliseconds"))reject("relay orphan grace requires explicit lifecycle profile");
-    if(p.namespaces.coverage&&r.ready_name!="bounded48MiBV1"&&r.ready_name!="bounded48MiBOrphanV1")reject("registered producer profile requires explicit large READY capacity");
-    // All 16 contributions of one physical receiver retain their independent
-    // READY capsules until the cohort install. This is the explicit v3 source
-    // policy; existing v2 profiles keep their exact eight-transfer/512MiB cap.
-    if(p.namespaces.coverage){ready.transfers=16;ready.charged_bytes=1073741824;}
+    r.ready=canonical_named_ready_profile(text(j,"authority"),p.writer.limits,bool(p.namespaces.coverage),r.ready_name,grace);
     const auto& upload=j.at("upload");shape(upload,{"tables","unlisted","maximumDeletes"});
     r.unlisted=upload.at("unlisted")=="allow"?7:upload.at("unlisted")=="deny"?0:255;if(r.unlisted==255)reject("relay unlisted policy required");
     r.maximum_deletes=static_cast<size_t>(number(upload,"maximumDeletes",0,frame_entries));
@@ -312,7 +307,7 @@ struct authenticated_ready_maintenance {
     static void remove(const std::shared_ptr<authenticated_mounted_source>&)noexcept{}
 #endif
 };
-struct authenticated_ready_budget {
+struct authenticated_ready_budget : canonical_ready_transport_limits {
     // Keep only the payload-free physical identity and bounded immutable recipe.
     // A queued result may outlive the last mounted source without retaining its
     // owner/adapter or running their destructors on a socket callback.
@@ -320,7 +315,6 @@ struct authenticated_ready_budget {
     const std::string recipe_key;
     std::mutex mutex;
     uint64_t requests=0,bytes=0,workspace=0;
-    static constexpr uint64_t max_requests=64,max_bytes=67108864,max_workspace=268435456,input_limit=8388608,reply_limit=4194304;
     authenticated_ready_budget(std::shared_ptr<const physical_store_identity> identity,std::string key):physical(std::move(identity)),recipe_key(std::move(key)){}
 };
 struct authenticated_ready_fence {
@@ -663,26 +657,8 @@ json ready_settlement(const recovery_install_result& result) {
         {"primaryError",bool(result.primary_error)},{"cleanupError",bool(result.cleanup_error)},
         {"postcommitError",bool(result.postcommit_error)},{"notificationError",bool(result.notification_error)}};
 }
-json ready_wire_limits(const ready_cr::wire_limits& v) {
-    return {{"frame_bytes",std::to_string(v.frame_bytes)},{"payload_bytes",std::to_string(v.payload_bytes)},
-        {"items_per_page",std::to_string(v.items_per_page)},{"content_pages",std::to_string(v.content_pages)},
-        {"content_identities",std::to_string(v.content_identities)},{"content_bytes",std::to_string(v.content_bytes)},
-        {"receipt_pages",std::to_string(v.receipt_pages)},{"receipts",std::to_string(v.receipts)},{"receipt_bytes",std::to_string(v.receipt_bytes)}};
-}
 json ready_profile_description(const source_recipe& r) {
-    const auto& p=r.ready;const auto& c=p.package.codec;
-    json result={{"name",r.ready_name},{"wire",ready_wire_limits(c.maximum)},
-        {"requestEntries",c.request_entries},{"requestTargets",c.request_targets},{"requestTargetBytes",c.request_target_bytes},
-        {"parserDepth",c.depth},{"parserNodes",c.nodes},{"scalarBytes",c.string_bytes},{"restartBytes",c.restart_bytes},
-        {"valueLimits",{{"rawBytes",c.values.raw_bytes},{"fields",c.values.fields},{"nameBytes",c.values.name_bytes},
-            {"valueBytes",c.values.value_bytes},{"decodedBytes",c.values.decoded_bytes}}},
-        {"leaseMilliseconds",c.lease_ms},{"packageBytes",p.package.retained_wire_bytes},{"frames",p.package.frames},
-        {"transfers",p.transfers},{"bindings",p.bindings},{"durableBytes",p.charged_bytes},{"transferBytes",p.transfer_bytes},
-        {"captureRows",p.capture.rows.wire.total_rows},{"captureBytes",p.capture.rows.wire.total_bytes},
-        {"requestBytes",authenticated_ready_budget::input_limit},{"pendingRequests",authenticated_ready_budget::max_requests},
-        {"pendingInputAndReplyBytes",authenticated_ready_budget::max_bytes},{"pendingWorkspaceBytes",authenticated_ready_budget::max_workspace}};
-    if(p.orphan_resume_grace_ms)result["orphanResumeGraceMilliseconds"]=*p.orphan_resume_grace_ms;
-    return result;
+    return canonical_ready_profile_description(r.ready,r.ready_name);
 }
 std::string ready_live_binding(const json& context) {
     // The exact actual namespace/registered replica/logical receiver binding;

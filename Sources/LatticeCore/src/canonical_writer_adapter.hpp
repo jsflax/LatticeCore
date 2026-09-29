@@ -78,6 +78,7 @@ class canonical_writer_adapter {
     struct context;
     struct retention_session;
     struct retention_frame;
+    struct lifecycle_adoption;
     std::shared_ptr<retention_session> retention_;
     static bool matches_connection(const database&, sqlite3*) noexcept;
     std::shared_ptr<database> writer_;
@@ -90,7 +91,8 @@ class canonical_writer_adapter {
                                       const canonical_retention_limits* = nullptr,
                                       const canonical_namespace_profile* = nullptr,
                                       const canonical_ready_profile* = nullptr,
-                                      const canonical_ready_profile* migration_from_ready = nullptr);
+                                      const canonical_ready_profile* migration_from_ready = nullptr,
+                                      lifecycle_adoption* = nullptr);
     static void validate_namespace_admission(const std::shared_ptr<lattice_db>&,
         const std::shared_ptr<database>&, const std::shared_ptr<context>&,
         const canonical_namespace_admission&);
@@ -112,6 +114,11 @@ class canonical_writer_adapter {
     static void migrate_authenticated_source(std::shared_ptr<lattice_db>,
         const canonical_namespaced_writer_profile&,canonical_upstream_limits,canonical_retention_limits,
         const canonical_ready_profile& before,const canonical_ready_profile& after);
+    // The actual closed administrative owner and physical mounted-source slot
+    // must be retained by the caller. This does not publish a serving adapter.
+    static canonical_ready_adoption_result adopt_authenticated_lifecycle(std::shared_ptr<lattice_db>,
+        const canonical_namespaced_writer_profile&,canonical_upstream_limits,canonical_retention_limits,
+        const canonical_ready_profile& before,const std::string& before_name,int64_t grace_ms);
     recovery_install_result expire_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&);
     canonical_ready_maintenance_result maintain_authenticated_ready(std::shared_ptr<lattice_db>);
     canonical_ready_lifecycle_result inspect_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,

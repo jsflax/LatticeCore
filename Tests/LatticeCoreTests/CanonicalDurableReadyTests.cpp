@@ -1,5 +1,8 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
+#include "CanonicalReadyAdoptionTestAccess.hpp"
+#include "../../Sources/LatticeCore/src/canonical_ready_named_profile.hpp"
+#include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include <cstdio>
 #include <cstring>
@@ -28,7 +31,22 @@ struct canonical_ready_test_access {
         int64_t duration,uint64_t route,const std::function<void()>& reserved={},const std::function<void(size_t,uint64_t)>& batch={}) {
         return adapter.prepare_ready_impl(std::move(owner),admission,attempt,request,duration,route,reserved,batch);
     }
+    static canonical_ready_adoption_result adopt(std::shared_ptr<lattice_db> owner,
+        const canonical_namespaced_writer_profile& source,canonical_upstream_limits upstream,canonical_retention_limits retention,
+        const canonical_ready_profile& before,const std::string& name,int64_t grace) {
+        return canonical_writer_adapter::adopt_authenticated_lifecycle(std::move(owner),source,upstream,retention,before,name,grace);
+    }
+    static void migrate(std::shared_ptr<lattice_db> owner,const canonical_namespaced_writer_profile& source,
+        canonical_upstream_limits upstream,canonical_retention_limits retention,
+        const canonical_ready_profile& before,const canonical_ready_profile& after) {
+        canonical_writer_adapter::migrate_authenticated_source(std::move(owner),source,upstream,retention,before,after);
+    }
 };
+canonical_ready_adoption_result adopt_ready_lifecycle_for_test(std::shared_ptr<lattice_db> owner,
+    const canonical_namespaced_writer_profile& source,canonical_upstream_limits upstream,canonical_retention_limits retention,
+    const canonical_ready_profile& before,const std::string& name,int64_t grace) {
+    return canonical_ready_test_access::adopt(std::move(owner),source,upstream,retention,before,name,grace);
+}
 }
 #if defined(__APPLE__) || defined(__linux__)
 namespace {
@@ -635,5 +653,254 @@ TEST_F(CanonicalDurableReady, LifecycleOffPageCorruptionRefusesReopenBeforeIncar
     owner=ready_owner(file.str());sibling=ready_owner(file.str());const auto before=snapshot();
     std::this_thread::sleep_for(std::chrono::milliseconds(3));EXPECT_THROW(attach(),db_error);EXPECT_EQ(snapshot(),before);
     EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+class CanonicalLifecycleAdoption:public CanonicalDurableReady {
+protected:
+    std::string name="bounded48MiBV1";
+    canonical_retention_limits kept_limits{8,3600000};
+    void SetUp()override {CanonicalDurableReady::SetUp();select(name);}
+    void select(const std::string& selected) {
+        name=selected;policy=canonical_named_ready_profile("qualification-source",p.writer.limits,bool(p.namespaces.coverage),name);
+        request.source={policy.authority,p.writer.binding.source,p.writer.binding.epoch,p.writer.binding.scope,p.writer.binding.schema};
+        request.budget=policy.package.codec.maximum;seal();
+    }
+    void attach(){adapter=canonical_writer_adapter::attach_ready_for_qualification(owner,p,upstream(),kept_limits,policy);}
+    canonical_ready_adoption_result adopt(int64_t grace) {
+        return canonical_ready_test_access::adopt(owner,p,upstream(),kept_limits,policy,name,grace);
+    }
+    using Snapshot=std::map<std::string,std::vector<database::row_t>>;
+    Snapshot preserved() {
+        Snapshot rows;
+        const auto tables=owner->db().query("SELECT name FROM sqlite_master WHERE type='table' AND (substr(name,1,19)='_lattice_canonical_' OR name IN ('AuditLog','DurableReadyRow')) ORDER BY name LIMIT 33");
+        if(tables.size()>32)throw std::runtime_error("adoption fixture inventory exceeds cap");
+        for(const auto& table:tables) {
+            const auto n=std::get<std::string>(table.at("name"));rows[n]=owner->db().query("SELECT * FROM "+n+" ORDER BY 1");
+            if(n=="_lattice_canonical_ready_profile")for(auto& row:rows[n]){row.erase("policy");row.erase("predecessor");}
+        }
+        return rows;
+    }
+    auto schema(){return owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name");}
+    void target(int64_t grace) {
+        policy=canonical_named_ready_profile(policy.authority,p.writer.limits,bool(p.namespaces.coverage),
+            name=="boundedV1"?"boundedV1OrphanV1":"bounded48MiBOrphanV1",grace);
+    }
+};
+struct AdoptionFault {
+    enum class Kind {policy_ignore,record_ignore,alter_deny,commit_deny};
+    static thread_local AdoptionFault* current;
+    Kind kind;int hits=0;
+    canonical_upstream_test_hooks::authorizer_fault fault;
+    const canonical_upstream_test_hooks::authorizer_fault* prior;AdoptionFault* previous;
+    AdoptionFault(database& db,Kind k):kind(k),fault{canonical_writer_custody_test_access::fault_handle(db),restrict_action},
+        prior(canonical_retention_test_hooks::fault),previous(current){current=this;canonical_retention_test_hooks::fault=&fault;}
+    ~AdoptionFault(){canonical_retention_test_hooks::fault=prior;current=previous;}
+    static int restrict_action(int action,const char* one,const char* two,const char*)noexcept {
+        auto& f=*current;const auto same=[](const char* a,const char* b){return a&&std::strcmp(a,b)==0;};if(f.hits)return SQLITE_OK;
+        if(action==SQLITE_UPDATE&&same(one,"_lattice_canonical_ready_profile")&&
+           (f.kind==Kind::policy_ignore&&same(two,"policy")||f.kind==Kind::record_ignore&&same(two,"predecessor"))){++f.hits;return SQLITE_IGNORE;}
+        if(action==SQLITE_ALTER_TABLE&&f.kind==Kind::alter_deny){++f.hits;return SQLITE_DENY;}
+        if(action==SQLITE_TRANSACTION&&same(one,"COMMIT")&&f.kind==Kind::commit_deny){++f.hits;return SQLITE_DENY;}
+        return SQLITE_OK;
+    }
+};
+thread_local AdoptionFault* AdoptionFault::current=nullptr;
+}
+TEST_F(CanonicalLifecycleAdoption, PreservesCompletedPreparingOrdinaryReservationsAndAllSourceRows) {
+    attach();auto admission=admit();const auto e=ready_entry(401,402);import_entry(admission,e);ask(e);
+    const auto completed=prepare(admission);complete(completed);
+    logical.channel="adoption-preparing";seal();
+    const auto interrupted=canonical_ready_test_access::prepare(*adapter,owner,admission,logical,request,10000,7,
+        []{throw std::runtime_error("retain actual PREPARING");});
+    committed(interrupted.preparation);ASSERT_NE(interrupted.capture_error,nullptr);
+    const auto reserved=adapter->reserve_recovery_owned(owner,head(),10000);committed(reserved.settlement);ASSERT_TRUE(reserved.reservation);
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);ASSERT_EQ(count("_lattice_canonical_attempt"),2);
+    const auto before=preserved();const auto incarnation=scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention");
+    adapter.reset();const auto result=adopt(10000);committed(result.settlement);ASSERT_TRUE(result.record);EXPECT_LE(result.record->size(),16384u);
+    EXPECT_EQ(preserved(),before);EXPECT_EQ(scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention"),incarnation);
+    EXPECT_EQ(result.disposition,canonical_ready_adoption_disposition::applied);
+    const auto again=adopt(10000);committed(again.settlement);EXPECT_EQ(again.record,result.record);EXPECT_EQ(preserved(),before);
+    EXPECT_EQ(again.disposition,canonical_ready_adoption_disposition::verified_existing);
+    // Administration has not performed the separately specified first mount.
+    target(10000);attach();EXPECT_EQ(scalar(owner->db(),"SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+}
+TEST_F(CanonicalLifecycleAdoption, FullSmallSixteenCapsulesPreserveExactEnvelopeAndResume) {
+    select("boundedV1");attach();auto admission=admit();const auto e=ready_entry(411,412);import_entry(admission,e);ask(e);
+    for(unsigned i=0;i<16;++i){logical.channel="small-adopt-"+std::to_string(i);seal();complete(prepare(admission));}
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),16);const auto before=preserved();
+    const auto stored=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    adapter.reset();const auto result=adopt(10000);committed(result.settlement);ASSERT_TRUE(result.record);EXPECT_EQ(preserved(),before);
+    target(10000);EXPECT_EQ(policy.transfers,16);EXPECT_EQ(policy.transfer_bytes,2097152);EXPECT_EQ(policy.charged_bytes,67108864);
+    attach();auto fresh=admit();const auto resumed=adapter->resume_ready_owned(owner,fresh,logical,request,10000,13);
+    committed(resumed.settlement);ASSERT_TRUE(resumed.lease);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),16);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),stored);
+    const auto frame=adapter->read_ready_frame_owned(owner,fresh,*resumed.lease,0);committed(frame.settlement);ASSERT_TRUE(frame.frame);
+    EXPECT_EQ(cr::decode(*frame.frame,policy.package.codec).route_generation,13u);
+}
+TEST_F(CanonicalLifecycleAdoption, LiveAdapterAndDirectoryOwnerRefuseBeforeMutation) {
+    attach();auto admission=admit();complete(prepare(admission));const auto before=preserved();const auto ddl=schema();
+    const auto same=adopt(10000);EXPECT_NE(same.settlement.state,phase::committed);EXPECT_FALSE(same.record);
+    const auto alias=canonical_ready_test_access::adopt(sibling,p,upstream(),kept_limits,policy,name,10000);
+    EXPECT_NE(alias.settlement.state,phase::committed);EXPECT_FALSE(alias.record);EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);
+}
+TEST_F(CanonicalLifecycleAdoption, FirstTransitionIsNotImplicitReopenAndChangedGraceOrPredecessorRefuse) {
+    attach();complete(prepare(admit()));adapter.reset();const auto before=preserved();const auto ddl=schema();const auto old=policy;
+    target(10000);EXPECT_THROW(attach(),db_error);EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);policy=old;
+    const auto accepted=adopt(10000);committed(accepted.settlement);const auto adopted=preserved();const auto adopted_ddl=schema();
+    const auto changed=adopt(10001);EXPECT_NE(changed.settlement.state,phase::committed);EXPECT_FALSE(changed.record);
+    auto small=canonical_named_ready_profile(policy.authority,p.writer.limits,false,"boundedV1");
+    const auto wrong=canonical_ready_test_access::adopt(owner,p,upstream(),kept_limits,small,"boundedV1",10000);
+    EXPECT_NE(wrong.settlement.state,phase::committed);EXPECT_FALSE(wrong.record);EXPECT_EQ(preserved(),adopted);EXPECT_EQ(schema(),adopted_ddl);
+    const auto retry=adopt(10000);committed(retry.settlement);EXPECT_EQ(retry.record,accepted.record);
+}
+TEST_F(CanonicalLifecycleAdoption, IgnoredWritesAlterAndCommitDenialRollbackTheExactSchemaAndRows) {
+    attach();complete(prepare(admit()));adapter.reset();const auto before=preserved();const auto ddl=schema();
+    const auto old_policy=owner->db().query("SELECT policy FROM _lattice_canonical_ready_profile");
+    for(auto kind:{AdoptionFault::Kind::policy_ignore,AdoptionFault::Kind::record_ignore,AdoptionFault::Kind::alter_deny,AdoptionFault::Kind::commit_deny}) {
+        AdoptionFault fault(owner->db(),kind);const auto result=adopt(10000);EXPECT_EQ(fault.hits,1);
+        EXPECT_EQ(result.settlement.state,phase::rolled_back);EXPECT_NE(result.settlement.primary_error,nullptr);EXPECT_FALSE(result.record);EXPECT_FALSE(result.disposition);
+        EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);EXPECT_EQ(owner->db().query("SELECT policy FROM _lattice_canonical_ready_profile"),old_policy);
+    }
+    committed(adopt(10000).settlement);
+}
+TEST_F(CanonicalLifecycleAdoption, KnownCommitSecondaryErrorKeepsExactPostconditionAndNoSecondTransition) {
+    attach();complete(prepare(admit()));adapter.reset();const auto before=preserved();int calls=0;
+    const auto hook=owner->add_invalidation_hook([&](const auto&,auto){++calls;throw std::runtime_error("actual adoption commit observer");});
+    const auto result=adopt(10000);owner->remove_invalidation_hook(hook);
+    EXPECT_EQ(calls,1);EXPECT_EQ(result.settlement.state,phase::committed);EXPECT_NE(result.settlement.postcommit_error,nullptr);
+    EXPECT_FALSE(result.settlement.primary_error);ASSERT_TRUE(result.record);EXPECT_EQ(preserved(),before);
+    const auto retry=adopt(10000);committed(retry.settlement);EXPECT_EQ(retry.record,result.record);EXPECT_EQ(preserved(),before);
+}
+TEST_F(CanonicalLifecycleAdoption, AdministrativeAndOrdinarySourceCannotRewriteImmutablePredecessor) {
+    attach();complete(prepare(admit()));adapter.reset();const auto adopted=adopt(10000);committed(adopted.settlement);ASSERT_TRUE(adopted.record);
+    const auto exact=owner->db().query("SELECT policy,predecessor FROM _lattice_canonical_ready_profile");
+    EXPECT_THROW(owner->db().execute("UPDATE _lattice_canonical_ready_profile SET predecessor=X'00'"),db_error);
+    EXPECT_THROW(owner->db().execute("UPDATE _lattice_canonical_ready_profile SET policy=X'00'"),db_error);
+    target(10000);attach();EXPECT_THROW(owner->write([&]{owner->db().execute("UPDATE _lattice_canonical_ready_profile SET predecessor=X'00'");}),db_error);
+    EXPECT_EQ(owner->db().query("SELECT policy,predecessor FROM _lattice_canonical_ready_profile"),exact);
+    committed(adapter->inspect_ready_owned(owner).settlement);
+}
+TEST_F(CanonicalLifecycleAdoption, ExplicitGraceBoundsAndWrongIdentityRefuseWithoutSchemaOrRowChange) {
+    attach();complete(prepare(admit()));adapter.reset();const auto before=preserved();const auto ddl=schema();
+    for(auto grace:{int64_t(0),int64_t(-1),int64_t(3600001)}){const auto result=adopt(grace);EXPECT_NE(result.settlement.state,phase::committed);EXPECT_FALSE(result.record);}
+    auto foreign=p;foreign.writer.binding.epoch=ready_uuid(499);const auto result=canonical_ready_test_access::adopt(owner,foreign,upstream(),kept_limits,policy,name,10000);
+    EXPECT_NE(result.settlement.state,phase::committed);EXPECT_FALSE(result.record);EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);
+}
+TEST_F(CanonicalLifecycleAdoption, EscapedHandleCannotAcquireAdministrativeCustody) {
+    attach();complete(prepare(admit()));adapter.reset();const auto before=preserved();const auto ddl=schema();(void)owner->db().handle();
+    const auto result=adopt(10000);EXPECT_NE(result.settlement.state,phase::committed);EXPECT_FALSE(result.record);EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);
+}
+TEST_F(CanonicalLifecycleAdoption, OffPageCorruptionRefusesBeforePolicySchemaOrPreparingCleanup) {
+    attach();complete(prepare(admit()));adapter.reset();owner->close();sibling->close();
+    {database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=X'7b7d' WHERE frame_index=(SELECT MAX(frame_index) FROM _lattice_canonical_ready_frame)");raw.execute(guard);}
+    owner=ready_owner(file.str());sibling=ready_owner(file.str());const auto before=preserved();const auto ddl=schema();
+    const auto result=adopt(10000);EXPECT_NE(result.settlement.state,phase::committed);EXPECT_FALSE(result.record);EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);
+}
+TEST_F(CanonicalLifecycleAdoption, TamperedOrOversizedPredecessorRefusesNormalReopenBeforeCleanup) {
+    attach();complete(prepare(admit()));adapter.reset();committed(adopt(10000).settlement);target(10000);
+    for(const auto* expression:{"X'00'","zeroblob(16385)","NULL"}) {
+        owner->close();sibling->close();
+        {database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_profile_guard_UPDATE'").at(0).at("sql"));
+            raw.execute("DROP TRIGGER _lattice_canonical_ready_profile_guard_UPDATE");raw.execute("UPDATE _lattice_canonical_ready_profile SET predecessor="+std::string(expression));raw.execute(guard);}
+        owner=ready_owner(file.str());sibling=ready_owner(file.str());const auto before=preserved();const auto ddl=schema();
+        EXPECT_THROW(attach(),db_error);EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+    }
+}
+TEST_F(CanonicalLifecycleAdoption, LaterReceiptConversionRefusesBeforeDisposingAnyRetainedWork) {
+    attach();complete(prepare(admit()));adapter.reset();committed(adopt(10000).settlement);const auto before=preserved();const auto ddl=schema();
+    auto registered=p;registered.namespaces.coverage=canonical_coverage_profile{ready_uuid(490),7,{"application-a","application-b"}};
+    const auto next=canonical_named_ready_profile(policy.authority,p.writer.limits,true,"bounded48MiBV1");
+    EXPECT_THROW(canonical_ready_test_access::migrate(owner,registered,upstream(),kept_limits,policy,next),db_error);
+    EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);EXPECT_FALSE(owner->db().table_exists("_lattice_canonical_receipt_profile"));
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST(CanonicalLifecycleProfileGolden, EveryPreexistingNamedPolicyKeepsExactPersistedBytes) {
+    // Fixed SHA256 values transcribed from 4079's pre-refactor policy encoder
+    // and numeric recipe, not computed by the new named-profile helper.
+    struct Example {const char* name;bool registered;std::optional<int64_t> grace;const char* sha;const char* wire_sha;};
+    const Example examples[]={{"boundedV1",false,std::nullopt,"d03779a6979cfc83cb0a02f2641f8e83fd14d9b259a42e5d4489e873c5f2233e","3c0d7d66c2254c4b950b330c36cf5c5a936d3f9b558cad8622f9164101d2ca2f"},
+        {"bounded48MiBV1",false,std::nullopt,"98ddf0d97d484bb01eea5e841a0672d746ba77ea3537ac08d10449418088aeb0","ce2570d7ea12f4a0884bd1bfece9fd8b11b782f051750be97f38532aeab6b7d3"},
+        {"bounded48MiBV1",true,std::nullopt,"89151c562eef4e63c837f2bbe3ce5576ba2d23b6b9a53ed4475be0021ea8311e","7b6e9d4587bca59ca08d246ef92e48f40c1ae763d768f282c8dc7c8939c31b81"},
+        {"bounded48MiBOrphanV1",false,10000,"bf8209f26849b24868045ee8df3aad28175ef7740ade3b413de7fa6f5aa95390","6e83b99e5ce58ed8570d3978dbbe6a03463504bd119bf35fa08ad11af87adf47"},
+        {"bounded48MiBOrphanV1",true,10000,"e58f8ff645719154e529896b126575fbe98b51a795120fb7a02cf1c7560a6f61","76cf6ede988161d94d1ca1002f71829a1178b5442cad23e23076f3b22b6c46b3"}};
+    for(const auto& example:examples) {
+        TempDB file{"canonical-ready-profile-golden"};auto owner=ready_owner(file.str());auto p=writer_profile();
+        if(example.registered)p.namespaces.coverage=canonical_coverage_profile{ready_uuid(490),7,{"application-a","application-b"}};
+        const auto policy=canonical_named_ready_profile("qualification-source",p.writer.limits,example.registered,example.name,example.grace);
+        auto adapter=canonical_writer_adapter::attach_ready_for_qualification(owner,p,upstream(),{8,3600000},policy);
+        const auto rows=owner->db().query("SELECT policy FROM _lattice_canonical_ready_profile");ASSERT_EQ(rows.size(),1u);
+        const auto& raw=std::get<std::vector<uint8_t>>(rows[0].at("policy"));
+        EXPECT_EQ(picosha2::hash256_hex_string(raw),example.sha)<<example.name<<" registered="<<example.registered;
+        EXPECT_EQ(picosha2::hash256_hex_string(canonical_ready_profile_description(policy,example.name).dump()),example.wire_sha);
+        EXPECT_EQ(owner->db().query("SELECT name FROM pragma_table_xinfo('_lattice_canonical_ready_profile') WHERE name='predecessor'").size(),0u);
+        adapter.reset();owner->close();
+    }
+    EXPECT_THROW(canonical_named_ready_profile("qualification-source",writer_profile().writer.limits,true,"boundedV1OrphanV1",10000),db_error);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST_F(CanonicalLifecycleAdoption, ValidSizedWrongProvenanceAndExtraColumnAreNotAdoptedVariants) {
+    attach();complete(prepare(admit()));adapter.reset();const auto result=adopt(10000);committed(result.settlement);ASSERT_TRUE(result.record);
+    const auto record=*result.record;target(10000);owner->close();sibling->close();
+    {database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_profile_guard_UPDATE'").at(0).at("sql"));
+        raw.execute("DROP TRIGGER _lattice_canonical_ready_profile_guard_UPDATE");auto altered=record;altered.back()='x';
+        raw.execute("UPDATE _lattice_canonical_ready_profile SET predecessor=?",{std::vector<uint8_t>(altered.begin(),altered.end())});raw.execute(guard);}
+    owner=ready_owner(file.str());sibling=ready_owner(file.str());const auto before=preserved();const auto ddl=schema();
+    EXPECT_THROW(attach(),db_error);EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);
+    owner->close();sibling->close();
+    {database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_profile_guard_UPDATE'").at(0).at("sql"));
+        raw.execute("DROP TRIGGER _lattice_canonical_ready_profile_guard_UPDATE");raw.execute("UPDATE _lattice_canonical_ready_profile SET predecessor=?",{std::vector<uint8_t>(record.begin(),record.end())});raw.execute(guard);
+        raw.execute("ALTER TABLE _lattice_canonical_ready_profile ADD COLUMN second_predecessor BLOB");}
+    owner=ready_owner(file.str());sibling=ready_owner(file.str());const auto extra=preserved();const auto extra_ddl=schema();
+    EXPECT_THROW(attach(),db_error);EXPECT_EQ(preserved(),extra);EXPECT_EQ(schema(),extra_ddl);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST_F(CanonicalLifecycleAdoption, BindingOnlyHighWaterAndChargesSurviveWithoutInventingPublishedWork) {
+    attach();const auto offered=prepare(admit());complete(offered);committed(adapter->abandon_ready_owned(owner,offered.transfer->identity));
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),0);ASSERT_EQ(count("_lattice_canonical_ready_binding"),1);
+    ASSERT_GT(scalar(owner->db(),"SELECT charged FROM _lattice_canonical_ready_profile"),0);
+    ASSERT_GT(scalar(owner->db(),"SELECT next_lease FROM _lattice_canonical_ready_profile"),0);
+    const auto before=preserved();adapter.reset();const auto adopted=adopt(10000);committed(adopted.settlement);ASSERT_TRUE(adopted.record);
+    EXPECT_EQ(preserved(),before);target(10000);attach();EXPECT_NE(prepare(admit()).preparation.state,phase::committed);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+}
+TEST_F(CanonicalLifecycleAdoption, EmptyEnrolledSourceHasNoNewCaptureLeaseOrBindingOnExactRetry) {
+    attach();adapter.reset();const auto before=preserved();const auto first=adopt(1);committed(first.settlement);ASSERT_TRUE(first.record);
+    const auto second=adopt(1);committed(second.settlement);EXPECT_EQ(second.record,first.record);EXPECT_EQ(preserved(),before);
+    EXPECT_EQ(first.disposition,canonical_ready_adoption_disposition::applied);EXPECT_EQ(second.disposition,canonical_ready_adoption_disposition::verified_existing);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_binding"),0);
+    EXPECT_EQ(scalar(owner->db(),"SELECT next_lease FROM _lattice_canonical_ready_profile"),0);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST_F(CanonicalLifecycleAdoption, CommitCallbackOwnerRetirementWithholdsRecordWithoutClaimingRollback) {
+    attach();complete(prepare(admit()));adapter.reset();const auto before=preserved();
+    const auto hook=owner->add_invalidation_hook([&](const auto&,auto){owner->close();});
+    const auto retired=adopt(10000);owner->remove_invalidation_hook(hook);
+    EXPECT_EQ(retired.settlement.state,phase::committed);EXPECT_NE(retired.settlement.postcommit_error,nullptr);EXPECT_FALSE(retired.record);EXPECT_FALSE(retired.disposition);
+    sibling->close();owner=ready_owner(file.str());sibling=ready_owner(file.str());EXPECT_EQ(preserved(),before);
+    const auto retry=adopt(10000);committed(retry.settlement);EXPECT_TRUE(retry.record);EXPECT_EQ(preserved(),before);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST_F(CanonicalLifecycleAdoption, FreshLifecyclePolicyCannotManufactureAnUnrecordedPredecessor) {
+    const auto old=policy;target(10000);attach();complete(prepare(admit()));adapter.reset();const auto before=preserved();const auto ddl=schema();policy=old;
+    const auto refused=adopt(10000);EXPECT_NE(refused.settlement.state,phase::committed);EXPECT_FALSE(refused.record);EXPECT_FALSE(refused.disposition);
+    EXPECT_EQ(preserved(),before);EXPECT_EQ(schema(),ddl);
+    EXPECT_TRUE(owner->db().query("SELECT name FROM pragma_table_xinfo('_lattice_canonical_ready_profile') WHERE name='predecessor'").empty());
 }
 #endif

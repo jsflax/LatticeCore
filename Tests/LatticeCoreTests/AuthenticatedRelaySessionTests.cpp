@@ -1,5 +1,7 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
+#include "CanonicalReadyAdoptionTestAccess.hpp"
+#include "../../Sources/LatticeCore/src/canonical_ready_named_profile.hpp"
 #include "../../Sources/LatticeCore/src/recovery_authenticated_session.hpp"
 #include "../../Sources/LatticeCore/src/recovery_writer_access.hpp"
 #include "../../Sources/LatticeCore/src/sync_recovery_values.hpp"
@@ -1545,5 +1547,68 @@ TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesSameValue
     EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));
 }
 
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReadySession, SmallLifecycleNameKeepsOldSmallDescriptionExceptExplicitLifecycleFields) {
+    setup=admitted();const auto old=description(setup);setup.close_on_io();setup={};
+    // A fresh source can explicitly select the small lifecycle profile. An
+    // existing old source still requires administration; opening cannot adopt.
+    auto p=source_policy();p["readyProfile"]="boundedV1OrphanV1";p["orphanResumeGraceMilliseconds"]=10000;
+    const auto unchanged=exact_source();auto implicit=open(p,connection(2));EXPECT_FALSE(implicit.valid());EXPECT_EQ(exact_source(),unchanged);
+    detail::canonical_namespaced_writer_profile native;
+    const auto& source=old.at("source");native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+    native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+    native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+    const auto ready=detail::canonical_named_ready_profile(source.at("authority"),native.writer.limits,false,"boundedV1");
+    const auto adopted=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"boundedV1",10000);
+    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);
+    setup=open(p,connection(3));ASSERT_TRUE(setup.valid())<<last_bridge_error();authorize();auto current=description(setup).at("profile");
+    EXPECT_EQ(current.at("name"),"boundedV1OrphanV1");EXPECT_EQ(current.at("orphanResumeGraceMilliseconds"),10000);
+    current["name"]="boundedV1";current.erase("orphanResumeGraceMilliseconds");EXPECT_EQ(current,old.at("profile"));
+}
+TEST_F(AuthenticatedReceiptCoverageV3, ExplicitAdoptionKeepsActualTwoNamespaceCapsulesAndAllRegisteredReceiptState) {
+    setup=covered_setup();auto other=covered_setup("other",2);const auto e=identified(entry(72));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(coverage().size(),2u);
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    for(auto* f:{&qa,&qb}) {
+        const auto ns=f==&qa?std::string("app"):std::string("other");auto& q=std::get<ready_wire::request>(f->body);
+        f->version=3;q.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};q.receipt_namespace=ns;
+        q.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};
+    }
+    seal(qa,da);seal(qb,db);(void)lease(setup,qa,da);(void)lease(other,qb,db);
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    const auto preserved=[&]{auto value=all_state();value.erase("sqlite_schema");
+        for(auto& row:value.at("_lattice_canonical_ready_profile")){row.erase("policy");row.erase("predecessor");}return value;};
+    const auto before=preserved();const auto exact_frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    other.close_on_io();other={};setup.close_on_io();setup={}; // No setup, result, charge or stop token remains.
+    detail::canonical_namespaced_writer_profile native;const auto& source=da.at("source");
+    native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+    native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+    native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+    native.namespaces.coverage=detail::canonical_coverage_profile{relay_uuid(5100),7,{"app","other"}};
+    const auto ready=detail::canonical_named_ready_profile(source.at("authority"),native.writer.limits,true,"bounded48MiBV1");
+    const auto adopted=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);EXPECT_EQ(preserved(),before);
+    const auto retry=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+    ASSERT_EQ(retry.settlement.state,detail::recovery_install_state::committed);EXPECT_EQ(retry.record,adopted.record);EXPECT_EQ(preserved(),before);
+    auto target=covered_policy();target["readyProfile"]="bounded48MiBOrphanV1";target["orphanResumeGraceMilliseconds"]=10000;
+    setup=open(target,connection(),std::make_shared<RelayRouteState>());ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));const auto current=description(setup);
+    qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume");
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),exact_frames);
+    size_t positives=0;for(uint64_t i=0;i<std::stoull(resumed.at("frames").get<std::string>());++i) {
+        const auto actual=read(setup,resumed,i);ASSERT_EQ(actual.status_code(),1);ASSERT_TRUE(actual.publishable())<<read_diagnostic(actual);
+        const auto decoded=decode_read(actual,current);if(const auto* page=std::get_if<ready_wire::receipt_page>(&decoded.body))for(const auto& item:page->items) {
+            ASSERT_TRUE(std::holds_alternative<ready_wire::committed>(item.value));EXPECT_EQ(item.original_id,e.global_id);
+            EXPECT_EQ(item.operation_digest,e.original_identity->digest);EXPECT_FALSE(item.legacy_unbound);++positives;
+        }
+    }
+    EXPECT_EQ(positives,1u);EXPECT_EQ(coverage().size(),2u);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    EXPECT_EQ(global_state().at("_lattice_canonical_receipt"),before.at("_lattice_canonical_receipt"));
+}
 }
 #endif

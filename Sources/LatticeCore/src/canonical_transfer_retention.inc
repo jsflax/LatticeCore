@@ -7,15 +7,16 @@ constexpr int receipt_migrate=11;
 // Private closed addressed-read body only; never a caller-provided witness.
 constexpr int ready_authenticated_read=12;
 constexpr int ready_lifecycle_resume=13,ready_lifecycle_discard=14;
+constexpr int ready_adopt_schema=15,ready_adopt_record=16;
 using retention_inventory=std::map<std::pair<std::string,std::string>,std::string>;
-void append_ready_schema(retention_inventory&);
+void append_ready_schema(retention_inventory&,bool adopted=false);
 void validate_ready_profile(const canonical_ready_profile&,const canonical_writer_profile&,const canonical_retention_limits&,bool registered_profile=false);
 const char* ready_inventory_query();
 bool ready_authorize(int,int,const char*,const char*)noexcept;
 constexpr const char* retention_profile_query="SELECT CASE WHEN typeof(id)='integer' THEN id END AS id,CASE WHEN typeof(version)='integer' THEN version END AS version,CASE WHEN typeof(incarnation)='integer' THEN incarnation END AS incarnation,CASE WHEN typeof(next_attempt)='integer' THEN next_attempt END AS next_attempt,CASE WHEN typeof(max_attempts)='integer' THEN max_attempts END AS max_attempts,CASE WHEN typeof(max_duration_ms)='integer' THEN max_duration_ms END AS max_duration_ms,CASE WHEN typeof(main_device)='integer' THEN main_device END AS main_device,CASE WHEN typeof(main_inode)='integer' THEN main_inode END AS main_inode,CASE WHEN typeof(parent_device)='integer' THEN parent_device END AS parent_device,CASE WHEN typeof(parent_inode)='integer' THEN parent_inode END AS parent_inode,CASE WHEN typeof(custody_device)='integer' THEN custody_device END AS custody_device,CASE WHEN typeof(custody_inode)='integer' THEN custody_inode END AS custody_inode FROM main._lattice_canonical_retention LIMIT 2";
 constexpr const char* retention_attempts_query="SELECT CASE WHEN typeof(id)='integer' THEN id END AS id,CASE WHEN typeof(incarnation)='integer' THEN incarnation END AS incarnation,CASE WHEN typeof(base)='integer' THEN base END AS base,CASE WHEN typeof(deadline_ms)='integer' THEN deadline_ms END AS deadline_ms FROM main._lattice_canonical_attempt LIMIT 1025";
 retention_inventory retention_schema(const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr,
-    const canonical_ready_profile* ready=nullptr) {
+    const canonical_ready_profile* ready=nullptr,bool adopted=false) {
     retention_inventory out;
     out[{"table","_lattice_canonical_store"}]="CREATE TABLE _lattice_canonical_store (id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,source BLOB NOT NULL,epoch BLOB NOT NULL,scope BLOB NOT NULL,schema_id BLOB NOT NULL,head INTEGER NOT NULL,floor INTEGER NOT NULL,markers INTEGER NOT NULL,marker_bytes INTEGER NOT NULL,receipts INTEGER NOT NULL,receipt_bytes INTEGER NOT NULL,max_markers INTEGER NOT NULL,max_marker_bytes INTEGER NOT NULL,max_receipts INTEGER NOT NULL,max_receipt_bytes INTEGER NOT NULL,max_batch INTEGER NOT NULL,max_identity INTEGER NOT NULL,max_operation INTEGER NOT NULL) WITHOUT ROWID";
     out[{"table","_lattice_canonical_touch"}]="CREATE TABLE _lattice_canonical_touch (relation BLOB NOT NULL,identity BLOB NOT NULL,position INTEGER NOT NULL,charge INTEGER NOT NULL,PRIMARY KEY(relation,identity)) WITHOUT ROWID";
@@ -51,7 +52,7 @@ retention_inventory retention_schema(const canonical_writer_profile& p,const can
                 demand(condition)+" END";
         }
     }
-    if(ready)append_ready_schema(out);
+    if(ready)append_ready_schema(out,adopted);
     if(namespaces&&namespaces->coverage) {
         for(const auto& [name,ddl]:canonical_coverage_schema()) {
             out[{"table",name}]=ddl;
@@ -74,19 +75,21 @@ constexpr const char* retention_inventory_query="SELECT type,CASE WHEN length(CA
         "OR (type='trigger' AND substr(tbl_name,1,19)='_lattice_canonical_') "
         "OR (tbl_name IN ('_lattice_canonical_retention','_lattice_canonical_attempt','_lattice_canonical_store',"
         "'_lattice_canonical_touch','_lattice_canonical_receipt','_lattice_canonical_coverage','_lattice_canonical_namespace') AND sql IS NOT NULL) LIMIT 32";
-void retention_inventory_matches(const std::vector<database::row_t>& rows,const canonical_writer_profile& p,
+bool retention_inventory_matches(const std::vector<database::row_t>& rows,const canonical_writer_profile& p,
     const canonical_namespace_profile* namespaces=nullptr,const canonical_ready_profile* ready=nullptr) {
     const auto expected=retention_schema(p,namespaces,ready);
     if(rows.size()!=expected.size())refuse("canonical retention object inventory differs");
     retention_inventory actual;
     for(const auto& row:rows)actual.emplace(std::pair{string(row,"type"),string(row,"name")},string(row,"sql"));
-    if(actual!=expected)refuse("canonical retention missing, altered or extra schema/guard");
+    if(actual==expected)return false;
+    if(ready&&ready->orphan_resume_grace_ms&&actual==retention_schema(p,namespaces,ready,true))return true;
+    refuse("canonical retention missing, altered or extra schema/guard");
 }
-void retention_inventory_matches(database& writer,const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr,
+bool retention_inventory_matches(database& writer,const canonical_writer_profile& p,const canonical_namespace_profile* namespaces=nullptr,
     const canonical_ready_profile* ready=nullptr) {
     auto query=std::string(ready?ready_inventory_query():retention_inventory_query);
     if(namespaces&&namespaces->coverage)query.replace(query.rfind(" LIMIT "),std::string::npos," LIMIT 96");
-    retention_inventory_matches(writer.query(query),p,namespaces,ready);
+    return retention_inventory_matches(writer.query(query),p,namespaces,ready);
 }
 }
 struct canonical_writer_adapter::retention_session {
@@ -170,10 +173,38 @@ void canonical_writer_adapter::context::admit_retention(sqlite3_context* sql,int
     const auto* frame=retention_frame::current;
     const bool valid=count==0 && frame && frame->state==&self && !self.retention.expired() &&
         sqlite3_context_db_handle(sql)==self.connection &&
-        (frame->bootstrap || (self.active->load(std::memory_order_acquire) &&
+        (frame->bootstrap || ((self.active->load(std::memory_order_acquire)||adoption_admitted(self,ready_adopt_record)) &&
             recovery_writer_access::active_install_for(self.owner,self.connection)));
     if(!valid)sqlite3_result_error(sql,"canonical retention closed operation required",-1);
     else sqlite3_result_int(sql,1);
+}
+bool canonical_writer_adapter::context::adoption_admitted(const context& self,int operation) noexcept {
+    const auto* frame=retention_frame::current;
+    return self.administrative&&frame&&frame->state==&self&&frame->operation==operation&&
+        !self.retention.expired()&&recovery_writer_access::active_install_for(self.owner,self.connection);
+}
+int canonical_writer_adapter::context::authorize_administration(context& self,int action,
+    const char* one,const char* two,const char* schema,const char* origin) noexcept {
+    // Only two literal statements in the closed owned body can enter these
+    // frames. No callback, caller SQL, normal enrollment or source DML enters.
+    const bool main=schema&&std::strcmp(schema,"main")==0;
+    if(action==SQLITE_ALTER_TABLE)return one&&two&&std::strcmp(one,"main")==0&&
+        std::strcmp(two,"_lattice_canonical_ready_profile")==0&&adoption_admitted(self,ready_adopt_schema)?SQLITE_OK:SQLITE_DENY;
+    if(action==SQLITE_INSERT||action==SQLITE_UPDATE||action==SQLITE_DELETE) {
+        if(action!=SQLITE_UPDATE||!main||origin||!one||!two)return SQLITE_DENY;
+        if(std::strcmp(one,"sqlite_master")==0&&std::strcmp(two,"sql")==0&&adoption_admitted(self,ready_adopt_schema))return SQLITE_OK;
+        if(std::strcmp(one,"_lattice_canonical_ready_profile")==0&&
+           (std::strcmp(two,"policy")==0||std::strcmp(two,"predecessor")==0)&&adoption_admitted(self,ready_adopt_record))return SQLITE_OK;
+        return SQLITE_DENY;
+    }
+    if(action==SQLITE_PRAGMA&&two&&!(same_ascii(one,"table_info")||same_ascii(one,"table_xinfo")||
+       same_ascii(one,"index_list")||same_ascii(one,"index_info")||same_ascii(one,"index_xinfo")||same_ascii(one,"foreign_key_list")))return SQLITE_DENY;
+    if(action==SQLITE_ATTACH||action==SQLITE_DETACH||action==SQLITE_CREATE_TABLE||action==SQLITE_CREATE_TEMP_TABLE||
+       action==SQLITE_CREATE_TRIGGER||action==SQLITE_CREATE_TEMP_TRIGGER||action==SQLITE_DROP_TABLE||action==SQLITE_DROP_TEMP_TABLE||
+       action==SQLITE_DROP_TRIGGER||action==SQLITE_DROP_TEMP_TRIGGER||action==SQLITE_CREATE_INDEX||action==SQLITE_DROP_INDEX||
+       action==SQLITE_CREATE_TEMP_INDEX||action==SQLITE_DROP_TEMP_INDEX||action==SQLITE_CREATE_VIEW||action==SQLITE_DROP_VIEW||
+       action==SQLITE_CREATE_TEMP_VIEW||action==SQLITE_DROP_TEMP_VIEW||action==SQLITE_CREATE_VTABLE||action==SQLITE_DROP_VTABLE)return SQLITE_DENY;
+    return SQLITE_OK;
 }
 bool canonical_writer_adapter::context::authorize_retention(context& self,int action,const char* table,const char* column) noexcept {
     const auto* frame=retention_frame::current;

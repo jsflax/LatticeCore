@@ -31,6 +31,7 @@ struct Sink {
     bool overflow=false,file_layer_unavailable=false;
 };
 inline thread_local Sink* current_sink=nullptr;
+inline thread_local bool scope_active=false;
 inline void append(Record& record,const char* text,size_t maximum=std::numeric_limits<size_t>::max()) noexcept {
     if(!text)return;
     size_t i=0;
@@ -251,6 +252,7 @@ class Scope {
     lattice::detail::database_open_test_hooks::selector selector;
     lattice::detail::database_open_test_hooks::selector* previous_selector=nullptr;
     Sink* previous_sink=nullptr;
+    bool previous_scope_active=false;
     std::unique_lock<std::mutex> registration;
     sqlite3_vfs* parent=nullptr;
     bool registered=false,armed=false,finished=false,available=false,cleanup_ok=true;
@@ -266,9 +268,12 @@ public:
         :selector{path.c_str(),SQLITE_OPEN_FULLMUTEX|SQLITE_OPEN_READONLY|SQLITE_OPEN_URI,nullptr} {
         const int saved=errno;
         previous_selector=lattice::detail::database_open_test_hooks::current;previous_sink=current_sink;
+        previous_scope_active=scope_active;scope_active=true;
         // Even an unavailable nested observation uses the original default
         // once, rather than accidentally consuming an outer matching selector.
         lattice::detail::database_open_test_hooks::current=nullptr;current_sink=nullptr;armed=true;
+        // std::mutex::try_lock is not safe when this thread already owns it.
+        if(previous_scope_active){reason="nestedScope";errno=saved;return;}
         try {
             registration=std::unique_lock<std::mutex>(registration_mutex(),std::try_to_lock);
             auto& c=context();parent=sqlite3_vfs_find(nullptr);
@@ -290,7 +295,7 @@ public:
     ~Scope() noexcept {finish();}
     void finish() noexcept {
         if(finished)return;const int saved=errno;finished=true;
-        if(armed){lattice::detail::database_open_test_hooks::current=previous_selector;current_sink=previous_sink;armed=false;}
+        if(armed){lattice::detail::database_open_test_hooks::current=previous_selector;current_sink=previous_sink;scope_active=previous_scope_active;armed=false;}
         remove_registration();errno=saved;
     }
     std::string failure_report() const {

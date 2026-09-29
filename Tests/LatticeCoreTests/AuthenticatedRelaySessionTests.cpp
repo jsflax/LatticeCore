@@ -1143,7 +1143,7 @@ TEST_F(AuthenticatedReadySession, EitherAuthorizerFaultUsesBothAuditsAndCommitRe
 TEST_F(AuthenticatedReadySession, ReadPostcommitObserverErrorKeepsTheExistingCommittedFrameContract) {
     setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
     ASSERT_TRUE(baseline.publishable());const auto before=exact_source();unsigned calls=0;
-    AddressedReadInvalidationHook hook{owner,owner->add_invalidation_hook([&](const auto&,auto){++calls;throw std::runtime_error("addressed read observer");})};
+    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw std::runtime_error("addressed read observer");})};
     const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);EXPECT_EQ(result.status_code(),1);EXPECT_TRUE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());
     EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
     EXPECT_TRUE(last_read_trace.postcommit_error);EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.notification_error);
@@ -1153,7 +1153,7 @@ TEST_F(AuthenticatedReadySession, ReadPostcommitObserverErrorKeepsTheExistingCom
 TEST_F(AuthenticatedReadySession, ReadPostcommitRevocationStillPreventsPublicationOfCommittedBytes) {
     setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
     ASSERT_TRUE(baseline.publishable());const auto before=exact_source();const auto stop=setup.stop_token();unsigned calls=0;
-    AddressedReadInvalidationHook hook{owner,owner->add_invalidation_hook([&](const auto&,auto){++calls;stop.stop();})};
+    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;stop.stop();})};
     const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);EXPECT_EQ(result.status_code(),1);EXPECT_FALSE(result.publishable());EXPECT_FALSE(baseline.publishable());
     EXPECT_EQ(result.wire(),baseline.wire());EXPECT_EQ(last_read_trace.full_audits,1u);
     EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(exact_source(),before);
@@ -1163,7 +1163,7 @@ TEST_F(AuthenticatedReadySession, ReadPostcommitLeaseExpiryStillPreventsPublicat
     setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d,"prepare",1000);const auto baseline=read(setup,offered,0);
     ASSERT_TRUE(baseline.publishable());const auto before=exact_source();bool reached_expiry=false;unsigned calls=0;
     {
-        AddressedReadInvalidationHook hook{owner,owner->add_invalidation_hook([&](const auto&,auto){
+        AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){
             ++calls;const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(3);
             while(baseline.publishable()&&std::chrono::steady_clock::now()<end)std::this_thread::yield();reached_expiry=!baseline.publishable();
         })};
@@ -1295,7 +1295,7 @@ TEST_F(AuthenticatedReadyLifecycle, DiscardCommitDenialAndIgnoredChargeNeverPubl
 }
 TEST_F(AuthenticatedReadyLifecycle, KnownDiscardCommitWithSecondaryErrorRetainsTerminalForLostReplyRetry) {
     setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);const auto this_thread=std::this_thread::get_id();
-    const auto hook=owner->add_invalidation_hook([this_thread](const auto&,auto){if(std::this_thread::get_id()==this_thread)throw std::runtime_error("lifecycle committed observer");});
+    const auto hook=owner->lattice_db::add_invalidation_hook([this_thread](const auto&,auto){if(std::this_thread::get_id()==this_thread)throw std::runtime_error("lifecycle committed observer");});
     const auto result=lifecycle_result(setup,"discard",q,d);owner->remove_invalidation_hook(hook);
     EXPECT_EQ(result["settlement"]["state"],"committed");EXPECT_EQ(result["settlement"]["postcommitError"],true);EXPECT_EQ(result["lifecycle"]["state"],"terminal");
     const auto exact=exact_source();EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");EXPECT_EQ(exact_source(),exact);

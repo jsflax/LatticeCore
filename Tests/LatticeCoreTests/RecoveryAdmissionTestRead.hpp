@@ -26,15 +26,20 @@ class held_read {
 public:
     std::exception_ptr error;
     size_t rows=0;
-    explicit held_read(lattice::database& db,bool managed=false,std::string sql="SELECT name FROM TestPerson")
+    explicit held_read(lattice::database& db,bool managed=false,std::string sql="SELECT name FROM TestPerson",bool exact_statement=false)
     {
         // Launch only after every member, including error and rows below the
         // thread declaration, has completed construction.
-        worker=std::thread([this,&db,managed,sql=std::move(sql)]{
+        worker=std::thread([this,&db,managed,sql=std::move(sql),exact_statement]{
             bool signaled=false;
             try {
-                row_probe probe([&](auto& actual,auto*){
-                    if(&actual!=&db||signaled)return;signaled=true;arrived_.set_value();
+                row_probe probe([&](auto& actual,auto* statement){
+                    if(&actual!=&db||signaled)return;
+                    // A write hook can query this same database recursively.
+                    // Select the actual outer RETURNING row after SQLite step
+                    // releases its mutex, not that nested globalId read.
+                    if(exact_statement){const auto* actual_sql=sqlite3_sql(statement);if(!actual_sql||sql!=actual_sql)return;}
+                    signaled=true;arrived_.set_value();
                     if(released.wait_for(std::chrono::seconds(12))!=std::future_status::ready)std::abort();
                 });
                 if(managed)rows=lattice::detail::canonical_writer_custody_test_access::query_managed_cell(db,"SELECT name FROM TestPerson WHERE id=?","name",1).has_value()?1:0;

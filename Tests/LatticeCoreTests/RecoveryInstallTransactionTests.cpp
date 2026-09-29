@@ -576,7 +576,7 @@ TEST(RecoveryControllerAdmission, RawCursorExplicitTransactionAndWriteReturningS
     ASSERT_EQ(sqlite3_step(raw),SQLITE_ROW);refused();sqlite3_finalize(raw);
     owner->begin_transaction();refused();owner->rollback();
     owner->db().execute("BEGIN");owner->db().query("SELECT name FROM TestPerson");refused();owner->db().rollback();
-    recovery_admission_test::held_read returning(owner->db(),false,"UPDATE TestPerson SET age=age+1 RETURNING age");
+    recovery_admission_test::held_read returning(owner->db(),false,"UPDATE TestPerson SET age=age+1 RETURNING age",true);
     refused();returning.finish();EXPECT_FALSE(returning.error);EXPECT_GT(returning.rows,0u);
 }
 TEST(RecoveryControllerAdmission, BodyAndCommitErrorsNeverBecomeAdmissionRetry) {

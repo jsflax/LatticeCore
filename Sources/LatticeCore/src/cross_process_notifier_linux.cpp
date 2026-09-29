@@ -4,7 +4,7 @@
 #include "lattice/log.hpp"
 
 #include <sys/inotify.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -79,28 +79,35 @@ public:
             char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
             while (listening_.load()) {
-                fd_set fds;
-                FD_ZERO(&fds);
-                FD_SET(inotify_fd_, &fds);
-                FD_SET(shutdown_pipe_[0], &fds);
-
-                int max_fd = std::max(inotify_fd_, shutdown_pipe_[0]) + 1;
-                int ret = select(max_fd, &fds, nullptr, nullptr, nullptr);
+                // poll stores one entry per descriptor rather than indexing a
+                // fixed-size fd_set by its numeric value.
+                pollfd fds[] = {
+                    {inotify_fd_, POLLIN, 0},
+                    {shutdown_pipe_[0], POLLIN, 0},
+                };
+                int ret = poll(fds, 2, -1);
 
                 if (ret < 0) {
                     if (errno == EINTR) continue;
-                    LOG_ERROR("xproc", "select failed: %s", strerror(errno));
+                    LOG_ERROR("xproc", "poll failed: %s", strerror(errno));
                     break;
                 }
 
                 // Shutdown signal
-                if (FD_ISSET(shutdown_pipe_[0], &fds)) {
+                if (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
                     LOG_DEBUG("xproc", "Shutdown signal received");
                     break;
                 }
 
+                // An invalid/failed watch cannot deliver notifications. Stop
+                // instead of spinning on a persistent poll error.
+                if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                    LOG_ERROR("xproc", "inotify poll failed: revents=%d", fds[0].revents);
+                    break;
+                }
+
                 // inotify event
-                if (FD_ISSET(inotify_fd_, &fds)) {
+                if (fds[0].revents & POLLIN) {
                     ssize_t len = read(inotify_fd_, buf, sizeof(buf));
                     if (len > 0 && callback_) {
                         callback_();

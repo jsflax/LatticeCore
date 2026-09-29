@@ -660,6 +660,36 @@ protected:
         }
         result["sqlite_schema"]=owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");return result;
     }
+    // The private adoption helper leaves its writer administratively closed.
+    // Observe the actual committed WAL through a separate READONLY connection,
+    // never by broadening that writer's retained authorizer.
+    Snapshot read_only_all_state(const physical_store_identity& expected) {
+        database reader(file.str(),database::open_mode::read_only,100);
+        const auto require_identity=[&]{
+            const auto actual=reader.physical_identity("main",{},true);
+            if(!actual||actual->device!=expected.device||actual->inode!=expected.inode||actual->filename!=expected.filename)
+                throw std::runtime_error("v3 readonly snapshot physical identity changed");
+        };
+        require_identity();reader.execute("BEGIN");
+        try {
+            Snapshot result;const auto tables=reader.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+            if(tables.size()>128)throw std::runtime_error("v3 fixture table inventory bound");
+            for(const auto& row:tables) {
+                const auto& name=std::get<std::string>(row.at("name"));
+                if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='_';}))
+                    throw std::runtime_error("v3 fixture table name refused");
+                result[name]=reader.query("SELECT * FROM \""+name+"\" ORDER BY 1");
+            }
+            result["sqlite_schema"]=reader.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+            require_identity();reader.execute("COMMIT");require_identity();return result;
+        }catch(...){const auto primary=std::current_exception();try{reader.execute("ROLLBACK");}catch(...){}std::rethrow_exception(primary);}
+    }
+    void expect_administrative_writer_closed() {
+        EXPECT_FALSE(owner->db().is_in_transaction());
+        EXPECT_THROW(owner->db().execute("UPDATE _lattice_meta SET value=value WHERE key='schema_version'"),db_error);
+        EXPECT_THROW(owner->db().execute("UPDATE AuthenticatedRelayRow SET text=text"),db_error);
+        EXPECT_FALSE(owner->db().is_in_transaction());
+    }
     Rows coverage() {return owner->db().query("SELECT * FROM _lattice_canonical_receipt_coverage ORDER BY original_id,namespace_id");}
     static std::vector<uint8_t> bytes(const std::string& text) {return {text.begin(),text.end()};}
 };
@@ -1599,7 +1629,8 @@ TEST_F(AuthenticatedReceiptCoverageV3, ExplicitAdoptionKeepsActualTwoNamespaceCa
     }
     seal(qa,da);seal(qb,db);(void)lease(setup,qa,da,"prepare",1000);(void)lease(other,qb,db,"prepare",1000);
     ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);
-    const auto preserved=[&]{auto value=all_state();value.erase("sqlite_schema");
+    const auto physical=owner->db().physical_identity("main",{},true);ASSERT_TRUE(physical);
+    const auto preserved=[&]{auto value=read_only_all_state(*physical);value.erase("sqlite_schema");
         for(auto& row:value.at("_lattice_canonical_ready_profile")){row.erase("policy");row.erase("predecessor");}return value;};
     const auto before=preserved();const auto exact_frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
     other.close_on_io();other={};setup.close_on_io();setup={}; // No setup, result, charge or stop token remains.
@@ -1610,9 +1641,9 @@ TEST_F(AuthenticatedReceiptCoverageV3, ExplicitAdoptionKeepsActualTwoNamespaceCa
     native.namespaces.coverage=detail::canonical_coverage_profile{relay_uuid(5100),7,{"app","other"}};
     const auto ready=detail::canonical_named_ready_profile(source.at("authority"),native.writer.limits,true,"bounded48MiBV1");
     const auto adopted=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
-    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);EXPECT_EQ(preserved(),before);
+    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);EXPECT_EQ(preserved(),before);expect_administrative_writer_closed();EXPECT_EQ(preserved(),before);
     const auto retry=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
-    ASSERT_EQ(retry.settlement.state,detail::recovery_install_state::committed);EXPECT_EQ(retry.record,adopted.record);EXPECT_EQ(preserved(),before);
+    ASSERT_EQ(retry.settlement.state,detail::recovery_install_state::committed);EXPECT_EQ(retry.record,adopted.record);EXPECT_EQ(preserved(),before);expect_administrative_writer_closed();EXPECT_EQ(preserved(),before);
     auto target=covered_policy();target["readyProfile"]="bounded48MiBOrphanV1";target["orphanResumeGraceMilliseconds"]=10000;
     setup=open(target,connection(),std::make_shared<RelayRouteState>());ASSERT_TRUE(setup.valid())<<last_bridge_error();
     ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));const auto current=description(setup);
@@ -2598,6 +2629,60 @@ TEST_F(AutomaticRelaySetup, ActualFileSubstitutionAfterBusyCannotUseTheCachedIde
     EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
     EXPECT_NE(error.find("authenticated physical store identity unavailable:"),std::string::npos);
     EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+struct AdoptionSnapshotFault {
+    static thread_local AdoptionSnapshotFault* active;
+    bool commit;unsigned hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* previous;
+    AdoptionSnapshotFault* prior;
+    AdoptionSnapshotFault(database& db,bool at_commit):commit(at_commit),
+        fault{detail::canonical_writer_custody_test_access::fault_handle(db),deny},
+        previous(detail::canonical_retention_test_hooks::fault),prior(active){active=this;detail::canonical_retention_test_hooks::fault=&fault;}
+    ~AdoptionSnapshotFault(){detail::canonical_retention_test_hooks::fault=previous;active=prior;}
+    static int deny(int action,const char* one,const char* two,const char* origin)noexcept {
+        if(!active||origin)return SQLITE_OK;
+        const bool selected=active->commit?
+            action==SQLITE_TRANSACTION&&one&&std::strcmp(one,"COMMIT")==0:
+            action==SQLITE_UPDATE&&one&&two&&std::strcmp(one,"_lattice_canonical_ready_profile")==0&&std::strcmp(two,"policy")==0;
+        if(selected){++active->hits;return SQLITE_DENY;}return SQLITE_OK;
+    }
+};
+thread_local AdoptionSnapshotFault* AdoptionSnapshotFault::active=nullptr;
+TEST_F(AuthenticatedReceiptCoverageV3, ReadonlyWholeSnapshotPreservesAdministrativeRefusalAfterBodyAndCommitRollback) {
+    setup=covered_setup();const auto e=identified(entry(972));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto description_before=description(setup);setup.close_on_io();setup={};
+    const auto physical=owner->db().physical_identity("main",{},true);ASSERT_TRUE(physical);
+    const auto before=read_only_all_state(*physical);EXPECT_EQ(before,all_state());
+    detail::canonical_namespaced_writer_profile native;const auto& source=description_before.at("source");
+    native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+    native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+    native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+    native.namespaces.coverage=detail::canonical_coverage_profile{relay_uuid(5100),7,{"app","other"}};
+    const auto ready=detail::canonical_named_ready_profile(source.at("authority"),native.writer.limits,true,"bounded48MiBV1");
+    for(const bool at_commit:{false,true}) {
+        SCOPED_TRACE(at_commit?"commit-refusal":"body-refusal");
+        {
+            AdoptionSnapshotFault fault(owner->db(),at_commit);
+            const auto refused=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+            EXPECT_EQ(fault.hits,1u);EXPECT_EQ(refused.settlement.state,detail::recovery_install_state::rolled_back);
+            EXPECT_NE(refused.settlement.primary_error,nullptr);EXPECT_FALSE(refused.record);
+        }
+        EXPECT_EQ(read_only_all_state(*physical),before);expect_administrative_writer_closed();EXPECT_EQ(read_only_all_state(*physical),before);
+    }
+    const auto accepted=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+    ASSERT_EQ(accepted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(accepted.record);
+    const auto after=read_only_all_state(*physical);expect_administrative_writer_closed();EXPECT_EQ(read_only_all_state(*physical),after);
+    EXPECT_EQ(after.at("_lattice_canonical_receipt"),before.at("_lattice_canonical_receipt"));
+    EXPECT_EQ(after.at("_lattice_canonical_receipt_origin"),before.at("_lattice_canonical_receipt_origin"));
+    EXPECT_EQ(after.at("_lattice_canonical_receipt_coverage"),before.at("_lattice_canonical_receipt_coverage"));
 }
 }
 #endif

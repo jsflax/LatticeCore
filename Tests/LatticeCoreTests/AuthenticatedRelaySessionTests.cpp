@@ -1505,37 +1505,43 @@ TEST_F(AuthenticatedReceiptFileAdministration, UnadmittedExistingSchemaIsNotHeal
     EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
     size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db*){++published;});EXPECT_EQ(published,0u);
 }
-TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesPrivateMetadataWithoutOrdinaryPublication) {
+TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesSameValueHeaderWithoutOrdinaryPublication) {
     open();authorize();setup.close_on_io();setup={};const auto before=all_state();size_t observations=0;
     const std::function<void(lattice_db&)> inspect=[&](lattice_db& actual) {
         ++observations;EXPECT_NE(&actual,owner.get());
         size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db* value){EXPECT_NE(value,&actual);++published;});
         EXPECT_EQ(published,1u);
+        const auto header=[&] {
+            const auto rows=actual.db().query("PRAGMA main.user_version");
+            return rows.size()==1&&rows[0].size()==1&&std::holds_alternative<int64_t>(rows[0].begin()->second)&&
+                std::get<int64_t>(rows[0].begin()->second)==1;
+        };
+        ASSERT_TRUE(header());
         // The production factory strongly retains actual for this entire
         // synchronous callback. This alias tests settlement, not lifetime.
         auto borrowed=std::shared_ptr<lattice_db>(&actual,[](lattice_db*){});
         using state=detail::recovery_install_state;
         const auto committed=detail::recovery_writer_access::install(borrowed,[&](database& writer){
             EXPECT_EQ(detail::recovery_writer_access::active_writer(actual),&writer);
-            writer.execute("UPDATE _lattice_canonical_store SET version=version");
+            writer.execute("PRAGMA main.user_version=1");
         });
         EXPECT_EQ(committed.state,state::committed);EXPECT_FALSE(committed.primary_error);EXPECT_FALSE(committed.postcommit_error);
-        EXPECT_EQ(all_state(),before);
+        EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
         const auto rolled=detail::recovery_writer_access::install(borrowed,[](database& writer){
-            writer.execute("UPDATE _lattice_canonical_store SET version=version");throw std::runtime_error("owned administration rollback");
+            writer.execute("PRAGMA main.user_version=1");throw std::runtime_error("owned administration rollback");
         });
-        EXPECT_EQ(rolled.state,state::rolled_back);EXPECT_TRUE(rolled.primary_error);EXPECT_FALSE(rolled.cleanup_error);EXPECT_EQ(all_state(),before);
+        EXPECT_EQ(rolled.state,state::rolled_back);EXPECT_TRUE(rolled.primary_error);EXPECT_FALSE(rolled.cleanup_error);EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
         const auto premature=detail::recovery_writer_access::install(borrowed,[](database& writer){
-            writer.execute("UPDATE _lattice_canonical_store SET version=version");writer.commit();
+            writer.execute("PRAGMA main.user_version=1");writer.commit();
         });
         EXPECT_EQ(premature.state,state::rolled_back);EXPECT_TRUE(premature.primary_error);EXPECT_FALSE(premature.cleanup_error);
-        EXPECT_FALSE(premature.unexpected_commit_observed);EXPECT_EQ(all_state(),before);
+        EXPECT_FALSE(premature.unexpected_commit_observed);EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
     };
     struct restore {const std::function<void(lattice_db&)>* prior;~restore(){detail::authenticated_relay_catalog_test_access::before_write(prior);}}
         restored{detail::authenticated_relay_catalog_test_access::before_write(&inspect)};
     ASSERT_EQ(migrate_file(),1)<<last_bridge_error();EXPECT_EQ(observations,1u);
     // The normal receipt migration adds its documented coverage tables; the
-    // hook's three transactions leave every pre-migration table unchanged.
+    // hook's three header transactions leave every pre-migration table unchanged.
     EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));
 }
 

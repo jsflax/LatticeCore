@@ -1,4 +1,5 @@
 #include "recovery_receiver_source.hpp"
+#include "recovery_upload_json.hpp"
 #include "recovery_receipt_json.hpp"
 #include "sync_callback_lifetime.hpp"
 #include <lattice/lattice.hpp>
@@ -266,27 +267,8 @@ bool receiver_upload_view::current()const {
     return binding->current_==record_&&binding->upload_failure_.empty()&&record_->endpoint.current_system_tls_for_owner();
 }
 bool receiver_upload_view::fits(const std::string& wire,size_t entries,size_t deletes,std::string& reason)const {
-    if(entries>entries_){reason="entry count";return false;}
-    if(wire.size()>wire_){reason="wire bytes";return false;}
-    if(deletes>deletes_){reason="delete count";return false;}
-    // Use the exact mounted parser event semantics on the complete envelope.
-    // Only a bound refusal is a fitting-prefix decision. JSON/read/provenance
-    // errors still propagate; they can never prove absence or a safe prefix.
-    struct limit {};
-    size_t nodes=0;std::vector<std::set<std::string>> keys;
-    try {
-        const auto parsed=json::parse(wire,[&](int depth,json::parse_event_t event,json& value){
-            if(depth<0||static_cast<size_t>(depth)>depth_){reason="parser depth";throw limit{};}
-            if(++nodes>nodes_){reason="parser events";throw limit{};}
-            if(value.is_string()&&value.get_ref<const std::string&>().size()>scalar_){reason="decoded scalar bytes";throw limit{};}
-            if(event==json::parse_event_t::object_start)keys.emplace_back();
-            if(event==json::parse_event_t::key&&(keys.empty()||!keys.back().insert(value.get<std::string>()).second))reject("negotiated export duplicate JSON key");
-            if(event==json::parse_event_t::object_end)keys.pop_back();return true;
-        });
-        if(!parsed.is_object()||parsed.size()!=1||!parsed.contains("auditLog")||!parsed.at("auditLog").is_array()||parsed.at("auditLog").size()!=entries)
-            reject("negotiated export envelope differs");
-    }catch(const limit&){return false;}
-    return true;
+    return recovery_upload_json::fits(wire,entries,deletes,
+        {entries_,wire_,scalar_,nodes_,depth_,deletes_},reason);
 }
 bool receiver_upload_view::send(owned_platform_sync_transport& transport,const transport_message& message)const {
     // Final admission. Later retirement can settle this already admitted send

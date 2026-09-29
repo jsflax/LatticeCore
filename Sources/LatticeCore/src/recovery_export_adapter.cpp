@@ -1,6 +1,7 @@
 #include "recovery_export_adapter.hpp"
 #include "recovery_unknown_reconciliation.hpp"
 #include "recovery_receiver_source.hpp"
+#include "recovery_upload_json.hpp"
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -587,11 +588,13 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         std::vector<int64_t> selected_delete_witnesses;
         std::string encoded="{\"auditLog\":[";
         if(frame.upload_view_) {
-            std::vector<int64_t> selected;size_t deletes=0;
+            std::vector<int64_t> selected;
+            recovery_upload_json::prefix prefix({frame.upload_view_->entries_,frame.upload_view_->wire_,
+                frame.upload_view_->scalar_,frame.upload_view_->nodes_,frame.upload_view_->depth_,frame.upload_view_->deletes_});
             // Process only the fitting ordered prefix. A later local byte cap
             // cannot consume the earlier prefix's opportunity to progress.
-            // Whole final envelopes use the mounted parser's event semantics;
-            // work is bounded by the local page cap and remote count clamp.
+            // Parse each new member in its actual envelope/depth once, then
+            // recheck the complete immutable envelope before creating claims.
             for(const auto id:ids) {
                 std::string reason;
                 try {
@@ -638,23 +641,18 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                     };
                     decode_generated(db,row,*table,raw,false,prove_absence,identity);wire_bound(row.entry,limits.wire_bytes);
                     const auto json=row.entry.to_json();
-                    const size_t overhead=encoded.size()+(!frame.entries_.empty()?1:0)+2;
-                    if(overhead>frame.upload_view_->wire_||json.size()>frame.upload_view_->wire_-overhead)reason="wire bytes";
-                    else {
-                        auto candidate=encoded;if(!frame.entries_.empty())candidate+=',';candidate+=json;candidate+="]}";
-                        const size_t next_deletes=deletes+(row.entry.operation=="DELETE");
-                        if(frame.upload_view_->fits(candidate,frame.entries_.size()+1,next_deletes,reason)) {
-                            encoded.assign(candidate.data(),candidate.size()-2);deletes=next_deletes;selected.push_back(id);
-                            for(const auto i:matches)by_scope[i].push_back(row.entry.global_id);
-                            frame.entries_.push_back(row.entry);tables.push_back(table);scope_indexes.push_back(std::move(matches));originals.push_back(std::move(row));
-                            selected_delete_witnesses.push_back(witness_id);
-                            continue;
-                        }
+                    if(prefix.append(json,row.entry.operation=="DELETE",reason)) {
+                        selected.push_back(id);
+                        for(const auto i:matches)by_scope[i].push_back(row.entry.global_id);
+                        frame.entries_.push_back(row.entry);tables.push_back(table);scope_indexes.push_back(std::move(matches));originals.push_back(std::move(row));
+                        selected_delete_witnesses.push_back(witness_id);
+                        continue;
                     }
                 }catch(const export_capacity_error& error){reason=error.what();}
                 if(frame.entries_.empty())output.blocked_original="negotiated upload original PK "+std::to_string(id)+" cannot fit: "+reason;
                 break;
             }
+            encoded=std::move(prefix).release_open();
             ids=std::move(selected);
         } else {
         for(const auto id:ids){auto row=read_audit(db,id,raw);const recovery_local_export_table* table=nullptr;std::vector<size_t> matches;
@@ -686,6 +684,13 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         }
         if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked before claims");
         encoded+="]}";if(frame.entries_.empty())return;
+        if(frame.upload_view_){
+            const auto deletes=std::count_if(frame.entries_.begin(),frame.entries_.end(),
+                [](const auto& entry){return entry.operation=="DELETE";});
+            std::string reason;
+            if(!frame.upload_view_->fits(encoded,frame.entries_.size(),deletes,reason))
+                refuse("negotiated export final envelope exceeds bounds");
+        }
         std::vector<std::pair<recovery_obligation_address,recovery_obligation_entry>> expected_entries;
         std::vector<recovery_obligation_scope> expected_scopes;
         for(size_t i=0;i<by_scope.size();++i)if(!by_scope[i].empty()){

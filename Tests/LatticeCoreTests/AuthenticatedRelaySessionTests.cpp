@@ -1143,6 +1143,7 @@ struct ReadyLifecycleGate {
     void wait(){std::unique_lock lock(mutex);entered=true;changed.notify_all();if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
     bool arrived(){std::lock_guard lock(mutex);return entered;}
     void release(){std::lock_guard lock(mutex);released=true;changed.notify_all();}
+    bool timedOut(){std::lock_guard lock(mutex);return timed_out;}
 };
 struct ReadyLifecycleEvents {
     std::mutex mutex;std::function<void(const char*)> callback;
@@ -1181,6 +1182,7 @@ protected:
     }
     void TearDown()override {
         events->set({});for(const auto& gate:gates)gate->release();
+        for(const auto& gate:gates)EXPECT_FALSE(gate->timedOut())<<"maintenance race gate timed out before release";
         detail::authenticated_ready_maintenance_test_observation::exchange(std::move(prior_probe));
         AuthenticatedReadySession::TearDown();
     }

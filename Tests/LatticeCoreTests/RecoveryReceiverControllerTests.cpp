@@ -2123,3 +2123,98 @@ TEST_F(RecoveryReceiverController, CloseWhileReadAdmissionDeferredCannotConsumeQ
 }
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(TerminalReceiverController, RealReadDeferralRetainsFirstRangeWithSecondStaleLifecycleInSharedInbox) {
+    configure();insert(*source,controller_uuid(9550),"combined source row");seed_local(1,9551);
+    reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
+    auto held=std::make_shared<ControllerAdmissionRead>();ControllerAdmissionReadRelease cleanup{held};
+    auto installed_pause=std::make_shared<ControllerPause>();pauses.push_back(installed_pause);const auto owner=receiver;
+    std::string stale,first_range;
+    after_control=[&](size_t,const json& control,std::string& outgoing){
+        if(control.at("operation")=="inspect")stale=outgoing;
+        if(control.at("operation")=="read"&&first_range.empty())first_range=outgoing;};
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[held,owner,installed_pause](const char* stage){
+        if(std::strcmp(stage,"range-response-ready")==0)held->hold(owner->db());
+        if(std::strcmp(stage,"admission-deferred")==0&&held->armed.load())++held->deferrals;
+        if(std::strcmp(stage,"response-consumed")==0&&held->armed.load())++held->consumed;
+        if(std::strcmp(stage,"install-committed")==0)installed_pause->wait();});
+    connect();ASSERT_TRUE(until([&]{return held->deferrals.load()>=1;}));ASSERT_FALSE(has_error());
+    ASSERT_FALSE(stale.empty());ASSERT_FALSE(first_range.empty());
+    ASSERT_EQ(json::parse(first_range).at("latticeCanonicalRange").at("kind"),"manifest");
+    const auto before=snapshot();const auto before_framing=framing();const auto endpoint=peers[0].physical;
+    const auto before_q=receiver->db().query("SELECT request_frame FROM _lattice_recovery_request");
+    const auto source_view=peers[0].setup.descriptor();const auto handled_before=handled,requests_before=requests.size();
+    const auto source_receipts=source->db().query("SELECT * FROM _lattice_canonical_receipt");
+    const auto deferrals_before=held->deferrals.load();
+    // The exact range already occupies the first slot and remains unconsumed
+    // while its real engine read blocks pre-BEGIN installation admission.
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(stale)));
+    ASSERT_TRUE(until([&]{return held->deferrals.load()>=deferrals_before+3;}));
+    EXPECT_FALSE(has_error());EXPECT_EQ(held->consumed.load(),0u);EXPECT_EQ(snapshot(),before);EXPECT_EQ(framing(),before_framing);
+    EXPECT_EQ(handled,handled_before);EXPECT_EQ(requests.size(),requests_before);EXPECT_EQ(source->db().query("SELECT * FROM _lattice_canonical_receipt"),source_receipts);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+    held->finish();ASSERT_TRUE(until([&]{return installed_pause->ready();}));EXPECT_FALSE(has_error());EXPECT_GT(held->consumed.load(),0u);
+    const auto stored=receiver->db().query("SELECT manifest_frame FROM _lattice_recovery_request WHERE sequence=2");ASSERT_EQ(stored.size(),1u);
+    const auto& bytes=std::get<std::vector<uint8_t>>(stored[0].at("manifest_frame"));EXPECT_EQ(std::string(bytes.begin(),bytes.end()),first_range);
+    EXPECT_EQ(receiver->db().query("SELECT request_frame FROM _lattice_recovery_request"),before_q);
+    EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),source_view);EXPECT_EQ(requests.size(),requests_before);
+    EXPECT_EQ(phase(),3);EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1 AND active IS NULL"),1);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow WHERE value='combined source row'"),1);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),before.at("AuditLog"));
+    installed_pause->release();ASSERT_TRUE(until([&]{return installed();}));EXPECT_FALSE(has_error());
+}
+TEST_F(TerminalReceiverController, LateOnlyDrainKeepsOriginalReadAdmissionDeadlineAfterPendingNullGap) {
+    configure();insert(*source,controller_uuid(9560),"unchanged behind exhausted admission");seed_local(1,9561);
+    reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
+    auto held=std::make_shared<ControllerAdmissionRead>();ControllerAdmissionReadRelease cleanup{held};const auto owner=receiver;
+    auto arm=std::make_shared<std::atomic<bool>>(false);auto first_deferral_ms=std::make_shared<std::atomic<int64_t>>(0);
+    auto late_count=std::make_shared<std::atomic<unsigned>>(0);
+    auto first_late=std::make_shared<ControllerPause>(),second_late=std::make_shared<ControllerPause>();pauses.push_back(first_late);pauses.push_back(second_late);
+    std::string stale;
+    after_control=[&](size_t,const json& control,std::string& outgoing){
+        if(control.at("operation")=="inspect")stale=outgoing;
+        if(!stale.empty()&&control.at("operation")=="prepare")arm->store(true);};
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
+        // Actual correlated prepare has been consumed and outstanding is null.
+        // The next owned phase inspection must encounter this real engine read.
+        if(std::strcmp(stage,"pending-consumed-before-successor")==0&&arm->load())held->hold(owner->db());
+        if(std::strcmp(stage,"admission-deferred")==0&&held->armed.load()&&held->deferrals.fetch_add(1)==0)
+            first_deferral_ms->store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        if(std::strcmp(stage,"response-consumed")==0&&held->armed.load())++held->consumed;
+        if(std::strcmp(stage,"late-lifecycle-discarded")==0){const auto n=late_count->fetch_add(1)+1;
+            if(n==1)first_late->wait();if(n==2)second_late->wait();}});
+    connect();ASSERT_TRUE(until([&]{return held->deferrals.load()>=12;}));ASSERT_FALSE(has_error());ASSERT_FALSE(stale.empty());
+    ASSERT_GT(first_deferral_ms->load(),0);ASSERT_EQ(held->consumed.load(),0u);
+    const auto before=snapshot();const auto old=framing();const auto handled_before=handled,requests_before=requests.size();
+    const auto source_receipts=source->db().query("SELECT * FROM _lattice_canonical_receipt");
+    const auto endpoint=peers[0].physical;const auto source_view=peers[0].setup.descriptor();
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(stale)));ASSERT_TRUE(until([&]{return first_late->ready();}));
+    const auto spent=held->deferrals.load();EXPECT_GE(spent,12u);EXPECT_LE(spent,32u);EXPECT_FALSE(has_error());
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(stale)));first_late->release();
+    ASSERT_TRUE(until([&]{return second_late->ready();}));EXPECT_EQ(held->deferrals.load(),spent);
+    // Twelve real >=100ms-spaced deferrals have already spent >1s of the
+    // episode, leaving <4.1s here (within the unchanged five-second pause).
+    // Keep the real read held until the ORIGINAL five-second window expires.
+    const auto after_original_deadline=std::chrono::steady_clock::time_point(std::chrono::milliseconds(first_deferral_ms->load()+5100));
+    const auto pause_remaining=std::chrono::duration_cast<std::chrono::milliseconds>(after_original_deadline-std::chrono::steady_clock::now()).count();
+    ASSERT_LT(pause_remaining,4500);if(pause_remaining>0)std::this_thread::sleep_until(after_original_deadline);
+    // With the second front still retained, only one other slot is available.
+    // The third reply forces this two-frame worker quantum to return before
+    // admission checks. Its next turn must retain the original expired episode.
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(stale)));second_late->release();
+    ASSERT_TRUE(until([&]{return has_error()||held->deferrals.load()!=spent;},2000));
+    ASSERT_TRUE(has_error());EXPECT_EQ(held->deferrals.load(),spent);EXPECT_LE(held->deferrals.load(),32u);EXPECT_EQ(late_count->load(),3u);
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()-first_deferral_ms->load();
+    EXPECT_GE(elapsed,5100);EXPECT_LE(elapsed,7500);
+    {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());EXPECT_NE(errors.front().find("admission retry budget exhausted"),std::string::npos);}
+    EXPECT_EQ(phase(),2);EXPECT_EQ(snapshot(),before);EXPECT_EQ(framing(),old);EXPECT_EQ(held->consumed.load(),0u);
+    EXPECT_EQ(handled,handled_before);EXPECT_EQ(requests.size(),requests_before);EXPECT_EQ(source->db().query("SELECT * FROM _lattice_canonical_receipt"),source_receipts);
+    EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),source_view);
+    held->finish();EXPECT_FALSE(until([&]{return handled!=handled_before||held->deferrals.load()!=spent||held->consumed.load()!=0;},350));
+    EXPECT_TRUE(has_error());EXPECT_EQ(snapshot(),before);EXPECT_EQ(phase(),2);
+}
+}
+#endif

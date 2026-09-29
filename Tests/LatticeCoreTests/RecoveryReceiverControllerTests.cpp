@@ -1422,7 +1422,7 @@ TEST_F(RecoveryComposedDelivery, StaleParkedRestrictedFrameKeepsCohortUntilActua
             }
         }
     });
-    connect();ASSERT_TRUE(drive([&]{return phase()==0;}));
+    connect();ASSERT_TRUE(drive([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
     auto configured=std::make_shared<std::atomic<bool>>(false);
     manual->invoke([this,configured]{detail::recovery_receiver_cohort_test_access::next_ack_timeout(*synchronizers[0]);configured->store(true);});
     ASSERT_TRUE(drive([&]{return configured->load();}));seed_local(1,830);ids=originals();ASSERT_EQ(ids.size(),1u);

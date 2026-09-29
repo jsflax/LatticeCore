@@ -846,10 +846,10 @@ protected:
         owner->db().execute("PRAGMA main.synchronous=FULL");
         ASSERT_EQ(std::get<int64_t>(owner->db().query("PRAGMA main.synchronous").at(0).at("synchronous")),2);
     }
-    static json migration_cell_summary(const column_value_t* value) {
+    static json migration_cell_summary(const column_value_t* value,size_t limit=96) {
         if(!value)return {{"missing",true}};
         json result={{"type",value->index()}};
-        if(const auto* text=std::get_if<std::string>(value)){result["bytes"]=text->size();result["prefix"]=text->substr(0,96);}
+        if(const auto* text=std::get_if<std::string>(value)){result["bytes"]=text->size();result["prefix"]=text->substr(0,limit);result["truncated"]=text->size()>limit;}
         else if(const auto* bytes=std::get_if<std::vector<uint8_t>>(value)){result["bytes"]=bytes->size();std::string hex;const char* digits="0123456789abcdef";
             for(size_t n=0;n<std::min<size_t>(16,bytes->size());++n){hex+=digits[(*bytes)[n]>>4];hex+=digits[(*bytes)[n]&15];}result["prefixHex"]=std::move(hex);}
         else if(const auto* number=std::get_if<int64_t>(value))result["value"]=*number;
@@ -857,11 +857,24 @@ protected:
         else result["value"]=nullptr;
         return result;
     }
-    // Evaluated only by a failed original whole-state assertion. This is an
-    // explicitly labeled fresh diagnostic sample, never the comparison oracle.
-    std::string migration_state_difference(const Snapshot& expected) {
+    // Failure-only explanation of the two exact already-compared snapshots.
+    // No resampling SQL and no change to the complete equality oracle.
+    static std::string migration_state_difference(const Snapshot& expected,const Snapshot& actual,const char* phase) {
         try {
-            const auto actual=all_state();json report={{"diagnosticResampleEqual",actual==expected},{"tables",json::array()}};
+            json report={{"phase",phase},{"exactComparedSnapshots",true},{"equal",actual==expected},{"tables",json::array()}};
+            const auto schema_expected=expected.find("sqlite_schema"),schema_actual=actual.find("sqlite_schema");
+            report["sqliteSchemaEqual"]=schema_expected!=expected.end()&&schema_actual!=actual.end()&&schema_expected->second==schema_actual->second;
+            const auto fingerprint_rows=[](const Snapshot& snapshot){
+                json rows=json::array();size_t total=0;const auto table=snapshot.find("_lattice_meta");
+                if(table!=snapshot.end())for(const auto& row:table->second){
+                    const auto key=row.find("key");if(key==row.end())continue;const auto* text=std::get_if<std::string>(&key->second);
+                    if(!text||text->rfind("schema_fingerprint:",0)!=0)continue;++total;
+                    if(rows.size()<8){const auto value=row.find("value");rows.push_back({{"key",migration_cell_summary(&key->second,128)},
+                        {"value",migration_cell_summary(value==row.end()?nullptr:&value->second)}});}
+                }
+                return json{{"total",total},{"rows",std::move(rows)},{"truncated",total>8}};
+            };
+            report["expectedFingerprints"]=fingerprint_rows(expected);report["actualFingerprints"]=fingerprint_rows(actual);
             std::set<std::string> tables;for(const auto& [table,_]:expected)tables.insert(table);for(const auto& [table,_]:actual)tables.insert(table);
             size_t changed=0;
             for(const auto& table:tables){const auto e=expected.find(table),a=actual.find(table);
@@ -869,26 +882,37 @@ protected:
                 ++changed;if(report["tables"].size()>=8)continue;
                 const auto en=e==expected.end()?0:e->second.size(),an=a==actual.end()?0:a->second.size();
                 json difference={{"table",table},{"expectedPresent",e!=expected.end()},{"actualPresent",a!=actual.end()},
-                    {"expectedRows",en},{"actualRows",an},{"cells",json::array()}};
+                    {"expectedRows",en},{"actualRows",an},{"rows",json::array()}};
+                size_t different_rows=0;const size_t row_limit=table=="_lattice_meta"?8:1;
                 for(size_t row=0;row<std::max(en,an);++row){const auto* er=row<en?&e->second[row]:nullptr;const auto* ar=row<an?&a->second[row]:nullptr;
-                    if(er&&ar&&*er==*ar)continue;difference["firstDifferentRow"]=row;
+                    if(er&&ar&&*er==*ar)continue;++different_rows;if(difference["rows"].size()>=row_limit)continue;
+                    json detail={{"orderedRow",row},{"expectedPresent",er!=nullptr},{"actualPresent",ar!=nullptr},{"cells",json::array()}};
+                    if(table=="_lattice_meta"){
+                        const auto* ek=er&&er->count("key")?&er->at("key"):nullptr;const auto* ak=ar&&ar->count("key")?&ar->at("key"):nullptr;
+                        detail["expectedKey"]=migration_cell_summary(ek,128);detail["actualKey"]=migration_cell_summary(ak,128);
+                        detail["sameKey"]=ek&&ak&&*ek==*ak;
+                    }
                     std::set<std::string> columns;if(er)for(const auto& [column,_]:*er)columns.insert(column);if(ar)for(const auto& [column,_]:*ar)columns.insert(column);
+                    size_t different_cells=0;
                     for(const auto& column:columns){const auto* ev=er&&er->count(column)?&er->at(column):nullptr;const auto* av=ar&&ar->count(column)?&ar->at(column):nullptr;
-                        if(ev&&av&&*ev==*av)continue;
-                        if(difference["cells"].size()>=4){difference["moreDifferentCells"]=true;break;}
-                        difference["cells"].push_back({{"column",column},{"expected",migration_cell_summary(ev)},{"actual",migration_cell_summary(av)}});
-                    }break;
-                }report["tables"].push_back(std::move(difference));
+                        if(ev&&av&&*ev==*av)continue;++different_cells;
+                        if(detail["cells"].size()<4)detail["cells"].push_back({{"column",column},{"expected",migration_cell_summary(ev)},{"actual",migration_cell_summary(av)}});
+                    }
+                    detail["differentCells"]=different_cells;detail["cellsTruncated"]=different_cells>4;difference["rows"].push_back(std::move(detail));
+                }
+                difference["differentOrderedRows"]=different_rows;difference["rowsTruncated"]=different_rows>row_limit;report["tables"].push_back(std::move(difference));
             }
-            report["differentTables"]=changed;return report.dump();
-        }catch(const std::exception& error){return json{{"diagnosticError",std::string(error.what()).substr(0,256)}}.dump();}
+            report["differentTables"]=changed;report["tablesTruncated"]=changed>8;
+            // Truncating diagnostic UTF-8 byte prefixes must not mask the original assertion.
+            return report.dump(-1,' ',false,json::error_handler_t::replace);
+        }catch(...){return "{}";}
     }
-    void require_pending_without_sql(const Snapshot& expected) {
+    void require_pending_without_sql(const Snapshot& expected,const char* phase) {
         const auto statements=database::thread_statement_count();
         const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
         EXPECT_EQ(database::thread_statement_count(),statements);
         EXPECT_EQ(result,2)<<last_bridge_error();EXPECT_TRUE(last_bridge_error().empty());
-        EXPECT_EQ(all_state(),expected)<<migration_state_difference(expected);
+        const auto actual=all_state();EXPECT_EQ(actual,expected)<<migration_state_difference(expected,actual,phase);
     }
 };
 
@@ -925,13 +949,14 @@ TEST_F(AuthenticatedReceiptMigrationClosure, ReplacementOwnerMigrationWaitsForEv
     setup.close_on_io();setup={};owner->close();owner.reset();ref.reset();
     ASSERT_TRUE(prior_owner.expired());EXPECT_FALSE(held.publishable());EXPECT_FALSE(copied.publishable());EXPECT_FALSE(stopped.live());
     recreate_owner();const auto replacement=owner->db().physical_identity("main",{},true);ASSERT_TRUE(replacement);
-    EXPECT_EQ(replacement->device,physical->device);EXPECT_EQ(replacement->inode,physical->inode);EXPECT_EQ(all_state(),before)<<migration_state_difference(before);
-    require_pending_without_sql(before);
-    held={};EXPECT_FALSE(stopped.drained());require_pending_without_sql(before);
+    EXPECT_EQ(replacement->device,physical->device);EXPECT_EQ(replacement->inode,physical->inode);
+    const auto reopened=all_state();EXPECT_EQ(reopened,before)<<migration_state_difference(before,reopened,"replacement-open");
+    require_pending_without_sql(before,"all-describe-results-held");
+    held={};EXPECT_FALSE(stopped.drained());require_pending_without_sql(before,"one-describe-copy-held");
     copied={};EXPECT_TRUE(stopped.drained());
     // A drained, stopped fence still retains this source's capacity domain.
     // Releasing the final actual fence is required before changing its recipe.
-    require_pending_without_sql(before);stopped={};
+    require_pending_without_sql(before,"stopped-fence-held");stopped={};
     ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
     expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);
     EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());

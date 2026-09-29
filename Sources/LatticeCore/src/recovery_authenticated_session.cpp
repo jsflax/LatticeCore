@@ -448,9 +448,32 @@ authenticated_relay_setup::open_administrative_file(const std::string& path,reco
     s.writer=std::make_shared<database>(s.expected->filename,database::open_mode::read_write,busy_timeout_ms,
         std::shared_ptr<database_read_control>{},database::initialization_key(s.expected));
     s.verify_writer();
-    const auto version=s.writer->query("PRAGMA main.user_version");
-    if(version.size()!=1||version[0].size()!=1||!std::holds_alternative<int64_t>(version[0].begin()->second)||
-       std::get<int64_t>(version[0].begin()->second)!=schema_version)
+    const auto& writer=s.writer;
+    // Lattice's declared version is the existing metadata row. SQLite's
+    // user_version is an independent application header, never that authority.
+    // Refuse absent/malformed metadata instead of the ordinary owner's fallback
+    // or ensure path. Bound every returned spelling before allocating it.
+    const auto meta=writer->query("SELECT type,CASE WHEN length(CAST(tbl_name AS BLOB))<=64 THEN tbl_name END AS name,rootpage "
+        "FROM main.sqlite_schema WHERE name='_lattice_meta' COLLATE BINARY LIMIT 2");
+    if(meta.size()!=1||!std::holds_alternative<std::string>(meta[0].at("type"))||std::get<std::string>(meta[0].at("type"))!="table"||
+       !std::holds_alternative<std::string>(meta[0].at("name"))||std::get<std::string>(meta[0].at("name"))!="_lattice_meta"||
+       !std::holds_alternative<int64_t>(meta[0].at("rootpage"))||std::get<int64_t>(meta[0].at("rootpage"))<=0)
+        reject("receipt administration existing metadata table required; no repair");
+    const auto columns=writer->query("SELECT cid,CASE WHEN length(CAST(name AS BLOB))<=64 THEN name END AS name,"
+        "CASE WHEN length(CAST(type AS BLOB))<=16 THEN type END AS type,[notnull] AS required,"
+        "dflt_value IS NULL AS no_default,pk,hidden FROM pragma_table_xinfo('_lattice_meta','main') ORDER BY cid LIMIT 3");
+    if(columns.size()!=2)reject("receipt administration metadata shape differs; no repair");
+    for(size_t i=0;i<2;++i) {
+        const auto& c=columns[i];const auto integer=[&](const char* key,int64_t value){const auto& v=c.at(key);return std::holds_alternative<int64_t>(v)&&std::get<int64_t>(v)==value;};
+        const auto spelling=[&](const char* key,const char* value){const auto& v=c.at(key);return std::holds_alternative<std::string>(v)&&std::get<std::string>(v)==value;};
+        if(!integer("cid",i)||!spelling("name",i==0?"key":"value")||!spelling("type","TEXT")||
+           !integer("required",i==0?0:1)||!integer("no_default",1)||!integer("pk",i==0?1:0)||!integer("hidden",0))
+            reject("receipt administration metadata shape differs; no repair");
+    }
+    const auto version=writer->query("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=10 THEN value END AS version "
+        "FROM main._lattice_meta WHERE key='schema_version' COLLATE BINARY LIMIT 2");
+    if(version.size()!=1||!std::holds_alternative<std::string>(version[0].at("version"))||
+       std::get<std::string>(version[0].at("version"))!=std::to_string(schema_version))
         reject("receipt administration declared schema version differs; no migration");
     configuration config(s.expected->filename);config.busy_timeout_ms=busy_timeout_ms;config.target_schema_version=static_cast<int32_t>(schema_version);
     s.owner=std::shared_ptr<lattice_db>(new lattice_db(config,std::move(catalog),s.writer));

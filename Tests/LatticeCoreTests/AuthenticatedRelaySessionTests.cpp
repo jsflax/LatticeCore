@@ -1579,7 +1579,7 @@ TEST_F(AuthenticatedReceiptCoverageV3, ExplicitAdoptionKeepsActualTwoNamespaceCa
         f->version=3;q.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};q.receipt_namespace=ns;
         q.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};
     }
-    seal(qa,da);seal(qb,db);(void)lease(setup,qa,da);(void)lease(other,qb,db);
+    seal(qa,da);seal(qb,db);(void)lease(setup,qa,da,"prepare",1000);(void)lease(other,qb,db,"prepare",1000);
     ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);
     const auto preserved=[&]{auto value=all_state();value.erase("sqlite_schema");
         for(auto& row:value.at("_lattice_canonical_ready_profile")){row.erase("policy");row.erase("predecessor");}return value;};
@@ -1598,7 +1598,7 @@ TEST_F(AuthenticatedReceiptCoverageV3, ExplicitAdoptionKeepsActualTwoNamespaceCa
     auto target=covered_policy();target["readyProfile"]="bounded48MiBOrphanV1";target["orphanResumeGraceMilliseconds"]=10000;
     setup=open(target,connection(),std::make_shared<RelayRouteState>());ASSERT_TRUE(setup.valid())<<last_bridge_error();
     ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));const auto current=description(setup);
-    qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume");
+    qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume",1000);
     EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),exact_frames);
     size_t positives=0;for(uint64_t i=0;i<std::stoull(resumed.at("frames").get<std::string>());++i) {
         const auto actual=read(setup,resumed,i);ASSERT_EQ(actual.status_code(),1);ASSERT_TRUE(actual.publishable())<<read_diagnostic(actual);

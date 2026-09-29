@@ -2229,7 +2229,9 @@ TEST_F(AuthenticatedCompletedDisposal, ObserverErrorKeepsKnownCommittedDisposalA
 TEST_F(AuthenticatedCompletedDisposal, LostResultStaysRouteFencedAndReopenedSameBindingCanRetryWithoutCapsule) {
     start_disposal();auto d=description(setup);auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
     auto first=invoke(setup,command("discard",q,d));ASSERT_EQ(completed_disposal_answer(first).at("settlement").at("state"),"committed");
-    route->current=false;EXPECT_FALSE(first.publishable());first={};setup.close_on_io();setup={};route=std::make_shared<RelayRouteState>();
+    const auto stop=setup.stop_token();ASSERT_TRUE(stop.live());
+    route->current=false;stop.stop();EXPECT_FALSE(first.publishable());EXPECT_FALSE(stop.drained());
+    first={};EXPECT_TRUE(stop.drained());setup.close_on_io();setup={};route=std::make_shared<RelayRouteState>();
     start_disposal();d=description(setup);q.route_generation=std::stoull(d.at("routeGeneration").get<std::string>());
     ASSERT_EQ(count("_lattice_canonical_ready_transfer"),0);ASSERT_EQ(count("_lattice_canonical_ready_binding"),1);const auto reopened=state();
     EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),reopened);

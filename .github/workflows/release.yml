@@ -6,6 +6,14 @@ on:
     tags: ['[0-9]+.[0-9]+.[0-9]+', '[0-9]+.[0-9]+.[0-9]+-*']
   workflow_dispatch:
     inputs:
+      profile:
+        description: 'Release profile (maintenance remains disabled)'
+        required: true
+        type: choice
+        default: main
+        options:
+          - main
+          - maintenance-1.4
       version:
         description: 'Explicit SemVer version without a v prefix'
         required: true
@@ -28,6 +36,7 @@ env:
   GH_TOKEN: ${{ github.token }}
   RELEASE_VERSION_INPUT: ${{ inputs.version }}
   EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+  RELEASE_PROFILE: ${{ inputs.profile || 'main' }}
 
 jobs:
   preflight:
@@ -68,7 +77,7 @@ jobs:
         id: candidate
         run: |
           VERSION="${RELEASE_VERSION_INPUT:-${GITHUB_REF_NAME#}}"
-          python3 release-train/release_train.py check --version "$VERSION" --expected-sha "$EXPECTED_SHA"
+          python3 release-train/core_release.py check --profile "$RELEASE_PROFILE" --version "$VERSION" --expected-sha "$EXPECTED_SHA"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   test-macos:
@@ -117,8 +126,8 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          python3 release-train/release_train.py candidate --version "$VERSION" --expected-sha "$EXPECTED_SHA" --output "$CORE_JOB_ROOT/tmp/candidate.json"
-          python3 release-train/release_train.py workflow-receipt --candidate "$CORE_JOB_ROOT/tmp/candidate.json" --output "$CORE_JOB_ROOT/tmp/release-receipt.json"
+          python3 release-train/core_release.py candidate --profile "$RELEASE_PROFILE" --version "$VERSION" --expected-sha "$EXPECTED_SHA" --output "$CORE_JOB_ROOT/tmp/candidate.json"
+          python3 release-train/core_release.py workflow-receipt --profile "$RELEASE_PROFILE" --candidate "$CORE_JOB_ROOT/tmp/candidate.json" --output "$CORE_JOB_ROOT/tmp/release-receipt.json"
           python3 - "$VERSION" "$CORE_JOB_ROOT/tmp/release-notes.md" <<'PYNOTES'
           import pathlib, re, sys
           text = pathlib.Path('CHANGELOG.md').read_text()

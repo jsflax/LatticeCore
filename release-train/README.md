@@ -2,6 +2,13 @@
 
 Each repository keeps its own SemVer 2.0.0 sequence. Orbital and Engram use `v` tags; Lattice and LatticeCore use bare version tags. `policy.json` records this repository's gates and dependencies. The Python protocol and tests are identical vendored copies in all four repositories; change them together and keep their SHA-256 hashes equal. No dependency pins or product versions are changed by installing this automation.
 
+Core's `core_release.py` is a repository-specific wrapper: its omitted or explicit
+`main` profile delegates to that unchanged protocol. The separate, disabled
+`maintenance-1.4.json` profile is described in [MAINTENANCE.md](MAINTENANCE.md).
+It implements source review only and cannot dispatch, build or publish a
+maintenance release. The normal release workflow uses the wrapper and defaults
+to `main`, retaining its existing source, run identity and publication behavior.
+
 ## What progresses automatically
 
 The release owner selects an explicit version and exact, adopted `main` commit. The protocol checks that commit, clean source, version monotonicity, changelog, lockfile consistency, published dependency tag revisions and required prior CI. It dispatches the **existing release workflow** directly, which runs the product's tests and packaging. Only the publication job creates the GitHub release/tag after those gates pass. Repeated dispatch calls reconcile the same version and source commit instead of starting another build. Promoting a prerelease to stable uses its own version identity.

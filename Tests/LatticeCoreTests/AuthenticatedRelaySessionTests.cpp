@@ -1612,3 +1612,220 @@ TEST_F(AuthenticatedReceiptCoverageV3, ExplicitAdoptionKeepsActualTwoNamespaceCa
 }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+class AuthenticatedLifecycleFileAdministration:public AuthenticatedReceiptFileAdministration {
+protected:
+    static json lifecycle(json prior,int64_t grace=10000) {
+        prior["readyProfile"]=prior.value("readyProfile",std::string("boundedV1"))=="boundedV1"?"boundedV1OrphanV1":"bounded48MiBOrphanV1";
+        prior["orphanResumeGraceMilliseconds"]=grace;return prior;
+    }
+    relay_lifecycle_adoption_result adopt_file(const json& prior,int64_t grace=10000,int64_t version=1,const SchemaVector& schema={relay_schema()}) {
+        return swift_lattice_ref::adopt_relay_lifecycle_file(file.str(),schema,version,100,prior.dump(),lifecycle(prior,grace).dump());
+    }
+    static Snapshot retained(Snapshot value) {
+        value.erase("sqlite_schema");
+        for(auto& row:value.at("_lattice_canonical_ready_profile")){row.erase("policy");row.erase("predecessor");}return value;
+    }
+    static void committed(const relay_lifecycle_adoption_result& value) {
+        ASSERT_FALSE(value.pending());ASSERT_EQ(value.phase(),2)<<value.primary_error()<<value.cleanup_error()<<value.postcommit_error();
+        ASSERT_FALSE(value.has_error());ASSERT_NE(value.disposition(),0);ASSERT_EQ(value.transition_id().size(),36u);ASSERT_EQ(value.record_digest().size(),64u);
+    }
+    detail::canonical_namespaced_writer_profile native_profile(const json& description) {
+        const auto& source=description.at("source");detail::canonical_namespaced_writer_profile native;
+        native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+        native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+        native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};return native;
+    }
+};
+struct LifecycleAdministrationFault {
+    enum Kind {deny_frames,ignore_policy,ignore_record,deny_alter,deny_commit};
+    static thread_local LifecycleAdministrationFault* current;
+    Kind kind;int hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* prior;LifecycleAdministrationFault* previous;
+    LifecycleAdministrationFault(database& db,Kind k):kind(k),fault{detail::canonical_writer_custody_test_access::fault_handle(db),restrict_action},
+        prior(detail::canonical_retention_test_hooks::fault),previous(current){current=this;detail::canonical_retention_test_hooks::fault=&fault;}
+    ~LifecycleAdministrationFault(){detail::canonical_retention_test_hooks::fault=prior;current=previous;}
+    static int restrict_action(int action,const char* one,const char* two,const char* origin)noexcept {
+        auto& f=*current;if(f.hits||origin)return SQLITE_OK;
+        const auto same=[](const char* a,const char* b){return a&&std::strcmp(a,b)==0;};
+        if(f.kind==deny_frames&&action==SQLITE_INSERT&&same(one,"_lattice_canonical_ready_frame")){++f.hits;return SQLITE_DENY;}
+        if(action==SQLITE_UPDATE&&same(one,"_lattice_canonical_ready_profile")&&
+           (f.kind==ignore_policy&&same(two,"policy")||f.kind==ignore_record&&same(two,"predecessor"))){++f.hits;return SQLITE_IGNORE;}
+        if(f.kind==deny_alter&&action==SQLITE_ALTER_TABLE){++f.hits;return SQLITE_DENY;}
+        if(f.kind==deny_commit&&action==SQLITE_TRANSACTION&&same(one,"COMMIT")){++f.hits;return SQLITE_DENY;}
+        return SQLITE_OK;
+    }
+};
+thread_local LifecycleAdministrationFault* LifecycleAdministrationFault::current=nullptr;
+struct LifecycleBeforeWrite {
+    std::function<void(lattice_db&)> callback;
+    const std::function<void(lattice_db&)>* prior;
+    explicit LifecycleBeforeWrite(std::function<void(lattice_db&)> body):callback(std::move(body)),prior(detail::authenticated_relay_catalog_test_access::before_write(&callback)){}
+    ~LifecycleBeforeWrite(){detail::authenticated_relay_catalog_test_access::before_write(prior);}
+};
+TEST_F(AuthenticatedLifecycleFileAdministration, ActualSmallSixteenCapsulesUseClosedFactoryAndResumeOriginalRequest) {
+    setup=admitted();const auto d=description(setup);auto first=request(d);(void)lease(setup,first,d);
+    std::vector<relay_recovery_setup> peers;
+    for(unsigned i=2;i<=16;++i){auto actual=admitted(i);const auto info=description(actual);(void)lease(actual,request(info),info);peers.push_back(std::move(actual));}
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),16);const auto before=retained(read_file(file.str()));
+    for(auto& peer:peers)peer.close_on_io();peers.clear();setup.close_on_io();setup={};
+    const auto first_result=adopt_file(source_policy());committed(first_result);EXPECT_EQ(first_result.disposition(),1);EXPECT_EQ(retained(read_file(file.str())),before);
+    const auto retry=adopt_file(source_policy());committed(retry);EXPECT_EQ(retry.disposition(),2);
+    EXPECT_EQ(retry.transition_id(),first_result.transition_id());EXPECT_EQ(retry.record_digest(),first_result.record_digest());EXPECT_EQ(retained(read_file(file.str())),before);
+    setup=open(lifecycle(source_policy()),connection());ASSERT_TRUE(setup.valid());auto answer=outcome(setup);answer["validForMilliseconds"]=600000;
+    ASSERT_TRUE(setup.finish_authorization(answer.dump()));const auto current=description(setup);
+    EXPECT_EQ(current.at("profile").at("transfers"),16);EXPECT_EQ(current.at("profile").at("durableBytes"),67108864);
+    EXPECT_EQ(current.at("profile").at("transferBytes"),2097152);
+    first.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,first,current,"resume");
+    const auto frame=read(setup,resumed,0);ASSERT_TRUE(frame.publishable());EXPECT_EQ(decode_read(frame,current).logical,first.logical);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),16);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, ActualFactoryKeepsLargePreparingOrdinaryReservationsAndNoNotificationPublication) {
+    setup=admitted(1,true);const auto d=description(setup);auto q=request(d);(void)lease(setup,q,d);setup.close_on_io();setup={};
+    const auto native=native_profile(d);const auto ready=detail::canonical_named_ready_profile(d.at("source").at("authority"),native.writer.limits,false,"bounded48MiBV1");
+    auto adapter=detail::canonical_writer_adapter::attach_ready_for_qualification(owner,native,{256,65536,1048576},{64,3600000},ready);
+    auto admission=adapter->admit_namespace_for_qualification(owner,"app","registered-replica-1");q.logical.channel="preparing-for-administration";seal(q,d);
+    {
+        LifecycleAdministrationFault fault(owner->db(),LifecycleAdministrationFault::deny_frames);
+        auto prepared=adapter->prepare_ready_owned(owner,admission,q.logical,std::get<ready_wire::request>(q.body),10000,q.route_generation);
+        EXPECT_EQ(fault.hits,1);ASSERT_EQ(prepared.preparation.state,detail::recovery_install_state::committed);
+        EXPECT_NE(prepared.publication.state,detail::recovery_install_state::committed);
+    }
+    const auto head=std::get<int64_t>(owner->db().query("SELECT head FROM _lattice_canonical_store").at(0).at("head"));
+    auto ordinary=adapter->reserve_recovery_owned(owner,head,10000);ASSERT_EQ(ordinary.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(ordinary.reservation);
+    ASSERT_EQ(count("_lattice_canonical_attempt"),2);ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);
+    const auto before=retained(read_file(file.str()));adapter.reset();int published=0,observed=0;
+    const auto hook=owner->add_invalidation_hook([&](const auto&,auto){++published;});
+    {
+        LifecycleBeforeWrite inspect([&](lattice_db& actual){++observed;EXPECT_NE(&actual,owner.get());
+            instance_registry::instance().for_each_alive(file.str(),[&](lattice_db* value){EXPECT_NE(value,&actual);});
+            actual.add_invalidation_hook([&](const auto&,auto){++published;});
+        });
+        const auto result=adopt_file(source_policy(true));committed(result);
+    }
+    owner->remove_invalidation_hook(hook);EXPECT_EQ(observed,1);EXPECT_EQ(published,0);EXPECT_EQ(retained(read_file(file.str())),before);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, RegisteredTwoNamespaceCapsulesAndOriginalReceiptSurviveActualFactory) {
+    setup=covered_setup();auto other=covered_setup("other",2);const auto e=identified(entry(83));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto a=description(setup),b=description(other);auto qa=request(a),qb=request(b);
+    for(auto* f:{&qa,&qb}){auto& request=std::get<ready_wire::request>(f->body);const std::string ns=f==&qa?"app":"other";
+        f->version=3;request.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};request.receipt_namespace=ns;
+        request.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};}
+    seal(qa,a);seal(qb,b);(void)lease(setup,qa,a);(void)lease(other,qb,b);
+    const auto before=retained(read_file(file.str()));other.close_on_io();other={};setup.close_on_io();setup={};
+    const auto result=adopt_file(covered_policy());committed(result);EXPECT_EQ(retained(read_file(file.str())),before);
+    setup=open(lifecycle(covered_policy()),connection());ASSERT_TRUE(setup.valid());ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));
+    const auto current=description(setup);qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume");
+    size_t positives=0;for(uint64_t i=0;i<std::stoull(resumed.at("frames").get<std::string>());++i){const auto actual=read(setup,resumed,i);ASSERT_TRUE(actual.publishable());
+        auto f=decode_read(actual,current);if(auto* page=std::get_if<ready_wire::receipt_page>(&f.body))for(const auto& item:page->items){EXPECT_TRUE(std::holds_alternative<ready_wire::committed>(item.value));EXPECT_EQ(item.operation_digest,e.original_identity->digest);++positives;}}
+    EXPECT_EQ(positives,1u);EXPECT_EQ(coverage().size(),2u);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, RegistryBlocksActualResultCopiesStopTokenAndConcurrentAdministrationBeforeOpen) {
+    setup=admitted();auto result=invoke(setup,control("describe"));auto copy=result;auto stop=setup.stop_token();
+    const auto pending=[&]{auto n=database::thread_statement_count();auto value=adopt_file(source_policy());EXPECT_TRUE(value.pending());EXPECT_EQ(value.disposition(),0);EXPECT_EQ(database::thread_statement_count(),n);};
+    pending();release_owner();pending();result={};pending();copy={};pending();stop={};
+    bool observed=false;
+    {
+        observation held([&]{observed=true;auto n=database::thread_statement_count();
+            auto other=adopt_file(source_policy());EXPECT_TRUE(other.pending());EXPECT_EQ(database::thread_statement_count(),n);
+        });
+        committed(adopt_file(source_policy()));
+    }
+    EXPECT_TRUE(observed);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, ActualClosedWriterRestrictionFaultsRollbackAndKeepExactTransitionTruth) {
+    setup=admitted();const auto d=description(setup);(void)lease(setup,request(d),d);setup.close_on_io();setup={};const auto before=read_file(file.str());
+    for(auto kind:{LifecycleAdministrationFault::ignore_policy,LifecycleAdministrationFault::ignore_record,LifecycleAdministrationFault::deny_alter,LifecycleAdministrationFault::deny_commit}) {
+        std::unique_ptr<LifecycleAdministrationFault> fault;
+        {LifecycleBeforeWrite arm([&](lattice_db& actual){fault=std::make_unique<LifecycleAdministrationFault>(actual.db(),kind);});
+            auto result=adopt_file(source_policy());ASSERT_TRUE(fault);EXPECT_EQ(fault->hits,1);EXPECT_FALSE(result.pending());EXPECT_EQ(result.phase(),1);
+            EXPECT_TRUE(result.has_error());EXPECT_FALSE(result.primary_error().empty());EXPECT_EQ(result.disposition(),0);EXPECT_TRUE(result.take_record().empty());}
+        fault.reset();EXPECT_EQ(read_file(file.str()),before);
+    }
+    committed(adopt_file(source_policy()));
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, WrongCatalogVersionNonWalAndMissingReplacementKeepIntendedFileUnrepaired) {
+    setup=admitted();setup.close_on_io();setup={};const auto prior=source_policy();const auto original=read_file(file.str());
+    auto wrong=relay_schema();property_descriptor extra{};extra.name="must_not_exist";extra.type=column_type::text;wrong.properties.emplace(extra.name,extra);
+    EXPECT_EQ(adopt_file(prior,10000,2).phase(),0);EXPECT_NE(adopt_file(prior,10000,1,{wrong}).phase(),2);EXPECT_EQ(read_file(file.str()),original);
+    release_owner();const auto saved=file.str()+".adoption-saved";
+    {observation missing([&]{std::filesystem::rename(file.str(),saved);});auto result=adopt_file(prior);EXPECT_FALSE(result.pending());EXPECT_EQ(result.phase(),0);EXPECT_FALSE(std::filesystem::exists(file.str()));}
+    std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),original);
+    TempDB replacement{"lifecycle-admin-replacement"};{database raw(replacement.str());raw.execute("CREATE TABLE KeepExact(value INTEGER)");raw.execute("INSERT INTO KeepExact VALUES(23)");raw.execute("PRAGMA user_version=1");}
+    const auto alternate=read_file(replacement.str());
+    {observation changed([&]{std::filesystem::rename(file.str(),saved);std::filesystem::copy_file(replacement.str(),file.str());});auto result=adopt_file(prior);EXPECT_EQ(result.phase(),0);EXPECT_EQ(result.disposition(),0);}
+    EXPECT_EQ(read_file(file.str()),alternate);std::filesystem::remove(file.str());std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),original);
+    {database raw(file.str());ASSERT_EQ(std::get<std::string>(raw.query("PRAGMA journal_mode=DELETE").at(0).at("journal_mode")),"delete");}
+    const auto before=read_file(file.str());auto nonwal=adopt_file(prior);EXPECT_EQ(nonwal.phase(),0);EXPECT_FALSE(nonwal.pending());EXPECT_EQ(read_file(file.str()),before);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, ReceiptConversionMustPrecedeAdoptionAndExactOldHandleRetryDoesNotChangeGrace) {
+    open();authorize();const auto e=entry(88);ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});setup.close_on_io();setup={};
+    ASSERT_EQ(migrate_file(),1);const auto migrated=read_file(file.str());const auto adopted=adopt_file(covered_policy());committed(adopted);
+    EXPECT_EQ(retained(read_file(file.str())),retained(migrated));
+    const auto exact=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),exact);
+    const auto changed=adopt_file(covered_policy(),10001);EXPECT_FALSE(changed.pending());EXPECT_NE(changed.phase(),2);EXPECT_EQ(changed.disposition(),0);EXPECT_EQ(read_file(file.str()),exact);
+    const auto retry=adopt_file(covered_policy());committed(retry);EXPECT_EQ(retry.disposition(),2);EXPECT_EQ(retry.transition_id(),adopted.transition_id());EXPECT_EQ(read_file(file.str()),exact);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, EmptyUnadmittedFileAndPreOpenThrowNeverPublishAClosedOwner) {
+    release_owner();const auto before=read_file(file.str());const auto refused=adopt_file(source_policy());EXPECT_FALSE(refused.pending());EXPECT_NE(refused.phase(),2);EXPECT_EQ(refused.disposition(),0);EXPECT_EQ(read_file(file.str()),before);
+    size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db*){++published;});EXPECT_EQ(published,0u);
+    {observation fail([]{throw std::runtime_error("passive adoption observation");});const auto result=adopt_file(source_policy());EXPECT_EQ(result.phase(),0);EXPECT_FALSE(result.pending());}
+    EXPECT_EQ(read_file(file.str()),before);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedLifecycleFileAdministration, ReservedAdministrationRefusesActualSourceOpenUntilItsOwnerRetires) {
+    setup=admitted();setup.close_on_io();setup={};const auto before=retained(read_file(file.str()));bool attempted=false;
+    {
+        observation held([&]{attempted=true;const auto statements=database::thread_statement_count();
+            auto competing=open(source_policy(),connection(29),std::make_shared<RelayRouteState>());
+            EXPECT_FALSE(competing.valid());EXPECT_EQ(database::thread_statement_count(),statements);
+        });
+        committed(adopt_file(source_policy()));
+    }
+    EXPECT_TRUE(attempted);EXPECT_EQ(retained(read_file(file.str())),before);
+    setup=open(lifecycle(source_policy()),connection(29),std::make_shared<RelayRouteState>());ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    auto answer=outcome(setup);answer["validForMilliseconds"]=600000;EXPECT_TRUE(setup.finish_authorization(answer.dump()));
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, UnregisteredDirectoryCustodianIsRefusalNotFabricatedRegistryPending) {
+    setup=admitted();const auto d=description(setup);setup.close_on_io();setup={};
+    const auto native=native_profile(d);const auto ready=detail::canonical_named_ready_profile(d.at("source").at("authority"),native.writer.limits,false,"boundedV1");
+    auto actual=detail::canonical_writer_adapter::attach_ready_for_qualification(owner,native,{256,65536,1048576},{64,3600000},ready);
+    const auto before=read_file(file.str());const auto result=adopt_file(source_policy());EXPECT_FALSE(result.pending());
+    EXPECT_NE(result.phase(),2);EXPECT_EQ(result.disposition(),0);EXPECT_TRUE(result.has_error());EXPECT_EQ(read_file(file.str()),before);
+    actual.reset();committed(adopt_file(source_policy()));
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, FreshLifecycleEnrollmentCannotInventAnOldProfilePredecessor) {
+    setup=open(lifecycle(source_policy()),connection());ASSERT_TRUE(setup.valid());auto answer=outcome(setup);answer["validForMilliseconds"]=600000;
+    ASSERT_TRUE(setup.finish_authorization(answer.dump()));setup.close_on_io();setup={};const auto before=read_file(file.str());
+    const auto result=adopt_file(source_policy());EXPECT_FALSE(result.pending());EXPECT_NE(result.phase(),2);EXPECT_EQ(result.disposition(),0);EXPECT_EQ(read_file(file.str()),before);
+}
+class AuthenticatedLifecycleDirectoryAdministration:public AuthenticatedLifecycleFileAdministration {
+protected:
+    std::filesystem::path parent;
+    void SetUp()override {
+        parent=file.path.string()+".owned-parent";std::filesystem::create_directory(parent);file.path=parent/"source.sqlite";
+        AuthenticatedLifecycleFileAdministration::SetUp();
+    }
+};
+TEST_F(AuthenticatedLifecycleDirectoryAdministration, ReplacedIntendedParentNeverCreatesOrUsesANewMainFile) {
+    setup=admitted();release_owner();const auto before=read_file(file.str());const auto saved=parent.string()+".held";
+    {
+        observation moved([&]{std::filesystem::rename(parent,saved);std::filesystem::create_directory(parent);});
+        const auto result=adopt_file(source_policy());EXPECT_FALSE(result.pending());EXPECT_EQ(result.phase(),0);EXPECT_EQ(result.disposition(),0);
+        EXPECT_FALSE(std::filesystem::exists(file.str()));
+    }
+    ASSERT_TRUE(std::filesystem::is_empty(parent));std::filesystem::remove(parent);std::filesystem::rename(saved,parent);
+    EXPECT_EQ(read_file(file.str()),before);committed(adopt_file(source_policy()));
+    // Existing custody directories stay bound to their original inode; no
+    // test or administration unlink/rebind is used to make the retry succeed.
+}
+}
+#endif

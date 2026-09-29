@@ -2,6 +2,8 @@
 #ifdef __cplusplus
 #include <bridging.hpp>
 #include <cstdint>
+#include <array>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
@@ -10,6 +12,7 @@ class authenticated_relay_setup;
 class authenticated_session_fence;
 class authenticated_relay_operation;
 class authenticated_ready_charge;
+struct authenticated_lifecycle_adoption_result;
 }
 namespace lattice {
 class swift_lattice_ref;
@@ -61,6 +64,34 @@ public:
     std::string take_request_id()noexcept SWIFT_NAME(takeRequestID());
     const std::string& request_id()const noexcept SWIFT_NAME(requestID());
     bool publishable()const noexcept;
+};
+// Copied administrative facts only; no owner, callback or receiver authority.
+class relay_lifecycle_adoption_result {
+    friend class swift_lattice_ref;
+    int32_t phase_=0,disposition_=0;
+    uint8_t errors_=0;
+    bool pending_=false,unexpected_=false;
+    std::array<char,769> primary_{},cleanup_{},postcommit_{},notification_{};
+    std::string record_;
+    std::array<char,37> transition_id_{};
+    std::array<char,65> record_digest_{};
+    void assign(detail::authenticated_lifecycle_adoption_result&&)noexcept;
+    void failure(std::exception_ptr)noexcept;
+public:
+    relay_lifecycle_adoption_result()=default;
+    bool pending()const noexcept{return pending_;}
+    int32_t phase()const noexcept{return phase_;}
+    // 0 no verified transition, 1 applied, 2 verified existing in this turn.
+    int32_t disposition()const noexcept{return disposition_;}
+    bool unexpected_commit()const noexcept SWIFT_NAME(unexpectedCommit()){return unexpected_;}
+    bool has_error()const noexcept SWIFT_NAME(hasError()){return errors_!=0;}
+    std::string primary_error()const noexcept SWIFT_NAME(primaryError());
+    std::string cleanup_error()const noexcept SWIFT_NAME(cleanupError());
+    std::string postcommit_error()const noexcept SWIFT_NAME(postcommitError());
+    std::string notification_error()const noexcept SWIFT_NAME(notificationError());
+    std::string take_record()noexcept SWIFT_NAME(takeRecord());
+    std::string transition_id()const noexcept SWIFT_NAME(transitionID());
+    std::string record_digest()const noexcept SWIFT_NAME(recordDigest());
 };
 // An unauthorized actual setup, not a transferable admission. Only the real
 // ref creates it; a retained live-route callback is mandatory. The SDK keeps

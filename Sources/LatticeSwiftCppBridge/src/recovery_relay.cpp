@@ -1,4 +1,6 @@
 #include <lattice.hpp>
+#include <cstring>
+#include "../../LatticeCore/src/vendor/picosha2/picosha2.h"
 #include "../../LatticeCore/src/recovery_authenticated_session.hpp"
 namespace lattice {
 namespace {
@@ -24,6 +26,59 @@ int32_t swift_lattice_ref::migrate_relay_receipt_coverage_file(const std::string
         return detail::authenticated_relay_setup::migrate_receipt_coverage_file(path,swift_lattice::recovery_catalog(declared,schemas),
             schema_version,busy_timeout_ms,prior,next)?1:2;
     }catch(...){relay_failure();return 4;}
+}
+namespace {
+void adoption_diagnostic(std::array<char,769>& out,std::exception_ptr error)noexcept {
+    out.fill(0);if(!error)return;
+    const char* text="Unknown lifecycle administration error";
+    try{std::rethrow_exception(error);}catch(const std::exception& e){
+        text=e.what();size_t n=0;while(n<768&&text[n])++n;std::memcpy(out.data(),text,n);return;
+    }catch(...){}
+    std::memcpy(out.data(),text,std::strlen(text));
+}
+}
+void relay_lifecycle_adoption_result::assign(detail::authenticated_lifecycle_adoption_result&& value)noexcept {
+    // Save known transaction truth before diagnostics or record conversion.
+    const auto& settlement=value.adoption.settlement;
+    phase_=static_cast<int32_t>(settlement.state);unexpected_=settlement.unexpected_commit_observed;
+    pending_=value.pending_quiescence;
+    errors_=(settlement.primary_error?1:0)|(settlement.cleanup_error?2:0)|(settlement.postcommit_error?4:0)|(settlement.notification_error?8:0);
+    adoption_diagnostic(primary_,settlement.primary_error);adoption_diagnostic(cleanup_,settlement.cleanup_error);
+    adoption_diagnostic(postcommit_,settlement.postcommit_error);adoption_diagnostic(notification_,settlement.notification_error);
+    if(phase_==2&&value.adoption.record&&value.adoption.disposition)try {
+        const auto& record=*value.adoption.record;
+        constexpr std::string_view prefix="canonical-ready-adoption-v1;36:";
+        if(record.size()>16384||record.size()<prefix.size()+36||!record.starts_with(prefix))
+            throw db_error("audited lifecycle record shape unavailable");
+        const auto digest=picosha2::hash256_hex_string(record);
+        std::memcpy(transition_id_.data(),record.data()+prefix.size(),36);
+        std::memcpy(record_digest_.data(),digest.data(),64);
+        record_=std::move(*value.adoption.record);
+        disposition_=*value.adoption.disposition==detail::canonical_ready_adoption_disposition::applied?1:2;
+    }catch(...){failure(std::current_exception());}
+}
+void relay_lifecycle_adoption_result::failure(std::exception_ptr error)noexcept {
+    const uint8_t bit=phase_==2?4:1;
+    if(!(errors_&bit))adoption_diagnostic(phase_==2?postcommit_:primary_,error);
+    if(error)errors_|=bit;record_.clear();disposition_=0;transition_id_.fill(0);record_digest_.fill(0);
+}
+std::string relay_lifecycle_adoption_result::primary_error()const noexcept{return sealed([&]{return std::string(primary_.data());});}
+std::string relay_lifecycle_adoption_result::cleanup_error()const noexcept{return sealed([&]{return std::string(cleanup_.data());});}
+std::string relay_lifecycle_adoption_result::postcommit_error()const noexcept{return sealed([&]{return std::string(postcommit_.data());});}
+std::string relay_lifecycle_adoption_result::notification_error()const noexcept{return sealed([&]{return std::string(notification_.data());});}
+std::string relay_lifecycle_adoption_result::transition_id()const noexcept{return sealed([&]{return std::string(transition_id_.data());});}
+std::string relay_lifecycle_adoption_result::record_digest()const noexcept{return sealed([&]{return std::string(record_digest_.data());});}
+std::string relay_lifecycle_adoption_result::take_record()noexcept{std::string out;out.swap(record_);return out;}
+relay_lifecycle_adoption_result swift_lattice_ref::adopt_relay_lifecycle_file(const std::string& path,const SchemaVector& schemas,
+    int64_t schema_version,int32_t busy_timeout_ms,const std::string& prior,const std::string& next)noexcept {
+    relay_lifecycle_adoption_result out;
+    try {
+        if(schema_version<1||schema_version>INT32_MAX)throw db_error("lifecycle administration declared schema version outside bounds");
+        swift_configuration declared;declared.target_schema_version=static_cast<int>(schema_version);
+        out.assign(detail::authenticated_relay_setup::adopt_lifecycle_file(path,swift_lattice::recovery_catalog(declared,schemas),
+            schema_version,busy_timeout_ms,prior,next));
+    }catch(...){out.failure(std::current_exception());}
+    return out;
 }
 int32_t swift_lattice_ref::migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept {
     last_bridge_error().clear();

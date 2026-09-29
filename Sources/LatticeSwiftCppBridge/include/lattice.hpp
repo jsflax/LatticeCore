@@ -3832,6 +3832,9 @@ public:
     static int32_t migrate_relay_receipt_coverage_file(const std::string& path,const SchemaVector& schemas,
         int64_t schema_version,int32_t busy_timeout_ms,const std::string& prior,const std::string& next)noexcept
         SWIFT_NAME(migrateRelayReceiptCoverageFile(path:schemas:schemaVersion:busyTimeoutMilliseconds:prior:next:));
+    static relay_lifecycle_adoption_result adopt_relay_lifecycle_file(const std::string& path,const SchemaVector& schemas,
+        int64_t schema_version,int32_t busy_timeout_ms,const std::string& prior,const std::string& next)noexcept
+        SWIFT_NAME(adoptRelayLifecycleFile(path:schemas:schemaVersion:busyTimeoutMilliseconds:prior:next:));
     int32_t migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept
         SWIFT_NAME(migrateRelayReceiptCoverage(prior:next:));
 

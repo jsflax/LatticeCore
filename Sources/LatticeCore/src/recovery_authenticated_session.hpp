@@ -73,12 +73,19 @@ struct authenticated_ready_result {
     std::shared_ptr<authenticated_relay_operation> operation;
     std::string request_id;
 };
+struct authenticated_lifecycle_adoption_result {
+    bool pending_quiescence=false;
+    canonical_ready_adoption_result adoption;
+};
 struct authenticated_mounted_source;
 class authenticated_relay_setup {
     friend class ::lattice::swift_lattice_ref;
     friend struct authenticated_ready_test_access;
     static thread_local const std::function<void()>* ready_before_owned_test_hook_;
     static thread_local const std::function<void()>* admin_before_open_test_hook_;
+    struct source_file_administration;
+    static std::unique_ptr<source_file_administration> open_administrative_file(const std::string&,
+        recovery_owner_schema,int64_t,int);
     struct state;
     std::shared_ptr<state> state_;
     explicit authenticated_relay_setup(std::shared_ptr<state>);
@@ -92,6 +99,8 @@ class authenticated_relay_setup {
     // imply durable absence and ordinary open never invokes this transition.
     static bool migrate_receipt_coverage_file(const std::string& path, recovery_owner_schema catalog,
         int64_t schema_version,int busy_timeout_ms,const std::string& prior,const std::string& next);
+    static authenticated_lifecycle_adoption_result adopt_lifecycle_file(const std::string&,recovery_owner_schema,
+        int64_t,int,const std::string& prior,const std::string& next);
     static bool migrate_receipt_coverage(std::shared_ptr<lattice_db>,
         const std::string& prior_mount_policy,const std::string& next_mount_policy);
 public:

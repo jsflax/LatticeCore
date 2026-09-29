@@ -380,12 +380,89 @@ authenticated_relay_setup::~authenticated_relay_setup(){close();}
 std::shared_ptr<authenticated_session_fence> authenticated_relay_setup::stop_token()const noexcept{return state_?state_->fence:nullptr;}
 void authenticated_relay_setup::close()noexcept{if(state_)state_->fence->stop();}
 thread_local const std::function<void()>* authenticated_relay_setup::admin_before_open_test_hook_=nullptr;
-bool authenticated_relay_setup::migrate_receipt_coverage_file(const std::string& path,recovery_owner_schema catalog,
-    int64_t schema_version,int busy_timeout_ms,const std::string& before_bytes,const std::string& after_bytes) {
+// Only these two closed source operations can hold this unpublished owner.
+// Destruction releases the SQLite owner before opening the physical registry
+// slot, and closes directory descriptors last. No main-file descriptor exists.
+struct authenticated_relay_setup::source_file_administration {
+#if defined(__APPLE__) || defined(__linux__)
+    int parent_fd=-1;
+    std::filesystem::path requested;
+    std::string name;
+    struct stat parent_stat{},main_stat{};
+    std::shared_ptr<const physical_store_identity> expected;
+    physical_key key{};
+    bool reserved=false;
+    std::shared_ptr<database> writer;
+    std::shared_ptr<lattice_db> owner;
+    ~source_file_administration() {
+        owner.reset();writer.reset();
+        if(reserved){std::lock_guard lock(registry_mutex);auto i=registry.find(key);if(i!=registry.end())i->second.building=false;}
+        if(parent_fd>=0)::close(parent_fd);
+    }
+    void verify()const {
+        struct stat current_parent{},current_main{};
+        if(::stat(requested.parent_path().c_str(),&current_parent)!=0||!S_ISDIR(current_parent.st_mode)||
+           current_parent.st_dev!=parent_stat.st_dev||current_parent.st_ino!=parent_stat.st_ino||
+           ::fstatat(parent_fd,name.c_str(),&current_main,AT_SYMLINK_NOFOLLOW)!=0||!S_ISREG(current_main.st_mode)||current_main.st_nlink!=1||
+           current_main.st_dev!=main_stat.st_dev||current_main.st_ino!=main_stat.st_ino)
+            reject("receipt administration intended file/parent changed");
+    }
+    void verify_writer()const {
+        verify();const auto actual=writer->physical_identity("main",{},true);
+        if(!actual||*actual!=*expected||actual->filename!=expected->filename)
+            reject("receipt administration actual SQLite identity changed");
+    }
+#endif
+};
+std::unique_ptr<authenticated_relay_setup::source_file_administration>
+authenticated_relay_setup::open_administrative_file(const std::string& path,recovery_owner_schema catalog,
+    int64_t schema_version,int busy_timeout_ms) {
 #if defined(__APPLE__) || defined(__linux__)
     if(path.empty()||path.size()>4096||path.find('\0')!=std::string::npos||path.starts_with("file:")||
        !std::filesystem::path(path).is_absolute()||schema_version<1||schema_version>INT32_MAX||
        busy_timeout_ms<0||busy_timeout_ms>30000||!catalog.valid())reject("receipt administration bounded intended-file contract required");
+    auto session=std::make_unique<source_file_administration>();auto& s=*session;
+    s.requested=std::filesystem::path(path);s.name=s.requested.filename().string();
+    if(s.name.empty()||s.name=="."||s.name=="..")reject("receipt administration regular file required");
+    std::error_code error;const auto parent=std::filesystem::canonical(s.requested.parent_path(),error);
+    if(error)reject("receipt administration existing parent unavailable");
+    s.parent_fd=::open(parent.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(s.parent_fd<0||::fstat(s.parent_fd,&s.parent_stat)!=0||!S_ISDIR(s.parent_stat.st_mode)||
+       ::fstatat(s.parent_fd,s.name.c_str(),&s.main_stat,AT_SYMLINK_NOFOLLOW)!=0||!S_ISREG(s.main_stat.st_mode)||s.main_stat.st_nlink!=1)
+        reject("receipt administration existing regular main/parent required");
+    auto expected=std::make_shared<physical_store_identity>();expected->device=s.main_stat.st_dev;expected->inode=s.main_stat.st_ino;
+    expected->filename=(parent/s.name).string();s.expected=std::move(expected);
+    s.verify();s.key={s.expected->device,s.expected->inode};
+    {
+        std::lock_guard lock(registry_mutex);
+        for(auto i=registry.begin();i!=registry.end();) {
+            if(!i->second.building&&i->second.value.expired()&&i->second.budget.expired())i=registry.erase(i);else ++i;
+        }
+        auto i=registry.find(s.key);
+        if(i!=registry.end()&&(i->second.building||!i->second.value.expired()||!i->second.budget.expired()))return {};
+        if(i==registry.end()&&registry.size()>=128)return {};
+        registry[s.key].building=true;s.reserved=true;
+    }
+    const auto observation=admin_before_open_test_hook_?*admin_before_open_test_hook_:std::function<void()>{};
+    if(observation)observation();
+    s.writer=std::make_shared<database>(s.expected->filename,database::open_mode::read_write,busy_timeout_ms,
+        std::shared_ptr<database_read_control>{},database::initialization_key(s.expected));
+    s.verify_writer();
+    const auto version=s.writer->query("PRAGMA main.user_version");
+    if(version.size()!=1||version[0].size()!=1||!std::holds_alternative<int64_t>(version[0].begin()->second)||
+       std::get<int64_t>(version[0].begin()->second)!=schema_version)
+        reject("receipt administration declared schema version differs; no migration");
+    configuration config(s.expected->filename);config.busy_timeout_ms=busy_timeout_ms;config.target_schema_version=static_cast<int32_t>(schema_version);
+    s.owner=std::shared_ptr<lattice_db>(new lattice_db(config,std::move(catalog),s.writer));
+    s.verify();return session;
+#else
+    (void)path;(void)catalog;(void)schema_version;(void)busy_timeout_ms;
+    reject("receipt administration platform unqualified");
+#endif
+}
+bool authenticated_relay_setup::migrate_receipt_coverage_file(const std::string& path,recovery_owner_schema catalog,
+    int64_t schema_version,int busy_timeout_ms,const std::string& before_bytes,const std::string& after_bytes) {
+#if defined(__APPLE__) || defined(__linux__)
     // Parse the exact declared catalog/policies before opening any file.
     const auto before_json=bounded(before_bytes,policy_bytes),after_json=bounded(after_bytes,policy_bytes);
     const auto before=recipe(catalog,before_json),after=recipe(catalog,after_json);
@@ -394,61 +471,44 @@ bool authenticated_relay_setup::migrate_receipt_coverage_file(const std::string&
     auto common=after_json;common.erase("receiptCoverage");common["version"]=1;
     if(before_json.contains("readyProfile"))common["readyProfile"]=before_json.at("readyProfile");else common.erase("readyProfile");
     if(common!=before_json)reject("receipt migration cannot change source, namespace catalog, models or permissions");
-    const auto requested=std::filesystem::path(path);const auto name=requested.filename().string();
-    if(name.empty()||name=="."||name=="..")reject("receipt administration regular file required");
-    std::error_code error;const auto parent=std::filesystem::canonical(requested.parent_path(),error);
-    if(error)reject("receipt administration existing parent unavailable");
-    struct directory {int fd=-1;~directory(){if(fd>=0)::close(fd);}} held;
-    held.fd=::open(parent.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
-    struct stat parent_stat{},main_stat{};
-    if(held.fd<0||::fstat(held.fd,&parent_stat)!=0||!S_ISDIR(parent_stat.st_mode)||
-       ::fstatat(held.fd,name.c_str(),&main_stat,AT_SYMLINK_NOFOLLOW)!=0||!S_ISREG(main_stat.st_mode)||main_stat.st_nlink!=1)
-        reject("receipt administration existing regular main/parent required");
-    auto expected=std::make_shared<physical_store_identity>();expected->device=main_stat.st_dev;expected->inode=main_stat.st_ino;
-    expected->filename=(parent/name).string();
-    const auto verify=[&] {
-        struct stat current_parent{},current_main{};
-        if(::stat(requested.parent_path().c_str(),&current_parent)!=0||!S_ISDIR(current_parent.st_mode)||
-           current_parent.st_dev!=parent_stat.st_dev||current_parent.st_ino!=parent_stat.st_ino||
-           ::fstatat(held.fd,name.c_str(),&current_main,AT_SYMLINK_NOFOLLOW)!=0||!S_ISREG(current_main.st_mode)||current_main.st_nlink!=1||
-           current_main.st_dev!=main_stat.st_dev||current_main.st_ino!=main_stat.st_ino)
-            reject("receipt administration intended file/parent changed");
-    };
-    verify();const physical_key key{expected->device,expected->inode};
-    {
-        std::lock_guard lock(registry_mutex);
-        for(auto i=registry.begin();i!=registry.end();) {
-            if(!i->second.building&&i->second.value.expired()&&i->second.budget.expired())i=registry.erase(i);else ++i;
-        }
-        auto i=registry.find(key);
-        if(i!=registry.end()&&(i->second.building||!i->second.value.expired()||!i->second.budget.expired()))return false;
-        if(i==registry.end()&&registry.size()>=128)return false;
-        registry[key].building=true;
-    }
-    struct reservation {physical_key key;~reservation(){std::lock_guard lock(registry_mutex);auto i=registry.find(key);if(i!=registry.end())i->second.building=false;}} reserved{key};
-    // The passive test observation owns no admission and executes off all locks.
-    const auto observation=admin_before_open_test_hook_?*admin_before_open_test_hook_:std::function<void()>{};
-    if(observation)observation();
-    auto writer=std::make_shared<database>(expected->filename,database::open_mode::read_write,busy_timeout_ms,
-        std::shared_ptr<database_read_control>{},database::initialization_key(expected));
-    verify();const auto actual=writer->physical_identity("main",{},true);
-    if(!actual||*actual!=*expected||actual->filename!=expected->filename)reject("receipt administration actual SQLite identity changed");
-    const auto version=writer->query("PRAGMA main.user_version");
-    if(version.size()!=1||version[0].size()!=1||!std::holds_alternative<int64_t>(version[0].begin()->second)||
-       std::get<int64_t>(version[0].begin()->second)!=schema_version)
-        reject("receipt administration declared schema version differs; no migration");
-    configuration config(expected->filename);config.busy_timeout_ms=busy_timeout_ms;config.target_schema_version=static_cast<int32_t>(schema_version);
-    auto owner=std::shared_ptr<lattice_db>(new lattice_db(config,std::move(catalog),writer));
-    verify();
-    canonical_writer_adapter::migrate_authenticated_source(owner,after.profile,
+    auto session=open_administrative_file(path,std::move(catalog),schema_version,busy_timeout_ms);
+    if(!session)return false;
+    canonical_writer_adapter::migrate_authenticated_source(session->owner,after.profile,
         {frame_entries,65536,frame_bytes},{64,3600000},before.ready,after.ready);
-    verify();const auto settled=writer->physical_identity("main",{},true);
-    if(!settled||*settled!=*expected||settled->filename!=expected->filename)
-        reject("receipt administration file changed after settlement");
-    return true;
+    session->verify_writer();return true;
 #else
     (void)path;(void)catalog;(void)schema_version;(void)busy_timeout_ms;(void)before_bytes;(void)after_bytes;
     reject("receipt administration platform unqualified");
+#endif
+}
+authenticated_lifecycle_adoption_result authenticated_relay_setup::adopt_lifecycle_file(const std::string& path,
+    recovery_owner_schema catalog,int64_t schema_version,int busy_timeout_ms,
+    const std::string& before_bytes,const std::string& after_bytes) {
+    authenticated_lifecycle_adoption_result out;
+#if defined(__APPLE__) || defined(__linux__)
+    const auto before_json=bounded(before_bytes,policy_bytes),after_json=bounded(after_bytes,policy_bytes);
+    const auto before=recipe(catalog,before_json),after=recipe(catalog,after_json);
+    const auto expected=before.ready_name=="boundedV1"?"boundedV1OrphanV1":"bounded48MiBOrphanV1";
+    if((before.ready_name!="boundedV1"&&before.ready_name!="bounded48MiBV1")||
+       after.ready_name!=expected||!after.ready.orphan_resume_grace_ms)
+        reject("lifecycle adoption requires an exact old named profile and explicit finite grace");
+    auto common=after_json;common.erase("orphanResumeGraceMilliseconds");
+    if(before_json.contains("readyProfile"))common["readyProfile"]=before_json.at("readyProfile");else common.erase("readyProfile");
+    if(common!=before_json)reject("lifecycle adoption cannot change source, receipt identity, permissions or capacity");
+    auto session=open_administrative_file(path,std::move(catalog),schema_version,busy_timeout_ms);
+    if(!session){out.pending_quiescence=true;return out;}
+    out.adoption=canonical_writer_adapter::adopt_authenticated_lifecycle(session->owner,before.profile,
+        {frame_entries,65536,frame_bytes},{64,3600000},before.ready,before.ready_name,*after.ready.orphan_resume_grace_ms);
+    try {session->verify_writer();}
+    catch(...) {
+        auto& error=out.adoption.settlement.state==recovery_install_state::committed?
+            out.adoption.settlement.postcommit_error:out.adoption.settlement.primary_error;
+        if(!error)error=std::current_exception();out.adoption.record.reset();out.adoption.disposition.reset();
+    }
+    return out;
+#else
+    (void)path;(void)catalog;(void)schema_version;(void)busy_timeout_ms;(void)before_bytes;(void)after_bytes;
+    reject("lifecycle administration platform unqualified");
 #endif
 }
 bool authenticated_relay_setup::migrate_receipt_coverage(std::shared_ptr<lattice_db> owner,

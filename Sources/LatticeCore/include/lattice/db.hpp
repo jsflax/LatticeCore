@@ -60,6 +60,7 @@ struct recovery_witness_access;
 struct recovery_refresh_access;
 struct receive_delivery_guard_access;
 class canonical_writer_adapter;
+class authenticated_relay_setup;
 struct canonical_writer_custody_test_access;
 class recovery_local_producer_adapter;
 class recovery_continuous_producer;
@@ -109,6 +110,7 @@ class database {
     friend struct detail::recovery_refresh_access;
     friend struct detail::receive_delivery_guard_access;
     friend class detail::canonical_writer_adapter;
+    friend class detail::authenticated_relay_setup;
     friend struct detail::canonical_writer_custody_test_access;
     friend class detail::recovery_local_producer_adapter;
     friend class detail::recovery_continuous_producer;
@@ -129,6 +131,7 @@ class database {
     // mutate the schema it just refused. This policy follows the physical
     // handle through moves, even before producer callback custody exists.
     bool suppress_destructor_optimize_ = false;
+    bool administrative_connection_ = false; // Private one-shot open: no optional close maintenance.
     // Writable constructors classify eagerly. Read-only internal/keeper paths
     // defer until a guarded raw/legacy export boundary. Unknown never means
     // absence; this denial-only state cannot grant producer/source authority.
@@ -167,12 +170,17 @@ class database {
     };
     engine_query_scope* engine_reads_ = nullptr;
     friend class detail::managed_route_scope;
-    // Only database can construct this key. The keyed overload remains
-    // accessible to make_shared so keepers retain its single allocation.
+    // Only the database and named closed engine factories construct this key.
+    // The keyed overload stays accessible to make_shared for one allocation.
     class initialization_key {
         friend class database;
         friend class detail::recovery_continuous_producer;
+        friend class detail::authenticated_relay_setup;
         const bool keeper_cache_;
+        const bool administrative_ = false;
+        std::shared_ptr<const physical_store_identity> administrative_identity_;
+        explicit initialization_key(std::shared_ptr<const physical_store_identity> value)
+            : keeper_cache_(false), administrative_(true), administrative_identity_(std::move(value)) {}
         std::shared_ptr<detail::recovery_continuous_admission> continuous_;
         explicit initialization_key(std::shared_ptr<detail::recovery_continuous_admission> value) : keeper_cache_(false), continuous_(std::move(value)) {}
         explicit initialization_key(bool keeper_cache) : keeper_cache_(keeper_cache) {}

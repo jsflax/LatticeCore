@@ -545,6 +545,38 @@ void lattice_db::reopen_read_db() {
     request_recovery_refresh();
 }
 
+// Closed source administration changes only private policy/receipt metadata.
+// It needs exact owned settlement, but never ordinary row buffering or delivery.
+void lattice_db::setup_administrative_transaction_hooks() {
+    auto& connection=*db_;
+    connection.lattice_update_hook_context_=std::make_unique<database::lattice_update_hook_context>();
+    auto* context=connection.lattice_update_hook_context_.get();
+    context->owner=this;context->connection=connection.internal_handle();
+    sqlite3_commit_hook(connection.internal_handle(),[](void* p)->int {
+        auto* context=static_cast<database::lattice_update_hook_context*>(p);
+        if(auto* settlement=context->sync_chunk) {
+            settlement->commit_attempted=true;
+            if(settlement->policy==database::sync_apply_chunk_state::commit_policy::owner_body) {
+                settlement->premature_commit=true;return 1;
+            }
+        }
+        return 0;
+    },context);
+    sqlite3_wal_hook(connection.internal_handle(),[](void* p,sqlite3* handle,const char* schema,int)->int {
+        auto* context=static_cast<database::lattice_update_hook_context*>(p);
+        if(context->connection==handle&&schema&&std::strcmp(schema,"main")==0)context->note_settled(true);
+        return SQLITE_OK;
+    },context);
+    connection.set_txn_hooks_owned_({},[this,context] {
+        auto* settlement=context->sync_chunk;
+        context->note_settled(false);
+        if(context->consume_recovery_reservation(settlement)) {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            change_buffer_.clear();recovery_change_buffer_reserved_=false;
+        }
+    });
+}
+
 void lattice_db::setup_change_hook(database& connection) {
     LOG_DEBUG("setup_change_hook", "Setting up hooks for path: %s", config_.path.c_str());
 

@@ -1,10 +1,13 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/recovery_authenticated_session.hpp"
+#include "../../Sources/LatticeCore/src/recovery_writer_access.hpp"
 #include "../../Sources/LatticeCore/src/sync_recovery_values.hpp"
 #include <algorithm>
 #include <set>
 #include <cstring>
+#include <cctype>
+#include <filesystem>
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include "../../Sources/LatticeCore/src/canonical_validated_sequence.hpp"
@@ -18,8 +21,13 @@
 namespace lattice::detail {
 struct authenticated_ready_test_access {
     static void before_owned(const std::function<void()>* hook) {authenticated_relay_setup::ready_before_owned_test_hook_=hook;}
+    static void before_admin_open(const std::function<void()>* hook) {authenticated_relay_setup::admin_before_open_test_hook_=hook;}
 };
 struct authenticated_relay_catalog_test_access {
+    static const std::function<void(lattice_db&)>* before_write(const std::function<void(lattice_db&)>* hook) {
+        const auto* prior=canonical_writer_adapter::namespace_before_write_test_hook_;
+        canonical_writer_adapter::namespace_before_write_test_hook_=hook;return prior;
+    }
     static const recovery_owner_schema& catalog(const lattice_db& owner) noexcept {
         return canonical_writer_adapter::authenticated_catalog(owner);
     }
@@ -1414,5 +1422,122 @@ TEST_F(AuthenticatedReceiptCoverageV3, LifecycleDiscardKeepsRegisteredOriginalsA
     EXPECT_EQ(global_state(),globals);EXPECT_EQ(coverage(),cells);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin ORDER BY original_id"),origins);
     EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
 }
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+class AuthenticatedReceiptFileAdministration:public AuthenticatedReceiptCoverageV3 {
+protected:
+    int migrate_file(int64_t version=1,const SchemaVector& schema={relay_schema()}) {
+        return swift_lattice_ref::migrate_relay_receipt_coverage_file(file.str(),schema,version,100,policy().dump(),covered_policy().dump());
+    }
+    void release_owner() {setup.close_on_io();setup={};if(owner)owner->close();owner.reset();ref.reset();}
+    static Snapshot read_file(const std::string& path) {
+        database reader(path,database::open_mode::read_only,100);Snapshot result;
+        const auto tables=reader.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+        if(tables.size()>128)throw std::runtime_error("administration fixture inventory bound");
+        for(const auto& row:tables){const auto& name=std::get<std::string>(row.at("name"));
+            if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](unsigned char c){return std::isalnum(c)||c=='_';}))
+                throw std::runtime_error("administration fixture table name bound");
+            result[name]=reader.query("SELECT * FROM \""+name+"\" ORDER BY 1");}
+        result["sqlite_schema"]=reader.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+        result["user_version"]=reader.query("PRAGMA user_version");result["journal_mode"]=reader.query("PRAGMA journal_mode");return result;
+    }
+    struct observation {
+        std::function<void()> callback;
+        explicit observation(std::function<void()> value):callback(std::move(value)){detail::authenticated_ready_test_access::before_admin_open(&callback);}
+        ~observation(){detail::authenticated_ready_test_access::before_admin_open(nullptr);}
+    };
+};
+TEST_F(AuthenticatedReceiptFileAdministration, OneShotUsesActualExistingFileAndPreservesGlobalReceipts) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    auto expected=global_state();const auto original_receipts=receipts();setup.close_on_io();setup={};
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);EXPECT_EQ(receipts(),original_receipts);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    setup=covered_setup();EXPECT_EQ(global_state(),expected);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, LiveAndRetainedResultCustodyRefusesBeforeAnyOpenSQL) {
+    open();authorize();const auto before=read_file(file.str());auto result=invoke(setup,control("describe"));ASSERT_EQ(result.status_code(),1);
+    auto copy=result;auto stop=setup.stop_token();const std::weak_ptr<lattice::swift_lattice> prior=owner;
+    const auto pending=[&]{const auto statements=database::thread_statement_count();EXPECT_EQ(migrate_file(),2)<<last_bridge_error();EXPECT_EQ(database::thread_statement_count(),statements);};
+    pending();release_owner();EXPECT_TRUE(prior.expired());pending();result={};pending();copy={};EXPECT_TRUE(stop.drained());pending();
+    EXPECT_EQ(read_file(file.str()),before);stop={};ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, MissingMainAfterCapturedIdentityIsNotRecreatedAndReservationRetires) {
+    open();authorize();release_owner();const auto before=read_file(file.str());const auto saved=file.str()+".admin-saved";
+    {observation race([&]{std::filesystem::rename(file.str(),saved);});EXPECT_EQ(migrate_file(),4);EXPECT_FALSE(std::filesystem::exists(file.str()));}
+    std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),before);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, ReplacementMainCannotBeAdoptedOrRepaired) {
+    open();authorize();release_owner();const auto before=read_file(file.str());const auto saved=file.str()+".admin-saved";
+    TempDB replacement{"receipt-admin-replacement"};
+    {database seed(replacement.str());seed.execute("CREATE TABLE KeepExact(value INTEGER)");seed.execute("INSERT INTO KeepExact VALUES(19)");seed.execute("PRAGMA user_version=1");}
+    const auto other=read_file(replacement.str());
+    {observation race([&]{std::filesystem::rename(file.str(),saved);std::filesystem::copy_file(replacement.str(),file.str());});EXPECT_EQ(migrate_file(),4);}
+    EXPECT_EQ(read_file(file.str()),other);std::filesystem::remove(file.str());std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),before);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, NonWalSourceRefusesWithoutJournalConversionOrCleanup) {
+    open();authorize();release_owner();
+    {database change(file.str());const auto mode=change.query("PRAGMA journal_mode=DELETE");ASSERT_EQ(std::get<std::string>(mode.at(0).at("journal_mode")),"delete");}
+    const auto before=read_file(file.str());ASSERT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    EXPECT_NE(last_bridge_error().find("existing WAL"),std::string::npos);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, DeclaredVersionAndCatalogMismatchNeverRunSchemaRepair) {
+    open();authorize();release_owner();const auto before=read_file(file.str());
+    EXPECT_EQ(migrate_file(2),4);EXPECT_EQ(read_file(file.str()),before);
+    auto changed=relay_schema();property_descriptor extra{};extra.name="must_not_be_created";extra.type=column_type::text;changed.properties.emplace(extra.name,extra);
+    EXPECT_EQ(migrate_file(1,{changed}),4);EXPECT_EQ(read_file(file.str()),before);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, PreOpenObservationThrowLeavesEveryTableAndReservationUnchanged) {
+    open();authorize();release_owner();const auto before=read_file(file.str());
+    {observation fail([]{throw std::runtime_error("passive administration observation");});EXPECT_EQ(migrate_file(),4);}
+    EXPECT_EQ(read_file(file.str()),before);ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, UnadmittedExistingSchemaIsNotHealedOrPublished) {
+    // Ordinary fixture construction has no canonical source enrollment yet.
+    release_owner();const auto before=read_file(file.str());
+    EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db*){++published;});EXPECT_EQ(published,0u);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesPrivateMetadataWithoutOrdinaryPublication) {
+    open();authorize();setup.close_on_io();setup={};const auto before=all_state();size_t observations=0;
+    const std::function<void(lattice_db&)> inspect=[&](lattice_db& actual) {
+        ++observations;EXPECT_NE(&actual,owner.get());
+        size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db* value){EXPECT_NE(value,&actual);++published;});
+        EXPECT_EQ(published,1u);
+        // The production factory strongly retains actual for this entire
+        // synchronous callback. This alias tests settlement, not lifetime.
+        auto borrowed=std::shared_ptr<lattice_db>(&actual,[](lattice_db*){});
+        using state=detail::recovery_install_state;
+        const auto committed=detail::recovery_writer_access::install(borrowed,[&](database& writer){
+            EXPECT_EQ(detail::recovery_writer_access::active_writer(actual),&writer);
+            writer.execute("UPDATE _lattice_canonical_store SET version=version");
+        });
+        EXPECT_EQ(committed.state,state::committed);EXPECT_FALSE(committed.primary_error);EXPECT_FALSE(committed.postcommit_error);
+        EXPECT_EQ(all_state(),before);
+        const auto rolled=detail::recovery_writer_access::install(borrowed,[](database& writer){
+            writer.execute("UPDATE _lattice_canonical_store SET version=version");throw std::runtime_error("owned administration rollback");
+        });
+        EXPECT_EQ(rolled.state,state::rolled_back);EXPECT_TRUE(rolled.primary_error);EXPECT_FALSE(rolled.cleanup_error);EXPECT_EQ(all_state(),before);
+        const auto premature=detail::recovery_writer_access::install(borrowed,[](database& writer){
+            writer.execute("UPDATE _lattice_canonical_store SET version=version");writer.commit();
+        });
+        EXPECT_EQ(premature.state,state::rolled_back);EXPECT_TRUE(premature.primary_error);EXPECT_FALSE(premature.cleanup_error);
+        EXPECT_FALSE(premature.unexpected_commit_observed);EXPECT_EQ(all_state(),before);
+    };
+    struct restore {const std::function<void(lattice_db&)>* prior;~restore(){detail::authenticated_relay_catalog_test_access::before_write(prior);}}
+        restored{detail::authenticated_relay_catalog_test_access::before_write(&inspect)};
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();EXPECT_EQ(observations,1u);
+    // The normal receipt migration adds its documented coverage tables; the
+    // hook's three transactions leave every pre-migration table unchanged.
+    EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));
+}
+
 }
 #endif

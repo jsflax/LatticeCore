@@ -656,6 +656,8 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
 }
 
 void recovery_writer_access::deliver(lattice_db& owner, const lattice_db::recovery_commit_batch& batch) {
+    // This unregistered one-shot owner has no model/event publication authority.
+    if(owner.administrative_owner_)return;
     auto alive = [&](auto&& fn) {
         if (owner.storage_shared_across_instances()) {
             instance_registry::instance().for_each_alive(owner.config_.path, [&](lattice_db* target) {

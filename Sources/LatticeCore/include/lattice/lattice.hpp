@@ -874,6 +874,14 @@ private:
 
 class lattice_db {
     struct recovery_commit_batch;
+    friend class detail::authenticated_relay_setup;
+    // Never published or cached. Only the one-shot source administrator can construct it.
+    lattice_db(const configuration& config, detail::recovery_owner_schema catalog, std::shared_ptr<database> writer)
+        : recovery_schemas_(std::move(catalog)), administrative_owner_(true), config_(config), db_(std::move(writer)) {
+        setup_administrative_transaction_hooks();
+        alive_count().fetch_add(1,std::memory_order_relaxed);
+    }
+    void setup_administrative_transaction_hooks();
 public:
     // Construct with path (uses default scheduler, no sync)
     explicit lattice_db(const std::string& path)
@@ -1583,6 +1591,12 @@ private:
     // Only the private owned recovery frame supplies a batch/writer. Ordinary
     // delivery retains its historical queries, callbacks and bounded drain.
     bool flush_changes_once_impl(database* recovery_writer, recovery_commit_batch* batch) {
+        if(administrative_owner_) {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if(!change_buffer_.empty()||is_flushing_)
+                throw db_error("closed source administration cannot publish model changes");
+            return false;
+        }
         LOG_DEBUG("flush_changes", "Called");
         std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> changes;
         {
@@ -6096,6 +6110,7 @@ protected:
     std::shared_ptr<detail::recovery_continuous_admission> recovery_continuous_;
     const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
     bool recovery_producer_bootstrapped_=false;
+    bool administrative_owner_=false;
     friend struct managed_attachment_test_access;
     struct managed_attachment_binding {
         std::string alias, filename;
@@ -8925,6 +8940,12 @@ inline lattice_close_result lattice_db::close_checked() noexcept {
     return result;
 }
 inline lattice_db::~lattice_db() {
+    if(administrative_owner_) {
+        closed_.store(true,std::memory_order_seq_cst);
+        guard_->alive.store(false,std::memory_order_seq_cst);
+        alive_count().fetch_sub(1,std::memory_order_relaxed);
+        return; // Only connection-local settlement hooks exist; no public facilities were published.
+    }
     // Keep the destructor's original retirement order. Every cleanup phase
     // still runs after a drain/transport/scheduler failure; destruction has no
     // reporting return and never turns pending work into an ACK claim.

@@ -9,6 +9,12 @@
 #include <set>
 #include <charconv>
 #include <condition_variable>
+#include <filesystem>
+#if defined(__APPLE__) || defined(__linux__)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace lattice::detail {
 namespace {
@@ -379,6 +385,78 @@ authenticated_relay_setup::authenticated_relay_setup(std::shared_ptr<state> s):s
 authenticated_relay_setup::~authenticated_relay_setup(){close();}
 std::shared_ptr<authenticated_session_fence> authenticated_relay_setup::stop_token()const noexcept{return state_?state_->fence:nullptr;}
 void authenticated_relay_setup::close()noexcept{if(state_)state_->fence->stop();}
+thread_local const std::function<void()>* authenticated_relay_setup::admin_before_open_test_hook_=nullptr;
+bool authenticated_relay_setup::migrate_receipt_coverage_file(const std::string& path,recovery_owner_schema catalog,
+    int64_t schema_version,int busy_timeout_ms,const std::string& before_bytes,const std::string& after_bytes) {
+#if defined(__APPLE__) || defined(__linux__)
+    if(path.empty()||path.size()>4096||path.find('\0')!=std::string::npos||path.starts_with("file:")||
+       !std::filesystem::path(path).is_absolute()||schema_version<1||schema_version>INT32_MAX||
+       busy_timeout_ms<0||busy_timeout_ms>30000||!catalog.valid())reject("receipt administration bounded intended-file contract required");
+    // Parse the exact declared catalog/policies before opening any file.
+    const auto before_json=bounded(before_bytes,policy_bytes),after_json=bounded(after_bytes,policy_bytes);
+    const auto before=recipe(catalog,before_json),after=recipe(catalog,after_json);
+    if(before.profile.namespaces.coverage||!after.profile.namespaces.coverage)
+        reject("receipt migration requires exact v2 to registered v3 transition");
+    auto common=after_json;common.erase("receiptCoverage");common["version"]=1;
+    if(before_json.contains("readyProfile"))common["readyProfile"]=before_json.at("readyProfile");else common.erase("readyProfile");
+    if(common!=before_json)reject("receipt migration cannot change source, namespace catalog, models or permissions");
+    const auto requested=std::filesystem::path(path);const auto name=requested.filename().string();
+    if(name.empty()||name=="."||name=="..")reject("receipt administration regular file required");
+    std::error_code error;const auto parent=std::filesystem::canonical(requested.parent_path(),error);
+    if(error)reject("receipt administration existing parent unavailable");
+    struct directory {int fd=-1;~directory(){if(fd>=0)::close(fd);}} held;
+    held.fd=::open(parent.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct stat parent_stat{},main_stat{};
+    if(held.fd<0||::fstat(held.fd,&parent_stat)!=0||!S_ISDIR(parent_stat.st_mode)||
+       ::fstatat(held.fd,name.c_str(),&main_stat,AT_SYMLINK_NOFOLLOW)!=0||!S_ISREG(main_stat.st_mode)||main_stat.st_nlink!=1)
+        reject("receipt administration existing regular main/parent required");
+    auto expected=std::make_shared<physical_store_identity>();expected->device=main_stat.st_dev;expected->inode=main_stat.st_ino;
+    expected->filename=(parent/name).string();
+    const auto verify=[&] {
+        struct stat current_parent{},current_main{};
+        if(::stat(requested.parent_path().c_str(),&current_parent)!=0||!S_ISDIR(current_parent.st_mode)||
+           current_parent.st_dev!=parent_stat.st_dev||current_parent.st_ino!=parent_stat.st_ino||
+           ::fstatat(held.fd,name.c_str(),&current_main,AT_SYMLINK_NOFOLLOW)!=0||!S_ISREG(current_main.st_mode)||current_main.st_nlink!=1||
+           current_main.st_dev!=main_stat.st_dev||current_main.st_ino!=main_stat.st_ino)
+            reject("receipt administration intended file/parent changed");
+    };
+    verify();const physical_key key{expected->device,expected->inode};
+    {
+        std::lock_guard lock(registry_mutex);
+        for(auto i=registry.begin();i!=registry.end();) {
+            if(!i->second.building&&i->second.value.expired()&&i->second.budget.expired())i=registry.erase(i);else ++i;
+        }
+        auto i=registry.find(key);
+        if(i!=registry.end()&&(i->second.building||!i->second.value.expired()||!i->second.budget.expired()))return false;
+        if(i==registry.end()&&registry.size()>=128)return false;
+        registry[key].building=true;
+    }
+    struct reservation {physical_key key;~reservation(){std::lock_guard lock(registry_mutex);auto i=registry.find(key);if(i!=registry.end())i->second.building=false;}} reserved{key};
+    // The passive test observation owns no admission and executes off all locks.
+    const auto observation=admin_before_open_test_hook_?*admin_before_open_test_hook_:std::function<void()>{};
+    if(observation)observation();
+    auto writer=std::make_shared<database>(expected->filename,database::open_mode::read_write,busy_timeout_ms,
+        std::shared_ptr<database_read_control>{},database::initialization_key(expected));
+    verify();const auto actual=writer->physical_identity("main",{},true);
+    if(!actual||*actual!=*expected||actual->filename!=expected->filename)reject("receipt administration actual SQLite identity changed");
+    const auto version=writer->query("PRAGMA main.user_version");
+    if(version.size()!=1||version[0].size()!=1||!std::holds_alternative<int64_t>(version[0].begin()->second)||
+       std::get<int64_t>(version[0].begin()->second)!=schema_version)
+        reject("receipt administration declared schema version differs; no migration");
+    configuration config(expected->filename);config.busy_timeout_ms=busy_timeout_ms;config.target_schema_version=static_cast<int32_t>(schema_version);
+    auto owner=std::shared_ptr<lattice_db>(new lattice_db(config,std::move(catalog),writer));
+    verify();
+    canonical_writer_adapter::migrate_authenticated_source(owner,after.profile,
+        {frame_entries,65536,frame_bytes},{64,3600000},before.ready,after.ready);
+    verify();const auto settled=writer->physical_identity("main",{},true);
+    if(!settled||*settled!=*expected||settled->filename!=expected->filename)
+        reject("receipt administration file changed after settlement");
+    return true;
+#else
+    (void)path;(void)catalog;(void)schema_version;(void)busy_timeout_ms;(void)before_bytes;(void)after_bytes;
+    reject("receipt administration platform unqualified");
+#endif
+}
 bool authenticated_relay_setup::migrate_receipt_coverage(std::shared_ptr<lattice_db> owner,
     const std::string& before_bytes,const std::string& after_bytes) {
     if(!owner)reject("receipt migration requires the resolved mount owner");

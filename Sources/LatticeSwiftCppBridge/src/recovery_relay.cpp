@@ -15,6 +15,16 @@ relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup(const std::str
     }catch(...){relay_failure();return {};}
 }
 bool relay_recovery_setup::valid()const noexcept{return bool(value_);}
+int32_t swift_lattice_ref::migrate_relay_receipt_coverage_file(const std::string& path,const SchemaVector& schemas,
+    int64_t schema_version,int32_t busy_timeout_ms,const std::string& prior,const std::string& next)noexcept {
+    last_bridge_error().clear();
+    try {
+        if(schema_version<1||schema_version>INT32_MAX)throw db_error("receipt administration declared schema version outside bounds");
+        swift_configuration declared;declared.target_schema_version=static_cast<int>(schema_version);
+        return detail::authenticated_relay_setup::migrate_receipt_coverage_file(path,swift_lattice::recovery_catalog(declared,schemas),
+            schema_version,busy_timeout_ms,prior,next)?1:2;
+    }catch(...){relay_failure();return 4;}
+}
 int32_t swift_lattice_ref::migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept {
     last_bridge_error().clear();
     try{return detail::authenticated_relay_setup::migrate_receipt_coverage(impl_,prior,next)?1:2;}

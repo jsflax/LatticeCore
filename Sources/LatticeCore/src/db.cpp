@@ -264,7 +264,8 @@ std::shared_ptr<database> database::make_read_keeper(const std::string& path,
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
                    std::shared_ptr<database_read_control> read_control, initialization_key key)
-    : path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
+    : administrative_connection_(key.administrative_), path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
+    suppress_destructor_optimize_=key.administrative_;
     if(mode==open_mode::read_write && !key.continuous_)detail::require_continuous_path_unowned(path);
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
@@ -286,8 +287,14 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         flags |= SQLITE_OPEN_URI;
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     } else {
-        flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-        flags |= SQLITE_OPEN_URI;  // see read-only branch note
+        flags |= SQLITE_OPEN_READWRITE;
+        if(key.administrative_) {
+#ifdef SQLITE_OPEN_NOFOLLOW
+            flags |= SQLITE_OPEN_NOFOLLOW;
+#else
+            throw db_error("receipt administration requires no-follow SQLite open");
+#endif
+        } else flags |= SQLITE_OPEN_CREATE | SQLITE_OPEN_URI; // ordinary open unchanged
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
     if (rc != SQLITE_OK) {
@@ -299,6 +306,19 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     }
 
     try {
+    if(key.administrative_) {
+#ifdef SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
+        if(sqlite3_db_config(db_,SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,1,nullptr)!=SQLITE_OK ||
+           sqlite3_wal_autocheckpoint(db_,0)!=SQLITE_OK)
+            throw db_error("receipt administration close/checkpoint policy unavailable");
+#else
+        throw db_error("receipt administration requires no-checkpoint-on-close support");
+#endif
+        const auto actual=physical_identity("main",{},true);
+        if(!key.administrative_identity_ || !actual || *actual!=*key.administrative_identity_ ||
+           actual->filename!=key.administrative_identity_->filename)
+            throw db_error("receipt administration file changed before SQLite admission");
+    }
     // Statement-level busy timeout MUST be installed before ANY statement runs.
     // It used to be set after the open-time pragmas, so the very first
     // `PRAGMA journal_mode = WAL` had no busy handler — a concurrent open or
@@ -338,6 +358,21 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     if(mode==open_mode::read_write)
         detail::recovery_continuous_producer::classify_open(*this,static_cast<bool>(key.continuous_),true);
 
+    if(key.administrative_) {
+        const auto mode=query("PRAGMA main.journal_mode");
+        if(mode.size()!=1 || mode[0].size()!=1 || !std::holds_alternative<std::string>(mode[0].begin()->second) ||
+           std::get<std::string>(mode[0].begin()->second)!="wal")
+            throw db_error("receipt administration requires existing WAL; no journal conversion");
+        // synchronous is connection-local, not evidence of a persisted setting.
+        // This private writer explicitly chooses FULL for its sole transaction.
+        execute("PRAGMA synchronous=FULL");
+        const auto durability=query("PRAGMA main.synchronous");
+        if(durability.size()!=1 || durability[0].size()!=1 || !std::holds_alternative<int64_t>(durability[0].begin()->second) ||
+           std::get<int64_t>(durability[0].begin()->second)!=2)
+            throw db_error("receipt administration FULL durability unavailable");
+        execute("PRAGMA foreign_keys=ON");
+        return; // No WAL assignment, cache tuning, schema materialization or maintenance.
+    }
     // Enable foreign keys
     execute("PRAGMA foreign_keys = ON");
 
@@ -418,15 +453,17 @@ database::~database() {
             // missing or stale. Never throw from a destructor.
             // An unresolved/failed producer bootstrap preserves its refused
             // schema. Hook detachment, passive checkpoint and close still run.
-            if (!suppress_destructor_optimize_) {
+            if (!suppress_destructor_optimize_ && !administrative_connection_) {
                 int orc = sqlite3_exec(db_, "PRAGMA optimize", nullptr, nullptr, nullptr);
                 if (orc != SQLITE_OK) {
                     LOG_DEBUG("db", "~database optimize skipped: rc=%d, path=%s", orc, path_.c_str());
                 }
             }
-            int nLog = 0, nCkpt = 0;
-            int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
-            LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
+            if(!administrative_connection_) {
+                int nLog = 0, nCkpt = 0;
+                int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
+                LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
+            }
         }
         int rc = sqlite3_close_v2(db_);
         if (rc != SQLITE_OK) {
@@ -583,6 +620,7 @@ database::database(database&& other) noexcept
     canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
     canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
     suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
+    administrative_connection_ = std::exchange(other.administrative_connection_, false);
     continuous_file_.store(other.continuous_file_.exchange(continuous_classification::unknown));
     txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
     local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
@@ -619,6 +657,7 @@ database& database::operator=(database&& other) noexcept {
         canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
         canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
         suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
+        administrative_connection_ = std::exchange(other.administrative_connection_, false);
         continuous_file_.store(other.continuous_file_.exchange(continuous_classification::unknown));
         txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
         local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);

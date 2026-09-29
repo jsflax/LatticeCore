@@ -78,6 +78,7 @@ class authenticated_relay_setup {
     friend class ::lattice::swift_lattice_ref;
     friend struct authenticated_ready_test_access;
     static thread_local const std::function<void()>* ready_before_owned_test_hook_;
+    static thread_local const std::function<void()>* admin_before_open_test_hook_;
     struct state;
     std::shared_ptr<state> state_;
     explicit authenticated_relay_setup(std::shared_ptr<state>);
@@ -89,6 +90,8 @@ class authenticated_relay_setup {
     // Explicit administration of the real resolved mount owner, never an
     // issuer. False is only pre-SQL quiescence contention; exceptions do not
     // imply durable absence and ordinary open never invokes this transition.
+    static bool migrate_receipt_coverage_file(const std::string& path, recovery_owner_schema catalog,
+        int64_t schema_version,int busy_timeout_ms,const std::string& prior,const std::string& next);
     static bool migrate_receipt_coverage(std::shared_ptr<lattice_db>,
         const std::string& prior_mount_policy,const std::string& next_mount_policy);
 public:

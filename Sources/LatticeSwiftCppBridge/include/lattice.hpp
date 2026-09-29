@@ -3828,6 +3828,10 @@ public:
     // Package administration of the actual resolved relay owner. 1 is known
     // migrated, 2 is no-effect quiescence contention, 4 is an error with no
     // assertion of rollback/absence. This never creates a session admission.
+    // One-shot administration: never returns or caches a privileged owner.
+    static int32_t migrate_relay_receipt_coverage_file(const std::string& path,const SchemaVector& schemas,
+        int64_t schema_version,int32_t busy_timeout_ms,const std::string& prior,const std::string& next)noexcept
+        SWIFT_NAME(migrateRelayReceiptCoverageFile(path:schemas:schemaVersion:busyTimeoutMilliseconds:prior:next:));
     int32_t migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept
         SWIFT_NAME(migrateRelayReceiptCoverage(prior:next:));
 

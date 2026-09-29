@@ -935,7 +935,11 @@ TEST_F(CanonicalDurableReady, LargerPrivateReceiptPageUsesBounded64IdBatchesInBo
     EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::receipt_batch)],4u);
     EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::retention_audit)],2u);
     EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::store_audit)],2u);
-    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::sequence_advance)],2*(offered.transfer->frames-1));
+    // Each full audit validates every frame once through the fused path,
+    // including its manifest. No retired standalone stage should be charged.
+    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::fused_frame_validation)],2*offered.transfer->frames);
+    for(const auto phase:{cp::frame_decode,cp::canonical_encode,cp::sequence_advance})
+        EXPECT_EQ(trace.cost.calls[static_cast<size_t>(phase)],0u);
     EXPECT_EQ(snapshot(),before);
 }
 

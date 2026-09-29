@@ -1803,7 +1803,12 @@ TEST_F(RecoveryAutomaticExportReadAdmission, ClaimedFrameExhaustsSameBoundWhileR
     EXPECT_EQ(snapshot(),committed);for(const auto& bytes:frames.bytes)EXPECT_EQ(bytes,frames.bytes.front());
     EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
     release(read);queue->drain();EXPECT_EQ(snapshot(),committed);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(errors.size(),1u);
-    EXPECT_THROW(senders[0]->sync_now(),db_error);EXPECT_TRUE(observed().failed);
+    // The fixture normally queues work. Enter its real immediate scheduler
+    // turn so this explicit call exercises foreground refusal, not enqueue.
+    queue->with_inline([&]{EXPECT_THROW(senders[0]->sync_now(),db_error);});
+    queue->drain();EXPECT_TRUE(observed().failed);EXPECT_EQ(errors.size(),1u);
+    EXPECT_EQ(snapshot(),committed);EXPECT_TRUE(audit_wire().empty());
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
 }
 TEST_F(RecoveryAutomaticExportReadAdmission, AcceptedAckExhaustsSameBoundWithoutBookkeepingOrCompletion) {
     negotiated_ack_pause pause(senders,factory);seed();accept(caps());ASSERT_TRUE(pump_until_batch(1));
@@ -1914,11 +1919,21 @@ TEST_F(RecoveryAutomaticExportReadAdmission, ActualEngineWriteReturningIsFatalWi
     EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM ContinuousLocalRow"),1);
 }
 TEST_F(RecoveryAutomaticExportReadAdmission, RevokedProducerDuringReadCannotOfferDeferredAdmission) {
-    negotiated_worker_observation workers;seed();auto read=hold();
-    // Public raw escape monotonically revokes real producer admission. This
-    // is an actual API action, not a fabricated owner/permission flag.
-    (void)owner->db().handle();accept(caps());queue->drain();EXPECT_EQ(observed().work,0u);EXPECT_TRUE(audit_wire().empty());
-    EXPECT_EQ(errors.size(),1u);release(read);EXPECT_EQ(claimed(),0);EXPECT_EQ(workers.started->load(),0u);
+    negotiated_worker_observation workers;seed();auto keeper=facade();
+    const auto originals=keeper->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto rows=keeper->db().query("SELECT * FROM ContinuousSharedRow ORDER BY id");
+    auto read=hold();
+    // Continuous stores refuse raw escape before any handle or revocation
+    // is published. Close the actual writer to revoke its physical producer
+    // admission; a separate admitted facade observes durable state afterward.
+    EXPECT_THROW(owner->db().handle(),db_error);
+    owner->db().close();accept(caps());queue->drain();
+    EXPECT_EQ(observed().work,0u);EXPECT_TRUE(audit_wire().empty());
+    EXPECT_EQ(errors.size(),1u);release(read);
+    EXPECT_EQ(number(keeper->db(),"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL"),0);
+    EXPECT_EQ(keeper->db().query("SELECT * FROM AuditLog ORDER BY id"),originals);
+    EXPECT_EQ(keeper->db().query("SELECT * FROM ContinuousSharedRow ORDER BY id"),rows);
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
 }
 TEST_F(RecoveryAutomaticExportReadAdmission, PublicStrictAndMutexOnlyEntryPointsKeepReadRefusal) {
     seed();const auto before=snapshot();auto read=hold();

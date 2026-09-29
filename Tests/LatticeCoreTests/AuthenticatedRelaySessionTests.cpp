@@ -2042,7 +2042,14 @@ TEST_F(AuthenticatedReadySession, ReadCostObservationSaturatesWithoutChangingRea
     struct reset {reads::observation* previous;~reset(){reads::current=previous;}} restore{previous};
     const auto result=invoke(setup,command);EXPECT_TRUE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());
     EXPECT_EQ(trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(trace.full_audits,1u);
-    for(const auto value:trace.cost.calls)EXPECT_EQ(value,maximum);
+    using cp=detail::canonical_ready_cost_observation::phase;
+    for(size_t i=0;i<trace.cost.calls.size();++i) {
+        const auto phase=static_cast<cp>(i);
+        // These three stages are performed by the fused validator now. Their
+        // independent counters must remain untouched, while active ones saturate.
+        const bool fused=phase==cp::frame_decode||phase==cp::canonical_encode||phase==cp::sequence_advance;
+        EXPECT_EQ(trace.cost.calls[i],fused?maximum-1:maximum)<<i;
+    }
     for(const auto value:trace.cost.microseconds)EXPECT_EQ(value,maximum);
     EXPECT_EQ(trace.cost.receipt_batches,maximum);EXPECT_EQ(trace.cost.receipt_batch_ids,maximum);EXPECT_EQ(exact_source(),before);
 }

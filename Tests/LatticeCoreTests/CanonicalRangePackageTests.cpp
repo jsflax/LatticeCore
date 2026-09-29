@@ -682,3 +682,222 @@ TEST(CanonicalValidatedSequence, CanonicalBytesPreserveEscapedUnicodeAndRealInsi
     EXPECT_EQ(cr::encode(cr::decode(escaped,f.policy.codec),f.policy.codec),package.frames()[1]);
     EXPECT_THROW(cr::decode_canonical(escaped,f.policy.codec),cr::protocol_error);
 }
+
+#include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
+#include <limits>
+namespace {
+// Deliberately encodes the hash framing without validating a typed payload.
+// These bounded test pages must reach the real parser with a freshly matching
+// outer digest even when their inner value grammar is malformed. A valid page
+// is compared to the production digest before this helper makes negatives.
+void content_append_test_reseal(cr::content_page& page) {
+    page.count=page.items.size();page.bytes=0;
+    for(const auto& item:page.items) {
+        page.bytes+=1+16+item.key.table.size()+item.key.id.size();
+        if(const auto* value=std::get_if<cr::present>(&item.value))page.bytes+=8+value->payload.size();
+    }
+    std::string wire;
+    const auto u=[&](uint64_t value){for(int shift=56;shift>=0;shift-=8)wire.push_back(static_cast<char>(value>>shift));};
+    const auto s=[&](const std::string& value){u(value.size());wire+=value;};
+    s("lattice.canonical-range.v2/content-page");
+    const auto nib=[](char c){return c<='9'?c-'0':c-'a'+10;};
+    for(size_t i=0;i<page.manifest_digest.size();i+=2)
+        wire.push_back(static_cast<char>((nib(page.manifest_digest[i])<<4)|nib(page.manifest_digest[i+1])));
+    u(page.index);u(page.count);u(page.bytes);
+    for(const auto& item:page.items) {
+        const auto* value=std::get_if<cr::present>(&item.value);wire.push_back(value?1:2);
+        s(item.key.table);s(item.key.id);if(value)s(value->payload);
+    }
+    page.digest=picosha2::hash256_hex_string(wire);
+}
+std::string content_append_test_wire(const std::string& valid,const cr::content_page& page) {
+    auto frame=nlohmann::json::parse(valid);auto& body=frame["latticeCanonicalRange"]["body"];
+    body["manifest_digest"]=page.manifest_digest;body["index"]=std::to_string(page.index);
+    body["count"]=std::to_string(page.count);body["bytes"]=std::to_string(page.bytes);body["digest"]=page.digest;
+    body["items"]=nlohmann::json::array();
+    for(const auto& item:page.items) {
+        nlohmann::json row={{"table",item.key.table},{"id",item.key.id}};
+        if(const auto* value=std::get_if<cr::present>(&item.value)){row["tag"]="present";row["payload"]=value->payload;}
+        else row["tag"]="tombstone";
+        body["items"].push_back(std::move(row));
+    }
+    return frame.dump();
+}
+void content_append_test_advance(cr::validated_sequence& cursor,bool raw,const std::string& wire,const cr::frame& frame) {
+    if(raw)(void)cursor.advance_canonical(wire,1);else cursor.advance(frame);
+}
+void content_append_test_finish(cr::validated_sequence& cursor,bool raw,const cr::encoded_package& package,
+    const cr::limits& limits,size_t first=1) {
+    for(size_t i=first;i<package.frames().size();++i)
+        content_append_test_advance(cursor,raw,package.frames()[i],cr::decode(package.frames()[i],limits));
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+}
+}
+
+TEST(CanonicalValidatedContentAppend, BothEntriesValidateEachItemOnceAndMatchStrictTypedPrefixes) {
+    PackageFixture f;
+    const sr::row_values values{{"integer",int64_t(-17)},{"real",1.25},{"null",nullptr},
+        {"blob",std::vector<uint8_t>{0,1,127,255}},
+        {"text",std::string("quote\" slash\\ nul")+std::string(1,'\0')+" caf\xc3\xa9 \xf0\x9f\x9a\x80"}};
+    f.rows={{{"PackageSourceRow","A"},cr::present{sr::encode_values(values,f.policy.codec.values)}},
+        f.row("B","second"),{{"PackageSourceRow","C"},cr::tombstone{}}};
+    f.receipt({"original",cr::unknown{}},std::string("namespace"),"C");const auto package=f.build();
+    EXPECT_EQ(sr::decode_values(std::get<cr::present>(f.rows[0].value).payload,f.policy.codec.values),values);
+    EXPECT_EQ(cr::content_sha256(package.offer(),f.rows,f.policy.codec),package.offer().content_digest);
+    for(bool raw:{false,true}) {
+        SCOPED_TRACE(raw);cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+        auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);uint64_t observed_items=0;
+        for(size_t i=1;i<package.frames().size();++i) {
+            const auto frame=cr::decode(package.frames()[i],f.policy.codec);
+            reference=cr::propose(reference,frame,f.policy.codec);
+            const auto* page=std::get_if<cr::content_page>(&frame.body);const auto expected=page?page->items.size():0;
+            {sequence_counter_scope count;
+                content_append_test_advance(cursor,raw,package.frames()[i],frame);
+                EXPECT_EQ(count.value.content_shape_calls,expected);observed_items+=count.value.content_shape_calls;}
+            EXPECT_EQ(cursor.snapshot(),reference);
+            EXPECT_EQ(cr::encode_state(cursor.snapshot(),f.policy.codec),cr::encode_state(reference,f.policy.codec));
+        }
+        EXPECT_EQ(observed_items,f.rows.size());EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+    }
+}
+
+TEST(CanonicalValidatedContentAppend, PublicHasherRemainsStrictAndCounterSaturatesWithoutChangingHashes) {
+    PackageFixture f;const auto package=f.build();
+    cr::stream_hasher strict(package.offer(),cr::stream_kind::content,f.policy.codec);
+    {sequence_counter_scope count;for(const auto& item:f.rows)strict.append(item);
+        EXPECT_EQ(count.value.content_shape_calls,f.rows.size());}
+    EXPECT_EQ(strict.finish(),package.offer().content_digest);
+    auto bad=f.rows[0];bad.value=cr::present{R"({"body":{"kind":1,"value":true}})"};
+    cr::stream_hasher rejected(package.offer(),cr::stream_kind::content,f.policy.codec);
+    {sequence_counter_scope count;EXPECT_THROW(rejected.append(bad),cr::protocol_error);
+        EXPECT_EQ(count.value.content_shape_calls,1u);}
+    // A refused public hasher is discarded under its original contract.
+    for(bool raw:{false,true}) {
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+        sequence_counter_scope count;count.value.content_shape_calls=std::numeric_limits<uint64_t>::max();
+        content_append_test_finish(cursor,raw,package,f.policy.codec);
+        EXPECT_EQ(count.value.content_shape_calls,std::numeric_limits<uint64_t>::max());
+    }
+    cr::validated_sequence unobserved(f.attempt,f.request,package.offer(),f.policy.codec);
+    content_append_test_finish(unobserved,true,package,f.policy.codec);
+}
+
+TEST(CanonicalValidatedContentAppend, MalformedTypedPayloadWithMatchingOuterDigestRefusesBothEntriesAndPublicAppend) {
+    PackageFixture f;const auto package=f.build();const auto valid=cr::decode(package.frames()[1],f.policy.codec);
+    auto calibration=std::get<cr::content_page>(valid.body);const auto digest=calibration.digest;
+    content_append_test_reseal(calibration);ASSERT_EQ(calibration.digest,digest);
+    ASSERT_EQ(content_append_test_wire(package.frames()[1],calibration),package.frames()[1]);
+    const std::vector<std::string> malformed{
+        R"({"body":{"kind":1,"value":true}})",
+        R"({"body":{"kind":2,"value":"a"},"body":{"kind":2,"value":"b"}})",
+        R"({"body":{"kind":2,"kind":2,"value":"a"}})",
+        R"({"body":{"kind":2,"value":17}})",R"({"body":{"kind":1,"value":1.0}})",
+        R"({"body":{"kind":7,"value":1}})",R"({"body":{"kind":4,"value":"null"}})",
+        R"({"body":{"kind":6,"value":"0"}})",R"({"body":{"kind":6,"value":"0g"}})",
+        R"({"body":{"kind":6,"value":"AB"}})",R"({"body":{"kind":2,"value":"\ud800"}})",
+        R"({"body":{"kind":3,"value":0}})",R"({"body":{"kind":2,"value":"a","extra":0}})"};
+    for(size_t index=0;index<malformed.size();++index) {
+        SCOPED_TRACE(index);auto bad=valid;auto& page=std::get<cr::content_page>(bad.body);
+        page.items[0].value=cr::present{malformed[index]};content_append_test_reseal(page);
+        const auto wire=content_append_test_wire(package.frames()[1],page);
+        EXPECT_THROW(sr::decode_values(malformed[index],f.policy.codec.values),cr::protocol_error);
+        EXPECT_THROW(cr::encode(bad,f.policy.codec),cr::protocol_error);
+        cr::stream_hasher strict(package.offer(),cr::stream_kind::content,f.policy.codec);
+        EXPECT_THROW(strict.append(page.items[0]),cr::protocol_error);
+        for(bool raw:{false,true}) {
+            SCOPED_TRACE(raw);cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+            const auto before=cursor.snapshot();
+            {sequence_counter_scope count;EXPECT_THROW(content_append_test_advance(cursor,raw,wire,bad),cr::protocol_error);
+                EXPECT_EQ(count.value.content_shape_calls,1u);EXPECT_EQ(count.value.transitions,0u);}
+            EXPECT_EQ(cursor.snapshot(),before);EXPECT_THROW(cr::propose(before,bad,f.policy.codec),cr::protocol_error);
+            content_append_test_finish(cursor,raw,package,f.policy.codec);
+        }
+    }
+}
+
+TEST(CanonicalValidatedContentAppend, FrozenRequestPayloadCapStillRejectsOuterProfileValidContentAtBothEntries) {
+    PackageFixture f;f.rows={f.row("A","12345678")};
+    const auto exact=std::get<cr::present>(f.rows[0].value).payload.size();
+    f.request.budget.payload_bytes=exact;f.seal_request();const auto package=f.build();
+    auto bad=cr::decode(package.frames()[1],f.policy.codec);auto& page=std::get<cr::content_page>(bad.body);
+    page.items[0]=f.row("A","123456789");sequence_reseal(bad,f.policy.codec);
+    const auto wire=cr::encode(bad,f.policy.codec);
+    ASSERT_EQ(std::get<cr::present>(page.items[0].value).payload.size(),exact+1);
+    EXPECT_NO_THROW(cr::decode_canonical(wire,f.policy.codec));
+    for(bool raw:{false,true}) {
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);const auto before=cursor.snapshot();
+        {sequence_counter_scope count;canonical_reparse_error([&]{content_append_test_advance(cursor,raw,wire,bad);},"canonical payload exceeds budget");
+            EXPECT_EQ(count.value.content_shape_calls,1u);}
+        EXPECT_EQ(cursor.snapshot(),before);content_append_test_finish(cursor,raw,package,f.policy.codec);
+    }
+}
+
+TEST(CanonicalValidatedContentAppend, ExactTypedValueLimitsAndOneBeyondRemainEnforcedAtBothEntries) {
+    PackageFixture f;f.rows={f.row("A","12345678")};const auto package=f.build();
+    const auto valid=cr::decode(package.frames()[1],f.policy.codec);
+    for(unsigned boundary=0;boundary<5;++boundary) {
+        SCOPED_TRACE(boundary);auto limits=f.policy.codec;auto bad=valid;auto& page=std::get<cr::content_page>(bad.body);
+        std::string payload=R"({"body":{"kind":2,"value":"123456789"}})";
+        if(boundary==0)limits.values.value_bytes=8;
+        if(boundary==1){limits.values.fields=1;payload=R"({"body":{"kind":2,"value":"12345678"},"other":{"kind":4,"value":null}})";}
+        if(boundary==2)limits.values.decoded_bytes=4+1+8;
+        if(boundary==3){limits.values.name_bytes=4;payload=R"({"bodyx":{"kind":2,"value":"12345678"}})";}
+        if(boundary==4){limits.values.raw_bytes=std::get<cr::present>(f.rows[0].value).payload.size();
+            limits.values.value_bytes=8;limits.values.decoded_bytes=4+1+8;}
+        page.items[0].value=cr::present{payload};content_append_test_reseal(page);
+        const auto wire=content_append_test_wire(package.frames()[1],page);
+        EXPECT_NO_THROW(cr::decode_canonical(wire,f.policy.codec));
+        EXPECT_THROW(sr::decode_values(payload,limits.values),cr::protocol_error);
+        cr::stream_hasher strict(package.offer(),cr::stream_kind::content,limits);
+        EXPECT_THROW(strict.append(page.items[0]),cr::protocol_error);
+        for(bool raw:{false,true}) {
+            cr::validated_sequence cursor(f.attempt,f.request,package.offer(),limits);const auto before=cursor.snapshot();
+            {sequence_counter_scope count;EXPECT_THROW(content_append_test_advance(cursor,raw,wire,bad),cr::protocol_error);
+                EXPECT_EQ(count.value.content_shape_calls,1u);}
+            EXPECT_EQ(cursor.snapshot(),before);content_append_test_finish(cursor,raw,package,limits);
+        }
+    }
+}
+
+TEST(CanonicalValidatedContentAppend, LaterCrossPageRefusalKeepsPriorHashesForTheOriginalRetryAtBothEntries) {
+    PackageFixture f;const auto package=f.build();ASSERT_EQ(package.offer().counts.content_pages,2u);
+    const auto first=cr::decode(package.frames()[1],f.policy.codec),second=cr::decode(package.frames()[2],f.policy.codec);
+    auto bad=second;auto& page=std::get<cr::content_page>(bad.body);page.items[0].key.id="B";sequence_reseal(bad,f.policy.codec);
+    const auto wire=cr::encode(bad,f.policy.codec);
+    for(bool raw:{false,true}) {
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+        content_append_test_advance(cursor,raw,package.frames()[1],first);const auto before=cursor.snapshot();
+        const auto strict=cr::propose(before,second,f.policy.codec);
+        {sequence_counter_scope count;EXPECT_THROW(content_append_test_advance(cursor,raw,wire,bad),cr::protocol_error);
+            EXPECT_EQ(count.value.content_shape_calls,1u);EXPECT_EQ(count.value.transitions,0u);}
+        EXPECT_EQ(cursor.snapshot(),before);EXPECT_THROW(cr::propose(before,bad,f.policy.codec),cr::protocol_error);
+        content_append_test_advance(cursor,raw,package.frames()[2],second);EXPECT_EQ(cursor.snapshot(),strict);
+        content_append_test_finish(cursor,raw,package,f.policy.codec,3);
+    }
+}
+
+TEST(CanonicalValidatedContentAppend, WholeHashFailureAtEndNeverPublishesEitherEntryCandidate) {
+    PackageFixture f;const auto package=f.build();auto wrong=package.offer();wrong.content_digest.assign(64,'0');
+    wrong.manifest_digest=cr::manifest_sha256(wrong,f.policy.codec);
+    for(bool raw:{false,true}) {
+        cr::validated_sequence cursor(f.attempt,f.request,wrong,f.policy.codec);
+        auto reference=cr::begin(f.attempt,f.request,wrong,f.policy.codec);
+        for(size_t i=1;i+1<package.frames().size();++i) {
+            auto frame=cr::decode(package.frames()[i],f.policy.codec);auto& page=std::get<cr::content_page>(frame.body);
+            page.manifest_digest=wrong.manifest_digest;sequence_reseal(frame,f.policy.codec);
+            const auto wire=cr::encode(frame,f.policy.codec);reference=cr::propose(reference,frame,f.policy.codec);
+            {sequence_counter_scope count;content_append_test_advance(cursor,raw,wire,frame);
+                EXPECT_EQ(count.value.content_shape_calls,page.items.size());}
+            EXPECT_EQ(cursor.snapshot(),reference);
+        }
+        const cr::frame end{f.attempt,1,cr::end{wrong.manifest_digest}};const auto wire=cr::encode(end,f.policy.codec);
+        EXPECT_EQ(cr::propose(reference,end,f.policy.codec).status,cr::phase::sequence_complete_unverified);
+        for(unsigned retry=0;retry<2;++retry) {
+            {sequence_counter_scope count;EXPECT_THROW(content_append_test_advance(cursor,raw,wire,end),cr::protocol_error);
+                EXPECT_EQ(count.value.content_shape_calls,0u);EXPECT_EQ(count.value.transitions,0u);}
+            EXPECT_EQ(cursor.snapshot(),reference);
+        }
+        cr::validated_sequence healthy(f.attempt,f.request,package.offer(),f.policy.codec);
+        content_append_test_finish(healthy,raw,package,f.policy.codec);
+    }
+}

@@ -260,3 +260,31 @@ TEST(CanonicalReceiptCoverageRange, CanonicalV3ReceiptKeepsActualBooleanTypeAndB
         }
     }
 }
+
+TEST(CanonicalReceiptCoverageRange, PrivateContentReuseKeepsBothEntriesAndActualReceiptBooleansExact) {
+    for(bool legacy_unbound:{false,true})for(bool raw:{false,true}) {
+        SCOPED_TRACE(legacy_unbound);SCOPED_TRACE(raw);
+        CoverageRangeFixture f;f.receipts[0].legacy_unbound=legacy_unbound;const auto package=f.build();
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+        auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);uint64_t content_items=0;
+        for(size_t index=1;index<package.frames().size();++index) {
+            const auto frame=cr::decode(package.frames()[index],f.policy.codec);reference=cr::propose(reference,frame,f.policy.codec);
+            const auto* page=std::get_if<cr::content_page>(&frame.body);const auto expected=page?page->items.size():0;
+            cr::sequence_test_observation::counters count;
+            struct scope {
+                cr::sequence_test_observation::counters* prior=cr::sequence_test_observation::current;
+                explicit scope(cr::sequence_test_observation::counters& value){cr::sequence_test_observation::current=&value;}
+                ~scope(){cr::sequence_test_observation::current=prior;}
+            };
+            {scope observed(count);if(raw)(void)cursor.advance_canonical(package.frames()[index],9);else cursor.advance(frame);}
+            EXPECT_EQ(count.content_shape_calls,expected);content_items+=count.content_shape_calls;
+            EXPECT_EQ(cursor.snapshot(),reference);
+            if(const auto* receipts=std::get_if<cr::receipt_page>(&frame.body))for(const auto& item:receipts->items) {
+                if(item.original_id==f.receipts[0].original_id)EXPECT_EQ(item.legacy_unbound,legacy_unbound);
+            }
+        }
+        EXPECT_EQ(content_items,f.rows.size());EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+        EXPECT_EQ(cr::content_sha256(package.offer(),f.rows,f.policy.codec),package.offer().content_digest);
+        EXPECT_EQ(cr::receipts_sha256(package.offer(),f.receipts,f.policy.codec),package.offer().receipt_digest);
+    }
+}

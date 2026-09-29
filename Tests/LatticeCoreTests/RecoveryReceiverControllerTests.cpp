@@ -1489,10 +1489,26 @@ protected:
     }
     std::shared_ptr<ControllerPause> pause_terminal(){auto pause=std::make_shared<ControllerPause>();pauses.push_back(pause);
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[pause](const char* stage){if(std::strcmp(stage,"terminal-cancel-committed")==0)pause->wait();});return pause;}
-    void expire_first_prepare(size_t selected=0){auto once=std::make_shared<bool>(false);
-        after_control=[this,once,selected](size_t index,const json& control,std::string&){if(!*once&&index==selected&&control.at("operation")=="prepare"){
-            *once=true;(void)discard(index);}};
+    // Same-setup discard revokes its ready fence. Drop the obsolete positive
+    // reply, then explicitly reopen; never pretend the subsequent status-4
+    // bridge refusal is a successful negative READY control.
+    void reopen_after_terminal(const std::function<bool(size_t,const json&)>& target) {
+        bool discarded=false;
+        after_control=[&](size_t index,const json& control,std::string& outgoing){
+            if(!discarded&&target(index,control)){(void)discard(index);discarded=true;outgoing.clear();}};
+        connect();ASSERT_TRUE(until([&]{return discarded;}));ASSERT_FALSE(has_error());ASSERT_EQ(phase(),2);
+        const auto old=framing(),intent=entries(),allocation=allocators();
+        const auto attempts=receiver->db().query("SELECT * FROM _lattice_range_attempt ORDER BY channel");
+        const auto pages=receiver->db().query("SELECT * FROM _lattice_range_page ORDER BY channel,stream,page_index");
+        close_receiver();after_control={};open_receiver();
+        EXPECT_EQ(framing(),old);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);
+        EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_range_attempt ORDER BY channel"),attempts);
+        EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_range_page ORDER BY channel,stream,page_index"),pages);
     }
+    void reopen_after_terminal_prepare(size_t selected=0) {
+        reopen_after_terminal([selected](size_t index,const json& control){return index==selected&&control.at("operation")=="prepare";});
+    }
+
     std::vector<database::row_t> entries(){return receiver->db().query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original");}
     std::vector<database::row_t> allocators(){return receiver->db().query("SELECT * FROM _lattice_obligation_store");}
     std::vector<database::row_t> framing(){return receiver->db().query("SELECT * FROM _lattice_recovery_request ORDER BY channel");}
@@ -1501,7 +1517,7 @@ protected:
 TEST_F(TerminalReceiverController, PreManifestTerminalRearmsExactOriginalsAndAllocatorState) {
     configure();insert(*source,controller_uuid(9300),"canonical");seed_local(2,9301);
     const auto audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),before_entries=entries(),before_allocators=allocators();
-    const auto pause=pause_terminal();expire_first_prepare();connect();ASSERT_TRUE(until([&]{return pause->ready();}));
+    reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());const auto pause=pause_terminal();connect();ASSERT_TRUE(until([&]{return pause->ready();}));
     EXPECT_EQ(phase(),1);EXPECT_EQ(entries(),before_entries);EXPECT_EQ(allocators(),before_allocators);
     EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=1 AND length(manifest_frame)=0"),1);
@@ -1513,10 +1529,9 @@ TEST_F(TerminalReceiverController, PreManifestTerminalRearmsExactOriginalsAndAll
 }
 TEST_F(TerminalReceiverController, PartialManifestTerminalRetiresOnlyExactActiveStageAndPreservesIntent) {
     configure();insert(*source,controller_uuid(9310),"canonical");seed_local(1,9311);const auto audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
-    const auto pause=pause_terminal();auto expired=std::make_shared<bool>(false);
-    after_control=[this,expired](size_t index,const json& control,std::string&){if(!*expired&&control.at("operation")=="read"&&control.at("index")=="1"){
-        *expired=true;(void)discard(index);}};
-    connect();ASSERT_TRUE(until([&]{return pause->ready();}));EXPECT_TRUE(*expired);EXPECT_EQ(phase(),1);
+    reopen_after_terminal([&](size_t,const json& control){return control.at("operation")=="read"&&control.at("index")=="2";});ASSERT_FALSE(HasFatalFailure());
+    EXPECT_GT(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_page"),0);
+    const auto pause=pause_terminal();connect();ASSERT_TRUE(until([&]{return pause->ready();}));EXPECT_EQ(phase(),1);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_attempt"),0);EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_page"),0);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=1 AND length(manifest_frame)>0"),1);
     EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
@@ -1524,11 +1539,10 @@ TEST_F(TerminalReceiverController, PartialManifestTerminalRetiresOnlyExactActive
 }
 TEST_F(TerminalReceiverController, MixedVerifiedAndManifestlessCohortDisposesEverySourceBeforeOneRestart) {
     configure(2);insert(*source,controller_uuid(9320),"canonical");seed_local(1,9321);const auto before_entries=entries(),before_allocators=allocators();
-    const auto pause=pause_terminal();bool verified_first=false;
-    after_control=[&](size_t index,const json& control,std::string&){if(index==1&&control.at("operation")=="prepare"&&!verified_first){
-        verified_first=scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_attempt WHERE verified=1")==1;
-        (void)discard(index);}};
-    connect();ASSERT_TRUE(until([&]{return pause->ready();}));ASSERT_TRUE(verified_first);EXPECT_EQ(phase(),1);
+    bool verified_first=false;
+    reopen_after_terminal([&](size_t index,const json& control){if(index!=1||control.at("operation")!="prepare")return false;
+        verified_first=scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_attempt WHERE verified=1")==1;return true;});ASSERT_FALSE(HasFatalFailure());
+    const auto pause=pause_terminal();connect();ASSERT_TRUE(until([&]{return pause->ready();}));ASSERT_TRUE(verified_first);EXPECT_EQ(phase(),1);
     EXPECT_EQ(entries(),before_entries);EXPECT_EQ(allocators(),before_allocators);
     EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE last_sequence=1 AND active IS NULL AND revision=0"),2);
@@ -1552,7 +1566,7 @@ TEST_F(TerminalReceiverController, NeverStartedQReopensAndPreparesExactSequenceW
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 namespace {
 TEST_F(TerminalReceiverController, CancellationCommitDenialRetainsWholeFrozenCohortForReopen) {
-    configure(2);insert(*source,controller_uuid(9340),"canonical");seed_local(1,9341);expire_first_prepare(1);
+    configure(2);insert(*source,controller_uuid(9340),"canonical");seed_local(1,9341);reopen_after_terminal_prepare(1);ASSERT_FALSE(HasFatalFailure());
     std::atomic<unsigned> denied{0};Snapshot before;
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[&](const char* stage)->std::shared_ptr<void>{
         if(std::strcmp(stage,"terminal-cancel")!=0)return {};before=snapshot();return std::make_shared<ControllerCommitFault>(receiver.get(),denied);});
@@ -1561,7 +1575,7 @@ TEST_F(TerminalReceiverController, CancellationCommitDenialRetainsWholeFrozenCoh
     ASSERT_TRUE(until([&]{return installed();}));EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),2);EXPECT_FALSE(has_error());
 }
 TEST_F(TerminalReceiverController, CanceledManifestlessPredecessorReopensBeforeRefreeze) {
-    configure();seed_local(1,9350);expire_first_prepare();
+    configure();seed_local(1,9350);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[](const char* stage){
         if(std::strcmp(stage,"terminal-cancel-committed")==0)throw db_error("fixture crash after terminal cancel COMMIT");});
     connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),1);const auto old=framing(),intent=entries(),alloc=allocators();
@@ -1569,7 +1583,7 @@ TEST_F(TerminalReceiverController, CanceledManifestlessPredecessorReopensBeforeR
     connect();ASSERT_TRUE(until([&]{return installed();}));EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),1);EXPECT_FALSE(has_error());
 }
 TEST_F(TerminalReceiverController, CanceledManifestlessPredecessorReopensAfterRefreezeBeforeNewQ) {
-    configure();seed_local(1,9360);expire_first_prepare();
+    configure();seed_local(1,9360);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[](const char* stage){
         if(std::strcmp(stage,"terminal-refreeze-committed")==0)throw db_error("fixture crash after terminal refreeze COMMIT");});
     connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);const auto old=framing();
@@ -1578,7 +1592,7 @@ TEST_F(TerminalReceiverController, CanceledManifestlessPredecessorReopensAfterRe
     close_receiver();probe.reset();after_control={};open_receiver();EXPECT_EQ(framing(),old);connect();ASSERT_TRUE(until([&]{return installed();}));EXPECT_FALSE(has_error());
 }
 TEST_F(TerminalReceiverController, FreshQCommitReopenResumesItsExactNewIdentity) {
-    configure();seed_local(1,9370);expire_first_prepare();
+    configure();seed_local(1,9370);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[](const char* stage){
         if(std::strcmp(stage,"terminal-request-committed")==0)throw db_error("fixture crash after terminal successor Q COMMIT");});
     connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);const auto fresh=framing();
@@ -1587,9 +1601,8 @@ TEST_F(TerminalReceiverController, FreshQCommitReopenResumesItsExactNewIdentity)
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),1);EXPECT_FALSE(has_error());
 }
 TEST_F(TerminalReceiverController, LostCommittedDiscardReplyReopensAndRefencesTheWholeCohort) {
-    configure(2);seed_local(1,9380);bool expired=false,lost=false;
+    configure(2);seed_local(1,9380);reopen_after_terminal_prepare(1);ASSERT_FALSE(HasFatalFailure());bool lost=false;
     after_control=[&](size_t index,const json& control,std::string& outgoing){
-        if(!expired&&index==1&&control.at("operation")=="prepare"){expired=true;(void)discard(index);}
         if(!lost&&index==0&&control.at("operation")=="discard"){lost=true;outgoing.clear();}};
     connect();ASSERT_TRUE(until([&]{return lost;}));ASSERT_EQ(phase(),2);const auto old=framing(),intent=entries();
     EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);
@@ -1598,9 +1611,8 @@ TEST_F(TerminalReceiverController, LostCommittedDiscardReplyReopensAndRefencesTh
     ASSERT_TRUE(until([&]{return installed();}));EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),2);EXPECT_FALSE(has_error());
 }
 TEST_F(TerminalReceiverController, UnknownSettlementCannotTurnTerminalBodyIntoRestartAuthority) {
-    configure();seed_local(1,9390);bool expired=false,corrupted=false;
+    configure();seed_local(1,9390);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());bool corrupted=false;
     after_control=[&](size_t index,const json& control,std::string& outgoing){
-        if(!expired&&control.at("operation")=="prepare"){expired=true;(void)discard(index);}
         if(control.at("operation")=="inspect"){auto reply=json::parse(outgoing);reply["settlement"]["state"]="unknown";outgoing=reply.dump();corrupted=true;}};
     connect();ASSERT_TRUE(until([&]{return has_error();}));EXPECT_TRUE(corrupted);EXPECT_EQ(phase(),2);
     EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),1);
@@ -1608,9 +1620,8 @@ TEST_F(TerminalReceiverController, UnknownSettlementCannotTurnTerminalBodyIntoRe
     const auto old=framing();close_receiver();after_control={};open_receiver();EXPECT_EQ(framing(),old);connect();ASSERT_TRUE(until([&]{return installed();}));EXPECT_FALSE(has_error());
 }
 TEST_F(TerminalReceiverController, FutureHighWaterCannotReplaceFrozenOriginals) {
-    configure();seed_local(1,9400);const auto original=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");bool expired=false;
+    configure();seed_local(1,9400);const auto original=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
     after_control=[&](size_t index,const json& control,std::string& outgoing){
-        if(!expired&&control.at("operation")=="prepare"){expired=true;(void)discard(index);}
         if(control.at("operation")=="inspect"){auto reply=json::parse(outgoing);reply["lifecycle"]["bindingHighWater"]="2";outgoing=reply.dump();}};
     connect();ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(phase(),2);EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),1);
     EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),original);
@@ -1633,12 +1644,11 @@ TEST_F(TerminalReceiverController, KnownInstalledReopenIgnoresGoneSourceCapsule)
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 namespace {
 TEST_F(TerminalReceiverController, DelayedOldTerminalReplyOnCurrentRouteCannotSettleFreshQ) {
-    configure();seed_local(1,9420);auto ignored=std::make_shared<std::atomic<bool>>(false);
+    configure();seed_local(1,9420);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());auto ignored=std::make_shared<std::atomic<bool>>(false);
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[ignored](const char* stage){
         if(std::strcmp(stage,"terminal-stale-control-ignored")==0)ignored->store(true);});
-    bool expired=false,injected=false;std::string old_reply,actual_reply;
+    bool injected=false;std::string old_reply,actual_reply;
     after_control=[&](size_t index,const json& control,std::string& outgoing){
-        if(!expired&&control.at("operation")=="prepare"){expired=true;(void)discard(index);}
         if(control.at("operation")=="inspect")old_reply=outgoing;
         if(!old_reply.empty()&&!injected&&control.at("operation")=="prepare"){
             injected=true;actual_reply=outgoing;outgoing=old_reply;}};
@@ -1658,7 +1668,7 @@ TEST_F(TerminalReceiverController, PriorAcceptedOriginalClaimAckTombstoneAndNewU
     const auto source_rows=source->db().query("SELECT * FROM ControllerRow ORDER BY id"),receipts=source->db().query("SELECT * FROM _lattice_canonical_receipt");
     close_receiver();open_receiver();seed_local(1,9431);
     const auto before_entries=entries(),before_allocators=allocators(),audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
-    const auto pause=pause_terminal();expire_first_prepare();connect();ASSERT_TRUE(until([&]{return pause->ready();}));
+    reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());const auto pause=pause_terminal();connect();ASSERT_TRUE(until([&]{return pause->ready();}));
     EXPECT_EQ(phase(),1);EXPECT_EQ(entries(),before_entries);EXPECT_EQ(allocators(),before_allocators);
     EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
     EXPECT_EQ(source->db().query("SELECT * FROM ControllerRow ORDER BY id"),source_rows);
@@ -1675,7 +1685,7 @@ TEST_F(TerminalReceiverController, PriorAcceptedOriginalClaimAckTombstoneAndNewU
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 namespace {
 TEST_F(TerminalReceiverController, LostCancelPublicationInspectsKnownSuccessorInSameController) {
-    configure();seed_local(1,9440);expire_first_prepare();auto stopped=std::make_shared<std::atomic<bool>>(false),inspected=std::make_shared<std::atomic<bool>>(false);
+    configure();seed_local(1,9440);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());auto stopped=std::make_shared<std::atomic<bool>>(false),inspected=std::make_shared<std::atomic<bool>>(false);
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[stopped,inspected](const char* stage){
         if(std::strcmp(stage,"terminal-cancel-committed")==0&&!stopped->exchange(true))throw db_error("fixture lost cancel publication");
         if(std::strcmp(stage,"terminal-cancel-inspected")==0)inspected->store(true);});
@@ -1686,18 +1696,16 @@ TEST_F(TerminalReceiverController, LostCancelPublicationInspectsKnownSuccessorIn
     EXPECT_NO_THROW(insert(*receiver,controller_uuid(9441),"admission reopened after exact successor"));
 }
 TEST_F(TerminalReceiverController, CurrentRequestWithMismatchedTerminalIdentityRemainsFrozen) {
-    configure();seed_local(1,9450);bool expired=false;
+    configure();seed_local(1,9450);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
     after_control=[&](size_t index,const json& control,std::string& outgoing){
-        if(!expired&&control.at("operation")=="prepare"){expired=true;(void)discard(index);}
         if(control.at("operation")=="inspect"){auto reply=json::parse(outgoing);reply["lifecycle"]["requestDigest"]=std::string(64,'0');outgoing=reply.dump();}};
     connect();ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(phase(),2);EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),1);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NULL"),1);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=1"),1);
 }
 TEST_F(TerminalReceiverController, KnownCommittedLifecycleSecondaryErrorRetainsTerminalFact) {
-    configure();seed_local(1,9460);bool expired=false,reported=false;
+    configure();seed_local(1,9460);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());bool reported=false;
     after_control=[&](size_t index,const json& control,std::string& outgoing){
-        if(!expired&&control.at("operation")=="prepare"){expired=true;(void)discard(index);}
         if(control.at("operation")=="inspect"){auto reply=json::parse(outgoing);
             if(reply.contains("lifecycle")&&reply["lifecycle"]["state"]=="terminal"){
                 reply["settlement"]["postcommitError"]=true;reply["settlement"]["notificationError"]=true;outgoing=reply.dump();reported=true;}}};
@@ -1705,5 +1713,89 @@ TEST_F(TerminalReceiverController, KnownCommittedLifecycleSecondaryErrorRetainsT
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),1);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
 }
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(TerminalReceiverController, QuietLostCommittedDiscardRetriesOnNativePacerAtOriginalThirtySecondDeadline) {
+    configure(2);seed_local(1,9470);reopen_after_terminal_prepare(1);ASSERT_FALSE(HasFatalFailure());
+    const auto pause=pause_terminal();bool lost=false;
+    std::chrono::steady_clock::time_point dropped_at;std::string dropped_id,route_generation,dropped_request;
+    after_control=[&](size_t index,const json& control,std::string& outgoing){
+        if(!lost&&index==0&&control.at("operation")=="discard"){
+            const auto actual=json::parse(outgoing);ASSERT_EQ(actual.at("settlement").at("state"),"committed");
+            ASSERT_EQ(actual.at("lifecycle").at("state"),"terminal");
+            lost=true;dropped_at=std::chrono::steady_clock::now();dropped_id=control.at("requestID");
+            route_generation=control.at("routeGeneration");dropped_request=control.at("request");outgoing.clear();}};
+    connect();ASSERT_TRUE(until([&]{return lost;}));ASSERT_EQ(phase(),2);
+    const auto intent=entries(),allocation=allocators(),audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto old=framing();const auto endpoint=peers[0].physical;const auto source_view=peers[0].setup.descriptor();const auto sent_before=controls.size();
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);
+    // From the lost reply onward there is no manual request, close/reopen,
+    // synthetic response, or scheduler invocation. until only pumps the wire.
+    ASSERT_TRUE(until([&]{return pause->ready();},45000));
+    EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-dropped_at).count(),29000);
+    EXPECT_EQ(phase(),1);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);EXPECT_EQ(framing(),old);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);EXPECT_TRUE(endpoint.matches(peers[0].physical));
+    unsigned retried=0;for(size_t i=sent_before;i<controls.size();++i){const auto& [index,control]=controls[i];
+        if(index==0&&control.at("operation")=="discard"){++retried;EXPECT_NE(control.at("requestID"),dropped_id);
+            EXPECT_EQ(control.at("routeGeneration"),route_generation);EXPECT_EQ(control.at("request"),dropped_request);}}
+    EXPECT_EQ(retried,1u);EXPECT_LT(controls.size()-sent_before,8u);EXPECT_EQ(peers[0].setup.descriptor(),source_view);EXPECT_FALSE(has_error());
+    pause->release();ASSERT_TRUE(until([&]{return installed();}));EXPECT_FALSE(has_error());
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),2);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
+}
+TEST_F(TerminalReceiverController, SchedulerHeldStaleAndCurrentRepliesRetainBothUntilActualWorkerConsumption) {
+    configure();seed_local(1,9480);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
+    auto ignored=std::make_shared<std::atomic<unsigned>>(0);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[ignored](const char* stage){
+        if(std::strcmp(stage,"terminal-stale-control-ignored")==0)++*ignored;});
+    auto held=std::make_shared<ControllerPause>();pauses.push_back(held);
+    bool injected=false;std::string stale;platform_transport_callbacks endpoint;
+    after_control=[&](size_t index,const json& control,std::string& outgoing){
+        if(control.at("operation")=="inspect")stale=outgoing;
+        if(injected||stale.empty()||control.at("operation")!="prepare")return;
+        injected=true;endpoint=peers[index].physical;
+        receiver->get_scheduler()->invoke([held]{held->wait();});
+        const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+        while(!held->ready()&&std::chrono::steady_clock::now()<limit)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ASSERT_TRUE(held->ready());ASSERT_EQ(ignored->load(),0u);
+        // Both actual envelopes arrive before the scheduler may drain either.
+        EXPECT_TRUE(endpoint.trigger_on_message(transport_message::from_string(stale)));
+        EXPECT_TRUE(endpoint.trigger_on_message(transport_message::from_string(outgoing)));
+        EXPECT_EQ(ignored->load(),0u);outgoing.clear();held->release();
+    };
+    connect();ASSERT_TRUE(until([&]{return installed();}));ASSERT_TRUE(injected);EXPECT_FALSE(has_error());
+    EXPECT_EQ(ignored->load(),1u);EXPECT_TRUE(endpoint.matches(peers[0].physical));
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),1);
+    unsigned prepares=0;for(const auto& [_,control]:controls)if(control.at("operation")=="prepare")++prepares;
+    EXPECT_EQ(prepares,2u);EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+}
+TEST_F(TerminalReceiverController, MalformedStaleLifecycleCannotBeDiscardedAheadOfCurrentReply) {
+    configure();seed_local(1,9490);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
+    auto ignored=std::make_shared<std::atomic<unsigned>>(0);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[ignored](const char* stage){
+        if(std::strcmp(stage,"terminal-stale-control-ignored")==0)++*ignored;});
+    auto held=std::make_shared<ControllerPause>();pauses.push_back(held);
+    bool injected=false;std::string stale;std::vector<database::row_t> fresh,intent;
+    after_control=[&](size_t index,const json& control,std::string& outgoing){
+        if(control.at("operation")=="inspect")stale=outgoing;
+        if(injected||stale.empty()||control.at("operation")!="prepare")return;
+        injected=true;receiver->get_scheduler()->invoke([held]{held->wait();});
+        const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+        while(!held->ready()&&std::chrono::steady_clock::now()<limit)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ASSERT_TRUE(held->ready());fresh=framing();intent=entries();
+        auto malformed=json::parse(stale);malformed["lifecycle"]["bindingHighWater"]="01";
+        EXPECT_TRUE(peers[index].physical.trigger_on_message(transport_message::from_string(malformed.dump())));
+        EXPECT_TRUE(peers[index].physical.trigger_on_message(transport_message::from_string(outgoing)));
+        outgoing.clear();held->release();
+    };
+    connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_TRUE(injected);
+    EXPECT_EQ(ignored->load(),0u);EXPECT_EQ(phase(),2);EXPECT_EQ(framing(),fresh);EXPECT_EQ(entries(),intent);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=0 AND active IS NULL"),1);
+}
+
 }
 #endif

@@ -23,7 +23,16 @@
 
 namespace lattice::detail {
 thread_local canonical_ready_test_observation::observation* canonical_ready_test_observation::current=nullptr;
+thread_local canonical_ready_read_test_observation::observation* canonical_ready_read_test_observation::current=nullptr;
 namespace {
+void observe_ready_read(canonical_ready_read_test_observation::point point) noexcept {
+    if(auto* value=canonical_ready_read_test_observation::current) {
+        const auto index=static_cast<size_t>(point);
+        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-value->origin).count();
+        if(!value->visits[index]++)value->first_us[index]=static_cast<uint64_t>(elapsed);
+        value->last_us[index]=static_cast<uint64_t>(elapsed);
+    }
+}
 void observe_ready(canonical_ready_test_observation::point point) noexcept {
     if(auto* value=canonical_ready_test_observation::current) {
         const auto index=static_cast<size_t>(point);

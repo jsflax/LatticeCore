@@ -1950,6 +1950,63 @@ class AuthenticatedPredecessor : public AuthenticatedReadySession {
 protected:
     json prior,current;
     ready_wire::frame frozen;
+    struct CapacityAdmissionState {
+        using clock=std::chrono::steady_clock;
+        struct turn {clock::time_point entered,busy_returned;};
+        const clock::time_point started=clock::now(),deadline=started+std::chrono::seconds(5);
+        std::atomic<bool> current{true};
+        std::atomic<unsigned> created{0},destroyed{0};
+        std::vector<turn> turns;
+        uint64_t registry_entries=0;
+        std::string failure;
+        CapacityAdmissionState(){turns.reserve(32);}
+    };
+    struct CapacityAdmissionRoute {
+        std::shared_ptr<CapacityAdmissionState> state;
+        explicit CapacityAdmissionRoute(std::shared_ptr<CapacityAdmissionState> s):state(std::move(s)){++state->created;}
+        static int32_t current(void* raw){return static_cast<CapacityAdmissionRoute*>(raw)->state->current?1:0;}
+        static int32_t admissible(void* raw){const auto& s=static_cast<CapacityAdmissionRoute*>(raw)->state;
+            const auto now=CapacityAdmissionState::clock::now();return s->current&&now>=s->started&&now<s->deadline?1:0;}
+        static void destroy(void* raw){auto* route=static_cast<CapacityAdmissionRoute*>(raw);++route->state->destroyed;delete route;}
+    };
+    relay_recovery_setup open_capacity_automatically(const json& p,const json& c,
+        std::shared_ptr<CapacityAdmissionState>* observed=nullptr) {
+        // Explicit native automatic contract for this capacity fixture only.
+        // The strict100ms open() helper and all existing refusal tests stay unchanged.
+        const auto actual_owner=owner;const auto policy_bytes=p.dump(),connection_bytes=c.dump();
+        const auto state=std::make_shared<CapacityAdmissionState>();if(observed)*observed=state;
+        struct episode_cleanup {std::shared_ptr<CapacityAdmissionState> state;bool admitted=false;
+            ~episode_cleanup(){if(!admitted)state->current=false;}} cleanup{state};
+        struct registry_counter {uint64_t count=0;uint64_t* prior=detail::authenticated_ready_test_access::setup_entries(&count);
+            ~registry_counter(){detail::authenticated_ready_test_access::setup_entries(prior);}} entries;
+        const auto fail=[&](std::string message)->relay_recovery_setup{state->failure=std::move(message);throw db_error(state->failure);};
+        for(;;) {
+            const auto now=CapacityAdmissionState::clock::now();
+            if(!state->current||!actual_owner||owner!=actual_owner||actual_owner->is_closed()||!ref||ref->get()!=actual_owner.get())
+                return fail("capacity automatic setup owner or route retired");
+            if(now<state->started||now>=state->deadline||state->turns.size()>=32)
+                return fail("capacity automatic pre-effect admission budget exhausted");
+            state->turns.push_back({now,{}});
+            auto next=ref->open_relay_recovery_setup_automatic(policy_bytes,connection_bytes,new CapacityAdmissionRoute(state),
+                CapacityAdmissionRoute::current,CapacityAdmissionRoute::admissible,CapacityAdmissionRoute::destroy);
+            const auto error=last_bridge_error();state->registry_entries=entries.count;
+            if(next.valid()) {
+                if(next.pending_before_enrollment()||entries.count!=1||!error.empty()) {
+                    next.close_on_io();return fail("capacity automatic setup returned inconsistent enrolled state: "+error);
+                }
+                // The deadline governs pre-effect admission, not work after enrollment.
+                cleanup.admitted=true;return next;
+            }
+            if(!next.pending_before_enrollment())return fail("capacity automatic terminal setup refusal: "+error);
+            if(!error.empty()||entries.count!=0)return fail("capacity automatic pending result had effects or error: "+error);
+            const auto returned=CapacityAdmissionState::clock::now();state->turns.back().busy_returned=returned;
+            if(state->destroyed.load()!=state->created.load())return fail("capacity automatic failed attempt retained route context");
+            if(state->turns.size()>=32||returned>=state->deadline)return fail("capacity automatic pre-effect admission budget exhausted");
+            // Native has returned and released all locks before this fixture-only wait.
+            std::this_thread::sleep_until(std::min(state->deadline,returned+std::chrono::milliseconds(100)));
+        }
+    }
+
     void adopt(bool large=false,bool capsule=true) {
         setup=admitted(1,large);prior=description(setup);frozen=request(prior);
         if(capsule)(void)lease(setup,frozen,prior);
@@ -2043,7 +2100,7 @@ namespace {
 TEST_F(AuthenticatedPredecessor, FullSmallTransferInventoryDoesNotChargeInspectionAsAnotherTransfer) {
     adopt();ASSERT_FALSE(HasFatalFailure());std::vector<relay_recovery_setup> active;
     for(unsigned n=2;n<=16;++n){auto p=source_policy();p["readyProfile"]="boundedV1OrphanV1";p["orphanResumeGraceMilliseconds"]=60000;
-        auto next=open(p,connection(n));ASSERT_TRUE(next.valid())<<last_bridge_error();auto authorized=outcome(next);authorized["validForMilliseconds"]=600000;ASSERT_TRUE(next.finish_authorization(authorized.dump()));
+        SCOPED_TRACE("automatic capacity route "+std::to_string(n));auto next=open_capacity_automatically(p,connection(n));ASSERT_TRUE(next.valid())<<last_bridge_error();auto authorized=outcome(next);authorized["validForMilliseconds"]=600000;ASSERT_TRUE(next.finish_authorization(authorized.dump()));
         const auto d=description(next);(void)lease(next,request(d),d,"prepare",590000);active.push_back(std::move(next));}
     ASSERT_EQ(count("_lattice_canonical_ready_transfer"),16);const auto before=exact_source();
     const auto answer=proof();EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_TRUE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
@@ -2708,6 +2765,38 @@ TEST_F(AuthenticatedReceiptCoverageV3, ReadonlyWholeSnapshotPreservesAdministrat
     EXPECT_EQ(after.at("_lattice_canonical_receipt"),before.at("_lattice_canonical_receipt"));
     EXPECT_EQ(after.at("_lattice_canonical_receipt_origin"),before.at("_lattice_canonical_receipt_origin"));
     EXPECT_EQ(after.at("_lattice_canonical_receipt_coverage"),before.at("_lattice_canonical_receipt_coverage"));
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedPredecessor, CapacityAutomaticAdmissionExhaustsWhileActualWriterMutexRemainsHeld) {
+    const auto schema_before=owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+    const auto actual_owner=owner;const auto p=source_policy(),c=connection(972);
+    auto* mutex=sqlite3_db_mutex(detail::canonical_writer_custody_test_access::fault_handle(owner->db()));ASSERT_NE(mutex,nullptr);
+    std::shared_ptr<CapacityAdmissionState> observed;
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+        const auto statements=database::thread_statement_count();
+        EXPECT_THROW((void)open_capacity_automatically(p,c,&observed),db_error);
+        EXPECT_EQ(database::thread_statement_count(),statements);ASSERT_TRUE(observed);
+        EXPECT_FALSE(observed->failure.empty());EXPECT_FALSE(observed->current);
+        ASSERT_GE(observed->turns.size(),1u);ASSERT_LE(observed->turns.size(),32u);
+        EXPECT_EQ(observed->registry_entries,0u);EXPECT_EQ(observed->created.load(),observed->turns.size());
+        EXPECT_EQ(observed->destroyed.load(),observed->created.load());
+        for(size_t i=0;i<observed->turns.size();++i) {
+            EXPECT_GE(observed->turns[i].entered,observed->started);EXPECT_LT(observed->turns[i].entered,observed->deadline);
+            if(i)EXPECT_GE(observed->turns[i].entered,observed->turns[i-1].busy_returned+std::chrono::milliseconds(100));
+        }
+        // The real SQLite hold is still in force through all exhaustion assertions.
+        EXPECT_EQ(owner,actual_owner);
+    }
+    EXPECT_EQ(owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name"),schema_before);
+    // Real strict admission remains available after releasing the actual mutex.
+    setup=open(p,c);ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_FALSE(setup.pending_before_enrollment());
+    setup.close_on_io();setup={};EXPECT_EQ(observed->destroyed.load(),observed->created.load());
 }
 }
 #endif

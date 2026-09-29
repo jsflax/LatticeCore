@@ -28,6 +28,43 @@ namespace lattice::detail {
 thread_local canonical_ready_test_observation::observation* canonical_ready_test_observation::current=nullptr;
 thread_local canonical_ready_read_test_observation::observation* canonical_ready_read_test_observation::current=nullptr;
 namespace {
+void ready_cost_add(uint64_t& value,uint64_t delta) noexcept {
+    const auto maximum=std::numeric_limits<uint64_t>::max();
+    value=delta>maximum-value?maximum:value+delta;
+}
+class ready_cost_scope {
+    using clock=std::chrono::steady_clock;
+    canonical_ready_cost_observation::observation* preparation_;
+    canonical_ready_cost_observation::observation* read_;
+    size_t phase_;
+    clock::time_point started_{};
+public:
+    explicit ready_cost_scope(canonical_ready_cost_observation::phase phase) noexcept
+        :preparation_(canonical_ready_test_observation::current?&canonical_ready_test_observation::current->cost:nullptr),
+         read_(canonical_ready_read_test_observation::current?&canonical_ready_read_test_observation::current->cost:nullptr),
+         phase_(static_cast<size_t>(phase)) {
+        if(!preparation_&&!read_)return;
+        started_=clock::now();
+        if(preparation_)ready_cost_add(preparation_->calls[phase_],1);
+        if(read_)ready_cost_add(read_->calls[phase_],1);
+    }
+    ~ready_cost_scope() noexcept {
+        if(!preparation_&&!read_)return;
+        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(clock::now()-started_).count();
+        const auto micros=elapsed>0?static_cast<uint64_t>(elapsed):uint64_t(0);
+        if(preparation_)ready_cost_add(preparation_->microseconds[phase_],micros);
+        if(read_)ready_cost_add(read_->microseconds[phase_],micros);
+    }
+    ready_cost_scope(const ready_cost_scope&)=delete;
+    ready_cost_scope& operator=(const ready_cost_scope&)=delete;
+};
+void observe_ready_receipt_batch(size_t count) noexcept {
+    const auto append=[&](canonical_ready_cost_observation::observation& value) noexcept {
+        ready_cost_add(value.receipt_batches,1);ready_cost_add(value.receipt_batch_ids,static_cast<uint64_t>(count));
+    };
+    if(auto* value=canonical_ready_test_observation::current)append(value->cost);
+    if(auto* value=canonical_ready_read_test_observation::current)append(value->cost);
+}
 void observe_ready_read(canonical_ready_read_test_observation::point point) noexcept {
     if(auto* value=canonical_ready_read_test_observation::current) {
         const auto index=static_cast<size_t>(point);

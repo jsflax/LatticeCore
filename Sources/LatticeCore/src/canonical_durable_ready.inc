@@ -204,6 +204,7 @@ database::row_t ready_row(database& db,const canonical_ready_profile& p,const st
     if(rows.size()!=1)refuse("canonical READY transfer missing or terminal");return rows[0];
 }
 cr::frame ready_request(const database::row_t& row,const canonical_ready_profile& p) {
+    ready_cost_scope observed(canonical_ready_cost_observation::phase::request);
     const auto raw=ready_blob(row,"request");
     if(picosha2::hash256_hex_string(raw)!=ready_blob(row,"request_sha"))refuse("canonical READY frozen request hash differs");
     auto request=cr::decode(raw,p.package.codec);
@@ -212,9 +213,11 @@ cr::frame ready_request(const database::row_t& row,const canonical_ready_profile
     return request;
 }
 void ready_hash_frame(picosha2::hash256_one_by_one& hash,const std::string& raw) {
+    ready_cost_scope observed(canonical_ready_cost_observation::phase::raw_fetch_hash);
     const auto size=std::to_string(raw.size())+":";hash.process(size.begin(),size.end());hash.process(raw.begin(),raw.end());
 }
 std::string ready_frame(database& db,const canonical_ready_profile& p,const std::string& key,int64_t index) {
+    ready_cost_scope observed(canonical_ready_cost_observation::phase::raw_fetch_hash);
     const auto rows=db.query("SELECT "+ready_b("data",p.package.codec.maximum.frame_bytes)+","+ready_b("sha256",64)+
         " FROM main._lattice_canonical_ready_frame WHERE binding=? AND frame_index=? LIMIT 2",{bytes(key),index});
     if(rows.size()!=1)refuse("canonical READY frame missing");
@@ -233,23 +236,37 @@ cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,co
     const auto n=integer(row,"frame_count");if(n<2 || n>static_cast<int64_t>(p.package.frames))refuse("canonical READY frame count outside cap");
     const auto counts=db.query("SELECT COUNT(*) AS n FROM main._lattice_canonical_ready_frame WHERE binding=?",{bytes(key)});
     if(integer(counts.at(0),"n")!=n)refuse("canonical READY frame inventory differs");
-    auto first=cr::decode(ready_frame(db,p,key,0),p.package.codec);
+    const auto decode=[&](const std::string& raw) {
+        ready_cost_scope observed(canonical_ready_cost_observation::phase::frame_decode);
+        return cr::decode(raw,p.package.codec);
+    };
+    auto first=decode(ready_frame(db,p,key,0));
     const auto* m=std::get_if<cr::manifest>(&first.body);if(!m)refuse("canonical READY first frame is not manifest");
     const auto manifest=*m;
     if(manifest.head!=static_cast<uint64_t>(integer(row,"head")) || manifest.manifest_digest!=ready_blob(row,"manifest_sha") ||
        manifest.protection!=cr::lease{ready_blob(row,"manifest_lease"),static_cast<uint64_t>(integer(row,"manifest_duration"))})
         refuse("canonical READY immutable manifest binding differs");
-    cr::validated_sequence sequence(request.logical,q,manifest,p.package.codec);
+    auto sequence=[&] {
+        ready_cost_scope observed(canonical_ready_cost_observation::phase::sequence_init);
+        return cr::validated_sequence(request.logical,q,manifest,p.package.codec);
+    }();
     picosha2::hash256_one_by_one hash;int64_t wire=0,charge=ready_metadata_charge(row);
     for(int64_t i=0;i<n;++i) {
         if(auto* observation=canonical_ready_test_observation::current)++observation->audited_frames;
         const auto raw=ready_frame(db,p,key,i);wire=ready_add(wire,raw.size());charge=ready_add(charge,ready_add(raw.size(),128));ready_hash_frame(hash,raw);
         if(auto* observation=canonical_ready_read_test_observation::current){++observation->audited_frames;observation->audited_bytes+=raw.size();}
         if(wire>static_cast<int64_t>(p.package.retained_wire_bytes) || charge>p.transfer_bytes)refuse("canonical READY bytes exceed charged cap");
-        const auto frame=cr::decode(raw,p.package.codec);
-        if(frame.logical!=request.logical || frame.route_generation!=ready_route || cr::encode(frame,p.package.codec)!=raw)
+        const auto frame=decode(raw);
+        const auto canonical=[&] {
+            ready_cost_scope observed(canonical_ready_cost_observation::phase::canonical_encode);
+            return cr::encode(frame,p.package.codec);
+        };
+        if(frame.logical!=request.logical || frame.route_generation!=ready_route || canonical()!=raw)
             refuse("canonical READY frame association or canonical bytes differ");
-        if(i)sequence.advance(frame);
+        if(i) {
+            ready_cost_scope observed(canonical_ready_cost_observation::phase::sequence_advance);
+            sequence.advance(frame);
+        }
         if(const auto* page=std::get_if<cr::receipt_page>(&frame.body)) {
             for(const auto& item:page->items) {
                 if(std::holds_alternative<cr::not_committed>(item.value))refuse("canonical READY cannot prove negative receipt");
@@ -301,6 +318,7 @@ void dispose_ready(database& db,const canonical_ready_profile& p,const database:
 }
 }
 void canonical_writer_adapter::verify_ready_retention(database& writer,const context& state,const retention_session& session) {
+    ready_cost_scope observed(canonical_ready_cost_observation::phase::retention_audit);
     if(auto* observation=canonical_ready_read_test_observation::current)++observation->full_audits;
     if(!state.ready || !state.namespaces)refuse("canonical READY profile missing");const auto& p=*state.ready;
     const auto sync=writer.query("PRAGMA main.synchronous"),mode=writer.query("PRAGMA main.journal_mode");
@@ -315,7 +333,9 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
        integer(profiles[0],"max_attempts")!=session.limits.attempts || integer(profiles[0],"max_duration_ms")!=session.limits.duration_ms)
         refuse("canonical READY retention incarnation or policy differs");
     session.verify_binding(profiles[0]);const auto policy=ready_profile_row(writer,p);
-    canonical_change_store store(*state.owner,state.binding,state.profile.limits,state.namespace_profile());store.audit();const auto bounds=store.state();
+    canonical_change_store store(*state.owner,state.binding,state.profile.limits,state.namespace_profile());
+    {ready_cost_scope audit(canonical_ready_cost_observation::phase::store_audit);store.audit();}
+    const auto bounds=store.state();
     const auto attempts=writer.query(retention_attempts_query);
     if(attempts.size()>static_cast<size_t>(session.limits.attempts))refuse("canonical READY ordinary reservation capacity exceeded");
     std::map<int64_t,database::row_t> reservations;
@@ -371,6 +391,7 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
             if(integer(row,"reservation")!=0 || integer(row,"head")!=pin || integer(row,"floor")<0 || integer(row,"floor")>pin)
                 refuse("canonical READY tail pin or captured bounds differ");
             const auto manifest=audit_ready_frames(writer,p,row,[&](const cr::receipt_page& page){
+                ready_cost_scope observed(canonical_ready_cost_observation::phase::receipt_evidence);
                 for(size_t next=0;next<page.items.size();) {
                     std::vector<std::string> ids;
                     std::vector<const cr::receipt_item*> positives;
@@ -379,7 +400,11 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
                         if(std::holds_alternative<cr::committed>(item.value)){ids.push_back(item.original_id);positives.push_back(&item);}
                     }
                     if(ids.empty())continue;
-                    const auto evidence=store.receipt_batch(ids);
+                    const auto evidence=[&] {
+                        ready_cost_scope batch(canonical_ready_cost_observation::phase::receipt_batch);
+                        observe_ready_receipt_batch(ids.size());
+                        return store.receipt_batch(ids);
+                    }();
                     for(size_t i=0;i<positives.size();++i) {
                         const auto& item=*positives[i];const auto* positive=std::get_if<cr::committed>(&item.value);
                         if(auto* observation=canonical_ready_read_test_observation::current)++observation->positive_receipt_lookups;

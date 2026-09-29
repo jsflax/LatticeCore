@@ -6,12 +6,24 @@
 #include <chrono>
 
 namespace lattice::detail {
+namespace canonical_ready_cost_observation {
+// Inclusive elapsed intervals can nest (audit/subphases, evidence/batches).
+// Some phases also occur outside an audit; aggregated totals must not be
+// summed as disjoint time. Fixed passive storage only.
+enum class phase { retention_audit,store_audit,request,sequence_init,raw_fetch_hash,
+    frame_decode,canonical_encode,sequence_advance,receipt_evidence,receipt_batch,count };
+struct observation {
+    std::array<uint64_t,static_cast<size_t>(phase::count)> calls{},microseconds{};
+    uint64_t receipt_batches=0,receipt_batch_ids=0;
+};
+}
 namespace canonical_ready_test_observation {
 // Passive fixed-storage observations only. No callback, SQL, allocation, wait,
 // clock override or authority. A fixture owns/resets this same-thread slot.
 // Times measure real elapsed work and never participate in lease decisions.
 enum class point { entered,prepared,captured,assembled,publish_requested,publish_body,publication_settled,audit_begin,audit_end,finished,count };
 struct observation {
+    canonical_ready_cost_observation::observation cost;
     std::chrono::steady_clock::time_point origin=std::chrono::steady_clock::now();
     std::array<uint64_t,static_cast<size_t>(point::count)> visits{},first_us{},last_us{};
     uint64_t audited_frames=0;
@@ -25,6 +37,7 @@ namespace canonical_ready_read_test_observation {
 // skip validation, change a deadline or invoke a fixture callback.
 enum class point { entered,owned_requested,body_begin,body_end,settled,finished,count };
 struct observation {
+    canonical_ready_cost_observation::observation cost;
     std::chrono::steady_clock::time_point origin=std::chrono::steady_clock::now();
     std::array<uint64_t,static_cast<size_t>(point::count)> visits{},first_us{},last_us{};
     uint64_t index=0,full_audits=0,audited_frames=0,audited_bytes=0,positive_receipt_lookups=0;

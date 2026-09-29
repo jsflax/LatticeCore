@@ -213,6 +213,11 @@ protected:
     lattice::detail::canonical_range::sequence_test_observation::counters last_read_work;
     uint64_t last_read_index=0;
     std::string last_read_bridge_error;
+    static json cost_diagnostic(const lattice::detail::canonical_ready_cost_observation::observation& cost) {
+        return {{"inclusive",true},{"phases",{"retentionAudit","storeAudit","request","sequenceInit","rawFetchHash",
+            "frameDecode","canonicalEncode","sequenceAdvance","receiptEvidence","receiptBatch"}},
+            {"calls",cost.calls},{"microseconds",cost.microseconds},{"receiptBatches",cost.receipt_batches},{"receiptBatchIDs",cost.receipt_batch_ids}};
+    }
     json source_policy(bool large=false){auto p=policy();p["maximumAuthorizationMilliseconds"]=600000;if(large)p["readyProfile"]="bounded48MiBV1";return p;}
     relay_recovery_setup admitted(unsigned replica=1,bool large=false) {
         auto value=open(source_policy(large),connection(replica));if(!value.valid())throw std::runtime_error("actual READY setup failed");
@@ -265,7 +270,7 @@ protected:
                 {"phases",{"entered","prepared","captured","assembled","publishRequested","publishBody","publicationSettled","auditBegin","auditEnd","finished"}},
                 {"visits",trace.visits},{"firstMicroseconds",trace.first_us},{"lastMicroseconds",trace.last_us},{"auditedFrames",trace.audited_frames},
                 {"requestValidations",work.request_validations},{"rebaseBuilds",work.rebase_builds},{"restartObjects",work.restart_objects},
-                {"cursors",work.cursors},{"pageTransitions",work.transitions}};
+                {"cursors",work.cursors},{"pageTransitions",work.transitions},{"subphaseCost",cost_diagnostic(trace.cost)}};
             throw std::runtime_error("READY lease response unavailable: "+diagnostic.dump());
         }
         auto answer=json::parse(result.wire());if(answer.at("leaseAvailable")!=true)throw std::runtime_error("READY lease did not commit: "+answer.dump());return answer;
@@ -288,7 +293,8 @@ protected:
             {"settlement",trace.settlement},{"primaryError",trace.primary_error},{"cleanupError",trace.cleanup_error},
             {"postcommitError",trace.postcommit_error},{"notificationError",trace.notification_error},
             {"requestValidations",work.request_validations},{"rebaseBuilds",work.rebase_builds},
-            {"restartObjects",work.restart_objects},{"cursors",work.cursors},{"pageTransitions",work.transitions}}.dump();
+            {"restartObjects",work.restart_objects},{"cursors",work.cursors},{"pageTransitions",work.transitions},
+            {"subphaseCost",cost_diagnostic(trace.cost)}}.dump();
     }
     ready_wire::frame decode_read(const relay_ready_result& result,const json& d) {
         try{return ready_wire::decode(result.wire(),codec(d));}
@@ -2007,6 +2013,28 @@ TEST_F(AuthenticatedReceiptCoverageV3, ActualAdoptedV3ProofBindsRegisteredProduc
     EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_TRUE(answer.contains("predecessor"));EXPECT_EQ(all_state(),before);EXPECT_EQ(coverage().size(),2u);
     auto wrong=q;std::get<ready_wire::request>(wrong.body).registered_producer->producer=producer(2);seal(wrong,d);control["request"]=ready_wire::encode(wrong,codec(d));
     EXPECT_NE(invoke(setup,control).status_code(),1);EXPECT_EQ(all_state(),before);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReadySession, ReadCostObservationSaturatesWithoutChangingRealBytesOrSettlement) {
+    setup=admitted();const auto e=entry(62001);ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    const auto d=description(setup);auto f=request(d);std::get<ready_wire::request>(f.body).receipts={{e.global_id,std::string("app"),{{e.table_name,e.global_row_id}}}};seal(f,d);
+    const auto offered=lease(setup,f,d);const auto baseline=read(setup,offered,0);ASSERT_TRUE(baseline.publishable());
+    ASSERT_TRUE(std::holds_alternative<ready_wire::manifest>(decode_read(baseline,d).body));const auto before=exact_source();
+    auto command=control("read");for(const auto* name:{"routeGeneration","leaseID","requestDigest","attemptID","sequence"})command[name]=offered.at(name);command["index"]="0";
+    namespace reads=lattice::detail::canonical_ready_read_test_observation;reads::observation trace;
+    const auto maximum=~uint64_t(0);trace.cost.calls.fill(maximum-1);trace.cost.microseconds.fill(maximum);
+    trace.cost.receipt_batches=maximum;trace.cost.receipt_batch_ids=maximum;
+    const auto previous=reads::current;reads::current=&trace;
+    struct reset {reads::observation* previous;~reset(){reads::current=previous;}} restore{previous};
+    const auto result=invoke(setup,command);EXPECT_TRUE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());
+    EXPECT_EQ(trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(trace.full_audits,1u);
+    for(const auto value:trace.cost.calls)EXPECT_EQ(value,maximum);
+    for(const auto value:trace.cost.microseconds)EXPECT_EQ(value,maximum);
+    EXPECT_EQ(trace.cost.receipt_batches,maximum);EXPECT_EQ(trace.cost.receipt_batch_ids,maximum);EXPECT_EQ(exact_source(),before);
 }
 }
 #endif

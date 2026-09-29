@@ -904,3 +904,52 @@ TEST_F(CanonicalLifecycleAdoption, FreshLifecyclePolicyCannotManufactureAnUnreco
     EXPECT_TRUE(owner->db().query("SELECT name FROM pragma_table_xinfo('_lattice_canonical_ready_profile') WHERE name='predecessor'").empty());
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST_F(CanonicalDurableReady, LargerPrivateReceiptPageUsesBounded64IdBatchesInBothFullAudits) {
+    // New private fixture only: a real 65-item receipt page exercises internal
+    // chunking without changing any named profile or existing workload.
+    policy.package.codec.maximum.frame_bytes=65536;policy.package.codec.maximum.items_per_page=128;
+    policy.package.codec.maximum.receipts=128;policy.package.codec.request_entries=128;
+    policy.capture.requests=128;policy.capture.requested_targets=128;
+    policy.capture.rows.wire.rows_per_page=128;policy.capture.rows.wire.total_rows=128;
+    request.budget=policy.package.codec.maximum;seal();attach();const auto admission=admit();
+    for(unsigned i=0;i<65;++i) {
+        const auto e=ready_entry(10000+i,20000+i);import_entry(admission,e);
+        request.receipts.push_back({e.global_id,std::string("application-a"),{{e.table_name,e.global_row_id}}});
+    }
+    seal();const auto offered=prepare(admission);complete(offered);
+    size_t receipt_pages=0;
+    for(const auto& row:owner->db().query("SELECT data FROM _lattice_canonical_ready_frame ORDER BY frame_index")) {
+        const auto& bytes=std::get<std::vector<uint8_t>>(row.at("data"));const auto frame=cr::decode(std::string(bytes.begin(),bytes.end()),policy.package.codec);
+        if(const auto* page=std::get_if<cr::receipt_page>(&frame.body)){++receipt_pages;ASSERT_EQ(page->items.size(),65u);}
+    }
+    ASSERT_EQ(receipt_pages,1u);const auto before=snapshot();
+    namespace reads=canonical_ready_read_test_observation;reads::observation trace;
+    const auto previous=reads::current;reads::current=&trace;
+    struct reset {reads::observation* previous;~reset(){reads::current=previous;}} restore{previous};
+    const auto read=adapter->read_ready_frame_owned(owner,admission,*offered.lease,0);committed(read.settlement);ASSERT_TRUE(read.frame);
+    EXPECT_EQ(trace.full_audits,2u);EXPECT_EQ(trace.positive_receipt_lookups,130u);
+    EXPECT_EQ(trace.cost.receipt_batches,4u);EXPECT_EQ(trace.cost.receipt_batch_ids,130u);
+    using cp=canonical_ready_cost_observation::phase;
+    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::receipt_batch)],4u);
+    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::retention_audit)],2u);
+    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::store_audit)],2u);
+    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(cp::sequence_advance)],2*(offered.transfer->frames-1));
+    EXPECT_EQ(snapshot(),before);
+}
+
+TEST_F(CanonicalDurableReady, UnknownOnlyReceiptPagePerformsNoPositiveBatchQuery) {
+    const auto absent=ready_entry(30000,30001);ask(absent);attach();const auto admission=admit();
+    const auto offered=prepare(admission);complete(offered);const auto before=snapshot();
+    namespace reads=canonical_ready_read_test_observation;reads::observation trace;
+    const auto previous=reads::current;reads::current=&trace;
+    struct reset {reads::observation* previous;~reset(){reads::current=previous;}} restore{previous};
+    const auto read=adapter->read_ready_frame_owned(owner,admission,*offered.lease,0);committed(read.settlement);ASSERT_TRUE(read.frame);
+    EXPECT_EQ(trace.full_audits,2u);EXPECT_EQ(trace.positive_receipt_lookups,0u);
+    EXPECT_EQ(trace.cost.receipt_batches,0u);EXPECT_EQ(trace.cost.receipt_batch_ids,0u);
+    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(canonical_ready_cost_observation::phase::receipt_batch)],0u);
+    EXPECT_EQ(trace.cost.calls[static_cast<size_t>(canonical_ready_cost_observation::phase::receipt_evidence)],2u);
+    EXPECT_EQ(snapshot(),before);
+}
+#endif

@@ -602,6 +602,14 @@ canonical_ready_resume_result canonical_writer_adapter::resume_ready_owned(std::
 }
 canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(std::shared_ptr<lattice_db> owner,const canonical_namespace_admission& admission,
     const canonical_ready_lease& lease,uint64_t index) {
+    return read_ready_frame_impl(std::move(owner),admission,lease,index,ready_read_audit::complete);
+}
+canonical_ready_frame_result canonical_writer_adapter::read_authenticated_ready_frame_owned(std::shared_ptr<lattice_db> owner,const canonical_namespace_admission& admission,
+    const canonical_ready_lease& lease,uint64_t index) {
+    return read_ready_frame_impl(std::move(owner),admission,lease,index,ready_read_audit::authenticated);
+}
+canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_impl(std::shared_ptr<lattice_db> owner,const canonical_namespace_admission& admission,
+    const canonical_ready_lease& lease,uint64_t index,ready_read_audit audit) {
     observe_ready_read(canonical_ready_read_test_observation::point::entered);
     if(auto* observation=canonical_ready_read_test_observation::current){observation->index=index;observation->deadline_ms=lease.deadline_;}
     struct finish_read_observation {~finish_read_observation(){observe_ready_read(canonical_ready_read_test_observation::point::finished);}} observed;
@@ -609,11 +617,17 @@ canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(st
     std::optional<std::string> frame;
     try {
         const auto held=admission;
+        if(audit==ready_read_audit::authenticated && !held.authenticated_)
+            refuse("canonical READY private read requires actual authenticated admission");
         if(!state || !state->ready || !session || lease.session_.lock()!=session || lease.context_.lock()!=state || lease.incarnation_!=session->incarnation)
             refuse("canonical READY old or foreign physical lease");
         validate_namespace_admission(owner,writer,state,held);
         observe_ready_read(canonical_ready_read_test_observation::point::owned_requested);
-        result.settlement=retention_owned(owner,writer,state,session,ready_read,[&](database& actual,retention_session& clock){
+        // Injected authorizer callbacks are not part of the closed-body proof.
+        // The complete original path remains available for their fault tests.
+        const auto operation=audit==ready_read_audit::authenticated &&
+            !canonical_upstream_test_hooks::fault && !canonical_retention_test_hooks::fault ? ready_authenticated_read : ready_read;
+        result.settlement=retention_owned(owner,writer,state,session,operation,[&](database& actual,retention_session& clock){
             observe_ready_read(canonical_ready_read_test_observation::point::body_begin);
             if(auto* observation=canonical_ready_read_test_observation::current)
                 observation->clock_before_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-clock.started).count();
@@ -632,6 +646,7 @@ canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(st
                 refuse("canonical READY route envelope exceeds frozen request frame budget");
             // This byte return is still not a transport handoff. The future
             // controller must revalidate its authenticated route at send time.
+            if(operation==ready_authenticated_read)clock.verify_file(actual);
             validate_namespace_admission(owner,writer,state,held);if(clock.now()>=lease.deadline_)refuse("canonical READY frame lease expired while reading");
             if(auto* observation=canonical_ready_read_test_observation::current)
                 observation->clock_after_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-clock.started).count();

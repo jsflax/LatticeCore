@@ -114,6 +114,13 @@ class canonical_writer_adapter {
     recovery_install_result expire_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&);
     recovery_install_result discard_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
         const canonical_range::attempt&,const canonical_range::request&);
+    // Only the actual authenticated setup reaches the closed addressed body.
+    // Direct/source-owner reads retain both full audits; no caller skip switch.
+    enum class ready_read_audit { complete, authenticated };
+    canonical_ready_frame_result read_authenticated_ready_frame_owned(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_ready_lease&,uint64_t);
+    canonical_ready_frame_result read_ready_frame_impl(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_ready_lease&,uint64_t,ready_read_audit);
     std::vector<std::string> apply_upstream_impl(std::shared_ptr<lattice_db>,
         const std::vector<audit_log_entry>&, const std::optional<std::string>&,
         const canonical_namespace_admission*);

@@ -4,6 +4,8 @@ namespace {
 constexpr int retention_bootstrap=1, retention_reserve=2, retention_release=3, retention_expire=4, retention_prune=5;
 constexpr int ready_prepare=6,ready_publish=7,ready_resume=8,ready_read=9,ready_abandon=10;
 constexpr int receipt_migrate=11;
+// Private closed addressed-read body only; never a caller-provided witness.
+constexpr int ready_authenticated_read=12;
 using retention_inventory=std::map<std::pair<std::string,std::string>,std::string>;
 void append_ready_schema(retention_inventory&);
 void validate_ready_profile(const canonical_ready_profile&,const canonical_writer_profile&,const canonical_retention_limits&,bool registered_profile=false);
@@ -331,7 +333,18 @@ recovery_install_result canonical_writer_adapter::retention_owned(std::shared_pt
             verify_retention(actual,*state,*session);
             retention_frame authority(*state,operation);
             body(actual,*session);
-            verify_retention(actual,*state,*session);
+            if(operation!=ready_authenticated_read || canonical_upstream_test_hooks::fault || canonical_retention_test_hooks::fault)
+                verify_retention(actual,*state,*session);
+            else {
+                // The private addressed body rechecks physical custody, its
+                // admission and finite lease after its two fixed SELECTs.
+                // BEGIN IMMEDIATE and maintenance_scope exclude other admitted
+                // SQL writers through settlement. This is no cross-call cache
+                // or claim that inode custody authenticates racing raw writes.
+                std::lock_guard<std::mutex> publication(owner->connection_ownership_mutex_);
+                if(owner->closed_.load() || owner->db_!=writer || &actual!=writer.get() ||
+                   !matches_connection(actual,state->connection))refuse("canonical READY source changed after addressed read");
+            }
             if(!state->active->load(std::memory_order_acquire))refuse("canonical retention retired before owned settlement");
         });
     } catch(...) {refused.primary_error=std::current_exception();return refused;}

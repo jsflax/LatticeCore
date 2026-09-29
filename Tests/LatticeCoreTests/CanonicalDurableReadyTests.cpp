@@ -1068,9 +1068,9 @@ TEST(ReadyByteRangeSHA, OrderedDecimalLengthPackageFramingMatchesOriginalIncreme
 }
 
 TEST_F(CanonicalDurableReady, StoredFrameAndPackageHashesMatchVendorAndActualReadStillAuditsAllBytes) {
-    attach();auto admission=admit();const auto first=ready_entry(98101,98201,std::string(1536,'a'));
-    import_entry(admission,first);import_entry(admission,ready_entry(98102,98202,std::string(1536,'b')));
-    import_entry(admission,ready_entry(98103,98203,std::string(1536,'c')));ask(first);
+    attach();auto admission=admit();const auto first=ready_entry(98101,98201,std::string(1024,'a'));
+    import_entry(admission,first);import_entry(admission,ready_entry(98102,98202,std::string(1024,'b')));
+    import_entry(admission,ready_entry(98103,98203,std::string(1024,'c')));ask(first);
     const auto offered=prepare(admission);complete(offered);const auto before=snapshot();
     const auto stored=owner->db().query("SELECT data,sha256 FROM _lattice_canonical_ready_frame ORDER BY frame_index");
     const auto transfers=owner->db().query("SELECT frames_sha FROM _lattice_canonical_ready_transfer");

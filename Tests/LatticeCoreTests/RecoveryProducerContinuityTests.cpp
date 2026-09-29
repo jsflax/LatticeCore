@@ -873,9 +873,9 @@ void negotiated_open_after_dial(const std::shared_ptr<negotiated_attempt>& attem
     // platform dial publishes this callback; never fabricate or buffer open.
     const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
     for(;;) {
-        bool published=false;
-        {std::lock_guard lock(attempt->wire->mutex);published=bool(attempt->wire->opened);}
-        if(published){attempt->wire->open();return;}
+        sync_transport::on_open_handler published;
+        {std::lock_guard lock(attempt->wire->mutex);published=attempt->wire->opened;}
+        if(published){attempt->wire->state=transport_state::open;published();return;}
         if(std::chrono::steady_clock::now()>=deadline)throw db_error("negotiated fixture actual dial did not publish within five seconds");
         // A configured child already owns a dedicated worker; manual fixtures
         // execute their real queued jobs using the existing 1ms pump style.

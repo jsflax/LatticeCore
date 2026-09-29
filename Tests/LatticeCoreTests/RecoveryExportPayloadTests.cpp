@@ -2,6 +2,7 @@
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include <condition_variable>
 #include <deque>
+#include <utility>
 
 #ifndef __EMSCRIPTEN__
 struct ExportPayloadDoc {std::string title;std::string body;};
@@ -49,6 +50,7 @@ struct payload_pause {
 struct payload_wire_state {
     std::mutex mutex;sync_transport::on_open_handler opened;sync_transport::on_message_handler message;
     std::vector<std::string> frames;bool throw_send=false;std::atomic<transport_state> state{transport_state::closed};
+    std::atomic<size_t> successful_sends{0};
     void open(){sync_transport::on_open_handler callback;{std::lock_guard<std::mutex> lock(mutex);callback=opened;}state=transport_state::open;callback();}
     void ack(const std::string& original) {
         sync_transport::on_message_handler callback;{std::lock_guard<std::mutex> lock(mutex);callback=message;}
@@ -69,6 +71,7 @@ public:
     void send(const transport_message& frame)override {
         bool fail;{std::lock_guard<std::mutex> lock(shared_->mutex);shared_->frames.push_back(frame.as_string());fail=shared_->throw_send;}
         if(fail)throw std::runtime_error("actual payload send interrupted");
+        ++shared_->successful_sends;
     }
     void set_on_open(on_open_handler fn)override{std::lock_guard<std::mutex> lock(shared_->mutex);shared_->opened=std::move(fn);}
     void set_on_message(on_message_handler fn)override{std::lock_guard<std::mutex> lock(shared_->mutex);shared_->message=std::move(fn);}
@@ -82,13 +85,21 @@ public:
     void page_size(size_t n){config_.chunk_size=n;}
 };
 struct payload_ack_hold {
-    std::mutex mutex;std::condition_variable changed;bool released=false,timed_out=false;size_t completed=0;
-    void wait(){std::unique_lock<std::mutex> lock(mutex);if(!changed.wait_for(lock,5s,[&]{return released;})){timed_out=true;throw std::runtime_error("payload ACK gate timed out");}}
+    std::mutex mutex;std::condition_variable changed;bool released=false,timed_out=false,schedule_retired=true;size_t started=0,completed=0;
+    void wait(){std::unique_lock<std::mutex> lock(mutex);++started;changed.notify_all();if(!changed.wait_for(lock,5s,[&]{return released;})){timed_out=true;throw std::runtime_error("payload ACK gate timed out");}}
     void finish(){std::lock_guard<std::mutex> lock(mutex);++completed;changed.notify_all();}
-    bool release_and_wait(size_t expected){
+    void retire(){std::lock_guard<std::mutex> lock(mutex);schedule_retired=true;changed.notify_all();}
+    bool release_and_wait(){
         std::unique_lock<std::mutex> lock(mutex);released=true;changed.notify_all();
-        return changed.wait_for(lock,5s,[&]{return completed==expected;})&&!timed_out;
+        return changed.wait_for(lock,5s,[&]{return schedule_retired&&completed==started;})&&!timed_out;
     }
+    auto counts(){std::lock_guard<std::mutex> lock(mutex);return std::pair{started,completed};}
+};
+struct payload_ack_custody {
+    std::shared_ptr<payload_ack_hold> hold;
+    explicit payload_ack_custody(std::shared_ptr<payload_ack_hold> value):hold(std::move(value)){
+        std::lock_guard<std::mutex> lock(hold->mutex);hold->schedule_retired=false;}
+    ~payload_ack_custody(){hold->retire();}
 };
 thread_local std::function<void()> payload_after_claim;
 struct payload_claim_hook {
@@ -128,13 +139,16 @@ protected:
         }));
         payload_commit(recovery_local_producer_adapter::enroll_for_qualification(owner,
             {address,{"ExportPayloadDoc","ExportPayloadRoot","ExportPayloadLeaf"},{'p'}},caps));
-        const auto hold=ack_hold;auto hook=std::make_shared<sync_background_test_hooks::ack_schedule>();
-        hook->before_expiry=[hold]{hold->wait();};hook->completed=[hold]{hold->finish();};sync_background_test_hooks::ack=std::move(hook);
+        const auto custody=std::make_shared<payload_ack_custody>(ack_hold);auto hook=std::make_shared<sync_background_test_hooks::ack_schedule>();
+        hook->before_expiry=[custody]{custody->hold->wait();};hook->completed=[custody]{custody->hold->finish();};sync_background_test_hooks::ack=std::move(hook);
         sender->connect();transport->open();ASSERT_TRUE(transport->sent().empty());
     }
     void TearDown()override {
-        sender.reset();EXPECT_TRUE(ack_hold->release_and_wait(transport->sent().size()));
-        sync_background_test_hooks::ack=std::move(prior_ack);queue->shutdown();
+        sender.reset();sync_background_test_hooks::ack=std::move(prior_ack);
+        // Hook retirement also accounts for a worker that has not started yet.
+        EXPECT_TRUE(ack_hold->release_and_wait());const auto [started,completed]=ack_hold->counts();
+        EXPECT_EQ(started,transport->successful_sends.load());EXPECT_EQ(completed,started);
+        queue->shutdown();
     }
     void send(){sender->drain(std::chrono::steady_clock::now());}
     std::vector<database::row_t> originals(){return owner->db().query("SELECT * FROM AuditLog ORDER BY id");}

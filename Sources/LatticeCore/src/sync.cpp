@@ -1409,6 +1409,12 @@ sync_drain_result synchronizer_base::drain_checked(std::chrono::steady_clock::ti
             if(unit.attempts&&std::chrono::steady_clock::now()>=deadline) {
                 completion->cancel(detail::sync_discovery_completion::outcome::expired);return true;
             }
+            // This FIFO turn has reached the caller's actual upload pass.
+            // Preserve sync_now's explicit pending-describe refusal rather
+            // than treating an unavailable negotiated source as an empty send.
+            if(is_connected_&&receiver_source_&&continuous_route_&&
+               !receiver_source_->capture_upload(unit.generation))
+                throw db_error("sync upload is pending authenticated source describe");
             return upload_pending_changes_step(*continuation,&unit);
         };
         bool enqueued=false;

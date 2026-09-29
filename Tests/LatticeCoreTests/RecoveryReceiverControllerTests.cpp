@@ -231,8 +231,25 @@ protected:
         }
         return true;
     }
+    void report_until_failure() noexcept {
+        // Failure-only copies of already observed fixture facts. No owner,
+        // SQLite, transport, controller inspection or extra predicate call.
+        try {
+            json observation={{"handled",handled},{"dropped",dropped},{"requestCount",requests.size()},
+                {"heldUploadCount",held_uploads.size()},{"observedUploadCount",observed_uploads.size()}};
+            json messages=json::array();size_t total=0;
+            {
+                std::lock_guard lock(errors_mutex);total=errors.size();
+                for(size_t i=0;i<std::min<size_t>(total,16);++i)messages.push_back(errors[i].substr(0,512));
+            }
+            observation["errorCount"]=total;observation["errors"]=std::move(messages);
+            observation["errorsTruncated"]=total>16;
+            std::cerr<<"controller timeout observation: "<<observation.dump()<<std::endl;
+        }catch(...){/* Observation cannot alter the original failure result. */}
+    }
     template<class F> bool until(F predicate,int milliseconds=5000) {const auto end=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
-        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;std::this_thread::sleep_for(std::chrono::milliseconds(2));}return predicate();}
+        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+        const bool result=predicate();if(!result)report_until_failure();return result;}
     int64_t scalar(lattice_db& owner,const std::string& sql){return std::get<int64_t>(owner.db().query(sql).at(0).at("n"));}
     int64_t phase(){return scalar(*receiver,"SELECT phase AS n FROM _lattice_producer_continuity");}
     bool has_error(){std::lock_guard lock(errors_mutex);return !errors.empty();}

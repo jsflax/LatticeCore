@@ -1704,7 +1704,7 @@ TEST_F(AuthenticatedLifecycleFileAdministration, ActualFactoryKeepsLargePreparin
     auto ordinary=adapter->reserve_recovery_owned(owner,head,10000);ASSERT_EQ(ordinary.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(ordinary.reservation);
     ASSERT_EQ(count("_lattice_canonical_attempt"),2);ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);
     const auto before=retained(read_file(file.str()));adapter.reset();int published=0,observed=0;
-    const auto hook=owner->add_invalidation_hook([&](const auto&,auto){++published;});
+    const auto hook=owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++published;});
     {
         LifecycleBeforeWrite inspect([&](lattice_db& actual){++observed;EXPECT_NE(&actual,owner.get());
             instance_registry::instance().for_each_alive(file.str(),[&](lattice_db* value){EXPECT_NE(value,&actual);});

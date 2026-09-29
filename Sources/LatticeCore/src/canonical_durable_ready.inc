@@ -524,13 +524,20 @@ std::vector<sync_recovery::canonical_capture_request> ready_capture_requests(con
     }
     return out;
 }
+// The strict wrapper and the immediate addressed-read caller own this exact
+// decoded frame and const row. This comparison never imports a proof or cache.
+void ready_require_decoded_identity(const database::row_t& row,const cr::frame& frozen,const cr::attempt& attempt,
+    const std::string& request_bytes,const canonical_namespace_entry& admission,const std::string& replica,
+    const std::optional<recovery_receipt_binding>& binding) {
+    if(std::get<cr::request>(frozen.body).registered_producer!=binding||frozen.logical!=attempt || ready_blob(row,"request")!=request_bytes || ready_blob(row,"namespace_id")!=admission.namespace_id ||
+       ready_blob(row,"coverage_id")!=admission.coverage_id || integer(row,"coverage_revision")!=admission.revision || ready_blob(row,"replica")!=replica)
+        refuse("canonical READY logical request or coverage changed; abandon and use a new attempt");
+}
 void ready_require_identity(const database::row_t& row,const canonical_ready_profile& p,const cr::attempt& attempt,
     const std::string& request_bytes,const canonical_namespace_entry& admission,const std::string& replica,
     const std::optional<recovery_receipt_binding>& binding) {
     const auto frozen=ready_request(row,p);
-    if(std::get<cr::request>(frozen.body).registered_producer!=binding||frozen.logical!=attempt || ready_blob(row,"request")!=request_bytes || ready_blob(row,"namespace_id")!=admission.namespace_id ||
-       ready_blob(row,"coverage_id")!=admission.coverage_id || integer(row,"coverage_revision")!=admission.revision || ready_blob(row,"replica")!=replica)
-        refuse("canonical READY logical request or coverage changed; abandon and use a new attempt");
+    ready_require_decoded_identity(row,frozen,attempt,request_bytes,admission,replica,binding);
 }
 }
 canonical_ready_result canonical_writer_adapter::prepare_ready_owned(std::shared_ptr<lattice_db> owner,const canonical_namespace_admission& admission,
@@ -760,7 +767,7 @@ canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_impl(std
                 observation->clock_before_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-clock.started).count();
             validate_namespace_admission(owner,writer,state,held);const auto& p=*state->ready;
             const auto row=ready_row(actual,p,lease.identity_.binding_);const auto frozen=ready_request(row,p);
-            ready_require_identity(row,p,frozen.logical,ready_blob(row,"request"),held.namespace_,held.replica_,held.receipt_binding_);
+            ready_require_decoded_identity(row,frozen,frozen.logical,ready_blob(row,"request"),held.namespace_,held.replica_,held.receipt_binding_);
             if(integer(row,"state")!=ready_complete || integer(row,"sequence")!=lease.identity_.sequence_ ||
                std::get<cr::request>(frozen.body).request_digest!=lease.identity_.request_digest_ ||
                integer(row,"lease_incarnation")!=lease.incarnation_ || integer(row,"lease_sequence")!=lease.sequence_ ||

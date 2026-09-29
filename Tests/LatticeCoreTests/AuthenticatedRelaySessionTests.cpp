@@ -1715,11 +1715,11 @@ TEST_F(AuthenticatedLifecycleFileAdministration, RegisteredTwoNamespaceCapsulesA
     for(auto* f:{&qa,&qb}){auto& request=std::get<ready_wire::request>(f->body);const std::string ns=f==&qa?"app":"other";
         f->version=3;request.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};request.receipt_namespace=ns;
         request.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};}
-    seal(qa,a);seal(qb,b);(void)lease(setup,qa,a);(void)lease(other,qb,b);
+    seal(qa,a);seal(qb,b);(void)lease(setup,qa,a,"prepare",1000);(void)lease(other,qb,b,"prepare",1000);
     const auto before=retained(read_file(file.str()));other.close_on_io();other={};setup.close_on_io();setup={};
     const auto result=adopt_file(covered_policy());committed(result);EXPECT_EQ(retained(read_file(file.str())),before);
     setup=open(lifecycle(covered_policy()),connection());ASSERT_TRUE(setup.valid());ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));
-    const auto current=description(setup);qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume");
+    const auto current=description(setup);qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume",1000);
     size_t positives=0;for(uint64_t i=0;i<std::stoull(resumed.at("frames").get<std::string>());++i){const auto actual=read(setup,resumed,i);ASSERT_TRUE(actual.publishable());
         auto f=decode_read(actual,current);if(auto* page=std::get_if<ready_wire::receipt_page>(&f.body))for(const auto& item:page->items){EXPECT_TRUE(std::holds_alternative<ready_wire::committed>(item.value));EXPECT_EQ(item.operation_digest,e.original_identity->digest);++positives;}}
     EXPECT_EQ(positives,1u);EXPECT_EQ(coverage().size(),2u);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);

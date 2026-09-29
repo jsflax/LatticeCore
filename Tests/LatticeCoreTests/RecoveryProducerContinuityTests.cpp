@@ -10,6 +10,8 @@
 #include <optional>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdio>
+#include <limits>
 #include <future>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -791,6 +793,30 @@ TEST_F(RecoveryProducerContinuity, ReadOnlyProtectedRouteRefusesBeforeFactoryPub
 
 namespace {
 using negotiated_json=nlohmann::json;
+// Opt-in failure-only scalar timing. No SQL, payload parsing or retained IDs.
+struct negotiated_phase_trace {
+    enum phase {begin,claim_precommit,claim_committed,handoff,publication,worker_entered,worker_expired,worker_finished,window_observed,ack_requested,permits_released,cleanup_released};
+    struct sample {uint64_t micros=0;unsigned stage=0;size_t first=0,second=0;};
+    std::mutex mutex;std::array<sample,64> samples{};size_t count=0,omitted=0;
+    const std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
+    void record(phase stage,size_t first=0,size_t second=0)noexcept {
+        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-started).count();
+        std::lock_guard lock(mutex);
+        if(count==samples.size()){if(omitted!=std::numeric_limits<size_t>::max())++omitted;return;}
+        samples[count++]={elapsed>0?static_cast<uint64_t>(elapsed):0,static_cast<unsigned>(stage),first,second};
+    }
+};
+struct negotiated_failure_phases {
+    std::shared_ptr<negotiated_phase_trace> trace=std::make_shared<negotiated_phase_trace>();
+    ~negotiated_failure_phases(){
+        if(!::testing::Test::HasFailure())return;
+        std::array<negotiated_phase_trace::sample,64> samples;size_t count,omitted;
+        {std::lock_guard lock(trace->mutex);samples=trace->samples;count=trace->count;omitted=trace->omitted;}
+        std::fprintf(stderr,"LATTICE_UPLOAD_PHASE {\"version\":1,\"case\":\"twoThousandWindow\",\"omitted\":%zu,\"samples\":[",omitted);
+        for(size_t i=0;i<count;++i)std::fprintf(stderr,"%s[%llu,%u,%zu,%zu]",i?",":"",static_cast<unsigned long long>(samples[i].micros),samples[i].stage,samples[i].first,samples[i].second);
+        std::fprintf(stderr,"]}\n");
+    }
+};
 // New negotiated fixture: one permit follows each actual ACK commit, so
 // already ACKed retry workers do not remain held during later page selection.
 // The original fixture and its 30-second/5-second deadlines remain unchanged.
@@ -802,12 +828,16 @@ struct negotiated_ack_pause {
     std::shared_ptr<continuity_factory> factory;
     size_t extra_attempts=0;
     std::function<void()> close_configured;
-    negotiated_ack_pause(std::vector<std::unique_ptr<synchronizer>>& s,std::shared_ptr<continuity_factory> f):senders(s),factory(std::move(f)){
+    std::shared_ptr<negotiated_phase_trace> phases;
+    negotiated_ack_pause(std::vector<std::unique_ptr<synchronizer>>& s,std::shared_ptr<continuity_factory> f,std::shared_ptr<negotiated_phase_trace> trace={}):senders(s),factory(std::move(f)),phases(std::move(trace)){
         const auto gate=held;auto schedule=std::make_shared<sync_background_test_hooks::ack_schedule>();
-        schedule->before_expiry=[gate]{std::unique_lock lock(gate->mutex);const auto ticket=gate->started++;gate->ready.notify_all();
+        schedule->before_expiry=[gate,phases=phases]{std::unique_lock lock(gate->mutex);const auto ticket=gate->started++;gate->ready.notify_all();
+            if(phases)phases->record(negotiated_phase_trace::worker_entered,ticket,gate->permits);
             if(!gate->ready.wait_for(lock,std::chrono::seconds(30),[&]{return gate->released||ticket<gate->permits;})){
+                if(phases)phases->record(negotiated_phase_trace::worker_expired,ticket,gate->permits);
                 gate->timed_out=true;throw db_error("negotiated fixture individual ACK hold expired");}};
-        schedule->completed=[gate]{std::lock_guard lock(gate->mutex);++gate->finished;gate->ready.notify_all();};
+        schedule->completed=[gate,phases=phases]{std::lock_guard lock(gate->mutex);++gate->finished;gate->ready.notify_all();
+            if(phases)phases->record(negotiated_phase_trace::worker_finished,gate->finished,gate->permits);};
         sync_background_test_hooks::ack=std::move(schedule);
     }
     void acknowledged(){std::unique_lock lock(held->mutex);++held->permits;held->ready.notify_all();
@@ -822,6 +852,7 @@ struct negotiated_ack_pause {
         if(held->started!=total)throw db_error("negotiated emitted-prefix worker inventory differs");}
     void acknowledged_prefix(size_t total){std::unique_lock lock(held->mutex);
         if(total<held->permits||total>held->started)throw db_error("negotiated ACK prefix was not witnessed");
+        if(phases)phases->record(negotiated_phase_trace::permits_released,total,held->started);
         held->permits=total;held->ready.notify_all();
         if(!held->ready.wait_for(lock,std::chrono::seconds(5),[&]{return held->finished==total;}))
             throw db_error("negotiated ACK prefix workers did not settle");}
@@ -830,6 +861,7 @@ struct negotiated_ack_pause {
         senders.clear();sync_background_test_hooks::ack=prior;
         size_t expected=extra_attempts;for(const auto& wire:factory->wires)expected+=wire->audit_batches().size();
         std::unique_lock lock(held->mutex);held->released=true;held->ready.notify_all();
+        if(phases)phases->record(negotiated_phase_trace::cleanup_released,held->started,held->finished);
         const bool completed=held->ready.wait_for(lock,std::chrono::seconds(5),[&]{return held->finished==expected;});
         const bool timed_out=held->timed_out;const auto started=held->started;lock.unlock();
         EXPECT_TRUE(completed);EXPECT_EQ(started,expected);EXPECT_FALSE(timed_out);
@@ -879,6 +911,51 @@ struct negotiated_attempt {
     std::function<void()> after_publication;
     sync_transport* transport=nullptr; // fixture observation while sender owns it
     platform_transport_callbacks current(){std::lock_guard lock(mutex);return endpoints.back();}
+};
+struct negotiated_publication_scope {
+    std::shared_ptr<negotiated_attempt> attempt;std::function<void()> prior;
+    negotiated_publication_scope(std::shared_ptr<negotiated_attempt> value,std::function<void()> callback):attempt(std::move(value)){
+        std::lock_guard lock(attempt->mutex);prior=std::move(attempt->after_publication);attempt->after_publication=std::move(callback);
+    }
+    ~negotiated_publication_scope(){std::function<void()> old;{std::lock_guard lock(attempt->mutex);old=std::move(attempt->after_publication);attempt->after_publication=std::move(prior);}}
+};
+// Each launcher captures its schedule before foreign send. Separate schedules
+// distinguish the outer inline ACK from the nested queue-owned prefix.
+struct foreground_prefix_workers {
+    struct state {std::mutex mutex;std::condition_variable ready;size_t started=0,finished=0;bool released=false,timed_out=false,retired=false;};
+    struct custody {std::shared_ptr<state> held;~custody(){std::lock_guard lock(held->mutex);held->retired=true;held->ready.notify_all();}};
+    std::array<std::shared_ptr<state>,2> held{std::make_shared<state>(),std::make_shared<state>()};
+    std::array<std::shared_ptr<const sync_background_test_hooks::ack_schedule>,2> schedules;
+    std::shared_ptr<const sync_background_test_hooks::ack_schedule> prior=sync_background_test_hooks::ack;
+    std::vector<std::unique_ptr<synchronizer>>& senders;
+    explicit foreground_prefix_workers(std::vector<std::unique_ptr<synchronizer>>& value):senders(value){
+        for(size_t i=0;i<held.size();++i){const auto gate=held[i];auto owner=std::make_shared<custody>();owner->held=gate;
+            auto schedule=std::make_shared<sync_background_test_hooks::ack_schedule>();
+            schedule->before_expiry=[gate,owner]{std::unique_lock lock(gate->mutex);++gate->started;gate->ready.notify_all();
+                if(!gate->ready.wait_for(lock,std::chrono::seconds(5),[&]{return gate->released;})){gate->timed_out=true;throw db_error("foreground prefix worker hold expired");}};
+            schedule->completed=[gate,owner]{std::lock_guard lock(gate->mutex);++gate->finished;gate->ready.notify_all();};
+            schedules[i]=std::move(schedule);
+        }
+    }
+    void select(size_t index){sync_background_test_hooks::ack=schedules.at(index);}
+    std::pair<size_t,size_t> counts(size_t index){const auto gate=held.at(index);std::lock_guard lock(gate->mutex);return {gate->started,gate->finished};}
+    void retire_first(){const auto gate=held[0];{std::lock_guard lock(gate->mutex);gate->released=true;gate->ready.notify_all();}schedules[0].reset();
+        std::unique_lock lock(gate->mutex);
+        if(!gate->ready.wait_for(lock,std::chrono::seconds(5),[&]{return gate->retired&&gate->finished==gate->started;}))throw db_error("inline ACK schedule did not retire");
+        if(gate->started!=0||gate->timed_out)throw db_error("committed inline ACK unexpectedly launched retry work");}
+    void await_second(){const auto gate=held[1];std::unique_lock lock(gate->mutex);
+        if(!gate->ready.wait_for(lock,std::chrono::seconds(5),[&]{return gate->started!=0;}))throw db_error("queued ACK prefix worker did not start");
+        if(gate->started!=1||gate->finished!=0||gate->timed_out)throw db_error("queued ACK prefix worker inventory differs");}
+    void finish_second(){const auto gate=held[1];std::unique_lock lock(gate->mutex);gate->released=true;gate->ready.notify_all();
+        if(!gate->ready.wait_for(lock,std::chrono::seconds(5),[&]{return gate->finished==1;}))throw db_error("queued ACK prefix worker did not settle");
+        if(gate->started!=1||gate->timed_out)throw db_error("queued ACK prefix worker expired or duplicated");}
+    ~foreground_prefix_workers(){
+        senders.clear();sync_background_test_hooks::ack=prior;schedules={};
+        for(const auto& gate:held){std::lock_guard lock(gate->mutex);gate->released=true;gate->ready.notify_all();}
+        for(const auto& gate:held){std::unique_lock lock(gate->mutex);
+            const bool complete=gate->ready.wait_for(lock,std::chrono::seconds(5),[&]{return gate->retired&&gate->finished==gate->started;});
+            const bool timed_out=gate->timed_out;lock.unlock();EXPECT_TRUE(complete);EXPECT_FALSE(timed_out);}
+    }
 };
 class negotiated_factory final:public network_factory {
     std::shared_ptr<continuity_factory> inventory_;
@@ -954,6 +1031,22 @@ struct negotiated_precommit_hook_scope {
     void (*prior)()=recovery_export_test_hooks::before_claim_commit;
     explicit negotiated_precommit_hook_scope(std::function<void()> work){negotiated_claim_hook=std::move(work);recovery_export_test_hooks::before_claim_commit=[] {negotiated_claim_hook();};}
     ~negotiated_precommit_hook_scope(){recovery_export_test_hooks::before_claim_commit=prior;negotiated_claim_hook={};}
+};
+struct negotiated_phase_hooks {
+    std::shared_ptr<negotiated_phase_trace> trace;size_t before=0,after=0,sent=0;
+    negotiated_phase_hooks* previous=current;
+    void(*pre)()=recovery_export_test_hooks::before_claim_commit;
+    void(*post)()=recovery_export_test_hooks::after_claim_commit;
+    void(*handoff)(const transport_message&)=recovery_export_test_hooks::automatic_handoff_observed;
+    inline static thread_local negotiated_phase_hooks* current=nullptr;
+    explicit negotiated_phase_hooks(std::shared_ptr<negotiated_phase_trace> value):trace(std::move(value)){
+        current=this;
+        recovery_export_test_hooks::before_claim_commit=[] {auto* scope=current;scope->trace->record(negotiated_phase_trace::claim_precommit,++scope->before);if(scope->pre)scope->pre();};
+        recovery_export_test_hooks::after_claim_commit=[] {auto* scope=current;scope->trace->record(negotiated_phase_trace::claim_committed,++scope->after);if(scope->post)scope->post();};
+        recovery_export_test_hooks::automatic_handoff_observed=[](const auto& frame){auto* scope=current;scope->trace->record(negotiated_phase_trace::handoff,++scope->sent);if(scope->handoff)scope->handoff(frame);};
+    }
+    ~negotiated_phase_hooks(){recovery_export_test_hooks::before_claim_commit=pre;recovery_export_test_hooks::after_claim_commit=post;
+        recovery_export_test_hooks::automatic_handoff_observed=handoff;current=previous;}
 };
 bool negotiated_ids_retired(synchronizer&,const std::vector<std::string>&);
 class RecoveryNegotiatedExport:public RecoveryProducerContinuity {
@@ -1722,12 +1815,12 @@ struct automatic_export_admission_test_access {
         uintptr_t work=0;unsigned attempts=0;size_t charge=0,count=0,bytes=0;
         sync_discovery_operation::clock::time_point deadline{};
         sync_discovery_kind kind=sync_discovery_kind::upload;
-        bool failed=false,has_completion=false;
+        bool failed=false,has_completion=false,active=false;
         std::map<std::string,std::pair<int64_t,uint64_t>> registrations;
     };
     static state read(synchronizer_base& sync) {
         state result;const auto queue=sync.discovery_deferral_;
-        {std::lock_guard lock(queue->mutex_);result.count=queue->count_;result.bytes=queue->bytes_;result.failed=queue->failed_;
+        {std::lock_guard lock(queue->mutex_);result.count=queue->count_;result.bytes=queue->bytes_;result.failed=queue->failed_;result.active=queue->active_;
             if(queue->count_){const auto& work=queue->slots_[queue->head_];result.work=reinterpret_cast<uintptr_t>(work.get());
                 result.attempts=work->attempts;result.charge=work->charge;result.deadline=work->deadline;result.kind=work->type;result.has_completion=bool(work->completion);}}
         {std::lock_guard lock(sync.in_flight_mutex_);for(const auto& [id,audit]:sync.in_flight_ids_)
@@ -2052,25 +2145,30 @@ TEST_F(RecoveryAutomaticExportReadAdmission, PositivePrefixContinuesWithBothActu
     EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),originals);EXPECT_TRUE(errors.empty());
 }
 TEST_F(RecoveryAutomaticExportReadAdmission, TwoThousandWindowRequiresRealPartialAckBeforeLastThree) {
-    negotiated_ack_pause pause(senders,factory);constexpr size_t count=2003;
+    negotiated_failure_phases diagnostic;negotiated_ack_pause pause(senders,factory,diagnostic.trace);constexpr size_t count=2003;
     policy.limits.obligations.records=2*(count+1);policy.limits.obligations.encoded_bytes=64*1024*1024;
     policy.limits.producers.stamps=2*(count+1);policy.limits.producers.encoded_bytes=64*1024*1024;
     policy.frozen_entries=2*(count+1);policy.frozen_bytes=64*1024*1024;
     open();std::vector<ContinuousSharedRow> rows(count,ContinuousSharedRow{"window"});owner->add_bulk(std::move(rows));
-    const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");start();auto limit=caps();limit["maximumEntries"]=1000;accept(limit);
+    const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");start();auto limit=caps();limit["maximumEntries"]=1000;
+    negotiated_phase_hooks phases(diagnostic.trace);
+    negotiated_publication_scope publications(platform->attempts[0],[trace=diagnostic.trace,ordinal=std::make_shared<std::atomic<size_t>>(0)]{trace->record(negotiated_phase_trace::publication,ordinal->fetch_add(1)+1);});
+    diagnostic.trace->record(negotiated_phase_trace::begin);accept(limit);
     // Four-turn dispatch can leave later selection for the real pacer. Observe
     // its actual saturated registrations before inspecting the complete prefix.
     ASSERT_TRUE(until([&]{return observed().registrations.size()==2000u;}));queue->drain();
     auto batches=factory->wires[0]->audit_batches();ASSERT_FALSE(batches.empty());size_t prefix=0;
     for(const auto& batch:batches){ASSERT_FALSE(batch.empty());ASSERT_LE(batch.size(),1000u);prefix+=batch.size();}
+    diagnostic.trace->record(negotiated_phase_trace::window_observed,prefix,batches.size());
     ASSERT_EQ(prefix,2000u);const auto initial_windows=batches.size();pause.await_started(initial_windows);
     EXPECT_EQ(observed().registrations.size(),2000u);EXPECT_EQ(claimed(),4000);const auto first_size=batches[0].size();ASSERT_GE(first_size,3u);
+    diagnostic.trace->record(negotiated_phase_trace::ack_requested,0,batches[0].size());
     factory->wires[0]->ack(batches[0]);ASSERT_TRUE(pump_until_ids_retired(batches[0]));queue->drain();
     batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),initial_windows+1);ASSERT_EQ(batches.back().size(),3u);pause.await_started(batches.size());
     EXPECT_EQ(observed().registrations.size(),count-first_size);EXPECT_EQ(senders[0]->get_progress().pending_upload,count-first_size);EXPECT_EQ(claimed(),4006);
     size_t index=0;for(const auto& batch:batches)for(const auto& id:batch)EXPECT_EQ(id,std::get<std::string>(originals.at(index++).at("globalId")));
     ASSERT_EQ(index,count);for(const auto& raw:audit_wire()){const auto m=wire_metrics(raw);EXPECT_LE(m.bytes,1048576u);EXPECT_LE(m.nodes,32768u);EXPECT_LE(m.scalar,65536u);EXPECT_LE(m.depth,16u);}
-    for(size_t i=1;i<batches.size();++i)factory->wires[0]->ack(batches[i]);
+    for(size_t i=1;i<batches.size();++i){diagnostic.trace->record(negotiated_phase_trace::ack_requested,i,batches[i].size());factory->wires[0]->ack(batches[i]);}
     ASSERT_TRUE(pump_until_ack());pause.acknowledged_prefix(batches.size());queue->drain();EXPECT_EQ(factory->wires[0]->audit_batches(),batches);
     EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),originals);EXPECT_TRUE(errors.empty());
 }
@@ -2095,16 +2193,34 @@ TEST_F(RecoveryAutomaticExportReadAdmission, ForegroundPositiveSendRetiresOldFra
     pause.await_started(2);EXPECT_EQ(claimed(),4);EXPECT_EQ(observed().registrations.size(),2u);EXPECT_TRUE(errors.empty());
 }
 TEST_F(RecoveryAutomaticExportReadAdmission, ForegroundSynchronousAckOfEachPrefixDoesNotResendOriginals) {
-    negotiated_worker_observation workers;open();start();auto limit=caps();limit["maximumEntries"]=1;accept(limit);
+    foreground_prefix_workers workers(senders);open();start();auto limit=caps();limit["maximumEntries"]=1;accept(limit);
     owner->add_bulk(std::vector<ContinuousSharedRow>{{"inline-a"},{"inline-b"}});const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");
-    const auto attempt=platform->attempts[0];size_t acknowledgements=0;
-    attempt->after_publication=[&]{const auto batches=factory->wires[0]->audit_batches();const auto& latest=batches.back();
-        EXPECT_EQ(latest.size(),1u);factory->wires[0]->ack(latest);++acknowledgements;};
-    queue->with_inline([&]{senders[0]->sync_now();});queue->drain();attempt->after_publication={};
+    ASSERT_EQ(originals.size(),2u);const auto attempt=platform->attempts[0];size_t acknowledgements=0,preparations=0;
+    auto synchronized=[&](size_t index){const auto row=owner->db().query("SELECT COALESCE((SELECT is_synchronized FROM _lattice_sync_state WHERE audit_entry_id=? AND sync_id=?),0) AS n",
+        {originals.at(index).at("id"),policy.routes[0].sync_id});return std::get<int64_t>(row.at(0).at("n"));};
+    negotiated_hook_scope schedule([&]{workers.select(preparations++);});
+    negotiated_publication_scope publications(attempt,[&]{
+        // The first ACK may synchronously run the second publication. Reserve
+        // its ordinal before triggering ACK, not after that foreign callback.
+        const auto index=acknowledgements++;ASSERT_LT(index,2u);
+        const auto batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),index+1);const auto latest=batches.back();
+        ASSERT_EQ(latest.size(),1u);EXPECT_EQ(latest[0],std::get<std::string>(originals[index].at("globalId")));
+        const auto before=observed();ASSERT_EQ(before.registrations.count(latest[0]),1u);EXPECT_EQ(synchronized(index),0);
+        if(index==0)EXPECT_FALSE(before.active);
+        else {EXPECT_EQ(synchronized(0),1);ASSERT_TRUE(before.active);EXPECT_EQ(before.kind,sync_discovery_kind::upload);ASSERT_NE(before.work,0u);}
+        factory->wires[0]->ack(latest);
+        const auto after=observed();
+        if(index==0){EXPECT_EQ(synchronized(0),1);EXPECT_EQ(after.registrations.count(latest[0]),0u);}
+        else {EXPECT_EQ(synchronized(1),0);EXPECT_TRUE(after.active);EXPECT_EQ(after.work,before.work);EXPECT_EQ(after.kind,sync_discovery_kind::upload);
+            EXPECT_GE(after.count,2u);EXPECT_EQ(after.registrations.at(latest[0]),before.registrations.at(latest[0]));}
+    });
+    queue->with_inline([&]{senders[0]->sync_now();});queue->drain();
     const auto batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),2u);EXPECT_EQ(acknowledgements,2u);
-    for(size_t i=0;i<2;++i)EXPECT_EQ(batches[i][0],std::get<std::string>(originals[i].at("globalId")));
+    EXPECT_EQ(preparations,2u);for(size_t i=0;i<2;++i){EXPECT_EQ(batches[i][0],std::get<std::string>(originals[i].at("globalId")));EXPECT_EQ(synchronized(i),1);}
     EXPECT_EQ(observed().registrations.size(),0u);EXPECT_EQ(senders[0]->get_progress().pending_upload,0);EXPECT_EQ(claimed(),4);
-    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);EXPECT_TRUE(errors.empty());
+    workers.retire_first();EXPECT_EQ(workers.counts(0),std::make_pair(size_t{0},size_t{0}));workers.await_second();
+    EXPECT_EQ(workers.counts(1),std::make_pair(size_t{1},size_t{0}));workers.finish_second();
+    EXPECT_EQ(workers.counts(1),std::make_pair(size_t{1},size_t{1}));EXPECT_TRUE(errors.empty());
 }
 TEST_F(RecoveryAutomaticExportReadAdmission, ActualPositivePublicationSelfRetirementCannotSelectSecond) {
     negotiated_worker_observation workers;open();owner->add_bulk(std::vector<ContinuousSharedRow>{{"sent"},{"not-selected"}});start();

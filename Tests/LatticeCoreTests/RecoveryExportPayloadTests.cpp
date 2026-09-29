@@ -51,6 +51,8 @@ struct payload_wire_state {
     std::mutex mutex;sync_transport::on_open_handler opened;sync_transport::on_message_handler message;
     std::vector<std::string> frames;bool throw_send=false;std::atomic<transport_state> state{transport_state::closed};
     std::atomic<size_t> successful_sends{0};
+    std::function<void()> after_success;
+    void observe_success(std::function<void()> callback){{std::lock_guard<std::mutex> lock(mutex);after_success.swap(callback);}}
     void open(){sync_transport::on_open_handler callback;{std::lock_guard<std::mutex> lock(mutex);callback=opened;}state=transport_state::open;callback();}
     void ack(const std::string& original) {
         sync_transport::on_message_handler callback;{std::lock_guard<std::mutex> lock(mutex);callback=message;}
@@ -69,14 +71,21 @@ public:
     transport_state state()const override{return shared_->state.load();}
     bool supports_reconnect()const override{return false;}
     void send(const transport_message& frame)override {
-        bool fail;{std::lock_guard<std::mutex> lock(shared_->mutex);shared_->frames.push_back(frame.as_string());fail=shared_->throw_send;}
+        bool fail;std::function<void()> observed;
+        {std::lock_guard<std::mutex> lock(shared_->mutex);shared_->frames.push_back(frame.as_string());fail=shared_->throw_send;observed=shared_->after_success;}
         if(fail)throw std::runtime_error("actual payload send interrupted");
         ++shared_->successful_sends;
+        if(observed)observed(); // Actual handoff cutpoint, off the wire mutex.
     }
     void set_on_open(on_open_handler fn)override{std::lock_guard<std::mutex> lock(shared_->mutex);shared_->opened=std::move(fn);}
     void set_on_message(on_message_handler fn)override{std::lock_guard<std::mutex> lock(shared_->mutex);shared_->message=std::move(fn);}
     void set_on_error(on_error_handler)override{}
     void set_on_close(on_close_handler)override{}
+};
+struct payload_send_observer {
+    std::shared_ptr<payload_wire_state> wire;
+    payload_send_observer(std::shared_ptr<payload_wire_state> value,std::function<void()> callback):wire(std::move(value)){wire->observe_success(std::move(callback));}
+    ~payload_send_observer(){wire->observe_success({});}
 };
 class payload_sender final:public synchronizer {
 public:
@@ -144,6 +153,7 @@ protected:
         sender->connect();transport->open();ASSERT_TRUE(transport->sent().empty());
     }
     void TearDown()override {
+        transport->observe_success({});
         sender.reset();sync_background_test_hooks::ack=std::move(prior_ack);
         // Hook retirement also accounts for a worker that has not started yet.
         EXPECT_TRUE(ack_hold->release_and_wait());const auto [started,completed]=ack_hold->counts();
@@ -250,8 +260,10 @@ TEST_F(RecoveryExportPayload, ActualOneEntryPagesClaimOnlyTheirSelectedOriginal)
     sender->page_size(1);
     {payload_pause pause(queue);owner->add(ExportPayloadDoc{"first","one"});owner->add(ExportPayloadDoc{"second","two"});owner->add(ExportPayloadDoc{"third","three"});}
     const auto before=originals();ASSERT_EQ(before.size(),3u);std::vector<std::optional<int64_t>> first_claims(3);
-    for(size_t page=0;page<3;++page) {
-        SCOPED_TRACE(page);EXPECT_NO_THROW(send());ASSERT_EQ(transport->sent().size(),page+1);
+    size_t observed=0;
+    payload_send_observer cutpoint(transport,[&] {
+        const auto page=observed++;ASSERT_LT(page,3u);
+        SCOPED_TRACE(page);ASSERT_EQ(transport->sent().size(),page+1);
         const auto entries=frame(page);ASSERT_EQ(entries.size(),1u);
         EXPECT_EQ(entries[0].global_id,std::get<std::string>(before[page].at("globalId")));
         for(size_t row=0;row<3;++row) {
@@ -259,7 +271,10 @@ TEST_F(RecoveryExportPayload, ActualOneEntryPagesClaimOnlyTheirSelectedOriginal)
             if(row<=page){ASSERT_TRUE(state.first_export_claim);if(!first_claims[row])first_claims[row]=state.first_export_claim;EXPECT_EQ(state.first_export_claim,first_claims[row]);}
             else EXPECT_FALSE(state.first_export_claim);
         }
-    }
+        EXPECT_EQ(originals(),before);
+    });
+    EXPECT_NO_THROW(send());ASSERT_EQ(observed,3u);ASSERT_EQ(transport->sent().size(),3u);
+    EXPECT_NO_THROW(send());EXPECT_EQ(observed,3u);EXPECT_EQ(transport->sent().size(),3u);
     EXPECT_EQ(originals(),before);
 }
 
@@ -272,17 +287,31 @@ TEST_F(RecoveryExportPayload, PostClaimLocalWriteCannotMixSelectedOriginalAndNex
     ASSERT_EQ(ack.size(),1u);ASSERT_EQ(std::get<int64_t>(ack[0].at("is_synchronized")),1);
     {payload_pause pause(queue);owner->db().execute("UPDATE ExportPayloadDoc SET body='selected-body' WHERE globalId=?",{target});}
     const auto before=originals();ASSERT_EQ(before.size(),2u);const auto selected_id=std::get<std::string>(before[1].at("globalId"));
-    int writes=0;
-    {payload_claim_hook hook([&]{++writes;payload_pause pause(queue);owner->db().execute("UPDATE ExportPayloadDoc SET body='next-page-body' WHERE globalId=?",{target});});
+    int writes=0;size_t observed=0;std::vector<database::row_t> after;std::string next_id;
+    std::optional<recovery_obligation_entry> selected_claim;
+    payload_send_observer cutpoint(transport,[&] {
+        const auto page=++observed;ASSERT_LE(page,2u);
+        if(page==1) {
+            ASSERT_EQ(writes,1);ASSERT_EQ(transport->sent().size(),2u);const auto selected=frame(1);ASSERT_EQ(selected.size(),1u);
+            EXPECT_EQ(selected[0].global_id,selected_id);EXPECT_EQ(payload_string(selected[0],"body"),"selected-body");
+            after=originals();ASSERT_EQ(after.size(),3u);EXPECT_EQ(after[0],before[0]);EXPECT_EQ(after[1],before[1]);
+            next_id=std::get<std::string>(after[2].at("globalId"));selected_claim=obligation(selected_id);
+            ASSERT_TRUE(selected_claim->first_export_claim);EXPECT_FALSE(obligation(next_id).first_export_claim);
+        }else {
+            ASSERT_TRUE(selected_claim);ASSERT_EQ(transport->sent().size(),3u);const auto next=frame(2);ASSERT_EQ(next.size(),1u);
+            EXPECT_EQ(next[0].global_id,next_id);EXPECT_EQ(payload_string(next[0],"body"),"next-page-body");
+            EXPECT_TRUE(obligation(next_id).first_export_claim);EXPECT_EQ(obligation(selected_id).first_export_claim,selected_claim->first_export_claim);
+            EXPECT_EQ(originals(),after);
+        }
+    });
+    {payload_claim_hook hook([&]{
+        // One deliberate mutation belongs to this selected frame. Subsequent
+        // real preparations keep their ordinary after-COMMIT semantics.
+        recovery_export_test_hooks::after_claim_commit=nullptr;
+        ++writes;payload_pause pause(queue);owner->db().execute("UPDATE ExportPayloadDoc SET body='next-page-body' WHERE globalId=?",{target});});
      EXPECT_NO_THROW(send());}
-    ASSERT_EQ(writes,1);ASSERT_EQ(transport->sent().size(),2u);const auto selected=frame(1);ASSERT_EQ(selected.size(),1u);
-    EXPECT_EQ(selected[0].global_id,selected_id);EXPECT_EQ(payload_string(selected[0],"body"),"selected-body");
-    const auto after=originals();ASSERT_EQ(after.size(),3u);EXPECT_EQ(after[0],before[0]);EXPECT_EQ(after[1],before[1]);
-    const auto next_id=std::get<std::string>(after[2].at("globalId"));const auto selected_claim=obligation(selected_id);
-    ASSERT_TRUE(selected_claim.first_export_claim);EXPECT_FALSE(obligation(next_id).first_export_claim);
-    EXPECT_NO_THROW(send());ASSERT_EQ(transport->sent().size(),3u);const auto next=frame(2);ASSERT_EQ(next.size(),1u);
-    EXPECT_EQ(next[0].global_id,next_id);EXPECT_EQ(payload_string(next[0],"body"),"next-page-body");
-    EXPECT_TRUE(obligation(next_id).first_export_claim);EXPECT_EQ(obligation(selected_id).first_export_claim,selected_claim.first_export_claim);
+    ASSERT_EQ(writes,1);ASSERT_EQ(observed,2u);ASSERT_EQ(transport->sent().size(),3u);
+    EXPECT_NO_THROW(send());EXPECT_EQ(observed,2u);EXPECT_EQ(transport->sent().size(),3u);
     EXPECT_EQ(originals(),after);
 }
 #endif

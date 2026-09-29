@@ -5,6 +5,8 @@
 #include "../../Sources/LatticeCore/src/sync_callback_lifetime.hpp"
 #include "../../Sources/LatticeCore/src/sync_upload_exclusion.hpp"
 #include <future>
+#include <array>
+#include <set>
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/recovery_receiver_controller.hpp"
 #include "../../Sources/LatticeCore/src/recovery_local_producer.hpp"
@@ -52,6 +54,163 @@ struct ControllerCommitFault {
 };
 thread_local ControllerCommitFault* ControllerCommitFault::active=nullptr;
 using json=nlohmann::json;
+// Pump-thread observations only. No live endpoint, source result, owner, or
+// callback is retained. Diagnostic overflow never changes fixture admission.
+struct ControllerBoundaryTrace {
+    enum class Event { open_receiver, close_receiver, dial, retired_frame, ready, discard, wait_begin, wait_end };
+    enum class Flag { unobserved, no, yes };
+    enum class Operation { unknown, describe, prepare, resume, read, inspect, discard, predecessor };
+    struct Copy { size_t offset=0,bytes=0;bool observed=false,stored=false; };
+    struct Record {
+        uint64_t ordinal=0,parent=0,connection=0,wait=0;size_t peer=0,request_bytes=0,used=0;
+        Event event=Event::ready;Operation operation=Operation::unknown;
+        Flag publishable=Flag::unobserved,opened=Flag::unobserved,delivered=Flag::unobserved,completed=Flag::unobserved;
+        bool status_observed=false,before_suppressed=false,prepare_dropped=false,terminal_empty=false;
+        int32_t status=0;
+        Copy request_id,route,request_index,source,after;
+        std::array<char,8192> bytes{};
+    };
+    std::array<Record,64> records{};
+    size_t retained=0;uint64_t total=0,overflow=0,connection=0,wait=0,next_wait=0;
+    Record* current=nullptr;
+    static void increment(uint64_t& value)noexcept{if(value!=UINT64_MAX)++value;}
+    static Flag flag(bool value)noexcept{return value?Flag::yes:Flag::no;}
+    Record* add(Event event,size_t peer=0)noexcept{
+        increment(total);if(retained==records.size()){increment(overflow);return nullptr;}
+        auto& out=records[retained++];out.ordinal=total;out.parent=current?current->ordinal:0;
+        out.event=event;out.peer=peer;out.connection=connection;out.wait=wait;return &out;
+    }
+    struct Scope {
+        ControllerBoundaryTrace& trace;Record* prior;
+        Scope(ControllerBoundaryTrace& value,Record* record)noexcept:trace(value),prior(value.current){trace.current=record;}
+        ~Scope(){trace.current=prior;}
+    };
+    struct WaitScope {
+        ControllerBoundaryTrace& trace;uint64_t prior;
+        explicit WaitScope(ControllerBoundaryTrace& value)noexcept:trace(value),prior(value.wait){
+            increment(trace.next_wait);trace.wait=trace.next_wait;trace.add(Event::wait_begin);
+        }
+        ~WaitScope(){trace.wait=prior;}
+        void finish(bool result)noexcept{if(auto* out=trace.add(Event::wait_end))out->completed=flag(result);}
+    };
+    static void copy(Record* out,Copy Record::* member,const std::string& value)noexcept{
+        if(!out)return;auto& part=out->*member;part.observed=true;part.bytes=value.size();
+        if(value.size()>out->bytes.size()-out->used)return;
+        part.offset=out->used;part.stored=true;
+        if(!value.empty())std::memcpy(out->bytes.data()+out->used,value.data(),value.size());out->used+=value.size();
+    }
+    static Operation operation(const json& value)noexcept{
+        try{if(!value.is_string())return Operation::unknown;const auto& text=value.get_ref<const std::string&>();
+            if(text=="describe")return Operation::describe;if(text=="prepare")return Operation::prepare;
+            if(text=="resume")return Operation::resume;if(text=="read")return Operation::read;
+            if(text=="inspect")return Operation::inspect;if(text=="discard")return Operation::discard;
+            if(text=="predecessor")return Operation::predecessor;
+        }catch(...){}return Operation::unknown;
+    }
+    static void request(Record* out,const json& control,size_t bytes)noexcept{
+        if(!out)return;out->request_bytes=bytes;
+        try{auto op=control.find("operation");if(op!=control.end())out->operation=operation(*op);
+            auto id=control.find("requestID");if(id!=control.end()&&id->is_string())copy(out,&Record::request_id,id->get_ref<const std::string&>());
+            auto route=control.find("routeGeneration");if(route!=control.end()&&route->is_string())copy(out,&Record::route,route->get_ref<const std::string&>());
+            auto index=control.find("index");if(index!=control.end()&&index->is_string())copy(out,&Record::request_index,index->get_ref<const std::string&>());
+        }catch(...){}
+    }
+    static void result(Record* out,int32_t status,bool publishable)noexcept{
+        if(!out)return;out->status_observed=true;out->status=status;
+        if(status==1)out->publishable=flag(publishable);
+    }
+    void delivery_bytes(const std::string& raw)noexcept{
+        if(!current)return;
+        // Identical source/delivery bytes share storage; a changed hook output
+        // uses only the remaining part of the same aggregate 8 KiB allowance.
+        const auto& source=current->source;
+        if(source.stored&&source.bytes==raw.size()&&
+            (raw.empty()||std::memcmp(current->bytes.data()+source.offset,raw.data(),raw.size())==0))current->after=source;
+        else copy(current,&Record::after,raw);
+    }
+    static const char* label(Flag value)noexcept{return value==Flag::yes?"yes":value==Flag::no?"no":"unobserved";}
+    static const char* label(Operation value)noexcept{
+        switch(value){case Operation::describe:return "describe";case Operation::prepare:return "prepare";
+            case Operation::resume:return "resume";case Operation::read:return "read";case Operation::inspect:return "inspect";
+            case Operation::discard:return "discard";case Operation::predecessor:return "predecessor";default:return "unknown";}
+    }
+    static const char* label(Event value)noexcept{
+        switch(value){case Event::open_receiver:return "openReceiver";case Event::close_receiver:return "closeReceiver";
+            case Event::dial:return "dial";case Event::retired_frame:return "retiredFrame";case Event::ready:return "ready";
+            case Event::discard:return "discard";case Event::wait_begin:return "waitBegin";case Event::wait_end:return "waitEnd";}
+        return "unknown";
+    }
+    // Only used after the original predicate failed. Reject excessive depth,
+    // events and duplicate keys before a bounded DOM parse; never parse a prefix.
+    struct MetadataGuard final:nlohmann::json_sax<json> {
+        size_t events=0,depth=0;std::array<std::set<std::string>,8> keys;std::array<bool,8> object{};
+        bool tick()noexcept{return ++events<=256;}
+        bool null()override{return tick();}bool boolean(bool)override{return tick();}
+        bool number_integer(number_integer_t)override{return tick();}bool number_unsigned(number_unsigned_t)override{return tick();}
+        bool number_float(number_float_t,const string_t&)override{return tick();}
+        bool string(string_t&)override{return tick();}bool binary(binary_t&)override{return false;}
+        bool start(bool is_object){if(!tick()||depth==keys.size())return false;keys[depth].clear();object[depth]=is_object;++depth;return true;}
+        bool start_object(std::size_t)override{return start(true);}bool start_array(std::size_t)override{return start(false);}
+        bool key(string_t& value)override{return tick()&&depth&&object[depth-1]&&keys[depth-1].insert(value).second;}
+        bool end_object()override{if(!tick()||!depth)return false;--depth;return true;}
+        bool end_array()override{if(!tick()||!depth)return false;--depth;return true;}
+        bool parse_error(std::size_t,const std::string&,const nlohmann::detail::exception&)override{return false;}
+    };
+    static const char* state_label(const json& value)noexcept{
+        try{if(!value.is_string())return "unknown";const auto& text=value.get_ref<const std::string&>();
+            for(const auto* allowed:{"committed","refused","rolledBack","unsettled","ownershipLost","available","terminal","unstarted"})
+                if(text==allowed)return allowed;
+        }catch(...){}return "unknown";
+    }
+    static std::optional<uint64_t> quantity(const json& value)noexcept{
+        try{if(value.is_number_unsigned())return value.get<uint64_t>();
+            if(value.is_number_integer()){const auto n=value.get<int64_t>();if(n>=0)return static_cast<uint64_t>(n);return {};}
+            if(!value.is_string())return {};const auto& text=value.get_ref<const std::string&>();if(text.empty()||text.size()>20)return {};
+            uint64_t n=0;for(const auto c:text){if(c<'0'||c>'9'||n>(UINT64_MAX-static_cast<unsigned>(c-'0'))/10)return {};n=n*10+static_cast<unsigned>(c-'0');}return n;
+        }catch(...){return {};}
+    }
+    static Flag equal(const Record& record,const Copy& part,const json& value)noexcept{
+        try{if(!part.stored||!value.is_string())return Flag::unobserved;const auto& text=value.get_ref<const std::string&>();
+            return flag(text.size()==part.bytes&&(!part.bytes||std::memcmp(text.data(),record.bytes.data()+part.offset,part.bytes)==0));
+        }catch(...){return Flag::unobserved;}
+    }
+    static json metadata(const Record& record,const Copy& part){
+        json out={{"observed",part.observed},{"bytes",part.bytes},{"stored",part.stored}};
+        if(!part.stored)return out;const auto* begin=record.bytes.data()+part.offset;const auto* end=begin+part.bytes;
+        try{MetadataGuard guard;if(!json::sax_parse(begin,end,&guard)){out["parse"]="unknown";return out;}
+            const auto value=json::parse(begin,end);if(!value.is_object()){out["parse"]="nonObject";return out;}out["parse"]="boundedObject";
+            auto field=value.find("kind");out["readyControl"]=field!=value.end()&&field->is_string()&&field->get_ref<const std::string&>()=="recoveryReady";
+            field=value.find("operation");if(field!=value.end())out["operation"]=label(operation(*field));
+            field=value.find("requestID");out["requestIDMatches"]=field==value.end()?"unobserved":label(equal(record,record.request_id,*field));
+            field=value.find("routeGeneration");out["routeMatches"]=field==value.end()?"unobserved":label(equal(record,record.route,*field));
+            for(const auto* key:{"leaseAvailable","frameAvailable","captureError","requiresFullRequest"}){
+                field=value.find(key);if(field!=value.end()&&field->is_boolean())out[key]=field->get<bool>();}
+            for(const auto* key:{"settlement","expiration","preparation","publication","lifecycle"}){
+                field=value.find(key);if(field!=value.end()&&field->is_object()){
+                    const auto state=field->find("state");out[key]=state==field->end()?"unknown":state_label(*state);}}
+            for(const auto* key:{"frames","wireBytes","index","sequence","durationMilliseconds"}){
+                field=value.find(key);if(field!=value.end())if(const auto n=quantity(*field))out[key]=*n;}
+        }catch(...){out["parse"]="unknown";}return out;
+    }
+    void report()const noexcept{
+        try{json rows=json::array();size_t copied=0;
+            for(size_t i=0;i<retained;++i){const auto& row=records[i];copied+=row.used;
+                json item={{"ordinal",row.ordinal},{"parent",row.parent},{"connection",row.connection},{"wait",row.wait},
+                    {"peer",row.peer},{"event",label(row.event)},{"operation",label(row.operation)},
+                    {"requestBytes",row.request_bytes},{"copiedBytes",row.used},{"publishable",label(row.publishable)},
+                    {"opened",label(row.opened)},{"delivered",label(row.delivered)},{"completed",label(row.completed)},
+                    {"beforeSuppressed",row.before_suppressed},{"prepareDropped",row.prepare_dropped},{"terminalEmpty",row.terminal_empty},
+                    {"source",metadata(row,row.source)},{"after",metadata(row,row.after)}};
+                if(row.status_observed)item["status"]=row.status;
+                item["requestIndexObserved"]=row.request_index.observed;item["requestIndexStored"]=row.request_index.stored;
+                if(row.request_index.stored){const json text=std::string(row.bytes.data()+row.request_index.offset,row.request_index.bytes);
+                    if(const auto index=quantity(text))item["requestIndex"]=*index;}
+                rows.push_back(std::move(item));}
+            const json report={{"total",total},{"retained",retained},{"overflow",overflow},{"copiedBytes",copied},{"records",std::move(rows)}};
+            std::cerr<<"controller boundary observation: "<<report.dump()<<std::endl;
+        }catch(...){/* Original count/error report and failure are independent. */}
+    }
+};
 std::string controller_uuid(unsigned n){char out[37];std::snprintf(out,sizeof(out),"80000000-0000-4000-8000-%012u",n);return out;}
 swift_schema_entry controller_schema(){swift_schema_entry out;out.table_name="ControllerRow";property_descriptor p{};
     p.name="value";p.type=column_type::text;p.kind=property_kind::primitive;out.properties[p.name]=p;
@@ -90,8 +249,9 @@ protected:
     std::shared_ptr<ControllerWire> wire=std::make_shared<ControllerWire>();
     std::shared_ptr<network_factory> previous;
     std::vector<std::unique_ptr<synchronizer>> synchronizers;
-    struct Peer {std::string channel,endpoint,ns;json expectation;relay_recovery_setup setup;std::shared_ptr<std::atomic<bool>> live=std::make_shared<std::atomic<bool>>(true);platform_transport_callbacks physical;};
+    struct Peer {std::string channel,endpoint,ns;json expectation;relay_recovery_setup setup;std::shared_ptr<std::atomic<bool>> live=std::make_shared<std::atomic<bool>>(true);platform_transport_callbacks physical;uint64_t trace_connection=0;};
     std::vector<Peer> peers;
+    ControllerBoundaryTrace boundary_trace;
     continuous_policy policy;
     std::vector<std::string> requests,errors;std::mutex errors_mutex;
     std::deque<ControllerWire::Frame> held_uploads;
@@ -146,6 +306,7 @@ protected:
     std::shared_ptr<ControllerPause> pause_install(){auto pause=std::make_shared<ControllerPause>();pauses.push_back(pause);
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[pause](const char* stage){if(std::strcmp(stage,"install-committed")==0)pause->wait();});return pause;}
     void open_receiver() {
+        boundary_trace.add(ControllerBoundaryTrace::Event::open_receiver);
         swift_configuration config((container/"store.sqlite").string(),std::make_shared<std_thread_scheduler>());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
         continuous_result result;
 #if LATTICE_HAS_FRT
@@ -191,7 +352,7 @@ protected:
         if(!peers.at(peer).physical.trigger_on_message(transport_message::from_string(server_sent_event::make_audit_log({}).to_json())))
             throw db_error("fixture current recovery request endpoint retired");
     }
-    void close_receiver(){{std::lock_guard lock(errors_mutex);errors.clear();}held_uploads.clear();synchronizers.clear();if(receiver)receiver->close();receiver.reset();receiver_ref.reset();}
+    void close_receiver(){boundary_trace.add(ControllerBoundaryTrace::Event::close_receiver);{std::lock_guard lock(errors_mutex);errors.clear();}held_uploads.clear();synchronizers.clear();if(receiver)receiver->close();receiver.reset();receiver_ref.reset();}
     void TearDown()override {
         for(const auto& pause:pauses)pause->release();
         close_receiver();for(const auto& pause:pauses)EXPECT_FALSE(pause->timedOut());probe.reset();for(auto& peer:peers){peer.live->store(false);peer.setup.close_on_io();peer.setup={};}peers.clear();
@@ -202,24 +363,38 @@ protected:
     // Successor fixtures may only delay/corrupt actual boundary traffic.
     virtual bool before_ready(size_t,const json&){return false;}
     virtual void after_ready(size_t index,const json&,const std::string& raw){
-        peers.at(index).physical.trigger_on_message(transport_message::from_string(raw));
+        boundary_trace.delivery_bytes(raw);
+        const bool delivered=peers.at(index).physical.trigger_on_message(transport_message::from_string(raw));
+        if(boundary_trace.current)boundary_trace.current->delivered=ControllerBoundaryTrace::flag(delivered);
     }
     bool pump() {
         std::optional<ControllerWire::Dial> dial;std::optional<ControllerWire::Frame> frame;
         {std::lock_guard lock(wire->mutex);if(!wire->dials.empty()){dial=std::move(wire->dials.front());wire->dials.pop_front();}else if(!wire->frames.empty()){frame=std::move(wire->frames.front());wire->frames.pop_front();}}
         if(dial){size_t index=0;while(index<peers.size()&&dial->url.rfind(peers[index].endpoint,0)!=0)++index;if(index==peers.size())throw db_error("fixture unexpected actual dial");
-            auto& peer=peers[index];peer.setup.close_on_io();peer.setup=serve(index);peer.physical=dial->endpoint;
-            {std::lock_guard lock(wire->mutex);wire->endpoints.push_back(dial->endpoint);}if(!(hold_second&&index==1))dial->endpoint.trigger_on_open();return true;}
+            ControllerBoundaryTrace::increment(boundary_trace.connection);
+            auto* observation=boundary_trace.add(ControllerBoundaryTrace::Event::dial,index);
+            auto& peer=peers[index];peer.setup.close_on_io();peer.setup=serve(index);peer.physical=dial->endpoint;peer.trace_connection=boundary_trace.connection;
+            {std::lock_guard lock(wire->mutex);wire->endpoints.push_back(dial->endpoint);}if(!(hold_second&&index==1)){
+                const bool opened=dial->endpoint.trigger_on_open();if(observation)observation->opened=ControllerBoundaryTrace::flag(opened);
+            }return true;}
         if(!frame)return false;
-        size_t index=0;while(index<peers.size()&&!peers[index].physical.matches(frame->endpoint))++index;if(index==peers.size())return true;
+        size_t index=0;while(index<peers.size()&&!peers[index].physical.matches(frame->endpoint))++index;if(index==peers.size()){
+            if(auto* observation=boundary_trace.add(ControllerBoundaryTrace::Event::retired_frame,index))observation->request_bytes=frame->raw.size();return true;}
         auto& peer=peers[index];const auto control=json::parse(frame->raw);
         if(control.contains("kind")&&control["kind"]=="recoveryReady") {
             if(control["operation"]=="prepare"||control["operation"]=="resume")requests.push_back(control.at("request"));
-            if(before_ready(index,control))return true;
+            auto* observation=boundary_trace.add(ControllerBoundaryTrace::Event::ready,index);
+            if(observation)observation->connection=peer.trace_connection;
+            ControllerBoundaryTrace::request(observation,control,frame->raw.size());
+            ControllerBoundaryTrace::Scope trace_scope(boundary_trace,observation);
+            if(before_ready(index,control)){if(observation)observation->before_suppressed=true;return true;}
             auto charge=peer.setup.stop_token().reserve_ready(frame->raw.size());if(!charge.valid())throw db_error("actual source finite request reservation failed");
-            auto result=peer.setup.ready(frame->raw,charge);if(result.status_code()!=1||!result.publishable())throw db_error("actual source READY result unavailable");++handled;
-            if(drop_prepare&&control["operation"]=="prepare"&&dropped++==0)return true;
-            after_ready(index,control,result.wire());
+            auto result=peer.setup.ready(frame->raw,charge);const auto status=result.status_code();bool publishable=false;
+            if(status==1)publishable=result.publishable();ControllerBoundaryTrace::result(observation,status,publishable);
+            if(status!=1||!publishable)throw db_error("actual source READY result unavailable");++handled;
+            if(drop_prepare&&control["operation"]=="prepare"&&dropped++==0){if(observation)observation->prepare_dropped=true;return true;}
+            const auto& raw=result.wire();ControllerBoundaryTrace::copy(observation,&ControllerBoundaryTrace::Record::source,raw);
+            after_ready(index,control,raw);
         } else if(control.contains("auditLog")) {
             if(observed_uploads.size()>=64)throw db_error("fixture observed upload bound");
             const auto event=server_sent_event::from_json(frame->raw);if(!event||event->event_type!=server_sent_event::type::audit_log)throw db_error("fixture invalid actual upload");
@@ -246,10 +421,12 @@ protected:
             observation["errorsTruncated"]=total>16;
             std::cerr<<"controller timeout observation: "<<observation.dump()<<std::endl;
         }catch(...){/* Observation cannot alter the original failure result. */}
+        boundary_trace.report();
     }
     template<class F> bool until(F predicate,int milliseconds=5000) {const auto end=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
-        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;std::this_thread::sleep_for(std::chrono::milliseconds(2));}
-        const bool result=predicate();if(!result)report_until_failure();return result;}
+        ControllerBoundaryTrace::WaitScope observation(boundary_trace);
+        while(std::chrono::steady_clock::now()<end){pump();if(predicate()){observation.finish(true);return true;}std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+        const bool result=predicate();observation.finish(result);if(!result)report_until_failure();return result;}
     int64_t scalar(lattice_db& owner,const std::string& sql){return std::get<int64_t>(owner.db().query(sql).at(0).at("n"));}
     int64_t phase(){return scalar(*receiver,"SELECT phase AS n FROM _lattice_producer_continuity");}
     bool has_error(){std::lock_guard lock(errors_mutex);return !errors.empty();}
@@ -1496,15 +1673,24 @@ protected:
     void after_ready(size_t index,const json& control,const std::string& raw)override {
         std::string outgoing=raw;if(after_control)after_control(index,control,outgoing);
         if(!outgoing.empty())RecoveryReceiverController::after_ready(index,control,outgoing);
+        else if(boundary_trace.current)boundary_trace.current->terminal_empty=true;
     }
     json discard(size_t index) {
         const auto& q=full_requests.at(index);json command={{"kind","recoveryReady"},{"version",1},{"operation","discard"},
             {"requestID",::lattice::uuid_t::generate().to_string()},{"routeGeneration",q.at("routeGeneration")},{"request",q.at("request")}};
-        const auto raw=command.dump();auto charge=peers.at(index).setup.stop_token().reserve_ready(raw.size());
+        const auto raw=command.dump();
+        auto* observation=boundary_trace.add(ControllerBoundaryTrace::Event::discard,index);
+        if(observation)observation->connection=peers.at(index).trace_connection;
+        ControllerBoundaryTrace::request(observation,command,raw.size());
+        ControllerBoundaryTrace::Scope trace_scope(boundary_trace,observation);
+        auto charge=peers.at(index).setup.stop_token().reserve_ready(raw.size());
         if(!charge.valid())throw db_error("terminal fixture discard admission refused");
         const auto result=peers.at(index).setup.ready(raw,charge);
-        if(result.status_code()!=1||!result.publishable())throw db_error("terminal fixture actual discard unavailable");
-        const auto reply=json::parse(result.wire());
+        const auto status=result.status_code();bool publishable=false;if(status==1)publishable=result.publishable();
+        ControllerBoundaryTrace::result(observation,status,publishable);
+        if(status!=1||!publishable)throw db_error("terminal fixture actual discard unavailable");
+        const auto& wire=result.wire();ControllerBoundaryTrace::copy(observation,&ControllerBoundaryTrace::Record::source,wire);
+        const auto reply=json::parse(wire);
         if(reply.at("settlement").at("state")!="committed"||reply.at("lifecycle").at("state")!="terminal")
             throw db_error("terminal fixture actual discard did not commit");return reply;
     }

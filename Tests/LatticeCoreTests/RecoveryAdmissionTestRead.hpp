@@ -1,4 +1,5 @@
 #pragma once
+#include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/recovery_admission_test_probe.hpp"
 #include <future>
 #include <thread>
@@ -36,7 +37,7 @@ public:
                     if(&actual!=&db||signaled)return;signaled=true;arrived_.set_value();
                     if(released.wait_for(std::chrono::seconds(12))!=std::future_status::ready)std::abort();
                 });
-                if(managed)rows=db.query_managed_cell("SELECT name FROM TestPerson WHERE id=?","name",1).has_value()?1:0;
+                if(managed)rows=lattice::detail::canonical_writer_custody_test_access::query_managed_cell(db,"SELECT name FROM TestPerson WHERE id=?","name",1).has_value()?1:0;
                 else rows=db.query(sql).size();
             }catch(...){error=std::current_exception();}
             if(!signaled)arrived_.set_value();

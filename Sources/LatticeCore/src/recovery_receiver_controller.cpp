@@ -103,7 +103,7 @@ void lifecycle_reply_shape(const json& value) {
     const auto& digest=body.at("requestDigest").get_ref<const std::string&>();
     require(digest.size()==64&&std::all_of(digest.begin(),digest.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}),"controller lifecycle digest shape differs");
     for(const auto* key:{"attemptID","receiverIncarnation","channelIncarnation"})
-        require(canonical_writer_adapter::uuid_key(body.at(key).get<std::string>())==body.at(key),"controller lifecycle canonical UUID differs");
+        require(canonical_writer_adapter::uuid_key(body.at(key).get<std::string>())==body.at(key).get_ref<const std::string&>(),"controller lifecycle canonical UUID differs");
     const auto seq=decimal(body,"sequence"),high=decimal(body,"bindingHighWater",0);const auto status=body.at("state").get<std::string>();
     require((status=="available"||status=="terminal"||status=="unstarted")&&(status=="unstarted"?high<seq:high==seq)&&
         (value.at("operation")!="discard"||status=="terminal"),"controller lifecycle status/high-water shape differs");
@@ -994,7 +994,7 @@ void recovery_receiver_controller::turn() {
                             require(frozen.scope.address.generation<INT64_MAX&&frozen.scope.revision<INT64_MAX,"controller terminal journal generation exhausted");
                             if(row->manifest_frame.empty()){
                                 require(!actual->active&&actual->last_sequence==attempt-1&&
-                                    db.query("SELECT 1 FROM main._lattice_range_attempt WHERE channel=? LIMIT 1",{blob(channel.begin(),channel.end())}).empty(),
+                                    db.query("SELECT 1 FROM main._lattice_range_attempt WHERE channel=? LIMIT 1",{std::vector<uint8_t>(channel.begin(),channel.end())}).empty(),
                                     "controller manifestless cancellation has active or retired receiver/stage");
                             }else{
                                 const auto q=cr::decode(row->request_frame,runtime.caps.codec),m=cr::decode(row->manifest_frame,runtime.caps.codec);

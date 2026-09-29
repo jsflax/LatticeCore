@@ -12,6 +12,21 @@ namespace authenticated_ready_maintenance_test_observation {
 struct probe {const lattice_db* owner=nullptr;std::function<void(const char*)> observed;};
 std::shared_ptr<const probe> exchange(std::shared_ptr<const probe>);
 }
+namespace authenticated_ready_control_test_observation {
+enum class operation : int32_t { unobserved,describe,prepare,resume,read,discard,inspect,predecessor,unknown };
+enum class point { entered,control_parsed,deadline_reserved,expiration_returned,prepare_returned,resume_returned,lease_copied,finished,count };
+struct observation : canonical_ready_control_observation::stages<static_cast<size_t>(point::count)> {
+    operation op=operation::unobserved;
+    // Copied only after native UUID validation; no untrusted/arbitrary string.
+    std::array<char,37> request_id{};
+    // Authenticated epoch milliseconds, distinct from retention-session time.
+    int64_t clock_ms=-1,deadline_ms=-1,duration_ms=-1;
+    canonical_ready_control_observation::settlement expiration,preparation,publication;
+    bool capture_error=false,requires_full_request=false,lease_available=false;
+};
+inline thread_local observation* current=nullptr;
+inline void mark(point p) noexcept {if(auto* value=current)value->mark(static_cast<size_t>(p));}
+}
 struct authenticated_ready_budget;
 struct authenticated_ready_fence;
 // Payload-free source-wide charge. This is capacity, never authority.

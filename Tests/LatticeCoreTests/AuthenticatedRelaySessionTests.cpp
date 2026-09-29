@@ -2893,5 +2893,124 @@ TEST_F(AuthenticatedReadySession, SameRowRequestReuseKeepsBothFaultAuditsAndFres
         EXPECT_EQ(completed_disposal_state(owner->db()),before);
     }
 }
+
+TEST(ReadyControlObservation, ClosedRefusalClassificationPreservesSettlementAndUnknowns) {
+    namespace diagnostic=lattice::detail::canonical_ready_control_observation;
+    using refusal=diagnostic::refusal;
+    const std::pair<const char*,refusal> cases[]{
+        {"canonical READY current lease expired; explicit disposal required",refusal::current_lease_expired},
+        {"canonical READY incomplete preparation cannot resume",refusal::incomplete_preparation},
+        {"canonical READY logical request or coverage changed; abandon and use a new attempt",refusal::request_or_coverage_changed},
+        {"canonical READY physical lease sequence exhausted",refusal::physical_lease_sequence_exhausted},
+        {"canonical READY physical lease write ignored or postimage differs",refusal::postimage_mismatch},
+        {"canonical READY current lease expired; explicit disposal required suffix",refusal::other_db_error}
+    };
+    EXPECT_EQ(diagnostic::settlement{}.primary,refusal::unobserved);
+    EXPECT_EQ(diagnostic::classify({}),refusal::none);
+    for(const auto& [message,expected]:cases) {
+        SCOPED_TRACE(message);
+        lattice::detail::recovery_install_result original;
+        original.state=lattice::detail::recovery_install_state::rolled_back;
+        original.primary_error=std::make_exception_ptr(db_error(message));
+        original.cleanup_error=std::make_exception_ptr(std::runtime_error("cleanup"));
+        original.postcommit_error=std::make_exception_ptr(std::runtime_error("postcommit"));
+        original.notification_error=std::make_exception_ptr(std::runtime_error("notification"));
+        original.unexpected_commit_observed=true;
+        const auto retained=original.primary_error;const auto snapshot=diagnostic::copy(original);
+        EXPECT_EQ(snapshot.state,static_cast<int32_t>(original.state));EXPECT_EQ(snapshot.errors,15);
+        EXPECT_TRUE(snapshot.unexpected_commit);EXPECT_EQ(snapshot.primary,expected);
+        EXPECT_EQ(original.primary_error,retained);
+        try {std::rethrow_exception(original.primary_error);FAIL()<<"retained original must still throw";}
+        catch(const db_error& error){EXPECT_STREQ(error.what(),message);}
+    }
+    EXPECT_EQ(diagnostic::classify(std::make_exception_ptr(std::runtime_error(cases[0].first))),refusal::other_exception);
+    EXPECT_EQ(diagnostic::classify(std::make_exception_ptr(71)),refusal::other_exception);
+}
+TEST(ReadyControlObservation, InvalidSetupKeepsMissingStagesUnobservedAndRestoresAllSlots) {
+    namespace prep=lattice::detail::canonical_ready_test_observation;
+    namespace read=lattice::detail::canonical_ready_read_test_observation;
+    namespace control=lattice::detail::authenticated_ready_control_test_observation;
+    namespace resume=lattice::detail::canonical_ready_resume_test_observation;
+    prep::observation p;read::observation r;control::observation c;resume::observation s;
+    const auto old_p=prep::current;const auto old_r=read::current;const auto old_c=control::current;const auto old_s=resume::current;
+    struct reset {prep::observation* p;read::observation* r;control::observation* c;resume::observation* s;
+        ~reset(){prep::current=p;read::current=r;control::current=c;resume::current=s;}} restore{old_p,old_r,old_c,old_s};
+    prep::current=&p;read::current=&r;control::current=&c;resume::current=&s;
+    relay_recovery_setup empty;auto observed=empty.ready_observed("{}",{});const auto facts=observed.diagnostics();
+    EXPECT_EQ(observed.take_result().status_code(),0);EXPECT_EQ(facts.bridge_status,0);EXPECT_EQ(facts.operation,0);
+    EXPECT_TRUE(facts.request_id().empty());EXPECT_EQ(facts.authenticated_clock_ms,-1);
+    EXPECT_EQ(prep::current,&p);EXPECT_EQ(read::current,&r);EXPECT_EQ(control::current,&c);EXPECT_EQ(resume::current,&s);
+    for(uint32_t family=0;family<4;++family)for(uint32_t point=0;point<10;++point)EXPECT_EQ(facts.stage_visits(family,point),0u);
+    for(uint32_t i=0;i<5;++i){EXPECT_EQ(facts.settlement_state(i),-1);EXPECT_EQ(facts.settlement_refusal(i),0);}
+    EXPECT_EQ(facts.stage_visits(UINT32_MAX,UINT32_MAX),0u);EXPECT_EQ(facts.cost_calls(UINT32_MAX,UINT32_MAX),0u);
+    EXPECT_EQ(facts.cost_us(UINT32_MAX,UINT32_MAX),0u);EXPECT_EQ(facts.cost_counter(UINT32_MAX,UINT32_MAX),0u);
+    EXPECT_EQ(facts.settlement_state(UINT32_MAX),-1);EXPECT_EQ(facts.settlement_errors(UINT32_MAX),0);
+    EXPECT_FALSE(facts.settlement_unexpected_commit(UINT32_MAX));
+}
+TEST_F(AuthenticatedReadySession, ObservedDescribePreservesExactWireAndCountedResultCustody) {
+    setup=admitted();const auto before=exact_source();const auto request=control("describe");
+    auto ordinary=invoke(setup,request);ASSERT_EQ(ordinary.status_code(),1);const auto expected=ordinary.wire();ordinary={};
+    const auto raw=request.dump();auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    auto observed=setup.ready_observed(raw,charge);const auto facts=observed.diagnostics();auto result=observed.take_result();
+    ASSERT_EQ(result.status_code(),1);EXPECT_EQ(result.wire(),expected);EXPECT_EQ(result.request_id(),relay_uuid(9000));
+    EXPECT_EQ(facts.request_id(),result.request_id());EXPECT_EQ(facts.operation,1);EXPECT_EQ(facts.bridge_status,1);
+    EXPECT_EQ(facts.stage_visits(2,0),1u);EXPECT_EQ(facts.stage_visits(2,1),1u);EXPECT_EQ(facts.stage_visits(2,7),1u);
+    EXPECT_EQ(facts.stage_visits(2,2),0u);EXPECT_EQ(facts.authenticated_deadline_ms,-1);EXPECT_EQ(facts.settlement_state(0),-1);
+    EXPECT_TRUE(result.publishable());EXPECT_EQ(exact_source(),before);EXPECT_EQ(observed.take_result().status_code(),0);
+    auto stop=setup.stop_token();EXPECT_FALSE(stop.drained());stop.stop();EXPECT_FALSE(result.publishable());
+    result={};EXPECT_TRUE(stop.drained());EXPECT_EQ(facts.request_id(),relay_uuid(9000));
+}
+TEST_F(AuthenticatedReadySession, ObservedMalformedInputPreservesErrorAndOneShotCharge) {
+    setup=admitted();const auto before=exact_source();const std::string raw="{";
+    auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    auto observed=setup.ready_observed(raw,charge);const auto failure=last_bridge_error();const auto facts=observed.diagnostics();
+    EXPECT_EQ(observed.take_result().status_code(),4);EXPECT_FALSE(failure.empty());EXPECT_EQ(last_bridge_error(),failure);
+    EXPECT_EQ(facts.stage_visits(2,0),1u);EXPECT_EQ(facts.stage_visits(2,7),1u);EXPECT_EQ(facts.stage_visits(2,1),0u);
+    EXPECT_EQ(facts.operation,0);EXPECT_TRUE(facts.request_id().empty());EXPECT_EQ(facts.settlement_state(3),-1);
+    EXPECT_EQ(setup.ready(raw,charge).status_code(),4);
+    EXPECT_EQ(last_bridge_error(),"READY actual one-shot source input reservation required");EXPECT_EQ(exact_source(),before);
+    EXPECT_EQ(lattice::detail::authenticated_ready_control_test_observation::current,nullptr);
+    EXPECT_EQ(lattice::detail::canonical_ready_resume_test_observation::current,nullptr);
+}
+TEST_F(AuthenticatedReadySession, ObservedPrepareReadAndResumeCopyActualSettlementsAndClockDomains) {
+    setup=admitted();const auto d=description(setup);const auto f=request(d);const auto original=receipts();
+    const auto invoke_observed=[&](const json& command) {
+        const auto raw=command.dump();auto charge=setup.stop_token().reserve_ready(raw.size());
+        if(!charge.valid())throw std::runtime_error("observed fixture input not admitted");return setup.ready_observed(raw,charge);
+    };
+    auto prepared=invoke_observed(command("prepare",f,d));const auto prepare=prepared.diagnostics();auto offer=prepared.take_result();
+    ASSERT_EQ(offer.status_code(),1);const auto wire=json::parse(offer.wire());ASSERT_TRUE(wire.at("leaseAvailable").get<bool>());
+    EXPECT_EQ(prepare.operation,2);EXPECT_EQ(prepare.duration_ms,10000);EXPECT_GE(prepare.authenticated_clock_ms,0);
+    EXPECT_EQ(prepare.authenticated_deadline_ms-prepare.authenticated_clock_ms,10000);
+    for(uint32_t phase=0;phase<3;++phase){EXPECT_EQ(prepare.settlement_state(phase),2);EXPECT_EQ(prepare.settlement_errors(phase),0);}
+    EXPECT_TRUE(prepare.lease_available);EXPECT_FALSE(prepare.capture_error);EXPECT_EQ(prepare.stage_visits(0,0),1u);EXPECT_EQ(prepare.stage_visits(0,9),1u);
+    auto read_command=control("read");for(const auto* key:{"routeGeneration","leaseID","requestDigest","attemptID","sequence"})read_command[key]=wire.at(key);
+    read_command["index"]="0";auto read=invoke_observed(read_command);const auto read_facts=read.diagnostics();auto frame=read.take_result();
+    ASSERT_EQ(frame.status_code(),1);EXPECT_EQ(ready_wire::decode(frame.wire(),codec(d)).logical,f.logical);
+    EXPECT_EQ(read_facts.operation,4);EXPECT_EQ(read_facts.settlement_state(4),2);EXPECT_EQ(read_facts.read_addressed_frames,1u);
+    EXPECT_GE(read_facts.read_clock_before_ms,0);EXPECT_GE(read_facts.read_clock_settled_ms,read_facts.read_clock_before_ms);
+    EXPECT_EQ(read_facts.authenticated_clock_ms,-1);EXPECT_EQ(read_facts.settlement_refusal(4),0);
+    EXPECT_FALSE(read_facts.settlement_unexpected_commit_observed(4));
+    auto resumed=invoke_observed(command("resume",f,d));const auto resume=resumed.diagnostics();const auto next=resumed.take_result();
+    ASSERT_EQ(next.status_code(),1);EXPECT_TRUE(json::parse(next.wire()).at("leaseAvailable").get<bool>());
+    EXPECT_EQ(resume.operation,3);EXPECT_EQ(resume.settlement_state(3),2);EXPECT_EQ(resume.settlement_refusal(3),1);
+    EXPECT_TRUE(resume.resume_expiration_present);EXPECT_TRUE(resume.resume_expiry_clock_observed);
+    EXPECT_LT(resume.resume_expiry_clock_ms,resume.resume_expiration_ms);EXPECT_GT(resume.resume_new_deadline_ms,resume.resume_expiry_clock_ms);
+    EXPECT_EQ(resume.stage_visits(3,0),1u);EXPECT_EQ(resume.stage_visits(3,6),1u);EXPECT_TRUE(resume.resume_lease_available);
+    EXPECT_FALSE(frame.publishable());EXPECT_EQ(receipts(),original);
+}
+TEST_F(AuthenticatedReadySession, ObservedResumeRefusalCopiesActualPrimaryWithoutEvaluatingLaterExpiry) {
+    setup=admitted();const auto d=description(setup);auto f=request(d);const auto offered=lease(setup,f,d);
+    ASSERT_TRUE(offered.at("leaseAvailable").get<bool>());const auto before=exact_source();
+    f.logical.attempt_id=relay_uuid(9200);seal(f,d);const auto raw=command("resume",f,d).dump();
+    const auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    auto observed=setup.ready_observed(raw,charge);const auto facts=observed.diagnostics();const auto result=observed.take_result();
+    ASSERT_EQ(result.status_code(),1);const auto response=json::parse(result.wire());
+    EXPECT_EQ(response.at("settlement").at("state"),"rolledBack");EXPECT_TRUE(response.at("settlement").at("primaryError").get<bool>());
+    EXPECT_FALSE(response.at("leaseAvailable").get<bool>());EXPECT_EQ(facts.settlement_state(3),1);EXPECT_EQ(facts.settlement_errors(3),1);
+    EXPECT_EQ(facts.settlement_refusal(3),4);EXPECT_EQ(facts.stage_visits(3,2),1u);EXPECT_EQ(facts.stage_visits(3,3),0u);
+    EXPECT_FALSE(facts.resume_expiry_clock_observed);EXPECT_EQ(facts.resume_expiry_clock_ms,-1);EXPECT_FALSE(facts.resume_lease_available);
+    EXPECT_EQ(exact_source(),before);
+}
 }
 #endif

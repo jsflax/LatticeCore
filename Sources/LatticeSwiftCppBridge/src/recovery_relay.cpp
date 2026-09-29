@@ -128,6 +128,76 @@ relay_ready_result relay_recovery_setup::ready(const std::string& wire,const rel
         result.wire_=std::move(actual.wire);result.request_id_=std::move(actual.request_id);result.operation_=std::move(actual.operation);return result;
     }catch(...){relay_failure();result.status_=4;return result;}
 }
+namespace {
+template<class T> class ready_observation_slot {
+    T*& slot_;T* previous_;
+public:
+    ready_observation_slot(T*& slot,T& value)noexcept:slot_(slot),previous_(slot){slot_=&value;}
+    ~ready_observation_slot(){slot_=previous_;}
+    ready_observation_slot(const ready_observation_slot&)=delete;
+    ready_observation_slot& operator=(const ready_observation_slot&)=delete;
+};
+}
+relay_observed_ready_result relay_recovery_setup::ready_observed(const std::string& wire,const relay_ready_charge& charge)const noexcept {
+    // All storage and clocks here belong to the explicit observed entrypoint.
+    // Existing callers still use ready and its unchanged result layout.
+    detail::canonical_ready_test_observation::observation preparation;
+    detail::canonical_ready_read_test_observation::observation read;
+    detail::authenticated_ready_control_test_observation::observation control;
+    detail::canonical_ready_resume_test_observation::observation resume;
+    ready_observation_slot preparation_slot(detail::canonical_ready_test_observation::current,preparation);
+    ready_observation_slot read_slot(detail::canonical_ready_read_test_observation::current,read);
+    ready_observation_slot control_slot(detail::authenticated_ready_control_test_observation::current,control);
+    ready_observation_slot resume_slot(detail::canonical_ready_resume_test_observation::current,resume);
+    relay_observed_ready_result output;
+    output.result_=ready(wire,charge); // Sole parse, admission and native call.
+    auto& out=output.diagnostics_;
+    const auto stages=[&](size_t family,const auto& source)noexcept {
+        for(size_t i=0;i<source.visits.size();++i) {
+            out.visits_[family][i]=source.visits[i];out.first_us_[family][i]=source.first_us[i];out.last_us_[family][i]=source.last_us[i];
+        }
+    };
+    stages(0,preparation);stages(1,read);stages(2,control);stages(3,resume);
+    const auto costs=[&](size_t family,const auto& source)noexcept {
+        out.cost_calls_[family]=source.calls;out.cost_us_[family]=source.microseconds;
+        out.cost_counters_[family]={source.receipt_batches,source.receipt_batch_ids,source.hash_input_bytes,source.hash_staged_input_bytes,source.hash_direct_blocks};
+    };
+    costs(0,preparation.cost);costs(1,read.cost);
+    const auto settlement=[&](size_t index,const detail::canonical_ready_control_observation::settlement& value)noexcept {
+        out.settlement_[index]=value.state;out.errors_[index]=value.errors;out.refusal_[index]=static_cast<int32_t>(value.primary);
+        out.unexpected_[index]=value.unexpected_commit;
+    };
+    settlement(0,control.expiration);settlement(1,control.preparation);settlement(2,control.publication);settlement(3,resume.result);
+    out.settlement_[4]=read.settlement;out.errors_[4]=(read.primary_error?1:0)|(read.cleanup_error?2:0)|(read.postcommit_error?4:0)|(read.notification_error?8:0);
+    out.operation=static_cast<int32_t>(control.op);out.bridge_status=output.result_.status_code();out.request_id_=control.request_id;
+    out.authenticated_clock_ms=control.clock_ms;out.authenticated_deadline_ms=control.deadline_ms;out.duration_ms=control.duration_ms;
+    out.resume_expiration_ms=resume.expiration_ms;out.resume_expiry_clock_ms=resume.expiry_clock_ms;out.resume_new_deadline_ms=resume.new_deadline_ms;
+    out.read_deadline_ms=read.deadline_ms;out.read_clock_before_ms=read.clock_before_ms;out.read_clock_after_ms=read.clock_after_ms;out.read_clock_settled_ms=read.clock_settled_ms;
+    out.prepare_audited_frames=preparation.audited_frames;out.read_index=read.index;out.read_full_audits=read.full_audits;
+    out.read_audited_frames=read.audited_frames;out.read_audited_bytes=read.audited_bytes;out.read_positive_receipt_lookups=read.positive_receipt_lookups;
+    out.read_addressed_frames=read.addressed_frames;out.read_addressed_bytes=read.addressed_bytes;
+    out.capture_error=control.capture_error;out.requires_full_request=control.requires_full_request;out.lease_available=control.lease_available;
+    out.resume_expiration_present=resume.expiration_present;out.resume_expiry_clock_observed=resume.expiry_clock_observed;
+    out.resume_transfer_available=resume.transfer_available;out.resume_lease_available=resume.lease_available;
+    return output;
+}
+relay_ready_result relay_observed_ready_result::take_result()noexcept {
+    relay_ready_result out=std::move(result_);result_={};return out;
+}
+std::string relay_ready_diagnostics::request_id()const noexcept {
+    try{return std::string(request_id_.data());}catch(...){return {};}
+}
+uint64_t relay_ready_diagnostics::stage_visits(uint32_t family,uint32_t point)const noexcept{return family<4&&point<10?visits_[family][point]:0;}
+uint64_t relay_ready_diagnostics::stage_first_us(uint32_t family,uint32_t point)const noexcept{return family<4&&point<10?first_us_[family][point]:0;}
+uint64_t relay_ready_diagnostics::stage_last_us(uint32_t family,uint32_t point)const noexcept{return family<4&&point<10?last_us_[family][point]:0;}
+uint64_t relay_ready_diagnostics::cost_calls(uint32_t family,uint32_t phase)const noexcept{return family<2&&phase<11?cost_calls_[family][phase]:0;}
+uint64_t relay_ready_diagnostics::cost_us(uint32_t family,uint32_t phase)const noexcept{return family<2&&phase<11?cost_us_[family][phase]:0;}
+uint64_t relay_ready_diagnostics::cost_counter(uint32_t family,uint32_t index)const noexcept{return family<2&&index<5?cost_counters_[family][index]:0;}
+int32_t relay_ready_diagnostics::settlement_state(uint32_t index)const noexcept{return index<5?settlement_[index]:-1;}
+int32_t relay_ready_diagnostics::settlement_errors(uint32_t index)const noexcept{return index<5?errors_[index]:0;}
+int32_t relay_ready_diagnostics::settlement_refusal(uint32_t index)const noexcept{return index<5?refusal_[index]:0;}
+bool relay_ready_diagnostics::settlement_unexpected_commit_observed(uint32_t index)const noexcept{return index<4&&settlement_[index]>=0;}
+bool relay_ready_diagnostics::settlement_unexpected_commit(uint32_t index)const noexcept{return index<5&&unexpected_[index];}
 int32_t relay_ready_result::status_code()const noexcept{return status_;}
 const std::string& relay_ready_result::wire()const noexcept{return wire_;}
 const std::string& relay_ready_result::request_id()const noexcept{return request_id_;}

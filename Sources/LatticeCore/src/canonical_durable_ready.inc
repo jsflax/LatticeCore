@@ -698,6 +698,9 @@ canonical_ready_inspection canonical_writer_adapter::inspect_ready_owned(std::sh
 canonical_ready_resume_result canonical_writer_adapter::resume_ready_owned(std::shared_ptr<lattice_db> owner,const canonical_namespace_admission& admission,
     const cr::attempt& attempt,const cr::request& request,int64_t duration,uint64_t route) {
     auto state=context_;auto writer=writer_;auto session=retention_;canonical_ready_resume_result result;
+    namespace observed=canonical_ready_resume_test_observation;
+    observed::mark(observed::point::entered);
+    struct finish_resume_observation {~finish_resume_observation(){observed::mark(observed::point::finished);}} observed_finish;
     try {
         const auto held=admission;if(!state || !state->ready || !session)refuse("canonical READY v3 profile unavailable");
         const auto& p=*state->ready;validate_namespace_admission(owner,writer,state,held);ready_duration(p,duration,route);
@@ -706,21 +709,33 @@ canonical_ready_resume_result canonical_writer_adapter::resume_ready_owned(std::
         const auto raw=cr::encode({attempt,ready_route,request},p.package.codec),key=ready_binding(held.namespace_.namespace_id,held.replica_,attempt);
         (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
         std::optional<canonical_ready_info> resumed;int64_t sequence=0,deadline=0;
+        observed::mark(observed::point::owned_requested);
         result.settlement=retention_owned(owner,writer,state,session,p.orphan_resume_grace_ms?ready_lifecycle_resume:ready_resume,[&](database& actual,retention_session& clock){
+            observed::mark(observed::point::body_entered);
             validate_namespace_admission(owner,writer,state,held);const auto row=ready_row(actual,p,key);
             ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
+            observed::mark(observed::point::identity_checked);
             if(integer(row,"state")!=ready_complete)refuse("canonical READY incomplete preparation cannot resume");
             // Same-process expiry cannot silently renew. A source restart has
             // explicitly orphaned the old physical lease; fresh admission may
             // then request a new finite lease over the continuously retained H.
             const auto expiration=ready_expiry(row,clock.incarnation,clock.orphan_deadline_ms);
-            if(expiration&&clock.now()>=*expiration) {
+            if(auto* value=observed::current) {value->expiration_present=bool(expiration);if(expiration)value->expiration_ms=*expiration;}
+            const auto expired=[&]() {
+                if(!expiration)return false;
+                const auto evaluated_now=clock.now(); // Exactly the original short-circuited clock evaluation.
+                if(auto* value=observed::current) {value->expiry_clock_ms=evaluated_now;value->expiry_clock_observed=true;}
+                return evaluated_now>=*expiration;
+            }();
+            observed::mark(observed::point::expiry_checked);
+            if(expired) {
                 if(!p.orphan_resume_grace_ms)refuse("canonical READY current lease expired; explicit disposal required");
                 dispose_ready(actual,p,row);validate_namespace_admission(owner,writer,state,held);return;
             }
             const auto policy=ready_profile_row(actual,p);
             if(integer(policy,"next_lease")==std::numeric_limits<int64_t>::max())refuse("canonical READY physical lease sequence exhausted");
             sequence=integer(policy,"next_lease")+1;deadline=ready_add(clock.now(),duration);
+            if(auto* value=observed::current)value->new_deadline_ms=deadline;
             actual.execute("UPDATE main._lattice_canonical_ready_profile SET next_lease=? WHERE id=1 AND next_lease=?",{sequence,integer(policy,"next_lease")});changed_retention(actual);
             actual.execute("UPDATE main._lattice_canonical_ready_transfer SET lease_incarnation=?,lease_sequence=?,deadline_ms=? WHERE binding=? AND sequence=? AND state=2",
                 {clock.incarnation,sequence,deadline,bytes(key),static_cast<int64_t>(attempt.sequence)});changed_retention(actual);
@@ -734,6 +749,12 @@ canonical_ready_resume_result canonical_writer_adapter::resume_ready_owned(std::
             if(result.transfer)result.lease=canonical_ready_lease(session,state,result.transfer->identity,session->incarnation,sequence,deadline,route);
         }
     } catch(...) {result.settlement.primary_error=std::current_exception();}
+    // retention_owned has settled and released its locks before classification.
+    if(auto* value=observed::current) {
+        value->result=canonical_ready_control_observation::copy(result.settlement);
+        value->transfer_available=bool(result.transfer);value->lease_available=bool(result.lease);
+        value->mark(static_cast<size_t>(observed::point::settled));
+    }
     return result;
 }
 canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(std::shared_ptr<lattice_db> owner,const canonical_namespace_admission& admission,

@@ -772,6 +772,9 @@ std::string ready_live_binding(const json& context) {
 }
 thread_local const std::function<void()>* authenticated_relay_setup::ready_before_owned_test_hook_=nullptr;
 authenticated_ready_result authenticated_relay_setup::ready(const std::string& raw,const std::shared_ptr<authenticated_ready_charge>& charge) {
+    namespace observed=authenticated_ready_control_test_observation;
+    observed::mark(observed::point::entered);
+    struct finish_control_observation {~finish_control_observation(){observed::mark(observed::point::finished);}} observed_finish;
     auto s=state_;if(!s||!s->admission||!s->route->live())return {2,{},{}};
     if(!charge||charge->budget_!=s->source->ready_budget||charge->input_!=raw.size()||charge->consumed_.exchange(true,std::memory_order_acq_rel))
         reject("READY actual one-shot source input reservation required");
@@ -793,6 +796,13 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
     }
     if(number(control,"version",1,1)!=1)reject("READY control version");
     const auto op=text(control,"operation",16),request_id=uuid(control,"requestID");
+    if(auto* value=observed::current) {
+        value->op=op=="describe"?observed::operation::describe:op=="prepare"?observed::operation::prepare:
+            op=="resume"?observed::operation::resume:op=="read"?observed::operation::read:op=="discard"?observed::operation::discard:
+            op=="inspect"?observed::operation::inspect:op=="predecessor"?observed::operation::predecessor:observed::operation::unknown;
+        std::copy_n(request_id.data(),36,value->request_id.data());
+        value->mark(static_cast<size_t>(observed::point::control_parsed));
+    }
     json response={{"kind","recoveryReady"},{"version",1},{"operation",op},{"requestID",request_id},
         {"routeGeneration",std::to_string(s->route_generation)}};
     const auto output=[&]() {
@@ -901,6 +911,10 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
     const auto lease_id=std::to_string(s->route_generation)+":"+std::to_string(++s->lease_sequence);
     const auto key=ready_live_binding(s->context);
     auto fence=std::make_shared<authenticated_ready_fence>(now+duration);
+    if(auto* value=observed::current) {
+        value->clock_ms=now;value->duration_ms=duration;value->deadline_ms=now+duration;
+        value->mark(static_cast<size_t>(observed::point::deadline_reserved));
+    }
     {
         std::lock_guard lock(s->source->ready_mutex);
         for(auto i=s->source->ready_fences.begin();i!=s->source->ready_fences.end();)if(i->second.expired())i=s->source->ready_fences.erase(i);else ++i;
@@ -928,16 +942,32 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
     std::optional<canonical_ready_info> info;std::optional<canonical_ready_lease> lease;
     if(op=="prepare") {
         const auto expiration=s->source->adapter->expire_authenticated_ready(s->source->owner,ready_admission);
+        if(auto* value=observed::current) {
+            value->expiration=canonical_ready_control_observation::copy(expiration);
+            value->mark(static_cast<size_t>(observed::point::expiration_returned));
+        }
         response["expiration"]=ready_settlement(expiration);
         if(expiration.state!=recovery_install_state::committed){response["leaseAvailable"]=false;return output();}
         const auto result=s->source->adapter->prepare_ready_owned(s->source->owner,ready_admission,logical,*request,duration,s->route_generation);
+        if(auto* value=observed::current) {
+            value->preparation=canonical_ready_control_observation::copy(result.preparation);
+            value->publication=canonical_ready_control_observation::copy(result.publication);
+            value->capture_error=bool(result.capture_error);value->requires_full_request=result.requires_full_request;
+            value->mark(static_cast<size_t>(observed::point::prepare_returned));
+        }
         response["preparation"]=ready_settlement(result.preparation);response["publication"]=ready_settlement(result.publication);
         response["captureError"]=bool(result.capture_error);response["requiresFullRequest"]=result.requires_full_request;
         if(result.publication.state==recovery_install_state::committed){info=result.transfer;lease=result.lease;}
     } else {
         const auto result=s->source->adapter->resume_ready_owned(s->source->owner,ready_admission,logical,*request,duration,s->route_generation);
+        if(auto* value=observed::current) {
+            value->mark(static_cast<size_t>(observed::point::resume_returned));
+        }
         response["settlement"]=ready_settlement(result.settlement);
         if(result.settlement.state==recovery_install_state::committed){info=result.transfer;lease=result.lease;}
+    }
+    if(auto* value=observed::current) {
+        value->lease_available=bool(info&&lease);value->mark(static_cast<size_t>(observed::point::lease_copied));
     }
     response["leaseAvailable"]=bool(info&&lease);
     if(info&&lease) {

@@ -4,6 +4,7 @@
 #include "recovery_writer_access.hpp"
 #include <array>
 #include <chrono>
+#include <cstring>
 
 namespace lattice::detail {
 namespace canonical_ready_cost_observation {
@@ -48,6 +49,57 @@ struct observation {
     bool primary_error=false,cleanup_error=false,postcommit_error=false,notification_error=false;
 };
 extern thread_local observation* current;
+}
+namespace canonical_ready_control_observation {
+// Private passive values; no error text, ownership, callback or authority.
+// Unknown is distinct from an observed settlement without a primary error.
+enum class refusal : int32_t { unobserved,none,current_lease_expired,incomplete_preparation,
+    request_or_coverage_changed,physical_lease_sequence_exhausted,postimage_mismatch,
+    other_db_error,other_exception };
+struct settlement {
+    int32_t state=-1;
+    uint8_t errors=0; // primary=1, cleanup=2, postcommit=4, notification=8.
+    bool unexpected_commit=false;
+    refusal primary=refusal::unobserved;
+};
+inline refusal classify(std::exception_ptr error) noexcept {
+    if(!error)return refusal::none;
+    try {std::rethrow_exception(error);}
+    catch(const db_error& e) {
+        const auto* text=e.what();
+        if(std::strcmp(text,"canonical READY current lease expired; explicit disposal required")==0)return refusal::current_lease_expired;
+        if(std::strcmp(text,"canonical READY incomplete preparation cannot resume")==0)return refusal::incomplete_preparation;
+        if(std::strcmp(text,"canonical READY logical request or coverage changed; abandon and use a new attempt")==0)return refusal::request_or_coverage_changed;
+        if(std::strcmp(text,"canonical READY physical lease sequence exhausted")==0)return refusal::physical_lease_sequence_exhausted;
+        if(std::strcmp(text,"canonical READY physical lease write ignored or postimage differs")==0)return refusal::postimage_mismatch;
+        return refusal::other_db_error;
+    } catch(...) {return refusal::other_exception;}
+}
+inline settlement copy(const recovery_install_result& value) noexcept {
+    return {static_cast<int32_t>(value.state),static_cast<uint8_t>((value.primary_error?1:0)|(value.cleanup_error?2:0)|
+        (value.postcommit_error?4:0)|(value.notification_error?8:0)),value.unexpected_commit_observed,classify(value.primary_error)};
+}
+template<size_t N> struct stages {
+    std::chrono::steady_clock::time_point origin=std::chrono::steady_clock::now();
+    std::array<uint64_t,N> visits{},first_us{},last_us{};
+    void mark(size_t index) noexcept {
+        const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-origin).count();
+        const auto us=elapsed>0?static_cast<uint64_t>(elapsed):uint64_t(0);
+        if(!visits[index]++)first_us[index]=us;
+        last_us[index]=us;
+    }
+};
+}
+namespace canonical_ready_resume_test_observation {
+enum class point { entered,owned_requested,body_entered,identity_checked,expiry_checked,settled,finished,count };
+struct observation : canonical_ready_control_observation::stages<static_cast<size_t>(point::count)> {
+    canonical_ready_control_observation::settlement result;
+    // Retention-session-relative milliseconds; never authenticated epoch time.
+    int64_t expiration_ms=-1,expiry_clock_ms=-1,new_deadline_ms=-1;
+    bool expiration_present=false,expiry_clock_observed=false,transfer_available=false,lease_available=false;
+};
+inline thread_local observation* current=nullptr;
+inline void mark(point p) noexcept {if(auto* value=current)value->mark(static_cast<size_t>(p));}
 }
 class canonical_writer_adapter;
 struct canonical_ready_profile {

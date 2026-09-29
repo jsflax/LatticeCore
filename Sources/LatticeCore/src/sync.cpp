@@ -1705,7 +1705,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                 if(callback_lifetime_->protected_route()&&!route->current(generation))return true;
                 const auto protected_store=try_has_automatic_export_protection();
                 if(!protected_store)return false;
-                bool admission_busy=false;mark_as_synced_after_discovery(ids,*protected_store,&admission_busy);
+                bool admission_busy=false;mark_as_synced_after_discovery_impl(ids,*protected_store,&admission_busy);
                 if(admission_busy)return false; // The same charged ACK/callback remains queued.
                 if(!route->current(generation))return true;
                 const auto completed=on_sync_complete_;
@@ -3263,7 +3263,11 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
     mark_as_synced_after_discovery(global_ids,protected_store);
 }
 
-void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::string>& global_ids,bool protected_store,bool* admission_busy) {
+void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::string>& global_ids,bool protected_store) {
+    mark_as_synced_after_discovery_impl(global_ids,protected_store,nullptr);
+}
+
+void synchronizer_base::mark_as_synced_after_discovery_impl(const std::vector<std::string>& global_ids,bool protected_store,bool* admission_busy) {
     if(admission_busy)*admission_busy=false;
     LOG_INFO("synchronizer", "[%s] mark_as_synced: %zu entries ACK'd (progress_acked was %lld)",
              log_id(), global_ids.size(),

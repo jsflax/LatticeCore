@@ -598,7 +598,7 @@ protected:
     bool upload_pending_changes_step(detail::sync_upload_continuation&,detail::sync_discovery_operation*);
     std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
-    void mark_as_synced_after_discovery(const std::vector<std::string>&,bool protected_store,bool* admission_busy=nullptr);
+    void mark_as_synced_after_discovery(const std::vector<std::string>&,bool protected_store);
 
     // upload_pending_changes decomposed phases
     struct classified_entries {
@@ -616,8 +616,12 @@ protected:
     bool send_committed_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy);
     bool upload_protected_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy=nullptr);
     std::optional<bool> try_has_export_protection();
-    std::optional<bool> try_has_automatic_export_protection();
     bool has_export_protection();
+private:
+    // Automatic admission is reachable only from this engine's queued work.
+    std::optional<bool> try_has_automatic_export_protection();
+    void mark_as_synced_after_discovery_impl(const std::vector<std::string>&,bool,bool*);
+protected:
     void schedule_ack_retry(const std::vector<audit_log_entry>&);
     std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false,uint64_t delivery_token=0,
         std::function<void()> delivery_retry={});

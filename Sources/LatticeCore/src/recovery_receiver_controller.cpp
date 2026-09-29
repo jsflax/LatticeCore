@@ -440,33 +440,44 @@ bool recovery_receiver_route::receive(const platform_transport_callbacks& endpoi
         // Initial/renewed describe still belongs to the original verifier.
         // This lane admits only an already worker-verified physical record.
         if(!view.value||!state_->source->recovery_matches(view,endpoint,lifecycle))return false;
-        require(message.data.size()<=recovery_request_store::frame_bytes,"controller late response byte capacity");
-        auto reply=std::make_shared<recovery_receiver_controller::state::reply>();
-        reply->late_route=shared_from_this();reply->late_view=view;
-        size_t slot=0;
-        {std::lock_guard lock(coordinator.mutex);
-            // Publication and late admission share this leaf. If a new
-            // request won the race, retain its ordinary correlation path.
-            pending=coordinator.outstanding;
-            if(!pending){
-                while(slot<coordinator.late_inbox.size()&&coordinator.late_inbox[slot])++slot;
-                require(slot<coordinator.late_inbox.size(),"controller bounded late response inbox full");
-                require(coordinator.late_order!=UINT64_MAX,"controller late response order exhausted");
-                reply->reservation=coordinator.reserve_locked(message.data.size(),true);
-                require(reply->reservation!=nullptr,"controller retained late response capacity");
-                reply->order=++coordinator.late_order;coordinator.late_inbox[slot]=reply;}}
-        if(!pending){
-            try {reply->bytes.assign(raw);}
-            catch(...){
-                {std::lock_guard lock(coordinator.mutex);if(coordinator.late_inbox[slot]==reply)coordinator.late_inbox[slot].reset();}
-                throw;
-            }
-            const bool live=state_->source->recovery_live(view);
+        try {
+            require(message.data.size()<=recovery_request_store::frame_bytes,"controller late response byte capacity");
+            auto reply=std::make_shared<recovery_receiver_controller::state::reply>();
+            reply->late_route=shared_from_this();reply->late_view=view;
+            size_t slot=0;
             {std::lock_guard lock(coordinator.mutex);
-                if(coordinator.late_inbox[slot]!=reply)return true;
-                if(!live||state_->retired.load()||state_->late_control_view.lock()!=view.value)coordinator.late_inbox[slot].reset();
-                else reply->ready=true;}
-            wake();return true;
+                // Publication and late admission share this leaf. If a new
+                // request won the race, retain its ordinary correlation path.
+                pending=coordinator.outstanding;
+                if(!pending){
+                    while(slot<coordinator.late_inbox.size()&&coordinator.late_inbox[slot])++slot;
+                    require(slot<coordinator.late_inbox.size(),"controller bounded late response inbox full");
+                    require(coordinator.late_order!=UINT64_MAX,"controller late response order exhausted");
+                    reply->reservation=coordinator.reserve_locked(message.data.size(),true);
+                    require(reply->reservation!=nullptr,"controller retained late response capacity");
+                    reply->order=++coordinator.late_order;coordinator.late_inbox[slot]=reply;}}
+            if(!pending){
+                try {reply->bytes.assign(raw);}
+                catch(...){
+                    {std::lock_guard lock(coordinator.mutex);if(coordinator.late_inbox[slot]==reply)coordinator.late_inbox[slot].reset();}
+                    throw;
+                }
+                const bool live=state_->source->recovery_live(view);
+                {std::lock_guard lock(coordinator.mutex);
+                    if(coordinator.late_inbox[slot]!=reply)return true;
+                    if(!live||state_->retired.load()||state_->late_control_view.lock()!=view.value)coordinator.late_inbox[slot].reset();
+                    else reply->ready=true;}
+                wake();return true;
+            }
+        }catch(...){
+            const auto failure=std::current_exception();
+            // Preserve source.receive's exact-view revocation on newly
+            // intercepted late admission failures, after every leaf unwinds.
+            bool invalidated=false;
+            try {invalidated=state_->source->recovery_live(view)&&state_->source->invalidate(view.value);}
+            catch(...){std::rethrow_exception(failure);}
+            if(invalidated)std::rethrow_exception(failure);
+            return true; // a retired/replaced view cannot revoke its successor
         }
     }
     if(pending->route.lock().get()!=this||!state_->source->recovery_matches(pending->view,endpoint,lifecycle))return true;
@@ -519,9 +530,17 @@ void recovery_receiver_controller::turn() {
                     const auto description=parse(route->state_->source->recovery_description(front->late_view),65536);
                     late_lifecycle_shape(parse(front->bytes,recovery_request_store::frame_bytes),description);
                 }catch(...){
-                    // Source turnover during the read/parse cannot make an
-                    // obsolete callback poison its successor's source view.
-                    if(route->state_->source->recovery_live(front->late_view))throw;
+                    const auto failure=std::current_exception();
+                    if(runtime.probe&&runtime.probe->owner==route->state_->owner.lock().get()&&runtime.probe->observed)
+                        runtime.probe->observed("late-lifecycle-validation-rejected");
+                    // Idle routes may already permit ordinary export. Revoke
+                    // exactly this current source before reporting its error;
+                    // replacement/retirement must not poison another view.
+                    bool invalidated=false;
+                    try {invalidated=route->state_->source->recovery_live(front->late_view)&&
+                        route->state_->source->invalidate(front->late_view.value);}
+                    catch(...){std::rethrow_exception(failure);}
+                    if(invalidated)std::rethrow_exception(failure);
                 }
                 // Shape and actual binding permit disposal only. The route
                 // may retire during parsing; neither case creates authority.

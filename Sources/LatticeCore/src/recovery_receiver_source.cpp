@@ -151,10 +151,11 @@ std::string receiver_source_binding::dial_url()const {
 bool receiver_source_binding::live(const std::shared_ptr<const record>& r)const {
     const auto owner=owner_.lock();const auto life=lifetime_.lock();return r&&owner&&!owner->is_closed()&&life&&now()<r->deadline&&life->current(r->lifecycle)&&r->endpoint.current_system_tls_for_owner();
 }
-void receiver_source_binding::invalidate(const std::shared_ptr<const record>& r) {
+bool receiver_source_binding::invalidate(const std::shared_ptr<const record>& r) {
     std::shared_ptr<const record> retired;
     {std::lock_guard lock(mutex_);if(current_==r){retired.swap(current_);upload_failure_="negotiated source describe revoked";}}
     // Last endpoint/provider/capture destruction must stay outside this leaf.
+    return static_cast<bool>(retired);
 }
 void receiver_source_binding::opened(const platform_transport_callbacks& attempt,uint64_t lifecycle,owned_platform_sync_transport& transport) {
     auto next=std::make_shared<record>();next->endpoint=attempt;next->lifecycle=lifecycle;

@@ -1939,3 +1939,92 @@ TEST_F(LateLifecycleReceiverController, QueuedLatePayloadFromActuallyRetiredPhys
 }
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+class IdleLateLifecycleReceiverController : public TerminalReceiverController {
+protected:
+    std::string actual_describe;
+    std::shared_ptr<std::atomic<unsigned>> rejected=std::make_shared<std::atomic<unsigned>>(0),retired=std::make_shared<std::atomic<unsigned>>(0);
+    void start_idle(const std::shared_ptr<ControllerPause>& rejection_pause={}) {
+        configure();seed_local(1,9540);hold_uploads=false;
+        after_control=[this](size_t,const json& control,std::string& outgoing){if(control.at("operation")=="describe")actual_describe=outgoing;};
+        const auto rejected_count=rejected,retired_count=retired;
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
+            if(std::strcmp(stage,"late-lifecycle-validation-rejected")==0){++*rejected_count;if(rejection_pause)rejection_pause->wait();}
+            if(std::strcmp(stage,"late-lifecycle-retired-disposed")==0)++*retired_count;});
+        connect();ASSERT_TRUE(until([&]{return installed()&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==1;}));
+        ASSERT_FALSE(has_error());ASSERT_FALSE(actual_describe.empty());ASSERT_EQ(observed_uploads.size(),1u);
+    }
+    std::string actual_inspect() {
+        const auto& q=full_requests.at(0);const auto command=json{{"kind","recoveryReady"},{"version",1},{"operation","inspect"},
+            {"requestID",::lattice::uuid_t::generate().to_string()},{"routeGeneration",q.at("routeGeneration")},{"request",q.at("request")}}.dump();
+        auto charge=peers[0].setup.stop_token().reserve_ready(command.size());
+        if(!charge.valid())throw db_error("idle lifecycle fixture inspect reservation refused");
+        const auto response=peers[0].setup.ready(command,charge);
+        if(response.status_code()!=1||!response.publishable())throw db_error("idle lifecycle fixture inspect unavailable");return response.wire();
+    }
+    void verifies_upload_fence(const Snapshot& before,size_t sent) {
+        ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(phase(),0);EXPECT_EQ(snapshot(),before);
+        // This allowed local write creates fresh ordinary demand after the
+        // malformed source was revoked. It may not claim or send an original.
+        seed_local(1,9541);const auto after_write=snapshot();
+        EXPECT_THROW(synchronizers[0]->sync_now(),db_error);
+        const auto drain=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+        EXPECT_EQ(drain.state,sync_drain_state::failed);EXPECT_TRUE(drain.error);
+        auto barrier=std::make_shared<std::promise<void>>();auto completed=barrier->get_future();
+        receiver->get_scheduler()->invoke([barrier]{barrier->set_value();});
+        ASSERT_EQ(completed.wait_for(std::chrono::seconds(2)),std::future_status::ready);
+        for(unsigned n=0;n<64&&pump();++n){}
+        EXPECT_EQ(snapshot(),after_write);EXPECT_EQ(observed_uploads.size(),sent);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NULL"),1);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2"),1);
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+        EXPECT_TRUE(peers[0].physical.is_current());
+    }
+};
+TEST_F(IdleLateLifecycleReceiverController, InstalledMalformedLateLifecycleRevokesActualOrdinaryExportView) {
+    start_idle();ASSERT_FALSE(HasFatalFailure());auto invalid=json::parse(actual_inspect());invalid["lifecycle"]["bindingHighWater"]="01";
+    const auto before=snapshot();const auto sent=observed_uploads.size();
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(invalid.dump())));
+    verifies_upload_fence(before,sent);EXPECT_EQ(rejected->load(),1u);
+}
+TEST_F(IdleLateLifecycleReceiverController, InstalledRepeatedDescribeRevokesActualOrdinaryExportView) {
+    start_idle();ASSERT_FALSE(HasFatalFailure());const auto before=snapshot();const auto sent=observed_uploads.size();
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(actual_describe)));
+    verifies_upload_fence(before,sent);EXPECT_EQ(rejected->load(),1u);
+}
+TEST_F(IdleLateLifecycleReceiverController, InstalledWrongLateBindingRevokesActualOrdinaryExportView) {
+    start_idle();ASSERT_FALSE(HasFatalFailure());auto invalid=json::parse(actual_inspect());invalid["lifecycle"]["namespaceID"]="b";
+    const auto before=snapshot();const auto sent=observed_uploads.size();
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(invalid.dump())));
+    verifies_upload_fence(before,sent);EXPECT_EQ(rejected->load(),1u);
+}
+TEST_F(IdleLateLifecycleReceiverController, InstalledOversizedLateAdmissionRevokesActualOrdinaryExportView) {
+    start_idle();ASSERT_FALSE(HasFatalFailure());const auto before=snapshot();const auto sent=observed_uploads.size();
+    std::string oversized="{\"kind\":\"recoveryReady\",\"padding\":\"";oversized.append(4194304,'x');oversized+="\"}";
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(oversized)));
+    verifies_upload_fence(before,sent);EXPECT_EQ(rejected->load(),0u); // rejected before worker parsing/copy
+}
+TEST_F(IdleLateLifecycleReceiverController, InstalledThirdLateSlotAdmissionRevokesActualOrdinaryExportView) {
+    start_idle();ASSERT_FALSE(HasFatalFailure());const auto actual=actual_inspect();const auto before=snapshot();const auto sent=observed_uploads.size();
+    auto pause=std::make_shared<ControllerPause>();pauses.push_back(pause);
+    receiver->get_scheduler()->invoke([pause]{pause->wait();});ASSERT_TRUE(until([&]{return pause->ready();}));
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(actual)));
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(actual)));
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(actual)));pause->release();
+    verifies_upload_fence(before,sent);EXPECT_EQ(rejected->load(),0u); // full global inbox refused on callback
+}
+TEST_F(IdleLateLifecycleReceiverController, ActualPhysicalRetirementAfterLateParseFailureDoesNotPoisonSuccessor) {
+    auto pause=std::make_shared<ControllerPause>();pauses.push_back(pause);start_idle(pause);ASSERT_FALSE(HasFatalFailure());
+    const auto before=snapshot();const auto old=peers[0].physical;
+    ASSERT_TRUE(old.trigger_on_message(transport_message::from_string(actual_describe)));
+    ASSERT_TRUE(until([&]{return pause->ready();}));ASSERT_EQ(rejected->load(),1u);
+    ASSERT_TRUE(old.trigger_on_close(1000,"retire after actual late parse rejection"));pause->release();
+    ASSERT_TRUE(until([&]{return retired->load()==1;}));EXPECT_FALSE(has_error());EXPECT_EQ(snapshot(),before);
+    EXPECT_FALSE(old.trigger_on_message(transport_message::from_string(actual_describe)));
+    synchronizers.clear();connect();ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
+    EXPECT_FALSE(old.matches(peers[0].physical));EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=2"),1);
+}
+}
+#endif

@@ -67,6 +67,9 @@ public:
     // duplicates that descriptor; it creates no parent/default/global catalog.
     // Bootstrap is exclusive. Partial bootstrap is an orphan, never reused.
     static journal create_unadopted(int directory_fd, const store_binding&);
+    // First observation is not authentication of a coherent catalog reset.
+    // The future installation authority must supply/validate expected catalog
+    // identity and qualify its filesystem. This substrate grants no adoption.
     static journal open_existing(int directory_fd, const store_binding& expected);
     ~journal();
     journal(journal&&) noexcept;

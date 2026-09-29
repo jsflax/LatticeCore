@@ -128,6 +128,8 @@ struct journal::implementation {
     const pid_t creator = ::getpid();
     store_binding binding;
     file_identity control;
+    file_identity accepted_entry{}, accepted_generation{};
+    bool locks_bound = false;
     explicit implementation(int fd, const store_binding& binding)
         : directory(::fcntl(fd, F_DUPFD_CLOEXEC, 0)), binding(binding) {
         if (directory.fd < 0) fail(error_code::unavailable, "ordinary admission control directory unavailable");
@@ -139,7 +141,9 @@ struct journal::implementation {
             fail(error_code::identity_changed, "ordinary admission control directory changed");
     }
     fd_owner entry() const {
-        check(); auto fd = file(directory.fd, "entry.lock"); lock(fd.fd, LOCK_EX); return fd;
+        check(); auto fd = file(directory.fd, "entry.lock");
+        if (locks_bound) check_named("entry.lock", fd.fd, accepted_entry);
+        lock(fd.fd, LOCK_EX); return fd;
     }
     void check_named(const char* name, int fd, const file_identity& expected) const {
         struct stat named{};
@@ -148,12 +152,18 @@ struct journal::implementation {
             identity(named) != expected)
             fail(error_code::identity_changed, "ordinary admission control object changed");
     }
+    void bind_locks(const record& value) {
+        if (locks_bound) fail(error_code::identity_changed, "ordinary admission control binding is immutable");
+        accepted_entry = value.entry; accepted_generation = value.generation; locks_bound = true;
+    }
     record load(int entry_fd) const {
         struct stat pending{};
         if (::fstatat(directory.fd, "admission.pending", &pending, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
             fail(error_code::durability_unproved, "ordinary admission unfinished publication retained");
         auto source = file(directory.fd, "admission.v1");
-        if (inspect(source.fd, false).st_size != static_cast<off_t>(encoded_record{}.size()))
+        const auto source_stat = inspect(source.fd, false);
+        const auto source_identity = identity(source_stat);
+        if (source_stat.st_size != static_cast<off_t>(encoded_record{}.size()))
             fail(error_code::invalid_record, "ordinary admission snapshot size invalid");
         encoded_record bytes{}; std::size_t done = 0;
         while (done < bytes.size()) {
@@ -168,6 +178,11 @@ struct journal::implementation {
         auto value = decode(bytes);
         if (value.binding != binding || value.control != control)
             fail(error_code::identity_changed, "ordinary admission binding changed");
+        // Retained instances must never let a coherent rewritten snapshot
+        // redefine the lock objects while an old generation hold still lives.
+        if (locks_bound && (value.entry != accepted_entry || value.generation != accepted_generation))
+            fail(error_code::identity_changed, "ordinary admission retained lock binding changed");
+        check_named("admission.v1", source.fd, source_identity);
         check_named("entry.lock", entry_fd, value.entry);
         auto generation = file(directory.fd, "generation.lock");
         check_named("generation.lock", generation.fd, value.generation);
@@ -175,11 +190,13 @@ struct journal::implementation {
         // before directory fsync. Re-establish durability before a retry can
         // report the same intent or obtain even a non-admitting hold.
         durable(source.fd); durable(directory.fd);
+        check_named("admission.v1", source.fd, source_identity);
         return value;
     }
     void save(const record& value) const {
         const auto bytes = encode(value);
         auto pending = file(directory.fd, "admission.pending", true);
+        const auto pending_identity = identity(inspect(pending.fd, false));
         fault(test_hooks::boundary::before_write);
         std::size_t done = 0;
         while (done < bytes.size()) {
@@ -190,10 +207,14 @@ struct journal::implementation {
         }
         fault(test_hooks::boundary::after_write); durable(pending.fd);
         fault(test_hooks::boundary::after_file_sync);
+        check_named("admission.pending", pending.fd, pending_identity);
         if (::renameat(directory.fd, "admission.pending", directory.fd, "admission.v1"))
             fail(error_code::durability_unproved, "ordinary admission snapshot publication failed");
-        fault(test_hooks::boundary::after_rename); durable(directory.fd);
+        fault(test_hooks::boundary::after_rename);
+        check_named("admission.v1", pending.fd, pending_identity);
+        durable(directory.fd);
         fault(test_hooks::boundary::after_directory_sync);
+        check_named("admission.v1", pending.fd, pending_identity);
     }
 };
 
@@ -219,6 +240,7 @@ journal journal::create_unadopted(int directory_fd, const store_binding& binding
     auto entry = file(state->directory.fd, "entry.lock", true); lock(entry.fd, LOCK_EX);
     auto generation = file(state->directory.fd, "generation.lock", true);
     value.entry = identity(inspect(entry.fd, false)); value.generation = identity(inspect(generation.fd, false));
+    state->bind_locks(value);
     durable(entry.fd); durable(generation.fd); durable(state->directory.fd);
     // An existing snapshot/pending record, even with missing lock objects, is
     // not an empty installation. Never overwrite it as bootstrap.
@@ -229,7 +251,8 @@ journal journal::create_unadopted(int directory_fd, const store_binding& binding
 }
 journal journal::open_existing(int directory_fd, const store_binding& expected) {
     auto state = std::make_unique<implementation>(directory_fd, expected);
-    auto entry = state->entry(); (void)state->load(entry.fd); return journal(std::move(state));
+    auto entry = state->entry(); const auto value = state->load(entry.fd);
+    state->bind_locks(value); return journal(std::move(state));
 }
 record journal::read() const {
     if (!impl_) fail(error_code::unavailable, "ordinary admission moved journal");

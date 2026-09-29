@@ -3,6 +3,7 @@
 #include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
 #include <filesystem>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <limits>
 #include <thread>
@@ -123,14 +124,36 @@ void overwrite(int dir, const admission::record& value) {
 }
 struct child_owner {
     pid_t pid = -1;
-    explicit child_owner(pid_t value) : pid(value) {}
-    ~child_owner() { if (pid > 0) { ::kill(pid, SIGKILL); int status; while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {} } }
+    bool group = false;
+    explicit child_owner(pid_t value, bool own_group = false) : pid(value), group(own_group) {}
+    ~child_owner() {
+        if (pid <= 0) return;
+        const auto owned = pid;
+        // Signal the group only while its unreaped leader remains our child;
+        // never signal a remembered numeric PGID after releasing that custody.
+        (void)::kill(group ? -owned : owned, SIGKILL);
+        int status; pid_t waited;
+        do { waited = ::waitpid(owned, &status, 0); } while (waited < 0 && errno == EINTR);
+        if (waited != owned) ADD_FAILURE() << "admission child cleanup could not join owned leader";
+        if (group) {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            bool gone = false;
+            do {
+                if (::kill(-owned, 0) < 0 && errno == ESRCH) { gone = true; break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            } while (std::chrono::steady_clock::now() < end);
+            if (!gone) ADD_FAILURE() << "admission child group completion unproved";
+        }
+    }
     int join() {
-        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(group ? 30 : 10);
         while (std::chrono::steady_clock::now() < end) {
             int status = 0; const auto result = ::waitpid(pid, &status, WNOHANG);
             if (result == pid) { pid = -1; return status; }
-            if (result < 0 && errno != EINTR) return -1;
+            if (result < 0 && errno != EINTR) {
+                pid = -1; // Lost custody: report failure, never signal an unverifiable PID.
+                return -1;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         return -1; // Destructor still kills and joins on every failure path.
@@ -157,13 +180,36 @@ pid_t start_helper(const area& owned, const std::string& mode) {
     char* argv[] = {executable.data(), filter.data(), repeat.data(), color.data(), output.data(), nullptr};
     std::vector<std::string> environment;
     for (char** item = environ; *item; ++item) {
-        if (std::string(*item).rfind("LATTICE_ORDINARY_JOURNAL_HELPER_", 0) != 0) environment.emplace_back(*item);
+        const std::string value(*item);
+        if (!value.starts_with("LATTICE_ORDINARY_JOURNAL_HELPER_") &&
+            !value.starts_with("LATTICE_TEST_LOG_PATH=")) environment.push_back(value);
     }
     environment.push_back("LATTICE_ORDINARY_JOURNAL_HELPER_MODE=" + mode);
     environment.push_back("LATTICE_ORDINARY_JOURNAL_HELPER_DIRECTORY=" + owned.path.string());
+    const char* parent_log = std::getenv("LATTICE_TEST_LOG_PATH");
+    const std::string native = parent_log && *parent_log ?
+        std::string(parent_log) + "." + owned.path.filename().string() + ".ordinary-" + mode + ".native.log" :
+        owned.path.string() + ".ordinary-" + mode + ".native.log";
+    // Native and terminal logs survive disposable control-area cleanup. The
+    // hosted parent config places this evidence under its owned localdev root.
+    descriptor reserved(::open(native.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+    if (reserved.fd < 0) throw std::runtime_error("admission helper native log collision");
+    environment.push_back("LATTICE_TEST_LOG_PATH=" + native);
     std::vector<char*> env; for (auto& value : environment) env.push_back(value.data()); env.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions)) throw std::runtime_error("admission helper actions unavailable");
+    struct actions_owner { posix_spawn_file_actions_t& value; ~actions_owner() { ::posix_spawn_file_actions_destroy(&value); } } own_actions{actions};
+    const std::string terminal = native + ".terminal.log";
+    if (::posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, terminal.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600) ||
+        ::posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO))
+        throw std::runtime_error("admission helper log actions unavailable");
+    posix_spawnattr_t attributes;
+    if (::posix_spawnattr_init(&attributes)) throw std::runtime_error("admission helper attributes unavailable");
+    struct attributes_owner { posix_spawnattr_t& value; ~attributes_owner() { ::posix_spawnattr_destroy(&value); } } own_attributes{attributes};
+    if (::posix_spawnattr_setpgroup(&attributes, 0) || ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP))
+        throw std::runtime_error("admission helper owned group unavailable");
     pid_t child = -1;
-    if (::posix_spawn(&child, executable.c_str(), nullptr, nullptr, argv, env.data()))
+    if (::posix_spawn(&child, executable.c_str(), &actions, &attributes, argv, env.data()))
         throw std::runtime_error("admission helper spawn failed");
     return child;
 }
@@ -272,6 +318,42 @@ TEST(OrdinaryStoreAdmission, ControlPermissionsAndSymlinksAreRefused) {
     EXPECT_THROW(first.read(), admission::error);
 }
 
+TEST(OrdinaryStoreAdmission, CoherentSnapshotAndLockReplacementCannotRebindRetainedJournal) {
+    for (const bool replace_entry : {false, true}) {
+        area owned; auto retained = admission::journal::create_unadopted(owned.fd, binding());
+        auto old_hold = retained.try_hold_generation();
+        auto replacement_record = retained.read();
+        ASSERT_EQ(::renameat(owned.fd, "generation.lock", owned.fd, "old-generation.lock"), 0);
+        descriptor replacement_generation(::openat(owned.fd, "generation.lock", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+        ASSERT_GE(replacement_generation.fd, 0);
+        struct stat st{}; ASSERT_EQ(::fstat(replacement_generation.fd, &st), 0);
+        replacement_record.generation = {static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino)};
+        if (replace_entry) {
+            ASSERT_EQ(::renameat(owned.fd, "entry.lock", owned.fd, "old-entry.lock"), 0);
+            descriptor replacement_entry(::openat(owned.fd, "entry.lock", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+            ASSERT_GE(replacement_entry.fd, 0); ASSERT_EQ(::fstat(replacement_entry.fd, &st), 0);
+            replacement_record.entry = {static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino)};
+        }
+        ASSERT_EQ(::renameat(owned.fd, "admission.v1", owned.fd, "old-admission.v1"), 0);
+        descriptor snapshot(::openat(owned.fd, "admission.v1", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+        ASSERT_GE(snapshot.fd, 0); overwrite(owned.fd, replacement_record);
+        EXPECT_THROW(retained.read(), admission::error);
+        EXPECT_THROW(retained.try_hold_generation(), admission::error);
+        EXPECT_THROW(retained.begin_retirement(id(20)), admission::error);
+        descriptor old_generation(::openat(owned.fd, "old-generation.lock", O_RDWR | O_CLOEXEC));
+        ASSERT_GE(old_generation.fd, 0);
+        ASSERT_EQ(::flock(old_generation.fd, LOCK_EX | LOCK_NB), -1);
+        EXPECT_TRUE(errno == EWOULDBLOCK || errno == EAGAIN);
+        // A fresh observation lacks external installation identity authority.
+        // Its OS probe can be quiet despite the old retained real hold; neither
+        // fresh reopen nor a quiet probe is ever an adoption capability.
+        auto freshly_observed = admission::journal::open_existing(owned.fd, binding());
+        EXPECT_FALSE(freshly_observed.generation_busy());
+        old_hold = {};
+        EXPECT_EQ(::flock(old_generation.fd, LOCK_EX | LOCK_NB), 0);
+    }
+}
+
 TEST(OrdinaryStoreAdmission, InterruptedPreRenamePublicationKeepsGateClosedAndOriginalBytes) {
     for (const auto point : {admission::test_hooks::boundary::before_write,
                              admission::test_hooks::boundary::after_write,
@@ -322,7 +404,11 @@ TEST(OrdinaryStoreAdmission, EntryContentionIsImmediateAndDoesNotMutateIntent) {
 
 TEST(OrdinaryStoreAdmission, ForkedUseRefusesAndChildCloseDoesNotUnlockParentHold) {
     area owned; auto first = admission::journal::create_unadopted(owned.fd, binding());
-    child_owner child(start_helper(owned, "fork-inheritance")); const auto status = child.join();
+    child_owner child(start_helper(owned, "fork-inheritance"), true);
+    // The actual helper writes this only after its own child is joined and all
+    // inheritance assertions passed. Do not reap its leader before that proof.
+    ASSERT_TRUE(wait_file(owned.path / "fork-joined.signal"));
+    const auto status = child.join();
     ASSERT_GE(status, 0);
     ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 0);
     EXPECT_FALSE(first.generation_busy());
@@ -330,7 +416,7 @@ TEST(OrdinaryStoreAdmission, ForkedUseRefusesAndChildCloseDoesNotUnlockParentHol
 
 TEST(OrdinaryStoreAdmission, ChildOwnsIndependentHoldUntilActualJoinedCompletion) {
     area owned; auto first = admission::journal::create_unadopted(owned.fd, binding());
-    child_owner child(start_helper(owned, "hold"));
+    child_owner child(start_helper(owned, "hold"), true);
     ASSERT_TRUE(wait_file(owned.path / "held.signal"));
     EXPECT_TRUE(first.generation_busy());
     EXPECT_EQ(first.begin_retirement(id(18)).cutover, id(18));
@@ -371,5 +457,6 @@ TEST(OrdinaryStoreAdmission, ProcessHelper) {
     ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 0);
     EXPECT_TRUE(owner.generation_busy());
     hold = {}; EXPECT_FALSE(owner.generation_busy());
+    if (!::testing::Test::HasFailure()) signal_file(directory.fd, "fork-joined.signal");
 }
 #endif

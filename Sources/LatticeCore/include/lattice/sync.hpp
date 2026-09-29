@@ -34,7 +34,7 @@ struct sync_drain_result {
 };
 // Forward declaration
 class lattice_db;
-namespace detail {class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;}
+namespace detail {class recovery_continuous_producer;class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -421,6 +421,9 @@ protected:
     std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
     std::shared_ptr<detail::receiver_source_binding> receiver_source_;
     std::shared_ptr<detail::recovery_receiver_route> receiver_controller_;
+    // Shutdown authority is independent of retaining the database. Publish it
+    // before init can fail; borrowed owner/sibling schedulers must stay live.
+    bool owns_scheduler_shutdown_=false;
     bool owns_inline_scheduler_adapter_=false;
     // The completed base is destroyed even when a subclass constructor
     // refuses a route before init_sync reaches the instance counter.
@@ -659,8 +662,12 @@ public:
 
 #else
 
-/// Native: owns a dedicated lattice_db (separate connection on its own thread).
+/// Native: shared owners lend their scheduler; unique child owners transfer
+/// dedicated scheduler shutdown responsibility to this synchronizer.
 class synchronizer : public synchronizer_base {
+    enum class scheduler_ownership { borrowed, owned };
+    synchronizer(std::shared_ptr<lattice_db>,const sync_config&,scheduler_ownership);
+    friend class detail::recovery_continuous_producer;
 public:
     synchronizer(std::shared_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);

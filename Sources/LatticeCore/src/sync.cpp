@@ -685,16 +685,14 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     // A native pacer introduces concurrent callers even when the owner chose
     // inline dispatch. Serialize this synchronizer's scheduled operations;
     // custom/actor/worker schedulers retain their existing execution policy.
-    scheduler_ = detail::make_synchronizer_scheduler(std::move(sched));
+    scheduler_ = detail::make_synchronizer_scheduler(std::move(sched),&owns_inline_scheduler_adapter_);
+    owns_scheduler_shutdown_=owns_scheduler_shutdown_||owns_inline_scheduler_adapter_;
 #else
     scheduler_ = sched;
 #endif
     callback_lifetime_=std::make_shared<detail::sync_callback_lifetime>(this,owned_db_);
     pacer_state_=std::make_shared<detail::sync_pacer_state>();
     discovery_deferral_=std::make_shared<detail::sync_discovery_deferral>();
-#ifndef __EMSCRIPTEN__
-    owns_inline_scheduler_adapter_=dynamic_cast<detail::sync_immediate_scheduler*>(scheduler_.get())!=nullptr;
-#endif
     scheduler_=detail::make_sync_lifetime_scheduler(std::move(scheduler_),callback_lifetime_);
     auto n = g_sync_instance_count.fetch_add(1, std::memory_order_relaxed) + 1;
     counted_instance_=true;
@@ -732,16 +730,14 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     // A native pacer introduces concurrent callers even when the owner chose
     // inline dispatch. Serialize this synchronizer's scheduled operations;
     // custom/actor/worker schedulers retain their existing execution policy.
-    scheduler_ = detail::make_synchronizer_scheduler(std::move(sched));
+    scheduler_ = detail::make_synchronizer_scheduler(std::move(sched),&owns_inline_scheduler_adapter_);
+    owns_scheduler_shutdown_=owns_scheduler_shutdown_||owns_inline_scheduler_adapter_;
 #else
     scheduler_ = sched;
 #endif
     callback_lifetime_=std::make_shared<detail::sync_callback_lifetime>(this,owned_db_);
     pacer_state_=std::make_shared<detail::sync_pacer_state>();
     discovery_deferral_=std::make_shared<detail::sync_discovery_deferral>();
-#ifndef __EMSCRIPTEN__
-    owns_inline_scheduler_adapter_=dynamic_cast<detail::sync_immediate_scheduler*>(scheduler_.get())!=nullptr;
-#endif
     scheduler_=detail::make_sync_lifetime_scheduler(std::move(scheduler_),callback_lifetime_);
     ws_client_ = std::move(transport);
     if(!ws_client_)throw db_error("synchronizer requires transport");
@@ -1206,13 +1202,12 @@ synchronizer_base::~synchronizer_base() {
     }
     remember([&]{disconnect();});
 
-    // Drain the scheduler: wait for any in-flight work to complete before
-    // implicit member destruction invalidates the state that work accesses.
-    // Without this, a lambda mid-way through upload_pending_changes() can
-    // access db_, config_, ws_client_ etc. after they're destroyed.
-    // Skip if we're on the scheduler thread (destructor called from within
-    // a callback) — the work will finish as part of the current call stack.
-    remember([&]{if (scheduler_) {
+    // Owned lanes keep their existing drain/join policy. Borrowed owner and
+    // sibling schedulers remain live: this synchronizer's queued work is
+    // already fenced by retirement and its admitted foreign work settled.
+    // Keep the existing own-thread policy; this does not establish arbitrary
+    // synchronous callback self-deletion safety.
+    remember([&]{if (scheduler_ && owns_scheduler_shutdown_) {
         if (owns_inline_scheduler_adapter_ || !scheduler_->is_on_thread()) {
             LOG_INFO("synchronizer", "[%s] ~synchronizer: draining scheduler...", log_id());
             remember([&]{scheduler_->shutdown();});
@@ -3493,6 +3488,7 @@ void synchronizer_base::fire_progress() {
 
 synchronizer::synchronizer(lattice_db& db_ref, const sync_config& config)
 {
+    owns_scheduler_shutdown_=true; // Preserve the existing browser shutdown policy.
     db_ptr_ = &db_ref;
     auto sched = db_ref.get_scheduler() ? db_ref.get_scheduler() : std::make_shared<immediate_scheduler>();
     init_sync(config, sched);
@@ -3501,6 +3497,7 @@ synchronizer::synchronizer(lattice_db& db_ref, const sync_config& config)
 synchronizer::synchronizer(lattice_db& db_ref, const sync_config& config,
                            std::unique_ptr<sync_transport> transport)
 {
+    owns_scheduler_shutdown_=true; // Preserve the existing browser shutdown policy.
     db_ptr_ = &db_ref;
     auto sched = db_ref.get_scheduler() ? db_ref.get_scheduler() : std::make_shared<immediate_scheduler>();
     init_sync(config, sched, std::move(transport));
@@ -3509,7 +3506,11 @@ synchronizer::synchronizer(lattice_db& db_ref, const sync_config& config,
 #else
 
 synchronizer::synchronizer(std::shared_ptr<lattice_db> db, const sync_config& config)
+    :synchronizer(std::move(db),config,scheduler_ownership::borrowed) {}
+
+synchronizer::synchronizer(std::shared_ptr<lattice_db> db,const sync_config& config,scheduler_ownership ownership)
 {
+    owns_scheduler_shutdown_=ownership==scheduler_ownership::owned;
     if(!db)throw db_error("retained synchronizer requires owner");
     owned_db_=std::move(db);db_ptr_=owned_db_.get();
     auto sched=owned_db_->get_scheduler()?owned_db_->get_scheduler():std::make_shared<immediate_scheduler>();
@@ -3518,6 +3519,7 @@ synchronizer::synchronizer(std::shared_ptr<lattice_db> db, const sync_config& co
 
 synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config)
 {
+    owns_scheduler_shutdown_=true;
     if(!db)throw db_error("retained synchronizer requires owner");
     owned_db_ = std::move(db);
     db_ptr_ = owned_db_.get();
@@ -3528,6 +3530,7 @@ synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& co
 synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
                            std::unique_ptr<sync_transport> transport)
 {
+    owns_scheduler_shutdown_=true;
     if(!db)throw db_error("retained synchronizer requires owner");
     owned_db_ = std::move(db);
     db_ptr_ = owned_db_.get();

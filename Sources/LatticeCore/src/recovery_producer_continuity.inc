@@ -484,7 +484,10 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     child.busy_timeout_ms=owner.config_.busy_timeout_ms;child.target_schema_version=owner.config_.target_schema_version;
     auto opened=open_owned(child,state->policy,owner.recovery_continuous_->recipe);
     if(!opened.owner||opened.settlement.state!=recovery_install_state::committed){if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);refuse("continuous dedicated facade open failed");}
-    owner.synchronizer_=std::make_unique<synchronizer>(std::move(opened.owner),config);
+    // This private facade was just given a dedicated scheduler. Public shared
+    // owners borrow theirs; only this internal creation transfers shutdown.
+    owner.synchronizer_=std::unique_ptr<synchronizer>(new synchronizer(std::move(opened.owner),config,
+        synchronizer::scheduler_ownership::owned));
     if(owner.on_sync_state_change_)owner.synchronizer_->set_on_state_change(owner.on_sync_state_change_);
     if(owner.on_sync_error_)owner.synchronizer_->set_on_error(owner.on_sync_error_);
     owner.synchronizer_->connect();

@@ -26,7 +26,10 @@ public:
     std::exception_ptr error;
     size_t rows=0;
     explicit held_read(lattice::database& db,bool managed=false,std::string sql="SELECT name FROM TestPerson")
-        :worker([this,&db,managed,sql=std::move(sql)]{
+    {
+        // Launch only after every member, including error and rows below the
+        // thread declaration, has completed construction.
+        worker=std::thread([this,&db,managed,sql=std::move(sql)]{
             bool signaled=false;
             try {
                 row_probe probe([&](auto& actual,auto*){
@@ -37,7 +40,9 @@ public:
                 else rows=db.query(sql).size();
             }catch(...){error=std::current_exception();}
             if(!signaled)arrived_.set_value();
-        }) {if(arrived.wait_for(std::chrono::seconds(12))!=std::future_status::ready)std::abort();}
+        });
+        if(arrived.wait_for(std::chrono::seconds(12))!=std::future_status::ready)std::abort();
+    }
     void finish(){if(!released_once.exchange(true))release_.set_value();if(worker.joinable())worker.join();}
     ~held_read(){finish();}
 };

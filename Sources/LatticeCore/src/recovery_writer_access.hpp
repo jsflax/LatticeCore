@@ -6,7 +6,11 @@
 
 namespace lattice::detail {
 enum class recovery_install_state { refused, rolled_back, committed, unsettled, ownership_lost };
+// Internal controller-only no-effect outcome. This is never a transaction
+// settlement and is never set after notification reservation or BEGIN.
+enum class recovery_install_deferred { none, connection_mutex, engine_read, store_gate };
 struct recovery_install_result {
+    recovery_install_deferred deferred = recovery_install_deferred::none;
     recovery_install_state state = recovery_install_state::refused;
     std::exception_ptr primary_error, cleanup_error, postcommit_error;
     // An ordinary successor may have committed inside a contract-violating
@@ -95,10 +99,11 @@ private:
     static bool active_install_for(const lattice_db*, sqlite3*) noexcept;
     static recovery_install_result install_impl(std::shared_ptr<lattice_db>,
         const std::function<void(database&)>&, const std::function<void()>& after_unlock,
-        const std::function<void()>& after_writer_capture = {}, bool* initial_admission_busy = nullptr);
+        const std::function<void()>& after_writer_capture = {}, bool* initial_admission_busy = nullptr, bool controller_try = false);
     static void deliver(lattice_db&, const lattice_db::recovery_commit_batch&);
     friend struct recovery_install_test_access;
     friend struct recovery_install_admission_test_access;
+    friend struct recovery_controller_admission_test_access;
     friend class recovery_local_producer_adapter;
     friend class recovery_continuous_producer;
     friend class canonical_writer_adapter;

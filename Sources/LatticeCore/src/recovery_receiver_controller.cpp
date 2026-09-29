@@ -19,7 +19,10 @@ namespace {
 namespace cr=canonical_range;
 using json=nlohmann::json;
 constexpr size_t pending_bytes=16777216;
+constexpr unsigned admission_retry_attempts=32;
+constexpr int64_t admission_retry_window_ms=5000,admission_retry_tick_ms=100;
 [[noreturn]] void refuse(const char* reason){throw db_error(reason);}
+class controller_admission_wait final {};
 class delivery_retry_wait final : public db_error {
 public:
     delivery_retry_wait():db_error("controller UNKNOWN persisted after one restricted pass; new external source/request generation or actual delivery timeout required"){}
@@ -75,6 +78,12 @@ cr::source_binding source_binding(const recovery_obligation_profile& profile) {
     const auto& b=profile.binding;return {b.authority,b.source,b.epoch,b.scope,b.schema};
 }
 void known(const recovery_install_result& result) {
+    if(result.deferred!=recovery_install_deferred::none) {
+        require(result.state==recovery_install_state::refused&&!result.primary_error&&!result.cleanup_error&&
+            !result.postcommit_error&&!result.notification_error&&!result.unexpected_commit_observed,
+            "controller invalid no-effect admission outcome");
+        throw controller_admission_wait{};
+    }
     if(result.state!=recovery_install_state::committed){if(result.primary_error)std::rethrow_exception(result.primary_error);refuse("controller transaction outcome unavailable; gate remains closed");}
     // Postcommit notification failure cannot roll back or justify model replay.
     // The next actual owned inspection observes the committed durable phase.
@@ -132,6 +141,13 @@ struct recovery_receiver_controller::state {
     uint64_t delivery_retry_revision=0,reconciled_delivery_retry_revision=0;
     bool awaiting_delivery_retry=false;
     std::exception_ptr failure;
+    // One episode, driven by the existing native 100ms receiver tick. A wake
+    // does not extend either the original deadline or the attempt allowance.
+    struct admission_episode {
+        uint64_t revision=0;
+        unsigned attempts=0;
+        int64_t deadline=0,next_due=0;
+    } admission_wait;
     std::shared_ptr<const verified_unsent_set> frozen;
     std::shared_ptr<const recovery_reconciliation_descriptor> reconciliation;
     int64_t frozen_attempt=0,frozen_barrier=0;
@@ -326,9 +342,11 @@ bool recovery_receiver_route::receive(const platform_transport_callbacks& endpoi
 void recovery_receiver_controller::turn() {
     auto& runtime=*state_;
     {std::lock_guard lock(runtime.mutex);runtime.scheduled=false;if(runtime.running)return;runtime.running=true;}
-    struct settlement {recovery_receiver_controller::state& value;std::function<void()> after;
-        ~settlement(){{std::lock_guard lock(value.mutex);value.running=false;}if(after)try{after();}catch(...) {}}} settle{runtime,{}};
+    struct settlement {recovery_receiver_controller::state& value;std::function<void()> after;bool keep_admission_wait=false;
+        ~settlement(){{std::lock_guard lock(value.mutex);value.running=false;if(!keep_admission_wait)value.admission_wait={};}if(after)try{after();}catch(...) {}}} settle{runtime,{}};
     std::weak_ptr<lattice_db> observed_owner;
+    int64_t admission_deadline=now()+admission_retry_window_ms;
+    uint64_t admission_revision=0;
     try {
         struct connected {
             std::shared_ptr<recovery_receiver_route> route;
@@ -374,9 +392,20 @@ void recovery_receiver_controller::turn() {
                 runtime.observed[channel]=c.view;runtime.frozen.reset();runtime.framing_committed=false;
             }
         }
+        for(const auto& [_,c]:connected_routes)
+            admission_deadline=std::min(admission_deadline,now()+c.route->state_->source->recovery_remaining(c.view));
         bool reconciliation_waiting=false;
         {std::lock_guard lock(runtime.mutex);reconciliation_waiting=static_cast<bool>(runtime.reconciliation);
-            if(!reconciliation_waiting&&(runtime.failure||(runtime.idle&&!runtime.demand&&!runtime.outstanding)))return;}
+            if(!reconciliation_waiting&&(runtime.failure||(runtime.idle&&!runtime.demand&&!runtime.outstanding)))return;
+            admission_revision=runtime.revision;
+            if(runtime.outstanding)admission_deadline=std::min(admission_deadline,runtime.outstanding->deadline);
+            auto& wait=runtime.admission_wait;
+            if(wait.attempts&&wait.revision!=runtime.revision)wait={};
+            if(wait.attempts){
+                wait.deadline=std::min(wait.deadline,admission_deadline);
+                require(now()<wait.deadline&&wait.attempts<admission_retry_attempts,"controller admission retry budget exhausted; gate remains closed");
+                if(now()<wait.next_due){settle.keep_admission_wait=true;return;}
+            }}
         if(reconciliation_waiting){settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;}
         const auto observe=[&](const char* stage){if(runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)runtime.probe->observed(stage);};
         // No new Q/frozen/journal graph may coexist with a retired cohort.
@@ -390,7 +419,7 @@ void recovery_receiver_controller::turn() {
         };
         const auto probe_scope=[&](const char* stage)->std::shared_ptr<void>{return runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope?runtime.probe->scope(stage):nullptr;};
         const auto live=[&]{for(const auto& [_,c]:connected_routes)require(!c.route->state_->retired.load()&&c.route->state_->source->recovery_live(c.view),"controller authenticated source retired during owned operation");};
-        const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();});known(result);};
+        const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();},true);known(result);};
         // Socket callbacks enqueue at most one bounded reply. Only this worker
         // parses it or touches SQL. Claiming the reply keeps its full byte
         // charge until the exact transactional consumer finishes.
@@ -401,9 +430,12 @@ void recovery_receiver_controller::turn() {
             if(!route||!route->state_->source->recovery_live(pending->view)||now()>=pending->deadline){
                 std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();return;
             }
-            std::string response;
-            {std::lock_guard lock(runtime.mutex);response.swap(pending->response);}
-            if(response.empty())return;
+            // Filled once by receive(). Keep the charged bytes in the pending
+            // slot until its real consumer commits; a no-effect busy result
+            // must not discard the only copy or admit another response.
+            {std::lock_guard lock(runtime.mutex);if(pending->response.empty())return;}
+            const auto& response=pending->response;
+            observe(pending->operation=="read"?"range-response-ready":"control-response-ready");
             const auto description=parse(route->state_->source->recovery_description(pending->view),65536);
             const auto channel=description.at("channel").get<std::string>();
             if(pending->operation=="read") {
@@ -472,6 +504,7 @@ void recovery_receiver_controller::turn() {
                 }
             }
             {std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();}
+            observe("response-consumed");
         }
         for(unsigned quantum=0;quantum<4;++quantum) {
             int64_t phase=0,barrier=0,attempt=0,physical_incarnation=0;uint64_t demand_revision;
@@ -483,7 +516,7 @@ void recovery_receiver_controller::turn() {
                 runtime.idle=false;
                 for(const auto& route:routes)route->state_->blocked.store(true,std::memory_order_release);
                 int64_t next=0;owned([&](database&){next=recovery_continuous_producer::controller_next_attempt_owned(owner);});
-                auto begun=recovery_continuous_producer::begin(owner,next);known(begun.settlement);observe("barrier-committed");if(begun.waiting)return;continue;
+                auto begun=recovery_continuous_producer::begin_impl(owner,next,true);known(begun.settlement);observe("barrier-committed");if(begun.waiting)return;continue;
             }
             for(const auto& route:routes)route->state_->blocked.store(true,std::memory_order_release);
             if(phase==4) {
@@ -514,8 +547,8 @@ void recovery_receiver_controller::turn() {
                     // demand. Reconstruction cannot discard an earlier expiry.
                     runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;
             }
-            if(phase==1) {auto status=recovery_continuous_producer::inspect(owner);known(status.settlement);require(status.barrier.has_value(),"controller closed phase lacks actual barrier");
-                auto frozen=recovery_continuous_producer::finish(*status.barrier);if(frozen.waiting)return;known(frozen.settlement);continue;}
+            if(phase==1) {auto status=recovery_continuous_producer::inspect_impl(owner,true);known(status.settlement);require(status.barrier.has_value(),"controller closed phase lacks actual barrier");
+                auto frozen=recovery_continuous_producer::finish_impl(*status.barrier,true);if(frozen.waiting)return;known(frozen.settlement);continue;}
             if(phase==3) {
                 auto scope_probe=probe_scope("resume");
                 owned([&](database& db){
@@ -545,8 +578,8 @@ void recovery_receiver_controller::turn() {
             }
             require(phase==2,"controller unsupported durable phase");
             if(!runtime.frozen||runtime.frozen_attempt!=attempt||runtime.frozen_barrier!=barrier) {
-                auto status=recovery_continuous_producer::inspect(owner);known(status.settlement);require(status.barrier.has_value(),"controller frozen barrier missing");
-                auto frozen=recovery_continuous_producer::finish(*status.barrier);if(frozen.waiting)return;known(frozen.settlement);require(frozen.unsent.has_value(),"controller frozen local custody missing");
+                auto status=recovery_continuous_producer::inspect_impl(owner,true);known(status.settlement);require(status.barrier.has_value(),"controller frozen barrier missing");
+                auto frozen=recovery_continuous_producer::finish_impl(*status.barrier,true);if(frozen.waiting)return;known(frozen.settlement);require(frozen.unsent.has_value(),"controller frozen local custody missing");
                 auto parked=std::make_shared<verified_unsent_set>(std::move(*frozen.unsent));recovery_continuous_producer::controller_park_proof(*parked);runtime.frozen=std::move(parked);runtime.frozen_attempt=attempt;runtime.frozen_barrier=barrier;runtime.framing_committed=false;
             }
             const auto proof=runtime.frozen;
@@ -675,7 +708,29 @@ void recovery_receiver_controller::turn() {
             return;
         }
     }catch(...){
-        const auto error=std::current_exception();std::shared_ptr<state::pending> released;
+        auto error=std::current_exception();std::shared_ptr<state::pending> released;
+        bool admission_busy=false;
+        try{std::rethrow_exception(error);}catch(const controller_admission_wait&){admission_busy=true;}catch(...){}
+        if(admission_busy) {
+            bool deferred=false;
+            {std::lock_guard lock(runtime.mutex);auto& wait=runtime.admission_wait;
+                // An external generation is observed by the next ordinary
+                // turn. This stale turn cannot spend or reset its allowance.
+                if(runtime.revision!=admission_revision)deferred=true;
+                else {
+                    if(!wait.attempts){wait.revision=admission_revision;wait.deadline=admission_deadline;}
+                    wait.deadline=std::min(wait.deadline,admission_deadline);
+                    if(now()<wait.deadline&&wait.attempts<admission_retry_attempts){++wait.attempts;wait.next_due=now()+admission_retry_tick_ms;deferred=true;}
+                }
+                if(deferred)settle.keep_admission_wait=true;
+            }
+            if(deferred){
+                try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)
+                    runtime.probe->observed("admission-deferred");}catch(...){}
+                return;
+            }
+            error=std::make_exception_ptr(db_error("controller admission retry budget exhausted; gate remains closed"));
+        }
         bool awaiting_delivery=false,retry_arrived=false;
         try{std::rethrow_exception(error);}catch(const delivery_retry_wait&){awaiting_delivery=true;}catch(...){}
         // Observation only: the typed UNKNOWN wait has left its SQL and leaf

@@ -512,3 +512,121 @@ TEST(RecoveryInstallTransaction, PreparedBatchMetadataFailureRollsBackAndRelease
         owner->remove_invalidation_hook(invalidation);
     }
 }
+
+#include "RecoveryAdmissionTestRead.hpp"
+namespace lattice::detail {
+struct recovery_controller_admission_test_access {
+    static recovery_install_result attempt(std::shared_ptr<lattice_db> owner,
+        const std::function<void(database&)>& body,const std::function<void()>& captured={}) {
+        return recovery_writer_access::install_impl(std::move(owner),body,{},captured,nullptr,true);
+    }
+};
+}
+namespace {
+using try_access=lattice::detail::recovery_controller_admission_test_access;
+using deferred=lattice::detail::recovery_install_deferred;
+void expect_no_effect_deferred(const lattice::detail::recovery_install_result& result,deferred reason) {
+    EXPECT_EQ(result.deferred,reason);EXPECT_EQ(result.state,state::refused);
+    EXPECT_FALSE(result.primary_error);EXPECT_FALSE(result.cleanup_error);EXPECT_FALSE(result.postcommit_error);
+    EXPECT_FALSE(result.notification_error);EXPECT_FALSE(result.unexpected_commit_observed);
+}
+TEST(RecoveryControllerAdmission, EngineReadAndManagedCellDeferWithoutChangingDefaultInstall) {
+    watchdog bounded;TempDB file{"controller_read_admission"};
+    for(const auto& path:{std::string(":memory:"),file.str()})for(bool managed:{false,true}) {
+        auto owner=store(path);observed observer(owner);bool body=false;
+        recovery_admission_test::held_read read(owner->db(),managed);
+        const auto busy=try_access::attempt(owner,[&](auto& writer){body=true;insert(writer,"after-read");});
+        expect_no_effect_deferred(busy,deferred::engine_read);EXPECT_FALSE(body);EXPECT_TRUE(observer.batches.empty());
+        const auto standard=access::install(owner,[&](auto&){body=true;});
+        EXPECT_EQ(standard.deferred,deferred::none);EXPECT_EQ(standard.state,state::refused);EXPECT_TRUE(standard.primary_error);EXPECT_FALSE(body);
+        read.finish();EXPECT_FALSE(read.error);EXPECT_GT(read.rows,0u);
+        const auto accepted=try_access::attempt(owner,[&](auto& writer){body=true;insert(writer,"after-read");});
+        EXPECT_EQ(accepted.deferred,deferred::none);EXPECT_EQ(accepted.state,state::committed);EXPECT_TRUE(body);
+        EXPECT_EQ(count(owner->db(),"after-read"),1);ASSERT_EQ(observer.batches.size(),1u);
+        owner->db().execute("DELETE FROM TestPerson WHERE globalId='after-read'");
+    }
+}
+TEST(RecoveryControllerAdmission, SQLiteMutexHeldByActualReadCallbackDefersBeforeBody) {
+    watchdog bounded;auto owner=store();auto* handle=owner->db().handle();
+    struct rendezvous {std::promise<void> arrived,release;std::future<void> done=release.get_future();} held;
+    auto arrived=held.arrived.get_future();
+    ASSERT_EQ(sqlite3_create_function_v2(handle,"held_engine_read",0,SQLITE_UTF8,&held,
+        [](sqlite3_context* context,int,sqlite3_value**){auto& hold=*static_cast<rendezvous*>(sqlite3_user_data(context));hold.arrived.set_value();
+            if(hold.done.wait_for(std::chrono::seconds(10))!=std::future_status::ready)std::abort();sqlite3_result_int(context,1);},nullptr,nullptr,nullptr),SQLITE_OK);
+    auto read=std::async(std::launch::async,[&]{return owner->db().query("SELECT held_engine_read()");});
+    ASSERT_EQ(arrived.wait_for(std::chrono::seconds(10)),std::future_status::ready);
+    bool body=false;expect_no_effect_deferred(try_access::attempt(owner,[&](auto&){body=true;}),deferred::connection_mutex);
+    EXPECT_FALSE(body);held.release.set_value();EXPECT_EQ(read.get().size(),1u);
+    EXPECT_EQ(try_access::attempt(owner,[&](auto&){body=true;}).state,state::committed);EXPECT_TRUE(body);
+}
+TEST(RecoveryControllerAdmission, SameThreadEngineReadCallbackCannotAcquireRetryOutcome) {
+    auto owner=store();unsigned attempted=0;bool body=false;
+    recovery_admission_test::row_probe probe([&](auto& db,auto*){
+        if(&db!=&owner->db()||attempted++)return;
+        const auto result=try_access::attempt(owner,[&](auto&){body=true;});
+        EXPECT_EQ(result.deferred,deferred::none);EXPECT_EQ(result.state,state::refused);EXPECT_TRUE(result.primary_error);
+    });
+    EXPECT_FALSE(owner->db().query("SELECT name FROM TestPerson").empty());EXPECT_EQ(attempted,1u);EXPECT_FALSE(body);
+}
+TEST(RecoveryControllerAdmission, RawCursorExplicitTransactionAndWriteReturningStayFatal) {
+    watchdog bounded;auto owner=store();bool body=false;auto* handle=owner->db().handle();
+    const auto refused=[&]{const auto result=try_access::attempt(owner,[&](auto&){body=true;});
+        EXPECT_EQ(result.deferred,deferred::none);EXPECT_EQ(result.state,state::refused);EXPECT_TRUE(result.primary_error);EXPECT_FALSE(body);};
+    sqlite3_stmt* raw=nullptr;ASSERT_EQ(sqlite3_prepare_v2(handle,"SELECT name FROM TestPerson",-1,&raw,nullptr),SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(raw),SQLITE_ROW);refused();sqlite3_finalize(raw);
+    owner->begin_transaction();refused();owner->rollback();
+    owner->db().execute("BEGIN");owner->db().query("SELECT name FROM TestPerson");refused();owner->db().rollback();
+    recovery_admission_test::held_read returning(owner->db(),false,"UPDATE TestPerson SET age=age+1 RETURNING age");
+    refused();returning.finish();EXPECT_FALSE(returning.error);EXPECT_GT(returning.rows,0u);
+}
+TEST(RecoveryControllerAdmission, BodyAndCommitErrorsNeverBecomeAdmissionRetry) {
+    auto owner=store();observed observer(owner);
+    auto result=try_access::attempt(owner,[&](auto& writer){insert(writer,"body-refused");throw lattice::db_error("audit maintenance connection is busy");});
+    EXPECT_EQ(result.deferred,deferred::none);EXPECT_EQ(result.state,state::rolled_back);EXPECT_TRUE(result.primary_error);
+    EXPECT_EQ(count(owner->db(),"body-refused"),0);EXPECT_TRUE(observer.batches.empty());
+    auto* handle=owner->db().handle();unsigned denied=0;
+    ASSERT_EQ(sqlite3_set_authorizer(handle,[](void* p,int action,const char* one,const char*,const char*,const char*)noexcept{
+        if(action==SQLITE_TRANSACTION&&one&&std::strcmp(one,"COMMIT")==0){++*static_cast<unsigned*>(p);return SQLITE_DENY;}return SQLITE_OK;},&denied),SQLITE_OK);
+    result=try_access::attempt(owner,[&](auto& writer){insert(writer,"commit-refused");});
+    ASSERT_EQ(sqlite3_set_authorizer(handle,nullptr,nullptr),SQLITE_OK);
+    EXPECT_EQ(denied,1u);EXPECT_EQ(result.deferred,deferred::none);EXPECT_EQ(result.state,state::rolled_back);EXPECT_TRUE(result.primary_error);
+    EXPECT_EQ(count(owner->db(),"commit-refused"),0);EXPECT_TRUE(observer.batches.empty());
+}
+TEST(RecoveryControllerAdmission, CloseBetweenWriterCaptureAndBusyProbeIsFatal) {
+    watchdog bounded;auto owner=store();bool body=false;
+    recovery_admission_test::held_read read(owner->db());
+    const auto result=try_access::attempt(owner,[&](auto&){body=true;},[&]{owner->close();});
+    EXPECT_EQ(result.deferred,deferred::none);EXPECT_EQ(result.state,state::refused);EXPECT_TRUE(result.primary_error);EXPECT_FALSE(body);
+    read.finish();
+}
+}
+
+namespace {
+struct after_initial_admission_probe {
+    std::function<void()> callback;
+    static inline thread_local after_initial_admission_probe* current=nullptr;
+    explicit after_initial_admission_probe(std::function<void()> f):callback(std::move(f)) {
+        current=this;lattice::detail::recovery_admission_test_hooks::after_initial_probe=[] {current->callback();};
+    }
+    ~after_initial_admission_probe(){lattice::detail::recovery_admission_test_hooks::after_initial_probe=nullptr;current=nullptr;}
+};
+TEST(RecoveryControllerAdmission, ReadStartingAfterInitialProbeIsRecheckedBeforeBegin) {
+    watchdog bounded;auto owner=store();bool body=false;
+    std::unique_ptr<recovery_admission_test::held_read> read;
+    {
+        after_initial_admission_probe probe([&]{read=std::make_unique<recovery_admission_test::held_read>(owner->db());});
+        expect_no_effect_deferred(try_access::attempt(owner,[&](auto&){body=true;}),deferred::engine_read);
+    }
+    EXPECT_FALSE(body);ASSERT_TRUE(read);read->finish();EXPECT_FALSE(read->error);
+    EXPECT_EQ(try_access::attempt(owner,[&](auto&){body=true;}).state,state::committed);EXPECT_TRUE(body);
+}
+TEST(RecoveryControllerAdmission, SharedMemoryGateContentionNeverWaitsOrBegins) {
+    watchdog bounded;auto owner=store("file:controller-admission-gate?mode=memory&cache=shared");
+    const auto gate=owner->store_write_gate();ASSERT_TRUE(gate);
+    std::promise<void> arrived,release;auto done=release.get_future();auto ready=arrived.get_future();
+    std::thread holder([&]{std::lock_guard lock(*gate);arrived.set_value();if(done.wait_for(std::chrono::seconds(10))!=std::future_status::ready)std::abort();});
+    ASSERT_EQ(ready.wait_for(std::chrono::seconds(10)),std::future_status::ready);
+    bool body=false;expect_no_effect_deferred(try_access::attempt(owner,[&](auto&){body=true;}),deferred::store_gate);EXPECT_FALSE(body);
+    release.set_value();holder.join();EXPECT_EQ(try_access::attempt(owner,[&](auto&){body=true;}).state,state::committed);EXPECT_TRUE(body);
+}
+}

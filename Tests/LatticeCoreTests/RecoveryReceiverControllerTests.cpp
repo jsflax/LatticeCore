@@ -1447,3 +1447,86 @@ TEST_F(RecoveryReceiverController, EqualSourceFrontierInstallsDistinctActualRequ
 }
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include "RecoveryAdmissionTestRead.hpp"
+namespace {
+struct ControllerAdmissionRead {
+    std::mutex mutex;
+    std::shared_ptr<recovery_admission_test::held_read> read;
+    bool released=false;
+    std::atomic<bool> armed{false};
+    std::atomic<unsigned> deferrals{0},consumed{0};
+    void hold(database& db) {
+        if(armed.exchange(true))return;
+        auto value=std::make_shared<recovery_admission_test::held_read>(db,false,"SELECT name FROM sqlite_schema");
+        bool finish=false;{std::lock_guard lock(mutex);read=value;finish=released;}
+        if(finish)value->finish();
+    }
+    void finish() {
+        std::shared_ptr<recovery_admission_test::held_read> value;
+        {std::lock_guard lock(mutex);released=true;value=read;}
+        if(value)value->finish();
+    }
+};
+struct ControllerAdmissionReadRelease {
+    std::shared_ptr<ControllerAdmissionRead> value;
+    ~ControllerAdmissionReadRelease(){value->finish();}
+};
+TEST_F(RecoveryReceiverController, RealReadDeferralRetainsActualRangeFrameUntilOwnedConsumption) {
+    configure();insert(*source,controller_uuid(9200),"source after read");
+    auto held=std::make_shared<ControllerAdmissionRead>();ControllerAdmissionReadRelease cleanup{held};
+    auto installed=std::make_shared<ControllerPause>();pauses.push_back(installed);
+    const auto owner=receiver;
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[held,owner,installed](const char* stage){
+        if(std::strcmp(stage,"range-response-ready")==0)held->hold(owner->db());
+        if(std::strcmp(stage,"admission-deferred")==0)++held->deferrals;
+        if(std::strcmp(stage,"response-consumed")==0&&held->armed.load())++held->consumed;
+        if(std::strcmp(stage,"install-committed")==0)installed->wait();
+    });
+    connect();ASSERT_TRUE(until([&]{return held->deferrals.load()>=3;}));
+    EXPECT_FALSE(has_error());EXPECT_EQ(held->consumed.load(),0u);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE length(manifest_frame)=0"),1);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    const auto requests_before=handled;EXPECT_EQ(requests.size(),1u);
+    held->finish();ASSERT_TRUE(until([&]{return installed->ready();}));
+    EXPECT_GT(held->consumed.load(),0u);EXPECT_GT(handled,requests_before);EXPECT_EQ(requests.size(),1u);EXPECT_FALSE(has_error());
+    EXPECT_EQ(phase(),3);EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow WHERE value='source after read'"),1);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1 AND active IS NULL"),1);
+    installed->release();ASSERT_TRUE(until([&]{return phase()==0;}));
+}
+TEST_F(RecoveryReceiverController, QuietReadAdmissionExhaustionIsBoundedAndDoesNotLoseFrozenRequest) {
+    configure();insert(*source,controller_uuid(9201),"source remains pending");
+    auto held=std::make_shared<ControllerAdmissionRead>();ControllerAdmissionReadRelease cleanup{held};const auto owner=receiver;
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[held,owner](const char* stage){
+        if(std::strcmp(stage,"range-response-ready")==0)held->hold(owner->db());
+        if(std::strcmp(stage,"admission-deferred")==0)++held->deferrals;
+        if(std::strcmp(stage,"response-consumed")==0&&held->armed.load())++held->consumed;
+    });
+    connect();ASSERT_TRUE(until([&]{return has_error();},7000));
+    const auto attempts=held->deferrals.load();EXPECT_GT(attempts,1u);EXPECT_LE(attempts,32u);
+    EXPECT_EQ(held->consumed.load(),0u);EXPECT_EQ(phase(),2);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE length(manifest_frame)=0"),1);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),0);EXPECT_EQ(requests.size(),1u);
+    {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());EXPECT_NE(errors.front().find("admission retry budget exhausted"),std::string::npos);}
+    const auto before=handled;held->finish();EXPECT_FALSE(until([&]{return handled!=before;},350));
+    EXPECT_EQ(held->deferrals.load(),attempts);EXPECT_EQ(phase(),2);EXPECT_EQ(held->consumed.load(),0u);
+}
+TEST_F(RecoveryReceiverController, CloseWhileReadAdmissionDeferredCannotConsumeQueuedRange) {
+    configure();insert(*source,controller_uuid(9202),"closed receiver source");
+    auto held=std::make_shared<ControllerAdmissionRead>();ControllerAdmissionReadRelease cleanup{held};const auto owner=receiver;
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[held,owner](const char* stage){
+        if(std::strcmp(stage,"range-response-ready")==0)held->hold(owner->db());
+        if(std::strcmp(stage,"admission-deferred")==0)++held->deferrals;
+        if(std::strcmp(stage,"response-consumed")==0&&held->armed.load())++held->consumed;
+    });
+    connect();ASSERT_TRUE(until([&]{return held->deferrals.load()>=2;}));
+    close_receiver();held->finish();const auto deferrals=held->deferrals.load();
+    EXPECT_FALSE(until([&]{return held->consumed.load()!=0||held->deferrals.load()!=deferrals;},350));
+    database observer((container/"store.sqlite").string(),database::open_mode::read_only,100);
+    EXPECT_EQ(scalar_from(observer,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    EXPECT_EQ(scalar_from(observer,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE length(manifest_frame)=0"),1);
+    EXPECT_EQ(scalar_from(observer,"SELECT phase AS n FROM _lattice_producer_continuity"),2);
+}
+}
+#endif

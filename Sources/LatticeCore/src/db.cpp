@@ -3,6 +3,7 @@
 #include "lattice/projection.hpp"
 #include "lattice/log.hpp"
 #include "checkpoint_test_probe.hpp"
+#include "recovery_admission_test_probe.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
 #include <iostream>
@@ -1055,13 +1056,55 @@ void database::remove(const std::string& table, primary_key_t id) {
     drain_if_settled();
 }
 
+database::engine_query_scope::engine_query_scope(database& db)
+    : owner(db), previous(current) { current = this; }
+
+database::engine_query_scope::~engine_query_scope() noexcept { reset(); }
+
+bool database::engine_query_scope::active_for(const database& db) noexcept {
+    for (auto* scope = current; scope; scope = scope->previous)
+        if (&scope->owner == &db) return true;
+    return false;
+}
+
+void database::engine_query_scope::adopt(sqlite3_stmt* value) noexcept {
+    statement = value;
+    auto* mutex = sqlite3_db_mutex(owner.db_);
+    sqlite3_mutex_enter(mutex);
+    if (statement && sqlite3_stmt_readonly(statement) && sqlite3_column_count(statement) > 0) {
+        next_read = owner.engine_reads_;
+        owner.engine_reads_ = this;
+        registered = true;
+    }
+    sqlite3_mutex_leave(mutex);
+}
+
+void database::engine_query_scope::reset() noexcept {
+    if (!active) return;
+    auto* mutex = sqlite3_db_mutex(owner.db_);
+    sqlite3_mutex_enter(mutex);
+    if (registered) {
+        auto** link = &owner.engine_reads_;
+        while (*link && *link != this) link = &(*link)->next_read;
+        if (*link == this) *link = next_read;
+        registered = false;
+    }
+    sqlite3_finalize(statement);
+    statement = nullptr;
+    sqlite3_mutex_leave(mutex);
+    current = previous;
+    active = false;
+}
+
 std::vector<database::row_t> database::query(const std::string& sql,
                                              const std::vector<column_value_t>& params) {
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return {};
+    engine_query_scope statement(*this);
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
+    statement.adopt(stmt);
     if (rc != SQLITE_OK) {
         auto errmsg = sqlite3_errmsg(db_);
         LOG_ERROR("db", "%s in %s", errmsg, sql.c_str());
@@ -1088,7 +1131,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
     for (int i = 0; i < col_count; ++i) {
         const char* name = sqlite3_column_name(stmt, i);
         if (!name) {
-            sqlite3_finalize(stmt);
+            statement.reset();
             LOG_ERROR("db", "column_name OOM in %s", sql.c_str());
             throw db_error("Query failed: out of memory reading column name");
         }
@@ -1096,6 +1139,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
     }
 
     while ((rc = step_statement_(stmt)) == SQLITE_ROW) {
+        detail::recovery_admission_test_hooks::read_row(*this, stmt);
         row_t row;
         for (int i = 0; i < col_count; ++i) {
             row[col_names[static_cast<size_t>(i)]] = extract_column(stmt, i);
@@ -1103,7 +1147,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
         results.push_back(std::move(row));
     }
 
-    sqlite3_finalize(stmt);
+    statement.reset();
 
     if (rc != SQLITE_DONE) {
         auto error = std::string(sqlite3_errmsg(db_));
@@ -1124,10 +1168,10 @@ std::optional<column_value_t> database::query_managed_cell(
     ++t_statement_count;
     if (closed_.load(std::memory_order_acquire)) return std::nullopt;
 
+    engine_query_scope statement(*this);
     sqlite3_stmt* raw = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &raw, nullptr);
-    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>
-        statement(raw, &sqlite3_finalize);
+    statement.adopt(raw);
     if (rc != SQLITE_OK) {
         auto errmsg = sqlite3_errmsg(db_);
         LOG_ERROR("db", "%s in %s", errmsg, sql.c_str());
@@ -1153,6 +1197,7 @@ std::optional<column_value_t> database::query_managed_cell(
     std::optional<column_value_t> value;
     bool first_row = true;
     while ((rc = step_statement_(raw)) == SQLITE_ROW) {
+        detail::recovery_admission_test_hooks::read_row(*this, raw);
         if (first_row && value_index >= 0) value = extract_column(raw, value_index);
         first_row = false;
     }
@@ -1282,12 +1327,64 @@ bool database::maintenance_scope::try_probe_before_store_gate(database& db) {
     return true;
 }
 
+database::maintenance_scope::admission database::maintenance_scope::controller_classify_locked(database& db) {
+    if (engine_query_scope::active_for(db) || active_for(db.db_) || update_hook_scope::active_for(db.db_))
+        throw db_error("controller maintenance cannot reenter a connection callback");
+    if (idle(db)) return admission::ready;
+    if (!db.db_ || db.closed_.load(std::memory_order_acquire) ||
+        sqlite3_get_autocommit(db.db_) == 0 || sqlite3_txn_state(db.db_, nullptr) == SQLITE_TXN_WRITE)
+        throw db_error("audit maintenance requires an idle connection");
+    bool found = false;
+    for (auto* statement = sqlite3_next_stmt(db.db_, nullptr); statement;
+         statement = sqlite3_next_stmt(db.db_, statement)) {
+        if (!sqlite3_stmt_busy(statement)) continue;
+        bool engine_read = false;
+        for (auto* scope = db.engine_reads_; scope; scope = scope->next_read)
+            if (scope->statement == statement && scope->thread != std::this_thread::get_id()) {
+                engine_read = true; break;
+            }
+        if (!engine_read || !sqlite3_stmt_readonly(statement))
+            throw db_error("audit maintenance requires an idle connection");
+        found = true;
+    }
+    if (!found) throw db_error("audit maintenance requires an idle connection");
+    return admission::engine_read_busy;
+}
+
+database::maintenance_scope::admission database::maintenance_scope::controller_probe(database& db) {
+    if (engine_query_scope::active_for(db) || active_for(db.db_) || update_hook_scope::active_for(db.db_))
+        throw db_error("controller maintenance cannot reenter a connection callback");
+    auto* mutex = db.db_ ? sqlite3_db_mutex(db.db_) : nullptr;
+#ifndef __EMSCRIPTEN__
+    if (!mutex) throw db_error("audit maintenance requires a serialized connection");
+#endif
+    if (sqlite3_mutex_try(mutex) != SQLITE_OK) return admission::mutex_busy;
+    try {
+        const auto result = controller_classify_locked(db);
+        sqlite3_mutex_leave(mutex);
+        return result;
+    } catch (...) { sqlite3_mutex_leave(mutex); throw; }
+}
+
 database::maintenance_scope::maintenance_scope(database& db)
+    : maintenance_scope(db, nullptr) {}
+
+database::maintenance_scope::maintenance_scope(database& db, admission* controller_admission)
     : owner(db), mutex(db.db_ ? sqlite3_db_mutex(db.db_) : nullptr) {
 #ifndef __EMSCRIPTEN__
     if (!mutex) throw db_error("audit maintenance requires a serialized connection");
 #endif
-    sqlite3_mutex_enter(mutex);
+    if (controller_admission) {
+        if (engine_query_scope::active_for(db) || active_for(db.db_) || update_hook_scope::active_for(db.db_))
+            throw db_error("controller maintenance cannot reenter a connection callback");
+        if (sqlite3_mutex_try(mutex) != SQLITE_OK) {
+            *controller_admission = admission::mutex_busy;
+            return;
+        }
+        try { *controller_admission = controller_classify_locked(db); }
+        catch (...) { sqlite3_mutex_leave(mutex); throw; }
+        if (*controller_admission != admission::ready) { sqlite3_mutex_leave(mutex); return; }
+    } else sqlite3_mutex_enter(mutex);
     // Recheck after admission: the pre-gate probe is not an ownership lease.
     // Never wait for another transaction while retaining its owner's mutex.
     if (!idle(db)) {
@@ -1296,9 +1393,11 @@ database::maintenance_scope::maintenance_scope(database& db)
     }
     previous = current;
     current = this;
+    entered = true;
 }
 
 database::maintenance_scope::~maintenance_scope() noexcept {
+    if (!entered) return;
     current = previous;
     sqlite3_mutex_leave(mutex);
 }

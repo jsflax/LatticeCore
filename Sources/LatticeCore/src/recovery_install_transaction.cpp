@@ -1,5 +1,6 @@
 #include "recovery_writer_access.hpp"
 #include "receive_delivery_guard.hpp"
+#include "recovery_admission_test_probe.hpp"
 
 namespace lattice::detail {
 namespace recovery_channel_reset_test_hooks {
@@ -442,7 +443,7 @@ void reset_sync_channel_with_producer_fence(lattice_db& owner,const std::string&
 
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
     const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
-    const std::function<void()>& after_writer_capture, bool* initial_admission_busy) {
+    const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try) {
     recovery_install_result result;
     if (initial_admission_busy) *initial_admission_busy = false;
     std::shared_ptr<database> writer;
@@ -462,23 +463,54 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
         // Private deterministic test rendezvous only; no owner/store/SQLite
         // lock is held here. Production supplies no callback.
         if (after_writer_capture) after_writer_capture();
-        if (initial_admission_busy) {
+        const auto defer = [&](recovery_install_deferred reason) {
+            // No reservation/transaction exists. A retained stale writer or
+            // closed owner must still refuse rather than offer a retry token.
+            std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+            if (owner->closed_.load() || owner->db_ != writer)
+                throw db_error("recovery install: admission invalidated");
+            const auto allowed = std::atomic_load(&writer->local_producer_write_allowed_);
+            if (allowed && !allowed->load(std::memory_order_acquire))
+                throw db_error("recovery install: local producer admission was revoked");
+            result.deferred = reason;
+        };
+        using admission = database::maintenance_scope::admission;
+        const auto deferred_reason = [](admission value) {
+            return value == admission::mutex_busy ? recovery_install_deferred::connection_mutex
+                                                  : recovery_install_deferred::engine_read;
+        };
+        if (controller_try) {
+            const auto initial = database::maintenance_scope::controller_probe(*writer);
+            if (initial != admission::ready) { defer(deferred_reason(initial)); return result; }
+            if (recovery_admission_test_hooks::after_initial_probe) recovery_admission_test_hooks::after_initial_probe();
+        } else if (initial_admission_busy) {
             if (!database::maintenance_scope::try_probe_before_store_gate(*writer)) {
                 *initial_admission_busy = true;
                 return result; // No gate, owned body, mutation or COMMIT entered.
             }
         } else database::maintenance_scope::probe_before_store_gate(*writer);
         {
-            lattice_db::store_write_gate_hold gate(*owner);
+            std::optional<lattice_db::store_write_gate_hold> gate;
+            std::unique_lock<std::recursive_timed_mutex> controller_gate;
+            if (controller_try && owner->store_write_gate_) {
+                controller_gate = std::unique_lock<std::recursive_timed_mutex>(*owner->store_write_gate_, std::try_to_lock);
+                if (!controller_gate.owns_lock()) { defer(recovery_install_deferred::store_gate); return result; }
+            } else if (!controller_try) gate.emplace(*owner);
             std::unique_lock<std::recursive_timed_mutex> memory_gate;
 #ifdef __EMSCRIPTEN__
             constexpr bool memory_maintenance = true;
 #else
             const bool memory_maintenance = owner->config_.is_in_memory();
 #endif
-            if (memory_maintenance && !owner->store_write_gate_)
-                memory_gate = std::unique_lock<std::recursive_timed_mutex>(owner->vec0_memory_maintenance_gate_);
-            database::maintenance_scope maintenance(*writer);
+            if (memory_maintenance && !owner->store_write_gate_) {
+                if (controller_try) {
+                    memory_gate = std::unique_lock<std::recursive_timed_mutex>(owner->vec0_memory_maintenance_gate_, std::try_to_lock);
+                    if (!memory_gate.owns_lock()) { defer(recovery_install_deferred::store_gate); return result; }
+                } else memory_gate = std::unique_lock<std::recursive_timed_mutex>(owner->vec0_memory_maintenance_gate_);
+            }
+            admission admitted = admission::ready;
+            database::maintenance_scope maintenance(*writer, controller_try ? &admitted : nullptr);
+            if (admitted != admission::ready) { defer(deferred_reason(admitted)); return result; }
             auto* context = writer->lattice_update_hook_context_.get();
             {
                 std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);

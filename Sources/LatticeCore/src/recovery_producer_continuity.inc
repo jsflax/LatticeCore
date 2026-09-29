@@ -342,9 +342,12 @@ recovery_install_result recovery_continuous_producer::export_owned(std::shared_p
     },{},{},initial_admission_busy);
 }
 recovery_continuous_quiescence recovery_continuous_producer::begin(std::shared_ptr<lattice_db> owner,int64_t attempt) {
+    return begin_impl(std::move(owner),attempt,false);
+}
+recovery_continuous_quiescence recovery_continuous_producer::begin_impl(std::shared_ptr<lattice_db> owner,int64_t attempt,bool controller_try) {
     recovery_continuous_quiescence output;std::shared_ptr<recovery_continuous_state> state;
     recovery_continuous_barrier token;
-    output.settlement=recovery_writer_access::install(owner,[&](database& db){
+    output.settlement=recovery_writer_access::install_impl(owner,[&](database& db){
         if(!owner->recovery_continuous_||attempt<=0)refuse("continuous barrier requires admitted owner and positive logical attempt");
         state=owner->recovery_continuous_->state;continuous_verify_row(db,*state);
         const auto row=db.query(continuous_query).at(0);
@@ -365,7 +368,7 @@ recovery_continuous_quiescence recovery_continuous_producer::begin(std::shared_p
         if(after.size()!=1||integer(after[0],"barrier")!=barrier||integer(after[0],"attempt")!=attempt||integer(after[0],"phase")!=1)refuse("continuous barrier write ignored or changed");
         token.owner_=owner;token.state_=state;token.incarnation_=state->incarnation;token.barrier_=barrier;token.attempt_=attempt;
         state->verify_file(db);
-    });
+    },{},{},nullptr,controller_try);
     if(output.settlement.state==recovery_install_state::committed){
         {std::lock_guard<std::mutex> lock(state->mutex);state->barrier=token.barrier_;state->attempt=token.attempt_;output.waiting=state->operations!=0;}
         output.barrier=token;
@@ -376,11 +379,14 @@ namespace {
 bool same_snapshot(const recovery_obligation_snapshot& a,const recovery_obligation_snapshot& b){return a.scope==b.scope&&a.entries==b.entries;}
 }
 recovery_continuous_quiescence recovery_continuous_producer::finish(const recovery_continuous_barrier& token) {
+    return finish_impl(token,false);
+}
+recovery_continuous_quiescence recovery_continuous_producer::finish_impl(const recovery_continuous_barrier& token,bool controller_try) {
     recovery_continuous_quiescence output;auto state=token.state_.lock();
     if(!state||!token.owner_){output.settlement.primary_error=std::make_exception_ptr(db_error("continuous barrier custody expired"));return output;}
     {std::lock_guard<std::mutex> lock(state->mutex);if(state->operations){output.waiting=true;output.barrier=token;return output;}}
     verified_unsent_set verified;
-    output.settlement=recovery_writer_access::install(token.owner_,[&](database& db){
+    output.settlement=recovery_writer_access::install_impl(token.owner_,[&](database& db){
         continuous_verify_row(db,*state);const auto row=db.query(continuous_query).at(0);
         if(token.owner_->recovery_continuous_->state!=state||token.incarnation_!=state->incarnation||integer(row,"barrier")!=token.barrier_||integer(row,"attempt")!=token.attempt_||integer(row,"phase")==0)
             refuse("continuous barrier changed before finite Q freeze");
@@ -414,17 +420,20 @@ recovery_continuous_quiescence recovery_continuous_producer::finish(const recove
         if(after.size()!=1||integer(after[0],"phase")!=2||integer(after[0],"barrier")!=token.barrier_||integer(after[0],"attempt")!=token.attempt_)refuse("continuous frozen Q transition ignored or changed");
         for(const auto& before:verified.journals_)if(!same_snapshot(before,journal.snapshot_for_install(before.scope.address,token.attempt_)))refuse("continuous Q changed during final verification");
         state->verify_file(db);verified.owner_=token.owner_;verified.state_=state;verified.incarnation_=token.incarnation_;verified.barrier_=token.barrier_;verified.policy_digest_=state->digest;
-    });
+    },{},{},nullptr,controller_try);
     if(output.settlement.state==recovery_install_state::committed){output.barrier=token;output.unsent=std::move(verified);}
     return output;
 }
 recovery_continuous_quiescence recovery_continuous_producer::inspect(std::shared_ptr<lattice_db> owner) {
+    return inspect_impl(std::move(owner),false);
+}
+recovery_continuous_quiescence recovery_continuous_producer::inspect_impl(std::shared_ptr<lattice_db> owner,bool controller_try) {
     recovery_continuous_quiescence output;recovery_continuous_barrier token;bool closed=false;
-    output.settlement=recovery_writer_access::install(owner,[&](database& db){
+    output.settlement=recovery_writer_access::install_impl(owner,[&](database& db){
         if(!owner->recovery_continuous_)refuse("continuous inspection needs actual owner");auto state=owner->recovery_continuous_->state;
         continuous_verify_row(db,*state);const auto row=db.query(continuous_query).at(0);closed=integer(row,"phase")!=0;
         if(closed){token.owner_=owner;token.state_=state;token.incarnation_=state->incarnation;token.barrier_=integer(row,"barrier");token.attempt_=integer(row,"attempt");}
-    });
+    },{},{},nullptr,controller_try);
     if(output.settlement.state==recovery_install_state::committed&&closed)output.barrier=token;
     return output;
 }
@@ -525,8 +534,8 @@ bool recovery_continuous_producer::reconciliation_work_current(
     return recovery_receiver_controller::reconciliation_route_current(work->reconciliation_,work->restricted_route_,owner,work->physical_);
 }
 recovery_install_result recovery_continuous_producer::controller_owned(const recovery_receiver_controller& controller,
-    std::shared_ptr<lattice_db> owner,const std::function<void(database&)>& body) {
-    return recovery_writer_access::install(owner,[&](database& db){
+    std::shared_ptr<lattice_db> owner,const std::function<void(database&)>& body,bool controller_try) {
+    return recovery_writer_access::install_impl(owner,[&](database& db){
         if(!owner->recovery_continuous_)refuse("controller lost actual continuous owner");
         auto state=owner->recovery_continuous_->state;
         if(!continuous_receiver_enabled(*state))refuse("controller profile is not enabled");
@@ -534,7 +543,7 @@ recovery_install_result recovery_continuous_producer::controller_owned(const rec
         continuous_verify_row(db,*state);
         continuous_frame frame(*state,db,6);body(db);
         continuous_verify_row(db,*state);state->verify_file(db);
-    });
+    },{},{},nullptr,controller_try);
 }
 void recovery_continuous_producer::controller_park_proof(verified_unsent_set& proof) {
     if(!proof.owner_||!proof.owner_->recovery_continuous_||!continuous_receiver_enabled(*proof.owner_->recovery_continuous_->state))refuse("controller proof parking requires actual enabled owner");

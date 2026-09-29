@@ -11,6 +11,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace lattice {
 
@@ -144,6 +145,27 @@ class database {
     // Only an explicit successful rollback clears this physical-writer fence.
     std::atomic<bool> channel_reset_unsettled_{false};
     int step_statement_(sqlite3_stmt*) const;
+    // Only materializing engine queries can prove that an autocommit read
+    // cursor belongs to another thread and will be finalized by its caller.
+    // The connection mutex guards the intrusive list; TLS rejects reentry
+    // even from prepare/step callbacks before a cursor becomes busy.
+    struct engine_query_scope {
+        database& owner;
+        sqlite3_stmt* statement = nullptr;
+        engine_query_scope* previous;
+        engine_query_scope* next_read = nullptr;
+        const std::thread::id thread = std::this_thread::get_id();
+        bool registered = false, active = true;
+        static inline thread_local engine_query_scope* current = nullptr;
+        explicit engine_query_scope(database&);
+        ~engine_query_scope() noexcept;
+        void adopt(sqlite3_stmt*) noexcept;
+        void reset() noexcept;
+        static bool active_for(const database&) noexcept;
+        engine_query_scope(const engine_query_scope&) = delete;
+        engine_query_scope& operator=(const engine_query_scope&) = delete;
+    };
+    engine_query_scope* engine_reads_ = nullptr;
     friend class detail::managed_route_scope;
     // Only database can construct this key. The keyed overload remains
     // accessible to make_shared so keepers retain its single allocation.
@@ -244,7 +266,12 @@ class database {
         sqlite3_mutex* mutex;
         maintenance_scope* previous = nullptr;
         static inline thread_local maintenance_scope* current = nullptr;
+        bool entered = false;
+        enum class admission { ready, mutex_busy, engine_read_busy };
         static bool idle(database& db) noexcept;
+        static admission controller_probe(database& db);
+        static admission controller_classify_locked(database& db);
+        maintenance_scope(database& db, admission* controller_admission);
         static void probe_before_store_gate(database& db);
         // False is only the initial no-effect SQLite mutex contention probe.
         static bool try_probe_before_store_gate(database& db);

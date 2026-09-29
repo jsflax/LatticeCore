@@ -165,7 +165,10 @@ class recovery_continuous_producer {
     static bool reconciliation_work_current(const std::shared_ptr<recovery_continuous_work>&,
         const std::shared_ptr<lattice_db>&);
     static recovery_install_result controller_owned(const recovery_receiver_controller&,
-        std::shared_ptr<lattice_db>,const std::function<void(database&)>&);
+        std::shared_ptr<lattice_db>,const std::function<void(database&)>&,bool controller_try=false);
+    static recovery_continuous_quiescence begin_impl(std::shared_ptr<lattice_db>,int64_t,bool controller_try);
+    static recovery_continuous_quiescence inspect_impl(std::shared_ptr<lattice_db>,bool controller_try);
+    static recovery_continuous_quiescence finish_impl(const recovery_continuous_barrier&,bool controller_try);
     static void controller_park_proof(verified_unsent_set&);
     static int64_t controller_next_attempt_owned(std::shared_ptr<lattice_db>);
     static const recovery_owner_schema& controller_catalog(const lattice_db&)noexcept;

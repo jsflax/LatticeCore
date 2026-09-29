@@ -180,6 +180,9 @@ class stream_hasher {
     std::unique_ptr<state> state_;
     explicit stream_hasher(std::unique_ptr<state>);
     stream_hasher clone() const;
+    // Only the friend cursor may reuse its same-call effective-limit check.
+    // Whole-stream state, ordering, count/byte and hash checks still apply.
+    void append_validated(const content_item&);
 public:
     stream_hasher(const manifest&, stream_kind, const limits&);
     ~stream_hasher();

@@ -34,7 +34,11 @@ public:
 };
 namespace sequence_test_observation {
 // Passive TLS counters only: no callback, clock, allocation, or input override.
-struct counters { uint64_t request_validations=0,rebase_builds=0,restart_objects=0,cursors=0,transitions=0; };
+struct counters {
+    uint64_t request_validations=0,rebase_builds=0,restart_objects=0,cursors=0,transitions=0;
+    // Saturating entry count, including refused content-shape checks.
+    uint64_t content_shape_calls=0;
+};
 extern thread_local counters* current;
 }
 }

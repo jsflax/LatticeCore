@@ -132,6 +132,8 @@ void manifest_shape(const manifest& m,const limits& b){
     digest(m.content_digest);digest(m.receipt_digest);digest(m.rebase_digest);
 }
 void content_shape(const content_item& x,const limits& b){
+    if(auto* c=sequence_test_observation::current)
+        if(c->content_shape_calls!=std::numeric_limits<uint64_t>::max())++c->content_shape_calls;
     valid(x.key,b);check(!x.value.valueless_by_exception(),"missing canonical content tag");
     if(const auto* p=std::get_if<present>(&x.value)){
         check(!p->payload.empty()&&p->payload.size()<=b.maximum.payload_bytes&&p->payload.size()<=b.string_bytes,"canonical payload exceeds budget");
@@ -566,7 +568,12 @@ stream_hasher::stream_hasher(stream_hasher&&) noexcept=default;
 stream_hasher& stream_hasher::operator=(stream_hasher&&) noexcept=default;
 void stream_hasher::append(const content_item& item) {
     check(state_&&!state_->finished&&state_->kind==stream_kind::content,"canonical content hasher is not active");
-    auto& s=*state_;content_shape(item,s.budget);
+    content_shape(item,state_->budget);
+    append_validated(item);
+}
+void stream_hasher::append_validated(const content_item& item) {
+    check(state_&&!state_->finished&&state_->kind==stream_kind::content,"canonical content hasher is not active");
+    auto& s=*state_;
     check(!s.last_identity||less(*s.last_identity,item.key),"whole content duplicate or unordered identity");
     const auto next_bytes=add(s.bytes,content_size(item));
     check(s.count<s.offer.counts.identities&&next_bytes<=s.offer.counts.content_bytes,"whole content exceeds manifest");
@@ -705,7 +712,10 @@ void validated_sequence::advance_validated(const frame& f) {
     const auto progress=transition(s.live->progress,s.initial.frozen_request,s.initial.offer,s.ids,f);
     s.restart_fits(progress);
     auto next=std::make_unique<state::pending>(progress,s.live->content.clone(),s.live->receipts.clone());
-    if(const auto* p=std::get_if<content_page>(&f.body))for(const auto& item:p->items)next->content.append(item);
+    // Both entries validated this unchanged frame with the same immutable
+    // effective limits. This proof stays inside this call and never escapes
+    // in the returned mutable DTO or survives a later caller mutation.
+    if(const auto* p=std::get_if<content_page>(&f.body))for(const auto& item:p->items)next->content.append_validated(item);
     if(const auto* p=std::get_if<receipt_page>(&f.body))for(const auto& item:p->items)next->receipts.append(item);
     if(progress.status==phase::sequence_complete_unverified)
         check(next->content.finish()==s.initial.offer.content_digest&&next->receipts.finish()==s.initial.offer.receipt_digest,"canonical whole-stream hashes differ");

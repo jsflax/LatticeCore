@@ -385,3 +385,80 @@ TEST_F(CanonicalRangeStaging, CorruptNumericSlotsAreRejectedBeforeGenericBlobOrT
     // usable; the oracle did not depend on a later unrelated setup failure.
     EXPECT_TRUE(finish().content_verified);staged->audit();tx.commit();
 }
+
+namespace {
+void registered_stage_bundle(Bundle& x) {
+    x.r.registered_producer=recovery_receipt_binding{{"retained-stage-producer",uuid('7')},uuid('8'),1,1};
+    x.r.receipt_namespace="namespace-A";
+    for(auto& asked:x.r.receipts)asked.operation_digest=std::string(64,'c');
+    for(auto& receipt:x.receipts)receipt.operation_digest=std::string(64,'c');
+    x.m.registered_producer=x.r.registered_producer;x.m.receipt_namespace=x.r.receipt_namespace;x.m.coverage_revision=1;
+    x.seal();
+}
+cr::frame stage_profile(cr::frame value,uint64_t version){value.version=version;return value;}
+using StageRows=std::vector<std::pair<std::string,std::vector<lattice::database::row_t>>>;
+StageRows stage_rows(lattice::lattice_db& owner) {
+    StageRows result;
+    for(const auto* table:{"_lattice_range_store","_lattice_range_attempt","_lattice_range_page"})
+        result.emplace_back(table,owner.db().query(std::string("SELECT * FROM ")+table+" ORDER BY 1,2"));
+    return result;
+}
+}
+
+TEST_F(CanonicalRangeStaging, ReceivedV2EndCannotVerifyOrRetryAnActualV3Stage) {
+    registered_stage_bundle(x);initialize();Owned tx(*owner);begin();
+    staged->append(stage_profile(x.content(),3));staged->append(stage_profile(x.receipt(),3));
+    const auto before=stage_rows(*owner);const auto receiver_before=installed();const auto usage_before=staged->usage();
+    // Pass decoded wire through the real owned staging entry point, not just
+    // the pure DTO transition. Only the terminal envelope version is changed.
+    const auto genuine=stage_profile(x.ending(),3);
+    auto wrong=nlohmann::json::parse(cr::encode(genuine,x.b));wrong["latticeCanonicalRange"]["version"]=2;
+    const auto received=cr::decode(wrong.dump(),x.b);ASSERT_EQ(received.version,2u);
+    refusal(canonical_staging_code::invalid_argument,[&]{staged->verify_end(received);});
+    EXPECT_EQ(stage_rows(*owner),before);EXPECT_EQ(installed(),receiver_before);EXPECT_EQ(staged->usage(),usage_before);
+    EXPECT_FALSE(staged->resume(x.a,x.m.manifest_digest,1).content_verified);
+    const auto verified=staged->verify_end(cr::decode(cr::encode(genuine,x.b),x.b));
+    EXPECT_TRUE(verified.content_verified);EXPECT_EQ(verified.state.status,cr::phase::sequence_complete_unverified);
+    EXPECT_EQ(verified.state.frozen_request.registered_producer,x.r.registered_producer);
+    const auto after=stage_rows(*owner);
+    refusal(canonical_staging_code::invalid_argument,[&]{staged->verify_end(received);});
+    EXPECT_EQ(stage_rows(*owner),after);EXPECT_EQ(installed(),receiver_before);
+    EXPECT_EQ(staged->verify_end(genuine).state,verified.state);staged->audit();tx.commit();
+}
+
+TEST_F(CanonicalRangeStaging, ReceivedV3EndCannotVerifyAnActualV2Stage) {
+    initialize();Owned tx(*owner);begin();staged->append(x.content());staged->append(x.receipt());
+    const auto before=stage_rows(*owner);const auto receiver_before=installed();
+    auto wrong=nlohmann::json::parse(cr::encode(x.ending(),x.b));wrong["latticeCanonicalRange"]["version"]=3;
+    const auto received=cr::decode(wrong.dump(),x.b);ASSERT_EQ(received.version,3u);
+    refusal(canonical_staging_code::invalid_argument,[&]{staged->verify_end(received);});
+    EXPECT_EQ(stage_rows(*owner),before);EXPECT_EQ(installed(),receiver_before);
+    EXPECT_TRUE(staged->verify_end(x.ending()).content_verified);staged->audit();tx.commit();
+}
+
+TEST_F(CanonicalRangeStaging, InternalRetainedVerificationUsesActualV3ProfileAndOwnedWriter) {
+    registered_stage_bundle(x);initialize();
+    refusal(canonical_staging_code::transaction_required,[&]{staged->verify_retained(x.a,x.m.manifest_digest,1);});
+    Owned tx(*owner);begin();staged->append(stage_profile(x.content(),3));staged->append(stage_profile(x.receipt(),3));
+    const auto receiver_before=installed();const auto before=stage_rows(*owner);
+    refusal(canonical_staging_code::stale_route,[&]{staged->verify_retained(x.a,x.m.manifest_digest,2);});
+    EXPECT_EQ(stage_rows(*owner),before);
+    const auto verified=staged->verify_retained(x.a,x.m.manifest_digest,1);
+    EXPECT_TRUE(verified.content_verified);EXPECT_EQ(verified.state.frozen_request.registered_producer,x.r.registered_producer);
+    EXPECT_EQ(installed(),receiver_before);const auto after=stage_rows(*owner);
+    EXPECT_EQ(staged->verify_retained(x.a,x.m.manifest_digest,1).state,verified.state);
+    EXPECT_EQ(staged->verify_end(stage_profile(x.ending(),3)).state,verified.state);EXPECT_EQ(stage_rows(*owner),after);
+    staged->audit();tx.commit();
+}
+
+TEST_F(CanonicalRangeStaging, InternalRetainedV3VerificationStillRequiresEveryPageAndWholeHash) {
+    registered_stage_bundle(x);x.m.content_digest=std::string(64,'e');x.m.manifest_digest=cr::manifest_sha256(x.m,x.b);
+    initialize();Owned tx(*owner);begin();staged->append(stage_profile(x.content(),3));
+    const auto incomplete=stage_rows(*owner);const auto receiver_before=installed();
+    EXPECT_THROW(staged->verify_retained(x.a,x.m.manifest_digest,1),cr::protocol_error);
+    EXPECT_EQ(stage_rows(*owner),incomplete);EXPECT_EQ(installed(),receiver_before);
+    staged->append(stage_profile(x.receipt(),3));const auto before=stage_rows(*owner);
+    refusal(canonical_staging_code::digest_mismatch,[&]{staged->verify_retained(x.a,x.m.manifest_digest,1);});
+    EXPECT_EQ(stage_rows(*owner),before);EXPECT_EQ(installed(),receiver_before);
+    EXPECT_EQ(scalar(owner->db(),"SELECT verified FROM _lattice_range_attempt"),0);tx.rollback();
+}

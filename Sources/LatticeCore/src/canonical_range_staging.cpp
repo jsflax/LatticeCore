@@ -239,14 +239,22 @@ canonical_staging_snapshot canonical_range_staging::append(const cr::frame& f){
     });
 }
 canonical_staging_snapshot canonical_range_staging::verify_end(const cr::frame& f){
-    auto& db=connection();(void)cr::encode(f,codec_);if(!std::holds_alternative<cr::end>(f.body))fail(code::invalid_argument,"canonical verification requires end frame");
-    const auto m=manifest_id(f);const auto old=addressed(f.logical,m,f.route_generation);(void)cr::encode(f,narrow(codec_,old.state.frozen_request.budget));audit_usage();
+    connection();(void)cr::encode(f,codec_);if(!std::holds_alternative<cr::end>(f.body))fail(code::invalid_argument,"canonical verification requires end frame");
+    const auto m=manifest_id(f);const auto old=addressed(f.logical,m,f.route_generation);(void)cr::encode(f,narrow(codec_,old.state.frozen_request.budget));
+    if(f.version!=(old.state.frozen_request.registered_producer?3u:2u))fail(code::invalid_argument,"canonical END wire profile differs from retained request");
+    return verify_complete(old);
+}
+canonical_staging_snapshot canonical_range_staging::verify_retained(const cr::attempt& a,const std::string& m,uint64_t route){
+    return verify_complete(addressed(a,m,route));
+}
+canonical_staging_snapshot canonical_range_staging::verify_complete(const canonical_staging_snapshot& old){
+    auto& db=connection();const auto& a=old.state.logical;const auto& m=old.state.offer.manifest_digest;const auto route=old.route_generation;audit_usage();
     const auto next=verify_storage(old,true);if(old.content_verified)return next;
-    const auto image=cr::encode_state(next.state,codec_);const auto u=usage();const auto prior=integer(db.query("SELECT length(state) AS bytes FROM main._lattice_range_attempt WHERE channel=?",{bytes(f.logical.channel)}).at(0),"bytes");
+    const auto image=cr::encode_state(next.state,codec_);const auto u=usage();const auto prior=integer(db.query("SELECT length(state) AS bytes FROM main._lattice_range_attempt WHERE channel=?",{bytes(a.channel)}).at(0),"bytes");
     if(prior<0||prior>u.stored_bytes)fail(code::corrupt_state,"canonical state charge exceeds usage");if(!fits(u.stored_bytes-prior,size(image),limits_.stored_bytes))fail(code::capacity,"canonical verified state exceeds stored-byte cap");
     auto after=u;after.stored_bytes=u.stored_bytes-prior+size(image);
-    return atomic(db,[&]{db.execute("UPDATE main._lattice_range_attempt SET state=?,verified=1 WHERE channel=?",{bytes(image),bytes(f.logical.channel)});changed(db);write_usage(db,u,after);
-        const auto actual=addressed(f.logical,m,f.route_generation);if(actual.state!=next.state||!actual.content_verified)fail(code::corrupt_state,"canonical verified write was changed");return actual;});
+    return atomic(db,[&]{db.execute("UPDATE main._lattice_range_attempt SET state=?,verified=1 WHERE channel=?",{bytes(image),bytes(a.channel)});changed(db);write_usage(db,u,after);
+        const auto actual=addressed(a,m,route);if(actual.state!=next.state||!actual.content_verified)fail(code::corrupt_state,"canonical verified write was changed");return actual;});
 }
 canonical_staging_snapshot canonical_range_staging::rebind(const cr::attempt& a,const std::string& m,uint64_t expected,uint64_t replacement){
     auto& db=connection();count(replacement);if(!replacement||replacement<=expected)fail(code::stale_route,"canonical replacement route must increase");const auto old=addressed(a,m,expected);

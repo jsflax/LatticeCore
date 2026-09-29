@@ -60,6 +60,7 @@ class canonical_range_staging {
     canonical_staging_snapshot addressed(const canonical_range::attempt&,const std::string& manifest,
         std::optional<uint64_t> route) const;
     canonical_staging_snapshot verify_storage(const canonical_staging_snapshot&,bool whole) const;
+    canonical_staging_snapshot verify_complete(const canonical_staging_snapshot&);
     void remove_staged(const canonical_staging_snapshot&);
 public:
     canonical_range_staging(std::shared_ptr<lattice_db>,receive_install_limits,
@@ -75,6 +76,11 @@ public:
     canonical_staging_snapshot resume(const canonical_range::attempt&,const std::string& manifest,uint64_t route) const;
     canonical_staging_snapshot append(const canonical_range::frame&);
     canonical_staging_snapshot verify_end(const canonical_range::frame&);
+    // Internal installer revalidation of the exact retained Q/M and whole
+    // streams. No received END envelope is fabricated or accepted here. The
+    // retained Q chooses the profile; owned WRITE and all stream checks apply.
+    canonical_staging_snapshot verify_retained(const canonical_range::attempt&,
+        const std::string& manifest,uint64_t route);
     // Controller must authenticate replacement and fence old physical callbacks
     // before this exact compare-and-swap. A received frame never rebinds itself.
     canonical_staging_snapshot rebind(const canonical_range::attempt&,const std::string& manifest,

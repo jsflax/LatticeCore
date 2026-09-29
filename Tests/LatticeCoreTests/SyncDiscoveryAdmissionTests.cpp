@@ -414,3 +414,179 @@ TEST_F(SyncDiscoveryWaitWindow, DroppedCallbackBetweenPredicateAndWaitStillRepor
 }
 } // namespace
 #endif
+
+#ifndef __EMSCRIPTEN__
+#include <nlohmann/json.hpp>
+namespace {
+using connect_json=nlohmann::json;
+struct connect_admission_wire {
+    struct dial {std::string url;platform_transport_callbacks endpoint;};
+    std::mutex mutex;std::vector<dial> dials;std::vector<std::string> frames;
+    bool throw_on_dial=false;
+    struct holder {std::shared_ptr<connect_admission_wire> state;};
+    static std::unique_ptr<sync_transport> transport(const std::shared_ptr<connect_admission_wire>& state) {
+        // Actual SDK-owned attempt/describe path with a mechanical TLS
+        // verifier; this fixture does not claim stock system-TLS validation.
+        return std::unique_ptr<sync_transport>(make_system_tls_platform_sync_transport(new holder{state},
+            [](void* p,const void* url,const void*,const void* endpoint) {
+                const auto state=static_cast<holder*>(p)->state;bool fail=false;
+                {std::lock_guard lock(state->mutex);if(state->dials.size()>=16)throw db_error("connect fixture dial bound");
+                    state->dials.push_back({*static_cast<const std::string*>(url),*static_cast<const platform_transport_callbacks*>(endpoint)});
+                    fail=state->throw_on_dial;}
+                if(fail)throw db_error("post-classifier dial failed");
+            },[](void*){},
+            [](void* p,const void* message,const void* endpoint) {
+                const auto state=static_cast<holder*>(p)->state;
+                const auto& physical=*static_cast<const platform_transport_callbacks*>(endpoint);
+                if(!physical.is_current())return;
+                const auto& frame=*static_cast<const transport_message*>(message);
+                if(frame.data.size()>8388608)throw db_error("connect fixture frame bound");
+                std::lock_guard lock(state->mutex);if(state->frames.size()>=16)throw db_error("connect fixture queue bound");
+                state->frames.push_back(frame.as_string());
+            },[](void* p){delete static_cast<holder*>(p);},nullptr,
+            [](void*,const void*,const void*)->int32_t{return 1;},[](void*){}));
+    }
+    size_t dial_count(){std::lock_guard lock(mutex);return dials.size();}
+    dial first(){std::lock_guard lock(mutex);return dials.at(0);}
+    std::vector<std::string> sent(){std::lock_guard lock(mutex);return frames;}
+    void fail_dial(){std::lock_guard lock(mutex);throw_on_dial=true;}
+};
+class SyncPublicConnectDiscovery:public ::testing::Test {
+protected:
+    std::shared_ptr<admission_scheduler> scheduled=std::make_shared<admission_scheduler>();
+    std::shared_ptr<connect_admission_wire> wire=std::make_shared<connect_admission_wire>();
+    std::unique_ptr<synchronizer> sync;std::shared_ptr<lattice_db> owner;
+    std::vector<std::string> errors;
+    static std::string expectation() {
+        const std::string hash(64,'a'),id="10000000-0000-4000-8000-000000000001";
+        return connect_json{{"endpoint","wss://registered.example/connect-admission"},
+            {"source",{{"authority","connect-fixture"},{"sourceID",id},{"epoch",id},{"scopeDigest",hash},
+                {"schemaDigest",hash},{"receiptNamespace","connect-receipts"},{"coverageID","connect-coverage"},
+                {"coverageRevision",1},{"descriptorDigest",hash}}},
+            {"incomingScope",{{"models",connect_json::array({{{"table","TestPerson"},{"incomingOperations",connect_json::array({"INSERT","UPDATE","DELETE"})}}})},
+                {"relations",connect_json::array()},{"scopedLinkTables",connect_json::array()},{"catalogDigest",hash}}},
+            {"peer",{{"replicaID","connect/replica"},{"receiverIncarnation",id},{"channelIncarnation",id}}},
+            {"channel","connect-admission"},{"validForMilliseconds",3600000}}.dump();
+    }
+    void SetUp()override {
+        configuration cfg(":memory:");cfg.sched=scheduled;cfg.audit_retention_seconds=0;cfg.busy_timeout_ms=100;
+        sync_config config;config.sync_id="connect-admission";config.websocket_url="wss://registered.example/connect-admission";
+        config.recovery_source_expectation=expectation();config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;
+        sync=std::make_unique<synchronizer>(std::make_unique<lattice_db>(cfg),config,connect_admission_wire::transport(wire));
+        owner=access::owner(*sync);sync->set_on_error([this](const std::string& error){errors.push_back(error);});flush();
+    }
+    void TearDown()override {sync.reset();owner.reset();}
+    void flush() {
+        for(unsigned i=0;i<128;++i)if(!scheduled->run_one())return;
+        FAIL()<<"public connect scheduler did not settle within 128 callbacks";
+    }
+    bool await(const std::function<bool()>& done) {
+        // New fixture allowance includes delivery of the unchanged five-second refusal.
+        const auto deadline=std::chrono::steady_clock::now()+6s;
+        while(!done()&&std::chrono::steady_clock::now()<deadline)scheduled->run_one(5ms);
+        return done();
+    }
+    bool pending(){return access::queue(*sync)->pending(access::generation(*sync));}
+    bool failed(){return access::queue(*sync)->failed(access::generation(*sync));}
+    void open_and_check_single_describe() {
+        ASSERT_EQ(wire->dial_count(),1u);const auto dial=wire->first();
+        EXPECT_EQ(dial.url.find("wss://registered.example/connect-admission?recovery-v=1&"),0u);
+        ASSERT_TRUE(dial.endpoint.is_current());dial.endpoint.trigger_on_open();flush();
+        const auto frames=wire->sent();ASSERT_EQ(frames.size(),1u);
+        const auto describe=connect_json::parse(frames[0]);EXPECT_EQ(describe.at("kind"),"recoveryReady");
+        EXPECT_EQ(describe.at("operation"),"describe");EXPECT_EQ(describe.at("version"),1);
+        EXPECT_EQ(describe.at("requestID").get<std::string>().size(),36u);
+        EXPECT_TRUE(errors.empty());EXPECT_FALSE(pending());EXPECT_FALSE(failed());
+    }
+};
+TEST_F(SyncPublicConnectDiscovery, UncontendedPublicConnectStillDialsSynchronously) {
+    EXPECT_NO_THROW(sync->connect());
+    // No scheduler drain is needed to initiate this physical attempt.
+    ASSERT_EQ(wire->dial_count(),1u);EXPECT_FALSE(pending());open_and_check_single_describe();
+}
+TEST_F(SyncPublicConnectDiscovery, ActualBusyThenReleaseUsesLivePacerForOneDialAndDescribe) {
+    admission_held_writer held(*owner);EXPECT_NO_THROW(sync->connect());
+    const auto original=access::generation(*sync);EXPECT_TRUE(pending());EXPECT_EQ(wire->dial_count(),0u);
+    ASSERT_TRUE(scheduled->run_one(5s)); // The actual queued probe still sees the held writer.
+    EXPECT_TRUE(pending());EXPECT_TRUE(errors.empty());held.allow();
+    // No pump, reconnect, second connect(), or artificial callback wakes it.
+    ASSERT_TRUE(await([&]{return wire->dial_count()!=0||!errors.empty();}));
+    EXPECT_EQ(access::generation(*sync),original);open_and_check_single_describe();
+}
+TEST_F(SyncPublicConnectDiscovery, ActualPersistentBusyStopsWithinOneFiniteEpisode) {
+    admission_held_writer held(*owner);EXPECT_NO_THROW(sync->connect());
+    const auto original=access::generation(*sync);
+    const bool reported=await([&]{return !errors.empty();});held.allow();
+    ASSERT_TRUE(reported);EXPECT_TRUE(failed());EXPECT_TRUE(pending());EXPECT_EQ(wire->dial_count(),0u);
+    ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors[0].find("discovery deferral exhausted"),std::string::npos);
+    // Once failed, releasing the writer or probing the pump cannot restart it.
+    access::pump(*sync);flush();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(wire->dial_count(),0u);
+    EXPECT_EQ(access::generation(*sync),original);sync->disconnect();EXPECT_FALSE(pending());EXPECT_FALSE(failed());
+}
+TEST_F(SyncPublicConnectDiscovery, DisconnectMakesRetainedConnectCallbackInert) {
+    admission_held_writer held(*owner);sync->connect();ASSERT_TRUE(pending());
+    const auto original=access::generation(*sync);sync->disconnect();held.allow();flush();
+    EXPECT_NE(access::generation(*sync),original);EXPECT_FALSE(pending());EXPECT_FALSE(failed());
+    EXPECT_EQ(wire->dial_count(),0u);EXPECT_TRUE(wire->sent().empty());EXPECT_TRUE(errors.empty());
+}
+TEST_F(SyncPublicConnectDiscovery, ReplacementCannotBorrowTheOldQueuedLifecycle) {
+    admission_held_writer held(*owner);sync->connect();ASSERT_TRUE(pending());
+    const auto original=access::generation(*sync);held.allow();
+    // The original scheduler capture is deliberately still retained here.
+    sync->connect();ASSERT_EQ(wire->dial_count(),1u);EXPECT_NE(access::generation(*sync),original);
+    flush();open_and_check_single_describe();EXPECT_EQ(wire->dial_count(),1u);
+}
+TEST_F(SyncPublicConnectDiscovery, PostClassifierDialThrowIsNotRetriedSynchronouslyOrAfterBusy) {
+    wire->fail_dial();EXPECT_THROW(sync->connect(),db_error);
+    EXPECT_EQ(wire->dial_count(),1u);EXPECT_FALSE(pending());flush();EXPECT_TRUE(errors.empty());
+    admission_held_writer held(*owner);EXPECT_NO_THROW(sync->connect());EXPECT_TRUE(pending());held.allow();
+    ASSERT_TRUE(await([&]{return !errors.empty();}));EXPECT_EQ(wire->dial_count(),2u);
+    EXPECT_FALSE(pending());EXPECT_FALSE(failed());ASSERT_EQ(errors.size(),1u);
+    EXPECT_NE(errors[0].find("post-classifier dial failed"),std::string::npos);
+    access::pump(*sync);flush();EXPECT_EQ(wire->dial_count(),2u);EXPECT_EQ(errors.size(),1u);
+}
+TEST_F(SyncPublicConnectDiscovery, BusyThenInvalidClassificationCannotDialAsAnUnprotectedStore) {
+    admission_held_writer held(*owner);sync->connect();ASSERT_TRUE(pending());held.allow();
+    owner->db().execute("CREATE TABLE _lattice_obligation_producer_profile(channel BLOB)");
+    ASSERT_TRUE(await([&]{return !errors.empty();}));EXPECT_EQ(wire->dial_count(),0u);
+    EXPECT_TRUE(wire->sent().empty());EXPECT_FALSE(pending());EXPECT_FALSE(failed());
+    ASSERT_EQ(errors.size(),1u);access::pump(*sync);flush();EXPECT_EQ(errors.size(),1u);
+    EXPECT_EQ(wire->dial_count(),0u);
+}
+TEST_F(SyncPublicConnectDiscovery, DelayedFirstQueuedTurnCannotRefreshTheInitialDeadline) {
+    admission_held_writer held(*owner);sync->connect();ASSERT_TRUE(pending());held.allow();
+    // Keep the scheduler-owned reservation beyond the unchanged five-second
+    // production episode. The pacer cannot steal this still-reserved turn.
+    std::this_thread::sleep_until(std::chrono::steady_clock::now()+5100ms);
+    ASSERT_TRUE(await([&]{return !errors.empty();}));EXPECT_TRUE(failed());EXPECT_TRUE(pending());
+    EXPECT_EQ(wire->dial_count(),0u);EXPECT_TRUE(wire->sent().empty());ASSERT_EQ(errors.size(),1u);
+}
+TEST_F(SyncPublicConnectDiscovery, DroppedConnectReservationReportsWithoutDialing) {
+    admission_held_writer held(*owner);sync->connect();ASSERT_TRUE(pending());
+    scheduled->discard_under_lock();held.allow();
+    ASSERT_TRUE(await([&]{return !errors.empty();}));EXPECT_TRUE(failed());EXPECT_TRUE(pending());
+    EXPECT_EQ(wire->dial_count(),0u);EXPECT_EQ(errors.size(),1u);
+    EXPECT_EQ(scheduled->recursive_drop_invocations.load(),0);
+}
+TEST(SyncDiscoveryAdmission, SeededConnectProbeSharesTheExistingAttemptAndDeadlineBounds) {
+    discovery_queue queue;auto work=admission_unit();work->type=discovery_queue::kind::connect;
+    const auto started=discovery_queue::clock::now();work->attempts=1;work->deadline=started+5s;
+    const auto ticket=queue.push_and_dispatch(work,started+4s).reserved;
+    ASSERT_EQ(queue.begin(ticket,started+4s),work);queue.finish(ticket,work,false,started+4s);
+    EXPECT_EQ(work->attempts,2u);EXPECT_EQ(work->deadline,started+5s);
+    const auto expired=queue.dispatch(started+5s);ASSERT_TRUE(expired);
+    EXPECT_FALSE(queue.begin(expired,started+5s));EXPECT_TRUE(queue.failed(1));
+    // The initial probe consumes one of the same 32 attempts, never a new
+    // retry budget allocated after the synchronous caller observes busy.
+    discovery_queue bounded;auto counted=admission_unit();counted->type=discovery_queue::kind::connect;
+    counted->attempts=1;counted->deadline=started+5s;
+    auto now=started;auto turn=bounded.push_and_dispatch(counted,now).reserved;unsigned queued_probes=0;
+    while(turn&&queued_probes<discovery_queue::attempt_limit) {
+        ASSERT_EQ(bounded.begin(turn,now),counted);++queued_probes;
+        bounded.finish(turn,counted,false,now);now+=100ms;turn=bounded.dispatch(now);
+    }
+    EXPECT_TRUE(bounded.failed(1));EXPECT_EQ(queued_probes,discovery_queue::attempt_limit-1);
+    EXPECT_EQ(counted->attempts,discovery_queue::attempt_limit);EXPECT_EQ(counted->deadline,started+5s);
+}
+} // namespace
+#endif

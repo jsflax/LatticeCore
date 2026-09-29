@@ -1250,13 +1250,42 @@ bool synchronizer_base::receive_lifecycle_stopped(uint64_t lifecycle) const noex
 }
 
 void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
+#ifdef __EMSCRIPTEN__
+    (void)connect_step_for_lifecycle(lifecycle);
+#else
+    // Preserve the synchronous uncontended path. The initial probe belongs to
+    // the same finite episode as all deferred probes, including queue delay.
+    const auto started=detail::sync_discovery_operation::clock::now();
+    if(connect_step_for_lifecycle(lifecycle))return;
+    auto work=std::make_shared<detail::sync_discovery_operation>();
+    work->type=detail::sync_discovery_kind::connect;work->label="connect discovery";
+    work->generation=lifecycle;work->charge=1024;
+    work->attempts=1;work->deadline=started+std::chrono::seconds(5);
+    work->step=[this,lifecycle](detail::sync_discovery_operation&) {
+        return connect_step_for_lifecycle(lifecycle);
+    };
+    // Do not resample the lifecycle or call public connect() on a retry. The
+    // existing queue/pacer owns bounds, cancellation, and dropped callbacks.
+    pump_discovery(std::move(work)); // May retire the owner; no later access.
+#endif
+}
+
+bool synchronizer_base::connect_step_for_lifecycle(uint64_t lifecycle) {
     // This rejects obsolete QUEUED work before cursor lookup (which can seed a
     // slot) or dialing. It does not preempt an already-admitted transport call,
     // and the token is not an object-lifetime or platform-callback fence.
-    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return true;
     const auto lifetime=callback_lifetime_;const auto route=recovery_export_route_;const auto transport=ws_client_;
+#ifdef __EMSCRIPTEN__
     const bool protected_route=has_export_protection();
-    if(!lifetime->current(lifecycle))return;
+#else
+    // Only the initial no-effect writer probe permits retry. Every exception
+    // and all work after classification settle this attempt without replay.
+    const auto protection=try_has_export_protection();
+    if(!protection)return false;
+    const bool protected_route=*protection;
+#endif
+    if(!lifetime->current(lifecycle))return true;
     if(protected_route)route->prepare_protected(lifecycle);
     else lifetime->begin_connect(lifecycle,false);
     const auto dial = [this,transport,lifetime,lifecycle](const std::string& url, const HeadersMap& headers) {
@@ -1308,9 +1337,9 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
         // "client retries via endpoint" path never existed.)
         LOG_INFO("synchronizer", "[%s] IPC connect: supports_reconnect=%d",
                  log_id(), (lifecycle & 1) ? 1 : 0);
-        if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
+        if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return true;
         dial("", {});
-        return;
+        return true;
     }
 
     std::string url = receiver_source_ ? receiver_source_->dial_url() : config_.websocket_url;
@@ -1332,8 +1361,9 @@ void synchronizer_base::connect_for_lifecycle(uint64_t lifecycle) {
 
     // Cursor lookup may take time. Do not publish an old attempt after an
     // explicit stop or replacement completed while its parameters were read.
-    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return;
+    if (is_destroyed_ || reconnect_lifecycle_.load() != lifecycle || receive_lifecycle_stopped(lifecycle)) return true;
     dial(url, headers);
+    return true;
 }
 
 void synchronizer_base::disconnect() {

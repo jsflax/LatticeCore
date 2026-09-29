@@ -635,6 +635,7 @@ protected:
     // Reconnection
     uint64_t advance_reconnect_lifecycle(bool enabled);
     void connect_for_lifecycle(uint64_t lifecycle);
+    bool connect_step_for_lifecycle(uint64_t lifecycle);
     void schedule_reconnect();
 
     // Get last received event ID for checkpoint

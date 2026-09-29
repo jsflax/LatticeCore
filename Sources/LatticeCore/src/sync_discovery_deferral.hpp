@@ -15,7 +15,7 @@ namespace lattice::detail {
 // Private ownership for the ordinary sync discovery seam. Work returns false
 // only at its explicit first no-effect discovery stage. Exceptions are never
 // retried here; in particular no background_operation closure is replayed.
-enum class sync_discovery_kind { intake,ack,upload,initial_upload,drain_upload };
+enum class sync_discovery_kind { intake,ack,upload,initial_upload,drain_upload,connect };
 // Passive completion ownership. No callbacks or owner pointers; admission and
 // cancellation settle it outside the queue leaf. A running turn retains its
 // first real failure even if cancellation/owner retirement races its tail.

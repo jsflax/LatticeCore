@@ -1092,7 +1092,7 @@ std::shared_ptr<const physical_store_identity> canonical_writer_adapter::authent
     const char* failure="missing_writer";
     auto identity=writer?writer->physical_identity_observed("main",{},true,failure):nullptr;
     if(!identity)
-        refuse("authenticated physical store identity unavailable: "+std::string(failure?failure:"unclassified"));
+        throw db_error("authenticated physical store identity unavailable: "+std::string(failure?failure:"unclassified"));
     if(!owner.guard_->alive.load(std::memory_order_seq_cst))
         refuse("authenticated physical store identity unavailable: owner_retired_after_capture");
     return identity;

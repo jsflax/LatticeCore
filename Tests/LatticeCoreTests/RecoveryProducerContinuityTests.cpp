@@ -1658,3 +1658,313 @@ TEST_F(RecoveryNegotiatedExport, ConfiguredSharedChildStopsOwnedWorkerBeforeReta
     child->close();
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include "RecoveryAdmissionTestRead.hpp"
+#include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
+namespace lattice::detail {
+// Read-only snapshots of the real queue/registration owners. This helper
+// cannot admit work, replace a response, change a clock, or grant authority.
+struct automatic_export_admission_test_access {
+    struct state {
+        uintptr_t work=0;unsigned attempts=0;size_t charge=0,count=0,bytes=0;
+        sync_discovery_operation::clock::time_point deadline{};
+        sync_discovery_kind kind=sync_discovery_kind::upload;
+        bool failed=false;
+        std::map<std::string,std::pair<int64_t,uint64_t>> registrations;
+    };
+    static state read(synchronizer_base& sync) {
+        state result;const auto queue=sync.discovery_deferral_;
+        {std::lock_guard lock(queue->mutex_);result.count=queue->count_;result.bytes=queue->bytes_;result.failed=queue->failed_;
+            if(queue->count_){const auto& work=queue->slots_[queue->head_];result.work=reinterpret_cast<uintptr_t>(work.get());
+                result.attempts=work->attempts;result.charge=work->charge;result.deadline=work->deadline;result.kind=work->type;}}
+        {std::lock_guard lock(sync.in_flight_mutex_);for(const auto& [id,audit]:sync.in_flight_ids_)
+            result.registrations[id]={audit,sync.upload_tracking_->registration_locked(id)};}
+        return result;
+    }
+};
+}
+namespace {
+using automatic_read_access=lattice::detail::automatic_export_admission_test_access;
+struct automatic_after_probe {
+    std::function<void()> action;
+    automatic_after_probe* previous=current;
+    void(*prior)()=recovery_admission_test_hooks::after_initial_probe;
+    static inline thread_local automatic_after_probe* current=nullptr;
+    explicit automatic_after_probe(std::function<void()> value):action(std::move(value)) {
+        current=this;recovery_admission_test_hooks::after_initial_probe=[]{current->action();};
+    }
+    ~automatic_after_probe(){recovery_admission_test_hooks::after_initial_probe=prior;current=previous;}
+};
+struct automatic_frame_observer {
+    std::vector<std::string> bytes;
+    automatic_frame_observer* previous=current;
+    void(*prior)(const transport_message&)=recovery_export_test_hooks::automatic_handoff_observed;
+    static inline thread_local automatic_frame_observer* current=nullptr;
+    automatic_frame_observer(){current=this;recovery_export_test_hooks::automatic_handoff_observed=[](const auto& frame){current->bytes.push_back(frame.as_string());};}
+    ~automatic_frame_observer(){recovery_export_test_hooks::automatic_handoff_observed=prior;current=previous;}
+};
+class RecoveryAutomaticExportReadAdmission:public RecoveryNegotiatedExport {
+protected:
+    using held_read=recovery_admission_test::held_read;
+    void seed(){open();owner->add(ContinuousSharedRow{"automatic-read-original"});start();}
+    std::unique_ptr<held_read> hold(const std::string& sql="SELECT value FROM ContinuousSharedRow"){
+        return std::make_unique<held_read>(owner->db(),false,sql,true);
+    }
+    void release(std::unique_ptr<held_read>& read){read->finish();EXPECT_FALSE(read->error);EXPECT_GT(read->rows,0u);read.reset();}
+    bool until(const std::function<bool()>& predicate,std::chrono::seconds bound=std::chrono::seconds(5)){
+        const auto deadline=std::chrono::steady_clock::now()+bound;
+        do{if(predicate())return true;if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+        while(std::chrono::steady_clock::now()<deadline);return predicate();
+    }
+    automatic_read_access::state observed(size_t index=0){return automatic_read_access::read(*senders.at(index));}
+    void same_episode(const automatic_read_access::state& first,const automatic_read_access::state& later){
+        EXPECT_NE(first.work,0u);EXPECT_EQ(later.work,first.work);EXPECT_EQ(later.deadline,first.deadline);
+        EXPECT_EQ(later.charge,first.charge);EXPECT_GE(later.attempts,first.attempts);EXPECT_LE(later.attempts,32u);
+        EXPECT_EQ(later.registrations,first.registrations);
+    }
+    void ack_only_batch(negotiated_ack_pause& pause,size_t index=0){
+        const auto batches=factory->wires.at(index)->audit_batches();ASSERT_EQ(batches.size(),1u);ASSERT_EQ(batches[0].size(),1u);
+        factory->wires[index]->ack(batches[0]);ASSERT_TRUE(pump_until_ack(index));pause.acknowledged();queue->drain();
+        EXPECT_EQ(factory->wires[index]->audit_batches(),batches);EXPECT_TRUE(errors.empty());
+    }
+    void selection_read(const std::string& sql){
+        negotiated_ack_pause pause(senders,factory);seed();const auto before=snapshot();auto read=hold(sql);
+        accept(caps());const auto first=observed();ASSERT_NE(first.work,0u);ASSERT_GE(first.attempts,1u);
+        EXPECT_EQ(claimed(),0);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+        ASSERT_TRUE(until([&]{return observed().attempts>=first.attempts+1;}));same_episode(first,observed());
+        EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());
+        {std::lock_guard lock(pause.held->mutex);EXPECT_EQ(pause.held->started,0u);}
+        release(read);ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(claimed(),2);ack_only_batch(pause);
+    }
+    void ack_read(bool after_probe){
+        negotiated_ack_pause pause(senders,factory);seed();accept(caps());ASSERT_TRUE(pump_until_batch(1));
+        const auto batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),1u);ASSERT_EQ(batches[0].size(),1u);
+        const auto durable=snapshot();const auto bookkeeping=owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2");
+        const auto registrations=observed().registrations;ASSERT_EQ(registrations.size(),1u);
+        std::vector<std::vector<std::string>> completed;senders[0]->set_on_sync_complete([&](const auto& ids){completed.push_back(ids);});
+        const auto acked=senders[0]->get_progress().acked;std::unique_ptr<held_read> read;size_t probes=0;
+        {automatic_after_probe probe([&]{++probes;if(after_probe&&!read)read=hold();});
+            if(!after_probe)read=hold();factory->wires[0]->ack(batches[0]);queue->drain();}
+        ASSERT_TRUE(read);EXPECT_EQ(probes,after_probe?1u:0u);const auto first=observed();ASSERT_EQ(first.kind,sync_discovery_kind::ack);
+        ASSERT_GE(first.attempts,1u);EXPECT_EQ(first.registrations,registrations);EXPECT_TRUE(completed.empty());
+        EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2"),bookkeeping);EXPECT_EQ(snapshot(),durable);
+        EXPECT_EQ(senders[0]->get_progress().acked,acked);EXPECT_EQ(senders[0]->get_progress().pending_upload,1);
+        ASSERT_TRUE(until([&]{return observed().attempts>=first.attempts+1;}));same_episode(first,observed());
+        release(read);ASSERT_TRUE(until([&]{return completed.size()==1;}));pause.acknowledged();queue->drain();
+        EXPECT_EQ(completed,(std::vector<std::vector<std::string>>{batches[0]}));EXPECT_EQ(snapshot(),durable);
+        EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),1);
+        EXPECT_TRUE(observed().registrations.empty());EXPECT_EQ(senders[0]->get_progress().acked,acked+1);
+        EXPECT_EQ(factory->wires[0]->audit_batches(),batches);EXPECT_TRUE(errors.empty());
+    }
+};
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, OtherThreadEngineReadDefersSelectionWithoutClaims) {
+    selection_read("SELECT value FROM ContinuousSharedRow");
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, EngineReadWithoutMainTransactionStillRequiresProvenance) {
+    selection_read("SELECT 1 AS value");
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, EngineReadStartingAfterSelectionProbeDefersBeforeBegin) {
+    negotiated_ack_pause pause(senders,factory);seed();const auto before=snapshot();std::unique_ptr<held_read> read;size_t probes=0;
+    {automatic_after_probe probe([&]{++probes;if(!read)read=hold();});accept(caps());}
+    ASSERT_TRUE(read);EXPECT_EQ(probes,1u);const auto first=observed();ASSERT_GE(first.attempts,1u);
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    release(read);ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(claimed(),2);ack_only_batch(pause);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ClaimedFrameSurvivesReadRetriesWithExactBytesAndOneHandoff) {
+    negotiated_ack_pause pause(senders,factory);seed();automatic_frame_observer frames;
+    std::unique_ptr<held_read> read;size_t commits=0;decltype(snapshot()) committed;
+    negotiated_hook_scope claim([&]{++commits;committed=snapshot();read=hold();});
+    accept(caps());ASSERT_TRUE(read);ASSERT_GE(frames.bytes.size(),1u);const auto first=observed();ASSERT_GE(first.attempts,1u);
+    EXPECT_EQ(snapshot(),committed);EXPECT_EQ(claimed(),2);EXPECT_TRUE(audit_wire().empty());
+    const auto first_observations=frames.bytes.size();
+    ASSERT_TRUE(until([&]{return frames.bytes.size()>=first_observations+2;}));same_episode(first,observed());
+    for(const auto& bytes:frames.bytes)EXPECT_EQ(bytes,frames.bytes.front());EXPECT_EQ(commits,1u);EXPECT_EQ(snapshot(),committed);
+    {std::lock_guard lock(pause.held->mutex);EXPECT_EQ(pause.held->started,0u);}
+    release(read);ASSERT_TRUE(pump_until_batch(1));ASSERT_EQ(audit_wire().size(),1u);EXPECT_EQ(audit_wire()[0],frames.bytes.front());
+    EXPECT_EQ(commits,1u);EXPECT_EQ(snapshot(),committed);ack_only_batch(pause);EXPECT_EQ(claimed(),2);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualAckRetainsIdsRegistrationAndCallbackAcrossEngineRead) {ack_read(false);}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualAckReadStartingAfterProbeDefersBeforeBookkeeping) {ack_read(true);}
+TEST_F(RecoveryAutomaticExportReadAdmission, ClaimedFrameExhaustsSameBoundWhileReadRemainsHeld) {
+    negotiated_worker_observation workers;seed();automatic_frame_observer frames;
+    std::unique_ptr<held_read> read;size_t commits=0;decltype(snapshot()) committed;
+    negotiated_hook_scope claim([&]{++commits;committed=snapshot();read=hold();});accept(caps());ASSERT_TRUE(read);
+    const auto first=observed();ASSERT_GE(first.attempts,1u);const auto started=sync_discovery_operation::clock::now();
+    // Seven seconds observes delivery overhead; the operation retains its
+    // original five-second deadline and the held SELECT's twelve-second guard.
+    ASSERT_TRUE(until([&]{return !errors.empty();},std::chrono::seconds(7)));
+    const auto failed=observed();EXPECT_TRUE(failed.failed);EXPECT_EQ(failed.work,first.work);EXPECT_EQ(failed.deadline,first.deadline);
+    EXPECT_EQ(failed.charge,first.charge);EXPECT_LE(failed.attempts,32u);
+    EXPECT_TRUE(failed.attempts==32||sync_discovery_operation::clock::now()>=first.deadline);
+    EXPECT_LE(first.deadline-started,std::chrono::seconds(5));EXPECT_EQ(errors.size(),1u);
+    EXPECT_NE(errors[0].find("deferral exhausted"),std::string::npos);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(commits,1u);
+    EXPECT_EQ(snapshot(),committed);for(const auto& bytes:frames.bytes)EXPECT_EQ(bytes,frames.bytes.front());
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    release(read);queue->drain();EXPECT_EQ(snapshot(),committed);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(errors.size(),1u);
+    EXPECT_THROW(senders[0]->sync_now(),db_error);EXPECT_TRUE(observed().failed);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, AcceptedAckExhaustsSameBoundWithoutBookkeepingOrCompletion) {
+    negotiated_ack_pause pause(senders,factory);seed();accept(caps());ASSERT_TRUE(pump_until_batch(1));
+    const auto batches=factory->wires[0]->audit_batches();ASSERT_EQ(batches.size(),1u);
+    const auto durable=snapshot();const auto bookkeeping=owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2");
+    size_t completed=0;senders[0]->set_on_sync_complete([&](const auto&){++completed;});auto read=hold();
+    factory->wires[0]->ack(batches[0]);queue->drain();const auto first=observed();ASSERT_EQ(first.kind,sync_discovery_kind::ack);
+    ASSERT_GE(first.attempts,1u);ASSERT_TRUE(until([&]{return !errors.empty();},std::chrono::seconds(7)));
+    const auto failed=observed();same_episode(first,failed);EXPECT_TRUE(failed.failed);
+    EXPECT_TRUE(failed.attempts==32||sync_discovery_operation::clock::now()>=first.deadline);EXPECT_EQ(errors.size(),1u);
+    EXPECT_NE(errors[0].find("deferral exhausted"),std::string::npos);EXPECT_EQ(completed,0u);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2"),bookkeeping);EXPECT_EQ(snapshot(),durable);
+    release(read);queue->drain();EXPECT_EQ(completed,0u);EXPECT_EQ(factory->wires[0]->audit_batches(),batches);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2"),bookkeeping);EXPECT_EQ(errors.size(),1u);
+    // Keep the ACK timer held until pause retires the actual sender.
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, RetiredReadParkedFrameCannotReachReplacementPhysicalRoute) {
+    negotiated_ack_pause pause(senders,factory);seed();std::unique_ptr<held_read> read;size_t commits=0;
+    {negotiated_hook_scope claim([&]{++commits;read=hold();});accept(caps());}
+    ASSERT_TRUE(read);const auto committed=snapshot();const auto old=platform->attempts[0]->current();
+    EXPECT_TRUE(old.trigger_on_close(1000,"retire parked engine-read frame"));queue->drain();
+    EXPECT_TRUE(audit_wire().empty());release(read);queue->drain();EXPECT_EQ(snapshot(),committed);EXPECT_TRUE(audit_wire().empty());
+    start(0);auto response2=response(1,caps());const auto same_policy=expected(0);
+    for(const auto* name:{"source","incomingScope","peer","channel"})response2[name]=same_policy.at(name);
+    ASSERT_TRUE(platform->attempts[1]->current().trigger_on_message(transport_message::from_string(response2.dump())));
+    ASSERT_TRUE(pump_until_batch(1,1));EXPECT_FALSE(old.trigger_on_open());
+    EXPECT_FALSE(old.trigger_on_message(transport_message::from_string(server_sent_event::make_ack(factory->wires[1]->audit_batches()[0]).to_json())));
+    EXPECT_EQ(senders[1]->get_progress().pending_upload,1);ack_only_batch(pause,1);
+    EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(commits,1u);EXPECT_EQ(claimed(),2);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, RetiredAcceptedAckCannotCompleteAgainstSuccessorRegistration) {
+    negotiated_ack_pause pause(senders,factory);seed();accept(caps());ASSERT_TRUE(pump_until_batch(1));
+    const auto batches=factory->wires[0]->audit_batches();const auto durable=snapshot();size_t old_completions=0;
+    senders[0]->set_on_sync_complete([&](const auto&){++old_completions;});auto read=hold();const auto old=platform->attempts[0]->current();
+    factory->wires[0]->ack(batches[0]);queue->drain();ASSERT_EQ(observed().kind,sync_discovery_kind::ack);ASSERT_GE(observed().attempts,1u);
+    EXPECT_TRUE(old.trigger_on_close(1000,"retire held ACK"));queue->drain();release(read);queue->drain();
+    EXPECT_EQ(old_completions,0u);EXPECT_EQ(snapshot(),durable);EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),0);
+    // Let the first real ACK worker observe retirement before starting a new
+    // worker; this is not an acknowledgement of the old queued ACK payload.
+    pause.acknowledged();start(0);auto response2=response(1,caps());const auto same_policy=expected(0);
+    for(const auto* name:{"source","incomingScope","peer","channel"})response2[name]=same_policy.at(name);
+    ASSERT_TRUE(platform->attempts[1]->current().trigger_on_message(transport_message::from_string(response2.dump())));
+    ASSERT_TRUE(pump_until_batch(1,1));EXPECT_FALSE(old.trigger_on_message(transport_message::from_string(server_sent_event::make_ack(batches[0]).to_json())));
+    EXPECT_EQ(old_completions,0u);EXPECT_EQ(senders[1]->get_progress().pending_upload,1);ack_only_batch(pause,1);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct automatic_raw_cursor {
+    sqlite3_stmt* statement=nullptr;
+    explicit automatic_raw_cursor(database& db,const char* sql){
+        const auto prepared=sqlite3_prepare_v2(canonical_writer_custody_test_access::fault_handle(db),sql,-1,&statement,nullptr);
+        if(prepared!=SQLITE_OK||!statement){sqlite3_finalize(statement);statement=nullptr;throw db_error("automatic admission fixture raw prepare failed");}
+        if(sqlite3_step(statement)!=SQLITE_ROW){sqlite3_finalize(statement);statement=nullptr;throw db_error("automatic admission fixture raw row missing");}
+    }
+    ~automatic_raw_cursor(){sqlite3_finalize(statement);}
+};
+struct automatic_rollback {
+    database& db;bool active=true;
+    explicit automatic_rollback(database& value):db(value){db.execute("BEGIN");}
+    void finish(){if(active){db.rollback();active=false;}}
+    ~automatic_rollback(){if(active)try{db.rollback();}catch(...){ADD_FAILURE()<<"automatic admission fixture rollback failed";}}
+};
+thread_local size_t automatic_commit_denials=0;
+int automatic_deny_commit(int action,const char* one,const char*,const char*) noexcept {
+    if(action==SQLITE_TRANSACTION&&one&&std::strcmp(one,"COMMIT")==0){++automatic_commit_denials;return SQLITE_DENY;}
+    return SQLITE_OK;
+}
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, SameThreadEngineReadCallbackIsFatalWithoutRetry) {
+    negotiated_worker_observation workers;seed();const auto before=snapshot();size_t callbacks=0;
+    {recovery_admission_test::row_probe probe([&](auto& actual,auto* statement){
+        if(&actual!=&owner->db()||callbacks||std::string(sqlite3_sql(statement))!="SELECT 1 AS value")return;
+        ++callbacks;accept(caps());
+    });EXPECT_EQ(owner->db().query("SELECT 1 AS value").size(),1u);}
+    queue->drain();EXPECT_EQ(callbacks,1u);ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors[0].find("cannot reenter"),std::string::npos);
+    EXPECT_EQ(observed().work,0u);EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_TRUE(audit_wire().empty());
+    EXPECT_EQ(workers.started->load(),0u);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, RawBusyCursorIsFatalWithoutRetry) {
+    negotiated_worker_observation workers;seed();const auto before=snapshot();
+    {automatic_raw_cursor cursor(owner->db(),"SELECT value FROM ContinuousSharedRow");accept(caps());
+        EXPECT_EQ(observed().work,0u);EXPECT_TRUE(audit_wire().empty());}
+    queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_EQ(workers.started->load(),0u);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, RawBusyCursorWithoutMainReadTransactionIsFatal) {
+    negotiated_worker_observation workers;seed();const auto before=snapshot();
+    {automatic_raw_cursor cursor(owner->db(),"SELECT 1 AS value");accept(caps());EXPECT_EQ(observed().work,0u);}
+    queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(workers.started->load(),0u);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ExplicitReadTransactionIsFatalWithoutRetry) {
+    negotiated_worker_observation workers;seed();const auto before=snapshot();
+    {automatic_rollback transaction(owner->db());EXPECT_EQ(owner->db().query("SELECT value FROM ContinuousSharedRow").size(),1u);
+        accept(caps());EXPECT_EQ(observed().work,0u);transaction.finish();}
+    queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(workers.started->load(),0u);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualEngineWriteReturningIsFatalWithoutRetry) {
+    negotiated_worker_observation workers;seed();
+    // Use the registered unprotected local model. The genuine engine UPDATE
+    // has an active writing VM at ROW; it cannot borrow readonly provenance.
+    owner->add(ContinuousLocalRow{"before-returning"});queue->drain();const auto claims_before=claimed();
+    auto read=hold("UPDATE ContinuousLocalRow SET value=value RETURNING value");
+    accept(caps());EXPECT_EQ(observed().work,0u);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(errors.size(),1u);
+    // Finalizing this genuine write may publish a new AuditLog demand. Retire
+    // the refused sender first; that later demand is not an admission retry.
+    senders.clear();release(read);queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(claimed(),claims_before);EXPECT_EQ(workers.started->load(),0u);
+    EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM ContinuousLocalRow"),1);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, RevokedProducerDuringReadCannotOfferDeferredAdmission) {
+    negotiated_worker_observation workers;seed();auto read=hold();
+    // Public raw escape monotonically revokes real producer admission. This
+    // is an actual API action, not a fabricated owner/permission flag.
+    (void)owner->db().handle();accept(caps());queue->drain();EXPECT_EQ(observed().work,0u);EXPECT_TRUE(audit_wire().empty());
+    EXPECT_EQ(errors.size(),1u);release(read);EXPECT_EQ(claimed(),0);EXPECT_EQ(workers.started->load(),0u);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, PublicStrictAndMutexOnlyEntryPointsKeepReadRefusal) {
+    seed();const auto before=snapshot();auto read=hold();
+    EXPECT_THROW(recovery_export_adapter::protected_store(owner),db_error);
+    EXPECT_THROW(recovery_export_adapter::try_protected_store(owner),db_error);
+    EXPECT_THROW(recovery_export_adapter::prepare_pending(owner,policy.routes[0].sync_id,1,1,{},false),db_error);
+    EXPECT_THROW(recovery_export_adapter::try_prepare_pending(owner,policy.routes[0].sync_id,1,1,{},false),db_error);
+    EXPECT_THROW(recovery_export_adapter::prepare_history_page(owner,1,0,1),db_error);
+    EXPECT_THROW(recovery_export_adapter::prepare_retained_page(owner,1,0,1),db_error);
+    EXPECT_THROW(recovery_export_adapter::acknowledge_legacy(owner,policy.routes[0].sync_id,{}),db_error);
+    bool entered=false;const auto installed=recovery_writer_access::install(owner,[&](auto&){entered=true;});
+    EXPECT_EQ(installed.deferred,recovery_install_deferred::none);EXPECT_TRUE(installed.primary_error);EXPECT_FALSE(entered);
+    release(read);EXPECT_EQ(snapshot(),before);
+    {negotiated_writer_hold mutex(canonical_writer_custody_test_access::fault_handle(owner->db()));
+        EXPECT_THROW(recovery_export_adapter::protected_store(owner),export_discovery_busy);
+        EXPECT_FALSE(recovery_export_adapter::try_protected_store(owner).has_value());
+        EXPECT_FALSE(recovery_export_adapter::try_prepare_pending(owner,policy.routes[0].sync_id,1,1,{},false).has_value());}
+    EXPECT_TRUE(recovery_export_adapter::protected_store(owner));EXPECT_EQ(snapshot(),before);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualOwnedWriteStillSupportsStrictProtectionDiscovery) {
+    seed();const auto before=snapshot();
+    owner->begin_transaction();
+    try {
+        owner->add(ContinuousLocalRow{"owned-write-discovery"});
+        EXPECT_EQ(recovery_writer_access::active_writer(*owner),&owner->db());
+        EXPECT_TRUE(recovery_export_adapter::protected_store(owner));
+        EXPECT_EQ(recovery_export_adapter::try_protected_store(owner),std::optional<bool>{true});
+        owner->rollback();
+    }catch(...){owner->rollback();throw;}
+    EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(claimed(),0);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, AutomaticClaimCommitFailureNeverBecomesAdmissionRetry) {
+    negotiated_worker_observation workers;seed();const auto before=snapshot();size_t bodies=0;automatic_commit_denials=0;
+    {continuity_fault fault(owner.get(),automatic_deny_commit);negotiated_precommit_hook_scope body([&]{++bodies;});accept(caps());}
+    queue->drain();EXPECT_EQ(automatic_commit_denials,1u);EXPECT_EQ(bodies,1u);EXPECT_EQ(errors.size(),1u);
+    EXPECT_EQ(observed().work,0u);EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(workers.started->load(),0u);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, AutomaticAckCommitFailureRetainsRegistrationAndNeverCallsCompletion) {
+    negotiated_ack_pause pause(senders,factory);seed();accept(caps());ASSERT_TRUE(pump_until_batch(1));
+    const auto batches=factory->wires[0]->audit_batches();const auto durable=snapshot();
+    const auto bookkeeping=owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2");const auto registrations=observed().registrations;
+    size_t completions=0;senders[0]->set_on_sync_complete([&](const auto&){++completions;});automatic_commit_denials=0;
+    {continuity_fault fault(owner.get(),automatic_deny_commit);factory->wires[0]->ack(batches[0]);queue->drain();}
+    EXPECT_EQ(automatic_commit_denials,1u);EXPECT_EQ(errors.size(),1u);EXPECT_EQ(completions,0u);EXPECT_EQ(observed().work,0u);
+    EXPECT_EQ(observed().registrations,registrations);EXPECT_EQ(snapshot(),durable);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_sync_state ORDER BY 1,2"),bookkeeping);EXPECT_EQ(factory->wires[0]->audit_batches(),batches);
+    // Timer retirement is owned by pause; no duplicate ACK is synthesized.
+}
+#endif

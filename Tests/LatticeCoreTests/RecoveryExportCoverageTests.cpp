@@ -231,3 +231,36 @@ TEST_F(RecoveryExportCoverage, MovedFromPermitRefusesBeforeOneValidTransportHand
     sender.reset();
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include "RecoveryAdmissionTestRead.hpp"
+namespace {
+// Calls the existing public strict/mutex-only route APIs on a real sender;
+// no automatic admission selector or permit constructor is exposed here.
+class public_handoff_sender final:public synchronizer {
+public:
+    using synchronizer::synchronizer;
+    std::shared_ptr<lattice_db> retained_owner(){return owned_db_;}
+    uint64_t generation()const{return reconnect_lifecycle_.load();}
+    bool handoff(committed_export_frame frame){return recovery_export_route_->handoff(std::move(frame));}
+    std::optional<bool> try_handoff(committed_export_frame& frame){return recovery_export_route_->try_handoff(frame);}
+};
+}
+TEST_F(RecoveryExportCoverage, PublicHandoffAndMutexOnlyTryStillRefuseActualEngineRead) {
+    owner->close();owner.reset();scheduler=std::make_shared<coverage_scheduler>();
+    configuration cfg(":memory:");cfg.audit_retention_seconds=0;cfg.sched=scheduler;
+    auto wire=std::make_shared<coverage_wire_state>();sync_config config;config.sync_id=route_channel;config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;
+    auto sender=std::make_unique<public_handoff_sender>(std::make_unique<lattice_db>(cfg),config,std::make_unique<coverage_wire>(wire));
+    owner=sender->retained_owner();bind();enroll();sender->connect();ASSERT_TRUE(wire->opened);wire->state=transport_state::open;wire->opened();
+    scheduler->pause(true);add();
+    for(bool mutex_only:{false,true}) {
+        auto prepared=prepare(4096,{},1000,sender->generation());ASSERT_TRUE(prepared.frame);const auto before=snapshot();
+        recovery_admission_test::held_read read(owner->db(),false,"SELECT value FROM ExportCoverageRow",true);
+        if(mutex_only)EXPECT_THROW(sender->try_handoff(*prepared.frame),db_error);
+        else EXPECT_THROW(sender->handoff(std::move(*prepared.frame)),db_error);
+        EXPECT_TRUE(wire->frames.empty());read.finish();EXPECT_FALSE(read.error);EXPECT_EQ(read.rows,1u);EXPECT_EQ(snapshot(),before);
+        EXPECT_THROW(sender->try_handoff(*prepared.frame),db_error); // Error consumed the original permit, never a retry lease.
+    }
+    sender.reset();
+}
+#endif

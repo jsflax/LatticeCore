@@ -2341,6 +2341,8 @@ protected:
     json source_policy(const std::string& ns)override {
         auto p=RecoveryReceiverController::source_policy(ns);
         p["readyProfile"]=small?(adopted?"boundedV1OrphanV1":"boundedV1"):(adopted?"bounded48MiBOrphanV1":"bounded48MiBV1");
+        // The historical small profile is selected only by omission.
+        if(small&&!adopted)p.erase("readyProfile");
         if(adopted)p["orphanResumeGraceMilliseconds"]=60000;return p;
     }
     void adopt_source() {

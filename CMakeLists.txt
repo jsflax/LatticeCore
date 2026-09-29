@@ -314,6 +314,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
     Tests/LatticeCoreTests/ManagedObservationTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
+    Tests/LatticeCoreTests/LinuxNotifierTests.cpp
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp
     Tests/LatticeCoreTests/ReaderLifetimeTests.cpp

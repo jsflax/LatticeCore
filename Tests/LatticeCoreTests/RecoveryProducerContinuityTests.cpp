@@ -867,6 +867,21 @@ public:
         state->transport=transport;return std::unique_ptr<sync_transport>(transport);
     }
 };
+void negotiated_open_after_dial(const std::shared_ptr<negotiated_attempt>& attempt,
+        const std::shared_ptr<continuity_queue>& queue={}) {
+    // connect() may now retain a proven busy first probe. Only the actual
+    // platform dial publishes this callback; never fabricate or buffer open.
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    for(;;) {
+        bool published=false;
+        {std::lock_guard lock(attempt->wire->mutex);published=bool(attempt->wire->opened);}
+        if(published){attempt->wire->open();return;}
+        if(std::chrono::steady_clock::now()>=deadline)throw db_error("negotiated fixture actual dial did not publish within five seconds");
+        // A configured child already owns a dedicated worker; manual fixtures
+        // execute their real queued jobs using the existing 1ms pump style.
+        if(!queue||!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 negotiated_json negotiated_profile(){
     negotiated_json result={{"name","fixture-v1"},{"wire",negotiated_json::object()},{"valueLimits",negotiated_json::object()}};
     for(const auto* name:{"frame_bytes","payload_bytes","items_per_page","content_pages","content_identities","content_bytes","receipt_pages","receipts","receipt_bytes"})result["wire"][name]="1";
@@ -900,7 +915,7 @@ protected:
             {"incomingScope",{{"models",negotiated_json::array({{{"table","ContinuousSharedRow"},{"incomingOperations",negotiated_json::array({"INSERT","UPDATE","DELETE"})}}})},{"relations",negotiated_json::array()},{"scopedLinkTables",negotiated_json::array()},{"catalogDigest",hash}}},
             {"peer",{{"replicaID","registered/replica"},{"receiverIncarnation",id},{"channelIncarnation",id}}},{"channel",policy.routes[route].sync_id},{"validForMilliseconds",3600000}};}
     void start(size_t route=0){sync_config c;c.sync_id=policy.routes[route].sync_id;c.websocket_url=policy.routes[route].endpoint;c.recovery_source_expectation=expected(route).dump();c.checkpoint_passive_interval_ms=0;c.upload_coalesce_ms=0;
-        auto sender=std::make_unique<synchronizer>(owner,c);sender->set_on_error([this](const std::string& error){errors.push_back(error);});sender->connect();queue->drain();factory->wires.back()->open();queue->drain();senders.push_back(std::move(sender));}
+        auto sender=std::make_unique<synchronizer>(owner,c);sender->set_on_error([this](const std::string& error){errors.push_back(error);});sender->connect();queue->drain();negotiated_open_after_dial(platform->attempts.back(),queue);queue->drain();senders.push_back(std::move(sender));}
     negotiated_json response(size_t index,const negotiated_json& limits){std::string raw;
         {std::lock_guard lock(factory->wires[index]->mutex);raw=factory->wires[index]->frames.front();}
         auto result=negotiated_json::parse(raw);const auto policy=expected(index);
@@ -942,7 +957,7 @@ TEST_F(RecoveryNegotiatedExport, ActualConfiguredOwnerForwardsExpectationToRetai
     const auto ack_schedule=sync_background_test_hooks::ack;
     negotiated_scheduler_pass(child_queue,[ack_schedule]{sync_background_test_hooks::ack=ack_schedule;});
     owner->add(ContinuousSharedRow{"configured-original"});negotiated_scheduler_pass(child_queue);
-    factory->wires[0]->open();negotiated_scheduler_pass(child_queue);
+    negotiated_open_after_dial(platform->attempts[0]);negotiated_scheduler_pass(child_queue);
     EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(claimed(),0);ASSERT_EQ(factory->wires[0]->count(),1u);
     EXPECT_THROW(owner->sync_now(),db_error);
     platform->attempts[0]->current().trigger_on_message(transport_message::from_string(response(0,caps()).dump()));
@@ -1062,7 +1077,7 @@ TEST_F(RecoveryNegotiatedExport, ActualAckTimeoutKeepsCompletedDrainPendingUntil
     const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");
     sync_config c;c.sync_id=policy.routes[0].sync_id;c.websocket_url=policy.routes[0].endpoint;c.recovery_source_expectation=expected(0).dump();
     c.checkpoint_passive_interval_ms=0;c.upload_coalesce_ms=0;c.ack_timeout_base_ms=1; // explicit fixture input; production timeout policy is unchanged
-    auto sender=std::make_unique<synchronizer>(owner,c);sender->set_on_error([this](const std::string& error){errors.push_back(error);});sender->connect();queue->drain();factory->wires.back()->open();queue->drain();senders.push_back(std::move(sender));
+    auto sender=std::make_unique<synchronizer>(owner,c);sender->set_on_error([this](const std::string& error){errors.push_back(error);});sender->connect();queue->drain();negotiated_open_after_dial(platform->attempts.back(),queue);queue->drain();senders.push_back(std::move(sender));
     accept(caps());const auto first=factory->wires[0]->audit_batches();ASSERT_EQ(first.size(),1u);ASSERT_EQ(first[0].size(),1u);
     const auto claims=owner->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY channel,original");ASSERT_EQ(claimed(),2);
     auto drained=std::async(std::launch::async,[&]{senders[0]->drain(std::chrono::steady_clock::now()+std::chrono::seconds(5));});
@@ -1258,7 +1273,7 @@ protected:
         negotiated_json expected={{"endpoint",policy.routes[route].endpoint},{"source",d.at("source")},{"incomingScope",d.at("incomingScope")},
             {"peer",d.at("route").at("peer")},{"channel",policy.routes[route].sync_id},{"validForMilliseconds",600000}};
         sync_config c;c.sync_id=policy.routes[route].sync_id;c.websocket_url=policy.routes[route].endpoint;c.recovery_source_expectation=expected.dump();c.checkpoint_passive_interval_ms=0;c.upload_coalesce_ms=0;
-        auto sender=std::make_unique<synchronizer>(owner,c);sender->set_on_error([this](const std::string& error){errors.push_back(error);});sender->connect();queue->drain();factory->wires.back()->open();queue->drain();senders.push_back(std::move(sender));
+        auto sender=std::make_unique<synchronizer>(owner,c);sender->set_on_error([this](const std::string& error){errors.push_back(error);});sender->connect();queue->drain();negotiated_open_after_dial(platform->attempts.back(),queue);queue->drain();senders.push_back(std::move(sender));
         std::string request;{std::lock_guard lock(factory->wires[route]->mutex);request=factory->wires[route]->frames.front();}
         const auto input=sessions[route].stop_token().reserve_ready(request.size());if(!input.valid())throw db_error("NoHistory describe input not admitted");
         const auto response=sessions[route].ready(request,input);if(response.status_code()!=1||!response.publishable())throw db_error("NoHistory actual describe failed");
@@ -1508,5 +1523,41 @@ TEST(RecoveryUploadExclusion, ExhaustedQueueDisposesPresendExclusionWhileRetaini
     // This only relinquishes volatile exclusion; payload/UNKNOWN remains in the
     // failed queue until explicit route disposition. No ACK or SQL is fabricated.
     queue.cancel(3,true);lease.reset();work.reset();EXPECT_FALSE(queue.pending(3));
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+TEST_F(RecoveryNegotiatedExport, PublicConnectRetriesActualProtectedWriterBusyWithoutClaimingBeforeDescribe) {
+    negotiated_ack_pause pause(senders,factory);open();owner->add(ContinuousSharedRow{"protected-connect-busy"});
+    const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");ASSERT_EQ(originals.size(),1u);
+    sync_config c;c.sync_id=policy.routes[0].sync_id;c.websocket_url=policy.routes[0].endpoint;
+    c.recovery_source_expectation=expected(0).dump();c.checkpoint_passive_interval_ms=0;c.upload_coalesce_ms=0;
+    auto sender=std::make_unique<synchronizer>(owner,c);
+    sender->set_on_error([this](const std::string& error){errors.push_back(error);});
+    ASSERT_EQ(platform->attempts.size(),1u);const auto attempt=platform->attempts[0];
+    const auto before=snapshot();EXPECT_EQ(claimed(),0);
+    {
+        // Hold the real retained writer mutex only after constructor admission
+        // has finished, so this forces the public connect classifier itself.
+        negotiated_writer_hold held(canonical_writer_custody_test_access::fault_handle(owner->db()));
+        EXPECT_NO_THROW(sender->connect());queue->drain();
+        {std::lock_guard lock(attempt->mutex);EXPECT_TRUE(attempt->endpoints.empty());}
+        EXPECT_EQ(attempt->wire->count(),0u);EXPECT_TRUE(errors.empty());
+    }
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);
+    // No second connect or manual discovery pump: the production pacer admits
+    // the due probe, while this fixture drains its actual scheduled callback.
+    negotiated_open_after_dial(attempt,queue);queue->drain();senders.push_back(std::move(sender));
+    {std::lock_guard lock(attempt->mutex);ASSERT_EQ(attempt->endpoints.size(),1u);}
+    ASSERT_EQ(attempt->wire->count(),1u);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);
+    {std::lock_guard lock(attempt->wire->mutex);const auto describe=negotiated_json::parse(attempt->wire->frames[0]);
+        EXPECT_EQ(describe.at("kind"),"recoveryReady");EXPECT_EQ(describe.at("operation"),"describe");}
+    accept(caps());const auto batches=attempt->wire->audit_batches();ASSERT_EQ(batches.size(),1u);ASSERT_EQ(batches[0].size(),1u);
+    EXPECT_EQ(batches[0][0],std::get<std::string>(originals[0].at("globalId")));EXPECT_EQ(claimed(),2);
+    attempt->wire->ack(batches[0]);ASSERT_TRUE(queue->run_one());pause.acknowledged();queue->drain();
+    EXPECT_EQ(senders[0]->get_progress().pending_upload,0);EXPECT_EQ(attempt->wire->audit_batches(),batches);
+    EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),originals);EXPECT_TRUE(errors.empty());
+    {std::lock_guard lock(attempt->mutex);EXPECT_EQ(attempt->endpoints.size(),1u);}
 }
 #endif

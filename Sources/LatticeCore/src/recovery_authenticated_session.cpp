@@ -1,5 +1,6 @@
 #include "recovery_authenticated_session.hpp"
 #include "canonical_ready_named_profile.hpp"
+#include "recovery_predecessor_wire.hpp"
 #include "recovery_receipt_json.hpp"
 #include "lattice/lattice.hpp"
 #include "vendor/picosha2/picosha2.h"
@@ -796,11 +797,11 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         response["settlement"]=ready_settlement(read.settlement);response["frameAvailable"]=false;return output();
     }
     const bool lifecycle=s->recipe.ready.orphan_resume_grace_ms.has_value();
-    if(op!="prepare"&&op!="resume"&&op!="discard"&&!(lifecycle&&op=="inspect"))reject("READY control operation unknown");
+    if(op!="prepare"&&op!="resume"&&op!="discard"&&!(lifecycle&&(op=="inspect"||op=="predecessor")))reject("READY control operation unknown");
     // A post-operation kick is essential: an earlier empty scan may have run
     // after the pre-operation kick but before this call acquired its WRITE.
-    struct maintenance_kick {std::shared_ptr<authenticated_mounted_source> source;~maintenance_kick(){if(source)authenticated_ready_maintenance::kick(source);}} maintenance{op=="inspect"?nullptr:s->source};
-    if(op!="inspect")authenticated_ready_maintenance::kick(s->source);
+    struct maintenance_kick {std::shared_ptr<authenticated_mounted_source> source;~maintenance_kick(){if(source)authenticated_ready_maintenance::kick(source);}} maintenance{op=="inspect"||op=="predecessor"?nullptr:s->source};
+    if(op!="inspect"&&op!="predecessor")authenticated_ready_maintenance::kick(s->source);
     if(op=="prepare") {
         // Finite source-wide charge for retained capture, canonical vectors,
         // capsule strings and request copies. This is explicit logical storage
@@ -811,7 +812,8 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         if(workspace>authenticated_ready_budget::max_workspace-charge->budget_->workspace)reject("READY source capture workspace unavailable");
         charge->workspace_=workspace;charge->budget_->workspace+=workspace;
     }
-    if(op=="discard"||op=="inspect")shape(control,{"kind","version","operation","requestID","routeGeneration","request"});
+    if(op=="predecessor")shape(control,{"kind","version","operation","requestID","routeGeneration","request","priorProfile"});
+    else if(op=="discard"||op=="inspect")shape(control,{"kind","version","operation","requestID","routeGeneration","request"});
     else shape(control,{"kind","version","operation","requestID","routeGeneration","request","durationMilliseconds"});
     const auto& codec=s->recipe.ready.package.codec;
     const auto request_bytes=text(control,"request",codec.maximum.frame_bytes);
@@ -832,7 +834,7 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         }
     }
     const auto now=authenticated_session_fence::now();
-    const auto duration=op=="discard"||op=="inspect"?int64_t(1):number(control,"durationMilliseconds",1,static_cast<int64_t>(codec.lease_ms));
+    const auto duration=op=="discard"||op=="inspect"||op=="predecessor"?int64_t(1):number(control,"durationMilliseconds",1,static_cast<int64_t>(codec.lease_ms));
     if(now>INT64_MAX-duration||now+duration>s->fence->deadline_.load(std::memory_order_acquire)||!s->fence->live()||!s->route->live())
         reject("READY finite lease exceeds actual authorization or route");
     const auto lifecycle_output=[&](const canonical_ready_lifecycle_result& result) {
@@ -847,6 +849,22 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         }
         return output();
     };
+    if(op=="predecessor") {
+        const auto prior=predecessor_wire::canonical_profile(control.at("priorProfile"),bool(s->recipe.profile.namespaces.coverage));
+        predecessor_wire::pair(control.at("priorProfile"),ready_profile_description(s->recipe),bool(s->recipe.profile.namespaces.coverage));
+        if(ready_before_owned_test_hook_)(*ready_before_owned_test_hook_)();
+        const auto result=s->source->adapter->inspect_authenticated_predecessor(s->source->owner,*s->admission,logical,*request,prior);
+        response["settlement"]=ready_settlement(result.settlement);response["leaseAvailable"]=false;
+        if(result.settlement.state==recovery_install_state::committed&&result.facts){const auto& f=*result.facts;
+            response["predecessor"]={{"version",1},{"transitionID",f.transition_id},{"transitionDigest",f.transition_digest},
+                {"beforeProfileDigest",f.before_profile_digest},{"afterProfileDigest",f.after_profile_digest},{"sourceIdentityDigest",f.source_identity_digest},
+                {"disposition","preserveCompleted"},{"requestDigest",request->request_digest},{"attemptID",logical.attempt_id},{"sequence",std::to_string(logical.sequence)},
+                {"namespaceID",s->recipe.selected_namespace},{"replicaID",peer.at("replicaID")},{"receiverIncarnation",logical.receiver_incarnation},
+                {"channelIncarnation",logical.channel_incarnation},{"channel",logical.channel}};
+            if(response["predecessor"].dump().size()>predecessor_wire::body_bytes)reject("READY predecessor body bound");
+        }
+        return output();
+    }
     if(op=="inspect") {
         // Pure inspection does not revoke a physical lease or infer expiry.
         if(ready_before_owned_test_hook_)(*ready_before_owned_test_hook_)();

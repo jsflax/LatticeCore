@@ -1,6 +1,7 @@
 #include "canonical_writer_adapter.hpp"
 #include "canonical_receipt_coverage.hpp"
 #include "canonical_ready_named_profile.hpp"
+#include "recovery_predecessor_wire.hpp"
 #include "canonical_validated_sequence.hpp"
 #include "recovery_authenticated_session.hpp"
 #include "recovery_writer_access.hpp"

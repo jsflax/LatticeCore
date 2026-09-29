@@ -68,7 +68,7 @@ void scope(const json& j) {
 }
 void profile(const json& j) {
     auto required=j;const auto name=text(j,"name",64);
-    if(name=="bounded48MiBOrphanV1"){
+    if(name=="bounded48MiBOrphanV1"||name=="boundedV1OrphanV1"){
         const auto grace=number(j,"orphanResumeGraceMilliseconds");
         if(grace<=0||grace>3600000)reject("receiver source lifecycle grace bound");
         required.erase("orphanResumeGraceMilliseconds");

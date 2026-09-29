@@ -1868,3 +1868,145 @@ TEST_F(AuthenticatedReceiptFileAdministration, ViewAndDuplicateMetadataRefuseWit
 }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#include "../../Sources/LatticeCore/src/recovery_predecessor_wire.hpp"
+namespace {
+class AuthenticatedPredecessor : public AuthenticatedReadySession {
+protected:
+    json prior,current;
+    ready_wire::frame frozen;
+    void adopt(bool large=false,bool capsule=true) {
+        setup=admitted(1,large);prior=description(setup);frozen=request(prior);
+        if(capsule)(void)lease(setup,frozen,prior);
+        setup.close_on_io();setup={};
+        detail::canonical_namespaced_writer_profile p;const auto& s=prior.at("source");
+        p.writer.binding={s.at("sourceID"),s.at("epoch"),s.at("scopeDigest"),s.at("schemaDigest")};
+        p.writer.limits={65536,16777216,65536,16777216,256,128,64};p.writer.models={"AuthenticatedRelayRow"};p.writer.upstream_requested=true;
+        p.namespaces.local_namespace="local";p.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+        const std::string name=large?"bounded48MiBV1":"boundedV1";
+        const auto result=detail::adopt_ready_lifecycle_for_test(owner,p,{256,65536,1048576},{64,3600000},
+            detail::canonical_named_ready_profile(s.at("authority"),p.writer.limits,false,name),name,60000);
+        ASSERT_EQ(result.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(result.record);
+        auto target=source_policy(large);target["readyProfile"]=large?"bounded48MiBOrphanV1":"boundedV1OrphanV1";target["orphanResumeGraceMilliseconds"]=60000;
+        setup=open(target,connection());ASSERT_TRUE(setup.valid())<<last_bridge_error();auto authorized=outcome(setup);authorized["validForMilliseconds"]=600000;
+        ASSERT_TRUE(setup.finish_authorization(authorized.dump()));current=description(setup);
+        frozen.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());
+    }
+    json proof_command() {
+        auto c=command("predecessor",frozen,current);c.erase("durationMilliseconds");c["priorProfile"]=prior.at("profile");return c;
+    }
+    json proof() {
+        const auto result=invoke(setup,proof_command());if(result.status_code()!=1||!result.publishable())throw db_error("fixture predecessor unavailable: "+last_bridge_error());
+        return json::parse(result.wire());
+    }
+};
+TEST_F(AuthenticatedPredecessor, ActualSmallAdoptionProofKeepsLiveLeaseAndEveryDurableCounter) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto resumed=lease(setup,frozen,current,"resume");const auto frame=read(setup,resumed,0);ASSERT_TRUE(frame.publishable());
+    const auto before=exact_source();detail::canonical_ready_read_test_observation::observation trace;
+    const auto previous=detail::canonical_ready_read_test_observation::current;detail::canonical_ready_read_test_observation::current=&trace;
+    struct restore {detail::canonical_ready_read_test_observation::observation* previous;~restore(){detail::canonical_ready_read_test_observation::current=previous;}} reset{previous};
+    const auto answer=proof();ASSERT_EQ(answer.at("settlement").at("state"),"committed");ASSERT_TRUE(answer.contains("predecessor"));EXPECT_EQ(answer.at("leaseAvailable"),false);
+    EXPECT_EQ(answer.at("predecessor").at("requestDigest"),std::get<ready_wire::request>(frozen.body).request_digest);
+    EXPECT_EQ(answer.at("predecessor").at("beforeProfileDigest"),detail::predecessor_wire::profile_digest(prior.at("profile")));
+    EXPECT_EQ(answer.at("predecessor").at("afterProfileDigest"),detail::predecessor_wire::profile_digest(current.at("profile")));
+    EXPECT_EQ(trace.full_audits,2u);EXPECT_EQ(exact_source(),before);EXPECT_TRUE(frame.publishable());EXPECT_EQ(read(setup,resumed,0).wire(),frame.wire());
+}
+TEST_F(AuthenticatedPredecessor, ActualLargeEmptyBindingProofDoesNotInventCapsuleOrHistory) {
+    adopt(true,false);ASSERT_FALSE(HasFatalFailure());const auto before=exact_source();const auto answer=proof();ASSERT_TRUE(answer.contains("predecessor"));
+    EXPECT_FALSE(answer.contains("lifecycle"));EXPECT_FALSE(answer.contains("bindingHighWater"));EXPECT_FALSE(answer.contains("leaseID"));
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),0);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(exact_source(),before);
+    const auto repeated=proof();EXPECT_EQ(repeated.at("predecessor"),answer.at("predecessor"));EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, FreshOrphanCannotManufactureRecordFromMatchingConfiguration) {
+    auto p=source_policy();p["readyProfile"]="boundedV1OrphanV1";p["orphanResumeGraceMilliseconds"]=60000;
+    setup=open(p,connection());ASSERT_TRUE(setup.valid());authorize();current=description(setup);prior=current;
+    prior["profile"]["name"]="boundedV1";prior["profile"].erase("orphanResumeGraceMilliseconds");frozen=request(current);
+    const auto before=exact_source();const auto answer=proof();EXPECT_NE(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, ExactProfileTypesMembersAndEveryAuthenticatedQBindingRemainMandatory) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto before=exact_source();const auto original=proof_command();
+    std::vector<json> invalid;
+    for(const auto& value:std::vector<json>{16.0,true,"16"}){auto c=original;c["priorProfile"]["transfers"]=value;invalid.push_back(c);}
+    {auto c=original;c["priorProfile"]["extra"]=1;invalid.push_back(c);}
+    {auto c=original;c["priorProfile"]["orphanResumeGraceMilliseconds"]=60000;invalid.push_back(c);}
+    {auto c=original;c["routeGeneration"]="1";if(c["routeGeneration"]==current["routeGeneration"])c["routeGeneration"]="2";invalid.push_back(c);}
+    for(unsigned kind=0;kind<5;++kind){auto q=frozen;auto& body=std::get<ready_wire::request>(q.body);
+        if(kind==0)q.logical.receiver_incarnation=relay_uuid(9911);if(kind==1)q.logical.channel_incarnation=relay_uuid(9912);
+        if(kind==2)q.logical.channel="wrong-channel";if(kind==3){body.source.epoch=relay_uuid(9913);body.expected.binding=body.source;}
+        if(kind==4)body.receipts={{relay_uuid(9914),"other",{{"AuthenticatedRelayRow",relay_uuid(9915)}}}};
+        seal(q,current);auto c=original;c["request"]=ready_wire::encode(q,codec(current));invalid.push_back(c);
+    }
+    for(const auto& c:invalid){SCOPED_TRACE(c.dump().substr(0,256));const auto result=invoke(setup,c);EXPECT_NE(result.status_code(),1);EXPECT_EQ(exact_source(),before);}
+    EXPECT_TRUE(proof().contains("predecessor"));
+}
+TEST_F(AuthenticatedPredecessor, CommitDenialWithholdsFactsAndSecondaryErrorKeepsKnownCommit) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto before=exact_source();
+    {AddressedReadAuthorizerFault fault(owner->db(),false,true);const auto answer=proof();EXPECT_EQ(fault.commits,1u);EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_FALSE(answer.contains("predecessor"));}
+    EXPECT_EQ(exact_source(),before);unsigned calls=0;
+    {AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw db_error("predecessor secondary observer");})};
+        const auto answer=proof();EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_EQ(answer.at("settlement").at("postcommitError"),true);EXPECT_TRUE(answer.contains("predecessor"));}
+    EXPECT_EQ(calls,1u);EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, PostcommitRevocationWithholdsFactsWithoutRelabelingCommit) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto c=proof_command();const auto before=exact_source();const auto stop=setup.stop_token();
+    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([stop](const auto&,auto){stop.stop();})};
+    const auto result=invoke(setup,c);ASSERT_EQ(result.status_code(),1);EXPECT_FALSE(result.publishable());const auto answer=json::parse(result.wire());
+    EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, OffPageCorruptionPreventsProvenancePublicationBeforeAnyCleanup) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto tail=owner->db().query("SELECT binding,frame_index,data FROM _lattice_canonical_ready_frame ORDER BY frame_index DESC LIMIT 1").at(0);
+    const auto replace=[&](const std::vector<uint8_t>& data){database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.begin_transaction();raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");raw.execute("UPDATE _lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",{data,tail.at("binding"),tail.at("frame_index")});raw.execute(guard);raw.commit();};
+    replace({'{','}'});const auto corrupted=exact_source();const auto answer=proof();EXPECT_NE(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),corrupted);
+    replace(std::get<std::vector<uint8_t>>(tail.at("data")));EXPECT_TRUE(proof().contains("predecessor"));
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedPredecessor, FullSmallTransferInventoryDoesNotChargeInspectionAsAnotherTransfer) {
+    adopt();ASSERT_FALSE(HasFatalFailure());std::vector<relay_recovery_setup> active;
+    for(unsigned n=2;n<=16;++n){auto p=source_policy();p["readyProfile"]="boundedV1OrphanV1";p["orphanResumeGraceMilliseconds"]=60000;
+        auto next=open(p,connection(n));ASSERT_TRUE(next.valid())<<last_bridge_error();auto authorized=outcome(next);authorized["validForMilliseconds"]=600000;ASSERT_TRUE(next.finish_authorization(authorized.dump()));
+        const auto d=description(next);(void)lease(next,request(d),d,"prepare",590000);active.push_back(std::move(next));}
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),16);const auto before=exact_source();
+    const auto answer=proof();EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_TRUE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
+    for(auto& next:active)next.close_on_io();
+}
+TEST(PredecessorWire, FixedDomainLengthFramingAndStrictNamedEnvelopeVectors) {
+    EXPECT_EQ(detail::predecessor_wire::profile_digest(json::object()),"880fb25a80b731fab82d0a81fbb353e19a1b55016a74dcb9da65f2568afabd1d");
+    EXPECT_EQ(detail::predecessor_wire::transition_digest("abc"),"48a8220dee0fc435f3d7dd270a8cb3025d989147d0be0e2087f1400c52182906");
+    for(const auto registered:{false,true})for(const auto large:{false,true}){
+        if(registered&&!large)continue;const std::string name=large?"bounded48MiBV1":"boundedV1";const auto target=large?"bounded48MiBOrphanV1":"boundedV1OrphanV1";
+        const auto before=detail::canonical_ready_profile_description(detail::canonical_named_ready_profile("test",{},registered,name),name);
+        const auto after=detail::canonical_ready_profile_description(detail::canonical_named_ready_profile("test",{},registered,target,60000),target);
+        EXPECT_NO_THROW(detail::predecessor_wire::pair(before,after,registered));
+        for(const auto& value:std::vector<json>{60000.0,true,"60000",0,3600001}){auto bad=after;bad["orphanResumeGraceMilliseconds"]=value;EXPECT_THROW(detail::predecessor_wire::pair(before,bad,registered),db_error);}
+        auto bad=after;bad["valueLimits"]["rawBytes"]=bad["valueLimits"]["rawBytes"].get<double>();EXPECT_THROW(detail::predecessor_wire::pair(before,bad,registered),db_error);
+        bad=after;bad["unknown"]=false;EXPECT_THROW(detail::predecessor_wire::pair(before,bad,registered),db_error);
+    }
+}
+TEST_F(AuthenticatedReceiptCoverageV3, ActualAdoptedV3ProofBindsRegisteredProducerAndLeavesReceiptCoverageExact) {
+    setup=covered_setup();auto other=covered_setup("other",2);const auto e=identified(entry(85));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto prior=description(setup);auto q=request(prior);q.version=3;auto& body=std::get<ready_wire::request>(q.body);
+    body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace="app";
+    body.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}},e.original_identity->digest}};seal(q,prior);(void)lease(setup,q,prior,"prepare",1000);
+    other.close_on_io();other={};setup.close_on_io();setup={};detail::canonical_namespaced_writer_profile p;const auto& s=prior.at("source");
+    p.writer.binding={s.at("sourceID"),s.at("epoch"),s.at("scopeDigest"),s.at("schemaDigest")};p.writer.limits={65536,16777216,65536,16777216,256,128,64};
+    p.writer.models={"AuthenticatedRelayRow"};p.writer.upstream_requested=true;p.namespaces.local_namespace="local";
+    p.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};p.namespaces.coverage=detail::canonical_coverage_profile{relay_uuid(5100),7,{"app","other"}};
+    const auto adopted=detail::adopt_ready_lifecycle_for_test(owner,p,{256,65536,1048576},{64,3600000},detail::canonical_named_ready_profile(s.at("authority"),p.writer.limits,true,"bounded48MiBV1"),"bounded48MiBV1",60000);
+    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);
+    auto policy=covered_policy();policy["readyProfile"]="bounded48MiBOrphanV1";policy["orphanResumeGraceMilliseconds"]=60000;
+    setup=open(policy,connection());ASSERT_TRUE(setup.valid());ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));const auto d=description(setup);q.route_generation=std::stoull(d.at("routeGeneration").get<std::string>());
+    auto control=command("predecessor",q,d);control.erase("durationMilliseconds");control["priorProfile"]=prior.at("profile");const auto before=all_state();
+    const auto result=invoke(setup,control);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());const auto answer=json::parse(result.wire());
+    EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_TRUE(answer.contains("predecessor"));EXPECT_EQ(all_state(),before);EXPECT_EQ(coverage().size(),2u);
+    auto wrong=q;std::get<ready_wire::request>(wrong.body).registered_producer->producer=producer(2);seal(wrong,d);control["request"]=ready_wire::encode(wrong,codec(d));
+    EXPECT_NE(invoke(setup,control).status_code(),1);EXPECT_EQ(all_state(),before);
+}
+}
+#endif

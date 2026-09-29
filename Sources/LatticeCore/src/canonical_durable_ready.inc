@@ -808,6 +808,41 @@ canonical_ready_maintenance_result canonical_writer_adapter::maintain_authentica
     if(result.settlement.state==recovery_install_state::committed&&observed){result.observed=true;result.next_delay_ms=next;}
     return result;
 }
+canonical_ready_predecessor_result canonical_writer_adapter::inspect_authenticated_predecessor(std::shared_ptr<lattice_db> owner,
+    const canonical_namespace_admission& admission,const cr::attempt& attempt,const cr::request& request,const std::string& prior_profile) {
+    auto state=context_;auto writer=writer_;auto session=retention_;const auto held=admission;
+    canonical_ready_predecessor_result result;std::optional<canonical_ready_predecessor_facts> facts;
+    try {
+        if(!state||!state->ready||!state->ready->orphan_resume_grace_ms||prior_profile.size()>predecessor_wire::profile_bytes)
+            refuse("canonical predecessor lifecycle or profile unavailable");
+        const auto& p=*state->ready;validate_namespace_admission(owner,writer,state,held);
+        if(!held.authenticated_||request.source!=ready_source(state->profile,p)||request.registered_producer!=held.receipt_binding_||
+            (request.registered_producer&&request.receipt_namespace!=std::optional<std::string>{held.namespace_.namespace_id}))
+            refuse("canonical predecessor actual source admission differs");
+        (void)cr::encode({attempt,ready_route,request},p.package.codec);
+        (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
+        const auto before=nlohmann::json::parse(prior_profile);
+        if(before.dump()!=prior_profile)refuse("canonical predecessor profile encoding differs");
+        const bool small=p.transfer_bytes==2097152;
+        const auto after=canonical_ready_profile_description(p,small?"boundedV1OrphanV1":"bounded48MiBOrphanV1");
+        predecessor_wire::pair(before,after,bool(state->namespaces->coverage));
+        result.settlement=retention_owned(owner,writer,state,session,ready_read,[&](database& actual,retention_session&){
+            validate_namespace_admission(owner,writer,state,held);
+            if(!ready_adopted_schema(actual))refuse("canonical predecessor record absent");
+            const auto raw=audit_ready_predecessor(actual,*state);
+            const std::string prefix="canonical-ready-adoption-v1;36:";
+            facts=canonical_ready_predecessor_facts{raw.substr(prefix.size(),36),predecessor_wire::transition_digest(raw),
+                predecessor_wire::profile_digest(before),predecessor_wire::profile_digest(after),ready_predecessor_identity(*state)};
+            validate_namespace_admission(owner,writer,state,held);
+        });
+        // Keep committed truth on secondary failure, but never publish facts
+        // after actual custody/admission retirement during postcommit callbacks.
+        if(result.settlement.state==recovery_install_state::committed){
+            validate_namespace_admission(owner,writer,state,held);session->verify_file(*writer);result.facts=std::move(facts);
+        }
+    }catch(...){result.facts.reset();result.settlement.primary_error=std::current_exception();}
+    return result;
+}
 canonical_ready_lifecycle_result canonical_writer_adapter::inspect_authenticated_ready(std::shared_ptr<lattice_db> owner,
     const canonical_namespace_admission& admission,const cr::attempt& attempt,const cr::request& request,bool discard) {
     auto state=context_;auto writer=writer_;auto session=retention_;const auto held=admission;

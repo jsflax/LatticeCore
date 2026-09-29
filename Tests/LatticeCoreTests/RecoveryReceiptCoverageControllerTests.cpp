@@ -100,7 +100,7 @@ protected:
     bool registered_source=true;
     std::map<size_t,std::pair<std::string,std::string>> registration_overrides;
     std::vector<std::pair<size_t,json>> range_responses;
-    json source_policy(const std::string& ns) {
+    virtual json source_policy(const std::string& ns) {
         auto value=json{{"version",2},{"receiptCoverage",{{"kind","registeredProducerV3"},{"cohortID",controller_uuid(90)},{"cohortRevision",1},{"operationCodec",1},{"namespaces",json::array({"a","b"})}}},{"authority","controller-service"},{"sourceID",controller_uuid(1)},{"epoch",controller_uuid(2)},
             {"localNamespace","local"},{"namespaces",json::array({{{"namespaceID","local"},{"coverageID","local-v1"},{"revision",1}},
                 {{"namespaceID","a"},{"coverageID","a-v1"},{"revision",1}},{{"namespaceID","b"},{"coverageID","b-v1"},{"revision",1}}})},
@@ -505,5 +505,60 @@ TEST_F(RecoveryReceiptCoverageMigrationController, IndividuallyAuthorizedProduce
     refuse_mixed_producer(true);
 }
 
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include "CanonicalReadyAdoptionTestAccess.hpp"
+#include "../../Sources/LatticeCore/src/canonical_ready_named_profile.hpp"
+namespace {
+class PredecessorReceiptCoverageController : public RecoveryReceiptCoverageMigrationController {
+protected:
+    bool adopted=false;
+    json source_policy(const std::string& ns)override {
+        auto p=RecoveryReceiptCoverageController::source_policy(ns);
+        if(adopted){p["readyProfile"]="bounded48MiBOrphanV1";p["orphanResumeGraceMilliseconds"]=60000;}return p;
+    }
+    void adopt_actual_v3() {
+        const auto s=peers.at(0).expectation.at("source");retire_for_source_migration();
+        detail::canonical_namespaced_writer_profile p;
+        p.writer.binding={s.at("sourceID"),s.at("epoch"),s.at("scopeDigest"),s.at("schemaDigest")};
+        p.writer.limits={65536,16777216,65536,16777216,256,128,64};p.writer.models={"ControllerRow"};p.writer.upstream_requested=true;
+        p.namespaces.local_namespace="local";p.namespaces.entries={{"a","a-v1",1},{"b","b-v1",1},{"local","local-v1",1}};
+        p.namespaces.coverage=detail::canonical_coverage_profile{controller_uuid(90),1,{"a","b"}};
+        const auto result=detail::adopt_ready_lifecycle_for_test(source,p,{256,65536,1048576},{64,3600000},
+            detail::canonical_named_ready_profile(s.at("authority"),p.writer.limits,true,"bounded48MiBV1"),"bounded48MiBV1",60000);
+        ASSERT_EQ(result.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(result.record);
+        adopted=true;for(auto& peer:peers)peer.live=std::make_shared<std::atomic<bool>>(true);drop_prepare=false;open_receiver();
+    }
+};
+TEST_F(PredecessorReceiptCoverageController, ActualRegisteredCohortAdoptionKeepsOneReceiptTwoCellsAndBothExactOldQs) {
+    configure(2);connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==2;}));
+    seed_local(1,9800);hold_uploads=false;
+    ASSERT_TRUE(until([&]{return scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt_coverage")==2;}));
+    const auto global=source_global_state();const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto coverage=source->db().query("SELECT * FROM _lattice_canonical_receipt_coverage ORDER BY namespace_id,original_id");
+    const auto origins=source->db().query("SELECT * FROM _lattice_canonical_receipt_origin ORDER BY original_id");
+    drop_prepare=true;request_recovery();ASSERT_TRUE(until([&]{return dropped==1;}));ASSERT_EQ(phase(),2);
+    const auto framing=receiver->db().query("SELECT channel,request_frame,source_context FROM _lattice_recovery_request ORDER BY channel");
+    adopt_actual_v3();ASSERT_FALSE(HasFatalFailure());auto proved=std::make_shared<std::atomic<unsigned>>(0);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[proved](const char* stage){if(std::strcmp(stage,"predecessor-consumed")==0)++*proved;});
+    connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==2;}));
+    EXPECT_FALSE(has_error());EXPECT_EQ(proved->load(),2u);EXPECT_EQ(source_global_state(),global);
+    EXPECT_EQ(source->db().query("SELECT * FROM _lattice_canonical_receipt_coverage ORDER BY namespace_id,original_id"),coverage);
+    EXPECT_EQ(source->db().query("SELECT * FROM _lattice_canonical_receipt_origin ORDER BY original_id"),origins);
+    EXPECT_EQ(receiver->db().query("SELECT channel,request_frame,source_context FROM _lattice_recovery_request ORDER BY channel"),framing);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),1);EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=2"),2);
+}
+TEST_F(PredecessorReceiptCoverageController, ChangedRegisteredProducerCannotUseAdoptionToRelaxRetainedReceiptBinding) {
+    configure(2);seed_local(1,9810);drop_prepare=true;connect();ASSERT_TRUE(until([&]{return dropped==1;}));
+    const auto prior=all_receiver_state();adopt_actual_v3();ASSERT_FALSE(HasFatalFailure());
+    registration_overrides[0]={"different-controller",controller_uuid(99)};registration_overrides[1]=registration_overrides[0];
+    auto proved=std::make_shared<std::atomic<unsigned>>(0);probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[proved](const char* stage){if(std::strcmp(stage,"predecessor-consumed")==0)++*proved;});
+    connect();ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(proved->load(),0u);EXPECT_EQ(phase(),2);
+    const auto after=all_receiver_state();for(const auto* table:{"ControllerRow","AuditLog","_lattice_obligation_entry","_lattice_recovery_request","_lattice_install_channel"})EXPECT_EQ(after.at(table),prior.at(table));
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt_origin"),0);EXPECT_TRUE(observed_uploads.empty());
+}
 }
 #endif

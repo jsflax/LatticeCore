@@ -123,6 +123,8 @@ class canonical_writer_adapter {
     canonical_ready_maintenance_result maintain_authenticated_ready(std::shared_ptr<lattice_db>);
     canonical_ready_lifecycle_result inspect_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
         const canonical_range::attempt&,const canonical_range::request&,bool discard);
+    canonical_ready_predecessor_result inspect_authenticated_predecessor(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_range::attempt&,const canonical_range::request&,const std::string& prior_profile);
     recovery_install_result discard_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
         const canonical_range::attempt&,const canonical_range::request&);
     // Only the actual authenticated setup reaches the closed addressed body.

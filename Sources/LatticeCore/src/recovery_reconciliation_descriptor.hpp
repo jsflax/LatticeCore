@@ -18,6 +18,19 @@ class recovery_reconciliation_descriptor final {
     friend class recovery_continuous_producer;
     friend class recovery_receiver_route;
     friend class recovery_unknown_reconciliation;
+    // Issued only by the actual controller after correlated source inspection
+    // and known owned local consumption. No raw reply/Q payload is retained.
+    struct predecessor {
+        std::weak_ptr<recovery_receiver_route> route;
+        receiver_source_binding::recovery_view view;
+        canonical_range::attempt logical;
+        recovery_obligation_address journal;
+        std::string request_digest,old_context,current_context,domain;
+        std::string transition_id,transition_digest,source_identity_digest;
+        int64_t row_barrier=0,row_sequence=0,row_revision=0;
+        int64_t physical=0,phase=0,barrier=0,attempt=0;
+        uint64_t controller_revision=0;
+    };
     struct contribution {
         recovery_request_row framing;
         recovery_obligation_snapshot journal;
@@ -25,6 +38,7 @@ class recovery_reconciliation_descriptor final {
         std::weak_ptr<recovery_receiver_route> route;
         std::shared_ptr<receiver_source_binding> source;
         receiver_source_binding::recovery_view view;
+        std::shared_ptr<const predecessor> compatibility;
     };
     // First data member, destroyed LAST: physical capacity is released only
     // after all Q/journal/source/worker payloads below have been destroyed.

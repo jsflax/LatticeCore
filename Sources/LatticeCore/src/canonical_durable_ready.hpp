@@ -56,6 +56,15 @@ struct canonical_ready_adoption_result {
     // no-change audit COMMIT, never the settlement of an earlier invocation.
     std::optional<canonical_ready_adoption_disposition> disposition;
 };
+// Passive source facts. Only the private mounted adapter can inspect the
+// durable record; receiver authority additionally requires actual wire/view/Q.
+struct canonical_ready_predecessor_facts {
+    std::string transition_id,transition_digest,before_profile_digest,after_profile_digest,source_identity_digest;
+};
+struct canonical_ready_predecessor_result {
+    recovery_install_result settlement;
+    std::optional<canonical_ready_predecessor_facts> facts;
+};
 // Durable lookup identity only. Possession cannot read a frame, grant a lease,
 // acknowledge installation, settle a receipt or authorize a peer.
 class canonical_ready_identity {

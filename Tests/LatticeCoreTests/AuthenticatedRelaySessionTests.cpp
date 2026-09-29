@@ -869,8 +869,15 @@ TEST_F(AuthenticatedReceiptCoverageV3, ConcurrentApiStartsAcceptOneGlobalOrigina
     for(const auto& result:workers.results){EXPECT_FALSE(result.error);EXPECT_EQ(result.status,1);EXPECT_TRUE(result.publishable);EXPECT_EQ(result.ids,std::vector<std::string>{e.global_id});}
     EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("AuditLog"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
     EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);
-    const auto head=owner->db().query("SELECT head FROM _lattice_canonical_store");ASSERT_EQ(head.size(),1u);EXPECT_EQ(std::get<int64_t>(head[0].at("head")),1);
-    const auto accepted=receipts();ASSERT_EQ(accepted.size(),1u);EXPECT_EQ(std::get<int64_t>(accepted[0].at("position")),1);
+    // The first INSERT records its model touch, then its original receipt.
+    // The other namespace adds coverage without advancing either position.
+    const auto head=owner->db().query("SELECT head FROM _lattice_canonical_store");ASSERT_EQ(head.size(),1u);EXPECT_EQ(std::get<int64_t>(head[0].at("head")),2);
+    const auto accepted=receipts();ASSERT_EQ(accepted.size(),1u);EXPECT_EQ(std::get<int64_t>(accepted[0].at("position")),2);
+    const auto touches=owner->db().query("SELECT position FROM _lattice_canonical_touch ORDER BY relation,identity");
+    ASSERT_EQ(touches.size(),1u);EXPECT_EQ(std::get<int64_t>(touches[0].at("position")),1);
+    const auto coverage_state=owner->db().query("SELECT mutation,origins,cells FROM _lattice_canonical_receipt_profile");
+    ASSERT_EQ(coverage_state.size(),1u);EXPECT_EQ(std::get<int64_t>(coverage_state[0].at("mutation")),2);
+    EXPECT_EQ(std::get<int64_t>(coverage_state[0].at("origins")),1);EXPECT_EQ(std::get<int64_t>(coverage_state[0].at("cells")),2);
     const auto cells=coverage();ASSERT_EQ(cells.size(),2u);
     EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[0].at("namespace_id")),bytes("app"));EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[1].at("namespace_id")),bytes("other"));
     for(const auto& cell:cells)EXPECT_EQ(std::get<std::vector<uint8_t>>(cell.at("original_id")),bytes(e.global_id));

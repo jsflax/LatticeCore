@@ -2963,3 +2963,25 @@ TEST_F(BinaryRecoveryReceiverController, ActualLostPrepareReopenResumesIdentical
 }
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+TEST_F(RecoveryDeliveryTimeout, CompletedRestrictedPrefixesReleaseCustodyBeforeActualRefreezeCommit) {
+    const auto refreeze=gate();auto first=std::make_shared<std::atomic<bool>>(true);
+    events->scope=[refreeze,first](const char* stage)->std::shared_ptr<void>{
+        if(std::strcmp(stage,"reconcile-refreeze")==0&&first->exchange(false))refreeze->wait();return {};};
+    start(2,1);ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(until([&]{return refreeze->arrived.load()==1;}));ASSERT_EQ(phase(),4);
+    ASSERT_EQ(events->restricted->started.load(),2u);EXPECT_EQ(events->restricted->completed.load(),0u);EXPECT_EQ(events->admitted.load(),0u);
+    EXPECT_EQ(held_originals(),(std::vector<std::string>{sent_ids[0],sent_ids[1],sent_ids[0],sent_ids[1]}));
+    const auto raw=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    const auto prior_attempt=scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity");
+    refreeze->release(); // No ACK, timer release, public request or reconnect.
+    ASSERT_TRUE(until([&]{return events->refrozen.load()==1&&phase()==2&&error_contains("UNKNOWN persisted after one restricted pass");}));
+    EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),prior_attempt+1);
+    EXPECT_EQ(events->restricted->completed.load(),0u);EXPECT_EQ(events->admitted.load(),0u);EXPECT_EQ(held_uploads.size(),4u);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);EXPECT_EQ(originals(),sent_ids);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),raw);
+    EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+}
+#endif

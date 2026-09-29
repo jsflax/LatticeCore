@@ -622,3 +622,54 @@ std::shared_ptr<lattice_db> retain_configured_sync_owner_for_scheduler_test(latt
 }
 }
 #endif
+
+TEST(SyncDiscoveryDeferral, CompletedUploadReusesFullSlotAndChargeAtTail) {
+    queue q;const auto now=queue::clock::now();
+    auto first=unit(queue::kind::initial_upload,queue::byte_limit-63*1024);
+    first->completion=std::make_shared<sync_discovery_completion>();ASSERT_EQ(q.push(first),queue::admission::accepted);
+    std::vector<std::shared_ptr<queue::operation>> later;
+    for(size_t i=1;i<queue::capacity;++i){later.push_back(unit());ASSERT_EQ(q.push(later.back()),queue::admission::accepted);}
+    auto ticket=q.dispatch(now);ASSERT_EQ(q.begin(ticket,now),first);
+    auto successor=unit(queue::kind::upload);auto next=q.finish_and_continue(ticket,first,true,now,true,successor);
+    ASSERT_TRUE(next);EXPECT_FALSE(q.failed(1));EXPECT_FALSE(successor->completion);EXPECT_EQ(successor->attempts,0u);
+    for(const auto& expected:later){ASSERT_EQ(q.begin(next,now),expected);next=q.finish_and_continue(next,expected,true,now,true);}
+    ASSERT_EQ(q.begin(next,now),successor);q.finish(next,successor,true,now);EXPECT_FALSE(q.pending(1));
+    EXPECT_EQ(first->completion->read().state,sync_discovery_completion::outcome::running);
+}
+TEST(SyncDiscoveryDeferral, CompletedUploadCoalescesWithoutDroppingInterveningFIFO) {
+    queue q;const auto now=queue::clock::now();auto first=unit(queue::kind::drain_upload),ack=unit(queue::kind::ack),pending=unit(queue::kind::upload);
+    q.push(first);q.push(ack);q.push(pending);auto ticket=q.dispatch(now);ASSERT_EQ(q.begin(ticket,now),first);
+    auto successor=unit(queue::kind::upload);auto next=q.finish_and_continue(ticket,first,true,now,true,successor);
+    ASSERT_EQ(q.begin(next,now),ack);next=q.finish_and_continue(next,ack,true,now,true);
+    ASSERT_EQ(q.begin(next,now),pending);next=q.finish_and_continue(next,pending,true,now,true);
+    EXPECT_FALSE(next);EXPECT_FALSE(q.pending(1));EXPECT_EQ(successor.use_count(),1);
+}
+TEST(SyncDiscoveryDeferral, CompletedUploadHonorsFourTurnBoundaryAndNewTicket) {
+    queue q;const auto now=queue::clock::now();auto work=unit(queue::kind::upload);q.push(work);auto ticket=q.dispatch(now);
+    for(unsigned turn=0;turn<queue::turn_limit;++turn){ASSERT_EQ(q.begin(ticket,now),work);auto successor=unit(queue::kind::upload);
+        const auto old=ticket;ticket=q.finish_and_continue(ticket,work,true,now,turn+1<queue::turn_limit,successor);work=successor;
+        if(turn+1<queue::turn_limit){ASSERT_TRUE(ticket);EXPECT_EQ(ticket.serial,old.serial);}
+        else {EXPECT_FALSE(ticket);EXPECT_TRUE(q.pending(1));ticket=q.dispatch(now);ASSERT_TRUE(ticket);EXPECT_NE(ticket.serial,old.serial);}}
+    ASSERT_EQ(q.begin(ticket,now),work);q.finish(ticket,work,true,now);EXPECT_FALSE(q.pending(1));
+}
+TEST(SyncDiscoveryDeferral, RetiredOrRefusedSuccessorCaptureDestructorsRunOffLeaf) {
+    for(bool retire:{false,true}){queue q;const auto now=queue::clock::now();auto work=unit(queue::kind::upload);q.push(work);auto ticket=q.dispatch(now);ASSERT_EQ(q.begin(ticket,now),work);
+        std::atomic<unsigned> destroyed{0};struct capture{queue* q;std::atomic<unsigned>* n;~capture(){q->cancel(3);++*n;}};
+        auto marker=std::make_shared<capture>();marker->q=&q;marker->n=&destroyed;auto successor=unit(queue::kind::upload);
+        successor->step=[marker](auto&){return true;};marker.reset();
+        if(retire)q.cancel(3);else successor->generation=7;
+        EXPECT_FALSE(q.finish_and_continue(ticket,work,true,now,true,std::move(successor)));EXPECT_EQ(destroyed.load(),1u);EXPECT_FALSE(q.pending(3));}
+}
+TEST(SyncDiscoveryDeferral, BusyTurnCannotActivateCompletedUploadAndPreservesExactHead) {
+    queue q;const auto now=queue::clock::now();auto work=unit(queue::kind::upload);q.push(work);auto ticket=q.dispatch(now);ASSERT_EQ(q.begin(ticket,now),work);
+    auto unused=unit(queue::kind::upload);EXPECT_FALSE(q.finish_and_continue(ticket,work,false,now,true,unused));EXPECT_EQ(unused.use_count(),1);
+    ticket=q.dispatch(now+5ms);ASSERT_EQ(q.begin(ticket,now+5ms),work);EXPECT_EQ(work->attempts,1u);q.finish(ticket,work,true,now+5ms);EXPECT_FALSE(q.pending(1));
+}
+TEST(SyncDiscoveryDeferral, FreshSuccessorSchedulerRejectionRetainsDemandAndCannotCompleteOldDrainAgain) {
+    queue q;const auto now=queue::clock::now();auto work=unit(queue::kind::drain_upload);
+    work->completion=std::make_shared<sync_discovery_completion>();q.push(work);auto ticket=q.dispatch(now);ASSERT_EQ(q.begin(ticket,now),work);
+    auto successor=unit(queue::kind::upload);EXPECT_FALSE(q.finish_and_continue(ticket,work,true,now,false,successor));work->completion->finish(true);
+    const auto next=q.dispatch(now);ASSERT_TRUE(next);EXPECT_FALSE(next.completion);EXPECT_TRUE(q.reject_unbegun(next));
+    EXPECT_TRUE(q.failed(1));EXPECT_TRUE(q.pending(1));EXPECT_EQ(successor.use_count(),2);
+    EXPECT_EQ(work->completion->read().state,sync_discovery_completion::outcome::completed);q.cancel(3);EXPECT_EQ(successor.use_count(),1);
+}

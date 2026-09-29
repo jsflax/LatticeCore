@@ -2024,7 +2024,13 @@ TEST_F(AuthenticatedReceiptCoverageV3, ActualAdoptedV3ProofBindsRegisteredProduc
     const auto result=invoke(setup,control);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());const auto answer=json::parse(result.wire());
     EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_TRUE(answer.contains("predecessor"));EXPECT_EQ(all_state(),before);EXPECT_EQ(coverage().size(),2u);
     auto wrong=q;std::get<ready_wire::request>(wrong.body).registered_producer->producer=producer(2);seal(wrong,d);control["request"]=ready_wire::encode(wrong,codec(d));
-    EXPECT_NE(invoke(setup,control).status_code(),1);EXPECT_EQ(all_state(),before);
+    const auto refused=invoke(setup,control);EXPECT_EQ(all_state(),before);
+    ASSERT_EQ(refused.status_code(),1);ASSERT_TRUE(refused.publishable());
+    const auto refusal=json::parse(refused.wire());
+    const json expected_settlement={{"state","refused"},{"unexpectedCommitObserved",false},{"primaryError",true},
+        {"cleanupError",false},{"postcommitError",false},{"notificationError",false}};
+    EXPECT_EQ(refusal.at("settlement"),expected_settlement);
+    EXPECT_EQ(refusal.at("leaseAvailable"),false);EXPECT_FALSE(refusal.contains("predecessor"));
 }
 }
 #endif

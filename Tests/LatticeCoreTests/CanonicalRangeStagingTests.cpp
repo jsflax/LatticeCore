@@ -472,11 +472,24 @@ protected:
         other.m.protection={"lease-B",30001};other.seal();return other;
     }
     canonical_staging_snapshot stage(const Bundle& value) {
-        receive_install_store install(owner,il);if(!install.read(value.a.channel))install.bind(value.binding());
-        staged->begin(value.a,value.r,value.m,1);
-        for(uint64_t n=0;n<value.m.counts.content_pages;++n)staged->append(value.content(n));
-        if(!value.receipts.empty())staged->append(value.receipt());
-        return staged->verify_end(value.ending());
+        const auto verify=[&](canonical_range_staging& target) {
+            target.begin(value.a,value.r,value.m,1);
+            for(uint64_t n=0;n<value.m.counts.content_pages;++n)target.append(value.content(n));
+            if(!value.receipts.empty())target.append(value.receipt());
+            return target.verify_end(value.ending());
+        };
+        if(value.a.channel==x.a.channel)return verify(*staged);
+        // Standalone installation stores deliberately forbid two channels for
+        // one authority/scope. Compare fully verified images from separate
+        // actual stores; retain the exact source/schema/head and wire inputs.
+        // Shared-store cohorts are exercised by the real receiver controller.
+        auto other_owner=std::make_shared<lattice::lattice_db>(config());
+        Owned other_tx(*other_owner);
+        receive_install_store other_install(other_owner,il);
+        other_install.initialize();other_install.bind(value.binding());
+        canonical_range_staging other_stage(other_owner,il,value.b,limits);
+        other_stage.initialize();const auto result=verify(other_stage);
+        other_stage.audit();other_tx.commit();return result;
     }
 };
 }

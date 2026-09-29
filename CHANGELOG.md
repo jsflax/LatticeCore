@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.4.3] - Unreleased
+
+### Fixed
+- Replace the Linux/Android cross-process notifier's `select` wait with
+  `poll`, avoiding descriptor-number indexing into a fixed-size `fd_set`.
+  End the listener loop when its watched descriptor reports an error or
+  becomes invalid, and preserve the shutdown pipe's wake-and-join behavior.
+
+### Tests
+- Add four Linux notifier cases covering signal-file notification delivery,
+  idle and repeated stop, no further callbacks after completed stop, and
+  restarting a listener. These cases do not force high descriptor numbers.
+
+### Release preparation
+- Remove the legacy tag-triggered release workflow from this maintenance
+  source. Publication requires the separately reviewed release controls.
+
 ## [1.2.1] - 2026-08-05
 
 ### Changed

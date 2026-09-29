@@ -2800,3 +2800,98 @@ TEST_F(AuthenticatedPredecessor, CapacityAutomaticAdmissionExhaustsWhileActualWr
 }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+std::string same_row_expected_frame(const std::vector<database::row_t>& stored,
+    const ready_wire::frame& request,const ready_wire::limits& limits,uint64_t index) {
+    std::optional<std::string> expected;
+    for(const auto& row:stored)if(std::get<int64_t>(row.at("frame_index"))==static_cast<int64_t>(index)) {
+        const auto& raw=std::get<std::vector<uint8_t>>(row.at("data"));
+        auto decoded=ready_wire::decode(std::string(raw.begin(),raw.end()),limits);
+        if(decoded.logical!=request.logical)continue;
+        if(expected)throw db_error("same-row request fixture found duplicate addressed frame");
+        decoded.route_generation=request.route_generation;expected=ready_wire::encode(decoded,limits);
+    }
+    if(!expected)throw db_error("same-row request fixture missed actual stored frame");
+    return *expected;
+}
+
+TEST_F(AuthenticatedReadySession, SameRowRequestReuseStillAuditsEveryCapsuleAndReturnsExactCommittedBytes) {
+    setup=admitted();auto other=admitted(2);const auto a=entry(64001,"first"),b=entry(64002,"second");
+    ASSERT_EQ(setup.receive(frame(a)).take_ids(),std::vector<std::string>{a.global_id});
+    ASSERT_EQ(other.receive(frame(b)).take_ids(),std::vector<std::string>{b.global_id});
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    std::get<ready_wire::request>(qa.body).receipts={{a.global_id,std::string("app"),{{a.table_name,a.global_row_id}}}};
+    std::get<ready_wire::request>(qb.body).receipts={{b.global_id,std::string("app"),{{b.table_name,b.global_row_id}}}};
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);
+    constexpr uint64_t capsules=2;ASSERT_EQ(count("_lattice_canonical_ready_transfer"),capsules);
+    const auto before=completed_disposal_state(owner->db());
+    const auto stored=owner->db().query("SELECT frame_index,data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    uint64_t bytes=0;for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const auto* selected:{&setup,&other}) {
+        const auto& d=selected==&setup?da:db;const auto& q=selected==&setup?qa:qb;const auto& offered=selected==&setup?la:lb;
+        const auto frames=std::stoull(offered.at("frames").get<std::string>());ASSERT_GE(frames,4u);
+        for(uint64_t index=0;index<frames;++index) {
+            const auto expected=same_row_expected_frame(stored,q,codec(d),index);
+            const auto result=read(*selected,offered,index);
+            ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+            ASSERT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+            EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.postcommit_error||last_read_trace.notification_error);
+            EXPECT_EQ(result.wire(),expected);const auto decoded=decode_read(result,d);
+            EXPECT_EQ(decoded.logical,q.logical);EXPECT_EQ(decoded.route_generation,q.route_generation);
+            EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.audited_frames,stored.size());EXPECT_EQ(last_read_trace.audited_bytes,bytes);
+            EXPECT_EQ(last_read_trace.positive_receipt_lookups,capsules);EXPECT_EQ(last_read_trace.addressed_frames,1u);
+            // One strict request decode for each pre-audit row plus this exact
+            // addressed row. Before factoring, the same body decoded twice.
+            EXPECT_EQ(last_read_trace.cost.calls[static_cast<size_t>(detail::canonical_ready_cost_observation::phase::request)],capsules+1);
+            EXPECT_EQ(completed_disposal_state(owner->db()),before);
+        }
+    }
+}
+
+TEST_F(AuthenticatedReadySession, SameRowRequestReuseKeepsBothFaultAuditsAndFreshRequestValidation) {
+    setup=admitted();auto other=admitted(2);const auto a=entry(64003,"first"),b=entry(64004,"second");
+    ASSERT_EQ(setup.receive(frame(a)).take_ids(),std::vector<std::string>{a.global_id});
+    ASSERT_EQ(other.receive(frame(b)).take_ids(),std::vector<std::string>{b.global_id});
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    std::get<ready_wire::request>(qa.body).receipts={{a.global_id,std::string("app"),{{a.table_name,a.global_row_id}}}};
+    std::get<ready_wire::request>(qb.body).receipts={{b.global_id,std::string("app"),{{b.table_name,b.global_row_id}}}};
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);
+    constexpr uint64_t capsules=2;ASSERT_EQ(count("_lattice_canonical_ready_transfer"),capsules);
+    const auto before=completed_disposal_state(owner->db());
+    const auto stored=owner->db().query("SELECT frame_index,data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    uint64_t bytes=0;for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const bool upstream:{false,true}) {
+        SCOPED_TRACE(upstream);
+        for(const auto* selected:{&setup,&other}) {
+            const auto& d=selected==&setup?da:db;const auto& q=selected==&setup?qa:qb;const auto& offered=selected==&setup?la:lb;
+            const auto frames=std::stoull(offered.at("frames").get<std::string>());ASSERT_GE(frames,4u);
+            for(uint64_t index=0;index<frames;++index) {
+                const auto expected=same_row_expected_frame(stored,q,codec(d),index);
+                {
+                    AddressedReadAuthorizerFault fault(owner->db(),upstream);
+                    const auto result=read(*selected,offered,index);
+                    ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+                    ASSERT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(fault.commits,1u);
+                    EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.postcommit_error||last_read_trace.notification_error);
+                    EXPECT_EQ(result.wire(),expected);const auto decoded=decode_read(result,d);
+                    EXPECT_EQ(decoded.logical,q.logical);EXPECT_EQ(decoded.route_generation,q.route_generation);
+                    EXPECT_EQ(last_read_trace.full_audits,2u);EXPECT_EQ(last_read_trace.audited_frames,2*stored.size());EXPECT_EQ(last_read_trace.audited_bytes,2*bytes);
+                    EXPECT_EQ(last_read_trace.positive_receipt_lookups,2*capsules);EXPECT_EQ(last_read_trace.addressed_frames,1u);
+                    EXPECT_EQ(last_read_trace.cost.calls[static_cast<size_t>(detail::canonical_ready_cost_observation::phase::request)],2*capsules+1);
+                }
+                EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(completed_disposal_state(owner->db()),before);
+            }
+        }
+        // Retiring either restriction restores the closed authenticated path;
+        // no decoded request or authorization proof survives this new call.
+        const auto retry=read(setup,la,0);ASSERT_TRUE(retry.publishable())<<read_diagnostic(retry);
+        EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+        EXPECT_EQ(retry.wire(),same_row_expected_frame(stored,qa,codec(da),0));EXPECT_EQ(last_read_trace.full_audits,1u);
+        EXPECT_EQ(last_read_trace.cost.calls[static_cast<size_t>(detail::canonical_ready_cost_observation::phase::request)],capsules+1);
+        EXPECT_EQ(completed_disposal_state(owner->db()),before);
+    }
+}
+}
+#endif

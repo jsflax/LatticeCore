@@ -1156,12 +1156,35 @@ TEST_F(RecoveryNegotiatedExport, ActualEightThousandTwoKiBOriginalsMakeOrderedBo
 TEST_F(RecoveryNegotiatedExport, ExactWireAndParserEventBoundaryFitOnlyTheMeasuredPrefix) {
     negotiated_ack_pause pause(senders,factory);open();owner->add_bulk(std::vector<ContinuousSharedRow>{{std::string(2048,'x')},{std::string(2048,'y')}});
     const auto originals=owner->db().query("SELECT globalId FROM AuditLog ORDER BY id");ASSERT_EQ(originals.size(),2u);
-    start();auto one=caps();one["maximumEntries"]=1;accept(one);auto first=audit_wire();ASSERT_EQ(first.size(),2u);const auto actual=wire_metrics(first[0]);
-    start(1);auto exact=caps();exact["maximumWireBytes"]=actual.bytes;exact["maximumScalarBytes"]=actual.scalar;exact["parserNodes"]=actual.nodes;exact["parserDepth"]=actual.depth;accept(exact,1);
+    start();auto one=caps();one["maximumEntries"]=1;accept(one);auto first=audit_wire();ASSERT_EQ(first.size(),2u);
+    const std::array<negotiated_metrics,2> measured{wire_metrics(first[0]),wire_metrics(first[1])};
+    ASSERT_EQ(measured[0].scalar,measured[1].scalar);
+    ASSERT_EQ(measured[0].nodes,measured[1].nodes);
+    ASSERT_EQ(measured[0].depth,measured[1].depth);
+    // Generated timestamps may have different encoded widths. At least one
+    // genuine single-row frame touches this exact maximum, with no added margin.
+    const auto wire_cap=std::max(measured[0].bytes,measured[1].bytes);
+    const std::string prefix="{\"auditLog\":[",suffix="]}";
+    std::array<std::string,2> members;
+    for(size_t i=0;i<2;++i) {
+        const auto parsed=negotiated_json::parse(first[i]);
+        ASSERT_TRUE(parsed.is_object());ASSERT_EQ(parsed.size(),1u);
+        ASSERT_TRUE(parsed.contains("auditLog"));ASSERT_TRUE(parsed.at("auditLog").is_array());
+        ASSERT_EQ(parsed.at("auditLog").size(),1u);
+        ASSERT_GE(first[i].size(),prefix.size()+suffix.size());
+        ASSERT_TRUE(first[i].starts_with(prefix));ASSERT_TRUE(first[i].ends_with(suffix));
+        // Remove only the fixed wrapper, preserving each actual member byte.
+        members[i]=first[i].substr(prefix.size(),first[i].size()-prefix.size()-suffix.size());
+    }
+    const auto combined=wire_metrics(prefix+members[0]+","+members[1]+suffix);
+    ASSERT_GT(combined.bytes,wire_cap);ASSERT_GT(combined.nodes,measured[0].nodes);
+    SCOPED_TRACE(::testing::Message()<<"wire0="<<measured[0].bytes<<" wire1="<<measured[1].bytes
+        <<" wireCap="<<wire_cap<<" nodes="<<measured[0].nodes<<" combinedWire="<<combined.bytes<<" combinedNodes="<<combined.nodes);
+    start(1);auto exact=caps();exact["maximumWireBytes"]=wire_cap;exact["maximumScalarBytes"]=measured[0].scalar;exact["parserNodes"]=measured[0].nodes;exact["parserDepth"]=measured[0].depth;accept(exact,1);
     const auto second=audit_wire(1);ASSERT_EQ(second.size(),2u);
     for(size_t i=0;i<2;++i){EXPECT_EQ(second[i],first[i]);const auto batch=factory->wires[1]->audit_batches()[i];ASSERT_EQ(batch.size(),1u);
         EXPECT_EQ(batch[0],std::get<std::string>(originals[i].at("globalId")));const auto m=wire_metrics(second[i]);
-        EXPECT_EQ(m.bytes,actual.bytes);EXPECT_EQ(m.scalar,actual.scalar);EXPECT_EQ(m.nodes,actual.nodes);EXPECT_EQ(m.depth,actual.depth);}
+        EXPECT_EQ(m.bytes,measured[i].bytes);EXPECT_EQ(m.scalar,measured[i].scalar);EXPECT_EQ(m.nodes,measured[i].nodes);EXPECT_EQ(m.depth,measured[i].depth);}
     EXPECT_EQ(claimed(),4);EXPECT_TRUE(errors.empty());
 }
 TEST_F(RecoveryNegotiatedExport, OneByteBelowActualWireRefusesWithoutNewClaimEffects) {

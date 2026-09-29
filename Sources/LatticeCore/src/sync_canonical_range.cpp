@@ -610,11 +610,13 @@ frame decode(std::string_view raw,const limits& b){
 }
 frame decode_canonical(std::string_view raw,const limits& b) {
     auto value=decode(raw,b);
-    // decode already performed frame_valid under this exact budget. Preserve
-    // the encoder's full escaped-byte/SAX admission without validating the
-    // same immutable local DTO a second time. No public DTO path uses this.
-    const auto* request_body=std::get_if<request>(&value.body);
-    check(dump(frame_json(value),b,request_body?request_body->budget.frame_bytes:b.maximum.frame_bytes)==raw,
+    // Exact equality transfers the completed decode's syntax and resource
+    // checks, including the request's advertised byte cap, to these bytes.
+    // Keep serialization and equality; no mutable public DTO uses this path.
+    const auto encoded=frame_json(value);
+    std::string canonical;
+    try{canonical=encoded.dump();}catch(const json::exception&){throw protocol_error("invalid canonical JSON encoding");}
+    check(canonical==raw,
           "canonical frame bytes differ from exact spelling");
     return value;
 }

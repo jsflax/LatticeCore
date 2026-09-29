@@ -1,5 +1,6 @@
 #include "canonical_writer_adapter.hpp"
 #include "canonical_receipt_coverage.hpp"
+#include "canonical_ready_named_profile.hpp"
 #include "canonical_validated_sequence.hpp"
 #include "recovery_authenticated_session.hpp"
 #include "recovery_writer_access.hpp"
@@ -206,6 +207,7 @@ std::map<std::string,std::string> triggers(database& db,const std::string& table
 
 struct canonical_writer_adapter::context {
     sqlite3* connection=nullptr;
+    bool administrative=false;
     canonical_store_binding binding;
     std::shared_ptr<std::atomic<bool>> active=std::make_shared<std::atomic<bool>>(false);
     std::set<std::string> programs, relations;
@@ -228,6 +230,8 @@ struct canonical_writer_adapter::context {
     static void admit_retention(sqlite3_context*,int,sqlite3_value**) noexcept;
     static bool authorize_retention(context&,int,const char*,const char*) noexcept;
     static bool migration_admitted(const context&) noexcept;
+    static bool adoption_admitted(const context&,int) noexcept;
+    static int authorize_administration(context&,int,const char*,const char*,const char*,const char*) noexcept;
     static void require(sqlite3_context* sql,int count,sqlite3_value** values) noexcept {
         if(count!=1 || sqlite3_value_type(values[0])!=SQLITE_INTEGER || sqlite3_value_int(values[0])!=1)
             sqlite3_result_error(sql,"canonical upstream condition refused",-1);
@@ -263,6 +267,7 @@ struct canonical_writer_adapter::context {
         auto& self=*static_cast<context*>(opaque);
         const auto normal=[&]() noexcept -> int {
         // Context is connection-owned; no SQLite/SQL, allocations or callbacks.
+        if(self.administrative)return authorize_administration(self,action,one,two,schema,origin);
         if(action==SQLITE_ATTACH || action==SQLITE_DETACH || action==SQLITE_ALTER_TABLE ||
            action==SQLITE_CREATE_TABLE || action==SQLITE_CREATE_TEMP_TABLE || action==SQLITE_CREATE_TRIGGER ||
            action==SQLITE_CREATE_TEMP_TRIGGER || action==SQLITE_DROP_TABLE || action==SQLITE_DROP_TEMP_TABLE ||
@@ -313,6 +318,34 @@ struct canonical_writer_adapter::context {
 };
 #include "canonical_transfer_retention.inc"
 #include "canonical_durable_ready.inc"
+struct canonical_writer_adapter::lifecycle_adoption {
+    std::shared_ptr<lattice_db> owner;
+    canonical_ready_profile before,after;
+    canonical_ready_adoption_result result;
+};
+canonical_ready_adoption_result canonical_writer_adapter::adopt_authenticated_lifecycle(std::shared_ptr<lattice_db> owner,
+    const canonical_namespaced_writer_profile& p,canonical_upstream_limits upstream,canonical_retention_limits retention,
+    const canonical_ready_profile& before,const std::string& before_name,int64_t grace_ms) {
+    lifecycle_adoption operation{owner,before,{},{}};
+    try {
+        if(!owner||!p.writer.upstream_requested||!upstream.entries||upstream.field_bytes<256||!upstream.delivery_bytes||
+           upstream.field_bytes>upstream.delivery_bytes||upstream.delivery_bytes>static_cast<size_t>(std::numeric_limits<int>::max()/8)||
+           (before_name!="boundedV1"&&before_name!="bounded48MiBV1"))refuse("canonical lifecycle adoption requires an exact bounded predecessor profile");
+        const bool registered=bool(p.namespaces.coverage);
+        const auto expected=canonical_named_ready_profile(before.authority,p.writer.limits,registered,before_name);
+        if(ready_policy(expected)!=ready_policy(before))refuse("canonical lifecycle predecessor envelope differs");
+        const std::string after_name=before_name=="boundedV1"?"boundedV1OrphanV1":"bounded48MiBOrphanV1";
+        operation.after=canonical_named_ready_profile(before.authority,p.writer.limits,registered,after_name,grace_ms);
+        validate_ready_profile(operation.after,p.writer,retention,registered);
+        canonical_writer_adapter adapter(*owner,p.writer,&upstream,&retention,&p.namespaces,&before,nullptr,&operation);
+    } catch(...) {
+        // Construction/admission failures precede the owned operation. Once it
+        // runs, the constructor returns its exact settlement, including known
+        // COMMIT with a secondary error, instead of translating it to a throw.
+        if(!operation.result.settlement.primary_error)operation.result.settlement.primary_error=std::current_exception();
+    }
+    return operation.result;
+}
 std::string canonical_writer_adapter::uuid_key(const std::string& value) {
     if(value.size()!=36)refuse("canonical requires UUID identity");
     char out[36];if(!uuid(reinterpret_cast<const unsigned char*>(value.data()),static_cast<int>(value.size()),out))refuse("canonical requires UUID identity");return {out,36};
@@ -328,7 +361,10 @@ canonical_writer_adapter::~canonical_writer_adapter() {
 }
 canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canonical_writer_profile& p,
     const canonical_upstream_limits* upstream,const canonical_retention_limits* retention,
-    const canonical_namespace_profile* namespaces,const canonical_ready_profile* ready,const canonical_ready_profile* migration_from_ready) {
+    const canonical_namespace_profile* namespaces,const canonical_ready_profile* ready,const canonical_ready_profile* migration_from_ready,
+    lifecycle_adoption* adoption) {
+    if(adoption&&(!ready||!retention||!upstream||!namespaces||migration_from_ready||adoption->owner.get()!=&owner))
+        refuse("canonical lifecycle adoption requires the exact retained source owner");
     const auto& catalog=owner.recovery_schemas_;
     if(!catalog.valid())refuse("canonical owner schema catalog outside bounds or ambiguous");
     // The attachment owns its setup transaction. It cannot attach during caller
@@ -379,15 +415,17 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     // No external callback may coexist on this private profile's writer.
     // The same attachment's revoked callback has connection-owned custody.
     context_=std::make_shared<context>();context_->connection=writer_->internal_handle();context_->binding=p.binding;
-    context_->owner=&owner;context_->profile=p;
+    context_->owner=&owner;context_->profile=p;context_->administrative=bool(adoption);
     if(namespaces)context_->namespaces=prior_namespaces?*prior_namespaces:*namespaces;
     if(ready)context_->ready=migration_from_ready?*migration_from_ready:*ready;
     if(upstream)context_->upstream=*upstream;
+    if(adoption&&ready_adopted_schema(*writer_))context_->ready=adoption->after;
     // An inert primitive ledger is not evidence of prior owned acceptance.
     // V2 first enrollment requires no canonical metadata at all; only the
     // complete exact retained profile may reopen below. No receipts are adopted.
     const bool namespaced_reopen=namespaces && writer_->table_exists("_lattice_canonical_coverage");
-    if(migration_from_ready&&!namespaced_reopen)refuse("receipt migration requires an existing exact v2 source");
+    if((migration_from_ready||adoption)&&!namespaced_reopen)refuse("canonical administration requires an existing exact retained source");
+    if(migration_from_ready&&ready_adopted_schema(*writer_))refuse("receipt migration must precede lifecycle adoption");
     if(namespaces && !namespaced_reopen &&
        !writer_->query("SELECT 1 FROM main.sqlite_master WHERE substr(name,1,19)='_lattice_canonical_' LIMIT 1").empty())
         refuse("canonical namespaced enrollment refuses preexisting unadmitted metadata");
@@ -419,7 +457,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         if(integer(writer_->query("PRAGMA recursive_triggers").at(0),"recursive_triggers")!=1)
             refuse("canonical REPLACE coverage needs recursive triggers");
         if(namespaces && namespace_before_write_test_hook_)(*namespace_before_write_test_hook_)(owner);
-        owner.begin_transaction();began=true;
+        const auto setup_owned=[&] {
         if(namespaces) {
             // Preflight is only a refusal optimization. BEGIN IMMEDIATE now
             // excludes sibling writes: make the no-adoption decision here,
@@ -448,6 +486,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         if(!writer_->query("SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND tbl_name='AuditLog' LIMIT 1").empty())
             refuse("canonical AuditLog has unapproved triggers");
         if(migration_from_ready)canonical_change_store(owner,p.binding,p.limits,&*prior_namespaces).audit();
+        else if(adoption)store.audit();
         else store.initialize();
         if(!retention && !writer_->query("SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND substr(tbl_name,1,19)='_lattice_canonical_' LIMIT 1").empty())
             refuse("canonical metadata has unapproved triggers");
@@ -617,6 +656,37 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             for(const auto& program:expected)if(program.sql.find(" ON "+name+" ")!=std::string::npos)want.emplace(program.name,normalized(program.sql));
             if(actual!=want)refuse("canonical missing/extra/non-generated trigger; scope refused");
         }
+        if(adoption) {
+            const auto previous=writer_->query(retention_profile_query);
+            if(previous.size()!=1)refuse("canonical adoption lost retained source identity");
+            retention_->incarnation=integer(previous[0],"incarnation");
+            verify_ready_retention(*writer_,*context_,*retention_);
+            if(recovery_writer_access::active_writer(owner)!=writer_.get())refuse("canonical adoption lost actual owned WRITE");
+            if(ready_adopted_schema(*writer_)) {
+                // Exact target + immutable predecessor is the postcondition;
+                // no new UUID, incarnation, lease, grace or cleanup on retry.
+                adoption->result.record=audit_ready_predecessor(*writer_,*context_);
+                adoption->result.disposition=canonical_ready_adoption_disposition::verified_existing;
+                return;
+            }
+            auto target=*context_;target.ready=adoption->after;
+            const auto record=ready_predecessor_record(target,uuid_key(uuid_t::generate().to_string()));
+            {
+                retention_frame frame(*context_,ready_adopt_schema);
+                writer_->execute("ALTER TABLE main._lattice_canonical_ready_profile ADD COLUMN predecessor BLOB");
+            }
+            {
+                retention_frame frame(*context_,ready_adopt_record);
+                writer_->execute("UPDATE main._lattice_canonical_ready_profile SET policy=?,predecessor=? WHERE id=1 AND policy=? AND predecessor IS NULL",
+                    {bytes(ready_policy(adoption->after)),bytes(record),bytes(ready_policy(adoption->before))});changed_retention(*writer_);
+            }
+            context_->ready=adoption->after;
+            verify_ready_retention(*writer_,*context_,*retention_);
+            retention_->verify_file(*writer_);
+            adoption->result.record=record;
+            adoption->result.disposition=canonical_ready_adoption_disposition::applied;
+            return;
+        }
         if(migration_from_ready) {
             // The public mount registry has retired every setup and charged
             // result. Directory custody and this actual owned WRITE now prove
@@ -663,6 +733,37 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         // restrictions can deny this genuine COMMIT without replacing hooks.
         if(migration_from_ready&&sqlite3_set_authorizer(context_->connection,context::authorize,context_.get())!=SQLITE_OK)
             refuse("receipt migration settlement authorizer registration failed");
+        };
+        if(adoption) {
+            // Administrative custody is connection-owned before BEGIN and
+            // remains closed through COMMIT/rollback and callback settlement.
+            writer_->canonical_trigger_only_=true;
+            writer_->canonical_callback_custody_=context_;
+            writer_->canonical_write_allowed_=context_->active;
+            if(sqlite3_set_authorizer(context_->connection,context::authorize,context_.get())!=SQLITE_OK)
+                refuse("canonical adoption authorizer registration failed");
+            adoption->result.settlement=recovery_writer_access::install(adoption->owner,[&](database& db) {
+                if(&db!=writer_.get())refuse("canonical adoption writer changed");
+                setup_owned();
+                retention_->verify_file(db);
+            });
+            if(adoption->result.settlement.state!=recovery_install_state::committed) {
+                adoption->result.record.reset();adoption->result.disposition.reset();
+            }
+            // Recheck the retained physical writer after callbacks without
+            // changing known-COMMIT truth or claiming the old owner is live.
+            if(adoption->result.settlement.state==recovery_install_state::committed)try {
+                {std::lock_guard lock(owner.connection_ownership_mutex_);
+                    if(owner.is_closed()||owner.db_!=writer_||writer_->is_closed())refuse("canonical adoption owner retired after COMMIT");}
+                retention_->verify_file(*writer_);
+            } catch(...) {
+                if(!adoption->result.settlement.postcommit_error)adoption->result.settlement.postcommit_error=std::current_exception();
+                adoption->result.record.reset();adoption->result.disposition.reset();
+            }
+            return;
+        }
+        owner.begin_transaction();began=true;
+        setup_owned();
         owner.commit();began=false;
         auto* mutex=sqlite3_db_mutex(context_->connection);sqlite3_mutex_enter(mutex);
         struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};

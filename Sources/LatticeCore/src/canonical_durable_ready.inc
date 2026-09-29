@@ -69,9 +69,14 @@ void validate_ready_profile(const canonical_ready_profile& p,const canonical_wri
     q.request_digest=cr::request_sha256(a,q,p.package.codec);
     (void)cr::encode({a,ready_route,q},p.package.codec);(void)ready_policy(p);
 }
-void append_ready_schema(retention_inventory& out) {
+void append_ready_schema(retention_inventory& out,bool adopted) {
     out[{"table","_lattice_canonical_ready_profile"}]=
         "CREATE TABLE _lattice_canonical_ready_profile(id INTEGER PRIMARY KEY CHECK(id=1),policy BLOB NOT NULL,active INTEGER NOT NULL,charged INTEGER NOT NULL,bindings INTEGER NOT NULL,next_lease INTEGER NOT NULL) WITHOUT ROWID";
+    if(adopted) {
+        auto& sql=out.at({"table","_lattice_canonical_ready_profile"});
+        // Exact SQLite ADD COLUMN postimage; old/fresh schema bytes stay exact.
+        sql.insert(sql.find(") WITHOUT ROWID"),", predecessor BLOB");
+    }
     out[{"table","_lattice_canonical_ready_binding"}]=
         "CREATE TABLE _lattice_canonical_ready_binding(binding BLOB PRIMARY KEY,sequence INTEGER NOT NULL,charge INTEGER NOT NULL) WITHOUT ROWID";
     out[{"table","_lattice_canonical_ready_transfer"}]=
@@ -88,6 +93,68 @@ const char* ready_inventory_query() {
     return "SELECT type,CASE WHEN length(CAST(name AS BLOB))<=128 THEN name END AS name,CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))<=8192 THEN sql END AS sql FROM main.sqlite_master WHERE "
         "(type='table' AND substr(name,1,19)='_lattice_canonical_') OR (type='trigger' AND substr(tbl_name,1,19)='_lattice_canonical_') OR "
         "(substr(tbl_name,1,19)='_lattice_canonical_' AND sql IS NOT NULL) LIMIT 64";
+}
+constexpr size_t ready_predecessor_limit=16384;
+bool ready_adopted_schema(database& writer) {
+    const auto rows=writer.query("SELECT CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))<=8192 THEN sql END AS sql FROM main.sqlite_master WHERE type='table' AND name='_lattice_canonical_ready_profile' LIMIT 2");
+    if(rows.size()!=1)refuse("canonical adoption requires an existing READY profile");
+    retention_inventory schema;append_ready_schema(schema,true);
+    if(string(rows[0],"sql")==schema.at({"table","_lattice_canonical_ready_profile"}))return true;
+    schema.clear();append_ready_schema(schema,false);
+    if(string(rows[0],"sql")!=schema.at({"table","_lattice_canonical_ready_profile"}))refuse("canonical READY profile DDL differs");
+    return false;
+}
+template<class State> std::string ready_predecessor_identity(const State& state) {
+    if(!state.ready||!state.namespaces)refuse("canonical predecessor source identity missing");
+    std::string raw="canonical-ready-source-identity-v1;";
+    for(const auto* value:{&state.ready->authority,&state.binding.source,&state.binding.epoch,&state.binding.scope,&state.binding.schema,
+                          &state.source_manifest,&state.namespaces->local_namespace})ready_part(raw,*value);
+    auto entries=state.namespaces->entries;
+    std::sort(entries.begin(),entries.end(),[](const auto& a,const auto& b){return a.namespace_id<b.namespace_id;});
+    raw+=std::to_string(entries.size())+";";
+    for(const auto& entry:entries){ready_part(raw,entry.namespace_id);ready_part(raw,entry.coverage_id);raw+=std::to_string(entry.revision)+";";}
+    raw+=state.namespaces->coverage?"v3;":"v2;";
+    if(state.namespaces->coverage) {
+        const auto& c=*state.namespaces->coverage;ready_part(raw,c.cohort_id);
+        for(auto n:{c.revision,c.maximum_origins,c.maximum_origin_bytes,c.maximum_cells,c.maximum_cell_bytes})raw+=std::to_string(n)+";";
+        raw+=std::to_string(c.namespaces.size())+";";for(const auto& ns:c.namespaces)ready_part(raw,ns);
+    }
+    // Mutable head/receipt/coverage counters and transfer state are deliberately
+    // absent. The full pre/post audit separately verifies those actual rows.
+    return picosha2::hash256_hex_string(raw);
+}
+template<class State> std::string ready_predecessor_record(const State& state,const std::string& id) {
+    if(canonical_writer_adapter::uuid_key(id)!=id||!state.ready||!state.ready->orphan_resume_grace_ms)
+        refuse("canonical predecessor transition identity or target differs");
+    const bool registered=bool(state.namespaces&&state.namespaces->coverage);
+    std::string before_name,after_name;canonical_ready_profile before;
+    for(const auto* name:{"boundedV1","bounded48MiBV1"}) {
+        if(registered&&std::strcmp(name,"boundedV1")==0)continue;
+        const std::string target=std::strcmp(name,"boundedV1")==0?"boundedV1OrphanV1":"bounded48MiBOrphanV1";
+        const auto expected=canonical_named_ready_profile(state.ready->authority,state.profile.limits,registered,target,state.ready->orphan_resume_grace_ms);
+        if(ready_policy(expected)==ready_policy(*state.ready)) {
+            before_name=name;after_name=target;
+            before=canonical_named_ready_profile(state.ready->authority,state.profile.limits,registered,before_name);break;
+        }
+    }
+    if(before_name.empty())refuse("canonical predecessor target is not an exact named envelope");
+    std::string raw="canonical-ready-adoption-v1;";
+    for(const auto& part:{id,before_name,after_name,ready_policy(before),ready_policy(*state.ready),
+        canonical_ready_profile_description(before,before_name).dump(),canonical_ready_profile_description(*state.ready,after_name).dump(),
+        ready_predecessor_identity(state),std::string("preserveCompleted")})ready_part(raw,part);
+    if(raw.size()>ready_predecessor_limit)refuse("canonical predecessor record exceeds fixed bound");return raw;
+}
+template<class State> std::string audit_ready_predecessor(database& writer,const State& state) {
+    // SQL type/length protection precedes materialization. No untrusted JSON,
+    // length-driven allocation or variable field-count decoder is involved.
+    const auto rows=writer.query("SELECT "+ready_b("predecessor",ready_predecessor_limit)+" FROM main._lattice_canonical_ready_profile WHERE id=1 LIMIT 2");
+    if(rows.size()!=1)refuse("canonical predecessor singleton missing");
+    const auto raw=ready_blob(rows[0],"predecessor");
+    const std::string prefix="canonical-ready-adoption-v1;36:";
+    if(raw.size()<prefix.size()+36||raw.compare(0,prefix.size(),prefix)!=0)refuse("canonical predecessor format differs");
+    const auto id=raw.substr(prefix.size(),36);
+    if(raw!=ready_predecessor_record(state,id))refuse("canonical predecessor immutable policy or source identity differs");
+    return raw;
 }
 bool ready_authorize(int op,int action,const char* table,const char* column)noexcept {
     const auto is=[&](const char* name){return std::strcmp(table,name)==0;};
@@ -237,7 +304,9 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
     const auto sync=writer.query("PRAGMA main.synchronous"),mode=writer.query("PRAGMA main.journal_mode");
     if(sync.size()!=1 || integer(sync[0],"synchronous")<2 || integer(sync[0],"synchronous")>3 ||
        mode.size()!=1 || string(mode[0],"journal_mode")!="wal")refuse("canonical READY requires actual WAL and FULL/EXTRA commit durability");
-    session.verify_file(writer);retention_inventory_matches(writer,state.profile,state.namespace_profile(),&p);
+    session.verify_file(writer);
+    const bool adopted=retention_inventory_matches(writer,state.profile,state.namespace_profile(),&p);
+    if(adopted)(void)audit_ready_predecessor(writer,state);
     const auto profiles=writer.query(retention_profile_query);
     if(profiles.size()!=1 || integer(profiles[0],"id")!=1 || integer(profiles[0],"version")!=3 ||
        integer(profiles[0],"incarnation")!=session.incarnation || integer(profiles[0],"next_attempt")<0 ||

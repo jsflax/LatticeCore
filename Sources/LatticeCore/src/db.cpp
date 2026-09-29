@@ -4,6 +4,7 @@
 #include "lattice/log.hpp"
 #include "checkpoint_test_probe.hpp"
 #include "recovery_admission_test_probe.hpp"
+#include "database_open_test_probe.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
 #include <iostream>
@@ -285,7 +286,12 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         // named-memory URIs ("file:<name>?mode=memory&cache=shared") instead
         // of creating a literal file of that name.
         flags |= SQLITE_OPEN_URI;
-        rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
+        const char* observed_vfs=nullptr;
+#if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
+        if(!key.administrative_&&!key.continuous_&&!key.keeper_cache_&&!read_control_)
+            observed_vfs=detail::database_open_test_hooks::consume(path.c_str(),flags);
+#endif
+        rc = sqlite3_open_v2(path.c_str(), &db_, flags, observed_vfs);
     } else {
         flags |= SQLITE_OPEN_READWRITE;
         if(key.administrative_) {

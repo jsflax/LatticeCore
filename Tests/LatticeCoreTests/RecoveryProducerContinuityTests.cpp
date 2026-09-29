@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "ReadonlyOpenObservation.hpp"
 #include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include "../../Sources/LatticeCore/src/recovery_producer_continuity.hpp"
@@ -157,9 +158,11 @@ int64_t number(database& db,const std::string& sql){return std::get<int64_t>(db.
 // Failure-only diagnostics for the actual read-only constructor. Do not add a
 // preliminary SQLite open, change flags, or manufacture missing WAL sidecars.
 database diagnostic_readonly_open(const std::string& path,const char* phase,const std::string& source_path={}) {
+    readonly_open_observation::Scope observation(path);
     try { return database(path,database::open_mode::read_only); }
     catch(const db_error& original) {
         const auto original_failure=std::current_exception();std::optional<db_error> diagnostic;
+        observation.finish();
         try {
             const auto bounded=[](const std::string& text){return text.substr(0,1024)+(text.size()>1024?"...<truncated>":"");};
             std::string context="readonly fixture phase="+std::string(phase)+" path="+bounded(path);
@@ -193,6 +196,7 @@ database diagnostic_readonly_open(const std::string& path,const char* phase,cons
             if(!source_path.empty()){
                 describe("source-main",source_path);describe("source-parent",std::filesystem::path(source_path).parent_path());header("source-main",source_path);
             }
+            context+=observation.failure_report();
             diagnostic.emplace(context+": "+original.what());
         }catch(...){std::rethrow_exception(original_failure);} // diagnostics never replace the original failure
         throw *diagnostic;

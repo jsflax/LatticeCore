@@ -182,8 +182,7 @@ TEST(DatabaseRetirement, BusyDisplacedConnectionDoesNotBorrowReplacementCloseEvi
 TEST(DatabaseRetirement, ActualBorrowedEngineReaderOutlivesOwnerPublicationAndWrapper) {
     TempDB file("retirement_borrowed_reader");
     auto owner = std::make_unique<lattice::lattice_db>(lattice::configuration(file.str()));
-    owner->db().execute("CREATE TABLE RetirementReader(value INTEGER)");
-    owner->db().execute("INSERT INTO RetirementReader VALUES(61)");
+    owner->add(TestPerson{"retirement-reader", 61, std::nullopt});
     auto reader = owner->borrow_read_connection();
     ASSERT_NE(reader.get(), &owner->db());
     const auto state = database_retirement_access::retain(*reader);
@@ -191,7 +190,7 @@ TEST(DatabaseRetirement, ActualBorrowedEngineReaderOutlivesOwnerPublicationAndWr
     EXPECT_EQ(state->state(), retirement::phase::live);
     owner.reset();
     EXPECT_EQ(state->state(), retirement::phase::live);
-    const auto rows = reader->query("SELECT value FROM RetirementReader");
+    const auto rows = reader->query("SELECT age AS value FROM TestPerson");
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(std::get<int64_t>(rows.front().at("value")), 61);
     EXPECT_FALSE(state->raw_handle_escaped());

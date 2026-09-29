@@ -1,22 +1,30 @@
 name: Release
-run-name: Release ${{ inputs.version || github.ref_name }} at ${{ inputs.expected_sha || github.sha }}
+run-name: ${{ inputs.profile == 'maintenance-1.4' && format('Release maintenance-1.4 {0} control {1} product {2}', inputs.version, github.sha, inputs.expected_sha) || format('Release {0} at {1}', inputs.version || github.ref_name, inputs.expected_sha || github.sha) }}
 
 on:
   push:
     tags: ['[0-9]+.[0-9]+.[0-9]+', '[0-9]+.[0-9]+.[0-9]+-*']
   workflow_dispatch:
     inputs:
+      profile:
+        description: 'Release profile (maintenance remains disabled)'
+        required: true
+        type: choice
+        default: main
+        options:
+          - main
+          - maintenance-1.4
       version:
         description: 'Explicit SemVer version without a v prefix'
         required: true
         type: string
       expected_sha:
-        description: 'Exact validated main commit (full 40-character SHA)'
+        description: 'Full 40-character SHA: product commit for maintenance; canonical main commit otherwise'
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 # Serialize publication; a newer request must never cancel an active release.
@@ -25,16 +33,23 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GH_TOKEN: ${{ github.token }}
+  PYTHONDONTWRITEBYTECODE: '1'
   RELEASE_VERSION_INPUT: ${{ inputs.version }}
   EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+  RELEASE_PROFILE: ${{ inputs.profile || 'main' }}
 
 jobs:
   preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
     outputs:
       version: ${{ steps.candidate.outputs.version }}
+      source_sha: ${{ steps.maintenance.outputs.source_sha || github.sha }}
+      source_tree: ${{ steps.maintenance.outputs.source_tree }}
+      control_sha: ${{ github.sha }}
+      candidate_sha256: ${{ steps.maintenance.outputs.candidate_sha256 }}
     steps:
       - name: Fetch authenticated full-history source into owned localdev directory
         shell: bash
@@ -68,22 +83,96 @@ jobs:
         id: candidate
         run: |
           VERSION="${RELEASE_VERSION_INPUT:-${GITHUB_REF_NAME#}}"
-          python3 release-train/release_train.py check --version "$VERSION" --expected-sha "$EXPECTED_SHA"
+          python3 release-train/core_release.py check --profile "$RELEASE_PROFILE" --version "$VERSION" --expected-sha "$EXPECTED_SHA"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # The preceding wrapper check remains hard-disabled for maintenance.
+      # All following maintenance wiring is dormant until a separate activation.
+      - name: Prepare dormant maintenance candidate from separate product source
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        id: maintenance
+        working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          git init "$CORE_JOB_ROOT/product"
+          git -C "$CORE_JOB_ROOT/product" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$CORE_JOB_ROOT/product" fetch --force --prune origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+          git -C "$CORE_JOB_ROOT/product" fetch origin "$EXPECTED_SHA"
+          git -C "$CORE_JOB_ROOT/product" checkout --detach "$EXPECTED_SHA"
+          python3 "$CORE_JOB_ROOT/source/release-train/core_release.py" maintenance-source-check \
+            --profile maintenance-1.4 --version "$RELEASE_VERSION_INPUT" \
+            --expected-sha "$EXPECTED_SHA" --control-sha "$GITHUB_SHA" \
+            --product-root "$CORE_JOB_ROOT/product" --output "$CORE_JOB_ROOT/tmp/source-review.json"
+          mkdir "$CORE_JOB_ROOT/tmp/candidate"
+          python3 "$CORE_JOB_ROOT/source/release-train/maintenance_release.py" candidate \
+            --source-review "$CORE_JOB_ROOT/tmp/source-review.json" \
+            --product-root "$CORE_JOB_ROOT/product" \
+            --gate-contract "$CORE_JOB_ROOT/source/release-train/maintenance-gates.json" \
+            --output "$CORE_JOB_ROOT/tmp/candidate/candidate.json"
+          python3 - "$CORE_JOB_ROOT/tmp/candidate/candidate.json" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          raw = path.read_bytes()
+          identity = json.loads(raw)['identity']
+          if not (identity['source']['sha'] == os.environ['EXPECTED_SHA']): raise SystemExit('maintenance workflow identity check failed')
+          if not (identity['control']['sha'] == os.environ['GITHUB_SHA']): raise SystemExit('maintenance workflow identity check failed')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('source_sha=' + identity['source']['sha'] + '\n')
+              out.write('source_tree=' + identity['source']['tree'] + '\n')
+              out.write('candidate_sha256=' + hashlib.sha256(raw).hexdigest() + '\n')
+          PY
+
+      - name: Retain exact maintenance candidate for this run attempt
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maintenance-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/tmp/candidate/candidate.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30
 
   test-macos:
     needs: preflight
     uses: ./.github/workflows/macos.yml
+    with:
+      release_profile: ${{ inputs.profile || 'main' }}
+      source_sha: ${{ needs.preflight.outputs.source_sha }}
+      source_tree: ${{ needs.preflight.outputs.source_tree }}
+      control_sha: ${{ needs.preflight.outputs.control_sha }}
+      candidate_sha256: ${{ needs.preflight.outputs.candidate_sha256 }}
   test-linux:
     needs: preflight
     uses: ./.github/workflows/linux.yml
+    with:
+      release_profile: ${{ inputs.profile || 'main' }}
+      source_sha: ${{ needs.preflight.outputs.source_sha }}
+      source_tree: ${{ needs.preflight.outputs.source_tree }}
+      control_sha: ${{ needs.preflight.outputs.control_sha }}
+      candidate_sha256: ${{ needs.preflight.outputs.candidate_sha256 }}
   test-capi:
     needs: preflight
     uses: ./.github/workflows/capi.yml
+    with:
+      release_profile: ${{ inputs.profile || 'main' }}
+      source_sha: ${{ needs.preflight.outputs.source_sha }}
+      source_tree: ${{ needs.preflight.outputs.source_tree }}
+      control_sha: ${{ needs.preflight.outputs.control_sha }}
+      candidate_sha256: ${{ needs.preflight.outputs.candidate_sha256 }}
 
   release:
     needs: [preflight, test-macos, test-linux, test-capi]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MAINTENANCE_CANDIDATE_SHA256: ${{ needs.preflight.outputs.candidate_sha256 }}
     steps:
       - name: Fetch authenticated full-history source into owned localdev directory
         shell: bash
@@ -113,12 +202,13 @@ jobs:
           test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git -C "$CORE_JOB_ROOT/source" rev-parse --is-shallow-repository)" = false
       - name: Recheck candidate after tests and emit source release receipt
+        if: ${{ inputs.profile != 'maintenance-1.4' }}
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          python3 release-train/release_train.py candidate --version "$VERSION" --expected-sha "$EXPECTED_SHA" --output "$CORE_JOB_ROOT/tmp/candidate.json"
-          python3 release-train/release_train.py workflow-receipt --candidate "$CORE_JOB_ROOT/tmp/candidate.json" --output "$CORE_JOB_ROOT/tmp/release-receipt.json"
+          python3 release-train/core_release.py candidate --profile "$RELEASE_PROFILE" --version "$VERSION" --expected-sha "$EXPECTED_SHA" --output "$CORE_JOB_ROOT/tmp/candidate.json"
+          python3 release-train/core_release.py workflow-receipt --profile "$RELEASE_PROFILE" --candidate "$CORE_JOB_ROOT/tmp/candidate.json" --output "$CORE_JOB_ROOT/tmp/release-receipt.json"
           python3 - "$VERSION" "$CORE_JOB_ROOT/tmp/release-notes.md" <<'PYNOTES'
           import pathlib, re, sys
           text = pathlib.Path('CHANGELOG.md').read_text()
@@ -128,6 +218,7 @@ jobs:
       # workflow_dispatch runs these jobs directly: the GITHUB_TOKEN-created tag
       # does not need a second push-triggered workflow (GitHub suppresses it).
       - name: Publish validated source release
+        if: ${{ inputs.profile != 'maintenance-1.4' }}
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -140,3 +231,187 @@ jobs:
           gh release create "$VERSION" "$CORE_JOB_ROOT/tmp/release-receipt.json" \
             --verify-tag --target "$EXPECTED_SHA" --title "$VERSION" \
             --notes-file "$CORE_JOB_ROOT/tmp/release-notes.md" "${FLAGS[@]}"
+
+      - name: Download the exact maintenance candidate
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: maintenance-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/tmp/candidate
+
+      - name: Recheck maintenance product and registered evidence transport
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MAINTENANCE_CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          python3 - "$CORE_JOB_ROOT/tmp/candidate" <<'PY'
+          import hashlib, os, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          if not (sorted(p.name for p in root.iterdir()) == ['candidate.json']): raise SystemExit('maintenance workflow identity check failed')
+          path = root / 'candidate.json'
+          if not (path.is_file() and not path.is_symlink()): raise SystemExit('maintenance workflow identity check failed')
+          if not (hashlib.sha256(path.read_bytes()).hexdigest() == os.environ['MAINTENANCE_CANDIDATE_SHA256']): raise SystemExit('maintenance workflow identity check failed')
+          PY
+          git init "$CORE_JOB_ROOT/product"
+          git -C "$CORE_JOB_ROOT/product" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$CORE_JOB_ROOT/product" fetch --force --prune origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+          git -C "$CORE_JOB_ROOT/product" fetch origin "$EXPECTED_SHA"
+          git -C "$CORE_JOB_ROOT/product" checkout --detach "$EXPECTED_SHA"
+          python3 "$CORE_JOB_ROOT/source/release-train/maintenance_release.py" verify-source \
+            --candidate "$CORE_JOB_ROOT/tmp/candidate/candidate.json" \
+            --control-root "$CORE_JOB_ROOT/source" --product-root "$CORE_JOB_ROOT/product" \
+            --output "$CORE_JOB_ROOT/tmp/source-verification.json"
+          python3 - "$CORE_JOB_ROOT/tmp/candidate/candidate.json" <<'PY'
+          import json, os, pathlib, sys
+          candidate = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          if not (candidate['identity']['source']['sha'] == os.environ['EXPECTED_SHA']): raise SystemExit('maintenance workflow identity check failed')
+          if not (candidate['identity']['control']['sha'] == os.environ['GITHUB_SHA']): raise SystemExit('maintenance workflow identity check failed')
+          fd = candidate['gateContract']['highFd']
+          if not (isinstance(fd['runId'], str) and fd['runId'].isdigit()): raise SystemExit('maintenance workflow identity check failed')
+          if not (type(fd['artifactId']) is int and fd['artifactId'] > 0): raise SystemExit('maintenance workflow identity check failed')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('high_fd_run_id=' + fd['runId'] + '\n')
+              out.write('high_fd_artifact_id=' + str(fd['artifactId']) + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write('HIGH_FD_ATTESTATION_PATH=' + fd['attestationPath'] + '\n')
+          PY
+
+      - name: Download exact core-macos evidence
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: maintenance-core-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/native/core-macos
+
+      - name: Download exact core-linux evidence
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: maintenance-core-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/native/core-linux
+
+      - name: Download exact capi-linux evidence
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: maintenance-capi-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/native/capi-linux
+
+      - name: Download exact capi-macos evidence
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: maintenance-capi-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/native/capi-macos
+
+      - name: Download control-registered high-descriptor evidence
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          repository: jsflax/LatticeCore
+          run-id: ${{ steps.evidence.outputs.high_fd_run_id }}
+          artifact-ids: ${{ steps.evidence.outputs.high_fd_artifact_id }}
+          merge-multiple: true
+          path: ${{ env.CORE_JOB_ROOT }}/high-fd
+
+      - name: Reconcile all maintenance evidence and prepare immutable publication plan
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTROL="$CORE_JOB_ROOT/source/release-train/maintenance_release.py"
+          CANDIDATE="$CORE_JOB_ROOT/tmp/candidate/candidate.json"
+          python3 "$CONTROL" aggregate-receipts --candidate "$CANDIDATE" \
+            --product-root "$CORE_JOB_ROOT/product" \
+            --gate-receipt "$CORE_JOB_ROOT/native/core-macos/receipt.json" \
+            --gate-receipt "$CORE_JOB_ROOT/native/core-linux/receipt.json" \
+            --gate-receipt "$CORE_JOB_ROOT/native/capi-linux/receipt.json" \
+            --gate-receipt "$CORE_JOB_ROOT/native/capi-macos/receipt.json" \
+            --gate-artifact-root "core-macos=$CORE_JOB_ROOT/native/core-macos" \
+            --gate-artifact-root "core-linux=$CORE_JOB_ROOT/native/core-linux" \
+            --gate-artifact-root "capi-linux=$CORE_JOB_ROOT/native/capi-linux" \
+            --gate-artifact-root "capi-macos=$CORE_JOB_ROOT/native/capi-macos" \
+            --high-fd-attestation "$CORE_JOB_ROOT/high-fd/$HIGH_FD_ATTESTATION_PATH" \
+            --high-fd-artifact-root "$CORE_JOB_ROOT/high-fd" \
+            --output "$CORE_JOB_ROOT/tmp/release-receipt.json"
+          python3 - "$CORE_JOB_ROOT/product/CHANGELOG.md" "$CORE_JOB_ROOT/tmp/release-notes.md" <<'PY'
+          import pathlib, re, sys
+          text = pathlib.Path(sys.argv[1]).read_text()
+          section = re.search(r'^## \[1\.4\.3\][^\n]*\n(.*?)(?=^## \[|\Z)', text, re.M | re.S)
+          if not (section and section[1].strip()): raise SystemExit('maintenance workflow identity check failed')
+          pathlib.Path(sys.argv[2]).write_text(section[1].strip() + '\n')
+          PY
+          python3 "$CONTROL" capture-state --candidate "$CANDIDATE" --phase before \
+            --output "$CORE_JOB_ROOT/tmp/remote-before.json"
+          python3 "$CONTROL" publication-plan --candidate "$CANDIDATE" \
+            --product-root "$CORE_JOB_ROOT/product" \
+            --release-receipt "$CORE_JOB_ROOT/tmp/release-receipt.json" \
+            --remote-state "$CORE_JOB_ROOT/tmp/remote-before.json" \
+            --notes-file "$CORE_JOB_ROOT/tmp/release-notes.md" \
+            --output "$CORE_JOB_ROOT/tmp/publication-plan.json"
+
+      - name: Publish maintenance from the validated plan without changing latest
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Extract only validated scalar fields. Never execute plan-supplied argv.
+          SOURCE_SHA="$(python3 - "$CORE_JOB_ROOT/tmp/publication-plan.json" <<'PY'
+          import hashlib, os, pathlib, re, sys
+          root = pathlib.Path(os.environ['CORE_JOB_ROOT'])
+          sys.path.insert(0, str(root / 'source/release-train'))
+          import maintenance_release as protocol
+          candidate = protocol._load(root / 'tmp/candidate/candidate.json')
+          protocol.validate_candidate(candidate)
+          protocol.github_context(dict(os.environ), candidate['identity']['control']['sha'], run=candidate['run'])
+          plan = protocol._load(sys.argv[1])
+          protocol.require(plan['kind'] == 'maintenance-publication-plan' and plan['makeLatest'] is False, 'invalid publication plan')
+          protocol.require(plan['planDigest'] == protocol.digest({k: v for k, v in plan.items() if k != 'planDigest'}), 'publication plan changed')
+          protocol.require(plan['binding'] == protocol.binding(candidate), 'publication plan candidate mismatch')
+          protocol.require(plan['tag'] == '1.4.3' and re.fullmatch(r'[0-9a-f]{40}', plan['sourceSha']), 'invalid publication identity')
+          protocol.require(plan['sourceSha'] == candidate['identity']['source']['sha'] == os.environ['EXPECTED_SHA'], 'publication source mismatch')
+          for field, relative, hash_key, bytes_key in [
+              ('notesFile', 'tmp/release-notes.md', 'notesSHA256', 'notesBytes'),
+              ('releaseReceiptFile', 'tmp/release-receipt.json', 'releaseReceiptSHA256', 'releaseReceiptBytes'),
+          ]:
+              path = root / relative
+              protocol.require(plan[field] == str(path) and path.is_file() and not path.is_symlink(), 'publication artifact path changed')
+              raw = path.read_bytes()
+              protocol.require(len(raw) == plan[bytes_key] and hashlib.sha256(raw).hexdigest() == plan[hash_key], 'publication artifact bytes changed')
+          print(plan['sourceSha'])
+          PY
+          )"
+          VERSION=1.4.3
+          # GitHub creates the ref atomically; even an identical existing tag
+          # is an error, so a race or partial release cannot silently resume.
+          gh api --method POST repos/jsflax/LatticeCore/git/refs \
+            -f ref="refs/tags/$VERSION" -f sha="$SOURCE_SHA"
+          gh release create "$VERSION" "$CORE_JOB_ROOT/tmp/release-receipt.json" \
+            --repo jsflax/LatticeCore --verify-tag --target "$SOURCE_SHA" \
+            --title "$VERSION" --notes-file "$CORE_JOB_ROOT/tmp/release-notes.md" --latest=false
+          python3 "$CORE_JOB_ROOT/source/release-train/maintenance_release.py" capture-state \
+            --candidate "$CORE_JOB_ROOT/tmp/candidate/candidate.json" --phase after \
+            --output "$CORE_JOB_ROOT/tmp/remote-after.json"
+          python3 "$CORE_JOB_ROOT/source/release-train/maintenance_release.py" verify-publication \
+            --plan "$CORE_JOB_ROOT/tmp/publication-plan.json" \
+            --observed-state "$CORE_JOB_ROOT/tmp/remote-after.json" \
+            --output "$CORE_JOB_ROOT/tmp/publication-verification.json"
+
+      - name: Retain maintenance publication audit
+        if: ${{ inputs.profile == 'maintenance-1.4' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maintenance-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CORE_JOB_ROOT }}/tmp/release-receipt.json
+            ${{ env.CORE_JOB_ROOT }}/tmp/publication-plan.json
+            ${{ env.CORE_JOB_ROOT }}/tmp/remote-before.json
+            ${{ env.CORE_JOB_ROOT }}/tmp/remote-after.json
+            ${{ env.CORE_JOB_ROOT }}/tmp/publication-verification.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30

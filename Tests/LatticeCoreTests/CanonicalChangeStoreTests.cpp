@@ -346,3 +346,100 @@ TEST_F(CanonicalChangeStore, AddressedRecordDoesNotScanRetainedMarkerSet) {
     sqlite3_progress_handler(handle,0,nullptr,nullptr);
     EXPECT_LE(callbacks,2000); EXPECT_EQ(s.state().markers,3072); EXPECT_EQ(s.state().head,3073); s.audit(); tx.commit();
 }
+
+namespace lattice::detail {
+// Only forwards the private bounded read. Real owned-writer and singleton
+// checks remain in production; no state token or query result can be injected.
+struct canonical_receipt_batch_test_access {
+    static std::vector<std::optional<canonical_receipt>> read(const canonical_change_store& store,const std::vector<std::string>& ids) {
+        return store.receipt_batch(ids);
+    }
+};
+}
+namespace {
+using batch_access=lattice::detail::canonical_receipt_batch_test_access;
+}
+
+TEST_F(CanonicalChangeStore, ReceiptBatchRequiresActualOwnerAndRevalidatesSingletonEachCall) {
+    initialize();auto s=store();
+    refused(err::transaction_required,[&]{batch_access::read(s,{"original"});});
+    refused(err::transaction_required,[&]{batch_access::read(s,{});});
+    db.db().begin_transaction();refused(err::transaction_required,[&]{batch_access::read(s,{"original"});});db.db().rollback();
+    Owned tx(db);s.record({},request());const auto first=batch_access::read(s,{"original"});ASSERT_TRUE(first.at(0));
+    std::optional<err> other_result;
+    std::thread other([&]{try{batch_access::read(s,{"original"});}catch(const canonical_store_error& e){other_result=e.code;}});
+    other.join();ASSERT_TRUE(other_result);EXPECT_EQ(*other_result,err::transaction_required);
+    db.db().execute("UPDATE _lattice_canonical_store SET head=0");
+    refused(err::corrupt_state,[&]{batch_access::read(s,{"original"});});
+    db.db().execute("UPDATE _lattice_canonical_store SET head=1,source=CAST('other-source' AS BLOB)");
+    refused(err::binding_mismatch,[&]{batch_access::read(s,{"original"});});
+    db.db().execute("UPDATE _lattice_canonical_store SET source=?,max_receipts=max_receipts+1",{bytes(binding().source)});
+    refused(err::limits_mismatch,[&]{batch_access::read(s,{"original"});});
+    tx.rollback();refused(err::transaction_required,[&]{batch_access::read(s,{"original"});});
+}
+
+TEST_F(CanonicalChangeStore, ReceiptBatchBoundariesUseTwoStatementsAndPreserveExactInputOrder) {
+    budget.receipts=256;budget.receipt_bytes=65536;initialize();Owned tx(db);auto s=store();
+    std::vector<std::string> ids;
+    for(unsigned i=0;i<130;++i) {
+        const auto id="batch-original-"+std::to_string(i);ids.push_back(id);
+        auto r=request(id,static_cast<outcome>(1+i%3));if(i%2)r.target.reset();s.record({},r);
+    }
+    for(const size_t count:{size_t(0),size_t(1),size_t(63),size_t(64)}) {
+        SCOPED_TRACE(count);std::vector<std::string> asked;
+        for(size_t i=0;i<count;++i)asked.push_back(ids[129-i]);
+        const auto before=lattice::database::thread_statement_count();const auto actual=batch_access::read(s,asked);
+        EXPECT_EQ(lattice::database::thread_statement_count()-before,count?2u:0u);ASSERT_EQ(actual.size(),asked.size());
+        for(size_t i=0;i<asked.size();++i){ASSERT_TRUE(actual[i]);EXPECT_EQ(actual[i],s.receipt(asked[i]));EXPECT_EQ(actual[i]->original.original_id,asked[i]);}
+    }
+    refused(err::invalid_argument,[&]{batch_access::read(s,std::vector<std::string>(ids.begin(),ids.begin()+65));});
+    refused(err::invalid_argument,[&]{batch_access::read(s,{ids[0],ids[0]});});
+    refused(err::invalid_argument,[&]{batch_access::read(s,{""});});
+    refused(err::invalid_argument,[&]{batch_access::read(s,{std::string(65,'x')});});
+    size_t received=0;
+    for(size_t start=0;start<ids.size();start+=64) {
+        const auto end=ids.size()-start<64?ids.size():start+64;const auto actual=batch_access::read(s,std::vector<std::string>(ids.begin()+start,ids.begin()+end));
+        for(size_t i=0;i<actual.size();++i){ASSERT_TRUE(actual[i]);EXPECT_EQ(actual[i]->original.original_id,ids[start+i]);++received;}
+    }
+    EXPECT_EQ(received,130u);s.audit();tx.commit();
+}
+
+TEST_F(CanonicalChangeStore, ReceiptBatchMissingIdsRemainUnknownAndNeverReturnUnrequestedEvidence) {
+    initialize();Owned tx(db);auto s=store();s.record({},request("present"));s.record({},request("unrequested"));
+    const std::vector<std::string> ids{"absent-first","present","absent-last"};
+    const auto actual=batch_access::read(s,ids);ASSERT_EQ(actual.size(),3u);EXPECT_FALSE(actual[0]);ASSERT_TRUE(actual[1]);EXPECT_FALSE(actual[2]);
+    EXPECT_EQ(actual[1],s.receipt("present"));EXPECT_EQ(actual[1]->original.original_id,"present");
+    db.db().execute("DELETE FROM _lattice_canonical_receipt WHERE original_id=?",{bytes("present")});
+    const auto later=batch_access::read(s,ids);ASSERT_EQ(later.size(),3u);for(const auto& item:later)EXPECT_FALSE(item);
+    tx.rollback();
+}
+
+TEST_F(CanonicalChangeStore, ReceiptBatchRejectsActualDuplicateAndExcessRowsWithBoundedSentinel) {
+    initialize();Owned tx(db);auto s=store();s.record({},request("original"));
+    // Deliberately replace the private primitive's table with actual malformed
+    // storage. No adapter admission or injected SELECT result is fabricated.
+    db.db().execute("ALTER TABLE _lattice_canonical_receipt RENAME TO receipt_batch_saved");
+    db.db().execute("CREATE TABLE _lattice_canonical_receipt AS SELECT * FROM receipt_batch_saved");
+    db.db().execute("INSERT INTO _lattice_canonical_receipt SELECT * FROM receipt_batch_saved");
+    refused(err::corrupt_state,[&]{batch_access::read(s,{"original","absent"});});
+    refused(err::corrupt_state,[&]{batch_access::read(s,{"original"});});
+    for(unsigned i=2;i<66;++i)db.db().execute("INSERT INTO _lattice_canonical_receipt SELECT * FROM receipt_batch_saved");
+    std::vector<std::string> ids{"original"};for(unsigned i=1;i<64;++i)ids.push_back("absent-"+std::to_string(i));
+    refused(err::corrupt_state,[&]{batch_access::read(s,ids);});tx.rollback();
+}
+
+TEST(CanonicalReceiptBatch, RejectsMalformedStoredFieldsAndUnenrolledNamespace) {
+    const std::vector<std::string> changes{
+        "position=0","position=2","position='bad'","outcome=9","outcome='bad'",
+        "charge=0","charge='bad'","relation=NULL","identity=NULL",
+        "relation='text-not-blob'","identity='text-not-blob'","relation=zeroblob(65)","identity=zeroblob(65)",
+        "namespace_id=CAST('foreign' AS BLOB)","namespace_id='text-not-blob'","namespace_id=zeroblob(257)"};
+    for(const auto& change:changes) {
+        SCOPED_TRACE(change);lattice::lattice_db db{config(":memory:")};Owned tx(db);
+        const canonical_namespace_profile namespaces{"local",{{"local","coverage",1},{"app","app-coverage",1}}};
+        canonical_change_store s(db,binding(),limits(),&namespaces);s.initialize();auto r=request();r.namespace_id="app";s.record({},r);
+        ASSERT_EQ(batch_access::read(s,{"original"}).at(0),s.receipt("original"));
+        db.db().execute("UPDATE _lattice_canonical_receipt SET "+change);
+        refused(err::corrupt_state,[&]{batch_access::read(s,{"original"});});tx.rollback();
+    }
+}

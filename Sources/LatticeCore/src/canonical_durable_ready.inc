@@ -227,7 +227,7 @@ int64_t ready_metadata_charge(const database::row_t& row) {
     return ready_add(count,128); // fixed manifest/frame digests, including PREPARING reservation
 }
 cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,const database::row_t& row,
-    const std::function<void(const cr::receipt_item&)>& validate_receipt={}) {
+    const std::function<void(const cr::receipt_page&)>& validate_receipts={}) {
     observe_ready(canonical_ready_test_observation::point::audit_begin);
     const auto request=ready_request(row,p);const auto& q=std::get<cr::request>(request.body);const auto key=ready_blob(row,"binding");
     const auto n=integer(row,"frame_count");if(n<2 || n>static_cast<int64_t>(p.package.frames))refuse("canonical READY frame count outside cap");
@@ -250,12 +250,14 @@ cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,co
         if(frame.logical!=request.logical || frame.route_generation!=ready_route || cr::encode(frame,p.package.codec)!=raw)
             refuse("canonical READY frame association or canonical bytes differ");
         if(i)sequence.advance(frame);
-        if(const auto* page=std::get_if<cr::receipt_page>(&frame.body))for(const auto& item:page->items) {
-            if(std::holds_alternative<cr::not_committed>(item.value))refuse("canonical READY cannot prove negative receipt");
-            if(const auto* committed=std::get_if<cr::committed>(&item.value))
-                if(committed->namespace_id!=ready_blob(row,"namespace_id") || committed->coverage_id!=ready_blob(row,"coverage_id"))
-                    refuse("canonical READY receipt coverage differs");
-            if(validate_receipt)validate_receipt(item);
+        if(const auto* page=std::get_if<cr::receipt_page>(&frame.body)) {
+            for(const auto& item:page->items) {
+                if(std::holds_alternative<cr::not_committed>(item.value))refuse("canonical READY cannot prove negative receipt");
+                if(const auto* committed=std::get_if<cr::committed>(&item.value))
+                    if(committed->namespace_id!=ready_blob(row,"namespace_id") || committed->coverage_id!=ready_blob(row,"coverage_id"))
+                        refuse("canonical READY receipt coverage differs");
+            }
+            if(validate_receipts)validate_receipts(*page);
         }
     }
     hash.finish();if(sequence.status()!=cr::phase::sequence_complete_unverified || wire!=integer(row,"wire_bytes") ||
@@ -368,24 +370,36 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
         } else if(kind==ready_complete) {
             if(integer(row,"reservation")!=0 || integer(row,"head")!=pin || integer(row,"floor")<0 || integer(row,"floor")>pin)
                 refuse("canonical READY tail pin or captured bounds differ");
-            const auto manifest=audit_ready_frames(writer,p,row,[&](const cr::receipt_item& item){
-                const auto* positive=std::get_if<cr::committed>(&item.value);if(!positive)return;
-                if(auto* observation=canonical_ready_read_test_observation::current)++observation->positive_receipt_lookups;
-                const auto actual=store.receipt(item.original_id);
-                bool actual_namespace=actual&&actual->original.namespace_id==std::optional<std::string>{ns};
-                if(q.registered_producer) {
-                    if(!item.operation_digest)refuse("canonical READY positive immutable identity missing");
-                    const auto coverage=lookup_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return writer.query(sql,values);},
-                        *state.namespaces->coverage,item.original_id,ns,*q.registered_producer,*item.operation_digest);
-                    actual_namespace=coverage==canonical_coverage_lookup::covered||coverage==canonical_coverage_lookup::legacy_original_namespace;
-                    if(item.legacy_unbound!=(coverage==canonical_coverage_lookup::legacy_original_namespace))refuse("canonical READY positive provenance kind changed");
+            const auto manifest=audit_ready_frames(writer,p,row,[&](const cr::receipt_page& page){
+                for(size_t next=0;next<page.items.size();) {
+                    std::vector<std::string> ids;
+                    std::vector<const cr::receipt_item*> positives;
+                    while(next<page.items.size() && ids.size()<64) {
+                        const auto& item=page.items[next++];
+                        if(std::holds_alternative<cr::committed>(item.value)){ids.push_back(item.original_id);positives.push_back(&item);}
+                    }
+                    if(ids.empty())continue;
+                    const auto evidence=store.receipt_batch(ids);
+                    for(size_t i=0;i<positives.size();++i) {
+                        const auto& item=*positives[i];const auto* positive=std::get_if<cr::committed>(&item.value);
+                        if(auto* observation=canonical_ready_read_test_observation::current)++observation->positive_receipt_lookups;
+                        const auto& actual=evidence[i];
+                        bool actual_namespace=actual&&actual->original.namespace_id==std::optional<std::string>{ns};
+                        if(q.registered_producer) {
+                            if(!item.operation_digest)refuse("canonical READY positive immutable identity missing");
+                            const auto coverage=lookup_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return writer.query(sql,values);},
+                                *state.namespaces->coverage,item.original_id,ns,*q.registered_producer,*item.operation_digest);
+                            actual_namespace=coverage==canonical_coverage_lookup::covered||coverage==canonical_coverage_lookup::legacy_original_namespace;
+                            if(item.legacy_unbound!=(coverage==canonical_coverage_lookup::legacy_original_namespace))refuse("canonical READY positive provenance kind changed");
+                        }
+                        if(!actual || !actual_namespace ||
+                           actual->position!=static_cast<int64_t>(positive->position) ||
+                           static_cast<int>(actual->original.outcome)!=static_cast<int>(positive->outcome)+1 ||
+                           bool(actual->original.target)!=bool(positive->accepted_target))refuse("canonical READY positive receipt lost source evidence");
+                        if(actual->original.target && (actual->original.target->table!=positive->accepted_target->table ||
+                            actual->original.target->global_id!=positive->accepted_target->id))refuse("canonical READY accepted receipt target differs");
+                    }
                 }
-                if(!actual || !actual_namespace ||
-                   actual->position!=static_cast<int64_t>(positive->position) ||
-                   static_cast<int>(actual->original.outcome)!=static_cast<int>(positive->outcome)+1 ||
-                   bool(actual->original.target)!=bool(positive->accepted_target))refuse("canonical READY positive receipt lost source evidence");
-                if(actual->original.target && (actual->original.target->table!=positive->accepted_target->table ||
-                    actual->original.target->global_id!=positive->accepted_target->id))refuse("canonical READY accepted receipt target differs");
             });
             if(q.registered_producer) {
                 const auto coverage=read_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return writer.query(sql,values);},*state.namespaces->coverage);

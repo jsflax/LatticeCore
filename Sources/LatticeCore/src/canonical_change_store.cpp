@@ -270,6 +270,51 @@ std::optional<canonical_receipt> canonical_change_store::receipt(const std::stri
     if (integer(v,"charge")!=receipt_charge(result.original)) fail(code::corrupt_state,"invalid canonical receipt charge");
     return result;
 }
+std::vector<std::optional<canonical_receipt>> canonical_change_store::receipt_batch(const std::vector<std::string>& ids) const {
+    auto& db=connection();
+    if(ids.size()>64)fail(code::invalid_argument,"canonical receipt batch exceeds fixed bound");
+    if(ids.empty())return {};
+    std::map<std::string,size_t> expected;
+    for(size_t i=0;i<ids.size();++i) {
+        valid_bytes(ids[i],limits_.operation_bytes);
+        if(!expected.emplace(ids[i],i).second)fail(code::invalid_argument,"duplicate canonical receipt batch ID");
+    }
+    const auto s=state();
+    std::string sql="SELECT CASE WHEN typeof(original_id)='blob' AND length(original_id) BETWEEN 1 AND ? THEN original_id END AS original_id,"
+        "CASE WHEN typeof(position)='integer' THEN position END AS position,"
+        "CASE WHEN typeof(outcome)='integer' THEN outcome END AS outcome,"
+        "CASE WHEN typeof(charge)='integer' THEN charge END AS charge,(relation IS NULL AND identity IS NULL) AS no_target,"
+        "CASE WHEN typeof(relation)='blob' AND length(relation) BETWEEN 1 AND ? THEN relation END AS relation,"
+        "CASE WHEN typeof(identity)='blob' AND length(identity) BETWEEN 1 AND ? THEN identity END AS identity "
+        +std::string(namespaces_?",CASE WHEN typeof(namespace_id)='blob' AND length(namespace_id) BETWEEN 1 AND 256 THEN namespace_id END AS namespace_id ":"")+
+        "FROM main._lattice_canonical_receipt WHERE original_id IN (";
+    std::vector<column_value_t> params{limits_.operation_bytes,limits_.identity_bytes,limits_.identity_bytes};
+    for(size_t i=0;i<ids.size();++i) {if(i)sql+=",";sql+="?";params.push_back(encoded(ids[i]));}
+    sql+=") LIMIT 65";
+    const auto rows=db.query(sql,params);
+    if(rows.size()>ids.size())fail(code::corrupt_state,"excess canonical receipt batch rows");
+    std::vector<std::optional<canonical_receipt>> result(ids.size());
+    for(const auto& v:rows) {
+        const auto id=decoded(v,"original_id");const auto found=expected.find(id);
+        if(found==expected.end())fail(code::corrupt_state,"foreign canonical receipt batch ID");
+        auto& target=result[found->second];
+        if(target)fail(code::corrupt_state,"duplicate canonical receipt batch row");
+        const auto p=integer(v,"position"),outcome=integer(v,"outcome");
+        if(p<=0 || p>s.head || !valid_outcome(outcome))fail(code::corrupt_state,"invalid canonical receipt outcome");
+        canonical_receipt receipt{{id,static_cast<canonical_receipt_outcome>(outcome),std::nullopt},p};
+        if(!integer(v,"no_target"))receipt.original.target=canonical_identity{decoded(v,"relation"),decoded(v,"identity")};
+        if(namespaces_) {
+            receipt.original.namespace_id=decoded(v,"namespace_id");
+            bool known=false;for(const auto& entry:namespaces_->entries)if(entry.namespace_id==*receipt.original.namespace_id)known=true;
+            if(!known)fail(code::corrupt_state,"canonical addressed receipt namespace is not enrolled");
+        }
+        if(integer(v,"charge")!=receipt_charge(receipt.original))fail(code::corrupt_state,"invalid canonical receipt charge");
+        target=std::move(receipt);
+    }
+    // No callback or proof escapes this call. Even an empty result describes
+    // UNKNOWN, never negative receipt authority.
+    return result;
+}
 canonical_record_result canonical_change_store::record(const std::vector<canonical_identity>& identities,
     const std::optional<canonical_receipt_request>& request) {
     const auto old=state();

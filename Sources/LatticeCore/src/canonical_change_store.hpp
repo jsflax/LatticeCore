@@ -80,12 +80,18 @@ public:
 };
 
 class canonical_change_store {
+    friend class canonical_writer_adapter;
+    friend struct canonical_receipt_batch_test_access;
     lattice_db& owner_;
     canonical_store_binding binding_;
     canonical_store_limits limits_;
     std::optional<canonical_namespace_profile> namespaces_;
     database& connection() const;
     void write_state(const canonical_store_state&, const canonical_store_state&);
+    // Closed audit helper: independently checks the actual owned writer and
+    // singleton on every nonempty call. No external state/proof or retained
+    // cache; results are ordered like the exact bounded input IDs.
+    std::vector<std::optional<canonical_receipt>> receipt_batch(const std::vector<std::string>&) const;
 public:
     // One explicitly bound scope per database in this first primitive. All IDs
     // are bounded opaque bytes, compared exactly; no UUID/collation migration

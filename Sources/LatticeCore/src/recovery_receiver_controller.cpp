@@ -10,6 +10,7 @@
 #include <lattice/lattice.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <set>
@@ -77,6 +78,68 @@ std::string domain(const json& description) {
 cr::source_binding source_binding(const recovery_obligation_profile& profile) {
     const auto& b=profile.binding;return {b.authority,b.source,b.epoch,b.scope,b.schema};
 }
+bool terminal_profile(const json& description) {
+    const auto& p=description.at("profile");
+    if(p.at("name")!="bounded48MiBOrphanV1")return false;
+    require(p.contains("orphanResumeGraceMilliseconds")&&p.at("orphanResumeGraceMilliseconds").is_number_integer(),"controller terminal profile grace missing");
+    const auto grace=p.at("orphanResumeGraceMilliseconds").get<int64_t>();
+    require(grace>0&&grace<=3600000,"controller terminal profile grace invalid");return true;
+}
+void lifecycle_reply_shape(const json& value) {
+    members(value,{"kind","version","operation","requestID","routeGeneration","settlement","leaseAvailable"},{"lifecycle"});
+    settlement_shape(value.at("settlement"));
+    require(value.at("kind")=="recoveryReady"&&value.at("version").is_number_integer()&&value.at("version")==1&&
+        (value.at("operation")=="inspect"||value.at("operation")=="discard")&&value.at("requestID").is_string()&&
+        !value.at("requestID").get_ref<const std::string&>().empty()&&value.at("requestID").get_ref<const std::string&>().size()<=128&&value.at("requestID").get_ref<const std::string&>().find('\0')==std::string::npos&&
+        value.at("leaseAvailable").is_boolean()&&value.at("leaseAvailable")==false,"controller lifecycle envelope shape differs");
+    (void)decimal(value,"routeGeneration");
+    if(!value.contains("lifecycle"))return;
+    require(value.at("settlement").at("state")=="committed","controller lifecycle body without known source COMMIT");
+    const auto& body=value.at("lifecycle");
+    members(body,{"state","requestDigest","attemptID","sequence","bindingHighWater","namespaceID","replicaID","receiverIncarnation","channelIncarnation","channel"});
+    for(const auto* key:{"state","requestDigest","attemptID","namespaceID","replicaID","receiverIncarnation","channelIncarnation","channel"})
+        require(body.at(key).is_string()&&!body.at(key).get_ref<const std::string&>().empty()&&body.at(key).get_ref<const std::string&>().size()<=256&&body.at(key).get_ref<const std::string&>().find('\0')==std::string::npos,
+            "controller lifecycle bounded text differs");
+    const auto& digest=body.at("requestDigest").get_ref<const std::string&>();
+    require(digest.size()==64&&std::all_of(digest.begin(),digest.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}),"controller lifecycle digest shape differs");
+    for(const auto* key:{"attemptID","receiverIncarnation","channelIncarnation"})
+        require(canonical_writer_adapter::uuid_key(body.at(key).get<std::string>())==body.at(key),"controller lifecycle canonical UUID differs");
+    const auto seq=decimal(body,"sequence"),high=decimal(body,"bindingHighWater",0);const auto status=body.at("state").get<std::string>();
+    require((status=="available"||status=="terminal"||status=="unstarted")&&(status=="unstarted"?high<seq:high==seq)&&
+        (value.at("operation")!="discard"||status=="terminal"),"controller lifecycle status/high-water shape differs");
+}
+// Late lifecycle traffic can only be disposed, never published as proof.
+void late_lifecycle_shape(const json& value,const json& description) {
+    lifecycle_reply_shape(value);
+    require(terminal_profile(description)&&value.at("routeGeneration")==description.at("routeGeneration"),
+        "controller late lifecycle physical route differs");
+    if(!value.contains("lifecycle"))return; // legal body-absent late failure
+    const auto& body=value.at("lifecycle");const auto& peer=description.at("peer");
+    require(body.at("namespaceID")==description.at("source").at("receiptNamespace")&&
+        body.at("replicaID")==peer.at("replicaID")&&body.at("receiverIncarnation")==peer.at("receiverIncarnation")&&
+        body.at("channelIncarnation")==peer.at("channelIncarnation")&&body.at("channel")==description.at("channel"),
+        "controller late lifecycle authenticated binding differs");
+}
+bool canceled_predecessor(const recovery_request_row& row,const recovery_obligation_scope& scope,
+    const receive_install_snapshot& receiver,const cr::request& q,int64_t phase,int64_t barrier,int64_t attempt) {
+    if((phase!=1&&phase!=2)||barrier<=1||attempt<=1||row.barrier!=barrier-1||row.sequence!=attempt-1||
+       row.journal.generation>INT64_MAX-phase||row.journal_revision>INT64_MAX-phase||
+       scope.address.incarnation!=row.journal.incarnation||scope.address.generation!=row.journal.generation+phase||
+       scope.revision!=row.journal_revision+phase||scope.last_attempt!=(phase==1?row.sequence:attempt)||
+       scope.mode!=(phase==1?recovery_obligation_mode::recording:recovery_obligation_mode::frozen)||
+       scope.freeze_revision!=(phase==1?row.journal_revision:scope.revision)||receiver.active||
+       receiver.binding!=scope.profile.binding||receiver.last_sequence!=row.sequence||
+       (receiver.last_installed&&receiver.last_installed->sequence>=row.sequence)||
+       receiver.revision!=scope.installed_revision||uint64_t(receiver.revision)!=q.expected.revision)return false;
+    const cr::frontier baseline{receiver.frontier.kind==receive_frontier_kind::position?cr::frontier_kind::position:
+        receiver.frontier.kind==receive_frontier_kind::beginning_null?cr::frontier_kind::beginning_null:cr::frontier_kind::uninitialized,
+        receiver.frontier.position?std::optional<uint64_t>{static_cast<uint64_t>(*receiver.frontier.position)}:std::nullopt};
+    if(baseline!=q.expected.base)return false;
+    return scope.installed_sequence==0?!receiver.last_installed&&receiver.frontier==receive_install_frontier{}:
+        receiver.last_installed&&receiver.last_installed->sequence==scope.installed_sequence&&
+        receiver.last_installed->head==scope.installed_head&&receiver.last_installed->manifest_digest==scope.installed_manifest&&
+        receiver.frontier==receive_install_frontier{receive_frontier_kind::position,scope.installed_head};
+}
 void known(const recovery_install_result& result) {
     if(result.deferred!=recovery_install_deferred::none) {
         require(result.state==recovery_install_state::refused&&!result.primary_error&&!result.cleanup_error&&
@@ -127,6 +190,9 @@ struct recovery_receiver_route::state {
     std::atomic<bool> retired{false},blocked{true};
     std::function<void()> resumed,renew,reconcile;
     std::atomic<bool> renewal_requested{false};
+    // Set only by worker validation of the actual current orphan profile.
+    // Coordinator mutex guards this weak record; it cannot retain old sources.
+    std::weak_ptr<const receiver_source_binding::record> late_control_view;
     std::function<void(std::exception_ptr)> error;
 };
 struct recovery_receiver_controller::state {
@@ -152,20 +218,64 @@ struct recovery_receiver_controller::state {
     std::shared_ptr<const recovery_reconciliation_descriptor> reconciliation;
     int64_t frozen_attempt=0,frozen_barrier=0;
     bool framing_committed=false;
+    // Reservations outlive the outstanding pointer when a callback or worker
+    // still owns bytes. Only reservations run under mutex; atomic releases
+    // happen after payload destruction and never need the coordinator leaf.
+    struct inbox_budget { std::atomic<size_t> bytes{0},slots{0}; };
+    struct charge {
+        std::shared_ptr<inbox_budget> budget;
+        size_t bytes=0;bool slot=false;
+        explicit charge(std::shared_ptr<inbox_budget> value):budget(std::move(value)){}
+        ~charge(){budget->bytes.fetch_sub(bytes);if(slot)budget->slots.fetch_sub(1);}
+        void shrink(size_t actual){require(actual<=bytes,"controller reservation exceeded");budget->bytes.fetch_sub(bytes-actual);bytes=actual;}
+    };
+    std::shared_ptr<inbox_budget> budget=std::make_shared<inbox_budget>();
+    std::shared_ptr<charge> reserve_locked(size_t bytes,bool slot) {
+        if(bytes>pending_bytes-budget->bytes.load()||(slot&&budget->slots.load()>=2))return {};
+        auto result=std::make_shared<charge>(budget);result->bytes=bytes;result->slot=slot;
+        budget->bytes.fetch_add(bytes);if(slot)budget->slots.fetch_add(1);return result;
+    }
+    struct reply {
+        std::shared_ptr<charge> reservation; // destroyed after bytes
+        std::string bytes;
+        uint64_t order=0;
+        std::weak_ptr<recovery_receiver_route> late_route;
+        receiver_source_binding::recovery_view late_view;
+        bool ready=false; // published under mutex, bytes immutable thereafter
+    };
     struct pending {
+        std::shared_ptr<charge> reservation; // destroyed after request/inbox
         std::weak_ptr<recovery_receiver_route> route;
         receiver_source_binding::recovery_view view;
-        std::string request_id,operation,request_bytes,response;
+        // Identity, request bytes and deadline are immutable after publication.
+        std::string request_id,operation,request_bytes;
         int64_t deadline=0;
-        uint64_t index=0;
+        uint64_t index=0,next_order=0;
+        bool terminal_inbox=false;
+        std::array<std::shared_ptr<reply>,2> inbox;
     };
     std::shared_ptr<pending> outstanding;
+    // Separate pointer inventory, SAME two-slot/16MiB global reservations.
+    std::array<std::shared_ptr<reply>,2> late_inbox;
+    uint64_t late_order=0;
     struct lease {
         std::weak_ptr<recovery_receiver_route> route;
         receiver_source_binding::recovery_view view;
         std::string id,request_digest,attempt_id;
         uint64_t sequence=0,frames=0;int64_t deadline=0;
     };
+    // Ephemeral authority only: each result belongs to the current actual
+    // physical source view and full Q. Reopen reacquires it from the source.
+    struct lifecycle {
+        std::weak_ptr<recovery_receiver_route> route;
+        receiver_source_binding::recovery_view view;
+        canonical_range::attempt attempt;
+        std::string request_digest,state;
+    };
+    std::map<std::string,lifecycle> lifecycles;
+    std::set<std::string> inspect_required;
+    bool terminal_rearm=false;
+    int64_t terminal_successor_attempt=0; // observation only; never authority
     std::map<std::string,lease> leases;
     std::map<std::string,receiver_source_binding::recovery_view> observed;
     explicit state(const recovery_continuous_policy& p):policy(p),caps(recovery_receiver_controller::limits(p)){}
@@ -210,7 +320,7 @@ void recovery_receiver_controller::initialize_owned(std::shared_ptr<lattice_db> 
     initialize_canonical_domains_owned(owner,caps.install,true);
     (void)bump_recovery_witness(*owner);
 }
-void recovery_receiver_controller::validate_reopen_owned(std::shared_ptr<lattice_db> owner,const recovery_continuous_policy& policy,int64_t phase,int64_t attempt) {
+void recovery_receiver_controller::validate_reopen_owned(std::shared_ptr<lattice_db> owner,const recovery_continuous_policy& policy,int64_t phase,int64_t barrier,int64_t attempt) {
     const auto caps=limits(policy);recovery_request_store requests(owner);requests.audit();
     initialize_canonical_domains_owned(owner,caps.install,false);
     require(read_recovery_witness(*recovery_writer_access::active_writer(*owner)).has_value(),"controller witness missing on reopen");
@@ -237,7 +347,10 @@ void recovery_receiver_controller::validate_reopen_owned(std::shared_ptr<lattice
                     scope->installed_revision==actual->revision,"controller reopened installed framing differs");
                     require(!actual->active&&actual->last_sequence==framing->sequence&&
                         (phase!=1||(framing->sequence==attempt-1&&scope->last_attempt==framing->sequence)),"controller prior installed request is not the exact barrier predecessor");}
-            }else require(phase==2&&framing->sequence==attempt,"controller manifestless Q outside frozen attempt");
+            }else require((phase==2&&framing->sequence==attempt&&framing->barrier==barrier&&framing->journal==scope->address&&framing->journal_revision==scope->revision)||
+                canceled_predecessor(*framing,*scope,*actual,*q,phase,barrier,attempt),"controller manifestless Q lacks exact current or canceled predecessor");
+            if(framing->manifest_frame.empty()&&(phase==1||phase==2)&&framing->sequence==attempt-1)
+                require(canceled_predecessor(*framing,*scope,*actual,*q,phase,barrier,attempt),"controller reopened canceled predecessor differs");
             if(phase==1)require(framing->sequence==attempt-1&&actual->last_sequence==framing->sequence&&!actual->active,
                 "controller preparing phase lacks its exact prior receiver sequence");
             if(phase==4||(phase==1&&framing->sequence<attempt&&(!actual->last_installed||actual->last_installed->sequence<framing->sequence)))require(framing->sequence==attempt-1&&framing->barrier+1>framing->barrier&&
@@ -262,8 +375,14 @@ std::shared_ptr<recovery_receiver_route> recovery_receiver_controller::attach(st
 recovery_receiver_route::recovery_receiver_route(std::shared_ptr<recovery_receiver_controller> controller,std::shared_ptr<state> state):state_(std::move(state)),controller_(std::move(controller)){}
 recovery_receiver_route::~recovery_receiver_route(){state_->retired.store(true,std::memory_order_release);controller_->retire(this);}
 void recovery_receiver_controller::retire(recovery_receiver_route*)noexcept {
-    // Weak registrations expire without destroying an owner/transport under a
-    // leaf. Durable barrier/Q survives; a later actual route can continue it.
+    std::shared_ptr<state::pending> released;
+    std::array<std::shared_ptr<state::reply>,2> retired;
+    {std::lock_guard lock(state_->mutex);
+        if(state_->outstanding&&state_->outstanding->route.expired())released=std::move(state_->outstanding);
+        for(size_t i=0;i<retired.size();++i)if(state_->late_inbox[i]&&state_->late_inbox[i]->late_route.expired())
+            retired[i]=std::move(state_->late_inbox[i]);}
+    // In-flight callbacks/worker retain their charges until actual disposal.
+    // Durable barrier/Q survives; a later actual route can continue it.
 }
 void recovery_receiver_route::wake(){if(!state_->retired.load(std::memory_order_acquire))controller_->wake(shared_from_this());}
 void recovery_receiver_route::notifications(std::function<void()> resumed,std::function<void()> renew,std::function<void(std::exception_ptr)> error,std::function<void()> reconcile){state_->resumed=std::move(resumed);state_->renew=std::move(renew);state_->error=std::move(error);state_->reconcile=std::move(reconcile);}
@@ -331,23 +450,131 @@ bool recovery_receiver_route::receive(const platform_transport_callbacks& endpoi
     auto& coordinator=*controller_->state_;
     std::shared_ptr<recovery_receiver_controller::state::pending> pending;
     {std::lock_guard lock(coordinator.mutex);pending=coordinator.outstanding;}
-    if(!pending)return false; // actual describe continues through its own verifier
+    if(!pending) {
+        receiver_source_binding::recovery_view view;
+        {std::lock_guard lock(coordinator.mutex);view.value=state_->late_control_view.lock();}
+        // Initial/renewed describe still belongs to the original verifier.
+        // This lane admits only an already worker-verified physical record.
+        if(!view.value||!state_->source->recovery_matches(view,endpoint,lifecycle))return false;
+        try {
+            require(message.data.size()<=recovery_request_store::frame_bytes,"controller late response byte capacity");
+            auto reply=std::make_shared<recovery_receiver_controller::state::reply>();
+            reply->late_route=shared_from_this();reply->late_view=view;
+            size_t slot=0;
+            {std::lock_guard lock(coordinator.mutex);
+                // Publication and late admission share this leaf. If a new
+                // request won the race, retain its ordinary correlation path.
+                pending=coordinator.outstanding;
+                if(!pending){
+                    while(slot<coordinator.late_inbox.size()&&coordinator.late_inbox[slot])++slot;
+                    require(slot<coordinator.late_inbox.size(),"controller bounded late response inbox full");
+                    require(coordinator.late_order!=UINT64_MAX,"controller late response order exhausted");
+                    reply->reservation=coordinator.reserve_locked(message.data.size(),true);
+                    require(reply->reservation!=nullptr,"controller retained late response capacity");
+                    reply->order=++coordinator.late_order;coordinator.late_inbox[slot]=reply;}}
+            if(!pending){
+                try {reply->bytes.assign(raw);}
+                catch(...){
+                    {std::lock_guard lock(coordinator.mutex);if(coordinator.late_inbox[slot]==reply)coordinator.late_inbox[slot].reset();}
+                    throw;
+                }
+                const bool live=state_->source->recovery_live(view);
+                {std::lock_guard lock(coordinator.mutex);
+                    if(coordinator.late_inbox[slot]!=reply)return true;
+                    if(!live||state_->retired.load()||state_->late_control_view.lock()!=view.value)coordinator.late_inbox[slot].reset();
+                    else reply->ready=true;}
+                wake();return true;
+            }
+        }catch(...){
+            const auto failure=std::current_exception();
+            // Preserve source.receive's exact-view revocation on newly
+            // intercepted late admission failures, after every leaf unwinds.
+            bool invalidated=false;
+            try {invalidated=state_->source->recovery_live(view)&&state_->source->invalidate(view.value);}
+            catch(...){std::rethrow_exception(failure);}
+            if(invalidated)std::rethrow_exception(failure);
+            return true; // a retired/replaced view cannot revoke its successor
+        }
+    }
     if(pending->route.lock().get()!=this||!state_->source->recovery_matches(pending->view,endpoint,lifecycle))return true;
-    require(message.data.size()<=recovery_request_store::frame_bytes&&pending->request_bytes.size()<=pending_bytes-message.data.size(),"controller pending response byte capacity");
-    std::string response(raw); // bounded before copy; parsing belongs to worker
+    require(message.data.size()<=recovery_request_store::frame_bytes,"controller pending response byte capacity");
+    auto reply=std::make_shared<recovery_receiver_controller::state::reply>();
+    size_t slot=0;
     {std::lock_guard lock(coordinator.mutex);if(coordinator.outstanding!=pending)return true;
-        require(pending->response.empty(),"controller duplicate outstanding response");pending->response=std::move(response);}
+        const size_t limit=pending->terminal_inbox?2:1;
+        while(slot<limit&&pending->inbox[slot])++slot;
+        require(slot<limit,"controller bounded response inbox full");
+        require(pending->next_order!=UINT64_MAX,"controller response order exhausted");
+        reply->reservation=coordinator.reserve_locked(message.data.size(),true);
+        require(reply->reservation!=nullptr,"controller retained response capacity");
+        reply->order=++pending->next_order;pending->inbox[slot]=reply;}
+    try {reply->bytes.assign(raw);}
+    catch(...){
+        // The local reference retains its charge beyond the leaf on failure.
+        {std::lock_guard lock(coordinator.mutex);if(pending->inbox[slot]==reply)pending->inbox[slot].reset();}
+        throw;
+    }
+    {std::lock_guard lock(coordinator.mutex);if(coordinator.outstanding!=pending)return true;
+        reply->ready=true;}
     wake();return true;
 }
 void recovery_receiver_controller::turn() {
     auto& runtime=*state_;
     {std::lock_guard lock(runtime.mutex);runtime.scheduled=false;if(runtime.running)return;runtime.running=true;}
-    struct settlement {recovery_receiver_controller::state& value;std::function<void()> after;bool keep_admission_wait=false;
+    struct settlement {recovery_receiver_controller::state& value;std::function<void()> after;
+        // Admission-retry composition consumes this flag. Merely disposing a
+        // late frame (or waiting for its copy) is not recovery progress and
+        // must not reset an already-running admission deadline/allowance.
+        bool keep_admission_wait=false;
         ~settlement(){{std::lock_guard lock(value.mutex);value.running=false;if(!keep_admission_wait)value.admission_wait={};}if(after)try{after();}catch(...) {}}} settle{runtime,{}};
     std::weak_ptr<lattice_db> observed_owner;
     int64_t admission_deadline=now()+admission_retry_window_ms;
     uint64_t admission_revision=0;
     try {
+        // Drain before idle/failure/cohort/source-count returns: even a dead
+        // route's payload must leave the shared byte/slot budget. No SQL or
+        // lifecycle proof publication is permitted in this bounded lane.
+        for(unsigned quantum=0;quantum<2;++quantum) {
+            std::shared_ptr<state::reply> front;
+            {std::lock_guard lock(runtime.mutex);
+                for(const auto& reply:runtime.late_inbox)if(reply&&(!front||reply->order<front->order))front=reply;
+                if(!front)break;
+                settle.keep_admission_wait=true;
+                if(!front->ready)return;}
+            auto route=front->late_route.lock();
+            if(route&&!route->state_->retired.load()&&route->state_->source->recovery_live(front->late_view)) {
+                observed_owner=route->state_->owner;
+                try {
+                    const auto description=parse(route->state_->source->recovery_description(front->late_view),65536);
+                    late_lifecycle_shape(parse(front->bytes,recovery_request_store::frame_bytes),description);
+                }catch(...){
+                    const auto failure=std::current_exception();
+                    if(runtime.probe&&runtime.probe->owner==route->state_->owner.lock().get()&&runtime.probe->observed)
+                        runtime.probe->observed("late-lifecycle-validation-rejected");
+                    // Idle routes may already permit ordinary export. Revoke
+                    // exactly this current source before reporting its error;
+                    // replacement/retirement must not poison another view.
+                    bool invalidated=false;
+                    try {invalidated=route->state_->source->recovery_live(front->late_view)&&
+                        route->state_->source->invalidate(front->late_view.value);}
+                    catch(...){std::rethrow_exception(failure);}
+                    if(invalidated)std::rethrow_exception(failure);
+                }
+                // Shape and actual binding permit disposal only. The route
+                // may retire during parsing; neither case creates authority.
+                if(route->state_->source->recovery_live(front->late_view)&&runtime.probe&&
+                    runtime.probe->owner==route->state_->owner.lock().get()&&runtime.probe->observed)
+                    runtime.probe->observed("late-lifecycle-discarded");
+            }
+            if(route&&!route->state_->source->recovery_live(front->late_view)&&runtime.probe&&
+                runtime.probe->owner==route->state_->owner.lock().get()&&runtime.probe->observed)
+                runtime.probe->observed("late-lifecycle-retired-disposed");
+            {std::lock_guard lock(runtime.mutex);for(auto& reply:runtime.late_inbox)if(reply==front)reply.reset();}
+        }
+        {std::lock_guard lock(runtime.mutex);
+            if(std::any_of(runtime.late_inbox.begin(),runtime.late_inbox.end(),[](const auto& reply){return bool(reply);})) {
+                settle.keep_admission_wait=true;return;
+            }}
         struct connected {
             std::shared_ptr<recovery_receiver_route> route;
             receiver_source_binding::recovery_view view;
@@ -370,6 +597,9 @@ void recovery_receiver_controller::turn() {
             auto contribution=std::find_if(runtime.policy.contributions.begin(),runtime.policy.contributions.end(),[&](const auto& c){return c.profile.binding.channel==channel;});
             require(contribution!=runtime.policy.contributions.end(),"controller live channel outside enrollment");
             auto scope=contract(description,*contribution,recovery_continuous_producer::controller_catalog(*owner));
+            const bool late_control=terminal_profile(description);
+            {std::lock_guard lock(runtime.mutex);route->state_->late_control_view=
+                late_control?std::weak_ptr<const receiver_source_binding::record>(view->value):std::weak_ptr<const receiver_source_binding::record>{};}
             const auto prior=connected_routes.find(channel);
             if(prior==connected_routes.end()||decimal(description,"routeGeneration")>decimal(prior->second.description,"routeGeneration"))
                 connected_routes.insert_or_assign(channel,connected{route,*view,std::move(description),std::move(scope)});
@@ -390,6 +620,7 @@ void recovery_receiver_controller::turn() {
                 std::shared_ptr<const recovery_reconciliation_descriptor> retired;
                 {std::lock_guard lock(runtime.mutex);retired=std::move(runtime.reconciliation);}
                 runtime.observed[channel]=c.view;runtime.frozen.reset();runtime.framing_committed=false;
+                runtime.lifecycles.clear();runtime.inspect_required.clear();runtime.terminal_rearm=false;runtime.leases.clear();
             }
         }
         for(const auto& [_,c]:connected_routes)
@@ -419,29 +650,48 @@ void recovery_receiver_controller::turn() {
         };
         const auto probe_scope=[&](const char* stage)->std::shared_ptr<void>{return runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope?runtime.probe->scope(stage):nullptr;};
         const auto live=[&]{for(const auto& [_,c]:connected_routes)require(!c.route->state_->retired.load()&&c.route->state_->source->recovery_live(c.view),"controller authenticated source retired during owned operation");};
-        const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();},true);known(result);};
-        // Socket callbacks enqueue at most one bounded reply. Only this worker
+        const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();},true);known(result);settle.keep_admission_wait=false;};
+        // Socket callbacks reserve at most two bounded replies. Only this worker
         // parses it or touches SQL. Claiming the reply keeps its full byte
         // charge until the exact transactional consumer finishes.
         std::shared_ptr<state::pending> pending;
         {std::lock_guard lock(runtime.mutex);pending=runtime.outstanding;}
-        if(pending) {
+        for(unsigned reply_quantum=0;pending&&reply_quantum<2;++reply_quantum) {
             auto route=pending->route.lock();
             if(!route||!route->state_->source->recovery_live(pending->view)||now()>=pending->deadline){
-                std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();return;
+                const bool expired=now()>=pending->deadline;
+                {std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();}
+                settle.keep_admission_wait=true;
+                observe(expired?"pending-expired-before-successor":"pending-retired-before-successor");return;
             }
-            // Filled once by receive(). Keep the charged bytes in the pending
-            // slot until its real consumer commits; a no-effect busy result
-            // must not discard the only copy or admit another response.
-            {std::lock_guard lock(runtime.mutex);if(pending->response.empty())return;}
-            const auto& response=pending->response;
+            std::shared_ptr<state::reply> front;
+            {std::lock_guard lock(runtime.mutex);
+                for(const auto& reply:pending->inbox)if(reply&&(!front||reply->order<front->order))front=reply;
+                if(!front||!front->ready)return;}
+            // Stable immutable bytes survive parsing, SQL, and a no-effect
+            // admission deferral. Do not dequeue before known consumption.
+            const auto& response=front->bytes;
             observe(pending->operation=="read"?"range-response-ready":"control-response-ready");
             const auto description=parse(route->state_->source->recovery_description(pending->view),65536);
             const auto channel=description.at("channel").get<std::string>();
+            const auto response_value=parse(response,recovery_request_store::frame_bytes);
+            if(terminal_profile(description)&&response_value.is_object()&&response_value.contains("kind")&&response_value.at("kind")=="recoveryReady"&&
+                response_value.contains("version")&&response_value.at("version")==1&&response_value.contains("operation")&&
+                (response_value.at("operation")=="inspect"||response_value.at("operation")=="discard")&&
+                response_value.contains("requestID")&&response_value.at("requestID").is_string()&&response_value.at("requestID")!=pending->request_id&&
+                response_value.contains("routeGeneration")&&response_value.at("routeGeneration")==description.at("routeGeneration")){
+                lifecycle_reply_shape(response_value);
+                // A delayed lifecycle reply cannot settle a different request.
+                // Keep its actual outstanding request, deadline and Q unchanged.
+                {std::lock_guard lock(runtime.mutex);
+                    require(runtime.outstanding==pending,"controller stale reply request retired");
+                    for(auto& reply:pending->inbox)if(reply==front)reply.reset();}
+                observe("terminal-stale-control-ignored");continue;
+            }
             if(pending->operation=="read") {
                 // A failed control response is not a range, absence proof or
                 // durable progress. Retain Q/stage and renew the real lease.
-                const auto envelope=parse(response,recovery_request_store::frame_bytes);
+                const auto& envelope=response_value;
                 if(envelope.contains("kind")) {
                     members(envelope,{"kind","version","operation","requestID","routeGeneration","settlement","frameAvailable"});settlement_shape(envelope.at("settlement"));
                     require(envelope.at("version")==1&&envelope.at("kind")=="recoveryReady"&&envelope.at("operation")=="read"&&envelope.at("requestID")==pending->request_id&&
@@ -466,8 +716,46 @@ void recovery_receiver_controller::turn() {
                         }
                     });
                 }
+            } else if(pending->operation=="inspect"||pending->operation=="discard") {
+                require(terminal_profile(description),"controller lifecycle reply outside negotiated profile");
+                const auto& value=response_value;
+                lifecycle_reply_shape(value);
+                require(value.at("kind")=="recoveryReady"&&value.at("version")==1&&value.at("operation")==pending->operation&&
+                    value.at("requestID")==pending->request_id&&value.at("routeGeneration")==description.at("routeGeneration")&&
+                    value.at("leaseAvailable").is_boolean()&&value.at("leaseAvailable")==false,"controller lifecycle correlation differs");
+                require(value.at("settlement").at("state")=="committed"&&value.contains("lifecycle"),"controller lifecycle lacks known source COMMIT");
+                const auto q=cr::decode(parse(pending->request_bytes,8388608).at("request").get<std::string>(),runtime.caps.codec);
+                const auto& request=std::get<cr::request>(q.body);const auto& lifecycle=value.at("lifecycle");
+                members(lifecycle,{"state","requestDigest","attemptID","sequence","bindingHighWater","namespaceID","replicaID","receiverIncarnation","channelIncarnation","channel"});
+                require(lifecycle.at("state").is_string(),"controller lifecycle state type");const auto status=lifecycle.at("state").get<std::string>();
+                const auto high=decimal(lifecycle,"bindingHighWater",0);
+                require((status=="available"||status=="terminal"||status=="unstarted")&&
+                    (status=="unstarted"?high<q.logical.sequence:high==q.logical.sequence)&&
+                    lifecycle.at("requestDigest")==request.request_digest&&lifecycle.at("attemptID")==q.logical.attempt_id&&
+                    decimal(lifecycle,"sequence")==q.logical.sequence&&lifecycle.at("namespaceID")==description.at("source").at("receiptNamespace")&&
+                    lifecycle.at("replicaID")==description.at("peer").at("replicaID")&&lifecycle.at("receiverIncarnation")==q.logical.receiver_incarnation&&
+                    lifecycle.at("channelIncarnation")==q.logical.channel_incarnation&&lifecycle.at("channel")==q.logical.channel&&
+                    lifecycle.at("receiverIncarnation")==description.at("peer").at("receiverIncarnation")&&
+                    lifecycle.at("channelIncarnation")==description.at("peer").at("channelIncarnation")&&q.logical.channel==channel,
+                    "controller lifecycle differs from exact authenticated frozen Q");
+                require(pending->operation!="discard"||status=="terminal","controller discard did not terminal-fence Q");
+                owned([&](database& db){recovery_request_store requests(owner);const auto row=requests.read(channel);
+                    require(row&&row->source_context==source_context(description)&&row->domain==common_domain,"controller lifecycle source context changed");
+                    const auto retained=cr::decode(row->request_frame,runtime.caps.codec);
+                    require(retained.logical==q.logical&&retained.body==q.body&&row->route==static_cast<int64_t>(q.route_generation),"controller lifecycle durable Q changed");
+                    const auto phase=db.query("SELECT phase,barrier,attempt FROM main._lattice_producer_continuity WHERE id=1");
+                    require(phase.size()==1&&integer(phase[0],"phase")==2&&integer(phase[0],"barrier")==row->barrier&&integer(phase[0],"attempt")==row->sequence,
+                        "controller lifecycle frozen attempt changed");
+                    require(status!="unstarted"||row->manifest_frame.empty(),"controller previously manifested Q became unstarted");
+                });
+                runtime.inspect_required.erase(channel);runtime.leases.erase(channel);
+                runtime.lifecycles.insert_or_assign(channel,state::lifecycle{route,pending->view,q.logical,request.request_digest,status});
+                if(status=="terminal"){
+                    for(const auto& [_,part]:connected_routes)require(terminal_profile(part.description),"controller terminal rearm needs every negotiated source");
+                    runtime.terminal_rearm=true;runtime.leases.clear();
+                }else if(status=="unstarted")runtime.leases.emplace(channel,state::lease{route,pending->view,{},{},{},0,0,now()+1000});
             } else {
-                const auto value=parse(response,recovery_request_store::frame_bytes);
+                const auto& value=response_value;
                 members(value,{"kind","version","operation","requestID","routeGeneration","leaseAvailable"},
                     {"settlement","expiration","preparation","publication","captureError","requiresFullRequest","leaseID","requestDigest","attemptID","sequence","frames","wireBytes","durationMilliseconds"});
                 require(value.at("leaseAvailable").is_boolean(),"controller lease status type");
@@ -488,6 +776,7 @@ void recovery_receiver_controller::turn() {
                     const auto frames=decimal(value,"frames");require(frames<=770&&frames<=description.at("profile").at("frames").get<uint64_t>(),"controller lease frame inventory capacity");
                     require(decimal(value,"wireBytes")<=description.at("profile").at("transferBytes").get<uint64_t>(),"controller lease wire inventory capacity");
                     runtime.leases.insert_or_assign(channel,state::lease{route,pending->view,id,std::get<cr::request>(q.body).request_digest,q.logical.attempt_id,q.logical.sequence,frames,now()+duration});
+                    runtime.lifecycles.erase(channel);runtime.inspect_required.erase(channel);
                 } else {
                     require(value.at("leaseAvailable")==false,"controller invalid lease status");
                     for(const auto* key:{"leaseID","requestDigest","attemptID","sequence","frames","wireBytes","durationMilliseconds"})require(!value.contains(key),"controller unavailable lease carries positive identity");
@@ -499,17 +788,33 @@ void recovery_receiver_controller::turn() {
                     if(pending->operation=="resume") {
                         // Empty lease identity denotes one allowed prepare
                         // attempt, never an authenticated negative outcome.
-                        runtime.leases.emplace(channel,state::lease{route,pending->view,{},{},{},0,0,now()+1000});
+                        if(terminal_profile(description))runtime.inspect_required.insert(channel);
+                        else runtime.leases.emplace(channel,state::lease{route,pending->view,{},{},{},0,0,now()+1000});
                     } else refuse("controller source preparation refused; exact Q retained");
                 }
             }
             {std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();}
+            pending.reset(); // worker/request payloads retire outside the leaf
+            settle.keep_admission_wait=false; // actual correlated consumption
             observe("response-consumed");
+            observe("pending-consumed-before-successor");
         }
+        if(pending){settle.after=[route=pending->route.lock()]{if(route)route->wake();};return;}
         for(unsigned quantum=0;quantum<4;++quantum) {
             int64_t phase=0,barrier=0,attempt=0,physical_incarnation=0;uint64_t demand_revision;
             {std::lock_guard lock(runtime.mutex);demand_revision=runtime.revision;}
             owned([&](database& db){const auto rows=db.query("SELECT CASE WHEN typeof(incarnation)='integer' THEN incarnation END AS incarnation,CASE WHEN typeof(phase)='integer' THEN phase END AS phase,CASE WHEN typeof(barrier)='integer' THEN barrier END AS barrier,CASE WHEN typeof(attempt)='integer' THEN attempt END AS attempt FROM main._lattice_producer_continuity WHERE id=1 LIMIT 2");require(rows.size()==1,"controller physical phase missing");phase=integer(rows[0],"phase");barrier=integer(rows[0],"barrier");attempt=integer(rows[0],"attempt");physical_incarnation=integer(rows[0],"incarnation");});
+            if(runtime.terminal_rearm&&phase==1){
+                // An unknown/secondary local result can have committed the
+                // cancellation. Inspect that exact successor before publishing
+                // runtime state; never carry old terminal authority into new Q.
+                require(runtime.frozen&&runtime.frozen_barrier<INT64_MAX&&runtime.frozen_attempt<INT64_MAX&&
+                    barrier==runtime.frozen_barrier+1&&attempt==runtime.frozen_attempt+1,"controller terminal successor differs from frozen predecessor");
+                owned([&](database&){validate_reopen_owned(owner,runtime.policy,phase,barrier,attempt);});
+                recovery_continuous_producer::controller_publish_reconcile(*this,owner,barrier,attempt);
+                runtime.frozen.reset();runtime.framing_committed=false;runtime.leases.clear();runtime.lifecycles.clear();runtime.inspect_required.clear();runtime.terminal_rearm=false;
+                runtime.terminal_successor_attempt=attempt;observe("terminal-cancel-inspected");
+            }
             if(phase==0) {
                 bool demand;{std::lock_guard lock(runtime.mutex);demand=runtime.demand;}
                 if(!demand){runtime.idle=true;for(const auto& route:routes)route->state_->blocked.store(false,std::memory_order_release);return;}
@@ -548,7 +853,8 @@ void recovery_receiver_controller::turn() {
                     runtime.reconciliation=std::move(descriptor);}observe("reconciliation-pending");settle.after=[routes]{for(const auto& route:routes)if(!route->state_->retired.load()&&route->state_->reconcile)route->state_->reconcile();};return;
             }
             if(phase==1) {auto status=recovery_continuous_producer::inspect_impl(owner,true);known(status.settlement);require(status.barrier.has_value(),"controller closed phase lacks actual barrier");
-                auto frozen=recovery_continuous_producer::finish_impl(*status.barrier,true);if(frozen.waiting)return;known(frozen.settlement);continue;}
+                auto frozen=recovery_continuous_producer::finish_impl(*status.barrier,true);if(frozen.waiting)return;known(frozen.settlement);
+                if(runtime.terminal_successor_attempt==attempt)observe("terminal-refreeze-committed");continue;}
             if(phase==3) {
                 auto scope_probe=probe_scope("resume");
                 owned([&](database& db){
@@ -600,12 +906,19 @@ void recovery_receiver_controller::turn() {
                     const auto existing=requests.read(scope.scope.address.channel);
                     if(existing&&existing->sequence==attempt){require(existing->journal==scope.scope.address&&existing->journal_revision==scope.scope.revision&&existing->barrier==barrier&&
                         existing->source_context==source_context(d)&&existing->domain==common_domain,"controller frozen request binding changed");continue;}
-                    if(existing){require(!existing->manifest_frame.empty(),"controller prior incomplete Q cannot be replaced");const auto oldq=cr::decode(existing->request_frame,runtime.caps.codec),oldm=cr::decode(existing->manifest_frame,runtime.caps.codec);
-                        const auto old=describe_canonical_range(oldq.logical,std::get<cr::request>(oldq.body),std::get<cr::manifest>(oldm.body),runtime.caps.codec,existing->route);
-                        const auto current=receiver.read(scope.scope.address.channel);const bool installed=current&&current->last_installed==std::optional<receive_install_identity>{old.installation_identity}&&!current->active;
-                        const bool canceled=current&&!current->active&&existing->sequence==attempt-1&&existing->barrier==barrier-1&&current->last_sequence==existing->sequence&&
+                    if(existing){const auto oldq=cr::decode(existing->request_frame,runtime.caps.codec);const auto current=receiver.read(scope.scope.address.channel);
+                        bool installed=false;
+                        if(current&&!existing->manifest_frame.empty()){const auto oldm=cr::decode(existing->manifest_frame,runtime.caps.codec);
+                            const auto old=describe_canonical_range(oldq.logical,std::get<cr::request>(oldq.body),std::get<cr::manifest>(oldm.body),runtime.caps.codec,existing->route);
+                            installed=current->last_installed==std::optional<receive_install_identity>{old.installation_identity}&&!current->active;}
+                        // Existing manifested UNKNOWN reconciliation may have
+                        // advanced claims/revision during its restricted pass.
+                        // The new manifestless path has no such authority.
+                        const bool canceled=current&&existing->source_context==source_context(d)&&existing->domain==common_domain&&
+                            (existing->manifest_frame.empty()?canceled_predecessor(*existing,scope.scope,*current,std::get<cr::request>(oldq.body),2,barrier,attempt):
+                            !current->active&&existing->sequence==attempt-1&&existing->barrier==barrier-1&&current->last_sequence==existing->sequence&&
                             (!current->last_installed||current->last_installed->sequence<existing->sequence)&&scope.scope.address.incarnation==existing->journal.incarnation&&
-                            scope.scope.address.generation==existing->journal.generation+2&&scope.scope.last_attempt==attempt;
+                            existing->journal.generation<=INT64_MAX-2&&scope.scope.address.generation==existing->journal.generation+2&&scope.scope.last_attempt==attempt);
                         require(installed||canceled,"controller prior Q lacks exact installed or canceled receiver evidence");requests.erase(*existing);}
                     const auto prior=receiver.read(scope.scope.address.channel);require(prior&&prior->binding==scope.scope.profile.binding&&!prior->active,"controller Q actual receiver unavailable");
                     cr::attempt logical{d.at("peer").at("receiverIncarnation"),d.at("peer").at("channelIncarnation"),scope.scope.address.channel,static_cast<uint64_t>(attempt),uuid_t::generate().to_string()};
@@ -621,6 +934,7 @@ void recovery_receiver_controller::turn() {
                 }
             });
             runtime.framing_committed=true;
+            if(created&&runtime.terminal_successor_attempt==attempt){observe("terminal-request-committed");runtime.terminal_successor_attempt=0;}
             // Known Q COMMIT precedes every handoff. A restart always attempts
             // exact resume first; a newly committed Q can start preparation.
             bool all_complete=true;std::optional<recovery_request_row> selected;uint64_t index=0;
@@ -636,6 +950,86 @@ void recovery_receiver_controller::turn() {
                     const auto m=cr::decode(row->manifest_frame,runtime.caps.codec);const auto progress=stages.resume(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route);
                     if(!progress.content_verified){all_complete=false;if(!selected){selected=std::move(row);index=1+progress.state.next_content_page+progress.state.next_receipt_page;}}
                 }});
+            if(runtime.terminal_rearm) {
+                // One terminal contribution closes the entire frozen cohort.
+                // No more reads/install selection until every exact Q is fenced.
+                selected.reset();all_complete=false;index=0;
+                const auto terminal_current=[&](const recovery_request_row& row,const connected& part){
+                    const auto at=runtime.lifecycles.find(row.journal.channel);
+                    if(at==runtime.lifecycles.end())return false;
+                    const auto q=cr::decode(row.request_frame,runtime.caps.codec);const auto& retained=at->second;
+                    return retained.state=="terminal"&&retained.route.lock()==part.route&&retained.view.value==part.view.value&&
+                        retained.attempt==q.logical&&retained.request_digest==std::get<cr::request>(q.body).request_digest;
+                };
+                owned([&](database&){recovery_request_store requests(owner);
+                    for(const auto& c:runtime.policy.contributions){const auto row=requests.read(c.profile.binding.channel);const auto& part=connected_routes.at(c.profile.binding.channel);
+                        require(row&&terminal_profile(part.description)&&row->sequence==attempt&&row->barrier==barrier&&
+                            row->source_context==source_context(part.description)&&row->domain==common_domain,"controller terminal cohort framing/source changed");
+                        if(!terminal_current(*row,part)&&!selected)selected=*row;
+                    }
+                });
+                if(!selected){
+                    require(barrier<INT64_MAX&&attempt<INT64_MAX,"controller terminal restart sequence exhausted");
+                    auto scope_probe=probe_scope("terminal-cancel");
+                    owned([&](database& db){
+                        recovery_continuous_producer::verify_for_owned_write(*proof);
+                        require(recovery_continuous_producer::controller_cohort(*this,owner)==recovery_continuous_producer::cohort_admission::available,
+                            "controller terminal restart retained cohort changed");
+                        {std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision&&!runtime.outstanding&&!runtime.reconciliation,
+                            "controller terminal restart generation or work changed");}
+                        recovery_request_store requests(owner);const auto framing=requests.fingerprints();
+                        recovery_obligation_store journal(owner,runtime.caps.obligations,runtime.caps.install.installations);
+                        receive_install_store receiver(owner,runtime.caps.install.installations);
+                        canonical_range_staging stages(owner,runtime.caps.install.installations,runtime.caps.codec,runtime.caps.staging);
+                        journal.audit();receiver.audit();stages.audit();
+                        std::vector<recovery_obligation_snapshot> before;std::vector<receive_install_snapshot> receivers;
+                        for(const auto& frozen:proof->frozen_journals()){
+                            const auto& channel=frozen.scope.address.channel;const auto row=requests.read(channel);const auto& part=connected_routes.at(channel);
+                            require(row&&terminal_current(*row,part)&&row->source_context==source_context(part.description)&&row->domain==common_domain&&
+                                row->sequence==attempt&&row->barrier==barrier&&row->journal==frozen.scope.address&&row->journal_revision==frozen.scope.revision&&
+                                row->route==static_cast<int64_t>(decimal(part.description,"routeGeneration")),"controller terminal cancellation lost exact Q/source custody");
+                            const auto snapshot=journal.snapshot_for_install(frozen.scope.address,attempt);const auto actual=receiver.read(channel);
+                            require(snapshot.scope==frozen.scope&&snapshot.entries==frozen.entries&&actual&&actual->binding==frozen.scope.profile.binding&&
+                                (!actual->last_installed||actual->last_installed->sequence<attempt),"controller terminal cancellation changed original inventory or installed proof");
+                            require(frozen.scope.address.generation<INT64_MAX&&frozen.scope.revision<INT64_MAX,"controller terminal journal generation exhausted");
+                            if(row->manifest_frame.empty()){
+                                require(!actual->active&&actual->last_sequence==attempt-1&&
+                                    db.query("SELECT 1 FROM main._lattice_range_attempt WHERE channel=? LIMIT 1",{blob(channel.begin(),channel.end())}).empty(),
+                                    "controller manifestless cancellation has active or retired receiver/stage");
+                            }else{
+                                const auto q=cr::decode(row->request_frame,runtime.caps.codec),m=cr::decode(row->manifest_frame,runtime.caps.codec);
+                                const auto described=describe_canonical_range(q.logical,std::get<cr::request>(q.body),std::get<cr::manifest>(m.body),runtime.caps.codec,row->route);
+                                require(actual->last_sequence==attempt&&actual->active==std::optional<receive_install_identity>{described.installation_identity},
+                                    "controller terminal cancellation lacks exact uninstalled active identity");
+                            }
+                            before.push_back(snapshot);receivers.push_back(*actual);
+                        }
+                        // Validate every member before mutating any member.
+                        for(const auto& frozen:before){const auto row=requests.read(frozen.scope.address.channel);
+                            if(!row->manifest_frame.empty()){const auto q=cr::decode(row->request_frame,runtime.caps.codec),m=cr::decode(row->manifest_frame,runtime.caps.codec);
+                                stages.abandon_active(q.logical,std::get<cr::manifest>(m.body).manifest_digest,row->route);}
+                            journal.cancel_frozen_for_retry(frozen.scope.address,attempt,frozen.scope.revision);
+                        }
+                        require(requests.fingerprints()==framing,"controller terminal cancellation altered retained Q/M");
+                        for(size_t n=0;n<before.size();++n){auto expected=before[n];auto expected_receiver=receivers[n];
+                            expected.scope.mode=recovery_obligation_mode::recording;++expected.scope.address.generation;++expected.scope.revision;
+                            expected_receiver.active.reset();expected_receiver.last_sequence=attempt;
+                            const auto actual=journal.snapshot_for_reconciliation(expected.scope.address);
+                            require(actual.scope==expected.scope&&actual.entries==expected.entries&&
+                                receiver.read(expected.scope.address.channel)==std::optional<receive_install_snapshot>{expected_receiver},
+                                "controller terminal cancellation original/ACK/claim or receiver postimage differs");
+                        }
+                        journal.audit();receiver.audit();stages.audit();live();
+                        {std::lock_guard lock(runtime.mutex);require(runtime.revision==demand_revision,"controller terminal cancellation demand changed");}
+                        recovery_continuous_producer::controller_restart_terminal_owned(*this,owner,physical_incarnation,barrier,attempt);
+                    });
+                    scope_probe.reset();observe("terminal-cancel-committed");
+                    recovery_continuous_producer::controller_publish_reconcile(*this,owner,barrier+1,attempt+1);
+                    runtime.terminal_successor_attempt=attempt+1;
+                    runtime.frozen.reset();runtime.framing_committed=false;runtime.leases.clear();runtime.lifecycles.clear();runtime.inspect_required.clear();runtime.terminal_rearm=false;
+                    observe("terminal-cancel-published");continue;
+                }
+            }
             if(all_complete) {
                 auto descriptor=std::shared_ptr<recovery_reconciliation_descriptor>(new recovery_reconciliation_descriptor);
                 if(!reserve_cohort(descriptor))return;
@@ -694,16 +1088,32 @@ void recovery_receiver_controller::turn() {
             auto lease=runtime.leases.find(selected->journal.channel);
             const bool usable=lease!=runtime.leases.end()&&!lease->second.id.empty()&&lease->second.view.value==c.view.value&&
                 lease->second.request_digest==std::get<cr::request>(q.body).request_digest&&now()<lease->second.deadline;
-            const std::string op=usable?"read":created?"prepare":lease!=runtime.leases.end()&&lease->second.id.empty()&&selected->manifest_frame.empty()?"prepare":"resume";
-            auto outgoing=std::make_shared<state::pending>();outgoing->route=c.route;outgoing->view=c.view;outgoing->request_id=uuid_t::generate().to_string();outgoing->operation=op;outgoing->index=index;
+            const auto lifecycle=runtime.lifecycles.find(selected->journal.channel);
+            const bool discard=runtime.terminal_rearm||(lifecycle!=runtime.lifecycles.end()&&lifecycle->second.state=="available"&&
+                lifecycle->second.view.value==c.view.value&&lifecycle->second.attempt==q.logical);
+            const std::string op=discard?"discard":runtime.inspect_required.count(selected->journal.channel)?"inspect":
+                usable?"read":created?"prepare":lease!=runtime.leases.end()&&lease->second.id.empty()&&selected->manifest_frame.empty()?"prepare":"resume";
+            auto outgoing=std::make_shared<state::pending>();
+            {std::lock_guard lock(runtime.mutex);if(runtime.budget->bytes.load()==0&&runtime.budget->slots.load()==0)outgoing->reservation=runtime.reserve_locked(8388608,false);}
+            // Retired callbacks may still own request or reply bytes. Retry on
+            // the existing pacer, with no handoff or new pending deadline.
+            if(!outgoing->reservation){settle.keep_admission_wait=true;return;}
+            outgoing->route=c.route;outgoing->view=c.view;outgoing->request_id=uuid_t::generate().to_string();outgoing->operation=op;outgoing->index=index;outgoing->terminal_inbox=terminal_profile(c.description);
             json command={{"kind","recoveryReady"},{"version",1},{"operation",op},{"requestID",outgoing->request_id},{"routeGeneration",c.description.at("routeGeneration")}};
             const auto remaining=c.route->state_->source->recovery_remaining(c.view);require(remaining>100,"controller source authorization renewal required");
-            if(usable){require(index<lease->second.frames,"controller frame index exceeds actual lease inventory");command["leaseID"]=lease->second.id;command["requestDigest"]=lease->second.request_digest;
+            if(op=="read"){require(index<lease->second.frames,"controller frame index exceeds actual lease inventory");command["leaseID"]=lease->second.id;command["requestDigest"]=lease->second.request_digest;
                 command["attemptID"]=lease->second.attempt_id;command["sequence"]=std::to_string(lease->second.sequence);command["index"]=std::to_string(index);}
-            else {command["request"]=cr::encode(q,runtime.caps.codec);command["durationMilliseconds"]=std::min<int64_t>({remaining-100,3600000,c.description.at("profile").at("leaseMilliseconds").get<int64_t>()});}
+            else {command["request"]=cr::encode(q,runtime.caps.codec);
+                if(op=="prepare"||op=="resume")command["durationMilliseconds"]=std::min<int64_t>({remaining-100,3600000,c.description.at("profile").at("leaseMilliseconds").get<int64_t>()});}
             outgoing->request_bytes=command.dump();require(outgoing->request_bytes.size()<=8388608&&outgoing->request_bytes.size()<=pending_bytes-4194304,"controller outgoing aggregate capacity");
+            outgoing->reservation->shrink(outgoing->request_bytes.size());
             outgoing->deadline=now()+std::min<int64_t>(remaining,30000);
-            {std::lock_guard lock(runtime.mutex);require(!runtime.outstanding,"controller overlapping request admission");runtime.outstanding=outgoing;}
+            observe("outgoing-built-before-publication");
+            bool late_pending=false;
+            {std::lock_guard lock(runtime.mutex);require(!runtime.outstanding,"controller overlapping request admission");
+                late_pending=runtime.budget->slots.load()!=0;
+                if(!late_pending)runtime.outstanding=outgoing;}
+            if(late_pending){settle.keep_admission_wait=true;observe("late-control-handoff-deferred");return;}
             require(c.route->state_->source->recovery_send(c.view,*c.route->state_->transport,transport_message::from_string(outgoing->request_bytes)),"controller final physical handoff refused");
             return;
         }
@@ -731,6 +1141,7 @@ void recovery_receiver_controller::turn() {
             }
             error=std::make_exception_ptr(db_error("controller admission retry budget exhausted; gate remains closed"));
         }
+        std::array<std::shared_ptr<state::reply>,2> retired_late;
         bool awaiting_delivery=false,retry_arrived=false;
         try{std::rethrow_exception(error);}catch(const delivery_retry_wait&){awaiting_delivery=true;}catch(...){}
         // Observation only: the typed UNKNOWN wait has left its SQL and leaf
@@ -747,8 +1158,10 @@ void recovery_receiver_controller::turn() {
             if(retry_arrived){runtime.demand=true;runtime.awaiting_delivery_retry=false;}
             else {runtime.failure=error;runtime.awaiting_delivery_retry=awaiting_delivery;}
             released=std::move(runtime.outstanding);
+            retired_late=std::move(runtime.late_inbox);
         }
         released.reset(); // source/endpoint ownership is released off the leaf
+        retired_late={};
         std::vector<std::shared_ptr<recovery_receiver_route>> report;
         {std::lock_guard lock(runtime.mutex);for(const auto& weak:runtime.routes)if(auto route=weak.lock())report.push_back(std::move(route));}
         if(retry_arrived){settle.after=[report]{for(const auto& route:report)if(!route->state_->retired.load()){route->wake();break;}};return;}

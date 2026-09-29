@@ -49,7 +49,7 @@ class receiver_source_binding : public std::enable_shared_from_this<receiver_sou
     std::string dial_url()const;
     void opened(const platform_transport_callbacks&,uint64_t,owned_platform_sync_transport&);
     bool receive(const platform_transport_callbacks&,uint64_t,const transport_message&);
-    void invalidate(const std::shared_ptr<const record>&);
+    bool invalidate(const std::shared_ptr<const record>&);
     bool live(const std::shared_ptr<const record>&)const;
     bool described()const;
     void request_upload();

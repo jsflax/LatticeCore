@@ -176,6 +176,10 @@ class recovery_continuous_producer {
         const verified_unsent_set&);
     static void controller_resume_owned(const recovery_receiver_controller&,
         std::shared_ptr<lattice_db>,int64_t barrier,int64_t attempt);
+    // Called only after the real receiver controller has terminal-fenced
+    // every source Q and canceled the exact complete local frozen cohort.
+    static void controller_restart_terminal_owned(const recovery_receiver_controller&,std::shared_ptr<lattice_db>,
+        int64_t physical_incarnation,int64_t barrier,int64_t attempt);
     static void controller_transition_reconcile_owned(const recovery_receiver_controller&,std::shared_ptr<lattice_db>,
         int64_t phase,int64_t barrier,int64_t attempt,int64_t next_phase,int64_t next_barrier,int64_t next_attempt);
     static void controller_publish_reconcile(const recovery_receiver_controller&,std::shared_ptr<lattice_db>,int64_t barrier,int64_t attempt);

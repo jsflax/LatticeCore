@@ -321,7 +321,7 @@ std::shared_ptr<recovery_continuous_work> recovery_continuous_producer::admit_re
     return work;
 }
 recovery_install_result recovery_continuous_producer::reconciliation_export_owned(std::shared_ptr<lattice_db> owner,
-    const std::shared_ptr<recovery_continuous_work>& work,const std::vector<std::string>& originals,const std::function<void(database&)>& body,bool* admission_busy) {
+    const std::shared_ptr<recovery_continuous_work>& work,const std::vector<std::string>& originals,const std::function<void(database&)>& body,bool* admission_busy,bool automatic) {
     // Only initial admission before any owned body or SQL can report BUSY.
     return recovery_writer_access::install_impl(owner,[&](database& db){
         if(!work||!work->reconciliation_||work->owner_!=owner||!owner->recovery_continuous_||work->state_!=owner->recovery_continuous_->state)
@@ -332,14 +332,14 @@ recovery_install_result recovery_continuous_producer::reconciliation_export_owne
             if(integer(row,"phase")!=4||integer(row,"incarnation")!=work->incarnation_||integer(row,"barrier")!=work->reconciliation_->barrier()||
                 integer(row,"attempt")!=work->reconciliation_->attempt())refuse("restricted export durable generation changed");};
         verify();continuous_frame claim(*state,db,2);body(db);verify();
-    },{},{},admission_busy);
+    },{},{},automatic?nullptr:admission_busy,automatic);
 }
-recovery_install_result recovery_continuous_producer::export_owned(std::shared_ptr<lattice_db> owner,const std::shared_ptr<recovery_continuous_work>& work,const std::function<void(database&)>& body,bool* initial_admission_busy) {
+recovery_install_result recovery_continuous_producer::export_owned(std::shared_ptr<lattice_db> owner,const std::shared_ptr<recovery_continuous_work>& work,const std::function<void(database&)>& body,bool* initial_admission_busy,bool automatic) {
     return recovery_writer_access::install_impl(owner,[&](database& db){
         verify_work(work,*owner,db);
         if(!work){body(db);return;}
         continuous_frame claim(*work->state_,db,2);body(db);verify_work(work,*owner,db);
-    },{},{},initial_admission_busy);
+    },{},{},automatic?nullptr:initial_admission_busy,automatic);
 }
 recovery_continuous_quiescence recovery_continuous_producer::begin(std::shared_ptr<lattice_db> owner,int64_t attempt) {
     return begin_impl(std::move(owner),attempt,false);

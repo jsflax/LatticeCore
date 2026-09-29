@@ -1703,9 +1703,10 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             enqueue_discovery(detail::sync_discovery_kind::ack,"transport ACK",charge.bytes,[this, ids = std::move(ids),generation,route](detail::sync_discovery_operation&) {
                 if (is_destroyed_||reconnect_lifecycle_.load()!=generation) return true;
                 if(callback_lifetime_->protected_route()&&!route->current(generation))return true;
-                const auto protected_store=try_has_export_protection();
+                const auto protected_store=try_has_automatic_export_protection();
                 if(!protected_store)return false;
-                mark_as_synced_after_discovery(ids,*protected_store);
+                bool admission_busy=false;mark_as_synced_after_discovery(ids,*protected_store,&admission_busy);
+                if(admission_busy)return false; // The same charged ACK/callback remains queued.
                 if(!route->current(generation))return true;
                 const auto completed=on_sync_complete_;
                 if(completed)completed(ids); // The callback may retire or replace its owner.
@@ -2990,6 +2991,14 @@ std::optional<bool> synchronizer_base::try_has_export_protection() {
 #endif
 }
 
+std::optional<bool> synchronizer_base::try_has_automatic_export_protection() {
+#ifdef __EMSCRIPTEN__
+    return false;
+#else
+    return detail::recovery_export_adapter::try_automatic_protected_store(owned_db_);
+#endif
+}
+
 bool synchronizer_base::upload_protected_entries(detail::sync_upload_continuation& continuation,detail::sync_discovery_operation* work,bool* discovery_busy) {
 #ifdef __EMSCRIPTEN__
     return false;
@@ -3013,7 +3022,7 @@ bool synchronizer_base::upload_protected_entries(detail::sync_upload_continuatio
     {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& [id,n]:in_flight_ids_)in_flight.push_back(n);}
     if(in_flight.size()>=2000&&!reconciling) {
         if(!discovery_busy)return has_export_protection();
-        const auto protected_store=try_has_export_protection();
+        const auto protected_store=try_has_automatic_export_protection();
         if(!protected_store){*discovery_busy=true;return false;}
         return *protected_store;
     }
@@ -3069,7 +3078,7 @@ bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation&
         // ACK may remove it before handed_off/launcher run; never relabel it.
         auto retry=prepare_ack_retry(frame.entries(),true,exclusion->delivery_token(),
             receiver_controller_?receiver_controller_->delivery_timeout_retry(frame,continuation.generation):std::function<void()>{});
-        const auto sent=discovery_busy?route->try_handoff(frame):std::optional<bool>(route->handoff(std::move(frame)));
+        const auto sent=discovery_busy?route->try_handoff_automatic(frame):std::optional<bool>(route->handoff(std::move(frame)));
         if(!sent){
             // Charge only when parking payload across turns. Ordinary handoff
             // keeps its existing frame limits and does not reserve queue bytes.
@@ -3203,7 +3212,7 @@ bool synchronizer_base::upload_pending_changes_step(detail::sync_upload_continua
     }
     if(!work)send_entries(continuation.entries);
     else {
-        const auto protected_store=try_has_export_protection();
+        const auto protected_store=try_has_automatic_export_protection();
         if(!protected_store) {
             if(!continuation.late_replay_owned)
                 throw db_error("late send discovery busy: filtered/synthetic or unowned replay is not supported");
@@ -3254,7 +3263,8 @@ void synchronizer_base::mark_as_synced(const std::vector<std::string>& global_id
     mark_as_synced_after_discovery(global_ids,protected_store);
 }
 
-void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::string>& global_ids,bool protected_store) {
+void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::string>& global_ids,bool protected_store,bool* admission_busy) {
+    if(admission_busy)*admission_busy=false;
     LOG_INFO("synchronizer", "[%s] mark_as_synced: %zu entries ACK'd (progress_acked was %lld)",
              log_id(), global_ids.size(),
              (long long)progress_acked_.load(std::memory_order_relaxed));
@@ -3264,7 +3274,11 @@ void synchronizer_base::mark_as_synced_after_discovery(const std::vector<std::st
         std::vector<std::string> matched;std::vector<uint64_t> registrations;std::set<std::string> seen;
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);for(const auto& id:global_ids)if(in_flight_ids_.count(id)&&seen.insert(id).second){matched.push_back(id);registrations.push_back(upload_tracking_->registration_locked(id));}}
         if(matched.empty())return;
-        detail::recovery_export_adapter::acknowledge_legacy(owner,config_.sync_id,matched);
+        if(admission_busy) {
+            if(!detail::recovery_export_adapter::try_acknowledge_legacy(owner,config_.sync_id,matched)){
+                *admission_busy=true;return;
+            }
+        }else detail::recovery_export_adapter::acknowledge_legacy(owner,config_.sync_id,matched);
         if(!route->current(generation))return;
         // Close the zero-in-flight / queued-next-selection drain window before
         // clearing this ACK batch. The next actual empty selection settles it.

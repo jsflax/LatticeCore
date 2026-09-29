@@ -52,6 +52,9 @@ public:
     export_discovery_busy(const export_discovery_busy&)=default;
 };
 class recovery_local_producer_adapter {
+    friend class recovery_export_adapter;
+    static std::optional<bool> export_protection_impl(std::shared_ptr<lattice_db>,bool automatic);
+    static std::optional<bool> try_automatic_export_protection(std::shared_ptr<lattice_db>);
     struct context;
     struct descriptor;
     struct management;

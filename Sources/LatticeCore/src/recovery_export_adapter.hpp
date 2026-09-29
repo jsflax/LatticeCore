@@ -20,6 +20,8 @@ extern thread_local void (*after_claim_commit)();
 // Private fault seam after one contribution's claim postimage was captured.
 // Null in production; permits deterministic cross-contribution fault tests.
 extern thread_local void (*after_contribution_claim)(size_t);
+// Passive exact-byte observation off all locks; no policy/DTO replacement.
+extern thread_local void (*automatic_handoff_observed)(const transport_message&);
 }
 class recovery_export_adapter;
 class recovery_export_route;
@@ -88,7 +90,9 @@ public:
     // Nullopt preserves the exact permit on initial no-effect admission busy.
     std::optional<bool> try_handoff(committed_export_frame&);
 private:
-    bool handoff_impl(committed_export_frame&, bool*);
+    friend class ::lattice::synchronizer_base;
+    std::optional<bool> try_handoff_automatic(committed_export_frame&);
+    bool handoff_impl(committed_export_frame&, bool*,bool automatic=false);
 };
 struct recovery_export_preparation {
     bool protected_store=false;
@@ -106,6 +110,9 @@ class recovery_export_adapter {
         std::shared_ptr<recovery_continuous_work>,std::shared_ptr<recovery_reconciliation_export>,
         uint64_t,std::shared_ptr<const receiver_upload_view>,bool*);
     friend class ::lattice::synchronizer_base;
+    static std::optional<bool> try_automatic_protected_store(std::shared_ptr<lattice_db>);
+    static bool try_acknowledge_legacy(std::shared_ptr<lattice_db>,const std::string&,const std::vector<std::string>&);
+    static recovery_install_result acknowledge_legacy_impl(std::shared_ptr<lattice_db>,const std::string&,const std::vector<std::string>&,bool automatic);
     static std::optional<recovery_export_preparation> prepare_for_route(std::shared_ptr<lattice_db>,
         const std::shared_ptr<recovery_continuous_route>&,const std::string&,uint64_t,size_t,
         const std::vector<int64_t>&,bool,bool*,std::shared_ptr<const receiver_upload_view> = {});
@@ -113,12 +120,12 @@ class recovery_export_adapter {
     friend class recovery_server_export_endpoint;
     friend class recovery_server_export_page;
     static void validate_server_limits(const recovery_export_limits&);
-    static void revalidate_claimed_frame(const committed_export_frame&, bool* = nullptr);
+    static void revalidate_claimed_frame(const committed_export_frame&, bool* = nullptr,bool automatic=false);
     static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
         const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr,
         bool retained_delete_page=false,std::shared_ptr<recovery_continuous_work> = {},
-        std::shared_ptr<const receiver_upload_view> = {},std::shared_ptr<recovery_reconciliation_export> = {});
+        std::shared_ptr<const receiver_upload_view> = {},std::shared_ptr<recovery_reconciliation_export> = {},bool automatic=false);
 public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.

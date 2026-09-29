@@ -16,10 +16,18 @@ namespace recovery_export_test_hooks {
 thread_local void (*before_claim_commit)()=nullptr;
 thread_local void (*after_claim_commit)()=nullptr;
 thread_local void (*after_contribution_claim)(size_t)=nullptr;
+thread_local void (*automatic_handoff_observed)(const transport_message&)=nullptr;
 }
 namespace {
 [[noreturn]] void refuse(const char* message){throw db_error(message);}
 struct export_capacity_error : db_error {using db_error::db_error;};
+bool automatic_export_deferred(const recovery_install_result& result,bool* busy) {
+    if(result.deferred==recovery_install_deferred::none)return false;
+    if(!busy||result.state!=recovery_install_state::refused||result.primary_error||result.cleanup_error||
+       result.postcommit_error||result.notification_error||result.unexpected_commit_observed)
+        refuse("automatic export invalid deferred settlement");
+    *busy=true;return true;
+}
 struct statement {
     sqlite3_stmt* p=nullptr;
     statement(sqlite3* db,const std::string& sql){
@@ -466,12 +474,15 @@ std::optional<bool> recovery_export_adapter::try_protected_store(std::shared_ptr
     try{return recovery_local_producer_adapter::export_protection_required(std::move(owner));}
     catch(const export_discovery_busy&){return std::nullopt;}
 }
+std::optional<bool> recovery_export_adapter::try_automatic_protected_store(std::shared_ptr<lattice_db> owner){
+    return recovery_local_producer_adapter::try_automatic_export_protection(std::move(owner));
+}
 std::optional<recovery_export_preparation> recovery_export_adapter::prepare_for_route(std::shared_ptr<lattice_db> owner,
     const std::shared_ptr<recovery_continuous_route>& route,const std::string& channel,uint64_t generation,size_t count,
     const std::vector<int64_t>& in_flight,bool filtered,bool* discovery_busy,std::shared_ptr<const receiver_upload_view> upload_view){
     if(upload_view){if(!upload_view->current())refuse("negotiated export source revoked before selection");count=std::min(count,upload_view->entries_);}
     auto work=recovery_continuous_producer::admit_work(route,owner,generation);
-    bool busy=false;auto prepared=prepare(std::move(owner),channel,generation,count,in_flight,filtered,{},std::nullopt,discovery_busy?&busy:nullptr,false,std::move(work),std::move(upload_view));
+    bool busy=false;auto prepared=prepare(std::move(owner),channel,generation,count,in_flight,filtered,{},std::nullopt,discovery_busy?&busy:nullptr,false,std::move(work),std::move(upload_view),{},discovery_busy!=nullptr);
     if(busy){*discovery_busy=true;return std::nullopt;}return prepared;
 }
 recovery_export_preparation recovery_export_adapter::prepare_reconciliation(std::shared_ptr<lattice_db> owner,
@@ -484,7 +495,7 @@ recovery_export_preparation recovery_export_adapter::prepare_reconciliation(std:
     const auto count=std::min(grant->requested_.size(),upload->entries_);
     const auto channel=grant->address_.channel;
     return prepare(std::move(owner),channel,generation,count,{},false,{},std::nullopt,busy,false,
-        std::move(work),std::move(upload),std::move(grant));
+        std::move(work),std::move(upload),std::move(grant),busy!=nullptr);
 }
 std::optional<recovery_export_preparation> recovery_export_adapter::try_prepare_pending(std::shared_ptr<lattice_db> owner,
     const std::string& sync_id,uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,
@@ -511,11 +522,17 @@ recovery_export_preparation recovery_export_adapter::prepare_retained_page(std::
 recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lattice_db> owner,const std::string& sync_id,
     uint64_t generation,size_t count,const std::vector<int64_t>& in_flight,bool filtered,const recovery_export_limits& limits,
     std::optional<int64_t> history_after,bool* discovery_busy,bool retained_delete_page,std::shared_ptr<recovery_continuous_work> work,
-    std::shared_ptr<const receiver_upload_view> upload_view,std::shared_ptr<recovery_reconciliation_export> reconciliation){
+    std::shared_ptr<const receiver_upload_view> upload_view,std::shared_ptr<recovery_reconciliation_export> reconciliation,bool automatic){
     recovery_export_preparation output;
     // Catch only this first no-effect classifier. A busy exception arising
     // later from reentrant work must never replay a claim or mutation stage.
-    try {if(!recovery_local_producer_adapter::export_protection_required(owner))return output;}
+    try {
+        if(automatic) {
+            const auto protection=try_automatic_protected_store(owner);
+            if(!protection){if(!discovery_busy)refuse("automatic export requires retained busy output");*discovery_busy=true;return output;}
+            if(!*protection)return output;
+        }else if(!recovery_local_producer_adapter::export_protection_required(owner))return output;
+    }
     catch(const export_discovery_busy&){
         if(!discovery_busy)throw;
         *discovery_busy=true;return output;
@@ -770,8 +787,9 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
         if(frame.upload_view_&&!frame.upload_view_->current())refuse("negotiated export source revoked during claims");
     };
     const auto result=frame.reconciliation_
-        ?recovery_continuous_producer::reconciliation_export_owned(owner,frame.continuous_work_,frame.reconciliation_->originals_,owned_body,discovery_busy)
-        :recovery_continuous_producer::export_owned(owner,frame.continuous_work_,owned_body,discovery_busy);
+        ?recovery_continuous_producer::reconciliation_export_owned(owner,frame.continuous_work_,frame.reconciliation_->originals_,owned_body,discovery_busy,automatic)
+        :recovery_continuous_producer::export_owned(owner,frame.continuous_work_,owned_body,discovery_busy,automatic);
+    if(automatic&&automatic_export_deferred(result,discovery_busy))return output;
     if(discovery_busy&&*discovery_busy)return output;
     require_committed(result);
     if(!frame.entries_.empty()){
@@ -782,8 +800,16 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
     return output;
 }
 void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> owner,const std::string& channel,const std::vector<std::string>& ids){
+    require_committed(acknowledge_legacy_impl(std::move(owner),channel,ids,false));
+}
+bool recovery_export_adapter::try_acknowledge_legacy(std::shared_ptr<lattice_db> owner,const std::string& channel,const std::vector<std::string>& ids){
+    const auto result=acknowledge_legacy_impl(std::move(owner),channel,ids,true);bool busy=false;
+    if(automatic_export_deferred(result,&busy))return false;
+    require_committed(result);return true;
+}
+recovery_install_result recovery_export_adapter::acknowledge_legacy_impl(std::shared_ptr<lattice_db> owner,const std::string& channel,const std::vector<std::string>& ids,bool automatic){
     if(channel.empty()||channel.size()>4096||ids.size()>2000)refuse("export legacy ACK bounds exceeded");
-    const auto result=recovery_writer_access::install(owner,[&](database& writer){
+    return recovery_writer_access::install_impl(owner,[&](database& writer){
         const auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);
         if(inventory.scopes.empty())refuse("export legacy ACK lost protected inventory");
         recovery_obligation_store journal(owner,inventory.limits.obligations,inventory.limits.installations);
@@ -829,11 +855,10 @@ void recovery_export_adapter::acknowledge_legacy(std::shared_ptr<lattice_db> own
         if(enabled)for(const auto& scope:inventory.scopes)
             if(journal.read(scope.contribution.address.channel)!=std::optional<recovery_obligation_scope>{scope.contribution})
                 refuse("enabled legacy ACK changed canonical scope");
-    });
-    require_committed(result);
+    },{},{},nullptr,automatic);
 }
 void recovery_export_adapter::validate_server_limits(const recovery_export_limits& limits){limits_ok(limits,limits.entries,{});}
-void recovery_export_adapter::revalidate_claimed_frame(const committed_export_frame& frame,bool* busy){
+void recovery_export_adapter::revalidate_claimed_frame(const committed_export_frame& frame,bool* busy,bool automatic){
     const auto owned_body=[&](database&){
         check_scopes(recovery_local_producer_adapter::export_inventory_for_owned_write(frame.owner_),frame.scopes_);
         recovery_obligation_store journal(frame.owner_,frame.limits_.obligations,frame.limits_.installations);check_claims(journal,frame.claims_,frame.entries_);
@@ -866,8 +891,9 @@ void recovery_export_adapter::revalidate_claimed_frame(const committed_export_fr
         }
     };
     const auto result=frame.reconciliation_
-        ?recovery_continuous_producer::reconciliation_export_owned(frame.owner_,frame.continuous_work_,frame.reconciliation_->selected_,owned_body,busy)
-        :recovery_continuous_producer::export_owned(frame.owner_,frame.continuous_work_,owned_body,busy);
+        ?recovery_continuous_producer::reconciliation_export_owned(frame.owner_,frame.continuous_work_,frame.reconciliation_->selected_,owned_body,busy,automatic)
+        :recovery_continuous_producer::export_owned(frame.owner_,frame.continuous_work_,owned_body,busy,automatic);
+    if(automatic&&automatic_export_deferred(result,busy))return;
     if(busy&&*busy)return;
     recovery_export_adapter::require_committed(result);
 }
@@ -923,7 +949,11 @@ std::optional<bool> recovery_export_route::try_handoff(committed_export_frame& f
     bool busy=false;const bool sent=handoff_impl(frame,&busy);
     if(busy)return std::nullopt;return sent;
 }
-bool recovery_export_route::handoff_impl(committed_export_frame& frame,bool* busy){
+std::optional<bool> recovery_export_route::try_handoff_automatic(committed_export_frame& frame){
+    bool busy=false;const bool sent=handoff_impl(frame,&busy,true);
+    if(busy)return std::nullopt;return sent;
+}
+bool recovery_export_route::handoff_impl(committed_export_frame& frame,bool* busy,bool automatic){
     if(frame.consumed_||!frame.owner_||frame.entries_.empty()||frame.claims_.empty())refuse("export permit already consumed or missing custody");
     if(!current(frame.physical_generation_)||frame.owner_->is_closed()){frame.consumed_=true;return false;}
     // A superseded descriptor must be disposable even when the owned writer
@@ -931,7 +961,11 @@ bool recovery_export_route::handoff_impl(committed_export_frame& frame,bool* bus
     if(frame.reconciliation_&&!recovery_continuous_producer::reconciliation_work_current(frame.continuous_work_,frame.owner_)){
         frame.consumed_=true;return false;
     }
-    try {recovery_export_adapter::revalidate_claimed_frame(frame,busy);}
+    try {
+        if(automatic&&recovery_export_test_hooks::automatic_handoff_observed)
+            recovery_export_test_hooks::automatic_handoff_observed(frame.message_);
+        recovery_export_adapter::revalidate_claimed_frame(frame,busy,automatic);
+    }
     catch(...){frame.consumed_=true;throw;}
     if(busy&&*busy)return false;
     frame.consumed_=true;

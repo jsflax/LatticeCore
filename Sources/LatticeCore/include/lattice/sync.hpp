@@ -34,7 +34,7 @@ struct sync_drain_result {
 };
 // Forward declaration
 class lattice_db;
-namespace detail {class recovery_continuous_producer;class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;}
+namespace detail {class recovery_continuous_producer;class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;struct automatic_export_admission_test_access;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -432,6 +432,7 @@ protected:
     friend struct detail::recovery_receiver_cohort_test_access;
     friend struct detail::recovery_delivery_registration_test_access;
     friend struct detail::sync_discovery_test_access;
+    friend struct detail::automatic_export_admission_test_access;
     friend struct sync_discovery_admission_test_access;
 
     /// Log-line identity: config_.log_label when set, else sync_id. Cached
@@ -597,7 +598,7 @@ protected:
     bool upload_pending_changes_step(detail::sync_upload_continuation&,detail::sync_discovery_operation*);
     std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
-    void mark_as_synced_after_discovery(const std::vector<std::string>&,bool protected_store);
+    void mark_as_synced_after_discovery(const std::vector<std::string>&,bool protected_store,bool* admission_busy=nullptr);
 
     // upload_pending_changes decomposed phases
     struct classified_entries {
@@ -615,6 +616,7 @@ protected:
     bool send_committed_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy);
     bool upload_protected_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy=nullptr);
     std::optional<bool> try_has_export_protection();
+    std::optional<bool> try_has_automatic_export_protection();
     bool has_export_protection();
     void schedule_ack_retry(const std::vector<audit_log_entry>&);
     std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false,uint64_t delivery_token=0,

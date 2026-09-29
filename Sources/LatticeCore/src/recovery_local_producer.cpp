@@ -756,6 +756,12 @@ std::vector<recovery_obligation_producer_profile> recovery_local_producer_adapte
     return stored;
 }
 bool recovery_local_producer_adapter::export_protection_required(std::shared_ptr<lattice_db> owner) {
+    return *export_protection_impl(std::move(owner),false);
+}
+std::optional<bool> recovery_local_producer_adapter::try_automatic_export_protection(std::shared_ptr<lattice_db> owner) {
+    return export_protection_impl(std::move(owner),true);
+}
+std::optional<bool> recovery_local_producer_adapter::export_protection_impl(std::shared_ptr<lattice_db> owner,bool automatic) {
     if(!owner)refuse("export discovery requires a retained owner");
     std::shared_ptr<database> writer;
     {
@@ -768,8 +774,20 @@ bool recovery_local_producer_adapter::export_protection_required(std::shared_ptr
 #ifndef __EMSCRIPTEN__
     if(!mutex)refuse("export discovery requires a serialized connection");
 #endif
+    const auto validate_deferred_owner=[&] {
+        // No SQLite calls on a busy mutex; this is retained owner identity,
+        // never authority to use an unvalidated snapshot or writer.
+        std::lock_guard<std::mutex> lock(owner->connection_ownership_mutex_);
+        if(owner->closed_.load()||owner->db_!=writer||writer->is_closed())
+            refuse("export discovery admission invalidated");
+        const auto allowed=std::atomic_load(&writer->local_producer_write_allowed_);
+        if(allowed&&!allowed->load(std::memory_order_acquire))refuse("export discovery admission revoked");
+    };
     const auto probe=sqlite3_mutex_try(mutex);
-    if(probe==SQLITE_BUSY)throw export_discovery_busy();
+    if(probe==SQLITE_BUSY) {
+        if(!automatic)throw export_discovery_busy();
+        validate_deferred_owner();return std::nullopt;
+    }
     if(probe!=SQLITE_OK)refuse("export discovery writer mutex failed");
     struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
     const auto validate_owner=[&] {
@@ -785,8 +803,16 @@ bool recovery_local_producer_adapter::export_protection_required(std::shared_ptr
     // A preexisting read snapshot may predate sibling enrollment. Only an
     // idle connection or the actual current owned WRITE can classify absence.
     const bool idle=sqlite3_get_autocommit(db)!=0&&sqlite3_txn_state(db,"main")==SQLITE_TXN_NONE;
-    if(!idle&&(sqlite3_txn_state(db,"main")!=SQLITE_TXN_WRITE||
-               recovery_writer_access::active_writer(*owner)!=writer.get()))
+    const bool owned_write=!idle&&sqlite3_txn_state(db,"main")==SQLITE_TXN_WRITE&&
+        recovery_writer_access::active_writer(*owner)==writer.get();
+    if(automatic&&!owned_write) {
+        // A busy SELECT without a main read transaction still needs provenance;
+        // so does same-thread query/callback reentry even when main is idle.
+        if(database::maintenance_scope::controller_classify_locked(*writer)==
+                database::maintenance_scope::admission::engine_read_busy) {
+            validate_deferred_owner();return std::nullopt;
+        }
+    }else if(!idle&&!owned_write)
         refuse("export discovery requires a fresh view or actual owned WRITE");
     const auto root=std::static_pointer_cast<context>(std::atomic_load(&writer->local_producer_callback_custody_));
     const auto* admitted=root?root->effective():nullptr;

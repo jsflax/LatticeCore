@@ -147,8 +147,14 @@ static any_property json_to_any_property(const json& j) {
 
         const auto& v = j["value"];
         switch (kind) {
-            case any_property_kind::int_kind:
-                return any_property(static_cast<int>(v.get<int>()));
+            case any_property_kind::int_kind: {
+                // Swift's Int uses the full signed 64-bit wire value on native
+                // hosts. Preserve its kind without narrowing through C++ int.
+                any_property property;
+                property.kind = any_property_kind::int_kind;
+                property.value = v.get<int64_t>();
+                return property;
+            }
             case any_property_kind::int64_kind:
                 return any_property(v.get<int64_t>());
             case any_property_kind::string_kind:

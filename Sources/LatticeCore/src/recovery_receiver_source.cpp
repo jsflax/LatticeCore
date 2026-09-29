@@ -171,7 +171,11 @@ void receiver_source_binding::opened(const platform_transport_callbacks& attempt
     std::shared_ptr<const record> retired;
     {std::lock_guard lock(mutex_);if(!attempt.current_system_tls_for_owner())reject("receiver source attempt replaced before describe");retired.swap(current_);current_=next;upload_failure_.clear();upload_pending_=true;}
     const auto wire=json{{"kind","recoveryReady"},{"version",1},{"operation","describe"},{"requestID",next->request}}.dump();
-    try {if(!live(next)||!transport.send_to_attempt(attempt,transport_message::from_string(wire)))reject("receiver source describe retired before send");}
+    try {
+        if(!live(next))reject("receiver source describe retired before send");
+        auto message=transport_message::from_string(wire);message.msg_type=transport_message::type::binary;
+        if(!transport.send_to_attempt(attempt,message))reject("receiver source describe retired before send");
+    }
     catch(...){invalidate(next);throw;}
 }
 bool receiver_source_binding::receive(const platform_transport_callbacks& attempt,uint64_t lifecycle,const transport_message& message) {

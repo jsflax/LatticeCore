@@ -829,7 +829,8 @@ void recovery_receiver_controller::turn() {
                 if(outgoing->completed_disposal)require(runtime.revision==outgoing->completed_disposal->key.revision,"controller disposal handoff generation changed");
                 late_pending=runtime.budget->slots.load()!=0;if(!late_pending)runtime.outstanding=outgoing;}
             if(late_pending){settle.keep_admission_wait=true;observe("late-control-handoff-deferred");return;}
-            require(c.route->state_->source->recovery_send(c.view,*c.route->state_->transport,transport_message::from_string(outgoing->request_bytes)),"controller final physical handoff refused");
+            auto message=transport_message::from_string(outgoing->request_bytes);message.msg_type=transport_message::type::binary;
+            require(c.route->state_->source->recovery_send(c.view,*c.route->state_->transport,message),"controller final physical handoff refused");
             if(outgoing->completed_disposal){std::lock_guard lock(runtime.mutex);c.route->state_->issued_discard_view=c.view.value;c.route->state_->late_control_view=c.view.value;}
         };
         // Socket callbacks reserve at most two bounded replies. Only this worker

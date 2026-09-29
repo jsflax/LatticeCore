@@ -61,6 +61,7 @@ struct ControllerWire {
     struct Dial {std::string url;platform_transport_callbacks endpoint;};
     struct Frame {platform_transport_callbacks endpoint;std::string raw;};
     std::mutex mutex;std::deque<Dial> dials;std::deque<Frame> frames;std::vector<platform_transport_callbacks> endpoints;
+    bool record_message_types=false;std::vector<transport_message::type> message_types;
     struct Pipe {std::weak_ptr<ControllerWire> wire;};
     static std::unique_ptr<sync_transport> transport(const std::shared_ptr<ControllerWire>& wire) {
         // Actual owned SDK platform boundary with a mechanical verifier. This
@@ -69,7 +70,7 @@ struct ControllerWire {
             [](void* p,const void* url,const void*,const void* endpoint){if(auto wire=static_cast<Pipe*>(p)->wire.lock()){std::lock_guard lock(wire->mutex);wire->dials.push_back({*static_cast<const std::string*>(url),*static_cast<const platform_transport_callbacks*>(endpoint)});}},
             [](void*){},
             [](void* p,const void* message,const void* endpoint){if(auto wire=static_cast<Pipe*>(p)->wire.lock()){const auto* frame=static_cast<const transport_message*>(message);
-                if(frame->data.size()>8388608)throw db_error("fixture wire bound");std::lock_guard lock(wire->mutex);if(wire->frames.size()>=32)throw db_error("fixture queue bound");wire->frames.push_back({*static_cast<const platform_transport_callbacks*>(endpoint),frame->as_string()});}},
+                if(frame->data.size()>8388608)throw db_error("fixture wire bound");std::lock_guard lock(wire->mutex);if(wire->frames.size()>=32)throw db_error("fixture queue bound");if(wire->record_message_types){if(wire->message_types.size()>=256)throw db_error("fixture message type observation bound");wire->message_types.push_back(frame->msg_type);}wire->frames.push_back({*static_cast<const platform_transport_callbacks*>(endpoint),frame->as_string()});}},
             [](void* p){delete static_cast<Pipe*>(p);},nullptr,[](void*,const void*,const void*)->int32_t{return 1;},[](void*){}));
     }
 };
@@ -2882,5 +2883,61 @@ TEST_F(CompletedPredecessorController, MalformedOriginalLateDiscardCannotKeepOrd
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NULL"),1);
 }
 
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+// Record only the actual outbound platform message discriminator. The existing
+// bounded wire still delivers the unchanged bytes to the real authenticated
+// source; this does not substitute a control or claim stock-adapter TLS proof.
+class BinaryRecoveryReceiverController:public RecoveryReceiverController {
+protected:
+    std::map<std::string,size_t> controls;
+    void capture_message_types(){std::lock_guard lock(wire->mutex);wire->record_message_types=true;}
+    bool before_ready(size_t,const json& control)override {
+        const auto operation=control.at("operation").get<std::string>();
+        if(controls.size()>=16&&!controls.count(operation))throw db_error("fixture control observation bound");
+        ++controls[operation];return false;
+    }
+    bool installed(int64_t revision){return phase()==0&&scalar(*receiver,
+        "SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision="+std::to_string(revision)+" AND active IS NULL")==1;}
+    void expect_binary_messages(){
+        std::vector<transport_message::type> types;
+        {std::lock_guard lock(wire->mutex);types=wire->message_types;}
+        size_t consumed=0;for(const auto& [_,count]:controls)consumed+=count;
+        ASSERT_GT(consumed,0u);ASSERT_GE(types.size(),consumed);
+        for(const auto type:types)EXPECT_EQ(type,transport_message::type::binary);
+    }
+};
+TEST_F(BinaryRecoveryReceiverController, ActualDescribePrepareReadAndCompletedDiscardUseBinaryAcrossPhysicalReconnect) {
+    capture_message_types();configure();insert(*source,controller_uuid(9940),"source");connect();
+    ASSERT_TRUE(until([&]{return installed(1);}));ASSERT_FALSE(has_error());
+    EXPECT_EQ(controls["describe"],1u);EXPECT_EQ(controls["prepare"],1u);EXPECT_GT(controls["read"],0u);
+    expect_binary_messages();
+    const auto rows=receiver->db().query("SELECT * FROM ControllerRow ORDER BY id");
+    ASSERT_EQ(rows.size(),1u);const auto old=peers[0].physical;
+    synchronizers[0]->disconnect();synchronizers[0]->connect();
+    ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
+    EXPECT_FALSE(old.trigger_on_message(transport_message::from_string("{}")));
+    EXPECT_EQ(controls["describe"],2u);EXPECT_EQ(controls["prepare"],2u);EXPECT_GT(controls["discard"],0u);
+    EXPECT_GT(controls["read"],1u);expect_binary_messages();
+    EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),rows);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),1);
+}
+TEST_F(BinaryRecoveryReceiverController, ActualLostPrepareReopenResumesIdenticalRequestUsingBinaryControls) {
+    capture_message_types();configure();insert(*source,controller_uuid(9941),"source");drop_prepare=true;connect();
+    ASSERT_TRUE(until([&]{return dropped==1;}));ASSERT_FALSE(requests.empty());
+    const auto original=requests.front();const auto old_request=receiver->db().query("SELECT request_frame FROM _lattice_recovery_request");
+    const auto old=peers[0].physical;expect_binary_messages();
+    close_receiver();drop_prepare=false;open_receiver();
+    EXPECT_EQ(receiver->db().query("SELECT request_frame FROM _lattice_recovery_request"),old_request);connect();
+    ASSERT_TRUE(until([&]{return installed(1);}));EXPECT_FALSE(has_error());
+    EXPECT_FALSE(old.trigger_on_message(transport_message::from_string("{}")));
+    EXPECT_EQ(controls["describe"],2u);EXPECT_EQ(controls["prepare"],1u);EXPECT_GT(controls["resume"],0u);EXPECT_GT(controls["read"],0u);
+    ASSERT_GE(requests.size(),2u);auto before=json::parse(original),after=json::parse(requests.back());
+    before["latticeCanonicalRange"]["route_generation"]=after["latticeCanonicalRange"]["route_generation"];
+    EXPECT_EQ(before,after);EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);expect_binary_messages();
+}
 }
 #endif

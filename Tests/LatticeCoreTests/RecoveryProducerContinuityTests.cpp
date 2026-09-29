@@ -1509,8 +1509,8 @@ struct no_history_contribution_hook {
 };
 }
 TEST_F(RecoveryNegotiatedNoHistory, AnotherContributionCannotRewriteWitnessFirstClaimBeforeItsOwnClaimSnapshot) {
-    negotiated_ack_pause pause(senders,factory);mount();generate(true,0);start_actual();ASSERT_EQ(audit_wire().size(),1u);
-    const auto first=sessions[0].receive(audit_wire()[0]);ASSERT_EQ(first.status_code(),1);ASSERT_EQ(first.ids().size(),3u);ack(0,pause);
+    negotiated_ack_pause pause(senders,factory);mount();generate(true,0);start_actual();ASSERT_EQ(audit_wire().size(),1u);pause.await_started(1);
+    const auto first=sessions[0].receive(audit_wire()[0]);ASSERT_EQ(first.status_code(),1);ASSERT_EQ(first.ids().size(),3u);ack(0);pause.acknowledged_prefix(1);
     const auto before=complete_snapshot();const auto channel=policy.contributions[1].profile.binding.channel;
     const auto first_claim=owner->db().query("SELECT first_export FROM _lattice_obligation_entry WHERE channel=CAST(? AS BLOB) AND actual_original=CAST(? AS BLOB)",{channel,delete_id});
     ASSERT_EQ(first_claim.size(),1u);const auto original=std::get<int64_t>(first_claim[0].at("first_export"));ASSERT_GT(original,0);

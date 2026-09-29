@@ -2038,3 +2038,202 @@ TEST_F(AuthenticatedReadySession, ReadCostObservationSaturatesWithoutChangingRea
 }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+using CompletedDisposalSnapshot=std::map<std::string,std::vector<database::row_t>>;
+CompletedDisposalSnapshot completed_disposal_state(database& db) {
+    CompletedDisposalSnapshot state;
+    const auto tables=db.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+    if(tables.size()>128)throw db_error("completed disposal fixture table inventory bound");
+    for(const auto& row:tables) {
+        const auto& name=std::get<std::string>(row.at("name"));
+        if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='_';}))
+            throw db_error("completed disposal fixture table name refused");
+        state[name]=db.query("SELECT * FROM \""+name+"\" ORDER BY 1");
+    }
+    state["sqlite_schema"]=db.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+    return state;
+}
+struct CompletedDisposalAudit {
+    detail::canonical_ready_read_test_observation::observation trace;
+    detail::canonical_ready_read_test_observation::observation* previous=detail::canonical_ready_read_test_observation::current;
+    CompletedDisposalAudit(){detail::canonical_ready_read_test_observation::current=&trace;}
+    ~CompletedDisposalAudit(){detail::canonical_ready_read_test_observation::current=previous;}
+};
+json completed_disposal_answer(const relay_ready_result& result) {
+    if(result.status_code()!=1||!result.publishable())throw db_error("completed disposal response unavailable: "+last_bridge_error());
+    auto answer=json::parse(result.wire());
+    if(answer.at("operation")!="discard"||answer.at("leaseAvailable")!=false||answer.contains("lifecycle")||answer.contains("leaseID"))
+        throw db_error("original-profile disposal response shape changed");
+    return answer;
+}
+class AuthenticatedCompletedDisposal:public AuthenticatedReadySession {
+protected:
+    void start_disposal() {
+        setup=open(policy(),connection());
+        if(!setup.valid()||!setup.finish_authorization(outcome(setup).dump()))
+            throw db_error("completed disposal actual source authorization failed: "+last_bridge_error());
+    }
+    json discard(const ready_wire::frame& q,const json& d) {return completed_disposal_answer(invoke(setup,command("discard",q,d)));}
+    CompletedDisposalSnapshot state(){return completed_disposal_state(owner->db());}
+};
+
+TEST_F(AuthenticatedCompletedDisposal, LostCompletedDiscardReplyRetriesWithOneBindingAndNoDurableChanges) {
+    start_disposal();const auto original=entry(801,"retained application row");
+    ASSERT_EQ(setup.receive(frame(original)).ids(),std::vector<std::string>{original.global_id});
+    const auto d=description(setup);ASSERT_EQ(d.at("profile").at("name"),"boundedV1");const auto q=request(d);
+    const auto offered=lease(setup,q,d,"prepare",1000);auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());
+    const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");
+    const auto old_receipts=receipts();ASSERT_EQ(bindings.size(),1u);ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);
+    auto first=invoke(setup,command("discard",q,d));const auto answer=completed_disposal_answer(first);
+    ASSERT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(queued.publishable());
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(receipts(),old_receipts);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),bindings);
+    const auto disposed=state();first={}; // The original response is lost after the real COMMIT.
+    {CompletedDisposalAudit audit;AddressedReadAuthorizerFault commit(owner->db(),false);
+        const auto retry=discard(q,d);EXPECT_EQ(retry.at("settlement").at("state"),"committed");
+        EXPECT_EQ(commit.commits,1u);EXPECT_EQ(audit.trace.full_audits,2u);}
+    EXPECT_EQ(state(),disposed);
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),disposed);
+    const auto stale=invoke(setup,command("prepare",q,d,1000));ASSERT_EQ(stale.status_code(),1);
+    EXPECT_FALSE(json::parse(stale.wire()).at("leaseAvailable").get<bool>());EXPECT_EQ(state(),disposed);
+    EXPECT_TRUE(lease(setup,request(d,2),d,"prepare",1000).at("leaseAvailable").get<bool>());
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(receipts(),old_receipts);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, ExtantCapsuleRequiresExactAttemptRequestAndSequence) {
+    start_disposal();const auto d=description(setup);const auto q=request(d,2);(void)lease(setup,q,d,"prepare",1000);
+    const auto before=state();
+    for(unsigned kind=0;kind<4;++kind) {
+        SCOPED_TRACE(kind);auto changed=q;
+        if(kind==0)changed.logical.attempt_id=relay_uuid(9810);
+        if(kind==1)std::get<ready_wire::request>(changed.body).receipts={{relay_uuid(9811),"app",{{"AuthenticatedRelayRow",relay_uuid(9812)}}}};
+        if(kind==2)changed.logical.sequence=1;
+        if(kind==3)changed.logical.sequence=3;
+        seal(changed,d);const auto refused=discard(changed,d);
+        EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(state(),before);
+    }
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, NeverStartedOrWrongHighWaterCannotRetireOrAdvanceASequence) {
+    start_disposal();const auto d=description(setup);const auto q=request(d,2);const auto empty=state();
+    EXPECT_NE(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),empty);
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),0);
+    (void)lease(setup,q,d,"prepare",1000);ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");
+    const auto terminal=state();
+    for(const uint64_t sequence:{uint64_t{1},uint64_t{3}}) {
+        SCOPED_TRACE(sequence);EXPECT_NE(discard(request(d,sequence),d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),terminal);
+    }
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),terminal);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, AbsentCapsuleProvesCurrentSequenceStateWithoutInventingHistoricalQBytes) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto terminal=state();
+    // Deleted capsules do not retain a historical attempt-ID/request digest.
+    // This different, valid Q names the same actual binding and exact high-water.
+    auto different=q;different.logical.attempt_id=relay_uuid(9820);
+    std::get<ready_wire::request>(different.body).receipts={{relay_uuid(9821),"app",{{"AuthenticatedRelayRow",relay_uuid(9822)}}}};seal(different,d);
+    ASSERT_NE(std::get<ready_wire::request>(different.body).request_digest,std::get<ready_wire::request>(q.body).request_digest);
+    const auto answer=discard(different,d);EXPECT_EQ(answer.at("settlement").at("state"),"committed");
+    EXPECT_FALSE(answer.contains("receipts"));EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(state(),terminal);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, AbsentRetryStillRequiresActualSourcePeerNamespaceAndExistingBinding) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto terminal=state();
+    for(unsigned kind=0;kind<4;++kind) {
+        SCOPED_TRACE(kind);auto foreign=q;auto& body=std::get<ready_wire::request>(foreign.body);
+        if(kind==0){body.source.epoch=relay_uuid(9830);body.expected.binding=body.source;}
+        if(kind==1)foreign.logical.receiver_incarnation=relay_uuid(9831);
+        if(kind==2)foreign.logical.channel_incarnation=relay_uuid(9832);
+        if(kind==3)foreign.logical.channel="another-channel";
+        seal(foreign,d);const auto result=invoke(setup,command("discard",foreign,d));EXPECT_NE(result.status_code(),1);EXPECT_EQ(state(),terminal);
+    }
+    auto other_peer=open(policy(),connection(2));ASSERT_TRUE(other_peer.valid());ASSERT_TRUE(other_peer.finish_authorization(outcome(other_peer).dump()));
+    const auto peer_d=description(other_peer);const auto peer_q=request(peer_d);const auto before_peer=state();
+    EXPECT_NE(completed_disposal_answer(invoke(other_peer,command("discard",peer_q,peer_d))).at("settlement").at("state"),"committed");EXPECT_EQ(state(),before_peer);
+    auto p=policy();p["receiptNamespace"]="other";auto other_namespace=open(p,connection());ASSERT_TRUE(other_namespace.valid());
+    ASSERT_TRUE(other_namespace.finish_authorization(outcome(other_namespace).dump()));const auto ns_d=description(other_namespace);const auto ns_q=request(ns_d);const auto before_ns=state();
+    EXPECT_NE(completed_disposal_answer(invoke(other_namespace,command("discard",ns_q,ns_d))).at("settlement").at("state"),"committed");EXPECT_EQ(state(),before_ns);
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");
+}
+
+TEST_F(AuthenticatedCompletedDisposal, AbsentRetryStillAuditsAnotherCapsulesOffPageContentBeforeAnyCommit) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");
+    auto other=open(policy(),connection(2));ASSERT_TRUE(other.valid());ASSERT_TRUE(other.finish_authorization(outcome(other).dump()));
+    const auto other_d=description(other);(void)lease(other,request(other_d),other_d,"prepare",1000);
+    const auto before=state();const auto tail=owner->db().query("SELECT binding,frame_index,data FROM _lattice_canonical_ready_frame ORDER BY frame_index DESC LIMIT 1").at(0);
+    ASSERT_GT(std::get<int64_t>(tail.at("frame_index")),0);
+    const auto replace=[&](const std::vector<uint8_t>& data){
+        database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.begin_transaction();raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",{data,tail.at("binding"),tail.at("frame_index")});
+        raw.execute(guard);raw.commit();
+    };
+    replace({'{','}'});const auto corrupt=state();
+    {CompletedDisposalAudit audit;AddressedReadAuthorizerFault commit(owner->db(),false);const auto refused=discard(q,d);
+        EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(audit.trace.full_audits,1u);EXPECT_EQ(commit.commits,0u);}
+    EXPECT_EQ(state(),corrupt);EXPECT_FALSE(owner->db().is_in_transaction());
+    replace(std::get<std::vector<uint8_t>>(tail.at("data")));EXPECT_EQ(state(),before);
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),before);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, CommitDenialRestoresExtantCapsuleAndCannotPublishAnAbsentRetryCommit) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);const auto offered=lease(setup,q,d,"prepare",1000);
+    const auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());const auto before=state();
+    {AddressedReadAuthorizerFault fault(owner->db(),false,true);const auto answer=discard(q,d);
+        EXPECT_EQ(fault.commits,1u);EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_EQ(answer.at("settlement").at("primaryError"),true);}
+    EXPECT_FALSE(queued.publishable());EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(state(),before);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto terminal=state();
+    {AddressedReadAuthorizerFault fault(owner->db(),false,true);const auto answer=discard(q,d);
+        EXPECT_EQ(fault.commits,1u);EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_EQ(answer.at("settlement").at("primaryError"),true);}
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(state(),terminal);
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),terminal);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, ObserverErrorKeepsKnownCommittedDisposalAndNoChangeRetryTruth) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);unsigned calls=0;
+    {AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw db_error("completed disposal observer");})};
+        const auto answer=discard(q,d);EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_EQ(answer.at("settlement").at("postcommitError"),true);
+        EXPECT_EQ(answer.at("settlement").at("primaryError"),false);EXPECT_EQ(answer.at("settlement").at("cleanupError"),false);}
+    ASSERT_EQ(calls,1u);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);const auto terminal=state();
+    {AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw db_error("completed disposal retry observer");})};
+        const auto answer=discard(q,d);EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_EQ(answer.at("settlement").at("postcommitError"),true);}
+    EXPECT_EQ(calls,2u);EXPECT_EQ(state(),terminal);EXPECT_FALSE(owner->db().is_in_transaction());
+}
+
+TEST_F(AuthenticatedCompletedDisposal, LostResultStaysRouteFencedAndReopenedSameBindingCanRetryWithoutCapsule) {
+    start_disposal();auto d=description(setup);auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    auto first=invoke(setup,command("discard",q,d));ASSERT_EQ(completed_disposal_answer(first).at("settlement").at("state"),"committed");
+    route->current=false;EXPECT_FALSE(first.publishable());first={};setup.close_on_io();setup={};route=std::make_shared<RelayRouteState>();
+    start_disposal();d=description(setup);q.route_generation=std::stoull(d.at("routeGeneration").get<std::string>());
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),0);ASSERT_EQ(count("_lattice_canonical_ready_binding"),1);const auto reopened=state();
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),reopened);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, CompletedAbsentDiscardStillRequiresActualRegisteredProducerAndReceiptNamespace) {
+    setup=covered_setup();const auto original=identified(entry(802,"registered immutable original"));
+    ASSERT_EQ(setup.receive(frame(original)).ids(),std::vector<std::string>{original.global_id});const auto d=description(setup);auto q=request(d);
+    q.version=3;auto& body=std::get<ready_wire::request>(q.body);
+    body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace="app";
+    body.receipts={{original.global_id,"app",{{original.table_name,original.global_row_id}},original.original_identity->digest}};seal(q,d);
+    (void)lease(setup,q,d,"prepare",1000);const auto coverage_before=coverage(),receipts_before=receipts();const auto global_before=global_state();
+    ASSERT_EQ(completed_disposal_answer(invoke(setup,command("discard",q,d))).at("settlement").at("state"),"committed");
+    const auto terminal=all_state();EXPECT_EQ(coverage(),coverage_before);EXPECT_EQ(receipts(),receipts_before);EXPECT_EQ(global_state(),global_before);
+    for(unsigned kind=0;kind<3;++kind) {
+        SCOPED_TRACE(kind);auto wrong=q;auto& changed=std::get<ready_wire::request>(wrong.body);
+        if(kind==0)changed.registered_producer->producer=producer(2);
+        if(kind==1){changed.receipt_namespace="other";changed.receipts.clear();}
+        if(kind==2){wrong.version=2;changed.registered_producer.reset();changed.receipt_namespace.reset();changed.receipts.clear();}
+        seal(wrong,d);const auto refused=completed_disposal_answer(invoke(setup,command("discard",wrong,d)));
+        EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(all_state(),terminal);
+    }
+    EXPECT_EQ(completed_disposal_answer(invoke(setup,command("discard",q,d))).at("settlement").at("state"),"committed");EXPECT_EQ(all_state(),terminal);
+}
+}
+#endif

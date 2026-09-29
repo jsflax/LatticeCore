@@ -1,8 +1,11 @@
 #include "canonical_range_staging.hpp"
 #include "recovery_writer_access.hpp"
+#include "vendor/picosha2/picosha2.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <bit>
 #include <limits>
+#include <string_view>
 #include <type_traits>
 
 namespace lattice::detail {
@@ -70,6 +73,48 @@ cr::frame stored_page(database& db,const std::string& channel,int64_t kind,uint6
     try{auto f=cr::decode(wire,b);if((!std::holds_alternative<cr::content_page>(f.body)&&!std::holds_alternative<cr::receipt_page>(f.body))||f.route_generation!=1||page_key(f)!=std::pair<int64_t,uint64_t>{kind,index}||cr::encode(f,b)!=wire)fail(code::corrupt_state,"canonical stored page encoding/index differs");return f;}
     catch(const cr::protocol_error&){fail(code::corrupt_state,"canonical stored page fails framing/hash");}
 }
+// Only the full, authenticated source image has implicit absence semantics.
+// Keep one decoded row and the fixed SHA state, never the whole row stream.
+// Original whole-C/E verification still checks all tombstones and framing.
+class full_present_hasher {
+    picosha2::hash256_one_by_one hash_;
+    uint64_t bytes_=0;
+    void raw(std::string_view value) {
+        if(value.size()>std::numeric_limits<uint64_t>::max()/8-bytes_)
+            fail(code::capacity,"canonical full image SHA length exceeded");
+        bytes_+=value.size();
+        while(!value.empty()){const auto n=std::min<size_t>(4096,value.size());hash_.process(value.begin(),value.begin()+n);value.remove_prefix(n);}
+    }
+    void number(uint64_t value){char out[8];for(unsigned i=0;i<8;++i)out[7-i]=static_cast<char>(value>>(8*i));raw({out,8});}
+    void field(std::string_view value){number(value.size());raw(value);}
+public:
+    explicit full_present_hasher(const cr::manifest& manifest) {
+        field("lattice.canonical-full-present.v1");
+        const auto& source=manifest.source;
+        for(const auto* value:{&source.authority,&source.source_id,&source.epoch,&source.scope_digest,&source.schema_digest})field(*value);
+        number(manifest.head);number(manifest.counts.present);
+    }
+    void append(const cr::content_item& item,const sync_recovery::value_limits& limits) {
+        const auto* present=std::get_if<cr::present>(&item.value);if(!present)return;
+        // The strict value decoder gives stable field order and scalar types;
+        // equivalent JSON whitespace/member ordering is not a different row.
+        const auto values=sync_recovery::decode_values(present->payload,limits);
+        // Production canonical capture already emits normalized UUID keys.
+        // Keep keys and payload strings exact; do not fold arbitrary text.
+        field(item.key.table);field(item.key.id);number(values.size());
+        for(const auto& [name,value]:values) {
+            field(name);
+            if(std::holds_alternative<std::nullptr_t>(value))number(0);
+            else if(const auto* n=std::get_if<int64_t>(&value)){number(1);number(static_cast<uint64_t>(*n));}
+            // row_values equality and SQLite numeric equality both identify
+            // REAL signed zeros; preserve every other finite REAL bit pattern.
+            else if(const auto* n=std::get_if<double>(&value)){number(2);number(std::bit_cast<uint64_t>(*n==0?0.0:*n));}
+            else if(const auto* text=std::get_if<std::string>(&value)){number(3);field(*text);}
+            else {number(4);const auto& data=std::get<blob>(value);number(data.size());if(!data.empty())raw({reinterpret_cast<const char*>(data.data()),data.size()});}
+        }
+    }
+    std::string finish(){hash_.finish();return picosha2::get_hash_hex_string(hash_);}
+};
 }
 canonical_staging_snapshot describe_canonical_range(const cr::attempt& a,const cr::request& request,
     const cr::manifest& manifest,const cr::limits& codec,uint64_t route) {
@@ -77,6 +122,15 @@ canonical_staging_snapshot describe_canonical_range(const cr::attempt& a,const c
     (void)cr::encode({a,route,request},codec);
     (void)cr::encode({a,route,manifest},narrow(codec,request.budget));
     return snapshot(initial,route,false);
+}
+void require_equal_canonical_full_images(const canonical_staging_snapshot& a,const canonical_staging_snapshot& b) {
+    if(a.state.offer.selection!=cr::mode::full||b.state.offer.selection!=cr::mode::full||
+       a.state.offer.source!=b.state.offer.source||a.state.offer.head!=b.state.offer.head)
+        fail(code::invalid_argument,"canonical full images require the same source and frontier");
+    if(!a.content_verified||!b.content_verified||!a.full_present_digest||!b.full_present_digest)
+        fail(code::not_verified,"canonical full images lack current whole verification");
+    if(a.full_present_digest!=b.full_present_digest)
+        fail(code::digest_mismatch,"canonical equal frontier images differ");
 }
 canonical_range_staging::canonical_range_staging(std::shared_ptr<lattice_db> owner,receive_install_limits il,cr::limits codec,canonical_staging_limits limits)
     : owner_(std::move(owner)),installation_(owner_,il),install_limits_(il),codec_(codec),limits_(limits) {
@@ -158,12 +212,14 @@ canonical_staging_snapshot canonical_range_staging::addressed(const cr::attempt&
 canonical_staging_snapshot canonical_range_staging::verify_storage(const canonical_staging_snapshot& stored,bool whole) const {
     auto state=cr::begin(stored.state.logical,stored.state.frozen_request,stored.state.offer,codec_);
     const auto effective=narrow(codec_,state.frozen_request.budget);cr::stream_hasher content(state.offer,cr::stream_kind::content,effective),receipts(state.offer,cr::stream_kind::receipts,effective);
+    std::optional<full_present_hasher> full_image;
+    if(whole&&state.offer.selection==cr::mode::full)full_image.emplace(state.offer);
     auto& db=connection();const auto& channel=state.logical.channel;int64_t actual_bytes=0;
     for(const int64_t kind:{0,1}){
         const auto pages=kind==0?stored.state.next_content_page:stored.state.next_receipt_page;
         for(uint64_t index=0;index<pages;++index){auto page=stored_page(db,channel,kind,index,effective);
             const auto wire=cr::encode(page,effective);actual_bytes=add(actual_bytes,add(size(channel),size(wire)));
-            if(const auto* p=std::get_if<cr::content_page>(&page.body))for(const auto& row:p->items)content.append(row);
+            if(const auto* p=std::get_if<cr::content_page>(&page.body))for(const auto& row:p->items){content.append(row);if(full_image)full_image->append(row,effective.values);}
             else for(const auto& row:std::get<cr::receipt_page>(page.body).items)receipts.append(row);
             state=cr::propose(state,page,codec_);
         }
@@ -178,7 +234,9 @@ canonical_staging_snapshot canonical_range_staging::verify_storage(const canonic
     }
     auto compare=state;if(whole&&!stored.content_verified)compare.status=cr::phase::receiving;
     if(compare!=stored.state)fail(code::corrupt_state,"canonical recorded progress differs from retained pages");
-    return snapshot(std::move(state),stored.route_generation,whole||stored.content_verified);
+    auto result=snapshot(std::move(state),stored.route_generation,whole||stored.content_verified);
+    if(full_image)result.full_present_digest=full_image->finish();
+    return result;
 }
 void canonical_range_staging::audit() const {
     connection();installation_.audit();audit_usage();auto& db=connection();std::optional<std::string> previous;
@@ -254,7 +312,7 @@ canonical_staging_snapshot canonical_range_staging::verify_complete(const canoni
     if(prior<0||prior>u.stored_bytes)fail(code::corrupt_state,"canonical state charge exceeds usage");if(!fits(u.stored_bytes-prior,size(image),limits_.stored_bytes))fail(code::capacity,"canonical verified state exceeds stored-byte cap");
     auto after=u;after.stored_bytes=u.stored_bytes-prior+size(image);
     return atomic(db,[&]{db.execute("UPDATE main._lattice_range_attempt SET state=?,verified=1 WHERE channel=?",{bytes(image),bytes(a.channel)});changed(db);write_usage(db,u,after);
-        const auto actual=addressed(a,m,route);if(actual.state!=next.state||!actual.content_verified)fail(code::corrupt_state,"canonical verified write was changed");return actual;});
+        auto actual=addressed(a,m,route);if(actual.state!=next.state||!actual.content_verified)fail(code::corrupt_state,"canonical verified write was changed");actual.full_present_digest=next.full_present_digest;return actual;});
 }
 canonical_staging_snapshot canonical_range_staging::rebind(const cr::attempt& a,const std::string& m,uint64_t expected,uint64_t replacement){
     auto& db=connection();count(replacement);if(!replacement||replacement<=expected)fail(code::stale_route,"canonical replacement route must increase");const auto old=addressed(a,m,expected);

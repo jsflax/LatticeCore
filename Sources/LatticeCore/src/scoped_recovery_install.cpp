@@ -1135,8 +1135,10 @@ std::vector<receive_install_receipt> install_canonical_cohort_owned(const canoni
         require(image.installation_identity.mode==receive_install_mode::full&&image.installation_identity.head>=floor,
             "canonical cohort would regress an installed domain frontier");
         if(n&&image.installation_identity.head==images[order[n-1]].installation_identity.head)
-            require(image.installation_identity.content_digest==images[order[n-1]].installation_identity.content_digest,
-                "canonical equal frontier images differ");
+            // Each digest was derived above from the actual fully verified
+            // staged pages in this owned WRITE. Transfer C hashes bind each
+            // distinct Q/lease and cannot identify a common source row image.
+            require_equal_canonical_full_images(image,images[order[n-1]]);
     }
     std::vector<receive_install_receipt> results;std::map<std::string,receive_install_snapshot> receivers;
     std::map<std::string,recovery_obligation_scope> scopes;

@@ -462,3 +462,126 @@ TEST_F(CanonicalRangeStaging, InternalRetainedV3VerificationStillRequiresEveryPa
     EXPECT_EQ(stage_rows(*owner),before);EXPECT_EQ(installed(),receiver_before);
     EXPECT_EQ(scalar(owner->db(),"SELECT verified FROM _lattice_range_attempt"),0);tx.rollback();
 }
+
+
+namespace {
+class CanonicalFullImageStaging : public CanonicalRangeStaging {
+protected:
+    Bundle alternate(const Bundle& first) {
+        auto other=first;other.a.channel="channel-B";other.a.channel_incarnation=uuid('6');other.a.attempt_id=uuid('7');
+        other.m.protection={"lease-B",30001};other.seal();return other;
+    }
+    canonical_staging_snapshot stage(const Bundle& value) {
+        receive_install_store install(owner,il);if(!install.read(value.a.channel))install.bind(value.binding());
+        staged->begin(value.a,value.r,value.m,1);
+        for(uint64_t n=0;n<value.m.counts.content_pages;++n)staged->append(value.content(n));
+        if(!value.receipts.empty())staged->append(value.receipt());
+        return staged->verify_end(value.ending());
+    }
+};
+}
+
+TEST_F(CanonicalFullImageStaging, SamePresentRowsAcceptDistinctRequestLeaseAndPagePartition) {
+    x.r.receipts.clear();x.receipts.clear();
+    x.rows={{{"Person","A"},cr::present{R"({"name":{"kind":2,"value":"first"}})"}},
+            {{"Person","B"},cr::present{R"({"name":{"kind":2,"value":"second"}})"}},
+            {{"Person","C"},cr::present{R"({"name":{"kind":2,"value":"third"}})"}}};x.seal();
+    auto other=alternate(x);other.r.budget.items_per_page=1;other.seal();
+    ASSERT_NE(x.r.request_digest,other.r.request_digest);ASSERT_NE(x.m.protection,other.m.protection);
+    ASSERT_NE(x.m.counts.content_pages,other.m.counts.content_pages);ASSERT_NE(x.m.content_digest,other.m.content_digest);
+    initialize();Owned tx(*owner);const auto first=stage(x),second=stage(other);
+    ASSERT_TRUE(first.full_present_digest);ASSERT_TRUE(second.full_present_digest);
+    EXPECT_NE(first.installation_identity.content_digest,second.installation_identity.content_digest);
+    EXPECT_NO_THROW(require_equal_canonical_full_images(first,second));
+    EXPECT_NO_THROW(require_equal_canonical_full_images(second,first));
+    EXPECT_EQ(first.full_present_digest,second.full_present_digest);staged->audit();tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, EmptyFullImagesAcceptDistinctTransferCommitments) {
+    x.rows.clear();x.receipts.clear();x.r.receipts.clear();x.seal();auto other=alternate(x);
+    ASSERT_NE(x.m.content_digest,other.m.content_digest);initialize();Owned tx(*owner);
+    const auto first=stage(x),second=stage(other);ASSERT_TRUE(first.full_present_digest);
+    EXPECT_NO_THROW(require_equal_canonical_full_images(first,second));
+    EXPECT_EQ(first.full_present_digest,second.full_present_digest);tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, RequestSpecificAbsentTargetsDoNotChangeThePresentImage) {
+    for(const bool empty:{false,true}) {
+        SCOPED_TRACE(empty);Bundle first;
+        first.r.receipts.clear();first.receipts.clear();first.rows.resize(empty?0:1);first.seal();
+        auto other=alternate(first);other.r.receipts={{"op-extra",std::string("namespace-B"),{{"Person","Z"}}}};
+        other.receipts={{"op-extra",cr::unknown{cr::unknown_reason::unproved_provenance}}};
+        other.rows.push_back({{"Person","Z"},cr::tombstone{}});other.seal();
+        // Each iteration owns a separate real staging/installation store.
+        owner=std::make_shared<lattice::lattice_db>(config());x=first;initialize();Owned tx(*owner);
+        const auto a=stage(first),b=stage(other);ASSERT_NE(a.state.offer.counts.tombstones,b.state.offer.counts.tombstones);
+        ASSERT_NE(a.installation_identity.content_digest,b.installation_identity.content_digest);
+        EXPECT_NO_THROW(require_equal_canonical_full_images(a,b));EXPECT_EQ(a.full_present_digest,b.full_present_digest);tx.commit();
+    }
+}
+
+TEST_F(CanonicalFullImageStaging, TypedValuesIgnoreJsonFormattingAndNormalizeOnlyRealSignedZero) {
+    x.r.receipts.clear();x.receipts.clear();
+    x.rows={{{"Person","A"},cr::present{R"({"count":{"kind":1,"value":1},"name":{"kind":2,"value":"CaseSensitive"},"zero":{"kind":7,"value":-0.0}})"}}};x.seal();
+    auto other=alternate(x);std::get<cr::present>(other.rows[0].value).payload=
+        R"({ "zero" : { "value" : 0.0, "kind" : 7 }, "name" : { "value" : "CaseSensitive", "kind" : 2 }, "count" : { "value" : 1, "kind" : 1 } })";
+    other.seal();ASSERT_NE(x.m.content_digest,other.m.content_digest);initialize();Owned tx(*owner);
+    const auto first=stage(x),second=stage(other);EXPECT_NO_THROW(require_equal_canonical_full_images(first,second));
+    EXPECT_EQ(first.full_present_digest,second.full_present_digest);tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, ChangedPresentPayloadRefusesEqualFrontierComparison) {
+    auto other=alternate(x);std::get<cr::present>(other.rows[0].value).payload=R"({"name":{"kind":2,"value":"Value"}})";other.seal();
+    initialize();Owned tx(*owner);const auto first=stage(x),second=stage(other);const auto before=staged->usage();
+    ASSERT_EQ(first.state.offer.head,second.state.offer.head);ASSERT_TRUE(first.content_verified&&second.content_verified);
+    refusal(canonical_staging_code::digest_mismatch,[&]{require_equal_canonical_full_images(first,second);});
+    EXPECT_EQ(staged->usage(),before);EXPECT_FALSE(installed().last_installed);tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, PresentVersusAbsentRefusesEvenWithValidWholeStreams) {
+    auto other=alternate(x);other.rows[0].value=cr::tombstone{};other.seal();
+    initialize();Owned tx(*owner);const auto first=stage(x),second=stage(other);
+    ASSERT_TRUE(first.content_verified&&second.content_verified);
+    refusal(canonical_staging_code::digest_mismatch,[&]{require_equal_canonical_full_images(first,second);});
+    EXPECT_FALSE(installed().last_installed);tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, IntegerAndRealPayloadTypesRemainDifferent) {
+    x.rows[0].value=cr::present{R"({"count":{"kind":1,"value":1}})"};x.seal();auto other=alternate(x);
+    other.rows[0].value=cr::present{R"({"count":{"kind":7,"value":1.0}})"};other.seal();
+    initialize();Owned tx(*owner);const auto first=stage(x),second=stage(other);
+    refusal(canonical_staging_code::digest_mismatch,[&]{require_equal_canonical_full_images(first,second);});tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, BeginPartialResumeAndDeltaNeverSupplyAFullCommitment) {
+    initialize();Owned tx(*owner);auto admitted=begin();ASSERT_TRUE(admitted.staged);
+    EXPECT_FALSE(admitted.staged->full_present_digest);
+    const auto partial=staged->append(x.content());EXPECT_FALSE(partial.full_present_digest);
+    EXPECT_FALSE(staged->resume(x.a,x.m.manifest_digest,1).full_present_digest);
+    staged->append(x.receipt());const auto first=staged->verify_end(x.ending());ASSERT_TRUE(first.full_present_digest);
+    // A persisted verified flag does not populate a new caller's commitment.
+    const auto resumed=staged->resume(x.a,x.m.manifest_digest,1);ASSERT_TRUE(resumed.content_verified);EXPECT_FALSE(resumed.full_present_digest);
+    refusal(canonical_staging_code::not_verified,[&]{require_equal_canonical_full_images(first,resumed);});
+    receive_install_store install(owner,il);install.complete(x.binding(),first.installation_identity);
+    staged->release_installed(x.a,x.m.manifest_digest,1);
+    next(2);const auto delta=stage(x);ASSERT_TRUE(delta.content_verified);EXPECT_FALSE(delta.full_present_digest);
+    refusal(canonical_staging_code::invalid_argument,[&]{require_equal_canonical_full_images(first,delta);});tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, APreviousCommitmentCannotReplaceReadingCurrentWholePages) {
+    initialize();Owned tx(*owner);const auto verified=stage(x);ASSERT_TRUE(verified.full_present_digest);
+    owner->db().execute("SAVEPOINT corrupt_full_image");
+    owner->db().execute("UPDATE _lattice_range_page SET wire=CAST('invalid current page' AS BLOB) WHERE stream=0");
+    refusal(canonical_staging_code::corrupt_state,[&]{staged->verify_end(x.ending());});
+    owner->db().execute("ROLLBACK TO corrupt_full_image");owner->db().execute("RELEASE corrupt_full_image");
+    const auto current=staged->verify_end(x.ending());EXPECT_NO_THROW(require_equal_canonical_full_images(verified,current));tx.commit();
+}
+
+TEST_F(CanonicalFullImageStaging, MatchingRowsDoNotIdentifyAnotherSourceOrHead) {
+    auto other=alternate(x);other.m.head++;other.seal();initialize();Owned tx(*owner);
+    const auto first=stage(x),second=stage(other);
+    refusal(canonical_staging_code::invalid_argument,[&]{require_equal_canonical_full_images(first,second);});
+    auto different=alternate(x);different.a.channel="channel-C";different.r.source.schema_digest=std::string(64,'c');
+    different.r.expected.binding=different.r.source;different.seal();const auto third=stage(different);
+    refusal(canonical_staging_code::invalid_argument,[&]{require_equal_canonical_full_images(first,third);});tx.commit();
+}

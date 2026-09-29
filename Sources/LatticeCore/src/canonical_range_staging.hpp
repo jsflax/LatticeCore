@@ -34,6 +34,12 @@ struct canonical_staging_snapshot {
     bool content_verified=false;
     receive_install_binding installation_binding;
     receive_install_identity installation_identity;
+    // Transient semantic commitment, derived only while re-reading and fully
+    // verifying the actual retained pages in the current owned WRITE. This is
+    // not persisted, a caller capability, or a replacement for the C/E hashes.
+    // Full images include every PRESENT row; request-specific absent targets
+    // and transfer framing do not change this image.
+    std::optional<std::string> full_present_digest=std::nullopt;
 };
 // Pure bounded framing description shared by staging and committed-result
 // observation. Revalidates Q/M against the complete logical attempt and derives
@@ -41,6 +47,11 @@ struct canonical_staging_snapshot {
 canonical_staging_snapshot describe_canonical_range(const canonical_range::attempt&,
     const canonical_range::request&,const canonical_range::manifest&,
     const canonical_range::limits&,uint64_t route_generation);
+// Pure assertion over derived full-image facts; grants no source/installation
+// authority. The installer must obtain both snapshots itself by whole staging
+// verification in the same actual owned WRITE that consumes this comparison.
+void require_equal_canonical_full_images(const canonical_staging_snapshot&,
+    const canonical_staging_snapshot&);
 struct canonical_staging_begin {
     receive_install_disposition disposition;
     // Empty for exact last-installed retry after explicit staging release.

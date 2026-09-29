@@ -1425,3 +1425,25 @@ TEST_F(RecoveryComposedDelivery, StaleParkedRestrictedFrameKeepsCohortUntilActua
 }
 }
 #endif
+
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(RecoveryReceiverController, EqualSourceFrontierInstallsDistinctActualRequestAndLeaseCommitments) {
+    configure(2);insert(*source,controller_uuid(9100),"shared source row");
+    insert(*receiver,controller_uuid(9101),"retained local intent");const auto pause=pause_install();connect();
+    ASSERT_TRUE(until([&]{return pause->ready();}));ASSERT_EQ(phase(),3);
+    const auto stored=receiver->db().query("SELECT manifest_frame FROM _lattice_recovery_request ORDER BY channel");ASSERT_EQ(stored.size(),2u);
+    std::vector<json> manifests;
+    for(const auto& row:stored){const auto& bytes=std::get<std::vector<uint8_t>>(row.at("manifest_frame"));
+        manifests.push_back(json::parse(std::string(bytes.begin(),bytes.end())).at("latticeCanonicalRange").at("body"));}
+    EXPECT_EQ(manifests[0].at("source"),manifests[1].at("source"));EXPECT_EQ(manifests[0].at("head"),manifests[1].at("head"));
+    EXPECT_NE(manifests[0].at("request_digest"),manifests[1].at("request_digest"));
+    EXPECT_NE(manifests[0].at("lease"),manifests[1].at("lease"));
+    EXPECT_NE(manifests[0].at("content_digest"),manifests[1].at("content_digest"));
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1 AND active IS NULL"),2);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),2);EXPECT_FALSE(has_error());
+    pause->release();ASSERT_TRUE(until([&]{return phase()==0;}));
+}
+}
+#endif

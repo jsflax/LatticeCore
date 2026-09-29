@@ -6,6 +6,7 @@ constexpr int ready_prepare=6,ready_publish=7,ready_resume=8,ready_read=9,ready_
 constexpr int receipt_migrate=11;
 // Private closed addressed-read body only; never a caller-provided witness.
 constexpr int ready_authenticated_read=12;
+constexpr int ready_lifecycle_resume=13,ready_lifecycle_discard=14;
 using retention_inventory=std::map<std::pair<std::string,std::string>,std::string>;
 void append_ready_schema(retention_inventory&);
 void validate_ready_profile(const canonical_ready_profile&,const canonical_writer_profile&,const canonical_retention_limits&,bool registered_profile=false);
@@ -93,6 +94,7 @@ struct canonical_writer_adapter::retention_session {
     std::shared_ptr<const physical_store_identity> identity;
     int64_t main_device=0,main_inode=0,parent_device=0,parent_inode=0,custody_device=0,custody_inode=0;
     int64_t incarnation=0;
+    std::optional<int64_t> orphan_deadline_ms;
     std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
     std::recursive_mutex mutex;
     bool busy=false;

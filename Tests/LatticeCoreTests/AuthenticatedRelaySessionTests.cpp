@@ -1134,3 +1134,242 @@ TEST_F(AuthenticatedReadySession, ReadPostcommitLeaseExpiryStillPreventsPublicat
 }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <condition_variable>
+namespace {
+struct ReadyLifecycleGate {
+    std::mutex mutex;std::condition_variable changed;bool entered=false,released=false,timed_out=false;
+    void wait(){std::unique_lock lock(mutex);entered=true;changed.notify_all();if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
+    bool arrived(){std::lock_guard lock(mutex);return entered;}
+    void release(){std::lock_guard lock(mutex);released=true;changed.notify_all();}
+};
+struct ReadyLifecycleEvents {
+    std::mutex mutex;std::function<void(const char*)> callback;
+    std::atomic<unsigned> settled{0},published{0};
+    void observe(const char* point){
+        if(std::strcmp(point,"maintenance-settled")==0)++settled;
+        if(std::strcmp(point,"maintenance-published")==0)++published;
+        std::function<void(const char*)> current;{std::lock_guard lock(mutex);current=callback;}if(current)current(point);
+    }
+    void set(std::function<void(const char*)> next){std::lock_guard lock(mutex);callback=std::move(next);}
+};
+struct ReadyLifecycleFault {
+    static thread_local ReadyLifecycleFault* current;
+    bool ignore_charge;unsigned hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* prior;
+    ReadyLifecycleFault(database& db,bool ignore=false):ignore_charge(ignore),fault{detail::canonical_writer_custody_test_access::fault_handle(db),apply},prior(detail::canonical_retention_test_hooks::fault){current=this;detail::canonical_retention_test_hooks::fault=&fault;}
+    ~ReadyLifecycleFault(){detail::canonical_retention_test_hooks::fault=prior;current=nullptr;}
+    static int apply(int action,const char* table,const char* column,const char* origin)noexcept {
+        if(origin||!table)return SQLITE_OK;auto& value=*current;
+        if(!value.ignore_charge&&action==SQLITE_TRANSACTION&&std::strcmp(table,"COMMIT")==0){++value.hits;return SQLITE_DENY;}
+        if(value.ignore_charge&&action==SQLITE_UPDATE&&std::strcmp(table,"_lattice_canonical_ready_profile")==0&&column&&std::strcmp(column,"charged")==0){++value.hits;return SQLITE_IGNORE;}
+        return SQLITE_OK;
+    }
+};
+thread_local ReadyLifecycleFault* ReadyLifecycleFault::current=nullptr;
+class AuthenticatedReadyLifecycle:public AuthenticatedReadySession {
+protected:
+    std::shared_ptr<ReadyLifecycleEvents> events=std::make_shared<ReadyLifecycleEvents>();
+    std::shared_ptr<const detail::authenticated_ready_maintenance_test_observation::probe> prior_probe;
+    std::vector<std::shared_ptr<ReadyLifecycleGate>> gates;
+    void SetUp()override {
+        AuthenticatedReadySession::SetUp();auto probe=std::make_shared<detail::authenticated_ready_maintenance_test_observation::probe>();
+        probe->owner=owner.get();probe->observed=[keep=events](const char* point){keep->observe(point);};
+        prior_probe=detail::authenticated_ready_maintenance_test_observation::exchange(std::move(probe));
+    }
+    void TearDown()override {
+        events->set({});for(const auto& gate:gates)gate->release();
+        detail::authenticated_ready_maintenance_test_observation::exchange(std::move(prior_probe));
+        AuthenticatedReadySession::TearDown();
+    }
+    template<class F> bool until(F condition){const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(5);while(!condition()&&std::chrono::steady_clock::now()<limit)std::this_thread::sleep_for(std::chrono::milliseconds(2));return condition();}
+    std::shared_ptr<ReadyLifecycleGate> gate(){auto value=std::make_shared<ReadyLifecycleGate>();gates.push_back(value);return value;}
+    json lifecycle_policy(int64_t grace=10000){auto p=source_policy(true);p["readyProfile"]="bounded48MiBOrphanV1";p["orphanResumeGraceMilliseconds"]=grace;return p;}
+    relay_recovery_setup lifecycle_setup(unsigned replica=1,int64_t grace=10000) {
+        auto value=open(lifecycle_policy(grace),connection(replica),std::make_shared<RelayRouteState>());
+        if(!value.valid())throw std::runtime_error("actual lifecycle setup failed: "+last_bridge_error());
+        auto answer=outcome(value);answer["validForMilliseconds"]=600000;
+        if(!value.finish_authorization(answer.dump()))throw std::runtime_error("actual lifecycle authorization failed");return value;
+    }
+    json lifecycle_command(const char* op,const ready_wire::frame& f,const json& d){auto value=command(op,f,d);value.erase("durationMilliseconds");return value;}
+    json lifecycle_result(const relay_recovery_setup& actual,const char* op,const ready_wire::frame& f,const json& d){
+        const auto response=invoke(actual,lifecycle_command(op,f,d));if(response.status_code()!=1||!response.publishable())throw std::runtime_error("actual lifecycle response unavailable: "+last_bridge_error());return json::parse(response.wire());
+    }
+    int64_t number(const char* sql){return std::get<int64_t>(owner->db().query(sql).at(0).begin()->second);}
+    void reopen_owner(){
+        setup.close_on_io();setup={};const std::weak_ptr<lattice::swift_lattice> prior=owner;
+        owner->close();owner.reset();ref.reset();
+        if(!until([&]{return prior.expired();}))throw std::runtime_error("closed lifecycle owner retained beyond bounded worker observation");
+        AuthenticatedReadySession::SetUp();
+        auto probe=std::make_shared<detail::authenticated_ready_maintenance_test_observation::probe>();probe->owner=owner.get();
+        probe->observed=[keep=events](const char* point){keep->observe(point);};detail::authenticated_ready_maintenance_test_observation::exchange(std::move(probe));
+    }
+};
+TEST_F(AuthenticatedReadyLifecycle, ProfileRequiresExplicitBoundedGraceAndLeavesOldNamesUnchanged) {
+    const auto schema=owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name");
+    auto invalid=lifecycle_policy();invalid.erase("orphanResumeGraceMilliseconds");EXPECT_FALSE(open(invalid,connection()).valid());
+    for(const auto value:{0,3600001}){invalid=lifecycle_policy(value);EXPECT_FALSE(open(invalid,connection()).valid());}
+    invalid=source_policy(true);invalid["orphanResumeGraceMilliseconds"]=1000;EXPECT_FALSE(open(invalid,connection()).valid());
+    EXPECT_EQ(owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"),schema);
+    setup=lifecycle_setup();const auto d=description(setup);EXPECT_EQ(d["profile"]["name"],"bounded48MiBOrphanV1");
+    EXPECT_EQ(d["profile"]["orphanResumeGraceMilliseconds"],10000);EXPECT_EQ(d["profile"]["transfers"],8);EXPECT_EQ(d["profile"]["bindings"],1024);
+    EXPECT_FALSE(open(source_policy(true),connection(2)).valid());EXPECT_FALSE(open(lifecycle_policy(9999),connection(2)).valid());
+}
+TEST_F(AuthenticatedReadyLifecycle, InspectUnstartedIsReadOnlyAndDiscardFencesDelayedPrepareWithExactHighWater) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);const auto before=exact_source();
+    const auto unseen=lifecycle_result(setup,"inspect",q,d);EXPECT_EQ(unseen["lifecycle"]["state"],"unstarted");EXPECT_EQ(unseen["lifecycle"]["bindingHighWater"],"0");EXPECT_EQ(exact_source(),before);
+    const auto disposed=lifecycle_result(setup,"discard",q,d);ASSERT_EQ(disposed["settlement"]["state"],"committed");EXPECT_EQ(disposed["lifecycle"]["state"],"terminal");
+    EXPECT_EQ(disposed["lifecycle"]["requestDigest"],std::get<ready_wire::request>(q.body).request_digest);EXPECT_EQ(disposed["lifecycle"]["attemptID"],q.logical.attempt_id);
+    EXPECT_EQ(disposed["lifecycle"]["sequence"],"1");EXPECT_EQ(disposed["lifecycle"]["bindingHighWater"],"1");EXPECT_EQ(disposed["lifecycle"]["namespaceID"],"app");
+    EXPECT_EQ(disposed["lifecycle"]["replicaID"],d["peer"]["replicaID"]);EXPECT_EQ(disposed["lifecycle"]["receiverIncarnation"],q.logical.receiver_incarnation);
+    EXPECT_EQ(disposed["lifecycle"]["channelIncarnation"],q.logical.channel_incarnation);EXPECT_EQ(disposed["lifecycle"]["channel"],q.logical.channel);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);EXPECT_EQ(count("_lattice_canonical_attempt"),0);
+    EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),number("SELECT SUM(charge) FROM _lattice_canonical_ready_binding"));
+    const auto terminal=exact_source();const auto delayed=invoke(setup,command("prepare",q,d));ASSERT_EQ(delayed.status_code(),1);EXPECT_FALSE(json::parse(delayed.wire())["leaseAvailable"].get<bool>());
+    EXPECT_EQ(exact_source(),terminal);EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");EXPECT_EQ(exact_source(),terminal);
+    EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"terminal");
+    auto next=request(d,2);EXPECT_TRUE(lease(setup,next,d)["leaseAvailable"].get<bool>());
+    const auto stale=lifecycle_result(setup,"inspect",q,d);EXPECT_FALSE(stale.contains("lifecycle"));EXPECT_NE(stale["settlement"]["state"],"committed");
+}
+TEST_F(AuthenticatedReadyLifecycle, PrepareBeforeDiscardKeepsReadOnlyInspectionAndRejectsChangedActiveQ) {
+    setup=lifecycle_setup();const auto d=description(setup);auto q=request(d);const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    std::get<ready_wire::request>(q.body).receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(q,d);
+    const auto offered=lease(setup,q,d);auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());const auto before=exact_source();const auto accepted=receipts();
+    EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"available");EXPECT_TRUE(queued.publishable());EXPECT_EQ(exact_source(),before);
+    auto changed=q;--std::get<ready_wire::request>(changed.body).budget.content_pages;seal(changed,d);
+    for(const auto* op:{"inspect","discard"}){const auto result=lifecycle_result(setup,op,changed,d);EXPECT_FALSE(result.contains("lifecycle"));EXPECT_NE(result["settlement"]["state"],"committed");EXPECT_EQ(exact_source(),before);}
+    const auto discarded=lifecycle_result(setup,"discard",q,d);EXPECT_EQ(discarded["lifecycle"]["state"],"terminal");EXPECT_FALSE(queued.publishable());
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(receipts(),accepted);EXPECT_EQ(count("AuthenticatedRelayRow"),1);
+}
+TEST_F(AuthenticatedReadyLifecycle, DiscardCommitDenialAndIgnoredChargeNeverPublishTerminalOrRetireSequence) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);const auto before=exact_source();
+    for(bool ignore:{false,true}){ReadyLifecycleFault fault(owner->db(),ignore);const auto result=lifecycle_result(setup,"discard",q,d);
+        EXPECT_GT(fault.hits,0u);EXPECT_NE(result["settlement"]["state"],"committed");EXPECT_FALSE(result.contains("lifecycle"));}
+    EXPECT_EQ(exact_source(),before);EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"unstarted");
+    EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");
+}
+TEST_F(AuthenticatedReadyLifecycle, KnownDiscardCommitWithSecondaryErrorRetainsTerminalForLostReplyRetry) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);const auto this_thread=std::this_thread::get_id();
+    const auto hook=owner->add_invalidation_hook([this_thread](const auto&,auto){if(std::this_thread::get_id()==this_thread)throw std::runtime_error("lifecycle committed observer");});
+    const auto result=lifecycle_result(setup,"discard",q,d);owner->remove_invalidation_hook(hook);
+    EXPECT_EQ(result["settlement"]["state"],"committed");EXPECT_EQ(result["settlement"]["postcommitError"],true);EXPECT_EQ(result["lifecycle"]["state"],"terminal");
+    const auto exact=exact_source();EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");EXPECT_EQ(exact_source(),exact);
+}
+TEST_F(AuthenticatedReadyLifecycle, ForeignPeerAndNamespaceCannotInspectOrDiscardAnotherBinding) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);lease(setup,q,d);const auto before=exact_source();
+    auto peer=lifecycle_setup(2);auto other_description=description(peer);auto foreign=q;foreign.route_generation=std::stoull(other_description["routeGeneration"].get<std::string>());
+    EXPECT_EQ(invoke(peer,lifecycle_command("discard",foreign,other_description)).status_code(),4);EXPECT_EQ(exact_source(),before);
+    auto changed=q;std::get<ready_wire::request>(changed.body).source.epoch=relay_uuid(9901);seal(changed,d);
+    EXPECT_EQ(invoke(setup,lifecycle_command("inspect",changed,d)).status_code(),4);EXPECT_EQ(exact_source(),before);
+    changed=q;std::get<ready_wire::request>(changed.body).receipts={{relay_uuid(9902),"other",{{"AuthenticatedRelayRow",relay_uuid(9903)}}}};seal(changed,d);
+    EXPECT_EQ(invoke(setup,lifecycle_command("discard",changed,d)).status_code(),4);EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedReadyLifecycle, AutomaticMaintenanceReclaimsFullSpoolWithoutPrepareCapacityOrReturningClients) {
+    std::vector<relay_recovery_setup> clients;std::vector<relay_ready_charge> held;
+    for(unsigned n=1;n<=8;++n){auto client=lifecycle_setup(n);const auto d=description(client);lease(client,request(d),d,"prepare",10000);clients.push_back(std::move(client));}
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),8);const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");
+    // Shorten only after observing all eight simultaneously retained slots.
+    for(auto& client:clients){const auto d=description(client);const auto response=invoke(client,command("resume",request(d),d,1000));
+        ASSERT_EQ(response.status_code(),1);ASSERT_TRUE(json::parse(response.wire())["leaseAvailable"].get<bool>());}
+    for(unsigned n=0;n<64;++n){auto charge=clients[0].stop_token().reserve_ready(128);if(!charge.valid())break;held.push_back(std::move(charge));}
+    ASSERT_FALSE(clients[0].stop_token().reserve_ready(128).valid());ASSERT_FALSE(held.empty());
+    for(auto& client:clients){client.close_on_io();client={};}clients.clear();
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),bindings);
+    EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),number("SELECT SUM(charge) FROM _lattice_canonical_ready_binding"));
+}
+TEST_F(AuthenticatedReadyLifecycle, EmptyDecisionRacingPrepareAndLastSetupCloseKeepsCurrentIncarnationUntilExpiry) {
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,once](const char* point){if(std::strcmp(point,"empty-before-retire")==0&&!once->exchange(true))paused->wait();});
+    setup=lifecycle_setup();ASSERT_TRUE(until([&]{return paused->arrived();}));const auto d=description(setup);const auto q=request(d);
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");lease(setup,q,d,"prepare",1000);
+    setup.close_on_io();setup={};paused->release();ASSERT_TRUE(until([&]{return events->published.load()>0;}));
+    setup=lifecycle_setup();EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation);
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));const auto next=description(setup);auto exact=q;exact.route_generation=std::stoull(next["routeGeneration"].get<std::string>());
+    EXPECT_EQ(lifecycle_result(setup,"inspect",exact,next)["lifecycle"]["state"],"terminal");
+}
+TEST_F(AuthenticatedReadyLifecycle, RegistrationFailurePrecedesEnrollmentAndDoesNotCreatePermanentUnarmedKeeper) {
+    const auto before=owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name");auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([once](const char* point){if(std::strcmp(point,"before-maintenance-register")==0&&!once->exchange(true))throw std::runtime_error("fixture worker registration failure");});
+    EXPECT_FALSE(open(lifecycle_policy(),connection()).valid());EXPECT_EQ(owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"),before);
+    events->set({});setup=lifecycle_setup();const auto d=description(setup);EXPECT_EQ(lifecycle_result(setup,"discard",request(d),d)["lifecycle"]["state"],"terminal");
+}
+TEST_F(AuthenticatedReadyLifecycle, TransientMaintenanceCallbackFailureIsNotAnEmptySourceOrNewIncarnation) {
+    setup=lifecycle_setup();const auto d=description(setup);lease(setup,request(d),d,"prepare",1000);
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,once](const char* point){if(std::strcmp(point,"before-maintenance")==0&&!once->exchange(true)){
+        paused->wait();throw std::runtime_error("fixture transient maintenance refusal");}});
+    setup.close_on_io();setup={};ASSERT_TRUE(until([&]{return paused->arrived();}));const auto published=events->published.load();paused->release();
+    ASSERT_TRUE(until([&]{return events->published.load()>published;}));events->set({});
+    setup=lifecycle_setup();EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation);
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+}
+TEST_F(AuthenticatedReadyLifecycle, ActualSourceReopenReclaimsDepartedCompletedOrphanAfterExplicitNewGrace) {
+    setup=lifecycle_setup(1,100);const auto d=description(setup);const auto q=request(d);lease(setup,q,d,"prepare",10000);
+    const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");
+    reopen_owner();setup=lifecycle_setup(1,100);const auto resumed_description=description(setup);
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    setup.close_on_io();setup={};ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));
+    EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),bindings);
+}
+TEST_F(AuthenticatedReadyLifecycle, PostEnrollmentSetupFailureKeepsOrphanMaintenanceArmedWithoutAnyReturningClient) {
+    setup=lifecycle_setup(1,100);const auto d=description(setup);lease(setup,request(d),d,"prepare",10000);
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");reopen_owner();
+    auto registrations=std::make_shared<std::atomic<unsigned>>(0);
+    events->set([registrations](const char* point){if(std::strcmp(point,"before-maintenance-register")==0&&++*registrations==2)
+        throw std::runtime_error("fixture setup allocation after enrolled worker armed");});
+    EXPECT_FALSE(open(lifecycle_policy(100),connection()).valid());events->set({});
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+}
+TEST_F(AuthenticatedReadyLifecycle, ClosedOwnerAfterMaintenanceCommitCannotRetainOrTouchReplacementOwner) {
+    const auto paused=gate();auto enabled=std::make_shared<std::atomic<bool>>(false),once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,enabled,once](const char* point){if(enabled->load()&&std::strcmp(point,"maintenance-settled")==0&&!once->exchange(true))paused->wait();});
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);lease(setup,q,d);
+    const auto frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    enabled->store(true);auto temporary=lifecycle_setup(2);ASSERT_TRUE(until([&]{return paused->arrived();}));
+    temporary.close_on_io();temporary={};setup.close_on_io();setup={};owner->close();paused->release();events->set({});reopen_owner();
+    setup=lifecycle_setup();const auto next=description(setup);auto resumed=q;resumed.route_generation=std::stoull(next["routeGeneration"].get<std::string>());
+    EXPECT_TRUE(lease(setup,resumed,next,"resume")["leaseAvailable"].get<bool>());
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),frames);
+}
+TEST_F(AuthenticatedReadyLifecycle, IncompletePublicationIsAvailableTransportStateUntilExactDiscard) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);
+    {AuthenticatedReadyFault fault(owner->db(),true);const auto failed=invoke(setup,command("prepare",q,d));ASSERT_EQ(failed.status_code(),1);
+        const auto body=json::parse(failed.wire());EXPECT_EQ(body["preparation"]["state"],"committed");EXPECT_EQ(body["publication"]["state"],"rolledBack");}
+    EXPECT_EQ(count("_lattice_canonical_attempt"),1);EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"available");
+    EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+TEST_F(AuthenticatedReadyLifecycle, PermanentBindingCapRefusesNewRetirementButExistingBindingCanAdvance) {
+    setup=lifecycle_setup();
+    for(unsigned n=1;n<=1024;++n){auto peer=lifecycle_setup(n);const auto d=description(peer);const auto result=lifecycle_result(peer,"discard",request(d),d);
+        ASSERT_EQ(result["lifecycle"]["state"],"terminal")<<n;}
+    ASSERT_EQ(count("_lattice_canonical_ready_binding"),1024);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);const auto charged=number("SELECT charged FROM _lattice_canonical_ready_profile");
+    auto extra=lifecycle_setup(1025);const auto d=description(extra);const auto failed=lifecycle_result(extra,"discard",request(d),d);
+    EXPECT_NE(failed["settlement"]["state"],"committed");EXPECT_FALSE(failed.contains("lifecycle"));EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),charged);
+    const auto original=description(setup);EXPECT_EQ(lifecycle_result(setup,"discard",request(original,2),original)["lifecycle"]["state"],"terminal");
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),1024);EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),charged);
+}
+TEST_F(AuthenticatedReceiptCoverageV3, LifecycleDiscardKeepsRegisteredOriginalsAndEveryNamespaceCoverageCell) {
+    const auto admitted=[&](const std::string& ns,unsigned peer){auto p=covered_policy(ns);p["readyProfile"]="bounded48MiBOrphanV1";p["orphanResumeGraceMilliseconds"]=1000;
+        auto value=open(p,connection(peer),std::make_shared<RelayRouteState>());if(!value.valid())throw std::runtime_error(last_bridge_error());
+        if(!value.finish_authorization(covered_answer(value).dump()))throw std::runtime_error(last_bridge_error());return value;};
+    setup=admitted("app",1);auto other=admitted("other",2);const auto e=identified(entry());ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);ASSERT_EQ(other.receive(frame(e)).ids().size(),1u);
+    const auto globals=global_state();const auto cells=coverage();const auto origins=owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin ORDER BY original_id");
+    for(auto* client:{&setup,&other}){const auto d=description(*client);auto q=request(d);auto& body=std::get<ready_wire::request>(q.body);
+        body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace=d["source"]["receiptNamespace"].get<std::string>();seal(q,d);
+        auto foreign=q;std::get<ready_wire::request>(foreign.body).receipt_namespace=*body.receipt_namespace=="app"?"other":"app";seal(foreign,d);
+        const auto before=all_state();const auto refused=invoke(*client,command("discard",foreign,d));ASSERT_EQ(refused.status_code(),1);
+        EXPECT_FALSE(json::parse(refused.wire()).contains("lifecycle"));EXPECT_EQ(all_state(),before);
+        EXPECT_TRUE(lease(*client,q,d,"prepare",1000)["leaseAvailable"].get<bool>());EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+        auto discard=command("discard",q,d);const auto result=invoke(*client,discard);ASSERT_EQ(result.status_code(),1);EXPECT_EQ(json::parse(result.wire())["lifecycle"]["state"],"terminal");}
+    EXPECT_EQ(global_state(),globals);EXPECT_EQ(coverage(),cells);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin ORDER BY original_id"),origins);
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+}
+#endif

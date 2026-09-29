@@ -67,7 +67,13 @@ void scope(const json& j) {
     std::set<std::string> seen;for(const auto& link:links)if(!link.is_string()||link.get_ref<const std::string&>().size()>64||!tables.count(link.get<std::string>())||!seen.insert(link.get<std::string>()).second)reject("receiver source link scope");
 }
 void profile(const json& j) {
-    shape(j,{"name","wire","requestEntries","requestTargets","requestTargetBytes","parserDepth","parserNodes","scalarBytes","restartBytes","valueLimits","leaseMilliseconds","packageBytes","frames","transfers","bindings","durableBytes","transferBytes","captureRows","captureBytes","requestBytes","pendingRequests","pendingInputAndReplyBytes","pendingWorkspaceBytes"});
+    auto required=j;const auto name=text(j,"name",64);
+    if(name=="bounded48MiBOrphanV1"){
+        const auto grace=number(j,"orphanResumeGraceMilliseconds");
+        if(grace<=0||grace>3600000)reject("receiver source lifecycle grace bound");
+        required.erase("orphanResumeGraceMilliseconds");
+    }
+    shape(required,{"name","wire","requestEntries","requestTargets","requestTargetBytes","parserDepth","parserNodes","scalarBytes","restartBytes","valueLimits","leaseMilliseconds","packageBytes","frames","transfers","bindings","durableBytes","transferBytes","captureRows","captureBytes","requestBytes","pendingRequests","pendingInputAndReplyBytes","pendingWorkspaceBytes"});
     (void)text(j,"name",64);
     const auto& wire=j.at("wire");shape(wire,{"frame_bytes","payload_bytes","items_per_page","content_pages","content_identities","content_bytes","receipt_pages","receipts","receipt_bytes"});
     for(auto it=wire.begin();it!=wire.end();++it)(void)decimal(wire,it.key().c_str());

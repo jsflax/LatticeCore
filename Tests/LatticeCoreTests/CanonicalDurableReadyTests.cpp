@@ -570,3 +570,70 @@ TEST_F(CanonicalDurableReady, OffPageTailCorruptionStillRefusesReopenBeforeIncar
     EXPECT_EQ(snapshot(),before);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+TEST_F(CanonicalDurableReady, ExplicitLifecycleGraceMustBePositiveBoundedAndPersistExactly) {
+    const auto before=owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name");
+    policy.orphan_resume_grace_ms=0;EXPECT_THROW(attach(),db_error);
+    policy.orphan_resume_grace_ms=retention().duration_ms+1;EXPECT_THROW(attach(),db_error);
+    policy.orphan_resume_grace_ms=INT64_MAX;EXPECT_THROW(attach(),db_error);
+    EXPECT_EQ(owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"),before);
+    policy.orphan_resume_grace_ms=1000;attach();auto admission=admit();const auto offered=prepare(admission);complete(offered);
+    const auto exact=snapshot();adapter.reset();policy.orphan_resume_grace_ms.reset();EXPECT_THROW(attach(),db_error);EXPECT_EQ(snapshot(),exact);
+    policy.orphan_resume_grace_ms=999;EXPECT_THROW(attach(),db_error);EXPECT_EQ(snapshot(),exact);
+    policy.orphan_resume_grace_ms=1000;attach();EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+}
+TEST_F(CanonicalDurableReady, LifecycleExpiredOrphansFreeAllSlotsPinsAndTransferChargeButKeepReceiptsAndHighWater) {
+    policy.orphan_resume_grace_ms=1;attach();auto admission=admit();const auto accepted=ready_entry(111,112);import_entry(admission,accepted);ask(accepted);
+    for(int n=0;n<policy.transfers;++n){logical.channel="orphan-"+std::to_string(n);seal();complete(prepare(admission));}
+    const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");
+    const auto receipts=owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY original_id");
+    const auto payload=owner->db().query("SELECT * FROM DurableReadyRow ORDER BY id");
+    reopen();std::this_thread::sleep_for(std::chrono::milliseconds(3));committed(adapter->expire_ready_owned(owner));
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(scalar(owner->db(),"SELECT active FROM _lattice_canonical_ready_profile"),0);
+    EXPECT_EQ(scalar(owner->db(),"SELECT charged FROM _lattice_canonical_ready_profile"),scalar(owner->db(),"SELECT SUM(charge) FROM _lattice_canonical_ready_binding"));
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),bindings);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY original_id"),receipts);
+    EXPECT_EQ(owner->db().query("SELECT * FROM DurableReadyRow ORDER BY id"),payload);
+    auto fresh=admit();EXPECT_NE(prepare(fresh).preparation.state,phase::committed);
+    owner->add(DurableReadyRow{"later tail"});committed(adapter->prune_recovery_owned(owner,head()));
+    logical.channel="new-binding-after-orphans";seal();complete(prepare(fresh));
+}
+TEST_F(CanonicalDurableReady, LifecycleEarlyResumeKeepsExactBytesAndWinsOverLaterOrphanMaintenance) {
+    policy.orphan_resume_grace_ms=1000;attach();auto old_admission=admit();const auto offered=prepare(old_admission);complete(offered);
+    const auto exact_frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    reopen();auto fresh=admit();const auto resumed=adapter->resume_ready_owned(owner,fresh,logical,request,10000,11);
+    committed(resumed.settlement);ASSERT_TRUE(resumed.lease);ASSERT_TRUE(resumed.transfer);EXPECT_EQ(resumed.transfer->manifest,offered.transfer->manifest);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1002));committed(adapter->expire_ready_owned(owner));
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),exact_frames);
+    const auto read=adapter->read_ready_frame_owned(owner,fresh,*resumed.lease,0);committed(read.settlement);ASSERT_TRUE(read.frame);
+    EXPECT_EQ(cr::decode(*read.frame,policy.package.codec).route_generation,11u);
+}
+TEST_F(CanonicalDurableReady, LifecycleLateResumeAtomicallyDisposesInsteadOfResurrectingOldCapsule) {
+    policy.orphan_resume_grace_ms=1;attach();auto admission=admit();const auto offered=prepare(admission);complete(offered);
+    const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding");
+    reopen();std::this_thread::sleep_for(std::chrono::milliseconds(3));auto fresh=admit();
+    const auto resumed=adapter->resume_ready_owned(owner,fresh,logical,request,10000,11);committed(resumed.settlement);
+    EXPECT_FALSE(resumed.lease);EXPECT_FALSE(resumed.transfer);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding"),bindings);
+    EXPECT_NE(prepare(fresh).preparation.state,phase::committed);
+}
+TEST_F(CanonicalDurableReady, LifecycleFailedOrphanDisposalKeepsWholeCapsuleForAuditedRetry) {
+    policy.orphan_resume_grace_ms=1;attach();auto admission=admit();complete(prepare(admission));reopen();
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));const auto before=snapshot();
+    {ReadyFault fault(owner->db(),ReadyFault::disposal_deny);const auto failed=adapter->expire_ready_owned(owner);
+        EXPECT_EQ(failed.state,phase::rolled_back);EXPECT_EQ(fault.hits,1);}
+    EXPECT_EQ(snapshot(),before);committed(adapter->expire_ready_owned(owner));EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+TEST_F(CanonicalDurableReady, LifecycleOffPageCorruptionRefusesReopenBeforeIncarnationAndGraceCleanup) {
+    policy.orphan_resume_grace_ms=1;attach();auto admission=admit();import_entry(admission,ready_entry(191,192));complete(prepare(admission));
+    adapter.reset();owner->close();sibling->close();
+    {database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=X'7b7d' WHERE frame_index=(SELECT MAX(frame_index) FROM _lattice_canonical_ready_frame)");raw.execute(guard);}
+    owner=ready_owner(file.str());sibling=ready_owner(file.str());const auto before=snapshot();
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));EXPECT_THROW(attach(),db_error);EXPECT_EQ(snapshot(),before);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+}
+#endif

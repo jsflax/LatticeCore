@@ -27,7 +27,7 @@ cr::source_binding ready_source(const canonical_writer_profile& p,const canonica
     return {ready.authority,p.binding.source,p.binding.epoch,p.binding.scope,p.binding.schema};
 }
 std::string ready_policy(const canonical_ready_profile& p) {
-    std::string out="canonical-ready-policy-v3;";ready_part(out,p.authority);
+    std::string out=p.orphan_resume_grace_ms?"canonical-ready-policy-v3-lifecycle1;":"canonical-ready-policy-v3;";ready_part(out,p.authority);
     const auto number=[&](uint64_t n){out+=std::to_string(n)+";";};
     for(auto n:{p.transfers,p.bindings,p.charged_bytes,p.transfer_bytes})number(n);
     const auto& b=p.package.codec;const auto& w=b.maximum;
@@ -44,6 +44,7 @@ std::string ready_policy(const canonical_ready_profile& p) {
     const auto& l=c.store;
     for(auto n:{l.markers,l.marker_bytes,l.receipts,l.receipt_bytes,l.batch_identities,l.identity_bytes,l.operation_bytes})number(n);
     number(c.requests);number(c.requested_targets);number(c.marker_batch);
+    if(p.orphan_resume_grace_ms)number(*p.orphan_resume_grace_ms);
     if(out.size()>4096)refuse("canonical READY policy serialization too large");return out;
 }
 void validate_ready_profile(const canonical_ready_profile& p,const canonical_writer_profile& source,const canonical_retention_limits& retention,bool registered_profile) {
@@ -53,6 +54,8 @@ void validate_ready_profile(const canonical_ready_profile& p,const canonical_wri
        p.package.frames<2 || p.package.frames>65536 || p.package.codec.maximum.frame_bytes>4*1024*1024 ||
        p.package.codec.lease_ms>static_cast<uint64_t>(retention.duration_ms) || p.capture.store!=source.limits)
         refuse("canonical READY invalid bounded persistent policy");
+    if(p.orphan_resume_grace_ms&&(*p.orphan_resume_grace_ms<=0||*p.orphan_resume_grace_ms>retention.duration_ms))
+        refuse("canonical READY lifecycle grace outside retained duration bound");
     const auto& c=p.capture;const auto& s=c.rows;const auto& v=s.wire;
     if(!v.frame_bytes || v.frame_bytes>16*1024*1024 || v.string_bytes<64 || v.string_bytes>v.frame_bytes ||
        !v.rows_per_page || v.rows_per_page>4096 || !v.pages || v.pages>65536 || !v.total_rows || v.total_rows>1048576 ||
@@ -88,16 +91,16 @@ const char* ready_inventory_query() {
 }
 bool ready_authorize(int op,int action,const char* table,const char* column)noexcept {
     const auto is=[&](const char* name){return std::strcmp(table,name)==0;};
-    const bool dispose=op==ready_abandon || op==retention_expire || op==retention_prune;
+    const bool dispose=op==ready_abandon || op==retention_expire || op==retention_prune || op==ready_lifecycle_resume || op==ready_lifecycle_discard;
     if(is("_lattice_canonical_attempt"))return (action==SQLITE_INSERT && op==ready_prepare) || (action==SQLITE_DELETE && (op==ready_publish || dispose));
     if(is("_lattice_canonical_retention"))return action==SQLITE_UPDATE && op==ready_prepare && column && std::strcmp(column,"next_attempt")==0;
     if(is("_lattice_canonical_ready_frame"))return (action==SQLITE_INSERT && op==ready_publish) || (action==SQLITE_DELETE && dispose);
-    if(is("_lattice_canonical_ready_binding"))return op==ready_prepare && (action==SQLITE_INSERT ||
+    if(is("_lattice_canonical_ready_binding"))return (op==ready_prepare||op==ready_lifecycle_discard) && (action==SQLITE_INSERT ||
         (action==SQLITE_UPDATE && column && std::strcmp(column,"sequence")==0));
     if(is("_lattice_canonical_ready_profile")) {
         if(action!=SQLITE_UPDATE || !column)return false;
-        if(std::strcmp(column,"next_lease")==0)return op==ready_prepare || op==ready_resume;
-        if(std::strcmp(column,"bindings")==0)return op==ready_prepare;
+        if(std::strcmp(column,"next_lease")==0)return op==ready_prepare || op==ready_resume || op==ready_lifecycle_resume;
+        if(std::strcmp(column,"bindings")==0)return op==ready_prepare||op==ready_lifecycle_discard;
         if(std::strcmp(column,"active")==0 || std::strcmp(column,"charged")==0)return op==ready_prepare || dispose;
         return false;
     }
@@ -105,7 +108,7 @@ bool ready_authorize(int op,int action,const char* table,const char* column)noex
     if(action==SQLITE_INSERT)return op==ready_prepare;
     if(action==SQLITE_DELETE)return dispose;
     if(action!=SQLITE_UPDATE || !column)return false;
-    if(op==ready_resume)return std::strcmp(column,"lease_incarnation")==0 || std::strcmp(column,"lease_sequence")==0 || std::strcmp(column,"deadline_ms")==0;
+    if(op==ready_resume||op==ready_lifecycle_resume)return std::strcmp(column,"lease_incarnation")==0 || std::strcmp(column,"lease_sequence")==0 || std::strcmp(column,"deadline_ms")==0;
     if(op==ready_publish)for(const auto* allowed:{"state","reservation","pin","head","floor","frame_count","wire_bytes","frames_sha","manifest_sha"})
         if(std::strcmp(column,allowed)==0)return true;
     return false;
@@ -208,6 +211,10 @@ std::vector<std::string> ready_key_parts(const std::string& key) {
     if(at!=key.size() || canonical_writer_adapter::uuid_key(parts[2])!=parts[2] || canonical_writer_adapter::uuid_key(parts[3])!=parts[3])
         refuse("canonical READY binding is not canonical");
     return parts;
+}
+std::optional<int64_t> ready_expiry(const database::row_t& row,int64_t incarnation,const std::optional<int64_t>& orphan_deadline) {
+    if(integer(row,"lease_incarnation")==incarnation)return integer(row,"deadline_ms");
+    return orphan_deadline;
 }
 void dispose_ready(database& db,const canonical_ready_profile& p,const database::row_t& row) {
     const auto key=ready_blob(row,"binding");const auto seq=integer(row,"sequence");
@@ -352,14 +359,24 @@ void canonical_writer_adapter::enroll_ready(lattice_db& owner,bool reopen) {
     writer.execute("DELETE FROM main._lattice_canonical_attempt");changed_retention(writer,remaining);
     writer.execute("UPDATE main._lattice_canonical_retention SET incarnation=incarnation+1,next_attempt=0 WHERE id=1 AND incarnation=?",{prior});changed_retention(writer);
     session.incarnation=prior+1;
+    if(p.orphan_resume_grace_ms)session.orphan_deadline_ms=ready_add(session.now(),*p.orphan_resume_grace_ms);
     // READY rows and H pins remain. Their old lease incarnation is deliberately
     // orphaned; no prior-process monotonic deadline is interpreted or renewed.
     verify_ready_retention(writer,state,session);
 }
 void canonical_writer_adapter::expire_ready_rows(database& writer,const context& state,retention_session& session) {
-    const auto rows=writer.query(ready_transfer_query(*state.ready)+" WHERE lease_incarnation=? AND deadline_ms<=? ORDER BY binding LIMIT 65",
-        {session.incarnation,session.now()});
-    for(const auto& row:rows)dispose_ready(writer,*state.ready,row);
+    const auto now=session.now();
+    const bool dispose_orphans=state.ready->orphan_resume_grace_ms&&session.orphan_deadline_ms&&now>=*session.orphan_deadline_ms;
+    const auto rows=dispose_orphans?
+        writer.query(ready_transfer_query(*state.ready)+" WHERE lease_incarnation<? OR (lease_incarnation=? AND deadline_ms<=?) ORDER BY binding LIMIT 65",
+            {session.incarnation,session.incarnation,now}):
+        writer.query(ready_transfer_query(*state.ready)+" WHERE lease_incarnation=? AND deadline_ms<=? ORDER BY binding LIMIT 65",
+            {session.incarnation,now});
+    for(const auto& row:rows) {
+        const auto deadline=ready_expiry(row,session.incarnation,session.orphan_deadline_ms);
+        if(!deadline||now<*deadline)refuse("canonical READY expiry selection differs");
+        dispose_ready(writer,*state.ready,row);
+    }
 }
 canonical_ready_info canonical_writer_adapter::ready_info(database& writer,const context& state,const retention_session& session,const std::string& key) {
     const auto row=ready_row(writer,*state.ready,key);const auto request=ready_request(row,*state.ready);
@@ -573,15 +590,18 @@ canonical_ready_resume_result canonical_writer_adapter::resume_ready_owned(std::
         const auto raw=cr::encode({attempt,ready_route,request},p.package.codec),key=ready_binding(held.namespace_.namespace_id,held.replica_,attempt);
         (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
         std::optional<canonical_ready_info> resumed;int64_t sequence=0,deadline=0;
-        result.settlement=retention_owned(owner,writer,state,session,ready_resume,[&](database& actual,retention_session& clock){
+        result.settlement=retention_owned(owner,writer,state,session,p.orphan_resume_grace_ms?ready_lifecycle_resume:ready_resume,[&](database& actual,retention_session& clock){
             validate_namespace_admission(owner,writer,state,held);const auto row=ready_row(actual,p,key);
             ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
             if(integer(row,"state")!=ready_complete)refuse("canonical READY incomplete preparation cannot resume");
             // Same-process expiry cannot silently renew. A source restart has
             // explicitly orphaned the old physical lease; fresh admission may
             // then request a new finite lease over the continuously retained H.
-            if(integer(row,"lease_incarnation")==clock.incarnation && clock.now()>=integer(row,"deadline_ms"))
-                refuse("canonical READY current lease expired; explicit disposal required");
+            const auto expiration=ready_expiry(row,clock.incarnation,clock.orphan_deadline_ms);
+            if(expiration&&clock.now()>=*expiration) {
+                if(!p.orphan_resume_grace_ms)refuse("canonical READY current lease expired; explicit disposal required");
+                dispose_ready(actual,p,row);validate_namespace_admission(owner,writer,state,held);return;
+            }
             const auto policy=ready_profile_row(actual,p);
             if(integer(policy,"next_lease")==std::numeric_limits<int64_t>::max())refuse("canonical READY physical lease sequence exhausted");
             sequence=integer(policy,"next_lease")+1;deadline=ready_add(clock.now(),duration);
@@ -679,8 +699,8 @@ recovery_install_result canonical_writer_adapter::expire_authenticated_ready(std
     return retention_owned(owner,writer,state,session,retention_expire,[&](database& actual,retention_session& clock){
         validate_namespace_admission(owner,writer,state,held);
         if(!state->ready)refuse("canonical READY expiry profile unavailable");
-        // Only this physical incarnation's expired leases are comparable.
-        // Completed prior-incarnation capsules retain exact resume/discard.
+        // Prior-process lease clocks are never compared. Only the explicit
+        // lifecycle profile gives their orphan state a new-incarnation grace.
         expire_ready_rows(actual,*state,clock);expire_retention(actual,clock.now());
         validate_namespace_admission(owner,writer,state,held);
     });
@@ -697,6 +717,83 @@ recovery_install_result canonical_writer_adapter::discard_authenticated_ready(st
         ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
         dispose_ready(actual,p,row);validate_namespace_admission(owner,writer,state,held);
     });
+}
+canonical_ready_maintenance_result canonical_writer_adapter::maintain_authenticated_ready(std::shared_ptr<lattice_db> owner) {
+    auto state=context_;auto writer=writer_;auto session=retention_;canonical_ready_maintenance_result result;
+    std::optional<int64_t> next;bool observed=false;
+    result.settlement=retention_owned(owner,writer,state,session,retention_expire,[&](database& actual,retention_session& clock){
+        if(!state->ready||!state->ready->orphan_resume_grace_ms||!clock.orphan_deadline_ms)
+            refuse("canonical READY maintenance requires explicit lifecycle profile");
+        expire_ready_rows(actual,*state,clock);expire_retention(actual,clock.now());
+        const auto rows=actual.query("SELECT "+ready_i("lease_incarnation")+","+ready_i("deadline_ms")+
+            " FROM main._lattice_canonical_ready_transfer ORDER BY binding LIMIT 65");
+        if(rows.size()>static_cast<size_t>(state->ready->transfers))refuse("canonical READY maintenance inventory exceeds cap");
+        const auto now=clock.now();
+        for(const auto& row:rows){const auto deadline=ready_expiry(row,clock.incarnation,clock.orphan_deadline_ms);
+            if(!deadline)refuse("canonical READY lifecycle deadline missing");
+            const auto delay=*deadline>now?*deadline-now:0;
+            if(delay>clock.limits.duration_ms)refuse("canonical READY maintenance deadline exceeds duration");
+            if(!next||delay<*next)next=delay;}
+        observed=true;
+    });
+    if(result.settlement.state==recovery_install_state::committed&&observed){result.observed=true;result.next_delay_ms=next;}
+    return result;
+}
+canonical_ready_lifecycle_result canonical_writer_adapter::inspect_authenticated_ready(std::shared_ptr<lattice_db> owner,
+    const canonical_namespace_admission& admission,const cr::attempt& attempt,const cr::request& request,bool discard) {
+    auto state=context_;auto writer=writer_;auto session=retention_;const auto held=admission;
+    canonical_ready_lifecycle_result result;std::optional<canonical_ready_lifecycle_state> disposition;int64_t high=0;
+    try {
+        if(!state||!state->ready||!state->ready->orphan_resume_grace_ms)refuse("canonical READY lifecycle profile unavailable");
+        const auto& p=*state->ready;validate_namespace_admission(owner,writer,state,held);
+        if(!held.authenticated_||request.source!=ready_source(state->profile,p)||request.registered_producer!=held.receipt_binding_||
+           (request.registered_producer&&request.receipt_namespace!=std::optional<std::string>{held.namespace_.namespace_id}))
+            refuse("canonical READY lifecycle actual source admission differs");
+        const auto raw=cr::encode({attempt,ready_route,request},p.package.codec);
+        (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
+        const auto key=ready_binding(held.namespace_.namespace_id,held.replica_,attempt);
+        result.settlement=retention_owned(owner,writer,state,session,discard?ready_lifecycle_discard:ready_read,[&](database& actual,retention_session&){
+            validate_namespace_admission(owner,writer,state,held);
+            const auto prior=actual.query("SELECT "+ready_i("sequence")+" FROM main._lattice_canonical_ready_binding WHERE binding=? LIMIT 2",{bytes(key)});
+            if(prior.size()>1)refuse("canonical READY lifecycle binding is ambiguous");
+            high=prior.empty()?0:integer(prior[0],"sequence");
+            if(high<0||uint64_t(high)>attempt.sequence)refuse("canonical READY lifecycle future high-water differs");
+            const auto rows=actual.query(ready_transfer_query(p)+" WHERE binding=? LIMIT 2",{bytes(key)});
+            if(rows.size()>1)refuse("canonical READY lifecycle capsule is ambiguous");
+            if(!rows.empty()) {
+                ready_require_identity(rows[0],p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
+                if(high!=static_cast<int64_t>(attempt.sequence))refuse("canonical READY lifecycle active high-water differs");
+                if(discard)dispose_ready(actual,p,rows[0]);
+                else disposition=canonical_ready_lifecycle_state::available;
+            }
+            if(discard&&high<static_cast<int64_t>(attempt.sequence)) {
+                // Exact authenticated transport-sequence retirement. This
+                // says nothing about whether Q ever produced a capsule or an
+                // original was accepted. It fences a delayed old prepare.
+                const auto profile=ready_profile_row(actual,p);const auto charge=ready_add(64,key.size());
+                if(prior.empty()) {
+                    if(integer(profile,"bindings")>=p.bindings||charge>p.charged_bytes-integer(profile,"charged"))
+                        refuse("canonical READY lifecycle binding capacity exhausted");
+                    actual.execute("INSERT INTO main._lattice_canonical_ready_binding VALUES(?,?,?)",{bytes(key),static_cast<int64_t>(attempt.sequence),charge});changed_retention(actual);
+                    actual.execute("UPDATE main._lattice_canonical_ready_profile SET bindings=bindings+1,charged=charged+? WHERE id=1 AND bindings=? AND charged=?",
+                        {charge,integer(profile,"bindings"),integer(profile,"charged")});changed_retention(actual);
+                } else {
+                    actual.execute("UPDATE main._lattice_canonical_ready_binding SET sequence=? WHERE binding=? AND sequence=?",
+                        {static_cast<int64_t>(attempt.sequence),bytes(key),high});changed_retention(actual);
+                }
+                high=static_cast<int64_t>(attempt.sequence);
+            }
+            if(!disposition)disposition=high==static_cast<int64_t>(attempt.sequence)?canonical_ready_lifecycle_state::terminal:canonical_ready_lifecycle_state::unstarted;
+            const auto after=actual.query("SELECT "+ready_i("sequence")+" FROM main._lattice_canonical_ready_binding WHERE binding=? LIMIT 2",{bytes(key)});
+            if((high==0&&!after.empty())||(high>0&&(after.size()!=1||integer(after[0],"sequence")!=high)))
+                refuse("canonical READY lifecycle high-water postimage differs");
+            if(discard&&!actual.query("SELECT 1 FROM main._lattice_canonical_ready_transfer WHERE binding=? LIMIT 1",{bytes(key)}).empty())
+                refuse("canonical READY lifecycle terminal postimage differs");
+            validate_namespace_admission(owner,writer,state,held);
+        });
+        if(result.settlement.state==recovery_install_state::committed){result.disposition=disposition;result.binding_high_water=high;}
+    } catch(...) {result.settlement.primary_error=std::current_exception();}
+    return result;
 }
 recovery_install_result canonical_writer_adapter::expire_ready_owned(std::shared_ptr<lattice_db> owner) {
     auto state=context_;

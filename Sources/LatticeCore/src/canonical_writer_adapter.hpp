@@ -71,6 +71,7 @@ struct canonical_upstream_limits {
 };
 class canonical_writer_adapter {
     friend class authenticated_relay_setup;
+    friend struct authenticated_ready_maintenance;
     friend struct authenticated_relay_catalog_test_access;
     friend void require_canonical_relation(database&, const std::string&);
     friend class canonical_upstream_delivery;
@@ -112,6 +113,9 @@ class canonical_writer_adapter {
         const canonical_namespaced_writer_profile&,canonical_upstream_limits,canonical_retention_limits,
         const canonical_ready_profile& before,const canonical_ready_profile& after);
     recovery_install_result expire_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&);
+    canonical_ready_maintenance_result maintain_authenticated_ready(std::shared_ptr<lattice_db>);
+    canonical_ready_lifecycle_result inspect_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
+        const canonical_range::attempt&,const canonical_range::request&,bool discard);
     recovery_install_result discard_authenticated_ready(std::shared_ptr<lattice_db>,const canonical_namespace_admission&,
         const canonical_range::attempt&,const canonical_range::request&);
     // Only the actual authenticated setup reaches the closed addressed body.

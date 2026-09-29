@@ -6,6 +6,12 @@
 
 namespace lattice { class swift_lattice_ref; }
 namespace lattice::detail {
+namespace authenticated_ready_maintenance_test_observation {
+// Passive scheduling probe only. It cannot create a setup/admission, supply
+// lifecycle facts, change time or bypass the actual owned transaction.
+struct probe {const lattice_db* owner=nullptr;std::function<void(const char*)> observed;};
+std::shared_ptr<const probe> exchange(std::shared_ptr<const probe>);
+}
 struct authenticated_ready_budget;
 struct authenticated_ready_fence;
 // Payload-free source-wide charge. This is capacity, never authority.

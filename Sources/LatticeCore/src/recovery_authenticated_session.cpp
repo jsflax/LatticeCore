@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <charconv>
+#include <condition_variable>
 
 namespace lattice::detail {
 namespace {
@@ -66,7 +67,7 @@ struct source_recipe {
     std::string ready_name="boundedV1";
 };
 source_recipe recipe(const recovery_owner_schema& catalog,const json& j) {
-    auto base_shape=j;base_shape.erase("readyProfile");base_shape.erase("receiptCoverage");
+    auto base_shape=j;base_shape.erase("readyProfile");base_shape.erase("receiptCoverage");base_shape.erase("orphanResumeGraceMilliseconds");
     shape(base_shape,{"version","authority","sourceID","epoch","localNamespace","namespaces","receiptNamespace","models","walFull","maximumAuthorizationMilliseconds","upload"});
     const auto version=number(j,"version",1,2);
     if((version==2)!=j.contains("receiptCoverage") || j.at("walFull")!=true)reject("relay explicit durability and receipt profile required");
@@ -113,13 +114,15 @@ source_recipe recipe(const recovery_owner_schema& catalog,const json& j) {
     ready.capture={{{65536,16,4096,8192,2,2048,4096,1048576},16,32,32},p.writer.limits,256,256,32};
     if(j.contains("readyProfile")) {
         r.ready_name=text(j,"readyProfile",32);
-        if(r.ready_name!="bounded48MiBV1")reject("relay explicit READY profile unknown");
+        if(r.ready_name!="bounded48MiBV1"&&r.ready_name!="bounded48MiBOrphanV1")reject("relay explicit READY profile unknown");
         ready.transfers=8;ready.charged_bytes=536870912;ready.transfer_bytes=50331648;
         ready.package={{{4194304,16384,64,512,16384,33554432,256,8192,8388608},
             16,262144,32768,8192,8192,2097152,4194304,3600000,{16384,64,256,4096,16384}},41943040,770};
         ready.capture={{{262144,16,16384,16384,64,256,16384,33554432},16,32,32},p.writer.limits,8192,8192,256};
     }
-    if(p.namespaces.coverage&&r.ready_name!="bounded48MiBV1")reject("registered producer profile requires explicit bounded48MiBV1 READY capacity");
+    if(r.ready_name=="bounded48MiBOrphanV1")ready.orphan_resume_grace_ms=number(j,"orphanResumeGraceMilliseconds",1,3600000);
+    else if(j.contains("orphanResumeGraceMilliseconds"))reject("relay orphan grace requires explicit lifecycle profile");
+    if(p.namespaces.coverage&&r.ready_name!="bounded48MiBV1"&&r.ready_name!="bounded48MiBOrphanV1")reject("registered producer profile requires explicit large READY capacity");
     // All 16 contributions of one physical receiver retain their independent
     // READY capsules until the cohort install. This is the explicit v3 source
     // policy; existing v2 profiles keep their exact eight-transfer/512MiB cap.
@@ -149,6 +152,159 @@ struct authenticated_mounted_source {
     std::shared_ptr<authenticated_ready_budget> ready_budget;
     std::mutex ready_mutex;
     std::map<std::string,std::weak_ptr<authenticated_ready_fence>> ready_fences;
+    std::shared_ptr<const authenticated_ready_maintenance_test_observation::probe> maintenance_probe;
+};
+namespace {
+std::mutex maintenance_probe_mutex;
+std::shared_ptr<const authenticated_ready_maintenance_test_observation::probe> maintenance_probe;
+void observe_maintenance(const std::shared_ptr<authenticated_mounted_source>& source,const char* point) {
+    const auto& p=source->maintenance_probe;if(p&&p->owner==source->owner.get()&&p->observed)p->observed(point);
+}
+}
+std::shared_ptr<const authenticated_ready_maintenance_test_observation::probe> authenticated_ready_maintenance_test_observation::exchange(std::shared_ptr<const probe> next) {
+    std::shared_ptr<const probe> prior;{std::lock_guard lock(maintenance_probe_mutex);prior=std::move(maintenance_probe);maintenance_probe=std::move(next);}return prior;
+}
+// One bounded registration per existing physical registry slot. No per-tick
+// task queue and no SQL, callback or source destruction under the leaf mutex.
+struct authenticated_ready_maintenance {
+#if defined(__APPLE__) || defined(__linux__)
+    struct entry {
+        std::shared_ptr<authenticated_mounted_source> source;
+        bool armed=false,dirty=true,observed_empty=false;
+        std::optional<std::chrono::steady_clock::time_point> due;
+    };
+    struct shared_state {
+        std::mutex mutex;std::condition_variable changed;bool stopped=false;
+        std::map<authenticated_mounted_source*,std::shared_ptr<entry>> entries;
+    };
+    std::shared_ptr<shared_state> shared=std::make_shared<shared_state>();
+    std_thread_scheduler executor;
+    authenticated_ready_maintenance() {
+        // The scheduler owns launch-failure cleanup/join/self-shutdown. If
+        // enqueue allocation throws its destructor settles the launched worker.
+        executor.invoke([keep=shared]{loop(keep);});
+    }
+    ~authenticated_ready_maintenance() {
+        {std::lock_guard lock(shared->mutex);shared->stopped=true;}
+        shared->changed.notify_all();
+        // A join failure restores the scheduler's thread custody. Its own
+        // destructor retries and provides the state-only detach fallback; do
+        // not let the first shutdown error escape this noexcept destructor.
+        try{executor.shutdown();}catch(...){}
+    }
+    static authenticated_ready_maintenance& instance(){static authenticated_ready_maintenance value;return value;}
+    static bool live(const std::shared_ptr<authenticated_mounted_source>& source) {
+        return source->owner_guard&&source->owner_guard->alive.load(std::memory_order_seq_cst)&&
+            source->adapter&&source->adapter->authenticated_active_guard()->load(std::memory_order_acquire);
+    }
+    static void loop(const std::shared_ptr<shared_state>& state) {
+        for(;;) {
+            try {
+                std::vector<std::shared_ptr<entry>> work,retired;
+                {
+                    std::unique_lock lock(state->mutex);
+                    auto wake=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+                    for(const auto& [key,item]:state->entries)if(item->armed){
+                        if(item->dirty){wake=std::chrono::steady_clock::now();break;}
+                        if(item->due&&*item->due<wake)wake=*item->due;}
+                    state->changed.wait_until(lock,wake);
+                    const auto now=std::chrono::steady_clock::now();
+                    for(auto it=state->entries.begin();it!=state->entries.end();) {
+                        const auto& item=it->second;
+                        if(state->stopped||!item->source->owner_guard->alive.load(std::memory_order_seq_cst)) {
+                            retired.push_back(item);it=state->entries.erase(it);continue;
+                        }
+                        if(item->armed&&(item->dirty||(item->due&&now>=*item->due))) {
+                            // Do not consume the kick while building a batch:
+                            // allocation failure must leave every unrun item
+                            // eligible for the next bounded retry.
+                            work.push_back(item);
+                        }
+                        ++it;
+                    }
+                    if(state->stopped){lock.unlock();return;}
+                }
+                retired.clear(); // owner/adapter/callback destruction off leaf
+                for(const auto& item:work) {
+                    const auto source=item->source;canonical_ready_maintenance_result result;
+                    {std::lock_guard lock(state->mutex);const auto found=state->entries.find(source.get());
+                        if(state->stopped||found==state->entries.end()||found->second!=item)continue;
+                        item->dirty=false;}
+                    try {
+                        observe_maintenance(source,"before-maintenance");
+                        if(live(source))result=source->adapter->maintain_authenticated_ready(source->owner);
+                        observe_maintenance(source,"maintenance-settled");
+                        if(result.observed&&!result.next_delay_ms)observe_maintenance(source,"empty-before-retire");
+                    } catch(...) {result.observed=false;}
+                    const bool still_live=live(source);
+                    std::shared_ptr<entry> dropped;
+                    {
+                        std::lock_guard lock(state->mutex);const auto found=state->entries.find(source.get());
+                        if(found==state->entries.end()||found->second!=item)continue;
+                        // A concurrent mutation/last-setup release marks dirty
+                        // before this decision. It can never be overwritten by
+                        // an earlier empty observation; its post-operation kick
+                        // also covers a worker that ran before the owned write.
+                        if(state->stopped||!still_live) {dropped=std::move(found->second);state->entries.erase(found);}
+                        else if(item->dirty)item->due=std::chrono::steady_clock::now();
+                        else if(result.settlement.state==recovery_install_state::committed&&result.observed&&
+                                !result.settlement.primary_error&&!result.settlement.cleanup_error&&!result.settlement.unexpected_commit_observed) {
+                            item->observed_empty=!result.next_delay_ms;
+                            item->due=result.next_delay_ms?std::optional{std::chrono::steady_clock::now()+std::chrono::milliseconds(*result.next_delay_ms)}:std::nullopt;
+                            if(item->observed_empty&&source->sessions.load(std::memory_order_acquire)==0){dropped=std::move(found->second);state->entries.erase(found);}
+                        } else {
+                            // A refusal/error is not an empty source. Retain
+                            // custody and retry, without a hard wall-time claim
+                            // under indefinite contention or corruption.
+                            item->observed_empty=false;item->due=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+                        }
+                    }
+                    dropped.reset();
+                    observe_maintenance(source,"maintenance-published");
+                }
+            }catch(...) {
+                std::unique_lock lock(state->mutex);if(state->stopped)return;
+                state->changed.wait_for(lock,std::chrono::seconds(1));
+            }
+        }
+    }
+    static void add(const std::shared_ptr<authenticated_mounted_source>& source,bool armed) {
+        if(!source->recipe.ready.orphan_resume_grace_ms)return;
+        observe_maintenance(source,"before-maintenance-register");
+        auto& worker=instance();
+        // Allocate before the leaf. The existing physical registry already
+        // charged this source slot; this is not another independent owner cap.
+        auto candidate=std::make_shared<entry>();candidate->source=source;candidate->armed=armed;
+        {std::lock_guard lock(worker.shared->mutex);
+            if(worker.shared->stopped)reject("READY maintenance service stopped");
+            const auto [at,added]=worker.shared->entries.emplace(source.get(),candidate);
+            if(!added){at->second->armed|=armed;at->second->dirty=true;}}
+        worker.shared->changed.notify_one();
+    }
+    static void kick(const std::shared_ptr<authenticated_mounted_source>& source)noexcept {
+        if(!source->recipe.ready.orphan_resume_grace_ms)return;
+        try{auto& worker=instance();{std::lock_guard lock(worker.shared->mutex);const auto at=worker.shared->entries.find(source.get());
+            if(at!=worker.shared->entries.end())at->second->dirty=true;}worker.shared->changed.notify_one();}catch(...){}
+    }
+    static void arm(const std::shared_ptr<authenticated_mounted_source>& source)noexcept {
+        if(!source->recipe.ready.orphan_resume_grace_ms)return;
+        // Enrollment already owns an allocated registration. No callback or
+        // allocation may fail between its known COMMIT and arming the keeper.
+        try{auto& worker=instance();{std::lock_guard lock(worker.shared->mutex);const auto at=worker.shared->entries.find(source.get());
+            if(at!=worker.shared->entries.end()){at->second->armed=true;at->second->dirty=true;}}worker.shared->changed.notify_one();}catch(...){}
+    }
+    static void remove(const std::shared_ptr<authenticated_mounted_source>& source)noexcept {
+        if(!source->recipe.ready.orphan_resume_grace_ms)return;
+        try{auto& worker=instance();std::shared_ptr<entry> retired;
+            {std::lock_guard lock(worker.shared->mutex);const auto at=worker.shared->entries.find(source.get());if(at!=worker.shared->entries.end()){retired=std::move(at->second);worker.shared->entries.erase(at);}}
+            worker.shared->changed.notify_one();retired.reset();}catch(...){}
+    }
+#else
+    static void add(const std::shared_ptr<authenticated_mounted_source>& source,bool){if(source->recipe.ready.orphan_resume_grace_ms)reject("READY lifecycle platform unavailable");}
+    static void kick(const std::shared_ptr<authenticated_mounted_source>&)noexcept{}
+    static void arm(const std::shared_ptr<authenticated_mounted_source>&)noexcept{}
+    static void remove(const std::shared_ptr<authenticated_mounted_source>&)noexcept{}
+#endif
 };
 struct authenticated_ready_budget {
     // Keep only the payload-free physical identity and bounded immutable recipe.
@@ -198,7 +354,7 @@ struct authenticated_relay_setup::state {
     };
     std::optional<ready_slot> ready;
     bool consumed=false,charged=false;
-    ~state(){if(charged)source->sessions.fetch_sub(1,std::memory_order_relaxed);}
+    ~state(){if(charged){source->sessions.fetch_sub(1,std::memory_order_acq_rel);authenticated_ready_maintenance::kick(source);}}
 };
 int64_t authenticated_session_fence::now()noexcept{return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 bool authenticated_session_fence::live()const noexcept{return !stopped_.load(std::memory_order_acquire)&&authorized_.load(std::memory_order_acquire)&&
@@ -305,11 +461,17 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
         try {
             source=std::make_shared<authenticated_mounted_source>();source->owner=owner;source->owner_guard=owner_guard;source->recipe=r;
             source->ready_budget=budget;
+            {std::lock_guard lock(maintenance_probe_mutex);source->maintenance_probe=maintenance_probe;}
+            // Register/start before enrollment can publish durable state. The
+            // worker cannot enter an unarmed source under construction.
+            authenticated_ready_maintenance::add(source,false);
             source->adapter=canonical_writer_adapter::open_authenticated_source(owner,r.profile,{frame_entries,65536,frame_bytes},{64,3600000},r.ready,true);
+            authenticated_ready_maintenance::arm(source);
             std::lock_guard lock(registry_mutex);auto& slot=registry.at(key);slot.value=source;slot.building=false;
         }catch(...) {
             // Failed re-enrollment must not erase charges retained by an old
             // result. Only an expired source AND budget can release the slot.
+            if(source)authenticated_ready_maintenance::remove(source);
             std::lock_guard lock(registry_mutex);registry.at(key).building=false;throw;
         }
     }
@@ -318,6 +480,9 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
     do{if(count>=1024)reject("relay native source session capacity");}
     while(!s->source->sessions.compare_exchange_weak(count,count+1,std::memory_order_relaxed));
     s->charged=true;s->recipe=std::move(r);
+    // Also re-register an existing empty source retained by a concurrent open
+    // after the worker removed its last empty/unused registration.
+    authenticated_ready_maintenance::add(s->source,true);
     s->fence=std::shared_ptr<authenticated_session_fence>(new authenticated_session_fence());
     s->fence->ready_budget_=s->source->ready_budget;
     s->fence->owner_guard_=owner_guard;
@@ -428,7 +593,7 @@ json ready_wire_limits(const ready_cr::wire_limits& v) {
 }
 json ready_profile_description(const source_recipe& r) {
     const auto& p=r.ready;const auto& c=p.package.codec;
-    return {{"name",r.ready_name},{"wire",ready_wire_limits(c.maximum)},
+    json result={{"name",r.ready_name},{"wire",ready_wire_limits(c.maximum)},
         {"requestEntries",c.request_entries},{"requestTargets",c.request_targets},{"requestTargetBytes",c.request_target_bytes},
         {"parserDepth",c.depth},{"parserNodes",c.nodes},{"scalarBytes",c.string_bytes},{"restartBytes",c.restart_bytes},
         {"valueLimits",{{"rawBytes",c.values.raw_bytes},{"fields",c.values.fields},{"nameBytes",c.values.name_bytes},
@@ -438,6 +603,8 @@ json ready_profile_description(const source_recipe& r) {
         {"captureRows",p.capture.rows.wire.total_rows},{"captureBytes",p.capture.rows.wire.total_bytes},
         {"requestBytes",authenticated_ready_budget::input_limit},{"pendingRequests",authenticated_ready_budget::max_requests},
         {"pendingInputAndReplyBytes",authenticated_ready_budget::max_bytes},{"pendingWorkspaceBytes",authenticated_ready_budget::max_workspace}};
+    if(p.orphan_resume_grace_ms)result["orphanResumeGraceMilliseconds"]=*p.orphan_resume_grace_ms;
+    return result;
 }
 std::string ready_live_binding(const json& context) {
     // The exact actual namespace/registered replica/logical receiver binding;
@@ -491,7 +658,12 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         }
         response["settlement"]=ready_settlement(read.settlement);response["frameAvailable"]=false;return output();
     }
-    if(op!="prepare"&&op!="resume"&&op!="discard")reject("READY control operation unknown");
+    const bool lifecycle=s->recipe.ready.orphan_resume_grace_ms.has_value();
+    if(op!="prepare"&&op!="resume"&&op!="discard"&&!(lifecycle&&op=="inspect"))reject("READY control operation unknown");
+    // A post-operation kick is essential: an earlier empty scan may have run
+    // after the pre-operation kick but before this call acquired its WRITE.
+    struct maintenance_kick {std::shared_ptr<authenticated_mounted_source> source;~maintenance_kick(){if(source)authenticated_ready_maintenance::kick(source);}} maintenance{op=="inspect"?nullptr:s->source};
+    if(op!="inspect")authenticated_ready_maintenance::kick(s->source);
     if(op=="prepare") {
         // Finite source-wide charge for retained capture, canonical vectors,
         // capsule strings and request copies. This is explicit logical storage
@@ -502,7 +674,7 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         if(workspace>authenticated_ready_budget::max_workspace-charge->budget_->workspace)reject("READY source capture workspace unavailable");
         charge->workspace_=workspace;charge->budget_->workspace+=workspace;
     }
-    if(op=="discard")shape(control,{"kind","version","operation","requestID","routeGeneration","request"});
+    if(op=="discard"||op=="inspect")shape(control,{"kind","version","operation","requestID","routeGeneration","request"});
     else shape(control,{"kind","version","operation","requestID","routeGeneration","request","durationMilliseconds"});
     const auto& codec=s->recipe.ready.package.codec;
     const auto request_bytes=text(control,"request",codec.maximum.frame_bytes);
@@ -523,9 +695,26 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         }
     }
     const auto now=authenticated_session_fence::now();
-    const auto duration=op=="discard"?int64_t(1):number(control,"durationMilliseconds",1,static_cast<int64_t>(codec.lease_ms));
+    const auto duration=op=="discard"||op=="inspect"?int64_t(1):number(control,"durationMilliseconds",1,static_cast<int64_t>(codec.lease_ms));
     if(now>INT64_MAX-duration||now+duration>s->fence->deadline_.load(std::memory_order_acquire)||!s->fence->live()||!s->route->live())
         reject("READY finite lease exceeds actual authorization or route");
+    const auto lifecycle_output=[&](const canonical_ready_lifecycle_result& result) {
+        response["settlement"]=ready_settlement(result.settlement);response["leaseAvailable"]=false;
+        if(result.settlement.state==recovery_install_state::committed&&result.disposition) {
+            const char* state=*result.disposition==canonical_ready_lifecycle_state::available?"available":
+                *result.disposition==canonical_ready_lifecycle_state::terminal?"terminal":"unstarted";
+            response["lifecycle"]={{"state",state},{"requestDigest",request->request_digest},{"attemptID",logical.attempt_id},
+                {"sequence",std::to_string(logical.sequence)},{"bindingHighWater",std::to_string(result.binding_high_water)},
+                {"namespaceID",s->recipe.selected_namespace},{"replicaID",peer.at("replicaID")},
+                {"receiverIncarnation",logical.receiver_incarnation},{"channelIncarnation",logical.channel_incarnation},{"channel",logical.channel}};
+        }
+        return output();
+    };
+    if(op=="inspect") {
+        // Pure inspection does not revoke a physical lease or infer expiry.
+        if(ready_before_owned_test_hook_)(*ready_before_owned_test_hook_)();
+        return lifecycle_output(s->source->adapter->inspect_authenticated_ready(s->source->owner,*s->admission,logical,*request,false));
+    }
     if(s->lease_sequence==INT64_MAX)reject("READY setup lease sequence exhausted");
     const auto lease_id=std::to_string(s->route_generation)+":"+std::to_string(++s->lease_sequence);
     const auto key=ready_live_binding(s->context);
@@ -550,6 +739,7 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
     const auto ready_admission=canonical_writer_adapter::ready_operation_admission(*s->admission,fence->admitted);
     if(ready_before_owned_test_hook_)(*ready_before_owned_test_hook_)();
     if(op=="discard") {
+        if(lifecycle)return lifecycle_output(s->source->adapter->inspect_authenticated_ready(s->source->owner,ready_admission,logical,*request,true));
         const auto result=s->source->adapter->discard_authenticated_ready(s->source->owner,ready_admission,logical,*request);
         response["settlement"]=ready_settlement(result);response["leaseAvailable"]=false;return output();
     }

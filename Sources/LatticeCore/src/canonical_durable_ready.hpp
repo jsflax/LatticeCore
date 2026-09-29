@@ -42,6 +42,9 @@ struct canonical_ready_profile {
     int64_t transfers, bindings, charged_bytes, transfer_bytes;
     canonical_range::package_limits package;
     sync_recovery::canonical_capture_limits capture;
+    // Explicit lifecycle-v1 opt-in only. No default, wall-clock inference or
+    // reinterpretation of an old persisted policy/lease deadline.
+    std::optional<int64_t> orphan_resume_grace_ms;
 };
 // Durable lookup identity only. Possession cannot read a frame, grant a lease,
 // acknowledge installation, settle a receipt or authorize a peer.
@@ -95,6 +98,20 @@ struct canonical_ready_resume_result {
 struct canonical_ready_inspection {
     recovery_install_result settlement;
     std::vector<canonical_ready_info> transfers;
+};
+enum class canonical_ready_lifecycle_state { available,terminal,unstarted };
+struct canonical_ready_lifecycle_result {
+    recovery_install_result settlement;
+    // A capsule disposition only, never original receipt/installation evidence.
+    std::optional<canonical_ready_lifecycle_state> disposition;
+    int64_t binding_high_water=0;
+};
+struct canonical_ready_maintenance_result {
+    recovery_install_result settlement;
+    // Present only after known COMMIT. A scheduling hint, never admission.
+    // nullopt next_delay means the audited source has no remaining capsules.
+    bool observed=false;
+    std::optional<int64_t> next_delay_ms;
 };
 struct canonical_ready_frame_result {
     recovery_install_result settlement;

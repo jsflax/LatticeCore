@@ -833,8 +833,7 @@ struct canonical_install_engine {
         canonical_range_staging staged(grant.owner_,limits.installations,grant.limits_.codec,grant.limits_.staging);
         staged.initialize();
         recovery_obligation_store journal(grant.owner_,grant.limits_.obligations,limits.installations);journal.initialize();
-        const cr::frame ending{grant.attempt_,grant.route_,cr::end{grant.manifest_digest_}};
-        const auto verified=staged.verify_end(ending);
+        const auto verified=staged.verify_retained(grant.attempt_,grant.manifest_digest_,grant.route_);
         require(verified.content_verified && verified.state.frozen_request.request_digest==grant.request_digest_ &&
             verified.installation_binding==grant.profile_.binding,"canonical admission differs from retained stage");
         auto current_journal=journal.read(grant.journal_.channel);
@@ -1129,7 +1128,7 @@ std::vector<receive_install_receipt> install_canonical_cohort_owned(const canoni
         receive_delivery_guard_access::verify_owned(owner,*writer,*grant.receive_guard_);
         auto state=receiver.read(grant.journal_.channel);require(state&&state->binding==grant.profile_.binding,"canonical receiver binding changed");
         if(state->last_installed)floor=std::max(floor,state->last_installed->head);
-        images.push_back(stages.verify_end({grant.attempt_,grant.route_,cr::end{grant.manifest_digest_}}));order.push_back(i);
+        images.push_back(stages.verify_retained(grant.attempt_,grant.manifest_digest_,grant.route_));order.push_back(i);
     }
     std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b){return images[a].installation_identity.head<images[b].installation_identity.head;});
     for(size_t n=0;n<order.size();++n){const auto& image=images[order[n]];

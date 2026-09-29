@@ -1953,8 +1953,12 @@ protected:
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
             if(std::strcmp(stage,"late-lifecycle-validation-rejected")==0){++*rejected_count;if(rejection_pause)rejection_pause->wait();}
             if(std::strcmp(stage,"late-lifecycle-retired-disposed")==0)++*retired_count;});
-        connect();ASSERT_TRUE(until([&]{return installed()&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==1;}));
+        // The first install releases the UNSENT original. Its real upload
+        // and legacy ACK request the second, receipt-bearing installation.
+        connect();ASSERT_TRUE(until([&]{return installed(2)&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==1;}));
         ASSERT_FALSE(has_error());ASSERT_FALSE(actual_describe.empty());ASSERT_EQ(observed_uploads.size(),1u);
+        ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)>0"),1);
+        ASSERT_EQ(json::parse(full_requests.at(0).at("request").get<std::string>()).at("latticeCanonicalRange").at("attempt").at("sequence"),"2");
     }
     std::string actual_inspect() {
         const auto& q=full_requests.at(0);const auto command=json{{"kind","recoveryReady"},{"version",1},{"operation","inspect"},
@@ -1962,7 +1966,12 @@ protected:
         auto charge=peers[0].setup.stop_token().reserve_ready(command.size());
         if(!charge.valid())throw db_error("idle lifecycle fixture inspect reservation refused");
         const auto response=peers[0].setup.ready(command,charge);
-        if(response.status_code()!=1||!response.publishable())throw db_error("idle lifecycle fixture inspect unavailable");return response.wire();
+        if(response.status_code()!=1||!response.publishable())throw db_error("idle lifecycle fixture inspect unavailable");
+        const auto request=json::parse(q.at("request").get<std::string>()).at("latticeCanonicalRange");const auto actual=json::parse(response.wire());
+        if(actual.at("settlement").at("state")!="committed"||actual.at("lifecycle").at("sequence")!="2"||
+           actual.at("lifecycle").at("bindingHighWater")!="2"||actual.at("lifecycle").at("attemptID")!=request.at("attempt").at("attempt_id")||
+           actual.at("lifecycle").at("requestDigest")!=request.at("body").at("request_digest"))
+            throw db_error("idle lifecycle fixture actual source did not inspect settled Q2");return response.wire();
     }
     void verifies_upload_fence(const Snapshot& before,size_t sent) {
         ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(phase(),0);EXPECT_EQ(snapshot(),before);
@@ -2023,8 +2032,11 @@ TEST_F(IdleLateLifecycleReceiverController, ActualPhysicalRetirementAfterLatePar
     ASSERT_TRUE(old.trigger_on_close(1000,"retire after actual late parse rejection"));pause->release();
     ASSERT_TRUE(until([&]{return retired->load()==1;}));EXPECT_FALSE(has_error());EXPECT_EQ(snapshot(),before);
     EXPECT_FALSE(old.trigger_on_message(transport_message::from_string(actual_describe)));
-    synchronizers.clear();connect();ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
-    EXPECT_FALSE(old.matches(peers[0].physical));EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=2"),1);
+    // This case isolates physical retirement. Retain the disconnected old
+    // synchronizer: its destructor shuts down this shared receiver scheduler.
+    for(auto& sync:synchronizers)sync->disconnect();ASSERT_EQ(synchronizers.size(),1u);
+    connect();ASSERT_EQ(synchronizers.size(),2u);ASSERT_TRUE(until([&]{return installed(3);}));EXPECT_FALSE(has_error());
+    EXPECT_FALSE(old.matches(peers[0].physical));EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=3"),1);
 }
 }
 #endif

@@ -83,6 +83,8 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/recovery_staging.cpp
     Sources/LatticeCore/src/recovery_install_transaction.cpp
     Sources/LatticeCore/src/canonical_change_store.cpp
+    Sources/LatticeCore/src/recovery_receipt_coverage.cpp
+    Sources/LatticeCore/src/canonical_receipt_coverage.cpp
     Sources/LatticeCore/src/canonical_writer_adapter.cpp
     Sources/LatticeCore/src/recovery_authenticated_session.cpp
     Sources/LatticeCore/src/recovery_receiver_source.cpp
@@ -235,6 +237,9 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SyncPartialConstructionTests.cpp
     Tests/LatticeCoreTests/RecoveryReceiverSourceTests.cpp
     Tests/LatticeCoreTests/RecoveryReceiverControllerTests.cpp
+    Tests/LatticeCoreTests/RecoveryOriginalIdentityTests.cpp
+    Tests/LatticeCoreTests/CanonicalReceiptCoverageRangeTests.cpp
+    Tests/LatticeCoreTests/RecoveryReceiptCoverageControllerTests.cpp
     Tests/LatticeCoreTests/SyncCommitProbeTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
     Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp

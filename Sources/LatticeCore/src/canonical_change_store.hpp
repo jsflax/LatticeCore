@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "recovery_receipt_coverage.hpp"
 
 namespace lattice {
 class lattice_db;
@@ -37,6 +38,8 @@ struct canonical_namespace_entry {
 struct canonical_namespace_profile {
     std::string local_namespace;
     std::vector<canonical_namespace_entry> entries;
+    std::optional<canonical_coverage_profile> coverage;
+    int64_t version() const noexcept { return coverage?3:2; }
     void validate() const; // fixed v2 caps: 64 entries, 256 bytes per identity
     bool operator==(const canonical_namespace_profile&) const = default;
 };
@@ -93,6 +96,9 @@ public:
     // Every call checks this thread's actual owned main WRITE transaction.
     // Owner/transaction custody remains with caller. No transferable token.
     void initialize(); // full integrity audit on reopen; no import/reset
+    // Actual adapter quiescence must precede this owned transition. Existing
+    // global receipts retain original-namespace, legacy-unbound semantics.
+    void migrate_coverage_from_v2();
     void audit() const;
     canonical_store_state state() const; // cached counters, not a full audit
     std::optional<int64_t> touch(const canonical_identity&) const;

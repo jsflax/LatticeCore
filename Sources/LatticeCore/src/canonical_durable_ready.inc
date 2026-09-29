@@ -46,9 +46,9 @@ std::string ready_policy(const canonical_ready_profile& p) {
     number(c.requests);number(c.requested_targets);number(c.marker_batch);
     if(out.size()>4096)refuse("canonical READY policy serialization too large");return out;
 }
-void validate_ready_profile(const canonical_ready_profile& p,const canonical_writer_profile& source,const canonical_retention_limits& retention) {
+void validate_ready_profile(const canonical_ready_profile& p,const canonical_writer_profile& source,const canonical_retention_limits& retention,bool registered_profile) {
     if(p.authority.empty() || p.authority.size()>256 || p.transfers<=0 || p.transfers>64 || p.bindings<=0 || p.bindings>1024 ||
-       p.charged_bytes<=0 || p.charged_bytes>512LL*1024*1024 || p.transfer_bytes<4096 || p.transfer_bytes>p.charged_bytes ||
+       p.charged_bytes<=0 || p.charged_bytes>(registered_profile?1024LL:512LL)*1024*1024 || p.transfer_bytes<4096 || p.transfer_bytes>p.charged_bytes ||
        p.package.retained_wire_bytes==0 || p.package.retained_wire_bytes>static_cast<uint64_t>(p.transfer_bytes) ||
        p.package.frames<2 || p.package.frames>65536 || p.package.codec.maximum.frame_bytes>4*1024*1024 ||
        p.package.codec.lease_ms>static_cast<uint64_t>(retention.duration_ms) || p.capture.store!=source.limits)
@@ -277,6 +277,9 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
         bool coverage=false;for(const auto& entry:state.namespaces->entries)
             if(entry.namespace_id==ns && entry.coverage_id==ready_blob(row,"coverage_id") && entry.revision==integer(row,"coverage_revision"))coverage=true;
         if(!coverage)refuse("canonical READY namespace coverage changed; explicit disposal required");
+        if(bool(q.registered_producer)!=bool(state.namespaces->coverage))refuse("canonical READY retained request receipt profile differs");
+        if(q.registered_producer){const auto& c=*state.namespaces->coverage;
+            if(q.registered_producer->cohort_id!=c.cohort_id||q.registered_producer->cohort_revision!=c.revision||q.receipt_namespace!=std::optional<std::string>{ns})refuse("canonical READY retained registered cohort differs");}
         for(const auto& requested:q.receipts)if(requested.namespace_id!=std::optional<std::string>{ns})refuse("canonical READY request namespace differs");
         if(kind==ready_preparing) {
             const auto id=integer(row,"reservation");
@@ -289,17 +292,30 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
         } else if(kind==ready_complete) {
             if(integer(row,"reservation")!=0 || integer(row,"head")!=pin || integer(row,"floor")<0 || integer(row,"floor")>pin)
                 refuse("canonical READY tail pin or captured bounds differ");
-            (void)audit_ready_frames(writer,p,row,[&](const cr::receipt_item& item){
+            const auto manifest=audit_ready_frames(writer,p,row,[&](const cr::receipt_item& item){
                 const auto* positive=std::get_if<cr::committed>(&item.value);if(!positive)return;
                 if(auto* observation=canonical_ready_read_test_observation::current)++observation->positive_receipt_lookups;
                 const auto actual=store.receipt(item.original_id);
-                if(!actual || actual->original.namespace_id!=std::optional<std::string>{ns} ||
+                bool actual_namespace=actual&&actual->original.namespace_id==std::optional<std::string>{ns};
+                if(q.registered_producer) {
+                    if(!item.operation_digest)refuse("canonical READY positive immutable identity missing");
+                    const auto coverage=lookup_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return writer.query(sql,values);},
+                        *state.namespaces->coverage,item.original_id,ns,*q.registered_producer,*item.operation_digest);
+                    actual_namespace=coverage==canonical_coverage_lookup::covered||coverage==canonical_coverage_lookup::legacy_original_namespace;
+                    if(item.legacy_unbound!=(coverage==canonical_coverage_lookup::legacy_original_namespace))refuse("canonical READY positive provenance kind changed");
+                }
+                if(!actual || !actual_namespace ||
                    actual->position!=static_cast<int64_t>(positive->position) ||
                    static_cast<int>(actual->original.outcome)!=static_cast<int>(positive->outcome)+1 ||
                    bool(actual->original.target)!=bool(positive->accepted_target))refuse("canonical READY positive receipt lost source evidence");
                 if(actual->original.target && (actual->original.target->table!=positive->accepted_target->table ||
                     actual->original.target->global_id!=positive->accepted_target->id))refuse("canonical READY accepted receipt target differs");
             });
+            if(q.registered_producer) {
+                const auto coverage=read_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return writer.query(sql,values);},*state.namespaces->coverage);
+                if(!manifest.coverage_revision || *manifest.coverage_revision>static_cast<uint64_t>(coverage.mutation))
+                    refuse("canonical READY coverage capture revision is ahead of durable evidence");
+            }
             expected_frames=ready_add(expected_frames,integer(row,"frame_count"));
         } else refuse("canonical READY unsupported transfer state");
         charge=ready_add(charge,p.transfer_bytes);
@@ -360,7 +376,7 @@ std::unique_ptr<canonical_writer_adapter> canonical_writer_adapter::attach_ready
     if(!owner || !p.writer.upstream_requested || !upstream.entries || upstream.field_bytes<256 || !upstream.delivery_bytes ||
        upstream.field_bytes>upstream.delivery_bytes || upstream.delivery_bytes>static_cast<size_t>(std::numeric_limits<int>::max()/8))
         refuse("canonical READY qualification requires bounded retained namespaced upstream owner");
-    p.namespaces.validate();validate_ready_profile(ready,p.writer,retention);
+    p.namespaces.validate();validate_ready_profile(ready,p.writer,retention,bool(p.namespaces.coverage));
     return std::unique_ptr<canonical_writer_adapter>(new canonical_writer_adapter(*owner,p.writer,&upstream,&retention,&p.namespaces,&ready));
 }
 namespace {
@@ -375,7 +391,7 @@ std::vector<sync_recovery::canonical_capture_request> ready_capture_requests(con
     for(const auto& requested:q.receipts) {
         if(requested.namespace_id!=std::optional<std::string>{ns} || canonical_writer_adapter::uuid_key(requested.original_id)!=requested.original_id ||
            requested.targets.size()>p.capture.requested_targets-targets)refuse("canonical READY request provenance or targets differ");
-        targets+=requested.targets.size();sync_recovery::canonical_capture_request item{requested.original_id,{},ns};
+        targets+=requested.targets.size();sync_recovery::canonical_capture_request item{requested.original_id,{},ns,q.registered_producer,requested.operation_digest};
         for(const auto& target:requested.targets) {
             if(canonical_writer_adapter::uuid_key(target.id)!=target.id)refuse("canonical READY target spelling is not normalized");
             item.targets.push_back({target.table,target.id});
@@ -385,9 +401,10 @@ std::vector<sync_recovery::canonical_capture_request> ready_capture_requests(con
     return out;
 }
 void ready_require_identity(const database::row_t& row,const canonical_ready_profile& p,const cr::attempt& attempt,
-    const std::string& request_bytes,const canonical_namespace_entry& admission,const std::string& replica) {
+    const std::string& request_bytes,const canonical_namespace_entry& admission,const std::string& replica,
+    const std::optional<recovery_receipt_binding>& binding) {
     const auto frozen=ready_request(row,p);
-    if(frozen.logical!=attempt || ready_blob(row,"request")!=request_bytes || ready_blob(row,"namespace_id")!=admission.namespace_id ||
+    if(std::get<cr::request>(frozen.body).registered_producer!=binding||frozen.logical!=attempt || ready_blob(row,"request")!=request_bytes || ready_blob(row,"namespace_id")!=admission.namespace_id ||
        ready_blob(row,"coverage_id")!=admission.coverage_id || integer(row,"coverage_revision")!=admission.revision || ready_blob(row,"replica")!=replica)
         refuse("canonical READY logical request or coverage changed; abandon and use a new attempt");
 }
@@ -409,6 +426,7 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
         if(!state || !state->ready || !session)refuse("canonical READY v3 profile unavailable");
         const auto& p=*state->ready;validate_namespace_admission(owner,writer,state,held_admission);ready_duration(p,duration,route);
         if(request.source!=ready_source(state->profile,p))refuse("canonical READY request source differs from actual profile");
+        if(request.registered_producer!=held_admission.receipt_binding_)refuse("canonical READY registered producer differs from actual authenticated admission");
         const auto raw=cr::encode({attempt,ready_route,request},p.package.codec);
         const auto frozen=cr::decode(raw,p.package.codec);const auto& logical=frozen.logical;const auto& q=std::get<cr::request>(frozen.body);
         const auto ns=held_admission.namespace_.namespace_id,replica=held_admission.replica_;
@@ -474,16 +492,16 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
                 row.payload?std::variant<cr::present,cr::tombstone>(cr::present{*row.payload}):std::variant<cr::present,cr::tombstone>(cr::tombstone{})});
             std::vector<cr::receipt_item> receipts;receipts.reserve(captured.capture->receipts.size());
             for(const auto& receipt:captured.capture->receipts) {
-                if(!receipt.stored){receipts.push_back({receipt.original_id,cr::unknown{cr::unknown_reason::unproved_provenance}});continue;}
+                if(!receipt.stored){receipts.push_back({receipt.original_id,cr::unknown{cr::unknown_reason::unproved_provenance},receipt.operation_digest,false});continue;}
                 const auto& stored=*receipt.stored;
                 if(stored.original.namespace_id!=std::optional<std::string>{ns})refuse("canonical READY capture receipt namespace differs");
                 cr::committed accepted{ns,held_admission.namespace_.coverage_id,static_cast<cr::decision>(static_cast<int>(stored.original.outcome)-1),
                     static_cast<uint64_t>(stored.position),{}};
                 if(stored.original.target)accepted.accepted_target=cr::identity{stored.original.target->table,stored.original.target->global_id};
-                receipts.push_back({receipt.original_id,std::move(accepted)});
+                receipts.push_back({receipt.original_id,std::move(accepted),receipt.operation_digest,receipt.legacy_unbound});
             }
             const auto package=cr::assemble_package(logical,ready_route,q,static_cast<uint64_t>(captured.head),
-                {manifest_lease,static_cast<uint64_t>(duration)},content,receipts,p.package);
+                {manifest_lease,static_cast<uint64_t>(duration)},content,receipts,p.package,captured.capture->coverage_revision);
             observe_ready(canonical_ready_test_observation::point::assembled);
             std::optional<canonical_ready_info> published;
             observe_ready(canonical_ready_test_observation::point::publish_requested);
@@ -491,7 +509,7 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
                 observe_ready(canonical_ready_test_observation::point::publish_body);
                 validate_namespace_admission(owner,writer,state,held_admission);
                 if(clock.now()>=deadline || clock.incarnation!=ticket->incarnation_)refuse("canonical READY preparation lease expired or retired before publication");
-                const auto row=ready_row(actual,p,key);ready_require_identity(row,p,logical,raw,held_admission.namespace_,replica);
+                const auto row=ready_row(actual,p,key);ready_require_identity(row,p,logical,raw,held_admission.namespace_,replica,held_admission.receipt_binding_);
                 if(integer(row,"state")!=ready_preparing || integer(row,"reservation")!=ticket->id_ || integer(row,"pin")!=ticket->base_ ||
                    integer(row,"lease_sequence")!=lease_sequence || integer(row,"lease_incarnation")!=clock.incarnation || integer(row,"deadline_ms")!=deadline)
                     refuse("canonical READY publication lost exact preparation reservation");
@@ -500,6 +518,10 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
                 canonical_change_store store(*owner,state->binding,state->profile.limits,state->namespace_profile());const auto current=store.state();
                 if(current.floor>ticket->base_ || captured.head>current.head || captured.floor>ticket->base_)
                     refuse("canonical READY source pin continuity lost");
+                if(state->namespaces->coverage) {
+                    const auto current_coverage=read_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return actual.query(sql,values);},*state->namespaces->coverage);
+                    if(captured.capture->coverage_revision!=std::optional<uint64_t>{static_cast<uint64_t>(current_coverage.mutation)})refuse("canonical READY captured coverage changed before publication");
+                }
                 int64_t charge=ready_metadata_charge(row);picosha2::hash256_one_by_one hash;int64_t index=0;
                 for(const auto& frame:package.frames()) {
                     charge=ready_add(charge,ready_add(frame.size(),128));if(charge>p.transfer_bytes)refuse("canonical READY capsule exceeds reserved charge");
@@ -547,12 +569,13 @@ canonical_ready_resume_result canonical_writer_adapter::resume_ready_owned(std::
         const auto held=admission;if(!state || !state->ready || !session)refuse("canonical READY v3 profile unavailable");
         const auto& p=*state->ready;validate_namespace_admission(owner,writer,state,held);ready_duration(p,duration,route);
         if(request.source!=ready_source(state->profile,p))refuse("canonical READY resume source differs");
+        if(request.registered_producer!=held.receipt_binding_)refuse("canonical READY resume registered producer differs");
         const auto raw=cr::encode({attempt,ready_route,request},p.package.codec),key=ready_binding(held.namespace_.namespace_id,held.replica_,attempt);
         (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
         std::optional<canonical_ready_info> resumed;int64_t sequence=0,deadline=0;
         result.settlement=retention_owned(owner,writer,state,session,ready_resume,[&](database& actual,retention_session& clock){
             validate_namespace_admission(owner,writer,state,held);const auto row=ready_row(actual,p,key);
-            ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_);
+            ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
             if(integer(row,"state")!=ready_complete)refuse("canonical READY incomplete preparation cannot resume");
             // Same-process expiry cannot silently renew. A source restart has
             // explicitly orphaned the old physical lease; fresh admission may
@@ -596,7 +619,7 @@ canonical_ready_frame_result canonical_writer_adapter::read_ready_frame_owned(st
                 observation->clock_before_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-clock.started).count();
             validate_namespace_admission(owner,writer,state,held);const auto& p=*state->ready;
             const auto row=ready_row(actual,p,lease.identity_.binding_);const auto frozen=ready_request(row,p);
-            ready_require_identity(row,p,frozen.logical,ready_blob(row,"request"),held.namespace_,held.replica_);
+            ready_require_identity(row,p,frozen.logical,ready_blob(row,"request"),held.namespace_,held.replica_,held.receipt_binding_);
             if(integer(row,"state")!=ready_complete || integer(row,"sequence")!=lease.identity_.sequence_ ||
                std::get<cr::request>(frozen.body).request_digest!=lease.identity_.request_digest_ ||
                integer(row,"lease_incarnation")!=lease.incarnation_ || integer(row,"lease_sequence")!=lease.sequence_ ||
@@ -656,7 +679,7 @@ recovery_install_result canonical_writer_adapter::discard_authenticated_ready(st
         const auto& p=*state->ready;const auto raw=cr::encode({attempt,ready_route,request},p.package.codec);
         (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
         const auto row=ready_row(actual,p,ready_binding(held.namespace_.namespace_id,held.replica_,attempt));
-        ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_);
+        ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
         dispose_ready(actual,p,row);validate_namespace_admission(owner,writer,state,held);
     });
 }

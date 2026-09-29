@@ -447,6 +447,10 @@ static json entry_to_json_obj(const audit_log_entry& entry) {
         // Optional key — only on the wire when set. Old receivers ignore it.
         j["synthesized"] = true;
     }
+    if(entry.original_identity) {
+        const auto& identity=*entry.original_identity;
+        j["originalIdentity"]={{"version",identity.version},{"changedFieldsNames",identity.changed_fields_names},{"digest",identity.digest}};
+    }
 
     return j;
 }
@@ -521,6 +525,21 @@ static std::optional<audit_log_entry> entry_from_parsed(const json& j) {
         }
         if (j.contains("synthesized") && j["synthesized"].is_boolean()) {
             entry.synthesized = j["synthesized"].get<bool>();
+        }
+        if(j.contains("originalIdentity")) {
+            const auto& identity=j.at("originalIdentity");
+            if(!identity.is_object()||identity.size()!=3||!identity.contains("version")||
+               !identity.at("version").is_number_integer()||identity.at("version")!=1||
+               !identity.contains("digest")||!identity.at("digest").is_string()||identity.at("digest").get_ref<const std::string&>().size()!=64||
+               !identity.contains("changedFieldsNames")||!identity.at("changedFieldsNames").is_array()||identity.at("changedFieldsNames").size()>32)return std::nullopt;
+            audit_original_identity original;original.digest=identity.at("digest").get<std::string>();
+            for(char c:original.digest)if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return std::nullopt;
+            for(const auto& name:identity.at("changedFieldsNames")) {
+                if(!name.is_string())return std::nullopt;const auto& s=name.get_ref<const std::string&>();
+                if(s.empty()||s.size()>64||s.find('\0')!=std::string::npos)return std::nullopt;
+                original.changed_fields_names.push_back(s);
+            }
+            entry.original_identity=std::move(original);
         }
 
         return entry;
@@ -632,6 +651,7 @@ struct discovery_charge {
         for(const auto& e:values) {
             for(const auto* value:{&e.global_id,&e.table_name,&e.operation,&e.global_row_id,&e.timestamp})add(value->capacity()+1);
             strings(e.changed_fields_names);
+            if(e.original_identity){strings(e.original_identity->changed_fields_names);add(e.original_identity->digest.capacity()+1);}
             add(e.changed_fields.bucket_count(),sizeof(void*));
             add(e.changed_fields.size(),sizeof(decltype(e.changed_fields)::value_type)+4*sizeof(void*));
             for(const auto& [key,value]:e.changed_fields) {

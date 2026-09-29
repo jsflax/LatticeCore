@@ -1,5 +1,7 @@
 #include "recovery_receiver_controller.hpp"
 #include "recovery_unknown_reconciliation.hpp"
+#include "recovery_export_adapter.hpp"
+#include "recovery_receipt_json.hpp"
 #include "recovery_request_store.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "recovery_witness.hpp"
@@ -58,11 +60,15 @@ uint64_t decimal(const json& row,const char* key,uint64_t minimum=1) {
 }
 std::string source_context(const json& description) {
     json value;for(const auto* key:{"source","incomingScope","peer","channel","profile","upload"})value[key]=description.at(key);
+    if(description.contains("receiptBinding"))value["receiptBinding"]=description.at("receiptBinding");
     auto raw=value.dump();require(raw.size()<=recovery_request_store::context_bytes,"controller source context capacity");return raw;
 }
 std::string domain(const json& description) {
     auto value=json{{"source",description.at("source")},{"incomingScope",description.at("incomingScope")}};
-    auto& source=value["source"];for(const auto* key:{"receiptNamespace","coverageID","coverageRevision","descriptorDigest"})source.erase(key);
+    // Receipt enrollment changes how an original is proved, not which rows
+    // this exact canonical authority/catalog replaces. Keep that enrollment
+    // in source_context and separately require one binding across the cohort.
+    auto& source=value["source"];for(const auto* key:{"receiptNamespace","coverageID","coverageRevision","descriptorDigest","receiptCoverage"})source.erase(key);
     return picosha2::hash256_hex_string(value.dump());
 }
 cr::source_binding source_binding(const recovery_obligation_profile& profile) {
@@ -354,9 +360,13 @@ void recovery_receiver_controller::turn() {
         auto owner=connected_routes.begin()->second.route->state_->owner.lock();if(!owner||owner->is_closed())return;
         observed_owner=owner;
         std::string common_domain;
+        const auto common_receipt_binding=connected_routes.begin()->second.description.value("receiptBinding",json{});
         for(const auto& [channel,c]:connected_routes) {
             const auto key=domain(c.description);if(common_domain.empty())common_domain=key;
             require(key==common_domain,"controller overlapping replacement authority requires explicit configuration");
+            require(c.description.value("receiptBinding",json{})==common_receipt_binding,"controller receipt producer or cohort differs across contributions");
+        }
+        for(const auto& [channel,c]:connected_routes) {
             if(!runtime.observed.count(channel)||runtime.observed.at(channel).value!=c.view.value){
                 {std::lock_guard lock(runtime.mutex);require(runtime.revision!=UINT64_MAX&&runtime.external_revision!=UINT64_MAX,"controller demand revision exhausted");++runtime.revision;++runtime.external_revision;runtime.demand=true;runtime.failure={};runtime.awaiting_delivery_retry=false;}
                 std::shared_ptr<const recovery_reconciliation_descriptor> retired;
@@ -548,6 +558,10 @@ void recovery_receiver_controller::turn() {
                 for(const auto& scope:proof->frozen_journals())for(const auto& entry:scope.entries){
                     require(originals.count(entry.canonical_original_id)||originals.size()<8192,"controller complete union exceeds finite request capacity");
                     const auto [at,added]=originals.emplace(entry.canonical_original_id,entry.record);require(added||at->second==entry.record,"controller shared original differs");}
+                std::map<std::string,std::string> immutable_originals;
+                const auto& first_description=connected_routes.at(proof->frozen_journals().front().scope.address.channel).description;
+                if(first_description.contains("receiptBinding"))immutable_originals=recovery_export_adapter::frozen_original_identities(owner,*proof,
+                    receipt_json::binding(first_description.at("receiptBinding")),first_description.at("source").at("schemaDigest").get<std::string>());
                 for(const auto& scope:proof->frozen_journals()) {
                     const auto& connected=connected_routes.at(scope.scope.address.channel);const auto& d=connected.description;
                     const auto existing=requests.read(scope.scope.address.channel);
@@ -563,10 +577,12 @@ void recovery_receiver_controller::turn() {
                     const auto prior=receiver.read(scope.scope.address.channel);require(prior&&prior->binding==scope.scope.profile.binding&&!prior->active,"controller Q actual receiver unavailable");
                     cr::attempt logical{d.at("peer").at("receiverIncarnation"),d.at("peer").at("channelIncarnation"),scope.scope.address.channel,static_cast<uint64_t>(attempt),uuid_t::generate().to_string()};
                     cr::request q;q.source=source_binding(scope.scope.profile);q.expected.binding=q.source;q.expected.revision=prior->revision;
+                    if(d.contains("receiptBinding")){q.registered_producer=receipt_json::binding(d.at("receiptBinding"));q.receipt_namespace=scope.scope.profile.receipt_namespace;}
                     q.expected.base={prior->frontier.kind==receive_frontier_kind::position?cr::frontier_kind::position:prior->frontier.kind==receive_frontier_kind::beginning_null?cr::frontier_kind::beginning_null:cr::frontier_kind::uninitialized,
                         prior->frontier.position?std::optional<uint64_t>{static_cast<uint64_t>(*prior->frontier.position)}:std::nullopt};q.budget=negotiate(d,runtime.caps.codec);
                     require(originals.size()<=d.at("profile").at("requestEntries").get<size_t>()&&originals.size()<=d.at("profile").at("requestTargets").get<size_t>(),"controller actual source request count capacity");
-                    for(const auto& [id,entry]:originals)q.receipts.push_back({id,scope.scope.profile.receipt_namespace,{{entry.table,canonical_writer_adapter::uuid_key(entry.target_id)}}});
+                    for(const auto& [id,entry]:originals)q.receipts.push_back({id,scope.scope.profile.receipt_namespace,{{entry.table,canonical_writer_adapter::uuid_key(entry.target_id)}},
+                        q.registered_producer?std::optional<std::string>{immutable_originals.at(id)}:std::nullopt});
                     q.request_digest=cr::request_sha256(logical,q,runtime.caps.codec);const auto route=decimal(d,"routeGeneration");
                     requests.insert({scope.scope.address,barrier,attempt,scope.scope.revision,static_cast<int64_t>(route),common_domain,source_context(d),cr::encode({logical,route,q},runtime.caps.codec),{}});created=true;
                 }

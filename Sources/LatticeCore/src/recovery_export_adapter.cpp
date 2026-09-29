@@ -110,7 +110,8 @@ bool has_column(const recovery_local_export_table& table,const std::string& name
     return false;
 }
 void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_table& table,budget& b,
-    bool retained_later_delete=false,const std::function<bool()>& absent_row_proof={}){
+    bool retained_later_delete=false,const std::function<bool()>& absent_row_proof={},
+    const std::function<void(audit_log_entry&)>& capture_identity={},bool materialize=true){
     auto& e=row.entry;
     {statement valid(db,"SELECT json_valid(?1),json_valid(?2),CASE WHEN json_valid(?1) THEN json_type(?1) END,CASE WHEN json_valid(?2) THEN json_type(?2) END");
      valid.text(1,row.fields);valid.text(2,row.names);
@@ -129,6 +130,8 @@ void decode_generated(sqlite3* db,raw_audit& row,const recovery_local_export_tab
         if(!keys.count(name)||!changed.insert(name).second)refuse("export missing or duplicate generated name");e.changed_fields_names.push_back(name);
      }}
     if(table.regular_link&&e.operation=="UPDATE")refuse("export unsupported link update");
+    if(capture_identity)capture_identity(e);
+    if(!materialize)return;
     if(e.operation=="UPDATE")for(const auto& column:table.no_history){
         if(!changed.count(column))continue;
         statement current(db,"SELECT "+quote_identifier(column)+" FROM main."+quote_identifier(table.name)+" WHERE globalId=? LIMIT 2");current.text(1,e.global_row_id);
@@ -152,6 +155,7 @@ size_t wire_bound(const audit_log_entry& e,size_t cap){
         if(const auto* s=std::get_if<std::string>(&p.value))add(s->size(),6);
         else if(const auto* bytes=std::get_if<std::vector<uint8_t>>(&p.value))add(bytes->size(),2);
     }
+    if(e.original_identity){add(128);add(e.original_identity->digest.size());for(const auto& n:e.original_identity->changed_fields_names){add(n.size(),6);add(4);}}
     if(n>cap)refuse("export wire budget exceeded before serialization");return n;
 }
 void check_scopes(const recovery_local_export_inventory& inventory,const std::vector<recovery_local_export_scope>& expected){
@@ -403,6 +407,37 @@ struct continuous_delete_witness {
 };
 } // namespace
 
+std::map<std::string,std::string> recovery_export_adapter::frozen_original_identities(std::shared_ptr<lattice_db> owner,
+    const verified_unsent_set& proof,const recovery_receipt_binding& binding,const std::string& schema) {
+    binding.validate();recovery_continuous_producer::verify_for_owned_write(proof);
+    if(!owner)refuse("frozen original identity requires actual owner");auto* writer=recovery_writer_access::active_writer(*owner);
+    if(!writer)refuse("frozen original identity requires actual owned WRITE");
+    const auto inventory=recovery_local_producer_adapter::export_inventory_for_owned_write(owner);
+    if(!inventory.continuous||inventory.scopes.size()!=proof.frozen_journals().size())refuse("frozen original identity producer inventory differs");
+    auto* db=recovery_writer_access::active_handle(*owner,*writer);
+    std::map<std::string,recovery_obligation_record> originals;
+    for(const auto& scope:proof.frozen_journals())for(const auto& entry:scope.entries){
+        if(!originals.count(entry.canonical_original_id)&&originals.size()>=8192)refuse("frozen original identity union bound");
+        const auto [at,added]=originals.emplace(entry.canonical_original_id,entry.record);
+        if(!added&&at->second!=entry.record)refuse("frozen shared original identity differs");
+    }
+    std::map<std::string,std::string> result;
+    for(const auto& [id,record]:originals) {
+        recovery_export_limits limits;budget raw{limits};auto row=read_audit(db,record.audit_id,raw);
+        if(row.entry.global_id!=record.original_id||row.entry.table_name!=record.table||row.entry.global_row_id!=record.target_id)refuse("frozen original audit differs from verified journal");
+        const recovery_local_export_table* table=nullptr;
+        for(const auto& scope:inventory.scopes)for(const auto& t:scope.tables)if(t.name==record.table){
+            if(table&&(table->columns!=t.columns||table->no_history!=t.no_history||table->regular_link!=t.regular_link))refuse("frozen original schema contribution differs");table=&t;}
+        if(!table)refuse("frozen original schema unavailable");
+        std::unordered_map<std::string,column_type> columns(table->columns.begin(),table->columns.end());
+        if(table->regular_link){columns.emplace("lhs",column_type::text);columns.emplace("rhs",column_type::text);}
+        decode_generated(db,row,*table,raw,false,{},[&](audit_log_entry& entry){
+            result.emplace(id,make_original_identity(entry,columns,table->no_history,schema,binding.producer).digest);
+        },false);
+    }
+    recovery_continuous_producer::verify_for_owned_write(proof);return result;
+}
+
 committed_export_frame::committed_export_frame(committed_export_frame&& other) noexcept {
     *this=std::move(other);
 }
@@ -577,7 +612,14 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                         }
                         witness_id=later;return true;
                     };
-                    decode_generated(db,row,*table,raw,false,prove_absence);wire_bound(row.entry,limits.wire_bytes);
+                    const auto identity=[&](audit_log_entry& entry){
+                        if(!frame.upload_view_->receipt_binding_)return;
+                        std::unordered_map<std::string,column_type> columns(table->columns.begin(),table->columns.end());
+                        if(table->regular_link){columns.emplace("lhs",column_type::text);columns.emplace("rhs",column_type::text);}
+                        entry.original_identity=make_original_identity(entry,columns,table->no_history,frame.upload_view_->schema_digest_,frame.upload_view_->receipt_binding_->producer);
+                        raw.charge(original_identity_bytes(*entry.original_identity));
+                    };
+                    decode_generated(db,row,*table,raw,false,prove_absence,identity);wire_bound(row.entry,limits.wire_bytes);
                     const auto json=row.entry.to_json();
                     const size_t overhead=encoded.size()+(!frame.entries_.empty()?1:0)+2;
                     if(overhead>frame.upload_view_->wire_||json.size()>frame.upload_view_->wire_-overhead)reason="wire bytes";
@@ -686,8 +728,16 @@ recovery_export_preparation recovery_export_adapter::prepare(std::shared_ptr<lat
                 // Recheck both actual row absence/value and exact projection
                 // after reentrant claim hooks; read errors never prove absence.
                 const bool continuous_absence=frame.upload_view_&&selected_delete_witnesses.at(i)!=0;
-                decode_generated(db,after,*tables[i],verify,later_delete(i)||continuous_absence);
+                const auto identity=[&](audit_log_entry& entry){
+                    if(!frame.upload_view_||!frame.upload_view_->receipt_binding_)return;
+                    const auto& table=*tables[i];std::unordered_map<std::string,column_type> columns(table.columns.begin(),table.columns.end());
+                    if(table.regular_link){columns.emplace("lhs",column_type::text);columns.emplace("rhs",column_type::text);}
+                    entry.original_identity=make_original_identity(entry,columns,table.no_history,frame.upload_view_->schema_digest_,frame.upload_view_->receipt_binding_->producer);
+                    verify.charge(original_identity_bytes(*entry.original_identity));
+                };
+                decode_generated(db,after,*tables[i],verify,later_delete(i)||continuous_absence,{},identity);
                 const auto& projected=frame.entries_[i];
+                if(after.entry.original_identity!=projected.original_identity)refuse("export immutable original identity changed after claims");
                 if(after.entry.changed_fields_names!=projected.changed_fields_names||after.entry.changed_fields.size()!=projected.changed_fields.size())
                     refuse("export retained projection changed after claims");
                 for(const auto& [name,value]:after.entry.changed_fields){const auto found=projected.changed_fields.find(name);

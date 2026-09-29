@@ -1,4 +1,5 @@
 #include "canonical_change_store.hpp"
+#include "canonical_receipt_coverage.hpp"
 #include "recovery_writer_access.hpp"
 #include <limits>
 #include <map>
@@ -78,6 +79,7 @@ void canonical_namespace_profile::validate() const {
             fail(code::invalid_argument,"canonical namespace revision or duplicate identity");
     }
     if(!unique.count(local_namespace))fail(code::invalid_argument,"canonical source-local namespace not enrolled");
+    if(coverage){coverage->validate();for(const auto& ns:coverage->namespaces)if(!unique.count(ns))fail(code::invalid_argument,"receipt cohort must name enrolled namespaces");}
 }
 canonical_change_store::canonical_change_store(lattice_db& owner, const canonical_store_binding& binding,
                                                canonical_store_limits limits,const canonical_namespace_profile* namespaces)
@@ -118,7 +120,7 @@ canonical_store_state canonical_change_store::state() const {
         "CASE WHEN typeof(scope)='blob' AND length(scope) BETWEEN 1 AND 256 THEN scope END AS scope,"
         "CASE WHEN typeof(schema_id)='blob' AND length(schema_id) BETWEEN 1 AND 256 THEN schema_id END AS schema_id "
         "FROM main._lattice_canonical_store LIMIT 2");
-    if (r.size() != 1 || integer(r[0],"id") != 1 || integer(r[0],"version") != (namespaces_?2:1))
+    if (r.size() != 1 || integer(r[0],"id") != 1 || integer(r[0],"version") != (namespaces_?namespaces_->version():1))
         fail(code::corrupt_state, "missing or unsupported canonical store");
     const auto& v = r[0];
     if (canonical_store_binding{decoded(v,"source"),decoded(v,"epoch"),decoded(v,"scope"),decoded(v,"schema_id")} != binding_)
@@ -173,11 +175,25 @@ void canonical_change_store::initialize() {
                 changed(db);
             }
         }
-        db.execute("INSERT INTO main._lattice_canonical_store VALUES(1,"+std::to_string(namespaces_?2:1)+",?,?,?,?,0,0,0,0,0,0,?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO main._lattice_canonical_store VALUES(1,"+std::to_string(namespaces_?namespaces_->version():1)+",?,?,?,?,0,0,0,0,0,0,?,?,?,?,?,?,?)",
             {encoded(binding_.source),encoded(binding_.epoch),encoded(binding_.scope),encoded(binding_.schema),
              limits_.markers,limits_.marker_bytes,limits_.receipts,limits_.receipt_bytes,
              limits_.batch_identities,limits_.identity_bytes,limits_.operation_bytes});
-        changed(db); audit(); return true;
+        changed(db);
+        if(namespaces_&&namespaces_->coverage)initialize_canonical_coverage(db,*namespaces_->coverage);
+        audit(); return true;
+    });
+}
+void canonical_change_store::migrate_coverage_from_v2() {
+    if(!namespaces_ || !namespaces_->coverage)fail(code::invalid_argument,"receipt migration requires explicit v3 cohort");
+    auto old=*namespaces_;old.coverage.reset();
+    canonical_change_store prior(owner_,binding_,limits_,&old);prior.audit();
+    const auto before=prior.state();auto& db=connection();
+    atomic(db,[&] {
+        initialize_canonical_coverage(db,*namespaces_->coverage);
+        db.execute("UPDATE main._lattice_canonical_store SET version=3 WHERE id=1 AND version=2");changed(db);
+        audit();if(state()!=before)fail(code::corrupt_state,"receipt migration changed canonical counters");
+        return true;
     });
 }
 void canonical_change_store::audit() const {
@@ -217,6 +233,8 @@ void canonical_change_store::audit() const {
     const auto r = db.query("SELECT COUNT(*) AS n,COALESCE(SUM(charge),0) AS bytes FROM main._lattice_canonical_receipt").at(0);
     if (integer(m,"n")!=s.markers || integer(m,"bytes")!=s.marker_bytes || integer(r,"n")!=s.receipts || integer(r,"bytes")!=s.receipt_bytes)
         fail(code::corrupt_state,"canonical counters differ from actual storage");
+    if(namespaces_&&namespaces_->coverage)
+        audit_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return db.query(sql,values);},*namespaces_->coverage);
 }
 std::optional<int64_t> canonical_change_store::touch(const canonical_identity& id) const {
     valid_identity(id,limits_); const auto s=state();

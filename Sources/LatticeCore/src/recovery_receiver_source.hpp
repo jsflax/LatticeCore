@@ -1,4 +1,5 @@
 #pragma once
+#include "recovery_receipt_coverage.hpp"
 #include <lattice/network.hpp>
 #include <memory>
 #include <mutex>
@@ -81,6 +82,8 @@ class receiver_upload_view {
     std::shared_ptr<const receiver_source_binding::record> record_;
     uint64_t revision_=0;
     size_t entries_=0,wire_=0,scalar_=0,nodes_=0,depth_=0,deletes_=0;
+    std::optional<recovery_receipt_binding> receipt_binding_;
+    std::string schema_digest_;
     receiver_upload_view()=default;
     bool current()const;
     bool fits(const std::string&,size_t,size_t,std::string&)const;

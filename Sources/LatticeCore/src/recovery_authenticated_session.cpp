@@ -1,4 +1,5 @@
 #include "recovery_authenticated_session.hpp"
+#include "recovery_receipt_json.hpp"
 #include "lattice/lattice.hpp"
 #include "vendor/picosha2/picosha2.h"
 #include <nlohmann/json.hpp>
@@ -65,9 +66,10 @@ struct source_recipe {
     std::string ready_name="boundedV1";
 };
 source_recipe recipe(const recovery_owner_schema& catalog,const json& j) {
-    auto base_shape=j;base_shape.erase("readyProfile");
+    auto base_shape=j;base_shape.erase("readyProfile");base_shape.erase("receiptCoverage");
     shape(base_shape,{"version","authority","sourceID","epoch","localNamespace","namespaces","receiptNamespace","models","walFull","maximumAuthorizationMilliseconds","upload"});
-    if(number(j,"version",1,1)!=1 || j.at("walFull")!=true)reject("relay explicit durability opt-in required");
+    const auto version=number(j,"version",1,2);
+    if((version==2)!=j.contains("receiptCoverage") || j.at("walFull")!=true)reject("relay explicit durability and receipt profile required");
     source_recipe r;r.maximum_duration=number(j,"maximumAuthorizationMilliseconds",1,3600000);
     auto& p=r.profile;
     if(!catalog.valid()||catalog.swift_digest.size()!=64)reject("relay actual Swift declaration catalog unavailable");
@@ -101,9 +103,11 @@ source_recipe recipe(const recovery_owner_schema& catalog,const json& j) {
     const auto& ns=j.at("namespaces");if(!ns.is_array()||ns.empty()||ns.size()>64)reject("relay namespace catalog bound");
     for(const auto& n:ns){shape(n,{"namespaceID","coverageID","revision"});p.namespaces.entries.push_back({text(n,"namespaceID"),text(n,"coverageID"),number(n,"revision",1,INT64_MAX)});}
     std::sort(p.namespaces.entries.begin(),p.namespaces.entries.end(),[](const auto& a,const auto& b){return a.namespace_id<b.namespace_id;});
+    if(version==2)p.namespaces.coverage=receipt_json::profile(j.at("receiptCoverage"));
     p.namespaces.validate();bool selected=false;
     for(const auto& n:p.namespaces.entries)if(n.namespace_id==r.selected_namespace)selected=true;
     if(!selected||r.selected_namespace==p.namespaces.local_namespace)reject("relay peer namespace must be enrolled and distinct from local");
+    if(p.namespaces.coverage && std::find(p.namespaces.coverage->namespaces.begin(),p.namespaces.coverage->namespaces.end(),r.selected_namespace)==p.namespaces.coverage->namespaces.end())reject("relay selected namespace is outside receipt cohort");
     auto& ready=r.ready;ready.authority=text(j,"authority");ready.transfers=16;ready.bindings=1024;ready.charged_bytes=67108864;ready.transfer_bytes=2097152;
     ready.package={{{16384,4096,2,256,4096,1048576,256,256,262144},16,4096,4096,256,256,65536,131072,3600000,{4096,32,256,2048,4096}},1572864,514};
     ready.capture={{{65536,16,4096,8192,2,2048,4096,1048576},16,32,32},p.writer.limits,256,256,32};
@@ -115,6 +119,11 @@ source_recipe recipe(const recovery_owner_schema& catalog,const json& j) {
             16,262144,32768,8192,8192,2097152,4194304,3600000,{16384,64,256,4096,16384}},41943040,770};
         ready.capture={{{262144,16,16384,16384,64,256,16384,33554432},16,32,32},p.writer.limits,8192,8192,256};
     }
+    if(p.namespaces.coverage&&r.ready_name!="bounded48MiBV1")reject("registered producer profile requires explicit bounded48MiBV1 READY capacity");
+    // All 16 contributions of one physical receiver retain their independent
+    // READY capsules until the cohort install. This is the explicit v3 source
+    // policy; existing v2 profiles keep their exact eight-transfer/512MiB cap.
+    if(p.namespaces.coverage){ready.transfers=16;ready.charged_bytes=1073741824;}
     const auto& upload=j.at("upload");shape(upload,{"tables","unlisted","maximumDeletes"});
     r.unlisted=upload.at("unlisted")=="allow"?7:upload.at("unlisted")=="deny"?0:255;if(r.unlisted==255)reject("relay unlisted policy required");
     r.maximum_deletes=static_cast<size_t>(number(upload,"maximumDeletes",0,frame_entries));
@@ -133,6 +142,7 @@ struct route_lifetime {
 }
 struct authenticated_mounted_source {
     std::shared_ptr<lattice_db> owner;
+    std::shared_ptr<instance_guard> owner_guard;
     std::shared_ptr<canonical_writer_adapter> adapter;
     source_recipe recipe;
     std::atomic<size_t> sessions{0};
@@ -144,12 +154,12 @@ struct authenticated_ready_budget {
     // Keep only the payload-free physical identity and bounded immutable recipe.
     // A queued result may outlive the last mounted source without retaining its
     // owner/adapter or running their destructors on a socket callback.
-    const std::shared_ptr<instance_guard> owner_guard;
+    const std::shared_ptr<const physical_store_identity> physical;
     const std::string recipe_key;
     std::mutex mutex;
     uint64_t requests=0,bytes=0,workspace=0;
     static constexpr uint64_t max_requests=64,max_bytes=67108864,max_workspace=268435456,input_limit=8388608,reply_limit=4194304;
-    authenticated_ready_budget(std::shared_ptr<instance_guard> guard,std::string key):owner_guard(std::move(guard)),recipe_key(std::move(key)){}
+    authenticated_ready_budget(std::shared_ptr<const physical_store_identity> identity,std::string key):physical(std::move(identity)),recipe_key(std::move(key)){}
 };
 struct authenticated_ready_fence {
     std::atomic<bool> current{false};
@@ -166,7 +176,8 @@ struct registry_slot {
     bool building=false;
 };
 std::mutex registry_mutex;
-std::map<instance_guard*,registry_slot> registry;
+using physical_key=std::pair<uint64_t,uint64_t>;
+std::map<physical_key,registry_slot> registry;
 std::atomic<uint64_t> turns{0};
 }
 struct authenticated_relay_setup::state {
@@ -176,6 +187,7 @@ struct authenticated_relay_setup::state {
     source_recipe recipe;
     json context;
     std::optional<canonical_namespace_admission> admission;
+    std::optional<recovery_receipt_binding> receipt_binding;
     std::string authorization_revision;
     uint64_t route_generation=0,lease_sequence=0;
     struct ready_slot {
@@ -211,6 +223,41 @@ authenticated_relay_setup::authenticated_relay_setup(std::shared_ptr<state> s):s
 authenticated_relay_setup::~authenticated_relay_setup(){close();}
 std::shared_ptr<authenticated_session_fence> authenticated_relay_setup::stop_token()const noexcept{return state_?state_->fence:nullptr;}
 void authenticated_relay_setup::close()noexcept{if(state_)state_->fence->stop();}
+bool authenticated_relay_setup::migrate_receipt_coverage(std::shared_ptr<lattice_db> owner,
+    const std::string& before_bytes,const std::string& after_bytes) {
+    if(!owner)reject("receipt migration requires the resolved mount owner");
+    const auto before_json=bounded(before_bytes,policy_bytes),after_json=bounded(after_bytes,policy_bytes);
+    const auto& catalog=canonical_writer_adapter::authenticated_catalog(*owner);
+    const auto before=recipe(catalog,before_json),after=recipe(catalog,after_json);
+    if(before.profile.namespaces.coverage||!after.profile.namespaces.coverage)
+        reject("receipt migration requires exact v2 to registered v3 transition");
+    auto common=after_json;common.erase("receiptCoverage");common["version"]=1;
+    if(before_json.contains("readyProfile"))common["readyProfile"]=before_json.at("readyProfile");else common.erase("readyProfile");
+    if(common!=before_json)reject("receipt migration cannot change source, namespace catalog, models or permissions");
+    const auto identity=canonical_writer_adapter::authenticated_owner_guard(*owner);
+    if(!identity||!identity->alive.load(std::memory_order_seq_cst))reject("receipt migration owner retired");
+    const auto physical=canonical_writer_adapter::authenticated_physical_identity(*owner);
+    const physical_key key{physical->device,physical->inode};
+    {
+        std::lock_guard lock(registry_mutex);
+        for(auto i=registry.begin();i!=registry.end();) {
+            if(!i->second.building&&i->second.value.expired()&&i->second.budget.expired())i=registry.erase(i);else ++i;
+        }
+        auto i=registry.find(key);
+        if(i!=registry.end()&&(i->second.building||!i->second.value.expired()||!i->second.budget.expired()))return false;
+        if(i==registry.end()&&registry.size()>=128)return false;
+        registry[key].building=true;
+    }
+    const auto release=[&] {
+        std::lock_guard lock(registry_mutex);
+        auto i=registry.find(key);if(i!=registry.end())i->second.building=false;
+    };
+    try {
+        canonical_writer_adapter::migrate_authenticated_source(owner,after.profile,
+            {frame_entries,65536,frame_bytes},{64,3600000},before.ready,after.ready);
+        release();return true;
+    } catch(...) {release();throw;}
+}
 std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::shared_ptr<lattice_db> owner,
     const std::string& policy,const std::string& connection,void* context,int32_t(*current)(void*),void(*destroy)(void*)) {
     // A supplied nonthrowing destroy transfers route custody on EVERY outcome.
@@ -224,6 +271,8 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
     (void)text(c.at("peer"),"replicaID");c["peer"]["receiverIncarnation"]=uuid(c.at("peer"),"receiverIncarnation");c["peer"]["channelIncarnation"]=uuid(c.at("peer"),"channelIncarnation");
     const auto owner_guard=canonical_writer_adapter::authenticated_owner_guard(*owner);
     if(!owner_guard)reject("relay actual owner identity unavailable");
+    const auto physical=canonical_writer_adapter::authenticated_physical_identity(*owner);
+    const physical_key key{physical->device,physical->inode};
     std::shared_ptr<authenticated_mounted_source> source;
     std::shared_ptr<authenticated_ready_budget> budget;
     bool busy=false,profile_differs=false;
@@ -232,16 +281,20 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
         for(auto i=registry.begin();i!=registry.end();) {
             if(!i->second.building&&i->second.value.expired()&&i->second.budget.expired())i=registry.erase(i);else ++i;
         }
-        auto i=registry.find(owner_guard.get());
+        auto i=registry.find(key);
         if(i!=registry.end()) {
             source=i->second.value.lock();budget=i->second.budget.lock();busy=i->second.building;
             profile_differs=budget&&budget->recipe_key!=r.key;
+            // Physical capacity spans owner turnover, while a live source may
+            // be reused only by its exact instance. Never attach a new owner
+            // to a retired owner's context or release that owner under lock.
+            busy=busy||(source&&source->owner_guard!=owner_guard);
         }
         if(!source&&!busy&&!profile_differs) {
             if(i==registry.end()&&registry.size()>=128)busy=true;
             else {
-                if(!budget)budget=std::make_shared<authenticated_ready_budget>(owner_guard,r.key);
-                auto& slot=registry[owner_guard.get()];slot.budget=budget;slot.building=true;
+                if(!budget)budget=std::make_shared<authenticated_ready_budget>(physical,r.key);
+                auto& slot=registry[key];slot.budget=budget;slot.building=true;
             }
         }
     }
@@ -250,14 +303,14 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
     if(source&&source->recipe.key!=r.key)reject("relay source profile differs on actual owner");
     if(!source) {
         try {
-            source=std::make_shared<authenticated_mounted_source>();source->owner=owner;source->recipe=r;
+            source=std::make_shared<authenticated_mounted_source>();source->owner=owner;source->owner_guard=owner_guard;source->recipe=r;
             source->ready_budget=budget;
             source->adapter=canonical_writer_adapter::open_authenticated_source(owner,r.profile,{frame_entries,65536,frame_bytes},{64,3600000},r.ready,true);
-            std::lock_guard lock(registry_mutex);auto& slot=registry.at(owner_guard.get());slot.value=source;slot.building=false;
+            std::lock_guard lock(registry_mutex);auto& slot=registry.at(key);slot.value=source;slot.building=false;
         }catch(...) {
             // Failed re-enrollment must not erase charges retained by an old
             // result. Only an expired source AND budget can release the slot.
-            std::lock_guard lock(registry_mutex);registry.at(owner_guard.get()).building=false;throw;
+            std::lock_guard lock(registry_mutex);registry.at(key).building=false;throw;
         }
     }
     auto s=std::make_shared<state>();s->source=std::move(source);
@@ -282,6 +335,7 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open(std::
         {"scopeDigest",p.writer.binding.scope},{"schemaDigest",p.writer.binding.schema},{"receiptNamespace",ns->namespace_id},
         {"coverageID",ns->coverage_id},{"coverageRevision",ns->revision},{"descriptorDigest",s->source->adapter->authenticated_descriptor_digest()}}},
         {"incomingScope",s->recipe.incoming}};
+    if(p.namespaces.coverage)s->context["source"]["receiptCoverage"]=receipt_json::encode(*p.namespaces.coverage);
     return std::shared_ptr<authenticated_relay_setup>(new authenticated_relay_setup(std::move(s)));
 }
 std::string authenticated_relay_setup::descriptor()const{if(!state_||state_->fence->stopped()||!state_->route->live())reject("relay setup retired");return state_->context.dump();}
@@ -289,7 +343,10 @@ bool authenticated_relay_setup::finish_authorization(const std::string& raw) {
     auto s=state_;if(!s||s->consumed||s->fence->stopped()||!s->route->live())return false;
     s->consumed=true; // A rejected/throwing outcome cannot be edited and retried.
     try {
-        auto value=bounded(raw,policy_bytes);shape(value,{"context","authenticatedUserID","peer","source","incomingScope","authorizationRevision","validForMilliseconds"});
+        auto value=bounded(raw,policy_bytes);auto base=value;base.erase("receiptCoverage");
+        shape(base,{"context","authenticatedUserID","peer","source","incomingScope","authorizationRevision","validForMilliseconds"});
+        if(bool(s->recipe.profile.namespaces.coverage)!=value.contains("receiptCoverage"))reject("relay authorization receipt coverage profile differs");
+        if(s->recipe.profile.namespaces.coverage)s->receipt_binding=receipt_json::authorization(value.at("receiptCoverage"),*s->recipe.profile.namespaces.coverage);
         value["authenticatedUserID"]=uuid(value,"authenticatedUserID");
         value["peer"]["receiverIncarnation"]=uuid(value.at("peer"),"receiverIncarnation");
         value["peer"]["channelIncarnation"]=uuid(value.at("peer"),"channelIncarnation");
@@ -301,7 +358,7 @@ bool authenticated_relay_setup::finish_authorization(const std::string& raw) {
         const auto time=authenticated_session_fence::now();if(time>INT64_MAX-ms)reject("relay authorization deadline exhausted");
         s->fence->deadline_.store(time+ms,std::memory_order_release);s->fence->authorized_.store(true,std::memory_order_release);
         s->admission=s->source->adapter->admit_authenticated_session(s->source->owner,s->recipe.selected_namespace,
-            text(s->context.at("route").at("peer"),"replicaID"),s->fence);
+            text(s->context.at("route").at("peer"),"replicaID"),s->fence,s->receipt_binding);
         if(!s->route->live()||!s->fence->live())reject("relay authorization completed after route retirement");return true;
     }catch(...){s->fence->stop();throw;}
 }
@@ -415,6 +472,7 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         response["source"]=s->context.at("source");response["incomingScope"]=s->context.at("incomingScope");
         response["peer"]=s->context.at("route").at("peer");response["channel"]=s->context.at("route").at("channel");
         response["profile"]=ready_profile_description(s->recipe);
+        if(s->receipt_binding)response["receiptBinding"]=receipt_json::encode(*s->receipt_binding);
         response["upload"]={{"maximumEntries",frame_entries},{"maximumWireBytes",frame_bytes},{"maximumScalarBytes",65536},{"parserNodes",32768},{"parserDepth",16},{"maximumDeletes",s->recipe.maximum_deletes}};return output();
     }
     if(ready_decimal(control,"routeGeneration")!=s->route_generation)reject("READY physical setup generation differs");

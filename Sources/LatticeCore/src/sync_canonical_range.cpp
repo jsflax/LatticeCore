@@ -1,4 +1,5 @@
 #include "sync_canonical_range.hpp"
+#include "recovery_receipt_json.hpp"
 #include "canonical_range_package.hpp"
 #include "canonical_validated_sequence.hpp"
 #include "vendor/picosha2/picosha2.h"
@@ -98,10 +99,14 @@ void request_shape(const attempt& a,const request& r,const limits& b){
     else check(r.expected.base.kind==frontier_kind::uninitialized,"initialized state requires expected binding");
     if(r.selection==mode::delta)check(r.expected.binding==std::optional<source_binding>{r.source}&&r.expected.base.kind==frontier_kind::position&&r.expected.base.value==r.base,"delta expected base differs");
     check(r.receipts.size()<=b.request_entries&&r.receipts.size()<=r.budget.receipts,"too many receipt requests");
+    check(bool(r.registered_producer)==bool(r.receipt_namespace),"registered receipt request namespace missing");
+    if(r.registered_producer){r.registered_producer->validate();name(*r.receipt_namespace,b);}
     uint64_t targets=0,bytes=0;const std::string* last=nullptr;
     for(const auto& q:r.receipts){
         name(q.original_id,b);check(!last||bytes_less(*last,q.original_id),"duplicate or unordered receipt request");last=&q.original_id;
         if(q.namespace_id)name(*q.namespace_id,b);
+        check(bool(q.operation_digest)==bool(r.registered_producer),"receipt request operation identity profile differs");
+        if(q.operation_digest){digest(*q.operation_digest);check(q.namespace_id==r.receipt_namespace,"registered request namespace differs");}
         check(!q.targets.empty()&&q.targets.size()<=b.request_targets-targets,"too many receipt targets");
         targets+=q.targets.size();const identity* previous=nullptr;
         for(const auto& t:q.targets){valid(t,b);check(!previous||less(*previous,t),"duplicate or unordered receipt target");previous=&t;bytes=add(bytes,identity_bytes(t));check(bytes<=b.request_target_bytes,"receipt target bytes exceeded");}
@@ -114,6 +119,9 @@ void stream_counts(uint64_t pages,uint64_t n,uint64_t bytes,uint64_t max_pages,u
 }
 void manifest_shape(const manifest& m,const limits& b){
     budgets(b);digest(m.request_digest);valid(m.source,b);selection(m.selection,m.base,m.head);
+    check(bool(m.registered_producer)==bool(m.receipt_namespace)&&bool(m.registered_producer)==bool(m.coverage_revision),"registered receipt manifest namespace or coverage revision missing");
+    if(m.coverage_revision)check(*m.coverage_revision<=maximum,"registered coverage revision bound");
+    if(m.registered_producer){m.registered_producer->validate();name(*m.receipt_namespace,b);}
     name(m.protection.id,b);check(m.protection.duration_ms>0&&m.protection.duration_ms<=b.lease_ms,"invalid canonical lease duration");
     const auto& t=m.counts;const auto& w=b.maximum;
     check(t.identities==add(t.present,t.tombstones),"canonical tag totals differ");
@@ -132,6 +140,9 @@ void content_shape(const content_item& x,const limits& b){
 }
 void receipt_shape(const receipt_item& x,const limits& b){
     name(x.original_id,b);
+    if(x.operation_digest)digest(*x.operation_digest);
+    check(!x.operation_digest||!std::holds_alternative<not_committed>(x.value),"registered receipt cannot encode negative coverage");
+    check(!x.legacy_unbound||(x.operation_digest&&std::holds_alternative<committed>(x.value)),"legacy receipt tag requires registered original-namespace positive");
     std::visit([&](const auto& v){using T=std::decay_t<decltype(v)>;
         if constexpr(std::is_same_v<T,unknown>)(void)spelling(v.reason);
         else {name(v.namespace_id,b);name(v.coverage_id,b);
@@ -152,7 +163,7 @@ public:
     void u(uint64_t n){char bytes[8];for(int i=0;i<8;++i)bytes[7-i]=static_cast<char>(n>>(8*i));raw(std::string_view(bytes,8));}
     void s(std::string_view s){u(s.size());raw(s);}
     void d(const std::string& d){digest(d);auto nib=[](char c){return c<='9'?c-'0':c-'a'+10;};for(size_t i=0;i<64;i+=2)byte(static_cast<uint8_t>((nib(d[i])<<4)|nib(d[i+1])));}
-    explicit hash_writer(std::string_view domain){s(std::string("lattice.canonical-range.v2/")+std::string(domain));}
+    explicit hash_writer(std::string_view domain,bool registered=false){s(std::string(registered?"lattice.canonical-range.v3/":"lattice.canonical-range.v2/")+std::string(domain));}
     std::string finish(){hash_.finish();return picosha2::get_hash_hex_string(hash_);}
 };
 void write(hash_writer& h,const identity& x){h.s(x.table);h.s(x.id);}
@@ -169,12 +180,15 @@ void write(hash_writer& h,const receipt_item& x){
         else {h.s(std::is_same_v<T,committed>?"committed":"not_committed");h.s(v.namespace_id);h.s(v.coverage_id);
             if constexpr(std::is_same_v<T,committed>){h.s(spelling(v.outcome));h.u(v.position);h.byte(v.accepted_target?1:0);if(v.accepted_target)write(h,*v.accepted_target);}}
     },x.value);
+    if(x.operation_digest){h.s("registered-original-v1");h.d(*x.operation_digest);h.byte(x.legacy_unbound?1:0);}
 }
+void write(hash_writer& h,const recovery_receipt_binding& b){h.s(b.producer.registration_id);h.s(b.producer.incarnation);h.s(b.cohort_id);h.u(b.cohort_revision);h.u(b.operation_codec);}
 std::string request_hash(const attempt& a,const request& r){
-    hash_writer h("request");write(h,a);write(h,r.source);h.s(spelling(r.selection));write(h,r.base);write(h,r.expected);write(h,r.budget);h.u(r.receipts.size());
-    for(const auto& q:r.receipts){h.s(q.original_id);h.s(q.namespace_id?"negotiated":"unknown");if(q.namespace_id)h.s(*q.namespace_id);h.u(q.targets.size());for(const auto& i:q.targets)write(h,i);}return h.finish();
+    hash_writer h("request",bool(r.registered_producer));write(h,a);write(h,r.source);h.s(spelling(r.selection));write(h,r.base);write(h,r.expected);write(h,r.budget);h.u(r.receipts.size());
+    for(const auto& q:r.receipts){h.s(q.original_id);h.s(q.namespace_id?"negotiated":"unknown");if(q.namespace_id)h.s(*q.namespace_id);h.u(q.targets.size());for(const auto& i:q.targets)write(h,i);if(q.operation_digest)h.d(*q.operation_digest);}
+    if(r.registered_producer){write(h,*r.registered_producer);h.s(*r.receipt_namespace);}return h.finish();
 }
-std::string anchor(const manifest& m){hash_writer h("anchor");h.d(m.request_digest);write(h,m.source);h.s(spelling(m.selection));write(h,m.base);h.u(m.head);h.s(m.protection.id);h.u(m.protection.duration_ms);return h.finish();}
+std::string anchor(const manifest& m){hash_writer h("anchor",bool(m.registered_producer));h.d(m.request_digest);write(h,m.source);h.s(spelling(m.selection));write(h,m.base);h.u(m.head);h.s(m.protection.id);h.u(m.protection.duration_ms);if(m.registered_producer){write(h,*m.registered_producer);h.s(*m.receipt_namespace);h.u(*m.coverage_revision);}return h.finish();}
 std::string manifest_hash(const manifest& m){hash_writer h("manifest");h.d(anchor(m));write(h,m.counts);h.d(m.content_digest);h.d(m.receipt_digest);h.d(m.rebase_digest);return h.finish();}
 void request_valid(const attempt& a,const request& r,const limits& b){if(auto* c=sequence_test_observation::current)++c->request_validations;request_shape(a,r,b);digest(r.request_digest);check(request_hash(a,r)==r.request_digest,"request digest mismatch");}
 void manifest_valid(const manifest& m,const limits& b){manifest_shape(m,b);digest(m.manifest_digest);check(manifest_hash(m)==m.manifest_digest,"manifest digest mismatch");}
@@ -186,7 +200,7 @@ uint64_t receipt_size(const receipt_item& x){
         if constexpr(std::is_same_v<T,unknown>)n=add(n,add(8+7,add(8,std::string_view(spelling(v.reason)).size())));
         else {n=add(n,8+(std::is_same_v<T,committed>?9:13));n=add(n,add(16,add(v.namespace_id.size(),v.coverage_id.size())));
             if constexpr(std::is_same_v<T,committed>){n=add(n,add(17,std::string_view(spelling(v.outcome)).size()));if(v.accepted_target)n=add(n,identity_bytes(*v.accepted_target));}}
-    },x.value);return n;
+    },x.value);if(x.operation_digest)n=add(n,8+22+32+1);return n;
 }
 template<class Page> void page_shape(const Page& p,const limits& b){
     budgets(b);digest(p.manifest_digest);const auto& w=b.maximum;
@@ -231,7 +245,7 @@ void keys(const json& j,std::initializer_list<const char*> fields){check(j.is_ob
 std::string text(const json& j){check(j.is_string(),"canonical string required");return j.get<std::string>();}
 uint64_t number(const json& j){return sync_recovery::parse_position(text(j));}
 std::string decimal(uint64_t n){check(n<=maximum,"canonical number overflow");return std::to_string(n);}
-void version(const json& j){check(j.is_number_integer()&&j==2,"unsupported canonical version");}
+uint64_t version(const json& j){check(j.is_number_integer()&&(j==2||j==3),"unsupported canonical version");return j.get<uint64_t>();}
 json optional_number(const std::optional<uint64_t>& n){return n?json(decimal(*n)):json(nullptr);}
 std::optional<uint64_t> read_optional_number(const json& j){return j.is_null()?std::nullopt:std::optional<uint64_t>{number(j)};}
 mode read_mode(const json& j){const auto s=text(j);check(s=="full"||s=="delta","unknown canonical mode");return s=="full"?mode::full:mode::delta;}
@@ -255,17 +269,24 @@ wire_limits read_budget(const json& j){
     return {number(j.at("frame_bytes")),number(j.at("payload_bytes")),number(j.at("items_per_page")),number(j.at("content_pages")),number(j.at("content_identities")),number(j.at("content_bytes")),number(j.at("receipt_pages")),number(j.at("receipts")),number(j.at("receipt_bytes"))};
 }
 json request_json(const request& r){
-    json entries=json::array();for(const auto& e:r.receipts){json targets=json::array();for(const auto& i:e.targets)targets.push_back(identity_json(i));json p={{"kind",e.namespace_id?"negotiated":"unknown"}};if(e.namespace_id)p["namespace_id"]=*e.namespace_id;entries.push_back({{"original_id",e.original_id},{"provenance",p},{"targets",targets}});}
-    return {{"source",source_json(r.source)},{"mode",spelling(r.selection)},{"base",optional_number(r.base)},{"expected_install",expected_json(r.expected)},{"limits",budget_json(r.budget)},{"receipt_requests",entries},{"request_digest",r.request_digest}};
+    json entries=json::array();for(const auto& e:r.receipts){json targets=json::array();for(const auto& i:e.targets)targets.push_back(identity_json(i));
+        if(r.registered_producer)entries.push_back({{"original_id",e.original_id},{"operation_digest",*e.operation_digest},{"targets",targets}});
+        else {json p={{"kind",e.namespace_id?"negotiated":"unknown"}};if(e.namespace_id)p["namespace_id"]=*e.namespace_id;entries.push_back({{"original_id",e.original_id},{"provenance",p},{"targets",targets}});}}
+    json result={{"source",source_json(r.source)},{"mode",spelling(r.selection)},{"base",optional_number(r.base)},{"expected_install",expected_json(r.expected)},{"limits",budget_json(r.budget)},{"receipt_requests",entries},{"request_digest",r.request_digest}};
+    if(r.registered_producer){result["registered_producer"]=receipt_json::encode(*r.registered_producer);result["receipt_namespace"]=*r.receipt_namespace;}return result;
 }
 request read_request(const json& j,const limits& b){
-    keys(j,{"source","mode","base","expected_install","limits","receipt_requests","request_digest"});
+    auto base=j;base.erase("registered_producer");base.erase("receipt_namespace");keys(base,{"source","mode","base","expected_install","limits","receipt_requests","request_digest"});
+    check(j.contains("registered_producer")==j.contains("receipt_namespace"),"registered request namespace missing");
     request r;r.source=read_source(j.at("source"));r.selection=read_mode(j.at("mode"));r.base=read_optional_number(j.at("base"));r.expected=read_expected(j.at("expected_install"));r.budget=read_budget(j.at("limits"));r.request_digest=text(j.at("request_digest"));
+    if(j.contains("registered_producer")){r.registered_producer=receipt_json::binding(j.at("registered_producer"));r.receipt_namespace=text(j.at("receipt_namespace"));name(*r.receipt_namespace,b);}
     const auto& entries=j.at("receipt_requests");check(entries.is_array()&&entries.size()<=b.request_entries,"too many receipt requests");
     size_t count=0;uint64_t bytes=0;
-    for(const auto& e:entries){keys(e,{"original_id","provenance","targets"});receipt_request q;q.original_id=text(e.at("original_id"));
-        const auto& p=e.at("provenance");check(p.is_object()&&p.contains("kind"),"provenance kind required");const auto kind=text(p.at("kind"));
-        if(kind=="negotiated"){keys(p,{"kind","namespace_id"});q.namespace_id=text(p.at("namespace_id"));}else {keys(p,{"kind"});check(kind=="unknown","unknown provenance kind");}
+    for(const auto& e:entries){receipt_request q;
+        if(r.registered_producer){keys(e,{"original_id","operation_digest","targets"});q.namespace_id=r.receipt_namespace;q.operation_digest=text(e.at("operation_digest"));digest(*q.operation_digest);}
+        else {keys(e,{"original_id","provenance","targets"});const auto& p=e.at("provenance");check(p.is_object()&&p.contains("kind"),"provenance kind required");const auto kind=text(p.at("kind"));
+            if(kind=="negotiated"){keys(p,{"kind","namespace_id"});q.namespace_id=text(p.at("namespace_id"));}else {keys(p,{"kind"});check(kind=="unknown","unknown provenance kind");}}
+        q.original_id=text(e.at("original_id"));
         const auto& targets=e.at("targets");check(targets.is_array()&&!targets.empty()&&targets.size()<=b.request_targets-count,"too many receipt targets");count+=targets.size();
         for(const auto& x:targets){auto i=read_identity(x);valid(i,b);bytes=add(bytes,identity_bytes(i));check(bytes<=b.request_target_bytes,"receipt target bytes exceeded");q.targets.push_back(std::move(i));}
         r.receipts.push_back(std::move(q));
@@ -276,10 +297,13 @@ totals read_totals(const json& j){
     keys(j,{"content_pages","identities","present","tombstones","content_bytes","receipt_pages","receipts","receipt_bytes","rebase_identities","rebase_bytes"});
     return {number(j.at("content_pages")),number(j.at("identities")),number(j.at("present")),number(j.at("tombstones")),number(j.at("content_bytes")),number(j.at("receipt_pages")),number(j.at("receipts")),number(j.at("receipt_bytes")),number(j.at("rebase_identities")),number(j.at("rebase_bytes"))};
 }
-json manifest_json(const manifest& m){return {{"request_digest",m.request_digest},{"source",source_json(m.source)},{"mode",spelling(m.selection)},{"base",optional_number(m.base)},{"head",decimal(m.head)},{"lease",{{"id",m.protection.id},{"duration_ms",decimal(m.protection.duration_ms)}}},{"totals",totals_json(m.counts)},{"content_digest",m.content_digest},{"receipt_digest",m.receipt_digest},{"rebase_digest",m.rebase_digest},{"manifest_digest",m.manifest_digest}};}
+json manifest_json(const manifest& m){json result={{"request_digest",m.request_digest},{"source",source_json(m.source)},{"mode",spelling(m.selection)},{"base",optional_number(m.base)},{"head",decimal(m.head)},{"lease",{{"id",m.protection.id},{"duration_ms",decimal(m.protection.duration_ms)}}},{"totals",totals_json(m.counts)},{"content_digest",m.content_digest},{"receipt_digest",m.receipt_digest},{"rebase_digest",m.rebase_digest},{"manifest_digest",m.manifest_digest}};
+    if(m.registered_producer){result["registered_producer"]=receipt_json::encode(*m.registered_producer);result["receipt_namespace"]=*m.receipt_namespace;result["coverage_revision"]=decimal(*m.coverage_revision);}return result;}
 manifest read_manifest(const json& j){
-    keys(j,{"request_digest","source","mode","base","head","lease","totals","content_digest","receipt_digest","rebase_digest","manifest_digest"});const auto& l=j.at("lease");keys(l,{"id","duration_ms"});
-    manifest m;m.request_digest=text(j.at("request_digest"));m.source=read_source(j.at("source"));m.selection=read_mode(j.at("mode"));m.base=read_optional_number(j.at("base"));m.head=number(j.at("head"));m.protection={text(l.at("id")),number(l.at("duration_ms"))};m.counts=read_totals(j.at("totals"));m.content_digest=text(j.at("content_digest"));m.receipt_digest=text(j.at("receipt_digest"));m.rebase_digest=text(j.at("rebase_digest"));m.manifest_digest=text(j.at("manifest_digest"));return m;
+    auto base=j;base.erase("registered_producer");base.erase("receipt_namespace");base.erase("coverage_revision");keys(base,{"request_digest","source","mode","base","head","lease","totals","content_digest","receipt_digest","rebase_digest","manifest_digest"});const auto& l=j.at("lease");keys(l,{"id","duration_ms"});
+    check(j.contains("registered_producer")==j.contains("receipt_namespace")&&j.contains("registered_producer")==j.contains("coverage_revision"),"registered manifest namespace or coverage revision missing");
+    manifest m;m.request_digest=text(j.at("request_digest"));m.source=read_source(j.at("source"));m.selection=read_mode(j.at("mode"));m.base=read_optional_number(j.at("base"));m.head=number(j.at("head"));m.protection={text(l.at("id")),number(l.at("duration_ms"))};m.counts=read_totals(j.at("totals"));m.content_digest=text(j.at("content_digest"));m.receipt_digest=text(j.at("receipt_digest"));m.rebase_digest=text(j.at("rebase_digest"));m.manifest_digest=text(j.at("manifest_digest"));
+    if(j.contains("registered_producer")){m.registered_producer=receipt_json::binding(j.at("registered_producer"));m.receipt_namespace=text(j.at("receipt_namespace"));m.coverage_revision=number(j.at("coverage_revision"));}return m;
 }
 json item_json(const content_item& x){json j=identity_json(x.key);if(const auto* p=std::get_if<present>(&x.value)){j["tag"]="present";j["payload"]=p->payload;}else j["tag"]="tombstone";return j;}
 content_item read_content(const json& j){
@@ -293,9 +317,9 @@ json item_json(const receipt_item& x){
         if constexpr(std::is_same_v<T,unknown>){j["status"]="unknown";j["reason"]=spelling(v.reason);}
         else {j["status"]=std::is_same_v<T,committed>?"committed":"not_committed";j["namespace_id"]=v.namespace_id;j["coverage_id"]=v.coverage_id;
             if constexpr(std::is_same_v<T,committed>){j["decision"]=spelling(v.outcome);j["position"]=decimal(v.position);j["accepted_target"]=v.accepted_target?identity_json(*v.accepted_target):json(nullptr);}}
-    },x.value);return j;
+    },x.value);if(x.operation_digest){j["operation_digest"]=*x.operation_digest;j["legacy_unbound"]=x.legacy_unbound;}return j;
 }
-receipt_item read_receipt(const json& j){
+receipt_item read_receipt_base(const json& j){
     check(j.is_object()&&j.contains("status"),"receipt status required");const auto status=text(j.at("status"));
     if(status=="committed"){
         keys(j,{"original_id","status","namespace_id","coverage_id","decision","position","accepted_target"});const auto d=text(j.at("decision"));check(d=="applied"||d=="no_op"||d=="policy","unknown receipt decision");
@@ -307,19 +331,36 @@ receipt_item read_receipt(const json& j){
     for(auto r:{unknown_reason::legacy,unknown_reason::missing_coverage,unknown_reason::retired_coverage,unknown_reason::source_changed,unknown_reason::unproved_provenance})if(reason==spelling(r))return {text(j.at("original_id")),unknown{r}};
     throw protocol_error("unknown receipt reason");
 }
+receipt_item read_receipt(const json& j){
+    auto base=j;base.erase("operation_digest");base.erase("legacy_unbound");
+    check(j.contains("operation_digest")==j.contains("legacy_unbound"),"registered receipt metadata incomplete");
+    auto result=read_receipt_base(base);
+    if(j.contains("operation_digest")){result.operation_digest=text(j.at("operation_digest"));digest(*result.operation_digest);check(j.at("legacy_unbound").is_boolean(),"registered receipt legacy tag type");result.legacy_unbound=j.at("legacy_unbound").get<bool>();}
+    return result;
+}
 template<class Page> json page_json(const Page& p){json items=json::array();for(const auto& i:p.items)items.push_back(item_json(i));return {{"manifest_digest",p.manifest_digest},{"index",decimal(p.index)},{"count",decimal(p.count)},{"bytes",decimal(p.bytes)},{"digest",p.digest},{"items",items}};}
 template<class Page> Page read_page(const json& j,const limits& b){
     keys(j,{"manifest_digest","index","count","bytes","digest","items"});const auto& items=j.at("items");check(items.is_array()&&!items.empty()&&items.size()<=b.maximum.items_per_page,"invalid page items");
     Page p;p.manifest_digest=text(j.at("manifest_digest"));p.index=number(j.at("index"));p.count=number(j.at("count"));p.bytes=number(j.at("bytes"));p.digest=text(j.at("digest"));
     for(const auto& x:items){if constexpr(std::is_same_v<Page,content_page>)p.items.push_back(read_content(x));else p.items.push_back(read_receipt(x));}return p;
 }
+uint64_t frame_version(const frame& f){
+    if(const auto* r=std::get_if<request>(&f.body))return r->registered_producer?3:2;
+    if(const auto* m=std::get_if<manifest>(&f.body))return m->registered_producer?3:2;
+    return f.version;
+}
 void frame_valid(const frame& f,const limits& b){
     budgets(b);valid(f.logical,b);check(f.route_generation>0&&f.route_generation<=maximum,"invalid route generation spelling");
+    check(f.version==2||f.version==3,"unsupported canonical frame profile");
     std::visit([&](const auto& v){using T=std::decay_t<decltype(v)>;
         if constexpr(std::is_same_v<T,request>)request_valid(f.logical,v,b);
         else if constexpr(std::is_same_v<T,manifest>)manifest_valid(v,b);
         else if constexpr(std::is_same_v<T,end>)digest(v.manifest_digest);
-        else page_valid(v,b);
+        else {
+            page_valid(v,b);
+            if constexpr(std::is_same_v<T,receipt_page>)for(const auto& item:v.items)
+                check(bool(item.operation_digest)==(f.version==3),"receipt page wire profile differs");
+        }
     },f.body);
 }
 json frame_json(const frame& f){
@@ -330,7 +371,7 @@ json frame_json(const frame& f){
         else if constexpr(std::is_same_v<T,end>){kind="end";body={{"manifest_digest",v.manifest_digest}};}
         else {kind=std::is_same_v<T,content_page>?"content_page":"receipt_page";body=page_json(v);}
     },f.body);
-    return {{"latticeCanonicalRange",{{"version",2},{"attempt",attempt_json(f.logical)},{"route_generation",decimal(f.route_generation)},{"kind",kind},{"body",body}}}};
+    return {{"latticeCanonicalRange",{{"version",frame_version(f)},{"attempt",attempt_json(f.logical)},{"route_generation",decimal(f.route_generation)},{"kind",kind},{"body",body}}}};
 }
 std::string dump(const json& j,const limits& b,uint64_t cap){
     std::string raw;try{raw=j.dump();}catch(const json::exception&){throw protocol_error("invalid canonical JSON encoding");}
@@ -339,6 +380,8 @@ std::string dump(const json& j,const limits& b,uint64_t cap){
 limits narrowed(const limits& b,const wire_limits& w){within(w,b.maximum);auto result=b;result.maximum=w;result.string_bytes=std::min<uint64_t>(b.string_bytes,w.frame_bytes);return result;}
 void receipt_binding(const receipt_item& item,const receipt_request& asked,uint64_t head){
     check(item.original_id==asked.original_id,"receipt does not cover exact requested ID");
+    check(item.operation_digest==asked.operation_digest,"receipt immutable operation identity differs");
+    if(asked.operation_digest)check(!std::holds_alternative<not_committed>(item.value),"registered source cannot invent negative coverage");
     std::visit([&](const auto& v){using T=std::decay_t<decltype(v)>;
         if constexpr(!std::is_same_v<T,unknown>){
             check(asked.namespace_id&&*asked.namespace_id==v.namespace_id,"receipt namespace is not negotiated request namespace");
@@ -349,7 +392,7 @@ void receipt_binding(const receipt_item& item,const receipt_request& asked,uint6
 std::string rebase_hash(const request& r){hash_writer h("rebase");h.d(r.request_digest);const auto ids=rebase(r);h.u(ids.size());for(const auto& i:ids)write(h,i);return h.finish();}
 void bound_offer(const attempt& a,const request& r,const manifest& m,const limits& b){
     request_valid(a,r,b);const auto narrow=narrowed(b,r.budget);manifest_valid(m,narrow);
-    check(m.request_digest==r.request_digest&&m.source==r.source&&m.selection==r.selection&&m.base==r.base,"manifest request binding differs");
+    check(m.request_digest==r.request_digest&&m.source==r.source&&m.selection==r.selection&&m.base==r.base&&m.registered_producer==r.registered_producer&&m.receipt_namespace==r.receipt_namespace,"manifest request binding differs");
     if(r.expected.binding==std::optional<source_binding>{r.source}&&r.expected.base.value)check(m.head>=*r.expected.base.value,"same-source full head regresses installed frontier");
     const auto ids=rebase(r);uint64_t bytes=0;for(const auto& i:ids)bytes=add(bytes,identity_bytes(i));
     check(m.counts.receipts==r.receipts.size()&&m.counts.rebase_identities==ids.size()&&m.counts.rebase_bytes==bytes&&m.rebase_digest==rebase_hash(r),"receipt or rebase manifest coverage differs");
@@ -415,7 +458,7 @@ void state_valid(const sequence_state& s,const limits& b){
 json state_json(const sequence_state& s){
     if(auto* c=sequence_test_observation::current)++c->restart_objects;
     std::string bitmap;bitmap.reserve(s.rebase_seen.size());for(auto c:s.rebase_seen)bitmap.push_back(c?'1':'0');
-    return {{"latticeCanonicalRangeState",{{"version",2},{"attempt",attempt_json(s.logical)},{"request",request_json(s.frozen_request)},{"manifest",manifest_json(s.offer)},
+    return {{"latticeCanonicalRangeState",{{"version",s.frozen_request.registered_producer?3:2},{"attempt",attempt_json(s.logical)},{"request",request_json(s.frozen_request)},{"manifest",manifest_json(s.offer)},
         {"phase",s.status==phase::receiving?"receiving":"sequence_complete_unverified"},{"next_content_page",decimal(s.next_content_page)},{"next_receipt_page",decimal(s.next_receipt_page)},
         {"identities",decimal(s.identities)},{"present",decimal(s.present_count)},{"tombstones",decimal(s.tombstone_count)},{"content_bytes",decimal(s.content_bytes)},
         {"receipts",decimal(s.receipt_count)},{"receipt_bytes",decimal(s.receipt_bytes)},{"last_identity",s.last_identity?identity_json(*s.last_identity):json(nullptr)},{"rebase_seen",bitmap}}}};
@@ -442,6 +485,7 @@ void apply_progress(sequence_state& s,const sequence_progress& p) {
 sequence_progress transition(const sequence_progress& current,const request& r,const manifest& m,
     const std::vector<identity>& ids,const frame& f) {
     check(current.status==phase::receiving,"canonical sequence already ended");auto next=current;
+    check(frame_version(f)==(r.registered_producer?3u:2u),"canonical sequence wire profile differs");
     if(const auto* p=std::get_if<content_page>(&f.body)){
         check(p->manifest_digest==m.manifest_digest&&current.next_receipt_page==0&&p->index==current.next_content_page&&p->index<m.counts.content_pages,"duplicate or out-of-order content page");
         check(!current.last_identity||less(*current.last_identity,p->items.front().key),"content identity repeats across pages");
@@ -553,14 +597,15 @@ std::string receipts_sha256(const manifest& m,const std::vector<receipt_item>& r
     for(const auto& row:rows)hash.append(row);return hash.finish();
 }
 frame decode(std::string_view raw,const limits& b){
-    const auto root=parse(raw,b,b.maximum.frame_bytes);keys(root,{"latticeCanonicalRange"});const auto& j=root.at("latticeCanonicalRange");keys(j,{"version","attempt","route_generation","kind","body"});version(j.at("version"));
-    frame f;f.logical=read_attempt(j.at("attempt"));f.route_generation=number(j.at("route_generation"));const auto kind=text(j.at("kind"));const auto& body=j.at("body");
+    const auto root=parse(raw,b,b.maximum.frame_bytes);keys(root,{"latticeCanonicalRange"});const auto& j=root.at("latticeCanonicalRange");keys(j,{"version","attempt","route_generation","kind","body"});const auto wire_version=version(j.at("version"));
+    frame f;f.version=wire_version;f.logical=read_attempt(j.at("attempt"));f.route_generation=number(j.at("route_generation"));const auto kind=text(j.at("kind"));const auto& body=j.at("body");
     if(kind=="request")f.body=read_request(body,b);
     else if(kind=="manifest")f.body=read_manifest(body);
     else if(kind=="content_page")f.body=read_page<content_page>(body,b);
     else if(kind=="receipt_page")f.body=read_page<receipt_page>(body,b);
     else if(kind=="end"){keys(body,{"manifest_digest"});f.body=end{text(body.at("manifest_digest"))};}
     else throw protocol_error("unknown canonical frame kind");
+    check(frame_version(f)==wire_version,"canonical encoded receipt profile differs");
     frame_valid(f,b);if(const auto* r=std::get_if<request>(&f.body))check(raw.size()<=r->budget.frame_bytes,"request raw frame exceeds advertised budget");return f;
 }
 std::string encode(const frame& f,const limits& b){
@@ -587,6 +632,7 @@ sequence_state decode_state(std::string_view bytes,const attempt& expected,const
     sequence_state s;s.logical=read_attempt(j.at("attempt"));check(s.logical==expected,"restart logical attempt differs");s.frozen_request=read_request(j.at("request"),b);s.offer=read_manifest(j.at("manifest"));const auto status=text(j.at("phase"));check(status=="receiving"||status=="sequence_complete_unverified","unknown canonical sequence phase");s.status=status=="receiving"?phase::receiving:phase::sequence_complete_unverified;
     s.next_content_page=number(j.at("next_content_page"));s.next_receipt_page=number(j.at("next_receipt_page"));s.identities=number(j.at("identities"));s.present_count=number(j.at("present"));s.tombstone_count=number(j.at("tombstones"));s.content_bytes=number(j.at("content_bytes"));s.receipt_count=number(j.at("receipts"));s.receipt_bytes=number(j.at("receipt_bytes"));if(!j.at("last_identity").is_null())s.last_identity=read_identity(j.at("last_identity"));
     const auto bitmap=text(j.at("rebase_seen"));check(bitmap.size()<=b.request_targets,"restart bitmap exceeds budget");for(char c:bitmap){check(c=='0'||c=='1',"invalid restart bitmap");s.rebase_seen.push_back(c-'0');}
+    check(version(j.at("version"))==(s.frozen_request.registered_producer?3u:2u),"canonical restart receipt profile differs");
     state_valid(s,b);return s;
 }
 struct validated_sequence::state {
@@ -689,7 +735,7 @@ Page package_page(const std::vector<Item>& items,const package_slice& slice,
 
 encoded_package assemble_package(const attempt& a,uint64_t route,const request& r,
     uint64_t head,const lease& protection,const std::vector<content_item>& rows,
-    const std::vector<receipt_item>& receipts,const package_limits& policy) {
+    const std::vector<receipt_item>& receipts,const package_limits& policy,std::optional<uint64_t> coverage_revision) {
     check(policy.retained_wire_bytes>0&&policy.retained_wire_bytes<=512u*1024u*1024u&&
           policy.frames>=2&&policy.frames<=65536,"invalid package output policy");
     const auto& local=policy.codec;
@@ -704,7 +750,7 @@ encoded_package assemble_package(const attempt& a,uint64_t route,const request& 
           "package input count cannot fit retained output");
     encoded_package result;auto& m=result.offer_;
     m.request_digest=r.request_digest;m.source=r.source;m.selection=r.selection;m.base=r.base;
-    m.head=head;m.protection=protection;
+    m.head=head;m.protection=protection;m.registered_producer=r.registered_producer;m.receipt_namespace=r.receipt_namespace;m.coverage_revision=coverage_revision;
     selection(m.selection,m.base,m.head);name(protection.id,b);
     check(protection.duration_ms>0&&protection.duration_ms<=b.lease_ms,"invalid package lease spelling");
     m.content_digest=m.receipt_digest=m.rebase_digest=std::string(64,'0');
@@ -752,14 +798,14 @@ encoded_package assemble_package(const attempt& a,uint64_t route,const request& 
     };
     retain({a,route,m});
     for(size_t i=0;i<content_pages.size();++i) {
-        frame value{a,route,package_page<content_page>(rows,content_pages[i],i,m.manifest_digest,b)};
+        frame value{a,route,package_page<content_page>(rows,content_pages[i],i,m.manifest_digest,b),r.registered_producer?3u:2u};
         sequence.advance(value);retain(std::move(value));
     }
     for(size_t i=0;i<receipt_pages.size();++i) {
-        frame value{a,route,package_page<receipt_page>(receipts,receipt_pages[i],i,m.manifest_digest,b)};
+        frame value{a,route,package_page<receipt_page>(receipts,receipt_pages[i],i,m.manifest_digest,b),r.registered_producer?3u:2u};
         sequence.advance(value);retain(std::move(value));
     }
-    frame terminal{a,route,end{m.manifest_digest}};
+    frame terminal{a,route,end{m.manifest_digest},r.registered_producer?3u:2u};
     sequence.advance(terminal);retain(std::move(terminal));
     check(sequence.status()==phase::sequence_complete_unverified,"package sequence incomplete");
     return result;

@@ -1,5 +1,6 @@
 #include "sync_snapshot_source.hpp"
 #include "canonical_source_capture.hpp"
+#include "canonical_receipt_coverage.hpp"
 #include "sync_recovery_values.hpp"
 #include <lattice/lattice.hpp>
 #include <nlohmann/json.hpp>
@@ -359,6 +360,9 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     std::optional<std::string> previous_original;
     for(const auto& q:requests) {
         check(bool(q.namespace_id)==bool(namespaces),"canonical request receipt profile differs");
+        const bool registered=namespaces&&namespaces->coverage;
+        check(bool(q.registered_producer)==registered&&bool(q.operation_digest)==registered,"canonical requested producer identity profile differs");
+        if(q.registered_producer){q.registered_producer->validate();check(q.operation_digest->size()==64,"canonical requested operation digest bound");}
         if(namespaces) {
             check(!q.namespace_id->empty()&&q.namespace_id->size()<=256,"canonical requested namespace outside bounds");
             bool found=false;for(const auto& entry:namespaces->entries)if(entry.namespace_id==*q.namespace_id)found=true;
@@ -377,6 +381,11 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     }
     view held(owner);unsealed_canonical_capture result;
     if(verify_generation)verify_generation(held.generation);
+    if(namespaces&&namespaces->coverage){
+        const auto query=[&](const std::string& sql,const std::vector<column_value_t>& values){return held.query(sql,values);};
+        audit_canonical_coverage(query,*namespaces->coverage);
+        result.coverage_revision=static_cast<uint64_t>(read_canonical_coverage(query,*namespaces->coverage).mutation);
+    }
     std::string state_sql="SELECT ";
     for(const char* name:{"id","version","head","floor","markers","marker_bytes","receipts","receipt_bytes",
         "max_markers","max_marker_bytes","max_receipts","max_receipt_bytes","max_batch","max_identity","max_operation"})
@@ -388,7 +397,7 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
         "FROM main._lattice_canonical_store LIMIT 2";
     const auto state=held.query(state_sql);
     check(state.size()==1,"canonical source store singleton missing");const auto& metadata=state.front();
-    check(integer(metadata,"id")==1&&integer(metadata,"version")==int64_t(namespaces?2:1)&&byte_string(metadata,"source")==binding.source&&
+    check(integer(metadata,"id")==1&&integer(metadata,"version")==int64_t(namespaces?namespaces->version():1)&&byte_string(metadata,"source")==binding.source&&
         byte_string(metadata,"epoch")==binding.epoch&&byte_string(metadata,"scope")==binding.scope&&
         byte_string(metadata,"schema_id")==binding.schema,"canonical source binding mismatch");
     check(integer(metadata,"max_markers")==l.markers&&integer(metadata,"max_marker_bytes")==l.marker_bytes&&
@@ -516,7 +525,11 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
             " FROM main._lattice_canonical_receipt WHERE original_id=? LIMIT 2",
             {source_bytes(asked.original_id)});
         check(rows.size()<=1,"canonical source receipt identity collision");
-        canonical_source_receipt fact{asked.original_id,{}};charge(48+asked.original_id.size());
+        canonical_source_receipt fact{asked.original_id,{}};fact.operation_digest=asked.operation_digest;charge(48+asked.original_id.size()+(asked.operation_digest?72:0));
+        auto covered=canonical_coverage_lookup::legacy_original_namespace;
+        if(namespaces&&namespaces->coverage)covered=lookup_canonical_coverage(
+            [&](const std::string& sql,const std::vector<column_value_t>& values){return held.query(sql,values);},
+            *namespaces->coverage,asked.original_id,*asked.namespace_id,*asked.registered_producer,*asked.operation_digest);
         if(!rows.empty()) {
             const auto& row=rows.front();const auto position=integer(row,"position"),outcome=integer(row,"outcome");
             check(position>0&&position<=result.head&&outcome>=1&&outcome<=3,"canonical source receipt is corrupt");
@@ -524,7 +537,7 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
             uint64_t bytes=32+asked.original_id.size();
             if(namespaces) {
                 const auto stored_namespace=byte_string(row,"namespace_id");
-                check(stored_namespace==*asked.namespace_id,"canonical receipt belongs to another namespace");
+                if(!namespaces->coverage)check(stored_namespace==*asked.namespace_id,"canonical receipt belongs to another namespace");
                 bytes+=stored_namespace.size();charge(stored_namespace.size());
             }
             if(rt=="blob"&&it=="blob") {
@@ -534,7 +547,10 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
                 bytes+=target->table.size()+target->global_id.size();charge(target->table.size()+target->global_id.size());
             } else check(rt=="null"&&it=="null","canonical source receipt target is corrupt");
             check(integer(row,"charge")==static_cast<int64_t>(bytes),"canonical receipt charge is corrupt");
-            fact.stored=canonical_receipt{{asked.original_id,static_cast<canonical_receipt_outcome>(outcome),target,asked.namespace_id},position};
+            if(covered==canonical_coverage_lookup::covered||covered==canonical_coverage_lookup::legacy_original_namespace){
+                fact.stored=canonical_receipt{{asked.original_id,static_cast<canonical_receipt_outcome>(outcome),target,asked.namespace_id},position};
+                fact.legacy_unbound=namespaces&&namespaces->coverage&&covered==canonical_coverage_lookup::legacy_original_namespace;
+            }
         }
         result.receipts.push_back(std::move(fact));
     }

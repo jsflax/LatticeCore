@@ -80,6 +80,11 @@ class authenticated_relay_setup {
     static std::shared_ptr<authenticated_relay_setup> open(std::shared_ptr<lattice_db>,
         const std::string& source_policy,const std::string& connection,
         void*,int32_t(*)(void*),void(*)(void*));
+    // Explicit administration of the real resolved mount owner, never an
+    // issuer. False is only pre-SQL quiescence contention; exceptions do not
+    // imply durable absence and ordinary open never invokes this transition.
+    static bool migrate_receipt_coverage(std::shared_ptr<lattice_db>,
+        const std::string& prior_mount_policy,const std::string& next_mount_policy);
 public:
     authenticated_relay_setup(const authenticated_relay_setup&)=delete;
     ~authenticated_relay_setup();

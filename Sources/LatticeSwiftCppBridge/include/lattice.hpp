@@ -3825,6 +3825,11 @@ public:
     relay_recovery_setup open_relay_recovery_setup(const std::string& policy,const std::string& connection,
         void* context,int32_t(*current)(void*),void(*destroy)(void*))const noexcept
         SWIFT_NAME(openRelayRecoverySetup(policy:connection:context:current:destroy:));
+    // Package administration of the actual resolved relay owner. 1 is known
+    // migrated, 2 is no-effect quiescence contention, 4 is an error with no
+    // assertion of rollback/absence. This never creates a session admission.
+    int32_t migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept
+        SWIFT_NAME(migrateRelayReceiptCoverage(prior:next:));
 
     // CRUD
     void add(const dynamic_object_ref& ref, cxx_error& err) const { impl().add(ref, err); }

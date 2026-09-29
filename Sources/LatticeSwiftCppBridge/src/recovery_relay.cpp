@@ -15,6 +15,11 @@ relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup(const std::str
     }catch(...){relay_failure();return {};}
 }
 bool relay_recovery_setup::valid()const noexcept{return bool(value_);}
+int32_t swift_lattice_ref::migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept {
+    last_bridge_error().clear();
+    try{return detail::authenticated_relay_setup::migrate_receipt_coverage(impl_,prior,next)?1:2;}
+    catch(...){relay_failure();return 4;}
+}
 std::string relay_recovery_setup::descriptor()const noexcept {
     last_bridge_error().clear();try{return value_?value_->descriptor():std::string{};}catch(...){relay_failure();return {};}
 }

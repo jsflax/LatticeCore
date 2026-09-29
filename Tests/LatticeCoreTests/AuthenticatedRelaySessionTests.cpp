@@ -384,8 +384,18 @@ TEST_F(AuthenticatedReadySession, ActualAdapterReopenOrphansAndResumesExactDurab
 }
 TEST_F(AuthenticatedReadySession, ExpiredSameProcessLeaseRequiresExactDiscardAndHigherSequence) {
     setup=admitted();auto keeper=admitted(2);const auto d=description(setup);auto f=request(d);const auto offered=lease(setup,f,d,"prepare",1000);
-    auto queued=read(setup,offered,0);const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
-    while(queued.publishable()&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();ASSERT_FALSE(queued.publishable());
+    auto queued=read(setup,offered,0);const auto observedAt=std::chrono::steady_clock::now();
+    const auto deadline=observedAt+std::chrono::seconds(3);const auto& trace=last_read_trace;
+    ASSERT_EQ(queued.status_code(),1);ASSERT_EQ(trace.settlement,static_cast<int>(lattice::detail::recovery_install_state::committed));
+    ASSERT_EQ(trace.index,0u);ASSERT_EQ(trace.addressed_frames,1u);ASSERT_GT(trace.addressed_bytes,0u);
+    ASSERT_GE(trace.clock_before_ms,0);ASSERT_GE(trace.clock_after_ms,trace.clock_before_ms);
+    ASSERT_GE(trace.clock_settled_ms,trace.clock_after_ms);ASSERT_GE(trace.deadline_ms,0);
+    const auto remaining=std::max<int64_t>(0,trace.deadline_ms-trace.clock_settled_ms);ASSERT_LE(remaining,1000);
+    // The queued publication fence starts earlier than the stored lease. This
+    // post-read anchor bounds durable expiry without changing either deadline.
+    const auto expiredBy=observedAt+std::chrono::milliseconds(remaining);
+    while((queued.publishable()||std::chrono::steady_clock::now()<expiredBy)&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+    ASSERT_FALSE(queued.publishable());ASSERT_TRUE(std::chrono::steady_clock::now()>=expiredBy);
     auto resume=invoke(setup,command("resume",f,d));ASSERT_EQ(resume.status_code(),1);EXPECT_FALSE(json::parse(resume.wire())["leaseAvailable"].get<bool>());
     const auto before=receipts();auto discarded=invoke(setup,command("discard",f,d));ASSERT_EQ(discarded.status_code(),1);
     EXPECT_EQ(json::parse(discarded.wire())["settlement"]["state"],"committed");EXPECT_EQ(receipts(),before);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);

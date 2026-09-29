@@ -2254,3 +2254,122 @@ TEST_F(AuthenticatedReceiptCoverageV3, CompletedAbsentDiscardStillRequiresActual
 }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReadySession, CompletedLargePrepareReleasesWorkspaceWhileBothActualRepliesRemainHeld) {
+    setup=admitted(1,true);auto other=admitted(2,true);
+    const auto original=entry(901,"workspace positive");ASSERT_EQ(setup.receive(frame(original)).ids().size(),1u);
+    const auto evidence=receipts();const auto d=description(setup),other_d=description(other);
+    auto q=request(d),other_q=request(other_d);
+    for(auto* value:{&q,&other_q})std::get<ready_wire::request>(value->body).receipts={{original.global_id,"app",{{original.table_name,original.global_row_id}}}};
+    seal(q,d);seal(other_q,other_d);
+    auto first=invoke(setup,command("prepare",q,d));ASSERT_EQ(first.status_code(),1);ASSERT_TRUE(first.publishable());
+    const auto offered=json::parse(first.wire());ASSERT_EQ(offered.at("publication").at("state"),"committed");ASSERT_EQ(offered.at("leaseAvailable"),true);
+    auto second=invoke(other,command("prepare",other_q,other_d));ASSERT_EQ(second.status_code(),1)<<last_bridge_error();ASSERT_TRUE(second.publishable());
+    const auto other_offered=json::parse(second.wire());ASSERT_EQ(other_offered.at("publication").at("state"),"committed");ASSERT_EQ(other_offered.at("leaseAvailable"),true);
+    EXPECT_TRUE(first.publishable());EXPECT_FALSE(setup.stop_token().drained());EXPECT_FALSE(other.stop_token().drained());
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),2);EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);EXPECT_EQ(count("_lattice_canonical_attempt"),0);
+    {
+        const auto a=read(setup,offered,0),b=read(other,other_offered,0);ASSERT_TRUE(a.publishable());ASSERT_TRUE(b.publishable());
+        const auto one=decode_read(a,d),two=decode_read(b,other_d);
+        EXPECT_EQ(one.logical,q.logical);EXPECT_EQ(two.logical,other_q.logical);
+        EXPECT_EQ(std::get<ready_wire::manifest>(one.body).request_digest,std::get<ready_wire::request>(q.body).request_digest);
+        EXPECT_EQ(std::get<ready_wire::manifest>(two.body).request_digest,std::get<ready_wire::request>(other_q.body).request_digest);
+    }
+    EXPECT_EQ(receipts(),evidence);EXPECT_EQ(count("AuthenticatedRelayRow"),1);
+    first={};EXPECT_TRUE(setup.stop_token().drained());EXPECT_FALSE(other.stop_token().drained());
+    second={};EXPECT_TRUE(other.stop_token().drained());
+}
+
+TEST_F(AuthenticatedReadySession, FailedLargePublicationReleasesWorkspaceButKeepsExactPreparingAndResponseState) {
+    setup=admitted(1,true);const auto d=description(setup);const auto q=request(d);const auto evidence=receipts();
+    relay_ready_result failed;
+    {AuthenticatedReadyFault fault(owner->db(),true);failed=invoke(setup,command("prepare",q,d));EXPECT_EQ(fault.hits,1);}
+    ASSERT_EQ(failed.status_code(),1);ASSERT_TRUE(failed.publishable());const auto response=json::parse(failed.wire());
+    ASSERT_EQ(response.at("preparation").at("state"),"committed");ASSERT_EQ(response.at("publication").at("state"),"rolledBack");
+    EXPECT_EQ(response.at("publication").at("primaryError"),true);EXPECT_EQ(response.at("leaseAvailable"),false);
+    EXPECT_FALSE(setup.stop_token().drained());EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(count("_lattice_canonical_attempt"),1);
+    auto disposed=invoke(setup,command("discard",q,d));ASSERT_EQ(disposed.status_code(),1);
+    ASSERT_EQ(json::parse(disposed.wire()).at("settlement").at("state"),"committed");
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+    const auto next=request(d,2);auto current=invoke(setup,command("prepare",next,d));ASSERT_EQ(current.status_code(),1)<<last_bridge_error();ASSERT_TRUE(current.publishable());
+    const auto answer=json::parse(current.wire());ASSERT_EQ(answer.at("publication").at("state"),"committed");ASSERT_EQ(answer.at("leaseAvailable"),true);
+    EXPECT_EQ(answer.at("sequence"),"2");EXPECT_EQ(failed.wire(),response.dump());EXPECT_EQ(receipts(),evidence);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);EXPECT_EQ(count("_lattice_canonical_attempt"),0);
+    failed={};EXPECT_FALSE(setup.stop_token().drained());disposed={};EXPECT_FALSE(setup.stop_token().drained());current={};EXPECT_TRUE(setup.stop_token().drained());
+}
+
+TEST_F(AuthenticatedReadySession, PausedLargePrepareKeepsSourceWorkspaceUntilItsActualNativeCallReturns) {
+    setup=admitted(1,true);auto other=admitted(2,true);const auto d=description(setup),other_d=description(other);
+    const auto q=request(d),other_q=request(other_d);const auto before=exact_source();
+    auto gate=std::make_shared<ReadyLifecycleGate>();relay_ready_result first;std::exception_ptr worker_error;
+    std::thread worker([&]{
+        try {
+            const std::function<void()> hook=[gate]{gate->wait();};
+            struct reset {~reset(){detail::authenticated_ready_test_access::before_owned(nullptr);}} restore;
+            detail::authenticated_ready_test_access::before_owned(&hook);
+            first=invoke(setup,command("prepare",q,d));
+        }catch(...){worker_error=std::current_exception();}
+    });
+    // Also releases and joins after a fatal assertion or exception below.
+    struct cleanup {ReadyLifecycleGate& gate;std::thread& worker;~cleanup(){gate.release();if(worker.joinable())worker.join();}} joined{*gate,worker};
+    const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(!gate->arrived()&&std::chrono::steady_clock::now()<until)std::this_thread::yield();
+    ASSERT_TRUE(gate->arrived());EXPECT_FALSE(setup.stop_token().drained());
+    const auto refused=invoke(other,command("prepare",other_q,other_d));const auto refused_error=last_bridge_error();
+    EXPECT_EQ(refused.status_code(),4);EXPECT_EQ(refused_error,"READY source capture workspace unavailable");
+    EXPECT_FALSE(refused.publishable());EXPECT_TRUE(other.stop_token().drained());EXPECT_EQ(exact_source(),before);
+    gate->release();worker.join();ASSERT_FALSE(gate->timedOut());ASSERT_FALSE(worker_error);
+    ASSERT_EQ(first.status_code(),1);ASSERT_TRUE(first.publishable());ASSERT_EQ(json::parse(first.wire()).at("leaseAvailable"),true);
+    auto second=invoke(other,command("prepare",other_q,other_d));ASSERT_EQ(second.status_code(),1)<<last_bridge_error();ASSERT_TRUE(second.publishable());
+    EXPECT_EQ(json::parse(second.wire()).at("publication").at("state"),"committed");EXPECT_EQ(json::parse(second.wire()).at("leaseAvailable"),true);
+    EXPECT_TRUE(first.publishable());EXPECT_EQ(count("_lattice_canonical_ready_transfer"),2);EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);
+    first={};second={};EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(other.stop_token().drained());
+}
+
+TEST_F(AuthenticatedReadySession, RetiredPrepareWorkspaceDoesNotReleaseQueuedInputReplyOrOperationCharges) {
+    setup=admitted(1,true);const auto d=description(setup);const auto raw=command("prepare",request(d),d).dump();
+    auto input=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(input.valid());
+    auto prepared=setup.ready(raw,input);input={};ASSERT_EQ(prepared.status_code(),1);ASSERT_TRUE(prepared.publishable());
+    ASSERT_EQ(json::parse(prepared.wire()).at("leaseAvailable"),true);auto copied=prepared;const auto queued=prepared.take_wire();ASSERT_FALSE(queued.empty());
+    const auto describe=control("describe").dump();const uint64_t reply_bytes=4194304;
+    ASSERT_EQ(d.at("profile").at("pendingInputAndReplyBytes"),67108864);ASSERT_EQ(d.at("profile").at("pendingRequests"),64);
+    ASSERT_LT(raw.size()+reply_bytes,uint64_t(67108864));
+    const auto expected=(uint64_t(67108864)-raw.size()-reply_bytes)/(describe.size()+reply_bytes);
+    ASSERT_LT(expected,32u);std::vector<relay_ready_result> held;
+    for(unsigned i=0;i<32;++i) {
+        auto charge=setup.stop_token().reserve_ready(describe.size());if(!charge.valid())break;
+        auto result=setup.ready(describe,charge);ASSERT_EQ(result.status_code(),1);held.push_back(std::move(result));
+    }
+    ASSERT_EQ(held.size(),expected);ASSERT_GT(held.size(),1u);EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());
+    const auto evidence=receipts();const auto frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index");
+    auto old_stop=setup.stop_token();setup.close_on_io();setup={};EXPECT_FALSE(old_stop.drained());
+    setup=admitted(2,true);EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());EXPECT_FALSE(copied.publishable());
+    EXPECT_EQ(receipts(),evidence);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index"),frames);
+    const auto reopened=exact_source();prepared={};EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());
+    copied={};auto charge=setup.stop_token().reserve_ready(describe.size());ASSERT_TRUE(charge.valid());
+    auto current=setup.ready(describe,charge);charge={};ASSERT_EQ(current.status_code(),1);ASSERT_TRUE(current.publishable());
+    EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());EXPECT_FALSE(old_stop.drained());
+    held.clear();EXPECT_TRUE(old_stop.drained());EXPECT_FALSE(setup.stop_token().drained());
+    current={};EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(setup.stop_token().reserve_ready(describe.size()).valid());
+    EXPECT_EQ(exact_source(),reopened);EXPECT_FALSE(queued.empty());
+}
+
+TEST_F(AuthenticatedReadySession, PrepareExceptionRetiresWorkspaceWhileItsConsumedInputReservationRemainsHeld) {
+    setup=admitted(1,true);const auto d=description(setup);const auto q=request(d);const auto before=exact_source();
+    auto malformed=command("prepare",q,d);malformed["unexpected"]=true;const auto raw=malformed.dump();
+    auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    const auto failed=setup.ready(raw,charge);const auto original_error=last_bridge_error();
+    ASSERT_EQ(failed.status_code(),4);EXPECT_EQ(original_error,"relay unexpected object shape");EXPECT_FALSE(failed.publishable());
+    EXPECT_TRUE(charge.valid());EXPECT_TRUE(setup.stop_token().drained());EXPECT_EQ(exact_source(),before);
+    const auto reused=setup.ready(raw,charge);EXPECT_EQ(reused.status_code(),4);
+    EXPECT_EQ(last_bridge_error(),"READY actual one-shot source input reservation required");EXPECT_EQ(exact_source(),before);
+    auto current=invoke(setup,command("prepare",q,d));ASSERT_EQ(current.status_code(),1)<<last_bridge_error();ASSERT_TRUE(current.publishable());
+    const auto answer=json::parse(current.wire());EXPECT_EQ(answer.at("publication").at("state"),"committed");EXPECT_EQ(answer.at("leaseAvailable"),true);
+    EXPECT_TRUE(charge.valid());EXPECT_FALSE(setup.stop_token().drained());EXPECT_EQ(original_error,"relay unexpected object shape");
+    current={};EXPECT_TRUE(setup.stop_token().drained());charge={};EXPECT_TRUE(setup.stop_token().reserve_ready(raw.size()).valid());
+}
+}
+#endif

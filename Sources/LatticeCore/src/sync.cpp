@@ -631,6 +631,7 @@ struct sync_upload_continuation {
     std::vector<audit_log_entry> entries;
     std::optional<committed_export_frame> protected_frame;
     std::shared_ptr<sync_upload_exclusion> protected_exclusion;
+    std::shared_ptr<sync_discovery_operation> completed_upload;
 };
 }
 namespace {
@@ -855,6 +856,17 @@ void synchronizer_base::background_upload() noexcept {
     });
 }
 
+std::shared_ptr<detail::sync_discovery_operation> synchronizer_base::make_upload_successor(uint64_t generation) {
+    const auto continuation=std::make_shared<detail::sync_upload_continuation>();
+    auto next=std::make_shared<detail::sync_discovery_operation>();
+    next->type=detail::sync_discovery_kind::upload;next->label="protected upload continuation";
+    next->generation=generation;next->charge=1024;
+    next->step=[this,continuation](detail::sync_discovery_operation& work) {
+        return upload_pending_changes_step(*continuation,&work);
+    };
+    return next;
+}
+
 void synchronizer_base::enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
         std::function<bool(detail::sync_discovery_operation&)> step) {
     const auto generation=callback_lifetime_->dispatch_generation();
@@ -923,14 +935,21 @@ void synchronizer_base::pump_discovery(std::shared_ptr<detail::sync_discovery_op
         lifetime->queued(addressed.generation,[queue,state,lifetime,scheduled,error,addressed] {
             auto ticket=addressed;
             for(unsigned turn=0;turn<detail::sync_discovery_deferral::turn_limit;++turn) {
-                const auto work=queue->begin(ticket,detail::sync_discovery_deferral::clock::now());
+                auto work=queue->begin(ticket,detail::sync_discovery_deferral::clock::now());
                 if(!work)break;
                 bool done=true;std::exception_ptr failure;
                 try {done=work->step(*work);}catch(...) {failure=std::current_exception();}
+                const auto completion=work->completion;const auto label=work->label;
+                auto successor=done&&!failure?std::move(work->completed_upload):nullptr;
+                // Positive upload has already released its frame/cohort. Drop
+                // the old step's remaining captures before publishing fresh
+                // selection, outside the queue leaf; destruction may retire us.
+                if(successor)work->step={};
                 const auto next=queue->finish_and_continue(ticket,work,done,
-                    detail::sync_discovery_deferral::clock::now(),turn+1<detail::sync_discovery_deferral::turn_limit);
-                if(work->completion)work->completion->finish(done,failure);
-                if(failure&&!work->completion)detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,work->label);
+                    detail::sync_discovery_deferral::clock::now(),turn+1<detail::sync_discovery_deferral::turn_limit,std::move(successor));
+                if(completion)completion->finish(done,failure);
+                if(failure&&!completion)detail::report_sync_background_error(scheduled,lifetime,addressed.generation,error,failure,label);
+                work.reset(); // Retire completed payload before next begin.
                 if(!lifetime->current(addressed.generation)||!next)break;
                 ticket=next;
             }
@@ -3061,6 +3080,7 @@ bool synchronizer_base::upload_protected_entries(detail::sync_upload_continuatio
 bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation& continuation,detail::sync_discovery_operation* work,bool* discovery_busy) {
     auto& frame=*continuation.protected_frame;
     const auto route=recovery_export_route_;
+    const auto queue=discovery_deferral_;
     std::vector<std::string> ids;ids.reserve(frame.entries().size());
     for(const auto& entry:frame.entries())ids.push_back(entry.global_id);
     if(!continuation.protected_exclusion){
@@ -3074,6 +3094,9 @@ bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation&
     }
     const auto exclusion=continuation.protected_exclusion;
     try {
+        // All allocations and owner-derived captures precede foreign send.
+        // Only a positive nonempty handoff activates this empty ordinary shell.
+        auto successor=ids.empty()?nullptr:make_upload_successor(continuation.generation);
         // Capture the exact registration before the foreign call. Reentrant
         // ACK may remove it before handed_off/launcher run; never relabel it.
         auto retry=prepare_ack_retry(frame.entries(),true,exclusion->delivery_token(),
@@ -3085,12 +3108,23 @@ bool synchronizer_base::send_committed_entries(detail::sync_upload_continuation&
             discovery_charge charge;charge.entries(frame.entries());
             charge.add(frame.retained_metadata_bytes(detail::sync_discovery_deferral::byte_limit));
             charge.add(exclusion->retained_bytes(detail::sync_discovery_deferral::byte_limit));
-            if(!work||!discovery_deferral_->resize(work,charge.bytes))
+            if(!work||!queue->resize(work,charge.bytes))
                 throw db_error("committed export frame exceeds discovery retention budget; claimed originals remain pending");
             work->coalescible.store(false,std::memory_order_release);
             *discovery_busy=true;return false; // Exact frame, claims and in-flight exclusion survive.
         }
-        if(*sent){exclusion->handed_off();retry();return true;} // Only passive/captured inputs after reentrant send.
+        if(*sent){
+            exclusion->handed_off();
+            // The ACK worker keeps genuine sent registrations. Frame/cohort
+            // custody must end before a fresh selection can cancel/refreeze.
+            try {retry();}catch(...) {
+                continuation.protected_frame.reset();continuation.protected_exclusion.reset();throw;
+            }
+            continuation.protected_frame.reset();continuation.protected_exclusion.reset();
+            if(work)work->completed_upload=std::move(successor);
+            else continuation.completed_upload=std::move(successor);
+            return true; // Only passive/captured inputs after reentrant send.
+        }
     }
     catch(...) {
         exclusion->release();throw;
@@ -3103,8 +3137,19 @@ void synchronizer_base::upload_pending_changes() {
         throw db_error("sync discovery deferral failed; explicit replay required");
     if(discovery_deferral_->pending(reconnect_lifecycle_.load()))
         throw db_error("sync upload is pending discovery deferral");
-    detail::sync_upload_continuation continuation;
-    (void)upload_pending_changes_step(continuation,nullptr);
+    const auto lifetime=callback_lifetime_;const auto generation=lifetime->dispatch_generation();
+    // Construct the only owner-using submission before send. Re-entry below
+    // requires fresh admission after all old continuation captures are gone.
+    const auto submit=[this,lifetime,generation](std::shared_ptr<detail::sync_discovery_operation> successor) {
+        lifetime->queued(generation,[this,&successor]{pump_discovery(std::move(successor));});
+    };
+    std::shared_ptr<detail::sync_discovery_operation> successor;
+    {
+        detail::sync_upload_continuation continuation;
+        (void)upload_pending_changes_step(continuation,nullptr);
+        successor=std::move(continuation.completed_upload);
+    }
+    if(successor)submit(std::move(successor));
 }
 
 bool synchronizer_base::upload_pending_changes_step(detail::sync_upload_continuation& continuation,

@@ -477,6 +477,7 @@ protected:
     void request_upload(bool background=false);
     void dispatch_upload(bool background,bool consume_request);
     void background_upload() noexcept;
+    std::shared_ptr<detail::sync_discovery_operation> make_upload_successor(uint64_t generation);
     void enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
                            std::function<bool(detail::sync_discovery_operation&)> work);
     void pump_discovery(std::shared_ptr<detail::sync_discovery_operation> initial = {});

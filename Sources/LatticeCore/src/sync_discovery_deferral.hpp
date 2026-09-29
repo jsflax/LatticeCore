@@ -58,6 +58,9 @@ struct sync_discovery_operation {
         std::atomic<bool> coalescible{true};
         std::shared_ptr<sync_discovery_completion> completion;
         std::shared_ptr<sync_upload_exclusion> upload_exclusion;
+        // Activated only by one positive protected handoff. The shell carries
+        // no old frame, claim, completion or authority; consumed once by pump.
+        std::shared_ptr<sync_discovery_operation> completed_upload;
 };
 class sync_discovery_deferral {
     friend struct recovery_receiver_cohort_test_access;
@@ -160,13 +163,20 @@ public:
 private:
     struct settlement {bool failed=false;ticket continuation;};
     settlement settle(ticket addressed,const std::shared_ptr<operation>& work,bool done,
-                      clock::time_point now,bool retain_dispatch) {
+                      clock::time_point now,bool retain_dispatch,std::shared_ptr<operation> successor={}) {
         std::shared_ptr<operation> released;
         std::unique_lock<std::mutex> lock(mutex_);
         if(addressed.generation!=generation_||addressed.serial!=serial_||!active_||!count_||slots_[head_]!=work)return {};
         active_=false;
         if(done) {
             bytes_-=work->charge;released=std::move(slots_[head_]);head_=(head_+1)%capacity;--count_;next_=now;
+            // Reuse the completed slot/charge atomically. Rejection/coalescing
+            // keeps the argument alive until after this leaf has unlocked.
+            if(successor) {
+                if(successor->type!=kind::upload||successor->generation!=addressed.generation||
+                   successor->charge>work->charge)failed_=true;
+                else (void)push_locked(successor,now);
+            }
         } else {
             if(work->attempts==0)work->deadline=now+std::chrono::seconds(5);
             ++work->attempts;
@@ -191,8 +201,8 @@ public:
         return settle(addressed,work,done,now,false).failed;
     }
     ticket finish_and_continue(ticket addressed,const std::shared_ptr<operation>& work,bool done,
-                               clock::time_point now,bool within_quantum) {
-        return settle(addressed,work,done,now,within_quantum).continuation;
+                               clock::time_point now,bool within_quantum,std::shared_ptr<operation> successor={}) {
+        return settle(addressed,work,done,now,within_quantum,std::move(successor)).continuation;
     }
     clock::time_point wake_at()const {
         std::lock_guard<std::mutex> lock(mutex_);

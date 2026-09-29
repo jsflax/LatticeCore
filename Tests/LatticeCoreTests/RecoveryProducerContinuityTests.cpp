@@ -2058,6 +2058,9 @@ TEST_F(RecoveryAutomaticExportReadAdmission, TwoThousandWindowRequiresRealPartia
     policy.frozen_entries=2*(count+1);policy.frozen_bytes=64*1024*1024;
     open();std::vector<ContinuousSharedRow> rows(count,ContinuousSharedRow{"window"});owner->add_bulk(std::move(rows));
     const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");start();auto limit=caps();limit["maximumEntries"]=1000;accept(limit);
+    // Four-turn dispatch can leave later selection for the real pacer. Observe
+    // its actual saturated registrations before inspecting the complete prefix.
+    ASSERT_TRUE(until([&]{return observed().registrations.size()==2000u;}));queue->drain();
     auto batches=factory->wires[0]->audit_batches();ASSERT_FALSE(batches.empty());size_t prefix=0;
     for(const auto& batch:batches){ASSERT_FALSE(batch.empty());ASSERT_LE(batch.size(),1000u);prefix+=batch.size();}
     ASSERT_EQ(prefix,2000u);const auto initial_windows=batches.size();pause.await_started(initial_windows);

@@ -608,6 +608,16 @@ frame decode(std::string_view raw,const limits& b){
     check(frame_version(f)==wire_version,"canonical encoded receipt profile differs");
     frame_valid(f,b);if(const auto* r=std::get_if<request>(&f.body))check(raw.size()<=r->budget.frame_bytes,"request raw frame exceeds advertised budget");return f;
 }
+frame decode_canonical(std::string_view raw,const limits& b) {
+    auto value=decode(raw,b);
+    // decode already performed frame_valid under this exact budget. Preserve
+    // the encoder's full escaped-byte/SAX admission without validating the
+    // same immutable local DTO a second time. No public DTO path uses this.
+    const auto* request_body=std::get_if<request>(&value.body);
+    check(dump(frame_json(value),b,request_body?request_body->budget.frame_bytes:b.maximum.frame_bytes)==raw,
+          "canonical frame bytes differ from exact spelling");
+    return value;
+}
 std::string encode(const frame& f,const limits& b){
     frame_valid(f,b);const auto* r=std::get_if<request>(&f.body);return dump(frame_json(f),b,r?r->budget.frame_bytes:b.maximum.frame_bytes);
 }
@@ -672,9 +682,24 @@ sequence_state validated_sequence::snapshot()const {
     check(bool(state_),"canonical cursor has no state");auto result=state_->initial;apply_progress(result,state_->live->progress);return result;
 }
 void validated_sequence::advance(const frame& f) {
-    check(bool(state_),"canonical cursor has no state");auto& s=*state_;
+    check(bool(state_),"canonical cursor has no state");
     check(!std::holds_alternative<request>(f.body)&&!std::holds_alternative<manifest>(f.body),"request or manifest cannot replace active sequence");
-    (void)encode(f,s.effective);check(f.logical==s.initial.logical,"frame logical attempt differs");
+    (void)encode(f,state_->effective);
+    advance_validated(f);
+}
+frame validated_sequence::advance_canonical(std::string_view raw,uint64_t expected_route) {
+    check(bool(state_),"canonical cursor has no state");
+    auto value=decode_canonical(raw,state_->effective);
+    check(value.route_generation==expected_route,"canonical frame physical route spelling differs");
+    check(!std::holds_alternative<request>(value.body)&&!std::holds_alternative<manifest>(value.body),"request or manifest cannot replace active sequence");
+    // Returning the owned DTO cannot fail after the sole cursor publication.
+    static_assert(std::is_nothrow_move_constructible_v<frame>);
+    advance_validated(value);
+    return value;
+}
+void validated_sequence::advance_validated(const frame& f) {
+    auto& s=*state_;
+    check(f.logical==s.initial.logical,"frame logical attempt differs");
     const auto progress=transition(s.live->progress,s.initial.frozen_request,s.initial.offer,s.ids,f);
     s.restart_fits(progress);
     auto next=std::make_unique<state::pending>(progress,s.live->content.clone(),s.live->receipts.clone());

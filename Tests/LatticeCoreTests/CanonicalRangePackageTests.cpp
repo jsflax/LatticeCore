@@ -434,3 +434,117 @@ TEST(CanonicalValidatedSequence, ExactRestartNodeBudgetMatchesSAXWhenLastIdentit
         }else {cursor.advance(first);EXPECT_EQ(cursor.snapshot(),next);}
     }
 }
+
+TEST(CanonicalValidatedSequence, CanonicalBytesMatchStrictDTOPrefixesForEveryV2ReceiptClass) {
+    for(unsigned kind=0;kind<3;++kind) {
+        PackageFixture f;cr::receipt_item receipt{"original",cr::unknown{}};
+        if(kind==0)receipt.value=cr::committed{"namespace","coverage",cr::decision::no_op,3,cr::identity{"PackageSourceRow","A"}};
+        if(kind==1)receipt.value=cr::not_committed{"namespace","coverage"};
+        f.receipt(receipt);const auto package=f.build();
+        const auto request_raw=cr::encode({f.attempt,1,f.request},f.policy.codec);
+        auto request=cr::decode_canonical(request_raw,f.policy.codec);
+        EXPECT_EQ(std::get<cr::request>(request.body),f.request);
+        EXPECT_THROW(cr::decode_canonical(" "+request_raw,f.policy.codec),cr::protocol_error);
+        // A returned DTO is mutable data, never a validation token.
+        std::get<cr::request>(request.body).request_digest.assign(64,'0');
+        EXPECT_THROW(cr::encode(request,f.policy.codec),cr::protocol_error);
+        auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+        cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+        for(size_t i=1;i<package.frames().size();++i) {
+            const auto strict=cr::decode(package.frames()[i],f.policy.codec);
+            reference=cr::propose(reference,strict,f.policy.codec);
+            const auto decoded=cursor.advance_canonical(package.frames()[i],1);
+            EXPECT_EQ(cr::encode(decoded,f.policy.codec),package.frames()[i]);
+            EXPECT_EQ(cursor.snapshot(),reference);
+        }
+        EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+    }
+}
+
+TEST(CanonicalValidatedSequence, CanonicalByteRefusalsKeepExactStateAndPermitTheOriginalRetry) {
+    PackageFixture f;f.receipt({"original",cr::unknown{}});const auto package=f.build();
+    cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+    const auto before=cursor.snapshot();const auto& raw=package.frames()[1];
+    const auto original=nlohmann::json::parse(raw);
+    std::vector<std::string> rejected{" "+raw,raw+"\n",package.frames().front(),package.frames().back(),
+        cr::encode({f.attempt,1,f.request},f.policy.codec)};
+    auto duplicate=raw;const auto route=duplicate.find("\"route_generation\":\"1\"");
+    ASSERT_NE(route,std::string::npos);duplicate.insert(route,"\"route_generation\":\"1\",");rejected.push_back(duplicate);
+    for(unsigned variant=0;variant<7;++variant) {
+        auto bad=original;auto& envelope=bad["latticeCanonicalRange"];auto& body=envelope["body"];
+        if(variant==0)envelope["attempt"]["sequence"]="3";
+        if(variant==1)envelope["route_generation"]="2";
+        if(variant==2)body["count"]="0";
+        if(variant==3)body["bytes"]="0";
+        if(variant==4)body["digest"]=std::string(64,'0');
+        if(variant==5)body["unexpected"]=true;
+        if(variant==6)body["index"]="1";
+        rejected.push_back(bad.dump());
+    }
+    for(size_t i=0;i<rejected.size();++i) {
+        SCOPED_TRACE(i);EXPECT_THROW(cursor.advance_canonical(rejected[i],1),cr::protocol_error);
+        EXPECT_EQ(cursor.snapshot(),before);
+    }
+    EXPECT_THROW(cursor.advance_canonical(raw,2),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),before);
+    for(size_t i=1;i<package.frames().size();++i)cursor.advance_canonical(package.frames()[i],1);
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+    const auto complete=cursor.snapshot();
+    EXPECT_THROW(cursor.advance_canonical(package.frames().back(),1),cr::protocol_error);
+    EXPECT_EQ(cursor.snapshot(),complete);
+}
+
+TEST(CanonicalValidatedSequence, CanonicalBytesEnforceFrozenRequestEscapedFrameLimit) {
+    PackageFixture f;f.request.budget.frame_bytes=4096;f.seal_request();const auto package=f.build();
+    auto oversized=cr::decode(package.frames()[1],f.policy.codec);
+    std::get<cr::content_page>(oversized.body).items[0]=f.row("A",std::string(2000,'\\'));
+    sequence_reseal(oversized,f.policy.codec);
+    const auto raw=cr::encode(oversized,f.policy.codec);
+    ASSERT_GT(raw.size(),f.request.budget.frame_bytes);ASSERT_LE(raw.size(),f.policy.codec.maximum.frame_bytes);
+    // This is a well-formed canonical frame under the outer profile. The
+    // cursor must still apply the narrower limits frozen in its request.
+    EXPECT_NO_THROW(cr::decode_canonical(raw,f.policy.codec));
+    cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+    const auto before=cursor.snapshot();EXPECT_THROW(cursor.advance_canonical(raw,1),cr::protocol_error);
+    EXPECT_EQ(cursor.snapshot(),before);
+    for(size_t i=1;i<package.frames().size();++i)cursor.advance_canonical(package.frames()[i],1);
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+}
+
+TEST(CanonicalValidatedSequence, CanonicalTerminalWholeHashRefusalDoesNotPublishProgress) {
+    for(bool corrupt_receipts:{false,true}) {
+        PackageFixture f;f.receipt({"original",cr::unknown{}});const auto package=f.build();auto manifest=package.offer();
+        (corrupt_receipts?manifest.receipt_digest:manifest.content_digest).assign(64,'0');
+        manifest.manifest_digest=cr::manifest_sha256(manifest,f.policy.codec);
+        cr::validated_sequence cursor(f.attempt,f.request,manifest,f.policy.codec);
+        auto reference=cr::begin(f.attempt,f.request,manifest,f.policy.codec);
+        for(size_t i=1;i+1<package.frames().size();++i) {
+            auto frame=cr::decode(package.frames()[i],f.policy.codec);
+            std::visit([&](auto& body){using T=std::decay_t<decltype(body)>;
+                if constexpr(std::is_same_v<T,cr::content_page>||std::is_same_v<T,cr::receipt_page>)body.manifest_digest=manifest.manifest_digest;
+            },frame.body);sequence_reseal(frame,f.policy.codec);
+            cursor.advance_canonical(cr::encode(frame,f.policy.codec),1);
+            reference=cr::propose(reference,frame,f.policy.codec);EXPECT_EQ(cursor.snapshot(),reference);
+        }
+        const cr::frame terminal{f.attempt,1,cr::end{manifest.manifest_digest}};
+        EXPECT_EQ(cr::propose(reference,terminal,f.policy.codec).status,cr::phase::sequence_complete_unverified);
+        const auto before=cursor.snapshot();const auto raw=cr::encode(terminal,f.policy.codec);
+        EXPECT_THROW(cursor.advance_canonical(raw,1),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),before);
+        EXPECT_THROW(cursor.advance_canonical(raw,1),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),before);
+    }
+}
+
+TEST(CanonicalValidatedSequence, CanonicalTerminalRestartBoundaryAndMovedFromCursorRemainStrict) {
+    PackageFixture f;const auto package=f.build();auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+    for(size_t i=1;i+1<package.frames().size();++i)reference=cr::propose(reference,cr::decode(package.frames()[i],f.policy.codec),f.policy.codec);
+    const auto complete=cr::propose(reference,cr::decode(package.frames().back(),f.policy.codec),f.policy.codec);
+    const auto exact=cr::encode_state(complete,f.policy.codec).size();ASSERT_GT(exact,cr::encode_state(reference,f.policy.codec).size());
+    for(int delta=-1;delta<=0;++delta) {
+        auto limits=f.policy.codec;limits.restart_bytes=exact+delta;
+        cr::validated_sequence original(f.attempt,f.request,package.offer(),limits);
+        for(size_t i=1;i+1<package.frames().size();++i)original.advance_canonical(package.frames()[i],1);
+        cr::validated_sequence cursor(std::move(original));EXPECT_EQ(cursor.snapshot(),reference);
+        EXPECT_THROW(original.advance_canonical(package.frames().back(),1),cr::protocol_error);
+        if(delta<0){EXPECT_THROW(cursor.advance_canonical(package.frames().back(),1),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),reference);}
+        else{cursor.advance_canonical(package.frames().back(),1);EXPECT_EQ(cursor.snapshot(),complete);}
+    }
+}

@@ -215,7 +215,7 @@ protected:
     std::string last_read_bridge_error;
     static json cost_diagnostic(const lattice::detail::canonical_ready_cost_observation::observation& cost) {
         return {{"inclusive",true},{"phases",{"retentionAudit","storeAudit","request","sequenceInit","rawFetchHash",
-            "frameDecode","canonicalEncode","sequenceAdvance","receiptEvidence","receiptBatch"}},
+            "frameDecode","canonicalEncode","sequenceAdvance","receiptEvidence","receiptBatch","fusedFrameValidation"}},
             {"calls",cost.calls},{"microseconds",cost.microseconds},{"receiptBatches",cost.receipt_batches},{"receiptBatchIDs",cost.receipt_batch_ids}};
     }
     json source_policy(bool large=false){auto p=policy();p["maximumAuthorizationMilliseconds"]=600000;if(large)p["readyProfile"]="bounded48MiBV1";return p;}

@@ -209,3 +209,38 @@ TEST(CanonicalReceiptCoverageRange, Full8192CompactRequestsFitEachOfSixteenActua
     }
     EXPECT_EQ(digests.size(),16u);
 }
+
+TEST(CanonicalReceiptCoverageRange, CanonicalV3BytesPreserveExactRegisteredRequestAndEveryPrefix) {
+    CoverageRangeFixture f;const auto package=f.build();
+    const auto q=cr::decode_canonical(cr::encode(f.request_frame(),f.policy.codec),f.policy.codec);
+    EXPECT_EQ(q.version,3u);EXPECT_EQ(std::get<cr::request>(q.body),f.request);
+    cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+    auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);
+    for(size_t i=1;i<package.frames().size();++i) {
+        reference=cr::propose(reference,cr::decode(package.frames()[i],f.policy.codec),f.policy.codec);
+        const auto decoded=cursor.advance_canonical(package.frames()[i],9);
+        EXPECT_EQ(decoded.version,3u);EXPECT_EQ(cr::encode(decoded,f.policy.codec),package.frames()[i]);
+        EXPECT_EQ(cursor.snapshot(),reference);
+    }
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+}
+
+TEST(CanonicalReceiptCoverageRange, CanonicalV3MetadataAndRehashedOperationTamperKeepPriorState) {
+    CoverageRangeFixture f;const auto package=f.build();
+    cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+    for(size_t i=1;i<=package.offer().counts.content_pages;++i)cursor.advance_canonical(package.frames()[i],9);
+    const auto before=cursor.snapshot();const auto index=1+package.offer().counts.content_pages;
+    const auto original=json::parse(package.frames()[index]);std::vector<std::string> rejected;
+    auto bad=original;bad["latticeCanonicalRange"]["version"]=2;rejected.push_back(bad.dump());
+    bad=original;bad["latticeCanonicalRange"]["body"]["items"][0].erase("operation_digest");rejected.push_back(bad.dump());
+    bad=original;bad["latticeCanonicalRange"]["body"]["items"][0].erase("legacy_unbound");rejected.push_back(bad.dump());
+    auto frame=f.first_receipt(package);auto& page=std::get<cr::receipt_page>(frame.body);
+    page.items[0].operation_digest=std::string(64,'e');page.bytes=cr::receipt_record_bytes(page.items[0],f.policy.codec);
+    page.digest=cr::page_sha256(page,f.policy.codec);const auto rehashed=cr::encode(frame,f.policy.codec);
+    EXPECT_NO_THROW(cr::decode_canonical(rehashed,f.policy.codec));rejected.push_back(rehashed);
+    for(size_t i=0;i<rejected.size();++i) {
+        SCOPED_TRACE(i);EXPECT_THROW(cursor.advance_canonical(rejected[i],9),cr::protocol_error);EXPECT_EQ(cursor.snapshot(),before);
+    }
+    for(size_t i=index;i<package.frames().size();++i)cursor.advance_canonical(package.frames()[i],9);
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+}

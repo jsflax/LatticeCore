@@ -207,8 +207,8 @@ cr::frame ready_request(const database::row_t& row,const canonical_ready_profile
     ready_cost_scope observed(canonical_ready_cost_observation::phase::request);
     const auto raw=ready_blob(row,"request");
     if(picosha2::hash256_hex_string(raw)!=ready_blob(row,"request_sha"))refuse("canonical READY frozen request hash differs");
-    auto request=cr::decode(raw,p.package.codec);
-    if(request.route_generation!=ready_route || !std::holds_alternative<cr::request>(request.body) || cr::encode(request,p.package.codec)!=raw)
+    auto request=cr::decode_canonical(raw,p.package.codec);
+    if(request.route_generation!=ready_route || !std::holds_alternative<cr::request>(request.body))
         refuse("canonical READY request is not exact canonical spelling");
     return request;
 }
@@ -230,17 +230,19 @@ int64_t ready_metadata_charge(const database::row_t& row) {
     return ready_add(count,128); // fixed manifest/frame digests, including PREPARING reservation
 }
 cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,const database::row_t& row,
-    const std::function<void(const cr::receipt_page&)>& validate_receipts={}) {
+    const cr::frame& request,const std::function<void(const cr::receipt_page&)>& validate_receipts={}) {
     observe_ready(canonical_ready_test_observation::point::audit_begin);
-    const auto request=ready_request(row,p);const auto& q=std::get<cr::request>(request.body);const auto key=ready_blob(row,"binding");
+    // The sole caller just validated this exact owned row/Q in the same full
+    // audit and transaction. No proof survives a call or crosses a SQL view.
+    const auto& q=std::get<cr::request>(request.body);const auto key=ready_blob(row,"binding");
     const auto n=integer(row,"frame_count");if(n<2 || n>static_cast<int64_t>(p.package.frames))refuse("canonical READY frame count outside cap");
     const auto counts=db.query("SELECT COUNT(*) AS n FROM main._lattice_canonical_ready_frame WHERE binding=?",{bytes(key)});
     if(integer(counts.at(0),"n")!=n)refuse("canonical READY frame inventory differs");
-    const auto decode=[&](const std::string& raw) {
-        ready_cost_scope observed(canonical_ready_cost_observation::phase::frame_decode);
-        return cr::decode(raw,p.package.codec);
-    };
-    auto first=decode(ready_frame(db,p,key,0));
+    auto first_raw=ready_frame(db,p,key,0);
+    auto first=[&] {
+        ready_cost_scope observed(canonical_ready_cost_observation::phase::fused_frame_validation);
+        return cr::decode_canonical(first_raw,p.package.codec);
+    }();
     const auto* m=std::get_if<cr::manifest>(&first.body);if(!m)refuse("canonical READY first frame is not manifest");
     const auto manifest=*m;
     if(manifest.head!=static_cast<uint64_t>(integer(row,"head")) || manifest.manifest_digest!=ready_blob(row,"manifest_sha") ||
@@ -253,20 +255,17 @@ cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,co
     picosha2::hash256_one_by_one hash;int64_t wire=0,charge=ready_metadata_charge(row);
     for(int64_t i=0;i<n;++i) {
         if(auto* observation=canonical_ready_test_observation::current)++observation->audited_frames;
-        const auto raw=ready_frame(db,p,key,i);wire=ready_add(wire,raw.size());charge=ready_add(charge,ready_add(raw.size(),128));ready_hash_frame(hash,raw);
+        const auto raw=i?ready_frame(db,p,key,i):std::move(first_raw);
+        wire=ready_add(wire,raw.size());charge=ready_add(charge,ready_add(raw.size(),128));ready_hash_frame(hash,raw);
         if(auto* observation=canonical_ready_read_test_observation::current){++observation->audited_frames;observation->audited_bytes+=raw.size();}
         if(wire>static_cast<int64_t>(p.package.retained_wire_bytes) || charge>p.transfer_bytes)refuse("canonical READY bytes exceed charged cap");
-        const auto frame=decode(raw);
-        const auto canonical=[&] {
-            ready_cost_scope observed(canonical_ready_cost_observation::phase::canonical_encode);
-            return cr::encode(frame,p.package.codec);
-        };
-        if(frame.logical!=request.logical || frame.route_generation!=ready_route || canonical()!=raw)
+        const auto frame=[&] {
+            if(!i)return std::move(first);
+            ready_cost_scope observed(canonical_ready_cost_observation::phase::fused_frame_validation);
+            return sequence.advance_canonical(raw,ready_route);
+        }();
+        if(frame.logical!=request.logical || frame.route_generation!=ready_route)
             refuse("canonical READY frame association or canonical bytes differ");
-        if(i) {
-            ready_cost_scope observed(canonical_ready_cost_observation::phase::sequence_advance);
-            sequence.advance(frame);
-        }
         if(const auto* page=std::get_if<cr::receipt_page>(&frame.body)) {
             for(const auto& item:page->items) {
                 if(std::holds_alternative<cr::not_committed>(item.value))refuse("canonical READY cannot prove negative receipt");
@@ -390,7 +389,7 @@ void canonical_writer_adapter::verify_ready_retention(database& writer,const con
         } else if(kind==ready_complete) {
             if(integer(row,"reservation")!=0 || integer(row,"head")!=pin || integer(row,"floor")<0 || integer(row,"floor")>pin)
                 refuse("canonical READY tail pin or captured bounds differ");
-            const auto manifest=audit_ready_frames(writer,p,row,[&](const cr::receipt_page& page){
+            const auto manifest=audit_ready_frames(writer,p,row,request,[&](const cr::receipt_page& page){
                 ready_cost_scope observed(canonical_ready_cost_observation::phase::receipt_evidence);
                 for(size_t next=0;next<page.items.size();) {
                     std::vector<std::string> ids;

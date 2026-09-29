@@ -11,7 +11,7 @@ namespace canonical_ready_cost_observation {
 // Some phases also occur outside an audit; aggregated totals must not be
 // summed as disjoint time. Fixed passive storage only.
 enum class phase { retention_audit,store_audit,request,sequence_init,raw_fetch_hash,
-    frame_decode,canonical_encode,sequence_advance,receipt_evidence,receipt_batch,count };
+    frame_decode,canonical_encode,sequence_advance,receipt_evidence,receipt_batch,fused_frame_validation,count };
 struct observation {
     std::array<uint64_t,static_cast<size_t>(phase::count)> calls{},microseconds{};
     uint64_t receipt_batches=0,receipt_batch_ids=0;

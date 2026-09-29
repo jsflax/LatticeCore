@@ -270,7 +270,10 @@ class CoreReleaseTests(unittest.TestCase):
             self.assertEqual(call[1], 'release-train/core_release.py')
             self.assertEqual(call[call.index('--profile') + 1], '$RELEASE_PROFILE')
         self.assertIn("RELEASE_PROFILE: ${{ inputs.profile || 'main' }}", workflow)
-        self.assertNotIn('maintenance-source-check', workflow)
+        # Dormant source preparation follows the same hard-blocking wrapper
+        # preflight; it cannot bypass that guard to reach native jobs.
+        self.assertLess(workflow.index('core_release.py check --profile'),
+                        workflow.index(' maintenance-source-check '))
         for job in ('test-macos', 'test-linux', 'test-capi'):
             self.assertRegex(workflow, rf'(?m)^  {re.escape(job)}:\n    needs: preflight\n')
         self.assertRegex(workflow, r'(?m)^  release:\n    needs: \[preflight, test-macos, test-linux, test-capi\]\n')

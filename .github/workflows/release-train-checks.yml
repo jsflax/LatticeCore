@@ -44,6 +44,7 @@ jobs:
       - name: Python syntax and policy
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
         run: |
-          python3 -m py_compile release-train/release_train.py release-train/core_release.py release-train/maintenance_profile.py
+          python3 -m py_compile release-train/release_train.py release-train/core_release.py release-train/maintenance_profile.py release-train/maintenance_release.py
           python3 -m json.tool release-train/policy.json > /dev/null
           python3 -m json.tool release-train/maintenance-1.4.json > /dev/null
+          python3 -m json.tool release-train/maintenance-gates.json > /dev/null

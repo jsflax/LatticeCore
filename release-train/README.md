@@ -5,9 +5,10 @@ Each repository keeps its own SemVer 2.0.0 sequence. Orbital and Engram use `v` 
 Core's `core_release.py` is a repository-specific wrapper: its omitted or explicit
 `main` profile delegates to that unchanged protocol. The separate, disabled
 `maintenance-1.4.json` profile is described in [MAINTENANCE.md](MAINTENANCE.md).
-It implements source review only and cannot dispatch, build or publish a
-maintenance release. The normal release workflow uses the wrapper and defaults
-to `main`, retaining its existing source, run identity and publication behavior.
+Its maintenance source, receipt and publication paths remain disabled and cannot
+dispatch, build or publish a maintenance release without separate activation.
+The normal release workflow uses the wrapper and defaults to `main`, retaining
+its existing source, run identity and publication behavior.
 
 ## What progresses automatically
 

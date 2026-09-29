@@ -1,106 +1,137 @@
-# Inactive Core 1.4 maintenance source admission
+# Disabled Core 1.4 maintenance release preparation
 
-This change implements the source-admission portion of a proposed, single Core
-1.4.3 release. **The profile is disabled; final product and control approval
-registrations are null. No version is allocated.** It does not implement or
-authorize maintenance publication, activate a release workflow, reserve a native
-resource slot or resume the performance work.
+The one-release maintenance path is implemented as dormant source code for
+review. **No version is allocated, the profile remains disabled, both approval
+registrations are null, and the native gate contract has no final source or
+approved inventories.** Operational CLI guards and workflow preflight block
+maintenance execution. Source preparation does not approve activation, native
+resources, credentials, dispatch, signing, publication or deployment.
 
-## Compatibility and default behavior
+## Preserved normal release route
 
-The shared `release_train.py`, its existing tests and `policy.json` remain
-unchanged. The Core-specific wrapper delegates an omitted or explicit `main`
-profile to the existing runner with the same remaining command arguments.
-The release workflow preserves its existing run-name, main/tag source selection,
-test dependencies, retry identity, version ordering, publication permissions,
-concurrency and tag/release steps. The macOS/Linux/C ABI workflows are unchanged.
+The shared `release_train.py`, its two existing test files and `policy.json`
+remain unchanged. The Core wrapper still delegates an omitted or explicit
+`main` profile to that protocol with the same remaining arguments. Normal 2.x
+version ordering, canonical-main requirement, retry matching, native test
+commands, publication behavior and shared publication concurrency are retained.
+The reusable native workflows default to the event source for ordinary push/PR
+and main-release runs. Maintenance-only inputs and receipt steps are conditional.
 
-An explicit `maintenance-1.4` workflow request stops in preflight before the
-native jobs. Every generic maintenance command—including `check`, `candidate`,
-`dispatch`, `receipt`, `workflow-receipt` and `verify-package`—is blocked in code.
-Changing `enabled` in JSON cannot remove that block. Notes/version suggestions
-also cannot select an implicit maintenance exception. Unknown/duplicate profile
-arguments fail rather than falling through to the default profile. Environment
-variables do not implicitly select a CLI profile; the workflow passes its input
-as a quoted explicit argument.
+The earlier source-admission change and its 73 passing source tests remain the
+baseline. The implementation extends that reviewed work; it does not replace the
+existing release owner or create another release workflow.
 
-No package, native implementation, public header, symbol, schema, wire contract,
-dependency requirement or deployment floor changes in this source branch. There
-is no new Python dependency. The legacy notifier candidate remains a distinct
-source branch and is not modified by these controls.
+## Prepared product source
 
-## Source-only entry point
+The local metadata candidate is a direct child of reviewed notifier backport
+`bcf43a8cc789d5330a103fcf1e97ebdfbf7e2b84`, which directly descends from Core
+1.4.2 `36b828864cbb1543e945898be31589f9c04d6384`.
 
-The sole maintenance operation is `maintenance-source-check`. Its caller must
-provide full control and product commit IDs and a separate existing product
-checkout. The runner and policy are always loaded from the control checkout
-containing the script. No candidate-side release script or policy is executed.
+Product candidate: `a82742b0e237c378981d3d9a67ed31bea696ecdc`.
+Product tree: `e5401d64ff58852411e08ef229f9291110db37c3`.
 
-For a future owner-reviewed registration, its command shape is:
+It changes only `CHANGELOG.md` (an unreleased 1.4.3 entry) and deletes the
+legacy product-side `.github/workflows/release.yml`. All runtime source,
+tests, public headers, package requirements, deployment floors, CMake and C ABI
+version values match the reviewed backport. No Kit port, SDK update or direct
+revision dependency override is included.
 
-```sh
-python3 release-train/core_release.py maintenance-source-check \
-  --profile maintenance-1.4 --version 1.4.3 \
-  --control-sha FULL_CONTROL_MAIN_COMMIT \
-  --expected-sha FULL_PRODUCT_COMMIT \
-  --product-root "$HOME/localdev/APPROVED_PRODUCT_CHECKOUT" \
-  --output "$HOME/localdev/APPROVED_EVIDENCE/source-review.json"
-```
+This identity is a proposed source for review, **not an active registration**.
+The prepared local product branch has not been promoted to the policy's existing
+`codex/linux-notifier-1-4-backport-20260929` branch. The owner must check the
+current remote head before deciding any future promotion. If signing or further
+edits change a commit, every final registration and qualification input must use
+the resulting exact identity.
 
-The shipped policy intentionally rejects this command before any Git/GitHub
-inspection. Do not fill the placeholders, enable the policy, create release
-metadata or treat this example as an activation instruction without a new
-reviewed decision. Synthetic source tests use private fixture registrations.
+## Control and product separation
 
-If a future registered source passes, the result is explicitly
-`maintenance-source-reviewed-not-release-admitted`, with
-`dispatchAdmitted=false` and `publicationAdmitted=false`. It is not a candidate,
-native result or release receipt and cannot unlock a workflow. Output must be
-outside both source checkouts.
+Only the reviewed main control checkout supplies Python helpers, release policy,
+gate contracts and workflow definitions. The product checkout supplies the code
+to build and test. Maintenance admission checks distinct clean canonical roots,
+committed control-file hashes, full product SHA/tree, base tag peel, exact
+backport/metadata parentage and complete registered diffs. It requires the
+changelog and removal of the legacy product publisher, rejects hidden index
+flags, sparse checkouts and replacement refs, and checks remote branch identities.
 
-The source checks require the exact repository/branch, explicit approvals,
-control file hashes, clean separate source roots, current canonical main,
-registered product branch head/SHA/tree, the original 1.4.2 tag identity,
-reviewed backport ancestry, complete registered source and metadata diffs,
-the 1.4.3 changelog and deletion of the legacy product-side release workflow.
-They verify all parseable remote 1.4 versions by SemVer precedence, including
-prereleases and build metadata, and reject any existing 1.4.3 tag/release/draft.
-Incomplete or failed remote reads do not mean absence.
+The maintenance version is exactly stable 1.4.3. It must exceed every parseable
+remote 1.4 version by SemVer precedence, including prereleases and build-metadata
+variants. Tag/release inventories include drafts and are fully paginated; exact
+absence probes accept only authenticated HTTP 404/JSON Not Found. Read errors do
+not establish absence. No other 1.x line or later 1.4 patch is approved.
 
-The fixed product base is Core 1.4.2 at
-`36b828864cbb1543e945898be31589f9c04d6384`; the reviewed backport is
-`bcf43a8cc789d5330a103fcf1e97ebdfbf7e2b84`, on
-`codex/linux-notifier-1-4-backport-20260929`. The final release metadata successor
-does not yet have an approved identity. No generic 1.x support policy or later
-1.4 patch is admitted by this profile.
+The dormant workflow carries admitted product SHA/tree and control identity into
+each reusable native gate. Each worker obtains its helpers from the control
+checkout and verifies the product checkout separately. Product build steps do
+not receive publication credentials. Native/validation jobs have read-only
+repository permissions; only the publication job has write permission.
 
-## Explicitly outside this change
+## Native receipts and gate contract
 
-A separate activation review must implement and qualify the control/product
-workflow split, exact product inputs to every native gate, source-bound native
-and high-descriptor evidence, schema-2 publication receipts, final rechecks,
-profile-aware retry identity, publication-only write permissions and stable
-maintenance `--latest=false` behavior. The existing publisher is deliberately
-unreachable for this profile until that work is reviewed; it has not been
-repurposed to publish 1.4.3.
+`maintenance-gates.json` is the control-owned contract for final source,
+expected complete test inventories, required checks and high-descriptor evidence.
+Its exact bytes are included in registered control hashes. Its shipped final
+values are empty; a caller cannot substitute a smaller unregistered inventory.
 
-Jason/jsflax is the proposed release owner. No confirmation, approval reference,
-signature or final source registration is inferred from that proposal. The
-future product successor needs its own source review and signing record under
-the repository's existing conventions. This change is not a signed release.
+Four gates are required: Core Linux, Core macOS, C ABI Linux and C ABI macOS.
+Receipts bind the exact product/control commits and trees, profile and policy,
+gate contract, workflow run/attempt, gate identity and retained artifact hashes.
+GoogleTest discovery inventories are reconciled against executed XML cases;
+empty, missing, duplicate, failed or skipped cases cannot become a full-suite
+pass. C ABI evidence retains the SwiftPM and CMake shared-library legs, export
+comparison, C11 header check and Linux all-target build. Toolchain/platform
+observations and source hashes travel with the evidence.
 
-The retained legacy-server overlay result passed 295 tests, but normal published
-dependency consumption and full final-source Core/C ABI qualification remain
-pending. Direct high-file-descriptor qualification is also pending. After a
-legitimate release, the legacy-server owner must update through ordinary
-resolution while retaining Lattice 1.7.2, Kit 12.5.0 and the unrelated 41 pins.
-No Kit port or direct-revision shortcut is part of this change.
+Publication reconciliation verifies the exact release workflow, maintenance
+run title, run/attempt and successful required jobs, as well as immutable artifact
+metadata and downloaded file hashes. Every uploaded native evidence leaf is
+accounted for by the receipt, with the receipt itself as the sole self-exclusion.
+A receipt's own `passed` label or a previous attempt's artifacts are insufficient.
+The release job itself may still be running while completed native jobs are
+verified. The verifier must distinguish those states.
 
-## Local source validation
+Direct high-file-descriptor evidence remains a separate prerequisite, tied to
+the final product identity and an owner-reviewed evidence digest. The four
+notifier tests in the backport do not force high descriptor numbers. No actual
+native inventory, high-descriptor result or passing native receipt was generated
+by this source-only work. Synthetic test fixtures are not qualification receipts.
 
-Use a scratch directory under the workspace for temporary Git fixtures and
-Python cache files, then run the shared regressions plus new profile/wrapper
-tests:
+## Retries and publication semantics
+
+Maintenance retry identity includes repository, profile, version, control and
+product source identities and candidate digest; run attempts remain separately
+bound. Authenticated, paginated workflow reads reconcile matching runs and all
+their attempts before candidate output and again before publication planning.
+Only the single current first attempt can proceed through the dormant path.
+Any previous matching run, rerun or partial attempt requires a separately
+reviewed exception; no exception is registered. Evidence from older or different
+attempts cannot satisfy a newer attempt.
+
+The dormant publication path rechecks source/remote/version conditions, verifies
+native receipts, and plans an immutable tag at the product commit. The stable
+maintenance GitHub release uses `--latest=false`, with exact target, notes and
+receipt hashes rechecked immediately before publication. Atomic create-ref rejects
+any existing tag, including one already pointing at the same product commit. It never force-updates tags, overwrites existing releases/assets, or
+silently repairs a partial publication. Post-publication verification checks the
+published product identity and preserves the prior latest release. The normal
+2.x publisher retains its existing semantics.
+
+Operational maintenance entry points remain blocked independently of the JSON
+profile. The protocol's CLI implementation sits behind a code-level disabled
+switch; the existing wrapper preflight also rejects maintenance release commands.
+Removing those guards or setting registrations is a separate activation change.
+No hosted workflow, release/tag mutation or deployment was executed here.
+
+## Source review commands and validation
+
+`core_release.py maintenance-source-check --profile maintenance-1.4` is the
+separate source-admission entry point. It requires explicit full control/product
+identities and a separate product checkout; the shipped profile rejects it
+before Git/GitHub inspection. A future admitted source result still reports
+`maintenance-source-reviewed-not-release-admitted`, with dispatch and publication
+false. It is not a native result or release receipt.
+
+Run only local Python/Git fixture tests for this review, directing temporary
+outputs under localdev:
 
 ```sh
 mkdir -p "$HOME/localdev/APPROVED_EVIDENCE/tmp"
@@ -109,6 +140,22 @@ TMPDIR="$HOME/localdev/APPROVED_EVIDENCE/tmp" \
   python3 -m unittest discover -s release-train -p 'test_*.py'
 ```
 
-These are source-level Python/Git fixture tests with mocked GitHub reads. They
-are not native, hosted or consumer release qualification. No secrets, workflow
-dispatch, tag, release, activation or deployment are required to run them.
+The tests use synthetic repositories and mocked transport/evidence. Workflow YAML
+and shell syntax checks do not execute their native or publication commands.
+The legacy 295/295 server-overlay run remains historical evidence for its exact
+backport/server pair. It does not qualify this metadata child or normal published
+dependency adoption.
+
+## Remaining owner decisions
+
+Jason/jsflax is the proposed release owner, not an approval recorded by these
+files. Before activation, the owner must review control and product commits,
+choose signing/promotion, approve the exact source/diff/control registrations,
+provide the final gate inventories and reviewed high-descriptor evidence binding,
+and authorize a bounded native qualification slot. The actual native receipts,
+publication decision, stable 1.4.3 tag/release and deployment remain outstanding.
+
+After legitimate publication, the legacy-server owner must resolve the tag
+normally, preserving Lattice 1.7.2, Kit 12.5.0 and the unrelated 41 dependency pins,
+update its source locks, and qualify the full suite without an overlay. The
+broader performance goal remains paused.

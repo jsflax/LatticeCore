@@ -24,6 +24,7 @@ BACKPORT_SHA = 'bcf43a8cc789d5330a103fcf1e97ebdfbf7e2b84'
 BACKPORT_TREE = '915ca2e5f4a4b8f4bd6429f2dcb65feec9c43538'
 REQUIRED_CONTROL_FILES = frozenset({
     'release-train/core_release.py', 'release-train/maintenance_profile.py',
+    'release-train/maintenance_release.py', 'release-train/maintenance-gates.json',
     'release-train/release_train.py', 'release-train/policy.json',
     '.github/workflows/release.yml', '.github/workflows/macos.yml',
     '.github/workflows/linux.yml', '.github/workflows/capi.yml',

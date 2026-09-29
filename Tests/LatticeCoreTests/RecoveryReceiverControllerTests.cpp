@@ -2679,3 +2679,208 @@ TEST_F(PredecessorReceiverController, UnsettledProofResponseCannotAuthorizeTermi
 }
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+class CompletedPredecessorController : public TerminalReceiverController {
+protected:
+    bool orphan=false;
+    json source_policy(const std::string& ns)override {
+        return orphan?TerminalReceiverController::source_policy(ns):RecoveryReceiverController::source_policy(ns);
+    }
+    static std::string stored_text(const database::row_t& row,const char* key) {
+        const auto& bytes=std::get<std::vector<uint8_t>>(row.at(key));return {bytes.begin(),bytes.end()};
+    }
+    Snapshot source_inventory() {
+        Snapshot out;
+        const auto tables=source->db().query("SELECT name FROM sqlite_schema WHERE type='table' AND (name LIKE '_lattice_canonical_%' OR name IN ('ControllerRow','AuditLog')) ORDER BY name LIMIT 97");
+        if(tables.size()>96)throw db_error("completed fixture source inventory bound");
+        for(const auto& row:tables){const auto name=std::get<std::string>(row.at("name"));out[name]=source->db().query("SELECT * FROM \""+name+"\"");}
+        return out;
+    }
+    void start_completed(size_t count=1) {
+        configure(count);insert(*source,controller_uuid(9920),"canonical");connect();
+        ASSERT_TRUE(until([&]{return installed();}));ASSERT_FALSE(has_error());
+        ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer WHERE sequence=1"),static_cast<int64_t>(count));
+    }
+    void actual_ack_successor() {
+        configure();seed_local(1,9921);const auto audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");const auto ids=originals();hold_uploads=false;
+        std::vector<json> discarded;
+        after_control=[&](size_t,const json& c,std::string& raw){if(c.at("operation")=="discard")discarded.push_back(json::parse(raw));};
+        connect();ASSERT_TRUE(until([&]{return installed(2)&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==1;}));
+        ASSERT_EQ(discarded.size(),1u);EXPECT_EQ(discarded[0].at("settlement").at("state"),"committed");
+        if(orphan)EXPECT_EQ(discarded[0].at("lifecycle").at("state"),"terminal");else EXPECT_FALSE(discarded[0].contains("lifecycle"));
+        EXPECT_EQ(observed_uploads.size(),1u);EXPECT_EQ(observed_originals(),ids);EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),1);EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)>0"),1);
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer WHERE sequence=2"),1);
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_binding WHERE sequence=2"),1);EXPECT_FALSE(has_error());
+    }
+    void held_original_discard_burst(bool stale_first) {
+        start_completed();ASSERT_FALSE(HasFatalFailure());std::string stale,current;bool capture_current=false;
+        after_control=[&](size_t,const json& c,std::string& raw){if(c.at("operation")=="discard"&&stale.empty())stale=raw;
+            if(capture_current&&c.at("operation")=="prepare"){current=raw;raw.clear();}};
+        request_recovery();ASSERT_TRUE(until([&]{return installed(2);}));ASSERT_FALSE(stale.empty());
+        capture_current=true;request_recovery();ASSERT_TRUE(until([&]{return !current.empty();}));
+        // The saved Q1 disposal reply predates the live Q3 prepare request.
+        // Hold the actual worker before both socket callbacks reserve slots.
+        auto pause=std::make_shared<ControllerPause>();pauses.push_back(pause);
+        receiver->get_scheduler()->invoke([pause]{pause->wait();});ASSERT_TRUE(until([&]{return pause->ready();}));
+        const auto q=framing(),intent=entries();const auto endpoint=peers[0].physical;const auto view=peers[0].setup.descriptor();
+        const auto first=stale_first?stale:current,second=stale_first?current:stale;
+        ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(first)));
+        ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(second)));
+        EXPECT_EQ(framing(),q);EXPECT_EQ(entries(),intent);pause->release();capture_current=false;
+        ASSERT_TRUE(until([&]{return installed(3);}));EXPECT_FALSE(has_error());EXPECT_FALSE(pause->timedOut());
+        EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),view);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=3"),1);
+    }
+};
+TEST_F(CompletedPredecessorController, OriginalProfileDisposesInstalledQBeforeRealAckSuccessor) {actual_ack_successor();}
+TEST_F(CompletedPredecessorController, OrphanProfileDisposesInstalledQBeforeRealAckSuccessor) {orphan=true;actual_ack_successor();}
+TEST_F(CompletedPredecessorController, WholeCohortKeepsEveryOldQMUntilLastActualDisposalReply) {
+    start_completed(2);ASSERT_FALSE(HasFatalFailure());const auto old=framing(),intent=entries(),allocation=allocators();std::string held;size_t held_peer=0;unsigned disposals=0;
+    after_control=[&](size_t index,const json& c,std::string& raw){if(c.at("operation")=="discard"){
+        EXPECT_EQ(json::parse(raw).at("settlement").at("state"),"committed");if(++disposals==2){held=raw;held_peer=index;raw.clear();}}};
+    request_recovery();ASSERT_TRUE(until([&]{return !held.empty();}));EXPECT_EQ(phase(),2);EXPECT_EQ(framing(),old);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_binding WHERE sequence=1"),2);
+    ASSERT_TRUE(peers[held_peer].physical.trigger_on_message(transport_message::from_string(held)));after_control={};
+    ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),2);
+}
+TEST_F(CompletedPredecessorController, LostActualDiscardReplyRetriesOnQuietLiveRouteAtOriginalThirtySecondDeadline) {
+    start_completed();ASSERT_FALSE(HasFatalFailure());const auto old=framing(),intent=entries();std::vector<json> commands;std::string lost;
+    after_control=[&](size_t,const json& c,std::string& raw){if(c.at("operation")=="discard"){
+        commands.push_back(c);EXPECT_EQ(json::parse(raw).at("settlement").at("state"),"committed");if(lost.empty()){lost=raw;raw.clear();}}};
+    const auto endpoint=peers[0].physical;const auto view=peers[0].setup.descriptor();request_recovery();ASSERT_TRUE(until([&]{return !lost.empty();}));
+    const auto started=std::chrono::steady_clock::now();EXPECT_EQ(framing(),old);EXPECT_EQ(entries(),intent);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);
+    // No close, reconnect, sync_now or request_recovery after the loss. The
+    // existing native 100ms pacer owns progress across the unchanged 30s wait.
+    ASSERT_TRUE(until([&]{return installed(2);},45000));EXPECT_GE(std::chrono::steady_clock::now()-started,std::chrono::seconds(29));
+    ASSERT_EQ(commands.size(),2u);EXPECT_EQ(commands[0].at("request"),commands[1].at("request"));EXPECT_NE(commands[0].at("requestID"),commands[1].at("requestID"));
+    EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),view);EXPECT_FALSE(has_error());
+}
+TEST_F(CompletedPredecessorController, PartialCohortDisposalReopensWithEveryOldQMAndRepeatsExactAbsentRetry) {
+    start_completed(2);ASSERT_FALSE(HasFatalFailure());const auto old=framing(),intent=entries(),allocation=allocators();std::string held_request;bool lost=false;
+    after_control=[&](size_t,const json& c,std::string& raw){if(!lost&&c.at("operation")=="discard"){held_request=c.at("request");lost=true;raw.clear();}};
+    request_recovery();ASSERT_TRUE(until([&]{return lost;}));ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),1);
+    const auto source_before=source_inventory();EXPECT_EQ(framing(),old);close_receiver();after_control={};open_receiver();
+    EXPECT_EQ(framing(),old);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);EXPECT_EQ(source_inventory(),source_before);
+    std::string retry;after_control=[&](size_t,const json& c,std::string&){if(retry.empty()&&c.at("operation")=="discard")retry=c.at("request");};
+    connect();ASSERT_TRUE(until([&]{return installed(2);}));ASSERT_FALSE(retry.empty());auto before=json::parse(held_request),after=json::parse(retry);
+    before["latticeCanonicalRange"]["route_generation"]=after["latticeCanonicalRange"]["route_generation"];EXPECT_EQ(before,after);EXPECT_FALSE(has_error());
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer WHERE sequence=2"),2);
+}
+TEST_F(CompletedPredecessorController, DeniedAtomicFramingCommitKeepsOldQMThenReopensAfterRealSourceCleanup) {
+    configure();insert(*source,controller_uuid(9922),"canonical");auto armed=std::make_shared<std::atomic<bool>>(false);auto hits=std::make_shared<std::atomic<unsigned>>(0);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[this,armed,hits](const char* stage)->std::shared_ptr<void>{
+        if(armed->load()&&std::strcmp(stage,"completed-disposal-framing")==0)return std::make_shared<ControllerCommitFault>(receiver.get(),*hits);return {};});
+    connect();ASSERT_TRUE(until([&]{return installed();}));const auto old=framing(),intent=entries(),allocation=allocators();armed->store(true);request_recovery();
+    ASSERT_TRUE(until([&]{return has_error();}));EXPECT_GT(hits->load(),0u);EXPECT_EQ(phase(),2);EXPECT_EQ(framing(),old);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);
+    close_receiver();probe.reset();open_receiver();EXPECT_EQ(framing(),old);connect();ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
+}
+TEST_F(CompletedPredecessorController, CrashAfterNewQCommitReopensWithoutRequiringAnotherOldDisposal) {
+    configure();insert(*source,controller_uuid(9923),"canonical");auto armed=std::make_shared<std::atomic<bool>>(false);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[armed](const char* stage){
+        if(armed->load()&&std::strcmp(stage,"completed-disposal-framing-committed")==0)throw db_error("fixture crash after replacement Q COMMIT");});
+    connect();ASSERT_TRUE(until([&]{return installed();}));armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return has_error();}));
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+    ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);const auto q=framing(),intent=entries();
+    close_receiver();probe.reset();open_receiver();EXPECT_EQ(framing(),q);EXPECT_EQ(entries(),intent);const auto start=controls.size();connect();
+    ASSERT_TRUE(until([&]{return installed(2);}));for(size_t n=start;n<controls.size();++n)EXPECT_NE(controls[n].second.at("operation"),"discard");EXPECT_FALSE(has_error());
+}
+TEST_F(CompletedPredecessorController, OriginalLateDiscardThenCurrentResponseSharesFixedTwoSlotInbox) {held_original_discard_burst(true);}
+TEST_F(CompletedPredecessorController, OriginalCurrentThenLateDiscardSharesFixedTwoSlotInbox) {held_original_discard_burst(false);}
+TEST_F(CompletedPredecessorController, OriginalLateDiscardAtConsumedGapAndIdleNeverSettlesSuccessor) {
+    configure();insert(*source,controller_uuid(9924),"canonical");auto armed=std::make_shared<std::atomic<bool>>(false),paused=std::make_shared<std::atomic<bool>>(false);
+    auto ignored=std::make_shared<std::atomic<unsigned>>(0);auto pause=std::make_shared<ControllerPause>();pauses.push_back(pause);std::string actual;
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
+        if(std::strcmp(stage,"pending-consumed-before-successor")==0&&armed->load()&&!paused->exchange(true))pause->wait();
+        if(std::strcmp(stage,"late-lifecycle-discarded")==0)++*ignored;});
+    connect();ASSERT_TRUE(until([&]{return installed();}));
+    after_control=[&](size_t,const json& c,std::string& raw){if(c.at("operation")=="discard"){actual=raw;armed->store(true);}};
+    request_recovery();ASSERT_TRUE(until([&]{return pause->ready();}));ASSERT_FALSE(actual.empty());const auto old=framing(),intent=entries();const auto endpoint=peers[0].physical;
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(actual)));EXPECT_EQ(framing(),old);EXPECT_EQ(entries(),intent);pause->release();
+    ASSERT_TRUE(until([&]{return installed(2);}));ASSERT_TRUE(until([&]{return ignored->load()==1;}));const auto settled=snapshot();
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(actual)));ASSERT_TRUE(until([&]{return ignored->load()==2;}));
+    EXPECT_EQ(snapshot(),settled);EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_FALSE(has_error());EXPECT_FALSE(pause->timedOut());
+}
+TEST_F(CompletedPredecessorController, RetiredDisposalResponseCannotAuthorizeNewPhysicalView) {
+    start_completed();ASSERT_FALSE(HasFatalFailure());std::string lost;after_control=[&](size_t,const json& c,std::string& raw){if(c.at("operation")=="discard"){lost=raw;raw.clear();}};
+    request_recovery();ASSERT_TRUE(until([&]{return !lost.empty();}));const auto q=framing(),intent=entries();const auto old_endpoint=peers[0].physical;
+    close_receiver();after_control={};open_receiver();EXPECT_EQ(framing(),q);EXPECT_EQ(entries(),intent);connect();
+    EXPECT_FALSE(old_endpoint.trigger_on_message(transport_message::from_string(lost)));ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
+}
+TEST_F(CompletedPredecessorController, UnknownReconciliationDisposesCanceledCapsuleWithoutChangingOriginalClaims) {
+    start_completed();ASSERT_FALSE(HasFatalFailure());seed_local(2,9925);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));
+    const auto audit=receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
+    held_uploads.clear();hold_uploads=false;legacy_ack(0,ids);
+    ASSERT_TRUE(until([&]{return installed(2)&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==2;}));
+    EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),3);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audit);EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
+    unsigned count=0;for(const auto& [_,c]:controls)if(c.at("operation")=="discard")++count;EXPECT_EQ(count,2u);EXPECT_FALSE(has_error());
+}
+TEST_F(PredecessorReceiverController, ExactInstalledPredecessorAfterAdoptionDoesNotAcquireOldProfileProofPrerequisite) {
+    configure();insert(*source,controller_uuid(9927),"canonical");connect();ASSERT_TRUE(until([&]{return installed();}));const auto rows=receiver->db().query("SELECT * FROM ControllerRow");
+    adopt_source();ASSERT_FALSE(HasFatalFailure());const auto before=proof_controls();connect();ASSERT_TRUE(until([&]{return installed(2);}));
+    EXPECT_EQ(proof_controls(),before);EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow"),rows);EXPECT_FALSE(has_error());
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer WHERE sequence=2"),1);
+}
+TEST_F(CompletedPredecessorController, SimulatedPreFixMissingQEvidenceFailsClosedWithActualOldSourceCapsule) {
+    start_completed();ASSERT_FALSE(HasFatalFailure());seed_local(1,9928);const auto old=framing();const auto source_before=source_inventory();
+    ASSERT_EQ(old.size(),1u);const auto old_q=json::parse(stored_text(old[0],"request_frame")).at("latticeCanonicalRange");
+    const auto actual_transfer=source->db().query("SELECT * FROM _lattice_canonical_ready_transfer");ASSERT_EQ(actual_transfer.size(),1u);
+    const auto source_q=json::parse(stored_text(actual_transfer[0],"request")).at("latticeCanonicalRange");EXPECT_EQ(source_q.at("attempt"),old_q.at("attempt"));EXPECT_EQ(source_q.at("body"),old_q.at("body"));
+    bool forged=false,held_q2=false;json real_q2;
+    before_control=[&](size_t index,const json& c){
+        if(!forged&&c.at("operation")=="discard"){
+            // Deliberately UNTRUTHFUL authenticated response simulates an
+            // unshipped pre-fix receiver losing Q1. This is no evidence of
+            // source COMMIT and is never a positive cleanup assertion.
+            forged=true;const auto reply=json{{"kind","recoveryReady"},{"version",1},{"operation","discard"},{"requestID",c.at("requestID")},
+                {"routeGeneration",c.at("routeGeneration")},{"leaseAvailable",false},{"settlement",{{"state","committed"},{"unexpectedCommitObserved",false},
+                    {"primaryError",false},{"cleanupError",false},{"postcommitError",false},{"notificationError",false}}}};
+            peers[index].physical.trigger_on_message(transport_message::from_string(reply.dump()));return true;
+        }
+        if(forged&&c.at("operation")=="prepare"){real_q2=c;held_q2=true;return true;}return false;};
+    request_recovery();ASSERT_TRUE(until([&]{return held_q2;}));ASSERT_TRUE(forged);
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+    const auto new_q=json::parse(stored_text(framing().at(0),"request_frame")).at("latticeCanonicalRange");
+    EXPECT_EQ(new_q.at("attempt").at("sequence"),"2");EXPECT_EQ(old_q.at("attempt").at("sequence"),"1");EXPECT_NE(new_q.at("body").at("request_digest"),old_q.at("body").at("request_digest"));
+    EXPECT_EQ(json::parse(real_q2.at("request").get<std::string>()).at("latticeCanonicalRange"),new_q);
+    ASSERT_EQ(source_inventory(),source_before);ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_binding WHERE sequence=1"),1);
+    const auto before=snapshot(),source_frozen=source_inventory();before_control={};const auto raw=real_q2.dump();auto charge=peers[0].setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    const auto result=peers[0].setup.ready(raw,charge);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());auto refusal=json::parse(result.wire());EXPECT_FALSE(refusal.at("leaseAvailable").get<bool>());
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(result.wire())));ASSERT_TRUE(until([&]{return has_error();}));
+    EXPECT_EQ(snapshot(),before);EXPECT_EQ(source_inventory(),source_frozen);
+    close_receiver();open_receiver();Snapshot retried;
+    after_control=[&](size_t,const json& c,std::string&){if(c.at("operation")=="resume")retried=snapshot();};
+    connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_FALSE(retried.empty());
+    EXPECT_EQ(snapshot(),retried);EXPECT_EQ(source_inventory(),source_frozen);
+}
+TEST_F(CompletedPredecessorController, UnsettledLastDisposalKeepsWholeLocalCohortUntilReopen) {
+    start_completed(2);ASSERT_FALSE(HasFatalFailure());const auto old=framing(),intent=entries(),allocation=allocators();unsigned replies=0;
+    after_control=[&](size_t,const json& c,std::string& raw){if(c.at("operation")=="discard"&&++replies==2){
+        auto value=json::parse(raw);ASSERT_EQ(value.at("settlement").at("state"),"committed");
+        // Withhold current settlement truth at the authenticated boundary;
+        // the first peer's real receipt cannot authorize partial replacement.
+        value["settlement"]["state"]="unsettled";raw=value.dump();}};
+    request_recovery();ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(replies,2u);EXPECT_EQ(framing(),old);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);
+    EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer"),0);
+    close_receiver();after_control={};open_receiver();EXPECT_EQ(framing(),old);connect();ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
+}
+TEST_F(CompletedPredecessorController, MalformedOriginalLateDiscardCannotKeepOrdinaryExportAdmission) {
+    start_completed();ASSERT_FALSE(HasFatalFailure());std::string actual;
+    after_control=[&](size_t,const json& c,std::string& raw){if(c.at("operation")=="discard")actual=raw;};
+    request_recovery();ASSERT_TRUE(until([&]{return installed(2);}));ASSERT_FALSE(actual.empty());
+    auto bad=json::parse(actual);bad["leaseAvailable"]=true;const auto before=snapshot();
+    ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(bad.dump())));ASSERT_TRUE(until([&]{return has_error();}));
+    EXPECT_EQ(snapshot(),before);seed_local(1,9929);EXPECT_THROW(synchronizers[0]->sync_now(),db_error);
+    const auto drained=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));EXPECT_EQ(drained.state,sync_drain_state::failed);EXPECT_TRUE(drained.error);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NULL"),1);
+}
+
+}
+#endif

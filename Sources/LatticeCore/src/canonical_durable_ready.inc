@@ -818,12 +818,27 @@ recovery_install_result canonical_writer_adapter::discard_authenticated_ready(st
     auto state=context_;auto writer=writer_;auto session=retention_;const auto held=admission;
     return retention_owned(owner,writer,state,session,ready_abandon,[&](database& actual,retention_session&){
         validate_namespace_admission(owner,writer,state,held);
-        if(!state->ready || request.source!=ready_source(state->profile,*state->ready))refuse("canonical READY disposal source differs");
+        if(!state->ready || !held.authenticated_ || request.source!=ready_source(state->profile,*state->ready) ||
+           request.registered_producer!=held.receipt_binding_ ||
+           (request.registered_producer&&request.receipt_namespace!=std::optional<std::string>{held.namespace_.namespace_id}))
+            refuse("canonical READY disposal source differs");
         const auto& p=*state->ready;const auto raw=cr::encode({attempt,ready_route,request},p.package.codec);
         (void)ready_capture_requests(request,held.namespace_.namespace_id,p);
-        const auto row=ready_row(actual,p,ready_binding(held.namespace_.namespace_id,held.replica_,attempt));
-        ready_require_identity(row,p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
-        dispose_ready(actual,p,row);validate_namespace_admission(owner,writer,state,held);
+        const auto key=ready_binding(held.namespace_.namespace_id,held.replica_,attempt);
+        const auto rows=actual.query(ready_transfer_query(p)+" WHERE binding=? LIMIT 2",{bytes(key)});
+        if(rows.size()>1)refuse("canonical READY disposal capsule is ambiguous");
+        if(!rows.empty()) {
+            ready_require_identity(rows[0],p,attempt,raw,held.namespace_,held.replica_,held.receipt_binding_);
+            dispose_ready(actual,p,rows[0]);
+        } else {
+            // Current audited no-effect settlement after a lost discard reply.
+            // This neither creates/advances a binding nor proves a prior call
+            // outcome, historical Q spelling, or any original receipt.
+            const auto prior=actual.query("SELECT "+ready_i("sequence")+" FROM main._lattice_canonical_ready_binding WHERE binding=? LIMIT 2",{bytes(key)});
+            if(prior.size()!=1||integer(prior[0],"sequence")<=0||uint64_t(integer(prior[0],"sequence"))!=attempt.sequence)
+                refuse("canonical READY disposal terminal high-water differs");
+        }
+        validate_namespace_admission(owner,writer,state,held);
     });
 }
 canonical_ready_maintenance_result canonical_writer_adapter::maintain_authenticated_ready(std::shared_ptr<lattice_db> owner) {

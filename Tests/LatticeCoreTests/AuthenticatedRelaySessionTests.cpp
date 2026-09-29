@@ -756,7 +756,7 @@ TEST_F(AuthenticatedReceiptCoverageV3, MigrationDisposesActualOldReadyCapsuleBut
     open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
     const auto d=description(setup);auto request_frame=request(d);auto& q=std::get<ready_wire::request>(request_frame.body);
     q.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(request_frame,d);
-    const auto offered=lease(setup,request_frame,d);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
+    const auto offered=lease(setup,request_frame,d,"prepare",1000);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
     ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);ASSERT_GT(count("_lattice_canonical_ready_frame"),0);
     const auto binding=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");ASSERT_EQ(binding.size(),1u);
     auto expected=global_state();setup.close_on_io();setup={};
@@ -783,13 +783,54 @@ protected:
         owner=swift_lattice_ref::shared_for_lattice(ref->get());
         if(!owner)throw std::runtime_error("replacement migration owner unavailable");
         if(auto* n=instance_registry::instance().get_or_create_notifier(file.str()))n->stop_listening();
+        // Reopen starts with ordinary connection durability. Migration is
+        // deliberately forbidden from changing it while settling source state.
+        owner->db().execute("PRAGMA main.synchronous=FULL");
+        ASSERT_EQ(std::get<int64_t>(owner->db().query("PRAGMA main.synchronous").at(0).at("synchronous")),2);
+    }
+    static json migration_cell_summary(const column_value_t* value) {
+        if(!value)return {{"missing",true}};
+        json result={{"type",value->index()}};
+        if(const auto* text=std::get_if<std::string>(value)){result["bytes"]=text->size();result["prefix"]=text->substr(0,96);}
+        else if(const auto* bytes=std::get_if<std::vector<uint8_t>>(value)){result["bytes"]=bytes->size();std::string hex;const char* digits="0123456789abcdef";
+            for(size_t n=0;n<std::min<size_t>(16,bytes->size());++n){hex+=digits[(*bytes)[n]>>4];hex+=digits[(*bytes)[n]&15];}result["prefixHex"]=std::move(hex);}
+        else if(const auto* number=std::get_if<int64_t>(value))result["value"]=*number;
+        else if(const auto* number=std::get_if<double>(value))result["value"]=*number;
+        else result["value"]=nullptr;
+        return result;
+    }
+    // Evaluated only by a failed original whole-state assertion. This is an
+    // explicitly labeled fresh diagnostic sample, never the comparison oracle.
+    std::string migration_state_difference(const Snapshot& expected) {
+        try {
+            const auto actual=all_state();json report={{"diagnosticResampleEqual",actual==expected},{"tables",json::array()}};
+            std::set<std::string> tables;for(const auto& [table,_]:expected)tables.insert(table);for(const auto& [table,_]:actual)tables.insert(table);
+            size_t changed=0;
+            for(const auto& table:tables){const auto e=expected.find(table),a=actual.find(table);
+                if(e!=expected.end()&&a!=actual.end()&&e->second==a->second)continue;
+                ++changed;if(report["tables"].size()>=8)continue;
+                const auto en=e==expected.end()?0:e->second.size(),an=a==actual.end()?0:a->second.size();
+                json difference={{"table",table},{"expectedPresent",e!=expected.end()},{"actualPresent",a!=actual.end()},
+                    {"expectedRows",en},{"actualRows",an},{"cells",json::array()}};
+                for(size_t row=0;row<std::max(en,an);++row){const auto* er=row<en?&e->second[row]:nullptr;const auto* ar=row<an?&a->second[row]:nullptr;
+                    if(er&&ar&&*er==*ar)continue;difference["firstDifferentRow"]=row;
+                    std::set<std::string> columns;if(er)for(const auto& [column,_]:*er)columns.insert(column);if(ar)for(const auto& [column,_]:*ar)columns.insert(column);
+                    for(const auto& column:columns){const auto* ev=er&&er->count(column)?&er->at(column):nullptr;const auto* av=ar&&ar->count(column)?&ar->at(column):nullptr;
+                        if(ev&&av&&*ev==*av)continue;
+                        if(difference["cells"].size()>=4){difference["moreDifferentCells"]=true;break;}
+                        difference["cells"].push_back({{"column",column},{"expected",migration_cell_summary(ev)},{"actual",migration_cell_summary(av)}});
+                    }break;
+                }report["tables"].push_back(std::move(difference));
+            }
+            report["differentTables"]=changed;return report.dump();
+        }catch(const std::exception& error){return json{{"diagnosticError",std::string(error.what()).substr(0,256)}}.dump();}
     }
     void require_pending_without_sql(const Snapshot& expected) {
         const auto statements=database::thread_statement_count();
         const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
         EXPECT_EQ(database::thread_statement_count(),statements);
         EXPECT_EQ(result,2)<<last_bridge_error();EXPECT_TRUE(last_bridge_error().empty());
-        EXPECT_EQ(all_state(),expected);
+        EXPECT_EQ(all_state(),expected)<<migration_state_difference(expected);
     }
 };
 
@@ -826,7 +867,7 @@ TEST_F(AuthenticatedReceiptMigrationClosure, ReplacementOwnerMigrationWaitsForEv
     setup.close_on_io();setup={};owner->close();owner.reset();ref.reset();
     ASSERT_TRUE(prior_owner.expired());EXPECT_FALSE(held.publishable());EXPECT_FALSE(copied.publishable());EXPECT_FALSE(stopped.live());
     recreate_owner();const auto replacement=owner->db().physical_identity("main",{},true);ASSERT_TRUE(replacement);
-    EXPECT_EQ(replacement->device,physical->device);EXPECT_EQ(replacement->inode,physical->inode);EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(replacement->device,physical->device);EXPECT_EQ(replacement->inode,physical->inode);EXPECT_EQ(all_state(),before)<<migration_state_difference(before);
     require_pending_without_sql(before);
     held={};EXPECT_FALSE(stopped.drained());require_pending_without_sql(before);
     copied={};EXPECT_TRUE(stopped.drained());
@@ -843,7 +884,7 @@ TEST_F(AuthenticatedReceiptMigrationClosure, ActualMigrationCommitDenialRestores
     open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
     const auto d=description(setup);auto requested=request(d);auto& q=std::get<ready_wire::request>(requested.body);
     q.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(requested,d);
-    const auto offered=lease(setup,requested,d);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
+    const auto offered=lease(setup,requested,d,"prepare",1000);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
     ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);ASSERT_GT(count("_lattice_canonical_ready_frame"),0);
     const auto binding=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");ASSERT_EQ(binding.size(),1u);
     setup.close_on_io();setup={};const auto before=all_state();auto expected=global_state();

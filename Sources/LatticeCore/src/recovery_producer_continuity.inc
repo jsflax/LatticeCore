@@ -242,7 +242,7 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
             receive_install_store receiver(owner,state->policy.limits.installations);journal.audit();receiver.audit();
             if(journal.usage().scopes!=static_cast<int64_t>(state->policy.contributions.size())||receiver.usage().channels!=static_cast<int64_t>(state->policy.contributions.size()))refuse("continuous extra or missing journal/receiver contribution");
             if(continuous_receiver_enabled(*state)) {
-                recovery_receiver_controller::validate_reopen_owned(owner,state->policy,phase,attempt);
+                recovery_receiver_controller::validate_reopen_owned(owner,state->policy,phase,barrier,attempt);
             } else for(const auto& profile:candidate->profiles){
                 const auto scope=journal.read(profile.stored.contribution.binding.channel);
                 const auto received=receiver.read(profile.stored.contribution.binding.channel);
@@ -590,6 +590,26 @@ void recovery_continuous_producer::controller_resume_owned(const recovery_receiv
     writer->execute("UPDATE _lattice_producer_continuity SET phase=0 WHERE id=1 AND phase=3 AND barrier=? AND attempt=?",{barrier,attempt});
     const auto after=writer->query(continuous_query).at(0);
     if(integer(after,"phase")!=0||integer(after,"barrier")!=barrier||integer(after,"attempt")!=attempt)refuse("controller resume transition changed");
+}
+void recovery_continuous_producer::controller_restart_terminal_owned(const recovery_receiver_controller& controller,
+    std::shared_ptr<lattice_db> owner,int64_t physical_incarnation,int64_t barrier,int64_t attempt) {
+    if(!owner||!owner->recovery_continuous_||!continuous_install_owned(*owner->recovery_continuous_))refuse("terminal restart lacks actual controller WRITE");
+    auto state=owner->recovery_continuous_->state;auto& db=*recovery_writer_access::active_writer(*owner);
+    {std::lock_guard lock(state->mutex);if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load()||
+        !state->reconciliation_cohort.expired()||state->gate_revision==UINT64_MAX)refuse("terminal restart retained work or cohort remains live");}
+    continuous_verify_row(db,*state);const auto row=db.query(continuous_query).at(0);
+    if(integer(row,"phase")!=2||integer(row,"incarnation")!=physical_incarnation||integer(row,"barrier")!=barrier||integer(row,"attempt")!=attempt||
+        barrier<=0||barrier==INT64_MAX||attempt<=0||attempt==INT64_MAX)refuse("terminal restart physical frozen attempt changed or exhausted");
+    recovery_obligation_store journals(owner,state->policy.limits.obligations,state->policy.limits.installations);
+    receive_install_store receiver(owner,state->policy.limits.installations);
+    for(const auto& c:state->policy.contributions){const auto scope=journals.read(c.profile.binding.channel);const auto actual=receiver.read(c.profile.binding.channel);
+        if(!scope||scope->profile!=c.profile||scope->mode!=recovery_obligation_mode::recording||scope->last_attempt!=attempt||
+            scope->freeze_revision==INT64_MAX||scope->revision!=scope->freeze_revision+1||!actual||actual->binding!=c.profile.binding||
+            actual->active||actual->last_sequence!=attempt||(actual->last_installed&&actual->last_installed->sequence>=attempt))
+            refuse("terminal restart lacks every exact canceled journal/receiver");}
+    db.execute("UPDATE _lattice_producer_continuity SET phase=1,barrier=?,attempt=? WHERE id=1 AND phase=2 AND barrier=? AND attempt=?",{barrier+1,attempt+1,barrier,attempt});
+    const auto after=db.query(continuous_query);auto expected=row;expected["phase"]=int64_t(1);expected["barrier"]=barrier+1;expected["attempt"]=attempt+1;
+    if(after.size()!=1||after[0]!=expected)refuse("terminal restart lineage postimage changed");state->verify_file(db);
 }
 void recovery_continuous_producer::controller_transition_reconcile_owned(const recovery_receiver_controller& controller,
     std::shared_ptr<lattice_db> owner,int64_t phase,int64_t barrier,int64_t attempt,int64_t next_phase,int64_t next_barrier,int64_t next_attempt) {

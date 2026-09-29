@@ -32,7 +32,7 @@ class recovery_receiver_controller final : public std::enable_shared_from_this<r
     explicit recovery_receiver_controller(const recovery_continuous_policy&);
     static canonical_scoped_limits limits(const recovery_continuous_policy&);
     static void initialize_owned(std::shared_ptr<lattice_db>,const recovery_continuous_policy&);
-    static void validate_reopen_owned(std::shared_ptr<lattice_db>,const recovery_continuous_policy&,int64_t phase,int64_t attempt);
+    static void validate_reopen_owned(std::shared_ptr<lattice_db>,const recovery_continuous_policy&,int64_t phase,int64_t barrier,int64_t attempt);
     std::shared_ptr<recovery_receiver_route> attach(std::shared_ptr<lattice_db>,const std::shared_ptr<recovery_continuous_route>&,
         const std::shared_ptr<receiver_source_binding>&,const std::shared_ptr<owned_platform_sync_transport>&,
         const std::shared_ptr<scheduler>&,const std::shared_ptr<sync_callback_lifetime>&);

@@ -244,3 +244,19 @@ TEST(CanonicalReceiptCoverageRange, CanonicalV3MetadataAndRehashedOperationTampe
     for(size_t i=index;i<package.frames().size();++i)cursor.advance_canonical(package.frames()[i],9);
     EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
 }
+
+TEST(CanonicalReceiptCoverageRange, CanonicalV3ReceiptKeepsActualBooleanTypeAndBothValues) {
+    for(bool legacy_unbound:{false,true}) {
+        CoverageRangeFixture f;f.receipts[0].legacy_unbound=legacy_unbound;const auto package=f.build();
+        const auto index=1+package.offer().counts.content_pages;const auto& raw=package.frames()[index];
+        const auto original=json::parse(raw);
+        ASSERT_TRUE(original.at("latticeCanonicalRange").at("body").at("items")[0].at("legacy_unbound").is_boolean());
+        const auto decoded=cr::decode_canonical(raw,f.policy.codec);
+        EXPECT_EQ(decoded.version,3u);EXPECT_EQ(cr::encode(decoded,f.policy.codec),raw);
+        EXPECT_EQ(std::get<cr::receipt_page>(decoded.body).items[0],f.receipts[0]);
+        for(const auto& wrong_type:{json(legacy_unbound?1:0),json(legacy_unbound?"true":"false"),json(nullptr),json(1.0)}) {
+            auto bad=original;bad["latticeCanonicalRange"]["body"]["items"][0]["legacy_unbound"]=wrong_type;
+            EXPECT_THROW(cr::decode_canonical(bad.dump(),f.policy.codec),cr::protocol_error);
+        }
+    }
+}

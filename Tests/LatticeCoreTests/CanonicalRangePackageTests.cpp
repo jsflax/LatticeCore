@@ -548,3 +548,137 @@ TEST(CanonicalValidatedSequence, CanonicalTerminalRestartBoundaryAndMovedFromCur
         else{cursor.advance_canonical(package.frames().back(),1);EXPECT_EQ(cursor.snapshot(),complete);}
     }
 }
+
+namespace {
+// Count the parser's actual SAX events, including keys and container starts;
+// a DOM element count would understate the initial wire parser's node budget.
+struct CanonicalWireSAXCounts : nlohmann::json_sax<nlohmann::json> {
+    size_t nodes=0,depth=0,max_depth=0,max_string=0;
+    bool node(){++nodes;return true;}
+    bool null() override{return node();}
+    bool boolean(bool) override{return node();}
+    bool number_integer(number_integer_t) override{return node();}
+    bool number_unsigned(number_unsigned_t) override{return node();}
+    bool number_float(number_float_t,const string_t&) override{return node();}
+    bool string(string_t& value) override{max_string=std::max(max_string,value.size());return node();}
+    bool key(string_t& value) override{return string(value);}
+    bool binary(binary_t&) override{return false;}
+    bool start(){++depth;max_depth=std::max(max_depth,depth);return node();}
+    bool start_object(size_t) override{return start();}
+    bool start_array(size_t) override{return start();}
+    bool end_object() override{--depth;return true;}
+    bool end_array() override{--depth;return true;}
+    bool parse_error(size_t,const std::string&,const nlohmann::detail::exception&) override{return false;}
+};
+template<class F> void canonical_reparse_error(F&& operation,const char* expected) {
+    try{operation();ADD_FAILURE()<<"canonical operation unexpectedly accepted";}
+    catch(const cr::protocol_error& error){EXPECT_STREQ(error.what(),expected);}
+}
+}
+
+TEST(CanonicalValidatedSequence, CanonicalBytesKeepExactInitialSAXBoundariesForEveryFrameKind) {
+    PackageFixture f;f.rows[0]=f.row("A",std::string(160,'q'));
+    f.receipt({"original",cr::committed{"namespace","coverage",cr::decision::applied,3,cr::identity{"PackageSourceRow","A"}}});
+    const auto package=f.build();auto wires=package.frames();
+    wires.push_back(cr::encode({f.attempt,1,f.request},f.policy.codec));
+    bool tested_string_refusal=false;
+    for(const auto& raw:wires) {
+        CanonicalWireSAXCounts measured;ASSERT_TRUE(nlohmann::json::sax_parse(raw,&measured));
+        ASSERT_EQ(measured.depth,0u);ASSERT_GT(measured.nodes,1u);ASSERT_GT(measured.max_depth,1u);
+        ASSERT_GE(measured.max_string,64u);
+        for(unsigned dimension=0;dimension<3;++dimension) {
+            SCOPED_TRACE(dimension);auto exact=f.policy.codec;
+            if(dimension==0)exact.nodes=measured.nodes;
+            if(dimension==1)exact.depth=measured.max_depth;
+            if(dimension==2)exact.string_bytes=measured.max_string;
+            EXPECT_EQ(cr::encode(cr::decode_canonical(raw,exact),f.policy.codec),raw);
+            // string_bytes below 64 is an invalid profile, not a SAX boundary.
+            if(dimension==2&&measured.max_string==64)continue;
+            auto below=exact;
+            if(dimension==0)--below.nodes;
+            if(dimension==1)--below.depth;
+            if(dimension==2){--below.string_bytes;tested_string_refusal=true;}
+            canonical_reparse_error([&]{(void)cr::decode_canonical(raw,below);},"invalid or over-budget canonical JSON");
+        }
+    }
+    EXPECT_TRUE(tested_string_refusal);
+}
+
+TEST(CanonicalValidatedSequence, CanonicalBytesEnforceExactRawAndOwnRequestCapsWithLegalProfiles) {
+    PackageFixture f;const auto package=f.build();const auto& terminal=package.frames().back();
+    auto exact=f.policy.codec;exact.maximum.frame_bytes=terminal.size();
+    exact.maximum.payload_bytes=1;exact.string_bytes=64;
+    EXPECT_EQ(cr::encode(cr::decode_canonical(terminal,exact),exact),terminal);
+    --exact.maximum.frame_bytes;
+    canonical_reparse_error([&]{(void)cr::decode_canonical(terminal,exact);},"raw canonical frame exceeds budget");
+
+    // Keep every advertised limit legal while finding the request's exact
+    // encoded size, including its own decimal cap and recomputed digest.
+    f.request.budget.payload_bytes=1;f.seal_request();
+    auto raw=cr::encode({f.attempt,1,f.request},f.policy.codec);
+    auto wire=nlohmann::json::parse(raw);
+    for(unsigned iteration=0;iteration<8;++iteration) {
+        f.request.budget.frame_bytes=raw.size();f.seal_request();
+        wire["latticeCanonicalRange"]["body"]["limits"]["frame_bytes"]=std::to_string(f.request.budget.frame_bytes);
+        wire["latticeCanonicalRange"]["body"]["request_digest"]=f.request.request_digest;
+        raw=wire.dump();if(raw.size()==f.request.budget.frame_bytes)break;
+    }
+    ASSERT_EQ(raw.size(),f.request.budget.frame_bytes);
+    ASSERT_LT(raw.size(),f.policy.codec.maximum.frame_bytes);
+    ASSERT_LE(f.request.budget.payload_bytes,f.request.budget.frame_bytes);
+    EXPECT_EQ(cr::encode({f.attempt,1,f.request},f.policy.codec),raw);
+    EXPECT_EQ(std::get<cr::request>(cr::decode_canonical(raw,f.policy.codec).body),f.request);
+    --f.request.budget.frame_bytes;f.seal_request();
+    wire["latticeCanonicalRange"]["body"]["limits"]["frame_bytes"]=std::to_string(f.request.budget.frame_bytes);
+    wire["latticeCanonicalRange"]["body"]["request_digest"]=f.request.request_digest;
+    raw=wire.dump();ASSERT_GT(raw.size(),f.request.budget.frame_bytes);
+    ASSERT_LE(raw.size(),f.policy.codec.maximum.frame_bytes);
+    ASSERT_LE(f.request.budget.payload_bytes,f.request.budget.frame_bytes);
+    canonical_reparse_error([&]{(void)cr::decode(raw,f.policy.codec);},"request raw frame exceeds advertised budget");
+    canonical_reparse_error([&]{(void)cr::decode_canonical(raw,f.policy.codec);},"request raw frame exceeds advertised budget");
+}
+
+TEST(CanonicalValidatedSequence, CanonicalBytesRejectEquivalentSpellingEscapedDuplicateKeysAndWrongTypes) {
+    PackageFixture f;f.attempt.channel="package/channel";f.seal_request();const auto package=f.build();
+    const auto& raw=package.frames().back();const auto original=nlohmann::json::parse(raw);
+    std::vector<std::string> equivalents{original.dump(2)};
+    auto escaped=raw;auto at=escaped.find("package/channel");ASSERT_NE(at,std::string::npos);
+    escaped.replace(at,std::string("package/channel").size(),"package\\/channel");equivalents.push_back(escaped);
+    escaped=raw;at=escaped.find("\"version\"");ASSERT_NE(at,std::string::npos);
+    escaped.replace(at,std::string("\"version\"").size(),"\"\\u0076ersion\"");equivalents.push_back(escaped);
+    for(const auto& equivalent:equivalents) {
+        ASSERT_NE(equivalent,raw);EXPECT_EQ(cr::encode(cr::decode(equivalent,f.policy.codec),f.policy.codec),raw);
+        canonical_reparse_error([&]{(void)cr::decode_canonical(equivalent,f.policy.codec);},"canonical frame bytes differ from exact spelling");
+    }
+    auto duplicate=raw;at=duplicate.find("\"version\":2");ASSERT_NE(at,std::string::npos);
+    duplicate.insert(at,"\"\\u0076ersion\":2,");
+    canonical_reparse_error([&]{(void)cr::decode_canonical(duplicate,f.policy.codec);},"invalid or over-budget canonical JSON");
+    std::vector<std::string> malformed{raw.substr(0,raw.size()-1),raw+"{}"};
+    auto invalid_utf8=raw;at=invalid_utf8.find("package/channel");ASSERT_NE(at,std::string::npos);
+    invalid_utf8[at]=static_cast<char>(0xff);malformed.push_back(invalid_utf8);
+    for(const auto& value:{nlohmann::json(2.0),nlohmann::json(true),nlohmann::json("2"),nlohmann::json(nullptr)}) {
+        auto bad=original;bad["latticeCanonicalRange"]["version"]=value;malformed.push_back(bad.dump());
+    }
+    auto bad=original;bad["latticeCanonicalRange"]["route_generation"]=1;malformed.push_back(bad.dump());
+    for(const auto& invalid:malformed)EXPECT_THROW(cr::decode_canonical(invalid,f.policy.codec),cr::protocol_error);
+}
+
+TEST(CanonicalValidatedSequence, CanonicalBytesPreserveEscapedUnicodeAndRealInsideTypedPayloadString) {
+    PackageFixture f;const std::string payload=R"({"real":{"kind":7,"value":1.25},"text":{"kind":2,"value":"quote\" slash\\ nul\u0000 caf\u00e9 \ud83d\ude80"}})";
+    f.attempt.channel="package-\xc3\xa9-\xf0\x9f\x9a\x80";f.seal_request();
+    f.rows={{{"PackageSourceRow","A"},cr::present{payload}}};const auto package=f.build();
+    const auto decoded=cr::decode_canonical(package.frames()[1],f.policy.codec);
+    const auto& item=std::get<cr::content_page>(decoded.body).items[0];
+    EXPECT_EQ(std::get<cr::present>(item.value).payload,payload);
+    EXPECT_EQ(cr::encode(decoded,f.policy.codec),package.frames()[1]);
+    const auto values=sr::decode_values(std::get<cr::present>(item.value).payload,f.policy.codec.values);
+    EXPECT_DOUBLE_EQ(std::get<double>(values.at("real")),1.25);
+    const auto expected=std::string("quote\" slash\\ nul")+std::string(1,'\0')+" caf\xc3\xa9 \xf0\x9f\x9a\x80";
+    EXPECT_EQ(std::get<std::string>(values.at("text")),expected);
+    // These escapes belong to the opaque typed payload. Equivalent outer
+    // Unicode spelling still fails exact canonical wire equality.
+    const auto escaped=nlohmann::json::parse(package.frames()[1]).dump(-1,' ',true);
+    ASSERT_NE(escaped,package.frames()[1]);
+    EXPECT_EQ(cr::encode(cr::decode(escaped,f.policy.codec),f.policy.codec),package.frames()[1]);
+    EXPECT_THROW(cr::decode_canonical(escaped,f.policy.codec),cr::protocol_error);
+}

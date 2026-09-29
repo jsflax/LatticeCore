@@ -970,3 +970,167 @@ TEST_F(AuthenticatedReceiptCoverageV3, OrdinaryIngressCountAndWireByteLimitsRefu
 }
 }
 #endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+struct AddressedReadAuthorizerFault {
+    using fault_type=detail::canonical_upstream_test_hooks::authorizer_fault;
+    static thread_local AddressedReadAuthorizerFault* active;
+    bool deny_commit;unsigned commits=0;
+    fault_type fault;const fault_type** slot;const fault_type* previous;AddressedReadAuthorizerFault* prior;
+    AddressedReadAuthorizerFault(database& db,bool upstream,bool deny=false):deny_commit(deny),
+        fault{detail::canonical_writer_custody_test_access::fault_handle(db),restrict_action},
+        slot(upstream?&detail::canonical_upstream_test_hooks::fault:&detail::canonical_retention_test_hooks::fault),
+        previous(*slot),prior(active){active=this;*slot=&fault;}
+    ~AddressedReadAuthorizerFault(){*slot=previous;active=prior;}
+    static int restrict_action(int action,const char* operation,const char*,const char* origin)noexcept {
+        if(active&&!origin&&action==SQLITE_TRANSACTION&&operation&&std::strcmp(operation,"COMMIT")==0){
+            ++active->commits;if(active->deny_commit)return SQLITE_DENY;
+        }
+        return SQLITE_OK;
+    }
+};
+thread_local AddressedReadAuthorizerFault* AddressedReadAuthorizerFault::active=nullptr;
+struct AddressedReadInvalidationHook {
+    std::shared_ptr<lattice::swift_lattice> owner;uint64_t token;
+    ~AddressedReadInvalidationHook(){owner->remove_invalidation_hook(token);}
+};
+
+TEST_F(AuthenticatedReadySession, EveryAuthenticatedReadAuditsAllCapsulesOnceAndReturnsExactStoredFrames) {
+    setup=admitted();auto other=admitted(2);const auto a=entry(41,"first"),b=entry(42,"second");
+    ASSERT_EQ(setup.receive(frame(a)).ids().size(),1u);ASSERT_EQ(other.receive(frame(b)).ids().size(),1u);
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    for(auto* q:{&qa,&qb})std::get<ready_wire::request>(q->body).budget.items_per_page=1;
+    std::get<ready_wire::request>(qa.body).receipts={{a.global_id,std::string("app"),{{a.table_name,a.global_row_id}}}};
+    std::get<ready_wire::request>(qb.body).receipts={{b.global_id,std::string("app"),{{b.table_name,b.global_row_id}}}};
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);
+    const auto before=exact_source();const auto stored=owner->db().query("SELECT frame_index,data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);uint64_t bytes=0;
+    for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const auto* selected:{&setup,&other}) {
+        const auto& d=selected==&setup?da:db;const auto& offered=selected==&setup?la:lb;const auto& q=selected==&setup?qa:qb;
+        const auto frames=std::stoull(offered.at("frames").get<std::string>());ASSERT_GT(frames,3u);
+        for(uint64_t index=0;index<frames;++index) {
+            const auto result=read(*selected,offered,index);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+            EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.audited_frames,stored.size());EXPECT_EQ(last_read_trace.audited_bytes,bytes);
+            EXPECT_EQ(last_read_trace.positive_receipt_lookups,2u);EXPECT_EQ(last_read_trace.addressed_frames,1u);
+            EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.postcommit_error||last_read_trace.notification_error);
+            unsigned matches=0;
+            for(const auto& row:stored)if(std::get<int64_t>(row.at("frame_index"))==static_cast<int64_t>(index)) {
+                const auto& data=std::get<std::vector<uint8_t>>(row.at("data"));auto expected=ready_wire::decode(std::string(data.begin(),data.end()),codec(d));
+                if(expected.logical!=q.logical)continue;++matches;expected.route_generation=q.route_generation;
+                EXPECT_EQ(result.wire(),ready_wire::encode(expected,codec(d)));
+            }
+            EXPECT_EQ(matches,1u);EXPECT_EQ(exact_source(),before);
+        }
+    }
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, RegisteredNamespaceReadAuditsBothPositiveCoverageCapsulesOnce) {
+    auto policy_a=covered_policy();policy_a["maximumAuthorizationMilliseconds"]=600000;
+    auto policy_b=policy_a;policy_b["receiptNamespace"]="other";
+    setup=open(policy_a,connection());auto other=open(policy_b,connection(2),std::make_shared<RelayRouteState>());
+    for(const auto* actual:{&setup,&other}){ASSERT_TRUE(actual->valid());auto answer=covered_answer(*actual);answer["validForMilliseconds"]=600000;
+        ASSERT_TRUE(actual->finish_authorization(answer.dump()));}
+    const auto e=identified(entry(51));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(coverage().size(),2u);
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    for(auto* f:{&qa,&qb}) {
+        const auto ns=f==&qa?std::string("app"):std::string("other");auto& q=std::get<ready_wire::request>(f->body);
+        f->version=3;q.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};q.receipt_namespace=ns;
+        q.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};
+    }
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);const auto before=all_state();
+    const auto stored=owner->db().query("SELECT data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    uint64_t bytes=0;for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const auto* selected:{&setup,&other}) {
+        const auto& d=selected==&setup?da:db;const auto& offered=selected==&setup?la:lb;const auto ns=selected==&setup?"app":"other";
+        size_t positives=0;const auto frames=std::stoull(offered.at("frames").get<std::string>());
+        for(uint64_t index=0;index<frames;++index) {
+            const auto result=read(*selected,offered,index);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+            EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.audited_frames,stored.size());EXPECT_EQ(last_read_trace.audited_bytes,bytes);
+            EXPECT_EQ(last_read_trace.positive_receipt_lookups,2u);const auto decoded=decode_read(result,d);EXPECT_EQ(decoded.version,3u);
+            if(const auto* page=std::get_if<ready_wire::receipt_page>(&decoded.body))for(const auto& item:page->items) {
+                const auto* positive=std::get_if<ready_wire::committed>(&item.value);ASSERT_NE(positive,nullptr);++positives;
+                EXPECT_EQ(positive->namespace_id,ns);EXPECT_EQ(item.original_id,e.global_id);EXPECT_EQ(item.operation_digest,e.original_identity->digest);EXPECT_FALSE(item.legacy_unbound);
+            }
+            EXPECT_EQ(all_state(),before);
+        }
+        EXPECT_EQ(positives,1u);
+    }
+}
+
+TEST_F(AuthenticatedReadySession, OffPageCorruptionBeforeAnotherReadStillFailsItsWholePreAudit) {
+    setup=admitted();const auto e=entry(61);ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto good=read(setup,offered,0);
+    ASSERT_TRUE(good.publishable());EXPECT_EQ(last_read_trace.full_audits,1u);const auto before=exact_source();
+    const auto tail=owner->db().query("SELECT binding,frame_index,data FROM _lattice_canonical_ready_frame ORDER BY frame_index DESC LIMIT 1").at(0);
+    ASSERT_GT(std::get<int64_t>(tail.at("frame_index")),0);
+    const auto replace=[&](const std::vector<uint8_t>& data) {
+        // Deliberate external SQL corruption before the next call. Restore the
+        // exact guard so the oracle must inspect off-page content, not DDL drift.
+        database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.begin_transaction();raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",{data,tail.at("binding"),tail.at("frame_index")});
+        raw.execute(guard);raw.commit();
+    };
+    replace(std::vector<uint8_t>{'{','}'});const auto corrupt=exact_source();const auto refused=read(setup,offered,0);
+    ASSERT_EQ(refused.status_code(),1);const auto answer=json::parse(refused.wire());EXPECT_EQ(answer.at("frameAvailable"),false);
+    EXPECT_NE(answer.at("settlement").at("state"),"committed");EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.addressed_frames,0u);
+    EXPECT_EQ(exact_source(),corrupt);replace(std::get<std::vector<uint8_t>>(tail.at("data")));EXPECT_EQ(exact_source(),before);
+    const auto restored=read(setup,offered,0);EXPECT_TRUE(restored.publishable());EXPECT_EQ(restored.wire(),good.wire());EXPECT_EQ(last_read_trace.full_audits,1u);
+}
+
+TEST_F(AuthenticatedReadySession, EitherAuthorizerFaultUsesBothAuditsAndCommitRefusalReturnsNoFrame) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();const auto frames=std::stoull(offered.at("frames").get<std::string>());
+    for(const bool upstream:{false,true}) {
+        SCOPED_TRACE(upstream);
+        {AddressedReadAuthorizerFault fault(owner->db(),upstream);const auto result=read(setup,offered,0);
+            EXPECT_EQ(result.wire(),baseline.wire());EXPECT_TRUE(result.publishable());EXPECT_EQ(fault.commits,1u);
+            EXPECT_EQ(last_read_trace.full_audits,2u);EXPECT_EQ(last_read_trace.audited_frames,2*frames);}
+        {AddressedReadAuthorizerFault fault(owner->db(),upstream,true);const auto result=read(setup,offered,0);
+            ASSERT_EQ(result.status_code(),1);const auto answer=json::parse(result.wire());EXPECT_EQ(answer.at("frameAvailable"),false);
+            EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_EQ(answer.at("settlement").at("primaryError"),true);
+            EXPECT_EQ(fault.commits,1u);EXPECT_EQ(last_read_trace.full_audits,2u);EXPECT_EQ(last_read_trace.audited_frames,2*frames);}
+        EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(exact_source(),before);
+        const auto retry=read(setup,offered,0);EXPECT_EQ(retry.wire(),baseline.wire());EXPECT_TRUE(retry.publishable());EXPECT_EQ(last_read_trace.full_audits,1u);
+    }
+}
+
+TEST_F(AuthenticatedReadySession, ReadPostcommitObserverErrorKeepsTheExistingCommittedFrameContract) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();unsigned calls=0;
+    AddressedReadInvalidationHook hook{owner,owner->add_invalidation_hook([&](const auto&,auto){++calls;throw std::runtime_error("addressed read observer");})};
+    const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);EXPECT_EQ(result.status_code(),1);EXPECT_TRUE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());
+    EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+    EXPECT_TRUE(last_read_trace.postcommit_error);EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.notification_error);
+    EXPECT_EQ(exact_source(),before);
+}
+
+TEST_F(AuthenticatedReadySession, ReadPostcommitRevocationStillPreventsPublicationOfCommittedBytes) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();const auto stop=setup.stop_token();unsigned calls=0;
+    AddressedReadInvalidationHook hook{owner,owner->add_invalidation_hook([&](const auto&,auto){++calls;stop.stop();})};
+    const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);EXPECT_EQ(result.status_code(),1);EXPECT_FALSE(result.publishable());EXPECT_FALSE(baseline.publishable());
+    EXPECT_EQ(result.wire(),baseline.wire());EXPECT_EQ(last_read_trace.full_audits,1u);
+    EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(exact_source(),before);
+}
+
+TEST_F(AuthenticatedReadySession, ReadPostcommitLeaseExpiryStillPreventsPublicationAndLaterRead) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d,"prepare",1000);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();bool reached_expiry=false;unsigned calls=0;
+    {
+        AddressedReadInvalidationHook hook{owner,owner->add_invalidation_hook([&](const auto&,auto){
+            ++calls;const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+            while(baseline.publishable()&&std::chrono::steady_clock::now()<end)std::this_thread::yield();reached_expiry=!baseline.publishable();
+        })};
+        const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);ASSERT_TRUE(reached_expiry);EXPECT_EQ(result.status_code(),1);
+        EXPECT_FALSE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());EXPECT_EQ(last_read_trace.full_audits,1u);
+        EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+    }
+    const auto expired=read(setup,offered,0);EXPECT_NE(expired.status_code(),1);EXPECT_EQ(last_read_trace.full_audits,0u);EXPECT_EQ(exact_source(),before);
+}
+}
+#endif

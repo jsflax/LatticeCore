@@ -482,7 +482,8 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
             uuid(control,"attemptID")!=s->ready->attempt.attempt_id||ready_decimal(control,"sequence")!=s->ready->attempt.sequence||!s->ready->fence->live())
             reject("READY current setup lease or exact attempt/Q differs");
         const auto held=*s->ready; // Capture this exact fence BEFORE the transaction.
-        const auto read=s->source->adapter->read_ready_frame_owned(s->source->owner,*s->admission,held.lease,ready_decimal(control,"index",0));
+        const auto read_admission=canonical_writer_adapter::ready_operation_admission(*s->admission,held.fence->admitted);
+        const auto read=s->source->adapter->read_authenticated_ready_frame_owned(s->source->owner,read_admission,held.lease,ready_decimal(control,"index",0));
         if(read.settlement.state==recovery_install_state::committed&&read.frame) {
             operation->ready_=held.fence;
             if(read.frame->size()>authenticated_ready_budget::reply_limit)reject("READY returned frame bound");

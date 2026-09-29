@@ -65,6 +65,8 @@ struct canonical_writer_custody_test_access;
 class recovery_local_producer_adapter;
 class recovery_continuous_producer;
 struct recovery_continuous_admission;
+class database_retirement_state;
+struct database_retirement_access;
 void require_continuous_raw_handle_absent(database&);
 void require_continuous_legacy_export_absent(database&);
 class recovery_obligation_producer_store;
@@ -114,6 +116,7 @@ class database {
     friend struct detail::canonical_writer_custody_test_access;
     friend class detail::recovery_local_producer_adapter;
     friend class detail::recovery_continuous_producer;
+    friend struct detail::database_retirement_access;
     friend void detail::require_continuous_raw_handle_absent(database&);
     friend void detail::require_continuous_legacy_export_absent(database&);
     friend class detail::recovery_obligation_producer_store;
@@ -461,6 +464,10 @@ private:
     // Trusted Core/bridge callers only; never return this pointer to a client.
     sqlite3* internal_handle() const noexcept { return db_; }
     sqlite3* db_ = nullptr;
+    // Follows this exact SQLite connection through moves. A retained state
+    // outlives the wrapper; close_v2 success is never physical-close proof.
+    std::shared_ptr<detail::database_retirement_state> retirement_;
+    void retire_connection_(bool detach_callbacks = true) noexcept;
     mutable std::atomic<bool> raw_handle_escaped_{false};
     std::string path_;
     open_mode mode_;

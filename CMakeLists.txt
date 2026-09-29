@@ -311,6 +311,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
+    Tests/LatticeCoreTests/DatabaseRetirementTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
     Tests/LatticeCoreTests/ManagedObservationTests.cpp

@@ -5,6 +5,7 @@
 #include "checkpoint_test_probe.hpp"
 #include "recovery_admission_test_probe.hpp"
 #include "database_open_test_probe.hpp"
+#include "database_retirement.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
 #include <iostream>
@@ -342,7 +343,8 @@ std::shared_ptr<database> database::make_read_keeper(const std::string& path,
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
                    std::shared_ptr<database_read_control> read_control, initialization_key key)
-    : administrative_connection_(key.administrative_), path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
+    : administrative_connection_(key.administrative_), retirement_(std::make_shared<detail::database_retirement_state>()),
+      path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
     suppress_destructor_optimize_=key.administrative_;
     if(mode==open_mode::read_write && !key.continuous_)detail::require_continuous_path_unowned(path);
     // Determine SQLite open flags based on mode
@@ -381,14 +383,21 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
     if (rc != SQLITE_OK) {
-        std::string error = sqlite3_errmsg(db_);
-        sqlite3_close_v2(db_);
-        db_ = nullptr;
-        LOG_ERROR("db", "Failed to open database: %s", error.c_str());
-        throw db_error("Failed to open database: " + error);
+        try {
+            std::string error = sqlite3_errmsg(db_);
+            retire_connection_(false);
+            LOG_ERROR("db", "Failed to open database: %s", error.c_str());
+            throw db_error("Failed to open database: " + error);
+        } catch (...) {
+            // Preserve cleanup even if constructing the primary error fails.
+            retire_connection_(false);
+            throw;
+        }
     }
 
     try {
+    if (const auto* probe = detail::database_retirement_test_hooks::current; probe && probe->after_open)
+        probe->after_open(*this, db_);
     if(key.administrative_) {
 #ifdef SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
         if(sqlite3_db_config(db_,SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,1,nullptr)!=SQLITE_OK ||
@@ -431,9 +440,6 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     // Busy/cancellation handlers above must still precede extension setup.
     int vec_rc = sqlite3_vec_init(db_, nullptr, nullptr);
     if (vec_rc != SQLITE_OK) {
-        if (read_control_) read_control_->unpublish(db_);
-        sqlite3_close_v2(db_);
-        db_ = nullptr;
         LOG_ERROR("db", "Failed to initialize sqlite-vec extension");
         throw db_error("Failed to initialize sqlite-vec extension");
     }
@@ -511,9 +517,7 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
 #endif
 
     } catch (...) {
-        if (read_control_) read_control_->unpublish(db_);
-        if (db_) sqlite3_close_v2(db_);
-        db_ = nullptr;
+        retire_connection_();
         throw;
     }
 }
@@ -548,13 +552,43 @@ database::~database() {
                 LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
             }
         }
-        int rc = sqlite3_close_v2(db_);
-        if (rc != SQLITE_OK) {
-            LOG_ERROR("db", "~database close failed: rc=%d (%s), path=%s", rc, sqlite3_errmsg(db_), path_.c_str());
-        } else {
-            LOG_DEBUG("db", "~database closed: path=%s", path_.c_str());
-        }
+        retire_connection_();
     }
+}
+
+void database::retire_connection_(bool detach_callbacks) noexcept {
+    if (!db_) return;
+    if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
+    if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
+    if (read_control_) read_control_->unpublish(db_);
+    // These callbacks borrow wrapper/read-control storage. Detach for every
+    // mode and cleanup path before a deferred close can outlive that storage.
+    // Connection-owned UDF contexts keep their existing SQLite-owned lifetime;
+    // their producer/canonical admission was revoked above, not re-created.
+    // Failed sqlite3_open can leave only a partial handle. No callbacks were
+    // installed on that path; use only its supported error/close operations.
+    if (detach_callbacks) {
+        sqlite3_update_hook(db_, nullptr, nullptr);
+        sqlite3_wal_hook(db_, nullptr, nullptr);
+        sqlite3_commit_hook(db_, nullptr, nullptr);
+        sqlite3_rollback_hook(db_, nullptr, nullptr);
+        sqlite3_progress_handler(db_, 0, nullptr, nullptr);
+        sqlite3_busy_handler(db_, nullptr, nullptr);
+    }
+    // No SQLite mutex guard may survive a successful close of that mutex.
+    auto* retiring = std::exchange(db_, nullptr);
+    const int checked = sqlite3_close(retiring);
+    int fallback = detail::database_retirement_state::not_attempted;
+    if (checked != SQLITE_OK) {
+        // Preserve the existing zombie cleanup semantics. Never save/poll this
+        // pointer: close_v2 may free it immediately or on final statement exit.
+        fallback = sqlite3_close_v2(retiring);
+        if (fallback != SQLITE_OK)
+            LOG_ERROR("db", "physical close cleanup failed: checked=%d fallback=%d, path=%s", checked, fallback, path_.c_str());
+        else
+            LOG_DEBUG("db", "physical close unproved: checked=%d fallback=%d, path=%s", checked, fallback, path_.c_str());
+    } else LOG_DEBUG("db", "physical close proved: path=%s", path_.c_str());
+    if (retirement_) retirement_->record_close(checked, fallback);
 }
 
 void database::close() {
@@ -588,6 +622,7 @@ sqlite3* database::handle() const {
         if (canonical_write_allowed_) canonical_write_allowed_->store(false,std::memory_order_release);
     }
     raw_handle_escaped_.store(true, std::memory_order_release);
+    if (retirement_) retirement_->raw_escaped_.store(true, std::memory_order_release);
     // A known raw escape ends future producer admission. There is no SQLite
     // getter that could establish which external authorizer a caller installs.
     if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
@@ -696,7 +731,7 @@ void database::discard_if_rolled_back() {
 }
 
 database::database(database&& other) noexcept
-    : db_(other.db_), path_(std::move(other.path_)), mode_(other.mode_),
+    : db_(other.db_), retirement_(std::move(other.retirement_)), path_(std::move(other.path_)), mode_(other.mode_),
       busy_timeout_ms_(other.busy_timeout_ms_), read_control_(std::move(other.read_control_)),
       main_physical_identity_(std::atomic_load(&other.main_physical_identity_)) {
     canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
@@ -714,25 +749,13 @@ database::database(database&& other) noexcept
     txn_hooks_ = std::move(other.txn_hooks_);
     if (txn_hooks_) rebind_txn_hooks_owned_();
     raw_handle_escaped_.store(other.raw_handle_escaped_.load(std::memory_order_acquire));
+    closed_.store(other.closed_.exchange(true, std::memory_order_acq_rel), std::memory_order_release);
     other.db_ = nullptr;
 }
 
 database& database::operator=(database&& other) noexcept {
     if (this != &other) {
-        if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
-        if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
-        if (read_control_) read_control_->unpublish(db_);
-        if (db_) {
-            // Uninstall before replacing our old owned context. close_v2 can
-            // defer physical destruction while an escaped statement exists.
-            if (lattice_update_hook_context_) {
-                sqlite3_update_hook(db_, nullptr, nullptr);
-                sqlite3_wal_hook(db_, nullptr, nullptr);
-                sqlite3_commit_hook(db_, nullptr, nullptr);
-            }
-            if (lattice_update_hook_context_ || txn_hooks_) sqlite3_rollback_hook(db_, nullptr, nullptr);
-            sqlite3_close_v2(db_);
-        }
+        retire_connection_();
         // Retire displaced user captures after the complete move/rebind, with
         // no SQLite mutex held. Bare wrappers' public bundles move as well.
         auto retired_hooks = std::move(txn_hooks_);
@@ -748,12 +771,14 @@ database& database::operator=(database&& other) noexcept {
         channel_reset_unsettled_.store(other.channel_reset_unsettled_.exchange(false));
         lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
         db_ = other.db_;
+        retirement_ = std::move(other.retirement_);
         txn_dirty_.store(other.txn_dirty_.exchange(false));
         txn_hooks_ = std::move(other.txn_hooks_);
         // The SQLite update/WAL userdata address has not changed. The rollback
         // trampoline uses database*, including on a public-hook-only wrapper.
         if (txn_hooks_) rebind_txn_hooks_owned_();
         raw_handle_escaped_.store(other.raw_handle_escaped_.load(std::memory_order_acquire));
+        closed_.store(other.closed_.exchange(true, std::memory_order_acq_rel), std::memory_order_release);
         mode_ = other.mode_;
         busy_timeout_ms_ = other.busy_timeout_ms_;
         read_control_ = std::move(other.read_control_);

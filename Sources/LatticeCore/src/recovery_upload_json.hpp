@@ -62,7 +62,22 @@ public:
         if(deleted&&deletes_>=caps_.deletes){reason="delete count";return false;}
         std::string single="{\"auditLog\":[";single+=member;single+="]}";
         size_t events=0;
-        if(!parse_envelope(single,1,caps_,member_events_,events,reason))return false;
+        const auto parse_original_context=[&] {
+            auto complete=encoded_;if(entries_)complete+=',';complete+=member;complete+="]}";
+            return parse_envelope(complete,entries_+1,caps_,0,events,reason);
+        };
+        try {
+            if(!parse_envelope(single,1,caps_,member_events_,events,reason))return false;
+        }catch(const db_error&) {
+            // An empty member alone is an envelope-count error, but after an
+            // accepted member it is a trailing-comma syntax error. Preserve
+            // the original parser's context and error precedence on failure.
+            if(!entries_)throw;
+            if(!parse_original_context())return false;
+        }catch(const nlohmann::json::exception&) {
+            if(!entries_)throw;
+            if(!parse_original_context())return false;
+        }
         // The mounted callback emits object start, auditLog key, array start,
         // array end, object end. Container construction skips value callbacks.
         // The wrapper preserves every member depth and duplicate-key scope.

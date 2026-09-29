@@ -223,3 +223,20 @@ TEST(RecoveryUploadJson, CompleteCheckerRetainsEnvelopeShapeAndCountPrecedence) 
     }
     compare_full(envelope({}),0,0,generous());compare_full(envelope(varied()),varied().size(),1,generous());
 }
+
+TEST(RecoveryUploadJson, EmptyLaterMemberRetainsSyntaxErrorAndUnchangedPrefixForRetry) {
+    for(const std::string fragment:{std::string{},std::string{" \t\r\n"}}) {
+        auto caps=generous();upload::prefix actual(caps);original_prefix original{caps};
+        std::string reason;
+        ASSERT_TRUE(actual.append("{}",false,reason));ASSERT_TRUE(original.append("{}",false,reason));
+        const auto before=actual.open_bytes();const auto events=actual.member_events();
+        const auto expected=capture([&](auto& why){return original.append(fragment,false,why);});
+        const auto observed=capture([&](auto& why){return actual.append(fragment,false,why);});
+        same_result(observed,expected);EXPECT_EQ(observed.kind,result_kind::json_error);EXPECT_EQ(observed.json_id,101);
+        EXPECT_EQ(actual.open_bytes(),before);EXPECT_EQ(actual.entries(),1u);EXPECT_EQ(actual.deletes(),0u);EXPECT_EQ(actual.member_events(),events);
+        same_result(capture([&](auto& why){return actual.append("null",true,why);}),
+                    capture([&](auto& why){return original.append("null",true,why);}));
+        EXPECT_EQ(actual.open_bytes(),original.encoded);EXPECT_EQ(actual.entries(),2u);EXPECT_EQ(actual.deletes(),1u);
+        for(size_t nodes=0;nodes<16;++nodes){caps=generous();caps.nodes=nodes;compare_prefix({{"{}"},{fragment}},caps);}
+    }
+}

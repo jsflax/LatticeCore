@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
+#include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include "../../Sources/LatticeCore/src/recovery_producer_continuity.hpp"
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include <deque>

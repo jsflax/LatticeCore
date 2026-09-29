@@ -1799,3 +1799,143 @@ TEST_F(TerminalReceiverController, MalformedStaleLifecycleCannotBeDiscardedAhead
 
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+class LateLifecycleReceiverController : public TerminalReceiverController {
+protected:
+    struct Gap {
+        std::shared_ptr<ControllerPause> pause=std::make_shared<ControllerPause>();
+        std::atomic<bool> armed{false},paused{false};
+        std::atomic<unsigned> discarded{0},retired{0};
+        std::string stale,fresh,describe;
+        platform_transport_callbacks endpoint;
+        std::string source_view;
+    };
+    std::shared_ptr<Gap> consumed_gap() {
+        configure();seed_local(1,9500);reopen_after_terminal_prepare();if(HasFatalFailure())return {};
+        auto gap=std::make_shared<Gap>();pauses.push_back(gap->pause);
+        after_control=[gap](size_t,const json& control,std::string& outgoing){
+            if(control.at("operation")=="describe")gap->describe=outgoing;
+            if(control.at("operation")=="inspect")gap->stale=outgoing;
+            if(!gap->stale.empty()&&control.at("operation")=="prepare"){
+                gap->fresh=outgoing;gap->armed.store(true);}};
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[gap](const char* stage){
+            if(std::strcmp(stage,"pending-consumed-before-successor")==0&&gap->armed.load()&&!gap->paused.exchange(true))gap->pause->wait();
+            if(std::strcmp(stage,"late-lifecycle-discarded")==0)++gap->discarded;
+            if(std::strcmp(stage,"late-lifecycle-retired-disposed")==0)++gap->retired;});
+        connect();if(!until([&]{return gap->pause->ready();})){ADD_FAILURE()<<"actual current reply did not reach consumed gap";return {};}
+        gap->endpoint=peers[0].physical;gap->source_view=peers[0].setup.descriptor();return gap;
+    }
+    void refuses_gap_frame(const std::shared_ptr<Gap>& gap,const std::string& raw) {
+        const auto before=framing(),intent=entries(),allocation=allocators(),audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+        ASSERT_TRUE(gap->endpoint.trigger_on_message(transport_message::from_string(raw)));gap->pause->release();
+        ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(gap->discarded.load(),0u);EXPECT_EQ(phase(),2);
+        EXPECT_EQ(framing(),before);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);
+        EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=0 AND active IS NULL"),1);
+    }
+};
+TEST_F(LateLifecycleReceiverController, CurrentConsumedThenActualLateLifecycleKeepsSamePhysicalViewAndFreshQ) {
+    const auto gap=consumed_gap();ASSERT_TRUE(gap);ASSERT_FALSE(gap->stale.empty());ASSERT_FALSE(gap->fresh.empty());
+    const auto q=receiver->db().query("SELECT request_frame FROM _lattice_recovery_request ORDER BY channel");
+    const auto audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+    ASSERT_TRUE(gap->endpoint.trigger_on_message(transport_message::from_string(gap->stale)));gap->pause->release();
+    ASSERT_TRUE(until([&]{return installed();}));EXPECT_EQ(gap->discarded.load(),1u);EXPECT_FALSE(has_error());
+    EXPECT_TRUE(gap->endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),gap->source_view);
+    EXPECT_EQ(receiver->db().query("SELECT request_frame FROM _lattice_recovery_request ORDER BY channel"),q);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),1);
+    unsigned prepares=0;for(const auto& [_,control]:controls)if(control.at("operation")=="prepare")++prepares;EXPECT_EQ(prepares,2u);
+}
+TEST_F(LateLifecycleReceiverController, MalformedLifecycleInConsumedGapFailsClosedWithoutSettlingFreshQ) {
+    const auto gap=consumed_gap();ASSERT_TRUE(gap);auto invalid=json::parse(gap->stale);invalid["lifecycle"]["bindingHighWater"]="01";
+    refuses_gap_frame(gap,invalid.dump());
+}
+TEST_F(LateLifecycleReceiverController, WrongAuthenticatedBindingInConsumedGapFailsClosed) {
+    const auto gap=consumed_gap();ASSERT_TRUE(gap);auto invalid=json::parse(gap->stale);invalid["lifecycle"]["namespaceID"]="b";
+    refuses_gap_frame(gap,invalid.dump());
+}
+TEST_F(LateLifecycleReceiverController, LateNonLifecycleLeaseReplyRetainsOriginalRefusal) {
+    const auto gap=consumed_gap();ASSERT_TRUE(gap);ASSERT_FALSE(gap->fresh.empty());refuses_gap_frame(gap,gap->fresh);
+}
+TEST_F(LateLifecycleReceiverController, RepeatedDescribeInConsumedGapRetainsOriginalRefusal) {
+    const auto gap=consumed_gap();ASSERT_TRUE(gap);ASSERT_FALSE(gap->describe.empty());refuses_gap_frame(gap,gap->describe);
+}
+TEST_F(LateLifecycleReceiverController, ActualThirtySecondTimeoutGapDisposesLateDiscardBeforeFreshCorrelatedRetry) {
+    configure(2);seed_local(1,9510);reopen_after_terminal_prepare(1);ASSERT_FALSE(HasFatalFailure());
+    auto gap=std::make_shared<ControllerPause>(),canceled=std::make_shared<ControllerPause>();pauses.push_back(gap);pauses.push_back(canceled);
+    auto timed_out=std::make_shared<std::atomic<bool>>(false);auto discarded=std::make_shared<std::atomic<unsigned>>(0);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
+        if(std::strcmp(stage,"pending-expired-before-successor")==0&&!timed_out->exchange(true))gap->wait();
+        if(std::strcmp(stage,"late-lifecycle-discarded")==0)++*discarded;
+        if(std::strcmp(stage,"terminal-cancel-committed")==0)canceled->wait();});
+    std::string late;json original;std::chrono::steady_clock::time_point dropped_at;
+    after_control=[&](size_t index,const json& control,std::string& outgoing){
+        if(late.empty()&&index==0&&control.at("operation")=="discard"){
+            const auto actual=json::parse(outgoing);ASSERT_EQ(actual.at("settlement").at("state"),"committed");
+            ASSERT_EQ(actual.at("lifecycle").at("state"),"terminal");
+            late=outgoing;original=control;dropped_at=std::chrono::steady_clock::now();outgoing.clear();}};
+    connect();ASSERT_TRUE(until([&]{return !late.empty();}));const auto sent=controls.size();
+    const auto intent=entries(),allocation=allocators(),old=framing(),audits=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto endpoint=peers[0].physical;const auto source_view=peers[0].setup.descriptor();
+    // Unchanged production deadline and native pacer: no close, request,
+    // synthetic scheduler wake, shortened timeout, or altered authorization.
+    ASSERT_TRUE(until([&]{return gap->ready();},45000));
+    EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-dropped_at).count(),29000);
+    EXPECT_EQ(phase(),2);EXPECT_EQ(framing(),old);EXPECT_EQ(discarded->load(),0u);
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(late)));gap->release();
+    ASSERT_TRUE(until([&]{return canceled->ready();}));EXPECT_EQ(discarded->load(),1u);EXPECT_FALSE(has_error());
+    EXPECT_EQ(phase(),1);EXPECT_EQ(entries(),intent);EXPECT_EQ(allocators(),allocation);EXPECT_EQ(framing(),old);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),audits);
+    unsigned retries=0;for(size_t i=sent;i<controls.size();++i){const auto& [index,control]=controls[i];
+        if(index==0&&control.at("operation")=="discard"){++retries;EXPECT_NE(control.at("requestID"),original.at("requestID"));
+            EXPECT_EQ(control.at("routeGeneration"),original.at("routeGeneration"));EXPECT_EQ(control.at("request"),original.at("request"));}}
+    EXPECT_EQ(retries,1u);EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),source_view);
+    canceled->release();ASSERT_TRUE(until([&]{return installed();}));EXPECT_FALSE(has_error());
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),2);
+}
+TEST_F(LateLifecycleReceiverController, LateReservationRacingOutgoingBuildDefersUnsentHandoffUnderSharedBudget) {
+    configure();seed_local(1,9520);reopen_after_terminal_prepare();ASSERT_FALSE(HasFatalFailure());
+    auto gap=std::make_shared<ControllerPause>();pauses.push_back(gap);
+    auto armed=std::make_shared<std::atomic<bool>>(false),paused=std::make_shared<std::atomic<bool>>(false);
+    auto deferred=std::make_shared<std::atomic<unsigned>>(0),discarded=std::make_shared<std::atomic<unsigned>>(0);
+    std::string late;
+    after_control=[&](size_t,const json& control,std::string& outgoing){if(control.at("operation")=="inspect"){late=outgoing;armed->store(true);}};
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
+        if(std::strcmp(stage,"outgoing-built-before-publication")==0&&armed->load()&&!paused->exchange(true))gap->wait();
+        if(std::strcmp(stage,"late-control-handoff-deferred")==0)++*deferred;
+        if(std::strcmp(stage,"late-lifecycle-discarded")==0)++*discarded;});
+    connect();ASSERT_TRUE(until([&]{return gap->ready();}));ASSERT_FALSE(late.empty());
+    ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)=0"),1);
+    const auto q=receiver->db().query("SELECT request_frame FROM _lattice_recovery_request ORDER BY channel");
+    const auto endpoint=peers[0].physical;const auto source_view=peers[0].setup.descriptor();
+    unsigned before=0;for(const auto& [_,control]:controls)if(control.at("operation")=="prepare")++before;ASSERT_EQ(before,1u);
+    // Fill both late slots while the unsent outgoing request owns its byte
+    // reservation. Both copies must drain before that request can be sent.
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(late)));
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(late)));gap->release();
+    ASSERT_TRUE(until([&]{return installed();}));EXPECT_EQ(deferred->load(),1u);EXPECT_EQ(discarded->load(),2u);EXPECT_FALSE(has_error());
+    EXPECT_EQ(receiver->db().query("SELECT request_frame FROM _lattice_recovery_request ORDER BY channel"),q);
+    EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),source_view);
+    unsigned after=0;for(const auto& [_,control]:controls)if(control.at("operation")=="prepare")++after;EXPECT_EQ(after,2u);
+}
+TEST_F(LateLifecycleReceiverController, QueuedLatePayloadFromActuallyRetiredPhysicalViewIsInert) {
+    configure();seed_local(1,9530);
+    auto held=std::make_shared<ControllerPause>();pauses.push_back(held);auto retired=std::make_shared<std::atomic<unsigned>>(0);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[retired](const char* stage){
+        if(std::strcmp(stage,"late-lifecycle-retired-disposed")==0)++*retired;});
+    connect();ASSERT_TRUE(until([&]{return installed();}));ASSERT_FALSE(has_error());
+    receiver->get_scheduler()->invoke([held]{held->wait();});ASSERT_TRUE(until([&]{return held->ready();}));
+    const auto before=snapshot();const auto endpoint=peers[0].physical;
+    // This shape-invalid control would fail a current view; it must never be
+    // parsed after this real endpoint's close revokes the queued view.
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string("{\"kind\":\"recoveryReady\",\"operation\":\"inspect\"}")));
+    ASSERT_TRUE(endpoint.trigger_on_close(1000,"retire actual late-control view"));held->release();
+    ASSERT_TRUE(until([&]{return retired->load()==1;}));EXPECT_FALSE(has_error());EXPECT_EQ(snapshot(),before);
+    EXPECT_FALSE(endpoint.trigger_on_message(transport_message::from_string("{\"kind\":\"recoveryReady\"}")));
+}
+}
+#endif

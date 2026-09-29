@@ -105,6 +105,18 @@ void lifecycle_reply_shape(const json& value) {
     require((status=="available"||status=="terminal"||status=="unstarted")&&(status=="unstarted"?high<seq:high==seq)&&
         (value.at("operation")!="discard"||status=="terminal"),"controller lifecycle status/high-water shape differs");
 }
+// Late lifecycle traffic can only be disposed, never published as proof.
+void late_lifecycle_shape(const json& value,const json& description) {
+    lifecycle_reply_shape(value);
+    require(terminal_profile(description)&&value.at("routeGeneration")==description.at("routeGeneration"),
+        "controller late lifecycle physical route differs");
+    if(!value.contains("lifecycle"))return; // legal body-absent late failure
+    const auto& body=value.at("lifecycle");const auto& peer=description.at("peer");
+    require(body.at("namespaceID")==description.at("source").at("receiptNamespace")&&
+        body.at("replicaID")==peer.at("replicaID")&&body.at("receiverIncarnation")==peer.at("receiverIncarnation")&&
+        body.at("channelIncarnation")==peer.at("channelIncarnation")&&body.at("channel")==description.at("channel"),
+        "controller late lifecycle authenticated binding differs");
+}
 bool canceled_predecessor(const recovery_request_row& row,const recovery_obligation_scope& scope,
     const receive_install_snapshot& receiver,const cr::request& q,int64_t phase,int64_t barrier,int64_t attempt) {
     if((phase!=1&&phase!=2)||barrier<=1||attempt<=1||row.barrier!=barrier-1||row.sequence!=attempt-1||
@@ -169,6 +181,9 @@ struct recovery_receiver_route::state {
     std::atomic<bool> retired{false},blocked{true};
     std::function<void()> resumed,renew,reconcile;
     std::atomic<bool> renewal_requested{false};
+    // Set only by worker validation of the actual current orphan profile.
+    // Coordinator mutex guards this weak record; it cannot retain old sources.
+    std::weak_ptr<const receiver_source_binding::record> late_control_view;
     std::function<void(std::exception_ptr)> error;
 };
 struct recovery_receiver_controller::state {
@@ -208,6 +223,8 @@ struct recovery_receiver_controller::state {
         std::shared_ptr<charge> reservation; // destroyed after bytes
         std::string bytes;
         uint64_t order=0;
+        std::weak_ptr<recovery_receiver_route> late_route;
+        receiver_source_binding::recovery_view late_view;
         bool ready=false; // published under mutex, bytes immutable thereafter
     };
     struct pending {
@@ -222,6 +239,9 @@ struct recovery_receiver_controller::state {
         std::array<std::shared_ptr<reply>,2> inbox;
     };
     std::shared_ptr<pending> outstanding;
+    // Separate pointer inventory, SAME two-slot/16MiB global reservations.
+    std::array<std::shared_ptr<reply>,2> late_inbox;
+    uint64_t late_order=0;
     struct lease {
         std::weak_ptr<recovery_receiver_route> route;
         receiver_source_binding::recovery_view view;
@@ -340,7 +360,11 @@ recovery_receiver_route::recovery_receiver_route(std::shared_ptr<recovery_receiv
 recovery_receiver_route::~recovery_receiver_route(){state_->retired.store(true,std::memory_order_release);controller_->retire(this);}
 void recovery_receiver_controller::retire(recovery_receiver_route*)noexcept {
     std::shared_ptr<state::pending> released;
-    {std::lock_guard lock(state_->mutex);if(state_->outstanding&&state_->outstanding->route.expired())released=std::move(state_->outstanding);}
+    std::array<std::shared_ptr<state::reply>,2> retired;
+    {std::lock_guard lock(state_->mutex);
+        if(state_->outstanding&&state_->outstanding->route.expired())released=std::move(state_->outstanding);
+        for(size_t i=0;i<retired.size();++i)if(state_->late_inbox[i]&&state_->late_inbox[i]->late_route.expired())
+            retired[i]=std::move(state_->late_inbox[i]);}
     // In-flight callbacks/worker retain their charges until actual disposal.
     // Durable barrier/Q survives; a later actual route can continue it.
 }
@@ -410,7 +434,41 @@ bool recovery_receiver_route::receive(const platform_transport_callbacks& endpoi
     auto& coordinator=*controller_->state_;
     std::shared_ptr<recovery_receiver_controller::state::pending> pending;
     {std::lock_guard lock(coordinator.mutex);pending=coordinator.outstanding;}
-    if(!pending)return false; // actual describe continues through its own verifier
+    if(!pending) {
+        receiver_source_binding::recovery_view view;
+        {std::lock_guard lock(coordinator.mutex);view.value=state_->late_control_view.lock();}
+        // Initial/renewed describe still belongs to the original verifier.
+        // This lane admits only an already worker-verified physical record.
+        if(!view.value||!state_->source->recovery_matches(view,endpoint,lifecycle))return false;
+        require(message.data.size()<=recovery_request_store::frame_bytes,"controller late response byte capacity");
+        auto reply=std::make_shared<recovery_receiver_controller::state::reply>();
+        reply->late_route=shared_from_this();reply->late_view=view;
+        size_t slot=0;
+        {std::lock_guard lock(coordinator.mutex);
+            // Publication and late admission share this leaf. If a new
+            // request won the race, retain its ordinary correlation path.
+            pending=coordinator.outstanding;
+            if(!pending){
+                while(slot<coordinator.late_inbox.size()&&coordinator.late_inbox[slot])++slot;
+                require(slot<coordinator.late_inbox.size(),"controller bounded late response inbox full");
+                require(coordinator.late_order!=UINT64_MAX,"controller late response order exhausted");
+                reply->reservation=coordinator.reserve_locked(message.data.size(),true);
+                require(reply->reservation!=nullptr,"controller retained late response capacity");
+                reply->order=++coordinator.late_order;coordinator.late_inbox[slot]=reply;}}
+        if(!pending){
+            try {reply->bytes.assign(raw);}
+            catch(...){
+                {std::lock_guard lock(coordinator.mutex);if(coordinator.late_inbox[slot]==reply)coordinator.late_inbox[slot].reset();}
+                throw;
+            }
+            const bool live=state_->source->recovery_live(view);
+            {std::lock_guard lock(coordinator.mutex);
+                if(coordinator.late_inbox[slot]!=reply)return true;
+                if(!live||state_->retired.load()||state_->late_control_view.lock()!=view.value)coordinator.late_inbox[slot].reset();
+                else reply->ready=true;}
+            wake();return true;
+        }
+    }
     if(pending->route.lock().get()!=this||!state_->source->recovery_matches(pending->view,endpoint,lifecycle))return true;
     require(message.data.size()<=recovery_request_store::frame_bytes,"controller pending response byte capacity");
     auto reply=std::make_shared<recovery_receiver_controller::state::reply>();
@@ -437,9 +495,49 @@ void recovery_receiver_controller::turn() {
     auto& runtime=*state_;
     {std::lock_guard lock(runtime.mutex);runtime.scheduled=false;if(runtime.running)return;runtime.running=true;}
     struct settlement {recovery_receiver_controller::state& value;std::function<void()> after;
+        // Admission-retry composition consumes this flag. Merely disposing a
+        // late frame (or waiting for its copy) is not recovery progress and
+        // must not reset an already-running admission deadline/allowance.
+        bool keep_admission_wait=false;
         ~settlement(){{std::lock_guard lock(value.mutex);value.running=false;}if(after)try{after();}catch(...) {}}} settle{runtime,{}};
     std::weak_ptr<lattice_db> observed_owner;
     try {
+        // Drain before idle/failure/cohort/source-count returns: even a dead
+        // route's payload must leave the shared byte/slot budget. No SQL or
+        // lifecycle proof publication is permitted in this bounded lane.
+        for(unsigned quantum=0;quantum<2;++quantum) {
+            std::shared_ptr<state::reply> front;
+            {std::lock_guard lock(runtime.mutex);
+                for(const auto& reply:runtime.late_inbox)if(reply&&(!front||reply->order<front->order))front=reply;
+                if(!front)break;
+                settle.keep_admission_wait=true;
+                if(!front->ready)return;}
+            auto route=front->late_route.lock();
+            if(route&&!route->state_->retired.load()&&route->state_->source->recovery_live(front->late_view)) {
+                observed_owner=route->state_->owner;
+                try {
+                    const auto description=parse(route->state_->source->recovery_description(front->late_view),65536);
+                    late_lifecycle_shape(parse(front->bytes,recovery_request_store::frame_bytes),description);
+                }catch(...){
+                    // Source turnover during the read/parse cannot make an
+                    // obsolete callback poison its successor's source view.
+                    if(route->state_->source->recovery_live(front->late_view))throw;
+                }
+                // Shape and actual binding permit disposal only. The route
+                // may retire during parsing; neither case creates authority.
+                if(route->state_->source->recovery_live(front->late_view)&&runtime.probe&&
+                    runtime.probe->owner==route->state_->owner.lock().get()&&runtime.probe->observed)
+                    runtime.probe->observed("late-lifecycle-discarded");
+            }
+            if(route&&!route->state_->source->recovery_live(front->late_view)&&runtime.probe&&
+                runtime.probe->owner==route->state_->owner.lock().get()&&runtime.probe->observed)
+                runtime.probe->observed("late-lifecycle-retired-disposed");
+            {std::lock_guard lock(runtime.mutex);for(auto& reply:runtime.late_inbox)if(reply==front)reply.reset();}
+        }
+        {std::lock_guard lock(runtime.mutex);
+            if(std::any_of(runtime.late_inbox.begin(),runtime.late_inbox.end(),[](const auto& reply){return bool(reply);})) {
+                settle.keep_admission_wait=true;return;
+            }}
         struct connected {
             std::shared_ptr<recovery_receiver_route> route;
             receiver_source_binding::recovery_view view;
@@ -462,6 +560,9 @@ void recovery_receiver_controller::turn() {
             auto contribution=std::find_if(runtime.policy.contributions.begin(),runtime.policy.contributions.end(),[&](const auto& c){return c.profile.binding.channel==channel;});
             require(contribution!=runtime.policy.contributions.end(),"controller live channel outside enrollment");
             auto scope=contract(description,*contribution,recovery_continuous_producer::controller_catalog(*owner));
+            const bool late_control=terminal_profile(description);
+            {std::lock_guard lock(runtime.mutex);route->state_->late_control_view=
+                late_control?std::weak_ptr<const receiver_source_binding::record>(view->value):std::weak_ptr<const receiver_source_binding::record>{};}
             const auto prior=connected_routes.find(channel);
             if(prior==connected_routes.end()||decimal(description,"routeGeneration")>decimal(prior->second.description,"routeGeneration"))
                 connected_routes.insert_or_assign(channel,connected{route,*view,std::move(description),std::move(scope)});
@@ -501,7 +602,7 @@ void recovery_receiver_controller::turn() {
         };
         const auto probe_scope=[&](const char* stage)->std::shared_ptr<void>{return runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope?runtime.probe->scope(stage):nullptr;};
         const auto live=[&]{for(const auto& [_,c]:connected_routes)require(!c.route->state_->retired.load()&&c.route->state_->source->recovery_live(c.view),"controller authenticated source retired during owned operation");};
-        const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();});known(result);};
+        const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();});known(result);settle.keep_admission_wait=false;};
         // Socket callbacks reserve at most two bounded replies. Only this worker
         // parses it or touches SQL. Claiming the reply keeps its full byte
         // charge until the exact transactional consumer finishes.
@@ -510,7 +611,10 @@ void recovery_receiver_controller::turn() {
         for(unsigned reply_quantum=0;pending&&reply_quantum<2;++reply_quantum) {
             auto route=pending->route.lock();
             if(!route||!route->state_->source->recovery_live(pending->view)||now()>=pending->deadline){
-                std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();return;
+                const bool expired=now()>=pending->deadline;
+                {std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();}
+                settle.keep_admission_wait=true;
+                observe(expired?"pending-expired-before-successor":"pending-retired-before-successor");return;
             }
             std::shared_ptr<state::reply> front;
             {std::lock_guard lock(runtime.mutex);
@@ -642,6 +746,8 @@ void recovery_receiver_controller::turn() {
             }
             {std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();}
             pending.reset(); // worker/request payloads retire outside the leaf
+            settle.keep_admission_wait=false; // actual correlated consumption
+            observe("pending-consumed-before-successor");
         }
         if(pending){settle.after=[route=pending->route.lock()]{if(route)route->wake();};return;}
         for(unsigned quantum=0;quantum<4;++quantum) {
@@ -941,7 +1047,7 @@ void recovery_receiver_controller::turn() {
             {std::lock_guard lock(runtime.mutex);if(runtime.budget->bytes.load()==0&&runtime.budget->slots.load()==0)outgoing->reservation=runtime.reserve_locked(8388608,false);}
             // Retired callbacks may still own request or reply bytes. Retry on
             // the existing pacer, with no handoff or new pending deadline.
-            if(!outgoing->reservation)return;
+            if(!outgoing->reservation){settle.keep_admission_wait=true;return;}
             outgoing->route=c.route;outgoing->view=c.view;outgoing->request_id=uuid_t::generate().to_string();outgoing->operation=op;outgoing->index=index;outgoing->terminal_inbox=terminal_profile(c.description);
             json command={{"kind","recoveryReady"},{"version",1},{"operation",op},{"requestID",outgoing->request_id},{"routeGeneration",c.description.at("routeGeneration")}};
             const auto remaining=c.route->state_->source->recovery_remaining(c.view);require(remaining>100,"controller source authorization renewal required");
@@ -952,12 +1058,18 @@ void recovery_receiver_controller::turn() {
             outgoing->request_bytes=command.dump();require(outgoing->request_bytes.size()<=8388608&&outgoing->request_bytes.size()<=pending_bytes-4194304,"controller outgoing aggregate capacity");
             outgoing->reservation->shrink(outgoing->request_bytes.size());
             outgoing->deadline=now()+std::min<int64_t>(remaining,30000);
-            {std::lock_guard lock(runtime.mutex);require(!runtime.outstanding,"controller overlapping request admission");runtime.outstanding=outgoing;}
+            observe("outgoing-built-before-publication");
+            bool late_pending=false;
+            {std::lock_guard lock(runtime.mutex);require(!runtime.outstanding,"controller overlapping request admission");
+                late_pending=runtime.budget->slots.load()!=0;
+                if(!late_pending)runtime.outstanding=outgoing;}
+            if(late_pending){settle.keep_admission_wait=true;observe("late-control-handoff-deferred");return;}
             require(c.route->state_->source->recovery_send(c.view,*c.route->state_->transport,transport_message::from_string(outgoing->request_bytes)),"controller final physical handoff refused");
             return;
         }
     }catch(...){
         const auto error=std::current_exception();std::shared_ptr<state::pending> released;
+        std::array<std::shared_ptr<state::reply>,2> retired_late;
         bool awaiting_delivery=false,retry_arrived=false;
         try{std::rethrow_exception(error);}catch(const delivery_retry_wait&){awaiting_delivery=true;}catch(...){}
         // Observation only: the typed UNKNOWN wait has left its SQL and leaf
@@ -974,8 +1086,10 @@ void recovery_receiver_controller::turn() {
             if(retry_arrived){runtime.demand=true;runtime.awaiting_delivery_retry=false;}
             else {runtime.failure=error;runtime.awaiting_delivery_retry=awaiting_delivery;}
             released=std::move(runtime.outstanding);
+            retired_late=std::move(runtime.late_inbox);
         }
         released.reset(); // source/endpoint ownership is released off the leaf
+        retired_late={};
         std::vector<std::shared_ptr<recovery_receiver_route>> report;
         {std::lock_guard lock(runtime.mutex);for(const auto& weak:runtime.routes)if(auto route=weak.lock())report.push_back(std::move(route));}
         if(retry_arrived){settle.after=[report]{for(const auto& route:report)if(!route->state_->retired.load()){route->wake();break;}};return;}

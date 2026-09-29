@@ -609,3 +609,16 @@ TEST_F(SyncCheckedClose, LegacySwiftBridgeCloseContainsRealCleanupFailure) {
 }
 } // namespace
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace lattice::detail {
+// Narrow test-only link to the already-defined access helper. Retain the
+// actual configured child so later DB destruction cannot mask missing sync
+// scheduler shutdown. No duplicate friend definition or production seam.
+std::shared_ptr<lattice_db> retain_configured_sync_owner_for_scheduler_test(lattice_db& parent) {
+    auto* sync=sync_discovery_test_access::configured(parent);
+    if(!sync)throw db_error("configured ownership fixture lacks actual synchronizer");
+    return sync_discovery_test_access::owner(*sync);
+}
+}
+#endif

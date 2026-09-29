@@ -1590,3 +1590,66 @@ TEST_F(RecoveryNegotiatedExport, PublicConnectRetriesActualProtectedWriterBusyWi
     {std::lock_guard lock(attempt->mutex);EXPECT_EQ(attempt->endpoints.size(),1u);}
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace lattice::detail {
+// Defined in SyncDiscoveryDeferralTests.cpp with the same native guard;
+// both translation units already belong to the LatticeCoreTests target.
+std::shared_ptr<lattice_db> retain_configured_sync_owner_for_scheduler_test(lattice_db&);
+}
+namespace {
+class configured_scheduler_capture final:public network_factory {
+    std::shared_ptr<network_factory> target_;
+public:
+    std::shared_ptr<scheduler> selected;
+    size_t count=0;
+    explicit configured_scheduler_capture(std::shared_ptr<network_factory> target):target_(std::move(target)){}
+    std::unique_ptr<http_client> create_http_client()override{return target_->create_http_client();}
+    std::unique_ptr<sync_transport> create_sync_transport()override{return target_->create_sync_transport();}
+    std::unique_ptr<sync_transport> create_sync_transport(std::shared_ptr<scheduler> scheduled)override {
+        if(count++)throw db_error("configured ownership fixture unexpected second transport");
+        selected=scheduled;return target_->create_sync_transport(std::move(scheduled));
+    }
+};
+}
+TEST_F(RecoveryNegotiatedExport, ConfiguredSharedChildStopsOwnedWorkerBeforeRetainedDatabaseAndLiveSibling) {
+    negotiated_ack_pause pause(senders,factory);pause.close_configured=[this]{if(owner)owner->close();};
+    auto capture=std::make_shared<configured_scheduler_capture>(platform);set_network_factory(capture);
+    auto parent_queue=std::make_shared<std_thread_scheduler>();
+    auto c=config();c.sched=parent_queue;c.websocket_url=policy.routes[0].endpoint;c.authorization_token="fixture-configured-token";
+    c.recovery_source_expectation=expected(0).dump();c.tuning.upload_coalesce_ms=0;c.tuning.checkpoint_passive_interval_ms=0;
+    auto opened=recovery_continuous_producer::open(c,policy);known_commit(opened.settlement);ASSERT_TRUE(opened.owner);
+    owner=std::move(opened.owner);stop_notifier();
+    auto child=retain_configured_sync_owner_for_scheduler_test(*owner);ASSERT_TRUE(child);ASSERT_NE(child.get(),owner.get());
+    const auto child_queue=child->get_scheduler();ASSERT_TRUE(child_queue);ASSERT_TRUE(capture->selected);ASSERT_EQ(capture->count,1u);
+    ASSERT_NE(child_queue.get(),parent_queue.get());EXPECT_TRUE(child_queue->can_invoke());
+    auto selected_child=std::make_shared<std::atomic<bool>>(false);
+    negotiated_scheduler_pass(capture->selected,[selected_child,child_queue]{selected_child->store(child_queue->is_on_thread());});ASSERT_TRUE(selected_child->load());
+    auto sibling_queue=std::make_shared<std_thread_scheduler>();auto sibling_config=config();sibling_config.sched=sibling_queue;
+    auto sibling_open=recovery_continuous_producer::open(sibling_config,policy);known_commit(sibling_open.settlement);ASSERT_TRUE(sibling_open.owner);
+    auto sibling=std::move(sibling_open.owner);facades.push_back(sibling);ASSERT_NE(child_queue.get(),sibling_queue.get());
+    const auto ack_schedule=sync_background_test_hooks::ack;
+    negotiated_scheduler_pass(child_queue,[ack_schedule]{sync_background_test_hooks::ack=ack_schedule;});
+    owner->add(ContinuousSharedRow{"configured-owned-worker-original"});negotiated_scheduler_pass(child_queue);
+    const auto originals=owner->db().query("SELECT * FROM AuditLog ORDER BY id");ASSERT_EQ(originals.size(),1u);
+    ASSERT_EQ(platform->attempts.size(),1u);const auto attempt=platform->attempts[0];
+    negotiated_open_after_dial(attempt);negotiated_scheduler_pass(child_queue);const auto endpoint=attempt->current();
+    ASSERT_EQ(attempt->wire->count(),1u);EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(claimed(),0);
+    ASSERT_TRUE(endpoint.trigger_on_message(transport_message::from_string(response(0,caps()).dump())));
+    ASSERT_TRUE(attempt->wire->wait_audit_batches(1));const auto batches=attempt->wire->audit_batches();ASSERT_EQ(batches.size(),1u);ASSERT_EQ(batches[0].size(),1u);
+    EXPECT_EQ(batches[0][0],std::get<std::string>(originals[0].at("globalId")));
+    attempt->wire->ack(batches[0]);negotiated_scheduler_pass(child_queue);pause.acknowledged();negotiated_scheduler_pass(child_queue);
+    EXPECT_EQ(attempt->wire->audit_batches(),batches);EXPECT_EQ(owner->db().query("SELECT * FROM AuditLog ORDER BY id"),originals);
+    ASSERT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM _lattice_sync_state WHERE is_synchronized=1"),1);
+    // Public parent close also stops its own scheduler. The distinct child
+    // must already stop here even though this real retained DB cannot die.
+    const auto closed=owner->close_checked();ASSERT_FALSE(closed.error);EXPECT_EQ(closed.sync,sync_drain_state::drained);
+    EXPECT_TRUE(owner->is_closed());EXPECT_FALSE(parent_queue->can_invoke());
+    EXPECT_FALSE(child->is_closed());EXPECT_FALSE(child_queue->can_invoke());EXPECT_FALSE(capture->selected->can_invoke());
+    EXPECT_EQ(attempt->wire->destruction.wait_for(std::chrono::seconds(5)),std::future_status::ready);EXPECT_FALSE(endpoint.trigger_on_open());
+    EXPECT_FALSE(sibling->is_closed());ASSERT_TRUE(sibling_queue->can_invoke());
+    negotiated_scheduler_pass(sibling_queue,[sibling]{sibling->add(ContinuousLocalRow{"sibling-after-configured-close"});});
+    EXPECT_EQ(number(sibling->db(),"SELECT COUNT(*) AS n FROM ContinuousLocalRow"),1);EXPECT_EQ(capture->count,1u);
+    child->close();
+}
+#endif

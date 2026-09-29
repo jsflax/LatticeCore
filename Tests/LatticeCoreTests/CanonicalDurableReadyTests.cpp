@@ -2,6 +2,7 @@
 #include "CanonicalWriterTestAccess.hpp"
 #include "CanonicalReadyAdoptionTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/canonical_ready_named_profile.hpp"
+#include "../../Sources/LatticeCore/src/canonical_ready_sha256.hpp"
 #include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include <cstdio>
@@ -954,6 +955,161 @@ TEST_F(CanonicalDurableReady, UnknownOnlyReceiptPagePerformsNoPositiveBatchQuery
     EXPECT_EQ(trace.cost.receipt_batches,0u);EXPECT_EQ(trace.cost.receipt_batch_ids,0u);
     EXPECT_EQ(trace.cost.calls[static_cast<size_t>(canonical_ready_cost_observation::phase::receipt_batch)],0u);
     EXPECT_EQ(trace.cost.calls[static_cast<size_t>(canonical_ready_cost_observation::phase::receipt_evidence)],2u);
+    EXPECT_EQ(snapshot(),before);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+std::string byte_sha_pattern(size_t count) {
+    std::string value(count,'\0');
+    for(size_t i=0;i<count;++i)value[i]=static_cast<char>(i%256);
+    return value;
+}
+std::string byte_sha_digest(const ready_sha256_state& value) {
+    return picosha2::bytes_to_hex_string(value.digest_bytes());
+}
+void byte_sha_check_work(const ready_sha256_work& work,size_t expected) {
+    EXPECT_EQ(work.input_bytes,expected);
+    EXPECT_EQ(work.input_bytes,work.staged_input_bytes+64*work.direct_blocks);
+    EXPECT_LE(work.staged_input_bytes,126u);
+}
+std::string byte_sha_row_blob(const database::row_t& row,const char* name) {
+    const auto& bytes=std::get<std::vector<uint8_t>>(row.at(name));
+    return {bytes.begin(),bytes.end()};
+}
+}
+
+TEST(ReadyByteRangeSHA, KnownAnswersAndBinaryBytesMatchUnchangedVendor) {
+    const std::vector<std::pair<std::string,std::string>> known{
+        {"","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"abc","ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq","248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
+        {std::string(1000000,'a'),"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"}
+    };
+    for(const auto& [input,expected]:known) {
+        SCOPED_TRACE(input.size());ready_sha256_work work;
+        EXPECT_EQ(ready_sha256_hex(input,&work),expected);
+        EXPECT_EQ(picosha2::hash256_hex_string(input),expected);
+        byte_sha_check_work(work,input.size());EXPECT_LE(work.staged_input_bytes,63u);
+    }
+    const auto binary=byte_sha_pattern(3*256+17);
+    EXPECT_EQ(ready_sha256_hex(binary),picosha2::hash256_hex_string(binary));
+    ready_sha256_state empty;
+    byte_sha_check_work(empty.process(std::string_view{}),0);
+    EXPECT_EQ(byte_sha_digest(empty),known.front().second);
+}
+
+TEST(ReadyByteRangeSHA, IncrementalBoundariesCarryLengthsAndNeverStageWholeLargeChunks) {
+    const size_t maximum_frame=ready_profile(writer_profile()).package.codec.maximum.frame_bytes;
+    const std::vector<size_t> lengths{0,1,55,56,63,64,65,127,128,129,65535,65536,65537,maximum_frame};
+    for(const auto length:lengths) {
+        SCOPED_TRACE(length);const auto input=byte_sha_pattern(length);
+        const auto expected=picosha2::hash256_hex_string(input);
+        const std::vector<size_t> chunks{1,63,64,65,127,257,std::max(size_t(1),length)};
+        for(const auto chunk:chunks) {
+            SCOPED_TRACE(chunk);ready_sha256_state state;picosha2::hash256_one_by_one reference;
+            byte_sha_check_work(state.process({}),0);
+            for(size_t at=0;at<input.size();) {
+                const auto count=std::min(chunk,input.size()-at);
+                byte_sha_check_work(state.process(std::string_view(input).substr(at,count)),count);
+                reference.process(input.begin()+at,input.begin()+at+count);
+                byte_sha_check_work(state.process({}),0);at+=count;
+            }
+            reference.finish();EXPECT_EQ(byte_sha_digest(state),expected);
+            EXPECT_EQ(picosha2::get_hash_hex_string(reference),expected);
+        }
+        if(length<=129)for(size_t split=0;split<=length;++split) {
+            ready_sha256_state state;
+            byte_sha_check_work(state.process(std::string_view(input).substr(0,split)),split);
+            byte_sha_check_work(state.process(std::string_view(input).substr(split)),length-split);
+            EXPECT_EQ(byte_sha_digest(state),expected)<<"split="<<split;
+        }
+    }
+}
+
+TEST(ReadyByteRangeSHA, CopiesOwnPartialBytesAndDigestInspectionDoesNotConsumeState) {
+    ready_sha256_state original,copy;std::string prefix;
+    {
+        auto borrowed=byte_sha_pattern(93);prefix=borrowed;
+        byte_sha_check_work(original.process(borrowed),borrowed.size());copy=original;
+        borrowed.assign(borrowed.size(),'x');
+    }
+    const auto before=original.digest_bytes();EXPECT_EQ(original.digest_bytes(),before);
+    EXPECT_EQ(byte_sha_digest(copy),picosha2::hash256_hex_string(prefix));
+    const auto first=byte_sha_pattern(75);const std::string second("\0other\xff",7);
+    byte_sha_check_work(original.process(first),first.size());
+    byte_sha_check_work(copy.process(second),second.size());
+    EXPECT_EQ(byte_sha_digest(original),picosha2::hash256_hex_string(prefix+first));
+    EXPECT_EQ(byte_sha_digest(copy),picosha2::hash256_hex_string(prefix+second));
+    EXPECT_NE(original.digest_bytes(),copy.digest_bytes());
+}
+
+TEST(ReadyByteRangeSHA, OrderedDecimalLengthPackageFramingMatchesOriginalIncrementalHash) {
+    const auto compare=[](const std::vector<std::string>& frames,bool wrong_length=false) {
+        ready_sha256_state actual;picosha2::hash256_one_by_one reference;
+        for(size_t i=0;i<frames.size();++i) {
+            const auto& raw=frames[i];
+            const auto prefix=std::to_string(raw.size()+(wrong_length&&i==1?1:0))+":";
+            byte_sha_check_work(actual.process(prefix),prefix.size());
+            byte_sha_check_work(actual.process(raw),raw.size());
+            reference.process(prefix.begin(),prefix.end());reference.process(raw.begin(),raw.end());
+        }
+        reference.finish();const auto expected=picosha2::get_hash_hex_string(reference);
+        EXPECT_EQ(byte_sha_digest(actual),expected);return expected;
+    };
+    // The first frame leaves a 63-byte tail so the next decimal prefix spans
+    // a compression block; binary/empty frames also preserve the hash domain.
+    std::vector<std::string> frames{byte_sha_pattern(60),byte_sha_pattern(65),"",byte_sha_pattern(129)};
+    const auto baseline=compare(frames);
+    EXPECT_NE(compare(frames,true),baseline);
+    auto changed=frames;std::swap(changed[0],changed[1]);EXPECT_NE(compare(changed),baseline);
+    changed=frames;changed.back().back()^=1;EXPECT_NE(compare(changed),baseline);
+}
+
+TEST_F(CanonicalDurableReady, StoredFrameAndPackageHashesMatchVendorAndActualReadStillAuditsAllBytes) {
+    attach();auto admission=admit();const auto first=ready_entry(98101,98201,std::string(1536,'a'));
+    import_entry(admission,first);import_entry(admission,ready_entry(98102,98202,std::string(1536,'b')));
+    import_entry(admission,ready_entry(98103,98203,std::string(1536,'c')));ask(first);
+    const auto offered=prepare(admission);complete(offered);const auto before=snapshot();
+    const auto stored=owner->db().query("SELECT data,sha256 FROM _lattice_canonical_ready_frame ORDER BY frame_index");
+    const auto transfers=owner->db().query("SELECT frames_sha FROM _lattice_canonical_ready_transfer");
+    ASSERT_GT(stored.size(),3u);ASSERT_EQ(transfers.size(),1u);
+    picosha2::hash256_one_by_one original;uint64_t raw_bytes=0,prefix_bytes=0;
+    for(const auto& row:stored) {
+        const auto raw=byte_sha_row_blob(row,"data");const auto prefix=std::to_string(raw.size())+":";
+        EXPECT_EQ(byte_sha_row_blob(row,"sha256"),picosha2::hash256_hex_string(raw));
+        original.process(prefix.begin(),prefix.end());original.process(raw.begin(),raw.end());
+        raw_bytes+=raw.size();prefix_bytes+=prefix.size();
+    }
+    original.finish();EXPECT_EQ(byte_sha_row_blob(transfers.front(),"frames_sha"),picosha2::get_hash_hex_string(original));
+    namespace reads=canonical_ready_read_test_observation;reads::observation trace;
+    const auto previous=reads::current;reads::current=&trace;
+    struct reset {reads::observation* previous;~reset(){reads::current=previous;}} restore{previous};
+    const auto read=adapter->read_ready_frame_owned(owner,admission,*offered.lease,0);committed(read.settlement);ASSERT_TRUE(read.frame);
+    auto expected=cr::decode(byte_sha_row_blob(stored.front(),"data"),policy.package.codec);expected.route_generation=7;
+    EXPECT_EQ(*read.frame,cr::encode(expected,policy.package.codec));
+    EXPECT_EQ(trace.full_audits,2u);EXPECT_EQ(trace.audited_frames,2*stored.size());EXPECT_EQ(trace.audited_bytes,2*raw_bytes);
+    EXPECT_EQ(trace.positive_receipt_lookups,2u);EXPECT_EQ(trace.addressed_frames,1u);
+    EXPECT_EQ(trace.cost.hash_input_bytes,4*raw_bytes+2*prefix_bytes+byte_sha_row_blob(stored.front(),"data").size());
+    EXPECT_EQ(trace.cost.hash_input_bytes,trace.cost.hash_staged_input_bytes+64*trace.cost.hash_direct_blocks);
+    EXPECT_GT(trace.cost.hash_direct_blocks,0u);EXPECT_LT(trace.cost.hash_staged_input_bytes,trace.cost.hash_input_bytes);
+    EXPECT_LE(trace.cost.hash_staged_input_bytes,126*(6*stored.size()+1));
+    EXPECT_EQ(snapshot(),before);
+}
+
+TEST_F(CanonicalDurableReady, PassiveHashWorkCountersSaturateWithoutChangingActualReadOrSettlement) {
+    attach();auto admission=admit();import_entry(admission,ready_entry(98111,98211));
+    const auto offered=prepare(admission);complete(offered);const auto before=snapshot();
+    const auto baseline=adapter->read_ready_frame_owned(owner,admission,*offered.lease,0);committed(baseline.settlement);ASSERT_TRUE(baseline.frame);
+    namespace reads=canonical_ready_read_test_observation;reads::observation trace;
+    const auto maximum=~uint64_t{0};
+    trace.cost.hash_input_bytes=trace.cost.hash_staged_input_bytes=trace.cost.hash_direct_blocks=maximum-1;
+    const auto previous=reads::current;reads::current=&trace;
+    struct reset {reads::observation* previous;~reset(){reads::current=previous;}} restore{previous};
+    const auto read=adapter->read_ready_frame_owned(owner,admission,*offered.lease,0);committed(read.settlement);
+    EXPECT_EQ(read.frame,baseline.frame);EXPECT_EQ(trace.full_audits,2u);
+    EXPECT_EQ(trace.cost.hash_input_bytes,maximum);EXPECT_EQ(trace.cost.hash_staged_input_bytes,maximum);EXPECT_EQ(trace.cost.hash_direct_blocks,maximum);
     EXPECT_EQ(snapshot(),before);
 }
 #endif

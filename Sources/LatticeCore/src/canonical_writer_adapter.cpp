@@ -1,6 +1,7 @@
 #include "canonical_writer_adapter.hpp"
 #include "canonical_receipt_coverage.hpp"
 #include "canonical_ready_named_profile.hpp"
+#include "canonical_ready_sha256.hpp"
 #include "recovery_predecessor_wire.hpp"
 #include "canonical_validated_sequence.hpp"
 #include "recovery_authenticated_session.hpp"
@@ -64,6 +65,21 @@ void observe_ready_receipt_batch(size_t count) noexcept {
     };
     if(auto* value=canonical_ready_test_observation::current)append(value->cost);
     if(auto* value=canonical_ready_read_test_observation::current)append(value->cost);
+}
+void observe_ready_hash(const ready_sha256_work& work) noexcept {
+    const auto append=[&](canonical_ready_cost_observation::observation& value) noexcept {
+        ready_cost_add(value.hash_input_bytes,work.input_bytes);
+        ready_cost_add(value.hash_staged_input_bytes,work.staged_input_bytes);
+        ready_cost_add(value.hash_direct_blocks,work.direct_blocks);
+    };
+    if(auto* value=canonical_ready_test_observation::current)append(value->cost);
+    if(auto* value=canonical_ready_read_test_observation::current)append(value->cost);
+}
+std::string ready_frame_sha256(const std::string& raw) {
+    ready_sha256_work work;
+    auto digest=ready_sha256_hex(raw,&work);
+    observe_ready_hash(work);
+    return digest;
 }
 void observe_ready_read(canonical_ready_read_test_observation::point point) noexcept {
     if(auto* value=canonical_ready_read_test_observation::current) {

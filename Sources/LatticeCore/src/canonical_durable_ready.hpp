@@ -15,6 +15,7 @@ enum class phase { retention_audit,store_audit,request,sequence_init,raw_fetch_h
 struct observation {
     std::array<uint64_t,static_cast<size_t>(phase::count)> calls{},microseconds{};
     uint64_t receipt_batches=0,receipt_batch_ids=0;
+    uint64_t hash_input_bytes=0,hash_staged_input_bytes=0,hash_direct_blocks=0;
 };
 }
 namespace canonical_ready_test_observation {

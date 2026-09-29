@@ -212,16 +212,17 @@ cr::frame ready_request(const database::row_t& row,const canonical_ready_profile
         refuse("canonical READY request is not exact canonical spelling");
     return request;
 }
-void ready_hash_frame(picosha2::hash256_one_by_one& hash,const std::string& raw) {
+void ready_hash_frame(ready_sha256_state& hash,const std::string& raw) {
     ready_cost_scope observed(canonical_ready_cost_observation::phase::raw_fetch_hash);
-    const auto size=std::to_string(raw.size())+":";hash.process(size.begin(),size.end());hash.process(raw.begin(),raw.end());
+    const auto size=std::to_string(raw.size())+":";
+    observe_ready_hash(hash.process(size));observe_ready_hash(hash.process(raw));
 }
 std::string ready_frame(database& db,const canonical_ready_profile& p,const std::string& key,int64_t index) {
     ready_cost_scope observed(canonical_ready_cost_observation::phase::raw_fetch_hash);
     const auto rows=db.query("SELECT "+ready_b("data",p.package.codec.maximum.frame_bytes)+","+ready_b("sha256",64)+
         " FROM main._lattice_canonical_ready_frame WHERE binding=? AND frame_index=? LIMIT 2",{bytes(key),index});
     if(rows.size()!=1)refuse("canonical READY frame missing");
-    const auto raw=ready_blob(rows[0],"data");if(raw.empty() || picosha2::hash256_hex_string(raw)!=ready_blob(rows[0],"sha256"))refuse("canonical READY frame hash differs");return raw;
+    const auto raw=ready_blob(rows[0],"data");if(raw.empty() || ready_frame_sha256(raw)!=ready_blob(rows[0],"sha256"))refuse("canonical READY frame hash differs");return raw;
 }
 int64_t ready_metadata_charge(const database::row_t& row) {
     int64_t count=512;
@@ -252,7 +253,7 @@ cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,co
         ready_cost_scope observed(canonical_ready_cost_observation::phase::sequence_init);
         return cr::validated_sequence(request.logical,q,manifest,p.package.codec);
     }();
-    picosha2::hash256_one_by_one hash;int64_t wire=0,charge=ready_metadata_charge(row);
+    ready_sha256_state hash;int64_t wire=0,charge=ready_metadata_charge(row);
     for(int64_t i=0;i<n;++i) {
         if(auto* observation=canonical_ready_test_observation::current)++observation->audited_frames;
         const auto raw=i?ready_frame(db,p,key,i):std::move(first_raw);
@@ -276,8 +277,9 @@ cr::manifest audit_ready_frames(database& db,const canonical_ready_profile& p,co
             if(validate_receipts)validate_receipts(*page);
         }
     }
-    hash.finish();if(sequence.status()!=cr::phase::sequence_complete_unverified || wire!=integer(row,"wire_bytes") ||
-       picosha2::get_hash_hex_string(hash)!=ready_blob(row,"frames_sha"))
+    const auto digest=hash.digest_bytes();
+    if(sequence.status()!=cr::phase::sequence_complete_unverified || wire!=integer(row,"wire_bytes") ||
+       picosha2::bytes_to_hex_string(digest)!=ready_blob(row,"frames_sha"))
         refuse("canonical READY exact capsule or whole-stream hashes differ");
     observe_ready(canonical_ready_test_observation::point::audit_end);
     return manifest;
@@ -653,15 +655,15 @@ canonical_ready_result canonical_writer_adapter::prepare_ready_impl(std::shared_
                     const auto current_coverage=read_canonical_coverage([&](const std::string& sql,const std::vector<column_value_t>& values){return actual.query(sql,values);},*state->namespaces->coverage);
                     if(captured.capture->coverage_revision!=std::optional<uint64_t>{static_cast<uint64_t>(current_coverage.mutation)})refuse("canonical READY captured coverage changed before publication");
                 }
-                int64_t charge=ready_metadata_charge(row);picosha2::hash256_one_by_one hash;int64_t index=0;
+                int64_t charge=ready_metadata_charge(row);ready_sha256_state hash;int64_t index=0;
                 for(const auto& frame:package.frames()) {
                     charge=ready_add(charge,ready_add(frame.size(),128));if(charge>p.transfer_bytes)refuse("canonical READY capsule exceeds reserved charge");
                     ready_hash_frame(hash,frame);actual.execute("INSERT INTO main._lattice_canonical_ready_frame VALUES(?,?,?,?)",
-                        {bytes(key),index++,bytes(frame),bytes(picosha2::hash256_hex_string(frame))});changed_retention(actual);
+                        {bytes(key),index++,bytes(frame),bytes(ready_frame_sha256(frame))});changed_retention(actual);
                 }
-                hash.finish();
+                const auto digest=hash.digest_bytes();
                 actual.execute("UPDATE main._lattice_canonical_ready_transfer SET state=2,reservation=0,pin=?,head=?,floor=?,frame_count=?,wire_bytes=?,frames_sha=?,manifest_sha=? WHERE binding=? AND state=1 AND reservation=?",
-                    {captured.head,captured.head,captured.floor,index,static_cast<int64_t>(package.retained_wire_bytes()),bytes(picosha2::get_hash_hex_string(hash)),
+                    {captured.head,captured.head,captured.floor,index,static_cast<int64_t>(package.retained_wire_bytes()),bytes(picosha2::bytes_to_hex_string(digest)),
                      bytes(package.offer().manifest_digest),bytes(key),ticket->id_});changed_retention(actual);
                 actual.execute("DELETE FROM main._lattice_canonical_attempt WHERE id=? AND incarnation=? AND base=? AND deadline_ms=?",
                     {ticket->id_,clock.incarnation,ticket->base_,deadline});changed_retention(actual);

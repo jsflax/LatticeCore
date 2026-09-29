@@ -69,8 +69,9 @@ std::shared_ptr<const physical_store_identity> database::physical_identity(
 
 std::shared_ptr<const physical_store_identity> database::physical_identity_observed(
     const std::string& schema, const std::shared_ptr<database_read_control>& control,
-    bool validate_current, const char*& failure) const {
+    bool validate_current, const char*& failure, physical_identity_details* details) const {
     failure = nullptr;
+    if (details) *details = {};
     const auto failed = [&](const char* label) -> std::shared_ptr<const physical_store_identity> {
         failure = label; return {};
     };
@@ -78,9 +79,13 @@ std::shared_ptr<const physical_store_identity> database::physical_identity_obser
     return failed("unsupported_platform");
 #else
     if (schema == "main" && !validate_current) {
-        if (auto cached = std::atomic_load(&main_physical_identity_)) return cached;
+        if (auto cached = std::atomic_load(&main_physical_identity_)) {
+            if (details) details->last_stage = physical_identity_details::stage::cached_identity;
+            return cached;
+        }
     }
     if (!db_) return failed("missing_handle");
+    if (details) details->last_stage = physical_identity_details::stage::connection_mutex;
     auto* mutex = sqlite3_db_mutex(db_);
     if (!mutex) return failed("missing_connection_mutex");
     const auto wait_end = std::chrono::steady_clock::now() +
@@ -91,7 +96,8 @@ std::shared_ptr<const physical_store_identity> database::physical_identity_obser
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     struct unlock { sqlite3_mutex* mutex; ~unlock() { sqlite3_mutex_leave(mutex); } } unlock{mutex};
-    return physical_identity_locked_observed(schema, control, failure);
+    if (details) details->mutex_acquired = true;
+    return physical_identity_locked_observed(schema, control, failure, details);
 #endif
 }
 
@@ -103,7 +109,7 @@ std::shared_ptr<const physical_store_identity> database::physical_identity_locke
 
 std::shared_ptr<const physical_store_identity> database::physical_identity_locked_observed(
     const std::string& schema, const std::shared_ptr<database_read_control>& control,
-    const char*& failure) const {
+    const char*& failure, physical_identity_details* details) const {
     failure = nullptr;
     const auto failed = [&](const char* label) -> std::shared_ptr<const physical_store_identity> {
         failure = label; return {};
@@ -112,25 +118,45 @@ std::shared_ptr<const physical_store_identity> database::physical_identity_locke
     return failed("unsupported_platform");
 #else
     if (control && control->stopped()) return failed("metadata_cancelled");
+    if (details) details->last_stage = physical_identity_details::stage::file_name;
     const char* filename = sqlite3_db_filename(db_, schema.c_str());
     if (!filename || !*filename) return failed("missing_file_name");
     if (sqlite3_uri_boolean(filename, "immutable", 0)) return failed("immutable_file");
     sqlite3_vfs* vfs = nullptr;
-    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_VFS_POINTER, &vfs) != SQLITE_OK ||
+    if (details) details->last_stage = physical_identity_details::stage::vfs;
+    const int vfs_rc = sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_VFS_POINTER, &vfs);
+    if (details) {
+        details->vfs_result_observed = true; details->vfs_rc = vfs_rc;
+        details->vfs = physical_identity_details::vfs_kind::unavailable_or_other;
+    }
+    if (vfs_rc != SQLITE_OK ||
         !vfs || !vfs->zName || (std::string(vfs->zName) != "unix" && std::string(vfs->zName) != "unix-excl")) return failed("unsupported_vfs");
+    // This discriminator is read only after the original exact-name guard.
+    if (details) details->vfs = vfs->zName[4] == '\0' ? physical_identity_details::vfs_kind::unix_vfs
+                                                     : physical_identity_details::vfs_kind::unix_excl;
     int moved = 1;
-    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK) return failed("move_check_unavailable");
+    if (details) details->last_stage = physical_identity_details::stage::first_move;
+    const int first_move_rc = sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved);
+    if (details) details->first_move.record(first_move_rc, first_move_rc == SQLITE_OK ? moved : 0);
+    if (first_move_rc != SQLITE_OK) return failed("move_check_unavailable");
     if (moved) return failed("file_moved");
     std::error_code error;
+    if (details) details->last_stage = physical_identity_details::stage::canonical_path;
     const auto canonical = std::filesystem::canonical(filename, error);
     if (error) return failed("canonical_path_unavailable");
     struct stat before{}, after{};
+    if (details) details->last_stage = physical_identity_details::stage::initial_stat;
     if (::stat(canonical.c_str(), &before) != 0) return failed("initial_stat_unavailable");
     if (!S_ISREG(before.st_mode)) return failed("not_regular_file");
     moved = 1;
-    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK) return failed("recheck_unavailable");
+    if (details) details->last_stage = physical_identity_details::stage::second_move;
+    const int second_move_rc = sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved);
+    if (details) details->second_move.record(second_move_rc, second_move_rc == SQLITE_OK ? moved : 0);
+    if (second_move_rc != SQLITE_OK) return failed("recheck_unavailable");
     if (moved) return failed("file_moved_during_capture");
+    if (details) details->last_stage = physical_identity_details::stage::final_stat;
     if (::stat(canonical.c_str(), &after) != 0) return failed("final_stat_unavailable");
+    if (details) details->last_stage = physical_identity_details::stage::identity_comparison;
     if (before.st_dev != after.st_dev || before.st_ino != after.st_ino) return failed("identity_changed_during_capture");
     if (control && control->stopped()) return failed("metadata_cancelled");
     auto identity = std::make_shared<physical_store_identity>();
@@ -138,10 +164,12 @@ std::shared_ptr<const physical_store_identity> database::physical_identity_locke
     identity->inode = static_cast<uint64_t>(after.st_ino);
     identity->filename = canonical.string();
     if (schema == "main") {
+        if (details) details->last_stage = physical_identity_details::stage::cache_comparison;
         auto cached = std::atomic_load(&main_physical_identity_);
         if (cached && !(*cached == *identity)) return failed("cached_identity_changed");
         if (!cached) std::atomic_store(&main_physical_identity_, std::shared_ptr<const physical_store_identity>(identity));
     }
+    if (details) details->last_stage = physical_identity_details::stage::complete;
     return identity;
 #endif
 }

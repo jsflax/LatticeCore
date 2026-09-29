@@ -3,10 +3,12 @@
 #include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
 #include "../../Sources/LatticeCore/src/projection_memory.hpp"
 #include "../../Sources/LatticeCore/src/recovery_local_producer.hpp"
+#include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <sstream>
 
 struct CustodyRecord {std::string name;std::string body;};
 LATTICE_SCHEMA(CustodyRecord,name,body);
@@ -420,6 +422,38 @@ TEST(PhysicalIdentityObservation, ActualCancelledControlStillRefusesCurrentIdent
     EXPECT_TRUE(current.identity); EXPECT_EQ(current.failure, nullptr);
 }
 
+// Called only by an existing failed assertion's stream. No pathname, raw
+// SQLite source ID, error text, SQL, or extra VFS/filesystem operation is used.
+std::string identity_failure_details(const identity_access::identity_observation& value,
+                                    int original_restore, int successor_restore) noexcept {
+    try {
+        const auto& d = value.details;
+        const char* source = sqlite3_sourceid();
+        size_t source_bytes = 0;
+        while (source && source_bytes < 128 && source[source_bytes]) ++source_bytes;
+        const auto source_hash = source ? picosha2::hash256_hex_string(source, source + source_bytes) : "unavailable";
+        std::ostringstream out;
+        out << " identityDetailsV1 platform="
+#if defined(__APPLE__)
+            << "apple"
+#else
+            << "linux"
+#endif
+            << " sqliteVersion=" << sqlite3_libversion_number() << " sourceIDPrefixSHA256=" << source_hash
+            << " sourceIDBytes=" << source_bytes << " sourceIDAtCap=" << (source_bytes == 128)
+            << " failure=" << (value.failure ? value.failure : "none")
+            << " stage=" << static_cast<int>(d.last_stage) << " mutexAcquired=" << d.mutex_acquired
+            << " vfs=" << static_cast<int>(d.vfs) << " vfsObserved=" << d.vfs_result_observed << " vfsRC=" << d.vfs_rc
+            << " firstObserved=" << d.first_move.observed << " firstRC=" << d.first_move.rc
+            << " firstMovedValid=" << d.first_move.moved_valid << " firstMoved=" << d.first_move.moved
+            << " secondObserved=" << d.second_move.observed << " secondRC=" << d.second_move.rc
+            << " secondMovedValid=" << d.second_move.moved_valid << " secondMoved=" << d.second_move.moved
+            << " originalRestoreRC=" << original_restore << " successorRestoreRC=" << successor_restore;
+        auto text = out.str();
+        return text.size() <= 1024 ? text : " identityDetailsV1 unavailable";
+    } catch (...) { return {}; }
+}
+
 TEST(PhysicalIdentityObservation, ActualFileReplacementRemainsRefusedWithoutLeakingItsPath) {
     TempDB original("identity_observation_original"), successor("identity_observation_successor"), moved("identity_observation_moved");
     database writer(original.str()); writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
@@ -427,25 +461,107 @@ TEST(PhysicalIdentityObservation, ActualFileReplacementRemainsRefusedWithoutLeak
     const auto before = writer.physical_identity("main", {}, true); ASSERT_TRUE(before);
     // Rename guards restore the actual paths before any assertion or database
     // destructor can execute SQL. Construction failures unwind the first move.
+    std::error_code original_restore, successor_restore;
     struct rename_back {
         std::filesystem::path from, to;
-        rename_back(std::filesystem::path from, std::filesystem::path to) : from(std::move(from)), to(std::move(to)) {
+        std::error_code& restore_error;
+        rename_back(std::filesystem::path from, std::filesystem::path to, std::error_code& restore_error)
+            : from(std::move(from)), to(std::move(to)), restore_error(restore_error) {
             std::filesystem::rename(this->from, this->to);
         }
-        ~rename_back() { std::error_code ignored; std::filesystem::rename(to, from, ignored); }
+        ~rename_back() { std::filesystem::rename(to, from, restore_error); }
     };
     identity_access::identity_observation actual{};
     std::shared_ptr<const physical_store_identity> legacy;
     {
-        rename_back first(original.path, moved.path), second(successor.path, original.path);
-        actual = identity_access::observe_identity(writer);
+        rename_back first(original.path, moved.path, original_restore), second(successor.path, original.path, successor_restore);
+        actual = identity_access::observe_identity_details(writer);
         legacy = writer.physical_identity("main", {}, true);
     }
-    EXPECT_FALSE(actual.identity); EXPECT_STREQ(actual.failure, "file_moved");
-    EXPECT_FALSE(legacy);
-    const auto restored = identity_access::observe_identity(writer);
-    ASSERT_TRUE(restored.identity); EXPECT_EQ(restored.failure, nullptr);
+    EXPECT_FALSE(actual.identity) << identity_failure_details(actual, original_restore.value(), successor_restore.value());
+    EXPECT_STREQ(actual.failure, "file_moved") << identity_failure_details(actual, original_restore.value(), successor_restore.value());
+    EXPECT_FALSE(legacy) << identity_failure_details(actual, original_restore.value(), successor_restore.value());
+    const auto restored = identity_access::observe_identity_details(writer);
+    ASSERT_TRUE(restored.identity) << identity_failure_details(restored, original_restore.value(), successor_restore.value());
+    EXPECT_EQ(restored.failure, nullptr) << identity_failure_details(restored, original_restore.value(), successor_restore.value());
     EXPECT_EQ(*restored.identity, *before);
+}
+
+TEST(PhysicalIdentityDetail, ActualSuccessReportsBothChecksAndMatchesNilDetailsPath) {
+    TempDB file("identity_detail_success"); database writer(file.str());
+    writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
+    const auto actual = identity_access::observe_identity_details(writer);
+    ASSERT_TRUE(actual.identity); EXPECT_EQ(actual.failure, nullptr);
+    const auto nil_details = identity_access::observe_identity(writer);
+    ASSERT_TRUE(nil_details.identity); EXPECT_EQ(nil_details.failure, nullptr);
+    EXPECT_EQ(*actual.identity, *nil_details.identity);
+    EXPECT_EQ(actual.identity->filename, nil_details.identity->filename);
+    const auto& d = actual.details;
+    EXPECT_EQ(d.last_stage, identity_access::identity_details::stage::complete);
+    EXPECT_TRUE(d.mutex_acquired); EXPECT_TRUE(d.vfs_result_observed); EXPECT_EQ(d.vfs_rc, SQLITE_OK);
+    EXPECT_TRUE(d.vfs == identity_access::identity_details::vfs_kind::unix_vfs ||
+                d.vfs == identity_access::identity_details::vfs_kind::unix_excl);
+    EXPECT_TRUE(d.first_move.observed); EXPECT_EQ(d.first_move.rc, SQLITE_OK);
+    EXPECT_TRUE(d.first_move.moved_valid); EXPECT_EQ(d.first_move.moved, 0);
+    EXPECT_TRUE(d.second_move.observed); EXPECT_EQ(d.second_move.rc, SQLITE_OK);
+    EXPECT_TRUE(d.second_move.moved_valid); EXPECT_EQ(d.second_move.moved, 0);
+}
+
+TEST(PhysicalIdentityDetail, ActualBusyAndExplicitCacheDoNotInventVFSResults) {
+    TempDB file("identity_detail_busy");
+    database writer(file.str(), database::open_mode::read_write, 20);
+    writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
+    const auto before = writer.physical_identity("main", {}, true); ASSERT_TRUE(before);
+    auto* mutex = sqlite3_db_mutex(identity_access::fault_handle(writer)); ASSERT_NE(mutex, nullptr);
+    {
+        held_identity_mutex held(mutex); ASSERT_TRUE(held.ready());
+        const auto busy = identity_access::observe_identity_details(writer);
+        EXPECT_FALSE(busy.identity); EXPECT_STREQ(busy.failure, "metadata_busy");
+        EXPECT_EQ(busy.details.last_stage, identity_access::identity_details::stage::connection_mutex);
+        EXPECT_FALSE(busy.details.mutex_acquired); EXPECT_FALSE(busy.details.vfs_result_observed);
+        EXPECT_FALSE(busy.details.first_move.observed); EXPECT_FALSE(busy.details.second_move.observed);
+        EXPECT_FALSE(busy.details.first_move.moved_valid); EXPECT_FALSE(busy.details.second_move.moved_valid);
+        const auto cached = identity_access::observe_identity_details(writer, {}, false);
+        EXPECT_EQ(cached.identity, before); EXPECT_EQ(cached.failure, nullptr);
+        EXPECT_EQ(cached.details.last_stage, identity_access::identity_details::stage::cached_identity);
+        EXPECT_FALSE(cached.details.mutex_acquired); EXPECT_FALSE(cached.details.vfs_result_observed);
+        EXPECT_FALSE(cached.details.first_move.observed); EXPECT_FALSE(cached.details.second_move.observed);
+    }
+    const auto current = identity_access::observe_identity_details(writer);
+    ASSERT_TRUE(current.identity); EXPECT_EQ(*current.identity, *before);
+    EXPECT_TRUE(current.details.first_move.observed); EXPECT_TRUE(current.details.second_move.observed);
+}
+
+TEST(PhysicalIdentityDetail, ActualCancelledAndNonFileCaptureDoNotInventFileControls) {
+    TempDB file("identity_detail_cancelled"); database writer(file.str());
+    writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
+    auto control = std::make_shared<database_read_control>();
+    control->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5); control->stop(1);
+    const auto canceled = identity_access::observe_identity_details(writer, control);
+    EXPECT_FALSE(canceled.identity); EXPECT_STREQ(canceled.failure, "metadata_cancelled");
+    EXPECT_TRUE(canceled.details.mutex_acquired); EXPECT_FALSE(canceled.details.vfs_result_observed);
+    EXPECT_FALSE(canceled.details.first_move.observed); EXPECT_FALSE(canceled.details.second_move.observed);
+    database memory(":memory:");
+    const auto nonfile = identity_access::observe_identity_details(memory);
+    EXPECT_FALSE(nonfile.identity); EXPECT_STREQ(nonfile.failure, "missing_file_name");
+    EXPECT_EQ(nonfile.details.last_stage, identity_access::identity_details::stage::file_name);
+    EXPECT_TRUE(nonfile.details.mutex_acquired); EXPECT_FALSE(nonfile.details.vfs_result_observed);
+    EXPECT_FALSE(nonfile.details.first_move.observed); EXPECT_FALSE(nonfile.details.second_move.observed);
+}
+
+TEST(PhysicalIdentityDetail, MoveOutputValidityRequiresTheActualOKReturnAndClearsPriorValue) {
+    identity_access::identity_details::move_result copied;
+    EXPECT_FALSE(copied.observed); EXPECT_FALSE(copied.moved_valid);
+    copied.record(SQLITE_OK, 1);
+    EXPECT_TRUE(copied.observed); EXPECT_EQ(copied.rc, SQLITE_OK);
+    EXPECT_TRUE(copied.moved_valid); EXPECT_EQ(copied.moved, 1);
+    copied.record(SQLITE_NOTFOUND, 123);
+    EXPECT_TRUE(copied.observed); EXPECT_EQ(copied.rc, SQLITE_NOTFOUND);
+    EXPECT_FALSE(copied.moved_valid); EXPECT_EQ(copied.moved, 0);
+    copied.record(SQLITE_IOERR, 1);
+    EXPECT_EQ(copied.rc, SQLITE_IOERR); EXPECT_FALSE(copied.moved_valid); EXPECT_EQ(copied.moved, 0);
+    copied.record(SQLITE_OK, 0);
+    EXPECT_EQ(copied.rc, SQLITE_OK); EXPECT_TRUE(copied.moved_valid); EXPECT_EQ(copied.moved, 0);
 }
 }
 #endif

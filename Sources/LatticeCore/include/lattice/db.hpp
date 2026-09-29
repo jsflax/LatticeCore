@@ -500,14 +500,36 @@ private:
         const std::shared_ptr<database_read_control>& control) const;
     // Same checks and wait policy; failure is a borrowed static label only.
     // Private diagnostics cannot issue identity or weaken current-file custody.
+    struct physical_identity_details {
+        enum class stage { entry, cached_identity, connection_mutex, file_name, vfs,
+            first_move, canonical_path, initial_stat, second_move, final_stat,
+            identity_comparison, cache_comparison, complete };
+        enum class vfs_kind { unobserved, unavailable_or_other, unix_vfs, unix_excl };
+        struct move_result {
+            bool observed = false;
+            int rc = 0;
+            bool moved_valid = false;
+            int moved = 0;
+            void record(int result, int output) noexcept {
+                observed = true; rc = result; moved_valid = result == SQLITE_OK;
+                moved = moved_valid ? output : 0;
+            }
+        };
+        stage last_stage = stage::entry;
+        bool mutex_acquired = false;
+        vfs_kind vfs = vfs_kind::unobserved;
+        bool vfs_result_observed = false;
+        int vfs_rc = 0;
+        move_result first_move, second_move;
+    };
     std::shared_ptr<const physical_store_identity> physical_identity_observed(
         const std::string& schema,
         const std::shared_ptr<database_read_control>& control,
-        bool validate_current, const char*& failure) const;
+        bool validate_current, const char*& failure, physical_identity_details* details = nullptr) const;
     std::shared_ptr<const physical_store_identity> physical_identity_locked_observed(
         const std::string& schema,
         const std::shared_ptr<database_read_control>& control,
-        const char*& failure) const;
+        const char*& failure, physical_identity_details* details = nullptr) const;
     // Attachment schema metadata only. Run the existing single read statement
     // inside one SQLite execution scope; keep original SQLite types and names.
     std::vector<std::string> query_attachment_text_metadata(

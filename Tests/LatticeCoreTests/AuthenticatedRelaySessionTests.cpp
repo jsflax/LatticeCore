@@ -1514,7 +1514,7 @@ TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesSameValue
         const auto header=[&] {
             const auto rows=actual.db().query("PRAGMA main.user_version");
             return rows.size()==1&&rows[0].size()==1&&std::holds_alternative<int64_t>(rows[0].begin()->second)&&
-                std::get<int64_t>(rows[0].begin()->second)==1;
+                std::get<int64_t>(rows[0].begin()->second)==0;
         };
         ASSERT_TRUE(header());
         // The production factory strongly retains actual for this entire
@@ -1523,16 +1523,16 @@ TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesSameValue
         using state=detail::recovery_install_state;
         const auto committed=detail::recovery_writer_access::install(borrowed,[&](database& writer){
             EXPECT_EQ(detail::recovery_writer_access::active_writer(actual),&writer);
-            writer.execute("PRAGMA main.user_version=1");
+            writer.execute("PRAGMA main.user_version=0");
         });
         EXPECT_EQ(committed.state,state::committed);EXPECT_FALSE(committed.primary_error);EXPECT_FALSE(committed.postcommit_error);
         EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
         const auto rolled=detail::recovery_writer_access::install(borrowed,[](database& writer){
-            writer.execute("PRAGMA main.user_version=1");throw std::runtime_error("owned administration rollback");
+            writer.execute("PRAGMA main.user_version=0");throw std::runtime_error("owned administration rollback");
         });
         EXPECT_EQ(rolled.state,state::rolled_back);EXPECT_TRUE(rolled.primary_error);EXPECT_FALSE(rolled.cleanup_error);EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
         const auto premature=detail::recovery_writer_access::install(borrowed,[](database& writer){
-            writer.execute("PRAGMA main.user_version=1");writer.commit();
+            writer.execute("PRAGMA main.user_version=0");writer.commit();
         });
         EXPECT_EQ(premature.state,state::rolled_back);EXPECT_TRUE(premature.primary_error);EXPECT_FALSE(premature.cleanup_error);
         EXPECT_FALSE(premature.unexpected_commit_observed);EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
@@ -1545,5 +1545,44 @@ TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesSameValue
     EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));
 }
 
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReceiptFileAdministration, OrdinaryCreatedFileUsesMetadataVersionAndPreservesIndependentHeader) {
+    // SetUp calls the real swift_lattice constructor; no fixture version PRAGMA.
+    ASSERT_EQ(std::get<int64_t>(owner->db().query("PRAGMA main.user_version").at(0).at("user_version")),0);
+    ASSERT_EQ(std::get<std::string>(owner->db().query("SELECT value FROM _lattice_meta WHERE key='schema_version'").at(0).at("value")),"1");
+    open();authorize();const auto original=entry(301);ASSERT_EQ(setup.receive(frame(original)).take_ids(),std::vector<std::string>{original.global_id});
+    const auto receipts_before=receipts();release_owner();const auto before=read_file(file.str());
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();const auto after=read_file(file.str());
+    EXPECT_EQ(after.at("_lattice_meta"),before.at("_lattice_meta"));EXPECT_EQ(after.at("user_version"),before.at("user_version"));
+    EXPECT_EQ(after.at("_lattice_canonical_receipt"),receipts_before);EXPECT_EQ(after.at("AuthenticatedRelayRow"),before.at("AuthenticatedRelayRow"));
+}
+TEST_F(AuthenticatedReceiptFileAdministration, MetadataVersionCannotBeAbsentMalformedOrReplacedByMatchingHeader) {
+    open();authorize();release_owner();
+    const std::vector<std::string> malformed={"", "0", "01", "+1", "1 ", "1tail", "-1", "2147483648", "999999999999999999999999"};
+    for(const auto& spelling:malformed) {
+        {database raw(file.str());raw.execute("UPDATE _lattice_meta SET value=? WHERE key='schema_version'",{spelling});raw.execute("PRAGMA user_version=1");}
+        const auto before=read_file(file.str());EXPECT_EQ(migrate_file(),4)<<spelling;EXPECT_EQ(read_file(file.str()),before);
+    }
+    {database raw(file.str());raw.execute("UPDATE _lattice_meta SET value=CAST(X'31' AS BLOB) WHERE key='schema_version'");}
+    auto before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("DELETE FROM _lattice_meta WHERE key='schema_version'");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("INSERT INTO _lattice_meta(key,value) VALUES('schema_version','2')");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, ViewAndDuplicateMetadataRefuseWithoutRepairOrFallback) {
+    open();authorize();release_owner();
+    {database raw(file.str());raw.execute("DROP TABLE _lattice_meta");raw.execute("CREATE VIEW _lattice_meta AS SELECT 'schema_version' AS key,'1' AS value");}
+    auto before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("DROP VIEW _lattice_meta");raw.execute("CREATE TABLE _lattice_meta(key TEXT,value TEXT NOT NULL)");
+        raw.execute("INSERT INTO _lattice_meta VALUES('schema_version','1'),('schema_version','1')");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("DROP TABLE _lattice_meta");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+}
 }
 #endif

@@ -498,6 +498,16 @@ private:
     std::shared_ptr<const physical_store_identity> physical_identity_locked(
         const std::string& schema,
         const std::shared_ptr<database_read_control>& control) const;
+    // Same checks and wait policy; failure is a borrowed static label only.
+    // Private diagnostics cannot issue identity or weaken current-file custody.
+    std::shared_ptr<const physical_store_identity> physical_identity_observed(
+        const std::string& schema,
+        const std::shared_ptr<database_read_control>& control,
+        bool validate_current, const char*& failure) const;
+    std::shared_ptr<const physical_store_identity> physical_identity_locked_observed(
+        const std::string& schema,
+        const std::shared_ptr<database_read_control>& control,
+        const char*& failure) const;
     // Attachment schema metadata only. Run the existing single read statement
     // inside one SQLite execution scope; keep original SQLite types and names.
     std::vector<std::string> query_attachment_text_metadata(

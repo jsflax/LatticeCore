@@ -1089,9 +1089,12 @@ std::shared_ptr<const physical_store_identity> canonical_writer_adapter::authent
     // Capture from the actual retained writer before taking any registry lock.
     // The identity validates SQLite's current main-file custody, not a caller
     // pathname. Constructor enrollment still verifies the complete source.
-    auto identity=writer?writer->physical_identity("main",{},true):nullptr;
-    if(!identity||!owner.guard_->alive.load(std::memory_order_seq_cst))
-        refuse("authenticated physical store identity unavailable");
+    const char* failure="missing_writer";
+    auto identity=writer?writer->physical_identity_observed("main",{},true,failure):nullptr;
+    if(!identity)
+        refuse("authenticated physical store identity unavailable: "+std::string(failure?failure:"unclassified"));
+    if(!owner.guard_->alive.load(std::memory_order_seq_cst))
+        refuse("authenticated physical store identity unavailable: owner_retired_after_capture");
     return identity;
 }
 std::shared_ptr<const std::atomic<bool>> canonical_writer_adapter::authenticated_active_guard()const noexcept{return context_->active;}

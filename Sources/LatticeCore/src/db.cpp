@@ -63,55 +63,83 @@ void database::record_statement() {
 std::shared_ptr<const physical_store_identity> database::physical_identity(
     const std::string& schema, const std::shared_ptr<database_read_control>& control,
     bool validate_current) const {
+    const char* failure = nullptr;
+    return physical_identity_observed(schema, control, validate_current, failure);
+}
+
+std::shared_ptr<const physical_store_identity> database::physical_identity_observed(
+    const std::string& schema, const std::shared_ptr<database_read_control>& control,
+    bool validate_current, const char*& failure) const {
+    failure = nullptr;
+    const auto failed = [&](const char* label) -> std::shared_ptr<const physical_store_identity> {
+        failure = label; return {};
+    };
 #if defined(__EMSCRIPTEN__) || (!defined(__APPLE__) && !defined(__linux__))
-    return {};
+    return failed("unsupported_platform");
 #else
     if (schema == "main" && !validate_current) {
         if (auto cached = std::atomic_load(&main_physical_identity_)) return cached;
     }
-    if (!db_) return {};
+    if (!db_) return failed("missing_handle");
     auto* mutex = sqlite3_db_mutex(db_);
-    if (!mutex) return {};
+    if (!mutex) return failed("missing_connection_mutex");
     const auto wait_end = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(std::max(0, busy_timeout_ms_));
     while (sqlite3_mutex_try(mutex) != SQLITE_OK) {
-        if ((control && control->stopped()) || (!control && std::chrono::steady_clock::now() >= wait_end)) return {};
+        if (control && control->stopped()) return failed("metadata_cancelled");
+        if (!control && std::chrono::steady_clock::now() >= wait_end) return failed("metadata_busy");
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     struct unlock { sqlite3_mutex* mutex; ~unlock() { sqlite3_mutex_leave(mutex); } } unlock{mutex};
-    return physical_identity_locked(schema, control);
+    return physical_identity_locked_observed(schema, control, failure);
 #endif
 }
 
 std::shared_ptr<const physical_store_identity> database::physical_identity_locked(
     const std::string& schema, const std::shared_ptr<database_read_control>& control) const {
+    const char* failure = nullptr;
+    return physical_identity_locked_observed(schema, control, failure);
+}
+
+std::shared_ptr<const physical_store_identity> database::physical_identity_locked_observed(
+    const std::string& schema, const std::shared_ptr<database_read_control>& control,
+    const char*& failure) const {
+    failure = nullptr;
+    const auto failed = [&](const char* label) -> std::shared_ptr<const physical_store_identity> {
+        failure = label; return {};
+    };
 #if defined(__EMSCRIPTEN__) || (!defined(__APPLE__) && !defined(__linux__))
-    return {};
+    return failed("unsupported_platform");
 #else
-    if (control && control->stopped()) return {};
+    if (control && control->stopped()) return failed("metadata_cancelled");
     const char* filename = sqlite3_db_filename(db_, schema.c_str());
-    if (!filename || !*filename || sqlite3_uri_boolean(filename, "immutable", 0)) return {};
+    if (!filename || !*filename) return failed("missing_file_name");
+    if (sqlite3_uri_boolean(filename, "immutable", 0)) return failed("immutable_file");
     sqlite3_vfs* vfs = nullptr;
     if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_VFS_POINTER, &vfs) != SQLITE_OK ||
-        !vfs || !vfs->zName || (std::string(vfs->zName) != "unix" && std::string(vfs->zName) != "unix-excl")) return {};
+        !vfs || !vfs->zName || (std::string(vfs->zName) != "unix" && std::string(vfs->zName) != "unix-excl")) return failed("unsupported_vfs");
     int moved = 1;
-    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved) return {};
+    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK) return failed("move_check_unavailable");
+    if (moved) return failed("file_moved");
     std::error_code error;
     const auto canonical = std::filesystem::canonical(filename, error);
-    if (error) return {};
+    if (error) return failed("canonical_path_unavailable");
     struct stat before{}, after{};
-    if (::stat(canonical.c_str(), &before) != 0 || !S_ISREG(before.st_mode)) return {};
+    if (::stat(canonical.c_str(), &before) != 0) return failed("initial_stat_unavailable");
+    if (!S_ISREG(before.st_mode)) return failed("not_regular_file");
     moved = 1;
-    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK || moved ||
-        ::stat(canonical.c_str(), &after) != 0 || before.st_dev != after.st_dev || before.st_ino != after.st_ino) return {};
-    if (control && control->stopped()) return {};
+    if (sqlite3_file_control(db_, schema.c_str(), SQLITE_FCNTL_HAS_MOVED, &moved) != SQLITE_OK) return failed("recheck_unavailable");
+    if (moved) return failed("file_moved_during_capture");
+    if (::stat(canonical.c_str(), &after) != 0) return failed("final_stat_unavailable");
+    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino) return failed("identity_changed_during_capture");
+    if (control && control->stopped()) return failed("metadata_cancelled");
     auto identity = std::make_shared<physical_store_identity>();
     identity->device = static_cast<uint64_t>(after.st_dev);
     identity->inode = static_cast<uint64_t>(after.st_ino);
     identity->filename = canonical.string();
     if (schema == "main") {
         auto cached = std::atomic_load(&main_physical_identity_);
-        if (cached && !(*cached == *identity)) return {};
+        if (cached && !(*cached == *identity)) return failed("cached_identity_changed");
         if (!cached) std::atomic_store(&main_physical_identity_, std::shared_ptr<const physical_store_identity>(identity));
     }
     return identity;

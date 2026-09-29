@@ -337,3 +337,115 @@ TEST_P(CanonicalWriterCustody, LocalProducerPolicyAlsoSurvivesBorrowerAndPublicH
 }
 
 INSTANTIATE_TEST_SUITE_P(Storage,CanonicalWriterCustody,::testing::Bool());
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+using namespace lattice;
+using identity_access = lattice::detail::canonical_writer_custody_test_access;
+
+// Actual SQLite mutex ownership on another joined thread. No callback, SQL,
+// global registry lock or source owner is manufactured by the observation.
+class held_identity_mutex {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool acquired = false, released = false;
+    std::thread worker;
+public:
+    explicit held_identity_mutex(sqlite3_mutex* target) : worker([this, target] {
+        sqlite3_mutex_enter(target);
+        {
+            std::unique_lock lock(mutex);
+            acquired = true; changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        sqlite3_mutex_leave(target);
+    }) {}
+    bool ready() {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(2), [&] { return acquired; });
+    }
+    ~held_identity_mutex() {
+        { std::lock_guard lock(mutex); released = true; }
+        changed.notify_all(); worker.join();
+    }
+};
+
+TEST(PhysicalIdentityObservation, ActualFileSuccessHasNoFailureAndMatchesLegacyIdentity) {
+    TempDB file("identity_observation_success"); database writer(file.str());
+    writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
+    const auto actual = identity_access::observe_identity(writer);
+    ASSERT_TRUE(actual.identity); EXPECT_EQ(actual.failure, nullptr);
+    const auto legacy = writer.physical_identity("main", {}, true);
+    ASSERT_TRUE(legacy); EXPECT_EQ(*actual.identity, *legacy);
+    EXPECT_EQ(actual.identity->filename, legacy->filename);
+}
+
+TEST(PhysicalIdentityObservation, NonFilesystemRefusalRemainsNullWithBoundedReason) {
+    database writer(":memory:");
+    const auto actual = identity_access::observe_identity(writer);
+    EXPECT_FALSE(actual.identity); EXPECT_STREQ(actual.failure, "missing_file_name");
+    EXPECT_FALSE(writer.physical_identity("main", {}, true));
+}
+
+TEST(PhysicalIdentityObservation, ActualMutexContentionIsDistinctFromMovedFileAndDoesNotBypassValidation) {
+    TempDB file("identity_observation_busy");
+    database writer(file.str(), database::open_mode::read_write, 20);
+    writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
+    const auto before = writer.physical_identity("main", {}, true); ASSERT_TRUE(before);
+    auto* mutex = sqlite3_db_mutex(identity_access::fault_handle(writer)); ASSERT_NE(mutex, nullptr);
+    {
+        held_identity_mutex held(mutex); ASSERT_TRUE(held.ready());
+        const auto actual = identity_access::observe_identity(writer);
+        EXPECT_FALSE(actual.identity); EXPECT_STREQ(actual.failure, "metadata_busy");
+        EXPECT_FALSE(writer.physical_identity("main", {}, true));
+        // Legacy callers requesting the existing cache keep that exact behavior.
+        const auto cached = identity_access::observe_identity(writer, {}, false);
+        EXPECT_EQ(cached.identity, before); EXPECT_EQ(cached.failure, nullptr);
+    }
+    const auto after = identity_access::observe_identity(writer);
+    ASSERT_TRUE(after.identity); EXPECT_EQ(after.failure, nullptr);
+    EXPECT_EQ(*after.identity, *before);
+}
+
+TEST(PhysicalIdentityObservation, ActualCancelledControlStillRefusesCurrentIdentity) {
+    TempDB file("identity_observation_cancelled"); database writer(file.str());
+    writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
+    auto control = std::make_shared<database_read_control>();
+    control->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    control->stop(1);
+    const auto actual = identity_access::observe_identity(writer, control);
+    EXPECT_FALSE(actual.identity); EXPECT_STREQ(actual.failure, "metadata_cancelled");
+    EXPECT_FALSE(writer.physical_identity("main", control, true));
+    const auto current = identity_access::observe_identity(writer);
+    EXPECT_TRUE(current.identity); EXPECT_EQ(current.failure, nullptr);
+}
+
+TEST(PhysicalIdentityObservation, ActualFileReplacementRemainsRefusedWithoutLeakingItsPath) {
+    TempDB original("identity_observation_original"), successor("identity_observation_successor"), moved("identity_observation_moved");
+    database writer(original.str()); writer.execute("CREATE TABLE IdentityValue(id INTEGER)");
+    { database other(successor.str()); other.execute("CREATE TABLE IdentityValue(id INTEGER)"); }
+    const auto before = writer.physical_identity("main", {}, true); ASSERT_TRUE(before);
+    // Rename guards restore the actual paths before any assertion or database
+    // destructor can execute SQL. Construction failures unwind the first move.
+    struct rename_back {
+        std::filesystem::path from, to;
+        rename_back(std::filesystem::path from, std::filesystem::path to) : from(std::move(from)), to(std::move(to)) {
+            std::filesystem::rename(this->from, this->to);
+        }
+        ~rename_back() { std::error_code ignored; std::filesystem::rename(to, from, ignored); }
+    };
+    identity_access::identity_observation actual{};
+    std::shared_ptr<const physical_store_identity> legacy;
+    {
+        rename_back first(original.path, moved.path), second(successor.path, original.path);
+        actual = identity_access::observe_identity(writer);
+        legacy = writer.physical_identity("main", {}, true);
+    }
+    EXPECT_FALSE(actual.identity); EXPECT_STREQ(actual.failure, "file_moved");
+    EXPECT_FALSE(legacy);
+    const auto restored = identity_access::observe_identity(writer);
+    ASSERT_TRUE(restored.identity); EXPECT_EQ(restored.failure, nullptr);
+    EXPECT_EQ(*restored.identity, *before);
+}
+}
+#endif

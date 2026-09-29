@@ -2732,3 +2732,76 @@ TEST(PlatformTransport, ClosedAttemptRejectsHeldMessageBeforeAutomaticRetryDials
     bounded_mock_case(platform_closed_attempt_rejects_message_before_queued_retry_dials);
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+enum class OrdinaryTerminalRetirement { none, progress, notification };
+void ordinary_terminal_callback_retirement(bool error,OrdinaryTerminalRetirement retirement) {
+    PlatformTransportProbe probe;
+    auto database=std::make_unique<lattice::lattice_db>(lattice::configuration(":memory:"));
+    lattice::sync_config config;
+    config.websocket_url="ws://fixture/callback-retirement";
+    config.sync_id="ordinary-terminal-callback-retirement";
+    config.all_active_sync_ids={config.sync_id};
+    config.base_delay_seconds=0;config.max_delay_seconds=0;config.max_reconnect_attempts=1;
+    config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;
+    auto sync=std::make_unique<lattice::synchronizer>(std::move(database),config,probe.make());
+    sync->connect();ASSERT_EQ(probe.attempts.size(),1u);
+    const auto first=probe.attempts.front();ASSERT_TRUE(first.trigger_on_open());ASSERT_TRUE(sync->is_connected());
+    std::vector<std::string> callbacks;
+    sync->set_on_progress([&](const auto&){
+        callbacks.push_back("progress");
+        if(retirement==OrdinaryTerminalRetirement::progress)sync.reset();
+    });
+    sync->set_on_error([&](const auto&){
+        callbacks.push_back("error");
+        if(retirement==OrdinaryTerminalRetirement::notification)sync.reset();
+    });
+    sync->set_on_state_change([&](bool connected){
+        if(connected)return;
+        callbacks.push_back("close");
+        if(retirement==OrdinaryTerminalRetirement::notification)sync.reset();
+    });
+    // The exact native immediate adapter executes these real terminal
+    // callbacks synchronously. No simulated owner or shortened retry policy
+    // substitutes for callback admission; the physical endpoint owns its cell.
+    ASSERT_TRUE(error?first.trigger_on_error("ordinary terminal failure"):
+        first.trigger_on_close(1006,"ordinary terminal close"));
+    const std::vector<std::string> expected=retirement==OrdinaryTerminalRetirement::progress?
+        std::vector<std::string>{"progress"}:std::vector<std::string>{"progress",error?"error":"close"};
+    EXPECT_EQ(callbacks,expected);
+    if(retirement==OrdinaryTerminalRetirement::none) {
+        // Positive control: normal notification still precedes the real
+        // automatic replacement dial, with the configured retry allowance.
+        ASSERT_TRUE(sync);ASSERT_EQ(probe.attempts.size(),2u);EXPECT_EQ(probe.destroys,0);
+        EXPECT_FALSE(first.matches(probe.attempts.back()));
+        EXPECT_TRUE(probe.attempts.back().is_current());
+        sync.reset();
+    } else {
+        EXPECT_FALSE(sync);EXPECT_EQ(probe.attempts.size(),1u);
+    }
+    EXPECT_EQ(probe.destroys,1);EXPECT_TRUE(probe.all_retired_at_destroy);
+    EXPECT_FALSE(first.trigger_on_error("late after retirement"));
+    EXPECT_FALSE(first.trigger_on_close(1006,"late after retirement"));
+    EXPECT_FALSE(first.trigger_on_open());EXPECT_EQ(callbacks,expected);
+}
+}
+TEST(SyncCallbackRetirement, ErrorProgressCanDestroyActualOwnerBeforeContinuation) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(true,OrdinaryTerminalRetirement::progress);});
+}
+TEST(SyncCallbackRetirement, CloseProgressCanDestroyActualOwnerBeforeContinuation) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(false,OrdinaryTerminalRetirement::progress);});
+}
+TEST(SyncCallbackRetirement, InlineErrorNotificationCanDestroyActualOwnerBeforeReconnect) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(true,OrdinaryTerminalRetirement::notification);});
+}
+TEST(SyncCallbackRetirement, InlineCloseNotificationCanDestroyActualOwnerBeforeReconnect) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(false,OrdinaryTerminalRetirement::notification);});
+}
+TEST(SyncCallbackRetirement, CurrentErrorPreservesProgressNotificationAndAutomaticDial) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(true,OrdinaryTerminalRetirement::none);});
+}
+TEST(SyncCallbackRetirement, CurrentClosePreservesProgressNotificationAndAutomaticDial) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(false,OrdinaryTerminalRetirement::none);});
+}
+#endif

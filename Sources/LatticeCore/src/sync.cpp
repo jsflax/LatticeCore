@@ -1795,13 +1795,20 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
         }
         progress_pending_upload_.store(0, std::memory_order_relaxed);
     }
+    // Either application callback may synchronously retire this owner or
+    // replace its generation. Only independently retained admission state is
+    // safe to consult before continuing after those callbacks.
+    const auto lifetime=callback_lifetime_;const auto generation=lifetime->dispatch_generation();
     fire_progress();
+    if(!lifetime->current(generation))return;
 
     if (on_error_) {
-        scheduler_->invoke([this, error] { on_error_(error); });
+        const auto callback=on_error_;const auto scheduled=scheduler_;
+        scheduled->invoke([callback, error] { callback(error); });
     }
+    if(!lifetime->current(generation))return;
 
-    // Attempt reconnection
+    // Attempt reconnection only for the same still-live owner generation.
     schedule_reconnect();
 }
 
@@ -1832,13 +1839,17 @@ void synchronizer_base::on_websocket_close(int code, const std::string& reason) 
         }
         progress_pending_upload_.store(0, std::memory_order_relaxed);
     }
+    const auto lifetime=callback_lifetime_;const auto generation=lifetime->dispatch_generation();
     fire_progress();
+    if(!lifetime->current(generation))return;
 
     if (on_state_change_) {
-        scheduler_->invoke([this] { on_state_change_(false); });
+        const auto callback=on_state_change_;const auto scheduled=scheduler_;
+        scheduled->invoke([callback] { callback(false); });
     }
+    if(!lifetime->current(generation))return;
 
-    // Attempt reconnection
+    // Attempt reconnection only for the same still-live owner generation.
     schedule_reconnect();
 }
 

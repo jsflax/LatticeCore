@@ -263,7 +263,8 @@ TEST(CanonicalReceiptCoverageRange, CanonicalV3ReceiptKeepsActualBooleanTypeAndB
 
 TEST(CanonicalReceiptCoverageRange, PrivateContentReuseKeepsBothEntriesAndActualReceiptBooleansExact) {
     for(bool legacy_unbound:{false,true})for(bool raw:{false,true}) {
-        SCOPED_TRACE(legacy_unbound);SCOPED_TRACE(raw);
+        SCOPED_TRACE(legacy_unbound);
+        SCOPED_TRACE(raw);
         CoverageRangeFixture f;f.receipts[0].legacy_unbound=legacy_unbound;const auto package=f.build();
         cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
         auto reference=cr::begin(f.attempt,f.request,package.offer(),f.policy.codec);uint64_t content_items=0;

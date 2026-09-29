@@ -28,7 +28,8 @@ void expect_wire_integer(const lattice::audit_log_entry& entry, int kind, int64_
 
 TEST(SyncIntegerWidth, SwiftIntAndInt64KeepValueAndKindAcrossEveryAuditDecodeEntry) {
     for (const int kind : {0, 1}) for (const int64_t value : swift_integer_boundaries()) {
-        SCOPED_TRACE(kind); SCOPED_TRACE(value);
+        SCOPED_TRACE(kind);
+        SCOPED_TRACE(value);
         const json fields = {{"int64_val", {{"kind", kind}, {"value", value}}}};
         lattice::audit_log_entry standalone;
         standalone.changed_fields = lattice::audit_log_entry::parse_changed_fields(fields.dump());

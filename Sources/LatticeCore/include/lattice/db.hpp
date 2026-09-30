@@ -166,12 +166,14 @@ class database {
         engine_query_scope* next_read = nullptr;
         const std::thread::id thread = std::this_thread::get_id();
         bool registered = false, active = true;
+        const bool defers_delivery;
         static inline thread_local engine_query_scope* current = nullptr;
-        explicit engine_query_scope(database&);
+        explicit engine_query_scope(database&, bool defer_delivery = false);
         ~engine_query_scope() noexcept;
         void adopt(sqlite3_stmt*) noexcept;
         void reset() noexcept;
         static bool active_for(const database&) noexcept;
+        static bool defers_delivery_for(const database&) noexcept;
         engine_query_scope(const engine_query_scope&) = delete;
         engine_query_scope& operator=(const engine_query_scope&) = delete;
     };

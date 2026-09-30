@@ -515,6 +515,7 @@ protected:
     int64_t scalar(lattice_db& owner,const std::string& sql){return std::get<int64_t>(owner.db().query(sql).at(0).at("n"));}
     int64_t phase(){return scalar(*receiver,"SELECT phase AS n FROM _lattice_producer_continuity");}
     bool has_error(){std::lock_guard lock(errors_mutex);return !errors.empty();}
+    bool error_contains(const std::string& text){std::lock_guard lock(errors_mutex);return std::any_of(errors.begin(),errors.end(),[&](const auto& e){return e.find(text)!=std::string::npos;});}
     using Snapshot=std::map<std::string,std::vector<database::row_t>>;
     Snapshot snapshot(){Snapshot value;
         for(const auto* table:{"ControllerRow","AuditLog","_lattice_obligation_entry","_lattice_obligation_scope","_lattice_obligation_store","_lattice_install_channel","_lattice_install_store","_lattice_producer_continuity","_lattice_recovery_request"})
@@ -1505,7 +1506,6 @@ protected:
         ASSERT_TRUE(until([&]{return events->ordinary->completed.load()==ordinary_windows;}));
         ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
     }
-    bool error_contains(const std::string& text){std::lock_guard lock(errors_mutex);return std::any_of(errors.begin(),errors.end(),[&](const auto& e){return e.find(text)!=std::string::npos;});}
     size_t dial_count(){std::lock_guard lock(wire->mutex);return wire->endpoints.size();}
     void expect_failed_drain(){const auto result=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(5));EXPECT_EQ(result.state,sync_drain_state::failed);EXPECT_TRUE(result.error);}
     void controller_failure_survives_timeout(bool commit_fault){

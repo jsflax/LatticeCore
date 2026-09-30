@@ -865,6 +865,9 @@ void database::drain_if_settled() {
     // Attached scalar wrappers release their writer (and optional vector
     // store gate) before delivering the outer successful statement's tail.
     if (detail::managed_route_scope::active_for(this)) return;
+    // A compound read may retain the connection mutex and a real main cursor
+    // across several queries. Its explicit tail drains after both are released.
+    if (engine_query_scope::defers_delivery_for(*this)) return;
     // Post-statement drain point (docs/design-deferred-memory-delivery.md):
     // after a successful statement, autocommit != 0 means the top-level
     // transaction just closed (implicit, or the explicit COMMIT that funnels
@@ -1391,14 +1394,20 @@ void database::remove(const std::string& table, primary_key_t id) {
     drain_if_settled();
 }
 
-database::engine_query_scope::engine_query_scope(database& db)
-    : owner(db), previous(current) { current = this; }
+database::engine_query_scope::engine_query_scope(database& db, bool defer_delivery)
+    : owner(db), previous(current), defers_delivery(defer_delivery) { current = this; }
 
 database::engine_query_scope::~engine_query_scope() noexcept { reset(); }
 
 bool database::engine_query_scope::active_for(const database& db) noexcept {
     for (auto* scope = current; scope; scope = scope->previous)
         if (&scope->owner == &db) return true;
+    return false;
+}
+
+bool database::engine_query_scope::defers_delivery_for(const database& db) noexcept {
+    for (auto* scope = current; scope; scope = scope->previous)
+        if (&scope->owner == &db && scope->defers_delivery) return true;
     return false;
 }
 

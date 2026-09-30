@@ -354,6 +354,87 @@ TEST(OrdinaryStoreAdmission, CoherentSnapshotAndLockReplacementCannotRebindRetai
     }
 }
 
+TEST(OrdinaryStoreAdmission, AnchoredFreshOpenPreservesExactControlsAndRetirementIntent) {
+    area owned;
+    admission::record original;
+    {
+        auto first = admission::journal::create_unadopted(owned.fd, binding());
+        original = first.read();
+    }
+    const admission::control_binding expected{original.control, original.entry, original.generation};
+    auto reopened = admission::journal::open_existing(owned.fd, binding(), expected);
+    EXPECT_EQ(reopened.read(), original);
+    auto hold = reopened.try_hold_generation();
+    EXPECT_TRUE(reopened.generation_busy());
+    const auto retirement = reopened.begin_retirement(id(21));
+    auto after_intent = admission::journal::open_existing(owned.fd, binding(), expected);
+    EXPECT_EQ(after_intent.read(), retirement);
+    EXPECT_EQ(after_intent.begin_retirement(id(21)), retirement);
+    EXPECT_THROW(after_intent.try_hold_generation(), admission::error);
+    EXPECT_TRUE(after_intent.generation_busy());
+    hold = {};
+    EXPECT_FALSE(after_intent.generation_busy());
+}
+
+TEST(OrdinaryStoreAdmission, AnchoredFreshOpenRefusesMissingWrongAndAliasedControls) {
+    area owned; auto first = admission::journal::create_unadopted(owned.fd, binding());
+    const auto original = first.read();
+    const admission::control_binding expected{original.control, original.entry, original.generation};
+    for (unsigned index = 0; index < 3; ++index) {
+        auto wrong = expected;
+        auto* changed = index == 0 ? &wrong.control : index == 1 ? &wrong.entry : &wrong.generation;
+        const auto original_identity = *changed;
+        changed->inode = 0;
+        EXPECT_THROW(admission::journal::open_existing(owned.fd, binding(), wrong), admission::error);
+        *changed = {original_identity.device, original_identity.inode == 1 ? 2u : 1u};
+        EXPECT_THROW(admission::journal::open_existing(owned.fd, binding(), wrong), admission::error);
+        EXPECT_EQ(first.read(), original);
+    }
+    auto aliased = expected; aliased.generation = aliased.entry;
+    EXPECT_THROW(admission::journal::open_existing(owned.fd, binding(), aliased), admission::error);
+    area other; auto other_journal = admission::journal::create_unadopted(other.fd, binding());
+    EXPECT_THROW(admission::journal::open_existing(other.fd, binding(), expected), admission::error);
+    EXPECT_EQ(first.read(), original);
+    EXPECT_FALSE(std::filesystem::exists(owned.path / "admission.pending"));
+    EXPECT_FALSE(other_journal.generation_busy());
+}
+
+TEST(OrdinaryStoreAdmission, ExternalControlExpectationRejectsCoherentReplacementAfterWrapperGone) {
+    area owned; admission::record original; admission::generation_hold old_hold;
+    {
+        auto first = admission::journal::create_unadopted(owned.fd, binding());
+        original = first.read(); old_hold = first.try_hold_generation();
+    }
+    // This expectation survives independently of every journal wrapper. The
+    // installation adapter must retain/persist it outside admission.v1.
+    const admission::control_binding expected{original.control, original.entry, original.generation};
+    auto replacement = original;
+    ASSERT_EQ(::renameat(owned.fd, "entry.lock", owned.fd, "old-entry.lock"), 0);
+    ASSERT_EQ(::renameat(owned.fd, "generation.lock", owned.fd, "old-generation.lock"), 0);
+    descriptor new_entry(::openat(owned.fd, "entry.lock", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+    descriptor new_generation(::openat(owned.fd, "generation.lock", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+    ASSERT_GE(new_entry.fd, 0); ASSERT_GE(new_generation.fd, 0);
+    struct stat st{}; ASSERT_EQ(::fstat(new_entry.fd, &st), 0);
+    replacement.entry = {static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino)};
+    ASSERT_EQ(::fstat(new_generation.fd, &st), 0);
+    replacement.generation = {static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino)};
+    ASSERT_EQ(::renameat(owned.fd, "admission.v1", owned.fd, "old-admission.v1"), 0);
+    descriptor snapshot(::openat(owned.fd, "admission.v1", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+    ASSERT_GE(snapshot.fd, 0); overwrite(owned.fd, replacement);
+    EXPECT_THROW(admission::journal::open_existing(owned.fd, binding(), expected), admission::error);
+    descriptor old_generation(::openat(owned.fd, "old-generation.lock", O_RDWR | O_CLOEXEC));
+    ASSERT_GE(old_generation.fd, 0);
+    ASSERT_EQ(::flock(old_generation.fd, LOCK_EX | LOCK_NB), -1);
+    EXPECT_TRUE(errno == EWOULDBLOCK || errno == EAGAIN);
+    // The old observational overload deliberately remains weaker; a quiet
+    // new lock cannot erase the real retained hold on the old generation.
+    auto observed = admission::journal::open_existing(owned.fd, binding());
+    EXPECT_EQ(observed.read(), replacement);
+    EXPECT_FALSE(observed.generation_busy());
+    old_hold = {};
+    EXPECT_EQ(::flock(old_generation.fd, LOCK_EX | LOCK_NB), 0);
+}
+
 TEST(OrdinaryStoreAdmission, InterruptedPreRenamePublicationKeepsGateClosedAndOriginalBytes) {
     for (const auto point : {admission::test_hooks::boundary::before_write,
                              admission::test_hooks::boundary::after_write,

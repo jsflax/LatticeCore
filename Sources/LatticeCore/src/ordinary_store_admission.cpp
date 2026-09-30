@@ -254,6 +254,22 @@ journal journal::open_existing(int directory_fd, const store_binding& expected) 
     auto entry = state->entry(); const auto value = state->load(entry.fd);
     state->bind_locks(value); return journal(std::move(state));
 }
+journal journal::open_existing(int directory_fd, const store_binding& expected,
+                               const control_binding& expected_controls) {
+    if (!expected_controls.control.inode || !expected_controls.entry.inode ||
+        !expected_controls.generation.inode || expected_controls.entry == expected_controls.generation)
+        fail(error_code::invalid_record, "ordinary admission expected control binding invalid");
+    auto state = std::make_unique<implementation>(directory_fd, expected);
+    if (state->control != expected_controls.control)
+        fail(error_code::identity_changed, "ordinary admission anchored control directory changed");
+    // Bind before opening entry.lock or reading admission.v1. A coherent
+    // replacement snapshot must not redefine first-open expectations.
+    record anchored; anchored.entry = expected_controls.entry;
+    anchored.generation = expected_controls.generation;
+    state->bind_locks(anchored);
+    auto entry = state->entry(); (void)state->load(entry.fd);
+    return journal(std::move(state));
+}
 record journal::read() const {
     if (!impl_) fail(error_code::unavailable, "ordinary admission moved journal");
     auto entry = impl_->entry(); return impl_->load(entry.fd);
@@ -297,6 +313,7 @@ struct journal::implementation {};
 namespace { [[noreturn]] void unsupported() { fail(error_code::unavailable, "ordinary admission platform unavailable"); } }
 journal journal::create_unadopted(int, const store_binding&) { unsupported(); }
 journal journal::open_existing(int, const store_binding&) { unsupported(); }
+journal journal::open_existing(int, const store_binding&, const control_binding&) { unsupported(); }
 record journal::read() const { unsupported(); }
 generation_hold journal::try_hold_generation() const { unsupported(); }
 record journal::begin_retirement(const identifier&) { unsupported(); }

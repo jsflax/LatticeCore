@@ -20,6 +20,13 @@ struct store_binding {
     file_identity main{}, parent{};
     bool operator==(const store_binding&) const = default;
 };
+// Expected identities supplied by a separately retained installation anchor,
+// never learned from the journal snapshot being opened. These remain facts,
+// not an assertion that old writers or source intake have retired.
+struct control_binding {
+    file_identity control{}, entry{}, generation{};
+    bool operator==(const control_binding&) const = default;
+};
 enum class stage : std::uint8_t { unadopted = 1, retirement_requested = 2 };
 struct record {
     std::uint64_t revision = 1;
@@ -71,6 +78,11 @@ public:
     // The future installation authority must supply/validate expected catalog
     // identity and qualify its filesystem. This substrate grants no adoption.
     static journal open_existing(int directory_fd, const store_binding& expected);
+    // Anchored fresh reopen: compare the caller's already-held expectations
+    // before accepting either named lock or the first snapshot. No bootstrap
+    // or repair is performed on mismatch; this still grants no adoption.
+    static journal open_existing(int directory_fd, const store_binding& expected,
+                                 const control_binding& expected_controls);
     ~journal();
     journal(journal&&) noexcept;
     journal& operator=(journal&&) noexcept;

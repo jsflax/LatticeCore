@@ -53,6 +53,10 @@ void members(const json& value,std::initializer_list<const char*> required,std::
     for(const auto* key:optional)allowed.insert(key);
     for(const auto& item:value.items())require(allowed.count(item.key()),"controller unknown control member");
 }
+bool repeated_description(const json& value) {
+    return value.is_object()&&value.contains("kind")&&value.at("kind")=="recoveryReady"&&
+        value.contains("operation")&&value.at("operation")=="describe";
+}
 void settlement_shape(const json& value) {
     members(value,{"state","unexpectedCommitObserved","primaryError","cleanupError","postcommitError","notificationError"});
     require(value.at("state").is_string(),"controller settlement state type");const auto state=value.at("state").get<std::string>();
@@ -639,6 +643,10 @@ void recovery_receiver_controller::turn() {
                 try {
                     const auto description=parse(route->state_->source->recovery_description(front->late_view),65536);
                     const auto late=parse(front->bytes,recovery_request_store::frame_bytes);
+                    // This inbox owns an already-described physical view. Keep
+                    // the original verifier's refusal and exact-view revocation
+                    // when a second describe is intercepted by this lane.
+                    require(!repeated_description(late),"receiver source unsolicited, repeated or expired recovery frame");
                     if(terminal_profile(description)) {
                         if(late.value("operation",std::string{})=="predecessor")late_predecessor_shape(late,description);
                         else late_lifecycle_shape(late,description);
@@ -863,6 +871,16 @@ void recovery_receiver_controller::turn() {
             const auto description=parse(route->state_->source->recovery_description(pending->view),65536);
             const auto channel=description.at("channel").get<std::string>();
             const auto response_value=parse(response,recovery_request_store::frame_bytes);
+            if(repeated_description(response_value)) {
+                // Pending control/range requests must not turn a repeated
+                // describe into a generic parse failure with live authority.
+                // invalidate compares the actual retained record under its
+                // leaf; a replaced view cannot revoke the successor.
+                if(route->state_->source->recovery_live(pending->view)&&route->state_->source->invalidate(pending->view.value))
+                    refuse("receiver source unsolicited, repeated or expired recovery frame");
+                {std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();}
+                settle.keep_admission_wait=true;return;
+            }
             bool original_discard_admitted;
             {std::lock_guard lock(runtime.mutex);original_discard_admitted=route->state_->issued_discard_view.lock()==pending->view.value;}
             if((terminal_profile(description)||(original_discard_admitted&&response_value.value("operation",std::string{})=="discard"))&&

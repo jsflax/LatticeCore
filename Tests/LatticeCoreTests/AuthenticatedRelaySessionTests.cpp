@@ -19,6 +19,9 @@
 #include <chrono>
 #include <thread>
 #include <condition_variable>
+#include <exception>
+#include <limits>
+#include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
 
 #if defined(__APPLE__) || defined(__linux__)
 namespace lattice::detail {
@@ -211,6 +214,7 @@ TEST_F(AuthenticatedRelaySession, OwnedIdsOutliveResultsWithoutReleasingPublicat
 namespace ready_wire=lattice::detail::canonical_range;
 class AuthenticatedReadySession:public AuthenticatedRelaySession {
 protected:
+    lattice::detail::canonical_ready_test_observation::observation last_prepare_trace;
     lattice::detail::canonical_ready_read_test_observation::observation last_read_trace;
     lattice::detail::canonical_range::sequence_test_observation::counters last_read_work;
     uint64_t last_read_index=0;
@@ -261,6 +265,7 @@ protected:
         counts::counters work;const auto previous_work=counts::current;counts::current=&work;
         struct reset {observation* previous;counts::counters* work;~reset(){current=previous;counts::current=work;}} restore{previous,previous_work};
         auto result=invoke(value,command(op,f,d,duration));
+        last_prepare_trace=trace; // Fixed diagnostic facts; never a lease or success oracle.
         if(result.status_code()!=1||!result.publishable()) {
             // Bounded local diagnostics even when the expired response MUST NOT
             // be sent. The original failure and all workload/lease inputs stay.
@@ -448,6 +453,45 @@ TEST_F(AuthenticatedReadySession, OwnerCloseInProgressRejectsAlreadyQueuedResult
     release=true;notification.join();closing.join();EXPECT_TRUE(finished.load());
 }
 TEST_F(AuthenticatedReadySession, LargerExplicitProfileCarriesEightThousandRowsAndRealReceiptRequests) {
+    // Preserve completed work when the next call fails before native entry.
+    // This emits only on an original assertion/exception, never changes a lease.
+    struct Progress {
+        using Clock=std::chrono::steady_clock;
+        Clock::time_point origin=Clock::now();int exceptions=std::uncaught_exceptions();
+        uint64_t prepare_us=0,read_us=0,consumer_us=0,reads=0;int phase=0;
+        detail::canonical_ready_test_observation::observation preparation;
+        detail::canonical_ready_read_test_observation::observation previous,current;
+        static uint64_t elapsed(Clock::time_point start) noexcept {
+            const auto value=std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-start).count();
+            return value>0?static_cast<uint64_t>(value):0;
+        }
+        static void add(uint64_t& total,uint64_t value) noexcept {
+            const auto maximum=std::numeric_limits<uint64_t>::max();total=value>maximum-total?maximum:total+value;
+        }
+        static json trace(const detail::canonical_ready_read_test_observation::observation& value) {
+            return {{"index",value.index},{"visits",value.visits},{"firstMicroseconds",value.first_us},{"lastMicroseconds",value.last_us},
+                {"deadlineMilliseconds",value.deadline_ms},{"clockBeforeBodyMilliseconds",value.clock_before_ms},
+                {"clockAfterBodyMilliseconds",value.clock_after_ms},{"clockAfterSettlementMilliseconds",value.clock_settled_ms},
+                {"fullAudits",value.full_audits},{"auditedFrames",value.audited_frames},{"auditedBytes",value.audited_bytes},
+                {"positiveReceiptLookups",value.positive_receipt_lookups},{"addressedFrames",value.addressed_frames},
+                {"settlement",value.settlement},{"primaryError",value.primary_error},{"inclusiveCostCalls",value.cost.calls},
+                {"inclusiveCostMicroseconds",value.cost.microseconds},{"receiptBatches",value.cost.receipt_batches}};
+        }
+        ~Progress() noexcept {
+            if(!::testing::Test::HasFailure()&&std::uncaught_exceptions()<=exceptions)return;
+            try {
+                const auto text=json{{"failureOnly",true},{"phase",phase},{"totalMicroseconds",elapsed(origin)},
+                    {"prepareMicroseconds",prepare_us},{"nativeReadMicroseconds",read_us},{"consumerMicroseconds",consumer_us},
+                    {"returnedReadCalls",reads},{"previousReturnedReadObserved",reads>1},{"currentReturnedReadObserved",reads>0},
+                    {"previousReturnedRead",trace(previous)},{"currentReturnedRead",trace(current)},
+                    {"prepareVisits",preparation.visits},{"prepareFirstMicroseconds",preparation.first_us},
+                    {"prepareLastMicroseconds",preparation.last_us},{"prepareInclusiveCostCalls",preparation.cost.calls},
+                    {"prepareInclusiveCostMicroseconds",preparation.cost.microseconds}}.dump();
+                if(text.size()<=8192)std::fprintf(stderr,"READY 8000 completed-work observation: %s\n",text.c_str());
+                else std::fprintf(stderr,"READY 8000 completed-work observation: bounded-output-unavailable\n");
+            }catch(...){} // Never replace the original assertion/exception.
+        }
+    } progress;
     setup=admitted(1,true);const auto d=description(setup);ASSERT_EQ(d["profile"]["name"],"bounded48MiBV1");
     std::vector<audit_log_entry> entries;entries.reserve(8000);const std::string payload(2048,'x');
     for(unsigned i=0;i<8000;++i){auto e=entry(i,payload);e.global_id=relay_uuid(100000+i);e.global_row_id=relay_uuid(200000+i);entries.push_back(std::move(e));}
@@ -458,14 +502,23 @@ TEST_F(AuthenticatedReadySession, LargerExplicitProfileCarriesEightThousandRowsA
     ASSERT_EQ(count("AuthenticatedRelayRow"),8000);ASSERT_EQ(count("_lattice_canonical_receipt"),8000);
     const auto before=receipts();auto f=request(d);auto& q=std::get<ready_wire::request>(f.body);
     for(const auto& e:entries)q.receipts.push_back({e.global_id,"app",{{e.table_name,e.global_row_id}}});seal(f,d);
-    const auto offered=lease(setup,f,d,"prepare",300000);const auto frames=std::stoull(offered["frames"].get<std::string>());ASSERT_LE(frames,770u);
-    auto first=read(setup,offered,0);ASSERT_TRUE(first.publishable())<<read_diagnostic(first);auto manifest=decode_read(first,d);
+    progress.phase=1;const auto preparation_start=Progress::Clock::now();
+    const auto offered=lease(setup,f,d,"prepare",300000);progress.prepare_us=Progress::elapsed(preparation_start);progress.preparation=last_prepare_trace;
+    const auto frames=std::stoull(offered["frames"].get<std::string>());ASSERT_LE(frames,770u);
+    const auto measured_read=[&](uint64_t index) {
+        progress.phase=2;const auto start=Progress::Clock::now();auto result=read(setup,offered,index);
+        Progress::add(progress.read_us,Progress::elapsed(start));Progress::add(progress.reads,1);
+        progress.previous=progress.current;progress.current=last_read_trace;return result;
+    };
+    auto first=measured_read(0);ASSERT_TRUE(first.publishable())<<read_diagnostic(first);
+    progress.phase=3;auto consumer_start=Progress::Clock::now();auto manifest=decode_read(first,d);
     const auto& m=std::get<ready_wire::manifest>(manifest.body);auto sequence=ready_wire::begin(f.logical,q,m,codec(d));
     ready_wire::stream_hasher contents(m,ready_wire::stream_kind::content,codec(d)),receipts_hash(m,ready_wire::stream_kind::receipts,codec(d));
     std::set<std::string> row_ids,original_ids;size_t bytes=first.wire().size();
+    Progress::add(progress.consumer_us,Progress::elapsed(consumer_start));
     for(uint64_t index=1;index<frames;++index) {
-        auto result=read(setup,offered,index);ASSERT_EQ(result.status_code(),1)<<read_diagnostic(result);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);bytes+=result.wire().size();
-        const auto frame=decode_read(result,d);sequence=ready_wire::propose(sequence,frame,codec(d));
+        auto result=measured_read(index);ASSERT_EQ(result.status_code(),1)<<read_diagnostic(result);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);bytes+=result.wire().size();
+        progress.phase=3;consumer_start=Progress::Clock::now();const auto frame=decode_read(result,d);sequence=ready_wire::propose(sequence,frame,codec(d));
         if(const auto* page=std::get_if<ready_wire::content_page>(&frame.body))for(const auto& item:page->items) {
             ASSERT_TRUE(std::holds_alternative<ready_wire::present>(item.value));contents.append(item);EXPECT_TRUE(row_ids.insert(item.key.id).second);
             const auto values=lattice::detail::sync_recovery::decode_values(std::get<ready_wire::present>(item.value).payload,codec(d).values);
@@ -474,7 +527,9 @@ TEST_F(AuthenticatedReadySession, LargerExplicitProfileCarriesEightThousandRowsA
         if(const auto* page=std::get_if<ready_wire::receipt_page>(&frame.body))for(const auto& item:page->items) {
             receipts_hash.append(item);ASSERT_TRUE(std::holds_alternative<ready_wire::committed>(item.value));EXPECT_TRUE(original_ids.insert(item.original_id).second);
         }
+        Progress::add(progress.consumer_us,Progress::elapsed(consumer_start));
     }
+    progress.phase=4;
     EXPECT_EQ(sequence.status,ready_wire::phase::sequence_complete_unverified);EXPECT_EQ(contents.finish(),m.content_digest);EXPECT_EQ(receipts_hash.finish(),m.receipt_digest);
     EXPECT_EQ(row_ids.size(),8000u);EXPECT_EQ(original_ids.size(),8000u);EXPECT_EQ(receipts(),before);EXPECT_LE(bytes,41943040u);
     for(const auto& e:entries){EXPECT_EQ(row_ids.count(e.global_row_id),1u);EXPECT_EQ(original_ids.count(e.global_id),1u);}
@@ -1503,14 +1558,29 @@ TEST_F(AuthenticatedReceiptCoverageV3, LifecycleDiscardKeepsRegisteredOriginalsA
 
 #if defined(__APPLE__) || defined(__linux__)
 namespace {
+// Read the real owner's existing protected key calculation without creating,
+// casting or modifying an owner. The inherited member pointer still names a
+// lattice_db member; this test-only access cannot publish schema/admission.
+struct AdministrativeFingerprintKeys: lattice_db {
+    static std::string core(const lattice_db& actual) {
+        const auto member=&AdministrativeFingerprintKeys::compute_core_fingerprint_key;
+        return (actual.*member)();
+    }
+};
 class AuthenticatedReceiptFileAdministration:public AuthenticatedReceiptCoverageV3 {
 protected:
     int migrate_file(int64_t version=1,const SchemaVector& schema={relay_schema()}) {
         return swift_lattice_ref::migrate_relay_receipt_coverage_file(file.str(),schema,version,100,policy().dump(),covered_policy().dump());
     }
     void release_owner() {setup.close_on_io();setup={};if(owner)owner->close();owner.reset();ref.reset();}
-    static Snapshot read_file(const std::string& path) {
+    static Snapshot read_file(const std::string& path,int64_t* schema_cookie=nullptr) {
         database reader(path,database::open_mode::read_only,100);Snapshot result;
+        // Only the explicit cookie caller requests one consistent read view.
+        // All prior callers retain their original SQL and snapshot contents.
+        if(schema_cookie) {
+            reader.execute("BEGIN");
+            *schema_cookie=std::get<int64_t>(reader.query("PRAGMA main.schema_version").at(0).at("schema_version"));
+        }
         const auto tables=reader.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
         if(tables.size()>128)throw std::runtime_error("administration fixture inventory bound");
         for(const auto& row:tables){const auto& name=std::get<std::string>(row.at("name"));
@@ -1518,7 +1588,8 @@ protected:
                 throw std::runtime_error("administration fixture table name bound");
             result[name]=reader.query("SELECT * FROM \""+name+"\" ORDER BY 1");}
         result["sqlite_schema"]=reader.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
-        result["user_version"]=reader.query("PRAGMA user_version");result["journal_mode"]=reader.query("PRAGMA journal_mode");return result;
+        result["user_version"]=reader.query("PRAGMA user_version");result["journal_mode"]=reader.query("PRAGMA journal_mode");
+        if(schema_cookie)reader.execute("COMMIT");return result;
     }
     struct observation {
         std::function<void()> callback;
@@ -1911,9 +1982,25 @@ TEST_F(AuthenticatedReceiptFileAdministration, OrdinaryCreatedFileUsesMetadataVe
     ASSERT_EQ(std::get<int64_t>(owner->db().query("PRAGMA main.user_version").at(0).at("user_version")),0);
     ASSERT_EQ(std::get<std::string>(owner->db().query("SELECT value FROM _lattice_meta WHERE key='schema_version'").at(0).at("value")),"1");
     open();authorize();const auto original=entry(301);ASSERT_EQ(setup.receive(frame(original)).take_ids(),std::vector<std::string>{original.global_id});
-    const auto receipts_before=receipts();release_owner();const auto before=read_file(file.str());
-    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();const auto after=read_file(file.str());
-    EXPECT_EQ(after.at("_lattice_meta"),before.at("_lattice_meta"));EXPECT_EQ(after.at("user_version"),before.at("user_version"));
+    const std::set<std::string> owner_keys{AdministrativeFingerprintKeys::core(*owner),
+        detail::authenticated_relay_catalog_test_access::catalog(*owner).swift_fingerprint};
+    ASSERT_EQ(owner_keys.size(),2u);ASSERT_FALSE(owner_keys.count(""));
+    const auto receipts_before=receipts();release_owner();int64_t before_cookie=-1,after_cookie=-1;
+    const auto before=read_file(file.str(),&before_cookie);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();const auto after=read_file(file.str(),&after_cookie);
+    ASSERT_GE(before_cookie,0);EXPECT_GT(after_cookie,before_cookie);
+    auto expected_metadata=before.at("_lattice_meta");std::set<std::string> refreshed;
+    for(auto& row:expected_metadata) {
+        const auto& key=std::get<std::string>(row.at("key"));
+        if(owner_keys.count(key)) {
+            // Only the two exact already-current owner keys may carry the DDL
+            // cookie. Every other metadata row/key/value stays byte-for-byte.
+            ASSERT_EQ(row.at("value"),column_value_t{std::to_string(before_cookie)});
+            ASSERT_TRUE(refreshed.insert(key).second);row.at("value")=std::to_string(after_cookie);
+        }
+    }
+    ASSERT_EQ(refreshed,owner_keys);
+    EXPECT_EQ(after.at("_lattice_meta"),expected_metadata);EXPECT_EQ(after.at("user_version"),before.at("user_version"));
     EXPECT_EQ(after.at("_lattice_canonical_receipt"),receipts_before);EXPECT_EQ(after.at("AuthenticatedRelayRow"),before.at("AuthenticatedRelayRow"));
 }
 TEST_F(AuthenticatedReceiptFileAdministration, MetadataVersionCannotBeAbsentMalformedOrReplacedByMatchingHeader) {
@@ -2200,6 +2287,54 @@ CompletedDisposalSnapshot completed_disposal_state(database& db) {
     state["sqlite_schema"]=db.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
     return state;
 }
+// Failure-only summary of the exact two compared snapshots. No SQL resampling,
+// normalization, raw IDs, payload text or arbitrary table/column names.
+std::string completed_disposal_difference(const CompletedDisposalSnapshot& expected,const CompletedDisposalSnapshot& actual) noexcept {
+    try {
+        const std::set<std::string> named_tables{"_lattice_meta","sqlite_schema","sqlite_stat1","sqlite_stat4",
+            "_lattice_canonical_ready_frame","_lattice_canonical_ready_transfer","_lattice_canonical_ready_profile",
+            "_lattice_canonical_ready_binding","_lattice_canonical_attempt","_lattice_canonical_retention"};
+        const std::set<std::string> named_columns{"key","value","type","name","tbl_name","rootpage","sql","binding","frame_index","data","sha256","tbl","idx","stat"};
+        const auto cell=[](const column_value_t* value,bool schema_number) {
+            if(!value)return json{{"missing",true}};
+            json out={{"type",value->index()}};
+            const auto bytes=[&](const auto& v) {
+                const size_t count=std::min<size_t>(v.size(),256);
+                out["bytes"]=v.size();out["prefixBytes"]=count;
+                out["prefixSHA256"]=picosha2::hash256_hex_string(v.begin(),v.begin()+count);
+            };
+            if(const auto* text=std::get_if<std::string>(value))bytes(*text);
+            else if(const auto* blob=std::get_if<std::vector<uint8_t>>(value))bytes(*blob);
+            else if(schema_number)if(const auto* number=std::get_if<int64_t>(value))out["value"]=*number;
+            return out;
+        };
+        json report={{"exactComparedSnapshots",true},{"tables",json::array()}};size_t changed=0;
+        std::set<std::string> tables;for(const auto& [k,_]:expected)tables.insert(k);for(const auto& [k,_]:actual)tables.insert(k);
+        for(const auto& table:tables) {
+            const auto e=expected.find(table),a=actual.find(table);if(e!=expected.end()&&a!=actual.end()&&e->second==a->second)continue;
+            ++changed;if(report["tables"].size()==4)continue;
+            const size_t en=e==expected.end()?0:e->second.size(),an=a==actual.end()?0:a->second.size();
+            json difference={{"tableCategory",named_tables.count(table)?table:"other"},{"expectedPresent",e!=expected.end()},
+                {"actualPresent",a!=actual.end()},{"expectedRows",en},{"actualRows",an},{"rows",json::array()}};size_t changed_rows=0;
+            for(size_t r=0;r<std::max(en,an);++r) {
+                const auto* er=r<en?&e->second[r]:nullptr;const auto* ar=r<an?&a->second[r]:nullptr;
+                if(er&&ar&&*er==*ar)continue;++changed_rows;if(difference["rows"].size()==2)continue;
+                json row={{"orderedRow",r},{"cells",json::array()}};size_t changed_cells=0;std::set<std::string> columns;
+                if(er)for(const auto& [k,_]:*er)columns.insert(k);if(ar)for(const auto& [k,_]:*ar)columns.insert(k);
+                for(const auto& column:columns) {
+                    const auto* ev=er&&er->count(column)?&er->at(column):nullptr;const auto* av=ar&&ar->count(column)?&ar->at(column):nullptr;
+                    if(ev&&av&&*ev==*av)continue;++changed_cells;if(row["cells"].size()==2)continue;
+                    const bool schema_number=table=="sqlite_schema"&&column=="rootpage";
+                    row["cells"].push_back({{"columnCategory",named_columns.count(column)?column:"other"},{"expected",cell(ev,schema_number)},{"actual",cell(av,schema_number)}});
+                }
+                row["changedCells"]=changed_cells;row["cellsTruncated"]=changed_cells>2;difference["rows"].push_back(std::move(row));
+            }
+            difference["changedRows"]=changed_rows;difference["rowsTruncated"]=changed_rows>2;report["tables"].push_back(std::move(difference));
+        }
+        report["changedTables"]=changed;report["tablesTruncated"]=changed>4;const auto text=report.dump();
+        return text.size()<=8192?text:json{{"changedTables",changed},{"boundedOutputUnavailable",true}}.dump();
+    }catch(...){return "{}";}
+}
 struct CompletedDisposalAudit {
     detail::canonical_ready_read_test_observation::observation trace;
     detail::canonical_ready_read_test_observation::observation* previous=detail::canonical_ready_read_test_observation::current;
@@ -2324,8 +2459,10 @@ TEST_F(AuthenticatedCompletedDisposal, AbsentRetryStillAuditsAnotherCapsulesOffP
     {CompletedDisposalAudit audit;AddressedReadAuthorizerFault commit(owner->db(),false);const auto refused=discard(q,d);
         EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(audit.trace.full_audits,1u);EXPECT_EQ(commit.commits,0u);}
     EXPECT_EQ(state(),corrupt);EXPECT_FALSE(owner->db().is_in_transaction());
-    replace(std::get<std::vector<uint8_t>>(tail.at("data")));EXPECT_EQ(state(),before);
-    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),before);
+    replace(std::get<std::vector<uint8_t>>(tail.at("data")));const auto restored=state();
+    EXPECT_EQ(restored,before)<<completed_disposal_difference(before,restored);
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto retried=state();
+    EXPECT_EQ(retried,before)<<completed_disposal_difference(before,retried);
 }
 
 TEST_F(AuthenticatedCompletedDisposal, CommitDenialRestoresExtantCapsuleAndCannotPublishAnAbsentRetryCommit) {

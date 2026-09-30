@@ -2312,6 +2312,36 @@ TEST_F(LateLifecycleReceiverController, LateNonLifecycleLeaseReplyRetainsOrigina
 TEST_F(LateLifecycleReceiverController, RepeatedDescribeInConsumedGapRetainsOriginalRefusal) {
     const auto gap=consumed_gap();ASSERT_TRUE(gap);ASSERT_FALSE(gap->describe.empty());refuses_gap_frame(gap,gap->describe);
 }
+class PendingRepeatedDescribeController : public TerminalReceiverController {
+protected:
+    void refuses_actual_description(const std::string& operation) {
+        configure();seed_local(1,9570);
+        std::string description;bool injected=false;Snapshot before;
+        struct ClearHook {decltype(after_control)& hook;~ClearHook(){hook={};}} clear{after_control};
+        after_control=[&](size_t,const json& control,std::string& outgoing){
+            if(control.at("operation")=="describe")description=outgoing;
+            if(!injected&&control.at("operation")==operation){
+                if(description.empty())throw db_error("pending describe fixture has no actual source description");
+                before=snapshot();injected=true;outgoing=description;
+            }
+        };
+        connect();ASSERT_TRUE(until([&]{return error_contains("receiver source unsolicited, repeated or expired recovery frame");}));
+        ASSERT_TRUE(injected);ASSERT_FALSE(before.empty());EXPECT_EQ(snapshot(),before);EXPECT_EQ(phase(),2);
+        // The physical connection remains present, but its source authority
+        // must be gone: a new upload cannot use the earlier accepted describe.
+        EXPECT_TRUE(peers[0].physical.is_current());EXPECT_THROW(synchronizers[0]->sync_now(),db_error);
+        const auto drained=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+        EXPECT_EQ(drained.state,sync_drain_state::failed);EXPECT_TRUE(drained.error);
+        EXPECT_EQ(snapshot(),before);EXPECT_TRUE(observed_uploads.empty());
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    }
+};
+TEST_F(PendingRepeatedDescribeController, ActualDescriptionDuringPrepareRevokesCurrentSourceWithoutDurableChange) {
+    refuses_actual_description("prepare");
+}
+TEST_F(PendingRepeatedDescribeController, ActualDescriptionDuringReadRevokesCurrentSourceWithoutDurableChange) {
+    refuses_actual_description("read");
+}
 TEST_F(LateLifecycleReceiverController, ActualThirtySecondTimeoutGapDisposesLateDiscardBeforeFreshCorrelatedRetry) {
     configure(2);seed_local(1,9510);reopen_after_terminal_prepare(1);ASSERT_FALSE(HasFatalFailure());
     auto gap=std::make_shared<ControllerPause>(),canceled=std::make_shared<ControllerPause>();pauses.push_back(gap);pauses.push_back(canceled);

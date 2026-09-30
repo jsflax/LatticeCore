@@ -211,6 +211,60 @@ struct ControllerBoundaryTrace {
         }catch(...){/* Original count/error report and failure are independent. */}
     }
 };
+// Passive copies from the existing private worker probe. Fixed storage, no
+// owner/route/SQL access; a later fixture phase cannot turn these into grants.
+struct ControllerWorkerTrace {
+    struct Stage {uint64_t count=0,first_ns=0,last_ns=0;};
+    inline static constexpr std::array<const char*,7> labels{{"control-response-ready","range-response-ready",
+        "response-consumed","cohort-retained","admission-deferred","install-committed","resume-committed"}};
+    inline static constexpr std::array<const char*,4> predicate_labels{{"revision1Count","phase","installed2","settledCount"}};
+    std::mutex mutex;
+    const std::chrono::steady_clock::time_point origin=std::chrono::steady_clock::now();
+    const bool idle;
+    std::array<Stage,7> stages{};
+    std::array<int64_t,4> predicates{};
+    std::array<bool,4> evaluated{};
+    uint64_t other=0,evaluations=0;
+    std::atomic<bool> observation_failed{false};
+    explicit ControllerWorkerTrace(bool idle_start):idle(idle_start){}
+    void observe(const char* label) noexcept {
+        try {size_t index=labels.size();
+            for(size_t n=0;n<labels.size();++n)if(std::strcmp(label,labels[n])==0){index=n;break;}
+            const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-origin).count();
+            const auto now=static_cast<uint64_t>(std::max<int64_t>(0,elapsed));
+            std::lock_guard lock(mutex);
+            if(index==labels.size()){ControllerBoundaryTrace::increment(other);return;}
+            auto& stage=stages[index];if(!stage.count)stage.first_ns=now;
+            else stage.first_ns=std::min(stage.first_ns,now);
+            stage.last_ns=std::max(stage.last_ns,now);ControllerBoundaryTrace::increment(stage.count);
+        }catch(...){observation_failed.store(true);}
+    }
+    void begin_predicate() noexcept {
+        try {std::lock_guard lock(mutex);evaluated.fill(false);ControllerBoundaryTrace::increment(evaluations);}
+        catch(...){observation_failed.store(true);}
+    }
+    template<class T>T value(size_t index,T copied) noexcept {
+        try {std::lock_guard lock(mutex);if(index<predicates.size()){predicates[index]=static_cast<int64_t>(copied);evaluated[index]=true;}}
+        catch(...){observation_failed.store(true);}return copied;
+    }
+    void report() noexcept {
+        try {std::array<Stage,7> copied_stages;std::array<int64_t,4> copied_predicates;std::array<bool,4> copied_evaluated;
+            uint64_t copied_other,copied_evaluations;
+            {std::lock_guard lock(mutex);copied_stages=stages;copied_predicates=predicates;copied_evaluated=evaluated;
+                copied_other=other;copied_evaluations=evaluations;}
+            json rows=json::array(),values=json::object();
+            for(size_t n=0;n<labels.size();++n){const auto& stage=copied_stages[n];
+                json row={{"stage",labels[n]},{"count",stage.count}};
+                if(stage.count){row["firstNanoseconds"]=stage.first_ns;row["lastNanoseconds"]=stage.last_ns;}rows.push_back(std::move(row));}
+            for(size_t n=0;n<predicate_labels.size();++n){json value={{"evaluated",copied_evaluated[n]}};
+                if(copied_evaluated[n])value["value"]=copied_predicates[n];values[predicate_labels[n]]=std::move(value);}
+            const json report={{"scope",idle?"startIdle":"firstInstall"},{"stages",std::move(rows)},
+                {"otherStageCount",copied_other},{"predicateEvaluations",copied_evaluations},{"lastPredicate",std::move(values)},
+                {"observationFailed",observation_failed.load()}};
+            std::cerr<<"controller worker observation: "<<report.dump()<<std::endl;
+        }catch(...){/* The original predicate failure remains authoritative. */}
+    }
+};
 std::string controller_uuid(unsigned n){char out[37];std::snprintf(out,sizeof(out),"80000000-0000-4000-8000-%012u",n);return out;}
 swift_schema_entry controller_schema(){swift_schema_entry out;out.table_name="ControllerRow";property_descriptor p{};
     p.name="value";p.type=column_type::text;p.kind=property_kind::primitive;out.properties[p.name]=p;
@@ -252,6 +306,7 @@ protected:
     struct Peer {std::string channel,endpoint,ns;json expectation;relay_recovery_setup setup;std::shared_ptr<std::atomic<bool>> live=std::make_shared<std::atomic<bool>>(true);platform_transport_callbacks physical;uint64_t trace_connection=0;};
     std::vector<Peer> peers;
     ControllerBoundaryTrace boundary_trace;
+    std::shared_ptr<ControllerWorkerTrace> worker_trace;
     continuous_policy policy;
     std::vector<std::string> requests,errors;std::mutex errors_mutex;
     std::deque<ControllerWire::Frame> held_uploads;
@@ -406,6 +461,14 @@ protected:
         }
         return true;
     }
+    std::function<void(const char*)> worker_observer(bool idle,std::function<void(const char*)> prior={}) {
+        worker_trace=std::make_shared<ControllerWorkerTrace>(idle);const auto trace=worker_trace;
+        return [trace,prior=std::move(prior)](const char* stage){
+            // Preserve any original restriction/side effect before observing.
+            // If it throws, its original error wins and this event is unobserved.
+            if(prior)prior(stage);trace->observe(stage);
+        };
+    }
     void report_until_failure() noexcept {
         // Failure-only copies of already observed fixture facts. No owner,
         // SQLite, transport, controller inspection or extra predicate call.
@@ -422,6 +485,7 @@ protected:
             std::cerr<<"controller timeout observation: "<<observation.dump()<<std::endl;
         }catch(...){/* Observation cannot alter the original failure result. */}
         boundary_trace.report();
+        if(worker_trace)worker_trace->report();
     }
     template<class F> bool until(F predicate,int milliseconds=5000) {const auto end=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
         ControllerBoundaryTrace::WaitScope observation(boundary_trace);
@@ -483,9 +547,11 @@ TEST_F(RecoveryReceiverController, InstalledReopenUsesExactFramingAndKeepsOrigin
     EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),rows);
 }
 TEST_F(RecoveryReceiverController, NextBarrierReopensWithPriorInstalledFraming) {
-    configure();insert(*source,controller_uuid(125),"source");connect();
-    ASSERT_TRUE(until([&]{return scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1&&phase()==0;}));
-    close_receiver();open_receiver();
+    configure();insert(*source,controller_uuid(125),"source");
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),worker_observer(false));connect();
+    ASSERT_TRUE(until([&]{worker_trace->begin_predicate();return worker_trace->value(0,scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1"))==1&&worker_trace->value(1,phase())==0;}));
+    worker_trace.reset(); // This diagnostic scope ends with the first installation.
+    close_receiver();probe.reset();open_receiver();
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[](const char* stage){if(std::strcmp(stage,"barrier-committed")==0)throw db_error("fixture process stop after next barrier commit");});
     connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),1);
     const auto prior=receiver->db().query("SELECT request_frame,manifest_frame FROM _lattice_recovery_request");
@@ -2157,12 +2223,12 @@ protected:
         configure();seed_local(1,9540);hold_uploads=false;
         after_control=[this](size_t,const json& control,std::string& outgoing){if(control.at("operation")=="describe")actual_describe=outgoing;};
         const auto rejected_count=rejected,retired_count=retired;
-        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),worker_observer(true,[=](const char* stage){
             if(std::strcmp(stage,"late-lifecycle-validation-rejected")==0){++*rejected_count;if(rejection_pause)rejection_pause->wait();}
-            if(std::strcmp(stage,"late-lifecycle-retired-disposed")==0)++*retired_count;});
+            if(std::strcmp(stage,"late-lifecycle-retired-disposed")==0)++*retired_count;}));
         // The first install releases the UNSENT original. Its real upload
         // and legacy ACK request the second, receipt-bearing installation.
-        connect();ASSERT_TRUE(until([&]{return installed(2)&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2")==1;}));
+        connect();ASSERT_TRUE(until([&]{worker_trace->begin_predicate();return worker_trace->value(2,installed(2))&&worker_trace->value(3,scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2"))==1;}));
         ASSERT_FALSE(has_error());ASSERT_FALSE(actual_describe.empty());ASSERT_EQ(observed_uploads.size(),1u);
         ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)>0"),1);
         ASSERT_EQ(json::parse(full_requests.at(0).at("request").get<std::string>()).at("latticeCanonicalRange").at("attempt").at("sequence"),"2");

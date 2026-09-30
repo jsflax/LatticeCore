@@ -24,6 +24,9 @@ public:
 // Source-test failure at the actual boundary after both capacity reservations
 // and before service registration or any child/factory allocation.
 extern thread_local std::function<void()> before_service_registration;
+// Failure injection after actual transport construction but before a route or
+// native retirement reservation is installed. It supplies no cleanup fact.
+extern thread_local std::function<void()> after_transport_creation;
 extern thread_local std::shared_ptr<const std::function<void(uint64_t,uint64_t)>> before_backoff_publication;
 }
 class configured_recovery_connection;
@@ -46,6 +49,10 @@ public:
     std::atomic<bool> construction_finished{false},wrapper_destroyed{false};
     std::atomic<bool> factory_entered{false},retirement_started{false};
     bool native_asserted=false;
+    // The base destructor writes this exact cell, including when its derived
+    // constructor unwinds without ever returning a physical pointer. Install
+    // before fallible setup; read only after actual destruction has returned.
+    std::shared_ptr<std::exception_ptr> destructor_error;
     std::exception_ptr primary_error,cleanup_error;
     configured_attempt(platform_retirement_receipt,std::shared_ptr<configured_retirement_registry>,
         std::shared_ptr<network_factory>,configured_platform_factory*);

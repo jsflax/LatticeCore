@@ -692,6 +692,11 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 }
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
     std::shared_ptr<detail::configured_attempt> configured) {
+#ifndef __EMSCRIPTEN__
+    // Retain the actual base-destructor result before route/config/factory
+    // setup can throw. No returned synchronizer is required to read it later.
+    if(configured)configured->destructor_error=cleanup_error_;
+#endif
     continuous_route_=detail::recovery_continuous_producer::admit_route(owned_db_,config,false);
     config_ = config;
     log_label_cache_ = config_.log_label;
@@ -725,6 +730,10 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 #endif
     {auto factory=get_network_factory();ws_client_=factory->create_sync_transport(scheduler_);}
     if(!ws_client_)throw db_error("synchronizer requires transport");
+#ifndef __EMSCRIPTEN__
+    if(configured&&detail::configured_recovery_test_hooks::after_transport_creation)
+        detail::configured_recovery_test_hooks::after_transport_creation();
+#endif
     recovery_export_route_ = std::make_shared<detail::recovery_export_route>(ws_client_,callback_lifetime_);
 #ifndef __EMSCRIPTEN__
     if(configured){

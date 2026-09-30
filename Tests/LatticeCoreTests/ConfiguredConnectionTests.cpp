@@ -316,4 +316,76 @@ TEST_F(ConfiguredConnectionOwner, CopiedTerminalCallbackCanCloseWithoutJoiningIt
     EXPECT_TRUE(owner->close_checked().cleanup_complete);
     EXPECT_EQ(factory->wire->snapshot().dials,1u);EXPECT_EQ(factory->wire->snapshot().requests,1u);
 }
+
+TEST(ConfiguredConnectionConstruction, FailedConstructorRetainsActualDestructorErrorSeparately) {
+    struct construction_state {
+        std::exception_ptr primary=std::make_exception_ptr(db_error("actual constructor failure after transport"));
+        std::exception_ptr cleanup=std::make_exception_ptr(db_error("actual transport disconnect failure"));
+        platform_retirement_receipt receipt;
+        std::atomic<size_t> factories{0},disconnects{0},requests{0};
+        bool fail_cleanup=false;
+    };
+    class construction_factory final:public network_factory,public configured_platform_factory {
+    public:
+        const std::shared_ptr<construction_state> observed;
+        explicit construction_factory(std::shared_ptr<construction_state> s):observed(std::move(s)){}
+        std::unique_ptr<http_client> create_http_client()override{return std::make_unique<null_http_client>();}
+        std::unique_ptr<sync_transport> create_sync_transport()override{throw db_error("unexpected legacy factory");}
+        std::unique_ptr<sync_transport> create_configured_sync_transport(std::shared_ptr<scheduler> actual,
+            const platform_retirement_receipt& receipt)override{
+            if(!actual||!receipt.valid())throw db_error("missing actual construction custody");
+            ++observed->factories;observed->receipt=receipt;
+            const auto state=observed;
+            // This adapter allocates no OS resource, endpoint, or async work.
+            // Its actual disconnect still reports a distinct native error.
+            if(!configured_retirement_registry::instance()->bind_request(receipt,[state](platform_retirement_receipt exact){
+                ++state->requests;exact.complete_adapter_cleanup(0);
+            }))throw db_error("actual empty adapter request registration failed");
+            return std::make_unique<generic_sync_transport>(state.get(),
+                [](void*,const void*,const void*){},
+                [](void* p){auto& actual=*static_cast<construction_state*>(p);++actual.disconnects;
+                    if(actual.fail_cleanup)std::rethrow_exception(actual.cleanup);},
+                [](void*){return transport_state::closed;},
+                [](void*,const void*){});
+        }
+    };
+    struct restore_hook {
+        std::function<void()> prior=std::move(configured_recovery_test_hooks::after_transport_creation);
+        ~restore_hook(){configured_recovery_test_hooks::after_transport_creation=std::move(prior);}
+    } restore;
+    const auto registry=configured_retirement_registry::instance();
+    // Compare the same real construction failure with successful teardown and
+    // with an actual teardown exception. The primary error is never cleanup proof.
+    for(const bool fail_cleanup:{false,true}){
+        const auto before=registry->charged_owners();
+        auto observed=std::make_shared<construction_state>();observed->fail_cleanup=fail_cleanup;
+        auto factory=std::make_shared<construction_factory>(observed);
+        auto scheduled=std::make_shared<std_thread_scheduler>();
+        auto parent=std::make_shared<lattice_db>(configuration(":memory:",scheduled));
+        auto control=configured_recovery_connection::create(parent,sync_config{},factory,factory.get(),[parent]{return parent;});
+        configured_recovery_test_hooks::after_transport_creation=[observed]{std::rethrow_exception(observed->primary);};
+        std::exception_ptr caught;
+        try{control->start();}catch(...){caught=std::current_exception();control->abandon_start(caught);}
+        EXPECT_EQ(caught,observed->primary);
+        const auto closed=control->close(std::chrono::steady_clock::now()+std::chrono::seconds(5));
+        EXPECT_EQ(closed.error,observed->primary);EXPECT_EQ(observed->factories.load(),1u);
+        EXPECT_EQ(observed->disconnects.load(),1u);EXPECT_EQ(observed->requests.load(),1u);
+        if(fail_cleanup){
+            EXPECT_EQ(closed.cleanup_error,observed->cleanup);EXPECT_FALSE(closed.cleanup_complete);
+            const auto actual=registry->snapshot(observed->receipt);
+            EXPECT_TRUE(actual.adapter_complete);EXPECT_TRUE(actual.native_complete);
+            EXPECT_TRUE(actual.quarantined);EXPECT_EQ(actual.first_error,-4);
+            EXPECT_FALSE(registry->collect_completed(observed->receipt));
+            EXPECT_EQ(registry->charged_owners(),before+1);
+            // The failed native attempt remains in one fixed charged slot.
+            // The fixture can separately close its resource-empty in-memory
+            // parent and join its actual scheduler; this cannot clear the error.
+            EXPECT_TRUE(parent->close_checked().cleanup_complete);scheduled->shutdown();
+            EXPECT_TRUE(registry->snapshot(observed->receipt).quarantined);
+        }else{
+            EXPECT_FALSE(closed.cleanup_error);EXPECT_TRUE(closed.cleanup_complete);
+            EXPECT_EQ(registry->charged_owners(),before);
+        }
+    }
+}
 #endif

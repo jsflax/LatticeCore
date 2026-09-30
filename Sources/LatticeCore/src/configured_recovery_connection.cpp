@@ -24,6 +24,7 @@ configured_recovery_test_hooks::successor_permission::successor_permission()noex
     :prior_(qualifying_configured_successors){qualifying_configured_successors=true;}
 configured_recovery_test_hooks::successor_permission::~successor_permission(){qualifying_configured_successors=prior_;}
 thread_local std::function<void()> configured_recovery_test_hooks::before_service_registration;
+thread_local std::function<void()> configured_recovery_test_hooks::after_transport_creation;
 thread_local std::shared_ptr<const std::function<void(uint64_t,uint64_t)>> configured_recovery_test_hooks::before_backoff_publication;
 
 // Fixed records, one event/timer dispatcher and one bounded cleanup lane. The
@@ -279,9 +280,16 @@ void configured_recovery_connection::construct_attempt(){
         attempt->construction_finished=true;
     }catch(...){
         {std::lock_guard<std::mutex> lock(state_->mutex);
-            attempt->primary_error=std::current_exception();attempt->construction_finished=true;
-            if(!attempt->physical)attempt->wrapper_destroyed=true;
+            attempt->primary_error=std::current_exception();
+            if(!attempt->physical){
+                // The failed constructor (or local unpublished unique_ptr)
+                // has already run the real base destructor before this catch.
+                if(attempt->destructor_error)attempt->cleanup_error=*attempt->destructor_error;
+                attempt->wrapper_destroyed=true;
+            }
             state_->close_result.remember(attempt->primary_error,false);
+            state_->close_result.remember(attempt->cleanup_error);
+            attempt->construction_finished=true;
         }
         request_renewal(attempt);throw;
     }
@@ -558,9 +566,11 @@ void configured_recovery_connection::finalize()noexcept{
             else if(pending)configured_control_service::instance().wake(state_->service_slot,this);
             return;
         }
-        const auto cleanup=physical?physical->cleanup_error_:std::shared_ptr<std::exception_ptr>{};
         physical.reset();
-        {std::lock_guard<std::mutex> lock(state_->mutex);state_->cleanup_running=false;attempt->wrapper_destroyed=true;if(cleanup)attempt->cleanup_error=*cleanup;}
+        {std::lock_guard<std::mutex> lock(state_->mutex);state_->cleanup_running=false;
+            if(attempt->destructor_error)attempt->cleanup_error=*attempt->destructor_error;
+            state_->close_result.remember(attempt->cleanup_error);attempt->wrapper_destroyed=true;
+        }
         notify();return;
     }
     std::shared_ptr<lattice_db> child;std::shared_ptr<scheduler> scheduled;

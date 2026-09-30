@@ -3019,5 +3019,90 @@ TEST_F(AuthenticatedReadySession, ObservedResumeRefusalCopiesActualPrimaryWithou
     EXPECT_FALSE(facts.resume_expiry_clock_observed);EXPECT_EQ(facts.resume_expiry_clock_ms,-1);EXPECT_FALSE(facts.resume_lease_available);
     EXPECT_EQ(exact_source(),before);
 }
+
+class CanonicalSchemaCacheContinuity:public AuthenticatedReceiptMigrationClosure {
+protected:
+    int64_t cookie() {return std::get<int64_t>(owner->db().query("PRAGMA main.schema_version").at(0).at("schema_version"));}
+    Rows markers() {return owner->db().query("SELECT key,value FROM main._lattice_meta WHERE substr(key,1,19)='schema_fingerprint:' ORDER BY key");}
+    Rows metadata() {return owner->db().query("SELECT key,value FROM main._lattice_meta ORDER BY key");}
+    std::string key(const Rows& rows,size_t n) {return std::get<std::string>(rows.at(n).at("key"));}
+    void expect_current(const Rows& original) {
+        const auto actual=markers();ASSERT_EQ(actual.size(),original.size());
+        for(size_t n=0;n<actual.size();++n) {
+            EXPECT_EQ(actual[n].at("key"),original[n].at("key"));
+            EXPECT_EQ(std::get<std::string>(actual[n].at("value")),std::to_string(cookie()));
+        }
+    }
+};
+TEST_F(CanonicalSchemaCacheContinuity, ValidOwnerMarkersSurviveCanonicalEnrollmentAndOrdinaryReopenWithoutRowChanges) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);expect_current(before);
+    const auto initial_cookie=cookie();open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_GT(cookie(),initial_cookie);expect_current(before);
+    setup.close_on_io();setup={};const auto enrolled=all_state();const auto enrolled_cookie=cookie();
+    owner->close();owner.reset();ref.reset();recreate_owner();
+    EXPECT_EQ(cookie(),enrolled_cookie);EXPECT_EQ(all_state(),enrolled);expect_current(before);
+    EXPECT_EQ(sqlite3_total_changes(detail::canonical_writer_custody_test_access::fault_handle(owner->db())),0);
+}
+TEST_F(CanonicalSchemaCacheContinuity, ExternalDdlLeavesStaleOwnerAndUnrelatedMarkersUntouched) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);expect_current(before);
+    owner->db().execute("CREATE TABLE SchemaCacheExternalDrift(value TEXT)");
+    const auto drift_cookie=cookie();
+    owner->db().execute("INSERT INTO main._lattice_meta(key,value) VALUES(?,?)",
+        {std::string("schema_fingerprint:unrelated-owner"),std::to_string(drift_cookie)});
+    const auto stale=metadata();open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_GT(cookie(),drift_cookie);EXPECT_EQ(metadata(),stale);
+}
+TEST_F(CanonicalSchemaCacheContinuity, MissingAndMalformedOwnerMarkersAreNeverCreatedOrNormalized) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);
+    owner->db().execute("DELETE FROM main._lattice_meta WHERE key=?",{key(before,0)});
+    owner->db().execute("UPDATE main._lattice_meta SET value=? WHERE key=?",{std::to_string(cookie())+"trailing",key(before,1)});
+    const auto untrusted=metadata();open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_EQ(metadata(),untrusted);EXPECT_EQ(markers().size(),1u);
+}
+TEST_F(CanonicalSchemaCacheContinuity, OnlyTheValidCurrentOwnerMarkerMovesAndForeignMarkersAreNotPruned) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);const auto stale_key=key(before,0),valid_key=key(before,1);
+    owner->db().execute("UPDATE main._lattice_meta SET value='-1' WHERE key=?",{stale_key});
+    owner->db().execute("INSERT INTO main._lattice_meta(key,value) VALUES('schema_fingerprint:other-binary','-7')");
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_EQ(owner->db().query("SELECT value FROM main._lattice_meta WHERE key=?",{stale_key}).at(0).at("value"),column_value_t{std::string("-1")});
+    EXPECT_EQ(owner->db().query("SELECT value FROM main._lattice_meta WHERE key=?",{valid_key}).at(0).at("value"),column_value_t{std::to_string(cookie())});
+    EXPECT_EQ(owner->db().query("SELECT value FROM main._lattice_meta WHERE key='schema_fingerprint:other-binary'").at(0).at("value"),column_value_t{std::string("-7")});
+    EXPECT_EQ(markers().size(),3u);
+}
+TEST_F(CanonicalSchemaCacheContinuity, BeforeWriteDdlCannotReuseThePreflightCookie) {
+    const auto before=metadata();unsigned calls=0;
+    const std::function<void(lattice_db&)> hook=[&](lattice_db& actual) {
+        if(&actual!=owner.get())throw std::runtime_error("schema-cache fixture owner mismatch");
+        ++calls;actual.db().execute("CREATE TABLE SchemaCacheBeforeWrite(value TEXT)");
+    };
+    struct Restore {
+        const std::function<void(lattice_db&)>* previous;
+        ~Restore(){detail::authenticated_relay_catalog_test_access::before_write(previous);}
+    } restore{detail::authenticated_relay_catalog_test_access::before_write(&hook)};
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_EQ(calls,1u);EXPECT_EQ(metadata(),before);
+}
+TEST_F(CanonicalSchemaCacheContinuity, MetadataTriggerPreventsCarryForwardAndNeverRunsDuringEnrollment) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);
+    owner->db().execute("CREATE TABLE SchemaCacheTriggerProbe(value INTEGER)");
+    owner->db().execute("CREATE TRIGGER SchemaCacheUnknownMetadata AFTER UPDATE ON _lattice_meta BEGIN INSERT INTO SchemaCacheTriggerProbe VALUES(1); END");
+    // Deliberately make both markers numerically current after the unknown DDL.
+    // This must not authorize the new implementation to invoke its trigger.
+    for(const auto& row:before)owner->db().execute("UPDATE main._lattice_meta SET value=? WHERE key=?",{std::to_string(cookie()),row.at("key")});
+    owner->db().execute("DELETE FROM SchemaCacheTriggerProbe");const auto held=metadata();
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_EQ(count("SchemaCacheTriggerProbe"),0);EXPECT_EQ(metadata(),held);
+}
+TEST_F(CanonicalSchemaCacheContinuity, ActualMigrationCommitDenialRestoresCookieMarkersAndEveryPriorRow) {
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();setup.close_on_io();setup={};
+    const auto before=all_state();const auto before_cookie=cookie();const auto prior_markers=markers();expect_current(prior_markers);
+    {
+        ReceiptMigrationCommitDenial fault(owner->db());
+        const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
+        EXPECT_EQ(result,4);EXPECT_EQ(fault.hits,1);EXPECT_FALSE(last_bridge_error().empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(cookie(),before_cookie);EXPECT_EQ(all_state(),before);
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    EXPECT_GT(cookie(),before_cookie);expect_current(prior_markers);
+}
 }
 #endif

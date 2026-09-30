@@ -512,6 +512,47 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
             refuse("canonical REPLACE coverage needs recursive triggers");
         if(namespaces && namespace_before_write_test_hook_)(*namespace_before_write_test_hook_)(owner);
         const auto setup_owned=[&] {
+        // Canonical-owned DDL must not make an already validated ordinary
+        // owner re-run schema setup on its next open. Retain at most this
+        // owner's two exact markers, within this actual WRITE and before DDL.
+        // This is not schema validation: stale/missing/foreign markers remain
+        // untouched. Closed administrative adoption has separate authority.
+        std::array<std::string,2> valid_fingerprints{};
+        size_t valid_fingerprint_count=0;
+        std::string prior_schema_cookie;
+        const auto plain_metadata=[&] {
+            const auto objects=writer_->query("SELECT type,name,CASE WHEN length(CAST(sql AS BLOB))<=256 THEN sql END AS sql "
+                "FROM main.sqlite_master WHERE name='_lattice_meta' OR tbl_name='_lattice_meta' ORDER BY type,name LIMIT 3");
+            if(objects.size()!=2)return false;
+            bool table=false,index=false;
+            for(const auto& row:objects) {
+                const auto type=string(row,"type"),name=string(row,"name");
+                if(type=="index"&&name=="sqlite_autoindex__lattice_meta_1"&&std::holds_alternative<std::nullptr_t>(row.at("sql")))index=true;
+                else if(type=="table"&&name=="_lattice_meta") {
+                    const auto* sql=std::get_if<std::string>(&row.at("sql"));if(!sql)return false;
+                    std::string compact;compact.reserve(sql->size());
+                    for(const char c:*sql)if(c!=' '&&c!='\n'&&c!='\r'&&c!='\t')compact+=c;
+                    table=compact=="CREATETABLE_lattice_meta(keyTEXTPRIMARYKEY,valueTEXTNOTNULL)";
+                } else return false;
+            }
+            return table&&index;
+        };
+        if(!adoption&&plain_metadata()) {
+            if(recovery_writer_access::active_writer(owner)!=writer_.get())
+                refuse("canonical schema cache requires the actual owned WRITE");
+            const auto cookie=owner.read_schema_cookie();
+            if(cookie>=0) {
+                prior_schema_cookie=std::to_string(cookie);
+                const std::array<std::string,2> keys{owner.compute_core_fingerprint_key(),catalog.swift_fingerprint};
+                for(const auto& key:keys) {
+                    if(key.empty()||(valid_fingerprint_count&&key==valid_fingerprints[0]))continue;
+                    const auto rows=writer_->query("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=20 THEN value END AS value "
+                        "FROM main._lattice_meta WHERE key=? LIMIT 2",{key});
+                    if(rows.size()==1)if(const auto* value=std::get_if<std::string>(&rows[0].at("value"));value&&*value==prior_schema_cookie)
+                        valid_fingerprints[valid_fingerprint_count++]=key;
+                }
+            }
+        }
         if(namespaces) {
             // Preflight is only a refusal optimization. BEGIN IMMEDIATE now
             // excludes sibling writes: make the no-adoption decision here,
@@ -782,6 +823,20 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
         }
         if(retention)enroll_retention(owner,reopen);
         store.audit();
+        if(valid_fingerprint_count) {
+            if(recovery_writer_access::active_writer(owner)!=writer_.get()||!plain_metadata())
+                refuse("canonical schema cache lost its owned metadata shape");
+            const auto cookie=owner.read_schema_cookie();if(cookie<0)refuse("canonical schema cache cookie unavailable");
+            const auto current=std::to_string(cookie);
+            if(current!=prior_schema_cookie)for(size_t n=0;n<valid_fingerprint_count;++n) {
+                const auto& key=valid_fingerprints[n];
+                writer_->execute("UPDATE main._lattice_meta SET value=? WHERE key=? AND typeof(value)='text' AND CAST(value AS BLOB)=CAST(? AS BLOB)",
+                    {current,key,prior_schema_cookie});
+                const auto rows=writer_->query("SELECT value FROM main._lattice_meta WHERE key=? LIMIT 2",{key});
+                if(rows.size()!=1||!std::holds_alternative<std::string>(rows[0].at("value"))||std::get<std::string>(rows[0].at("value"))!=current)
+                    refuse("canonical schema cache carry-forward refused");
+            }
+        }
         // A migrated source has finished all schema work. Restore normal
         // protection before COMMIT and its reentrant notification tail; test
         // restrictions can deny this genuine COMMIT without replacing hooks.

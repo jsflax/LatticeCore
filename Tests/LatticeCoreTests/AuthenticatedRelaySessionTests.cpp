@@ -2081,8 +2081,15 @@ TEST_F(AuthenticatedPredecessor, CommitDenialWithholdsFactsAndSecondaryErrorKeep
 }
 TEST_F(AuthenticatedPredecessor, PostcommitRevocationWithholdsFactsWithoutRelabelingCommit) {
     adopt();ASSERT_FALSE(HasFatalFailure());const auto c=proof_command();const auto before=exact_source();const auto stop=setup.stop_token();
-    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([stop](const auto&,auto){stop.stop();})};
-    const auto result=invoke(setup,c);ASSERT_EQ(result.status_code(),1);EXPECT_FALSE(result.publishable());const auto answer=json::parse(result.wire());
+    const auto callback_thread=std::this_thread::get_id();const auto callbacks=std::make_shared<std::atomic<unsigned>>(0);
+    // Copied callbacks own all captured state even after hook removal.
+    // Only this synchronous proof COMMIT may revoke, never background maintenance.
+    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([stop,callback_thread,callbacks](const auto&,auto reason){
+        if(std::this_thread::get_id()!=callback_thread||reason!=lattice_db::invalidation_reason::commit)return;
+        callbacks->fetch_add(1,std::memory_order_relaxed);stop.stop();
+    })};
+    const auto result=invoke(setup,c);EXPECT_EQ(callbacks->load(std::memory_order_relaxed),1u);
+    ASSERT_EQ(result.status_code(),1);EXPECT_FALSE(result.publishable());const auto answer=json::parse(result.wire());
     EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
 }
 TEST_F(AuthenticatedPredecessor, OffPageCorruptionPreventsProvenancePublicationBeforeAnyCleanup) {

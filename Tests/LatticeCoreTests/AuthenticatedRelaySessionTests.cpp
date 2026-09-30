@@ -3083,14 +3083,17 @@ TEST_F(CanonicalSchemaCacheContinuity, BeforeWriteDdlCannotReuseThePreflightCook
 }
 TEST_F(CanonicalSchemaCacheContinuity, MetadataTriggerPreventsCarryForwardAndNeverRunsDuringEnrollment) {
     const auto before=markers();ASSERT_EQ(before.size(),2u);
-    owner->db().execute("CREATE TABLE SchemaCacheTriggerProbe(value INTEGER)");
-    owner->db().execute("CREATE TRIGGER SchemaCacheUnknownMetadata AFTER UPDATE ON _lattice_meta BEGIN INSERT INTO SchemaCacheTriggerProbe VALUES(1); END");
+    // This is an internal counter, not a model with id/globalId columns.
+    owner->db().execute("CREATE TABLE _SchemaCacheTriggerProbe(value INTEGER)");
+    owner->db().execute("CREATE TRIGGER SchemaCacheUnknownMetadata AFTER UPDATE ON _lattice_meta BEGIN INSERT INTO _SchemaCacheTriggerProbe VALUES(1); END");
     // Deliberately make both markers numerically current after the unknown DDL.
     // This must not authorize the new implementation to invoke its trigger.
     for(const auto& row:before)owner->db().execute("UPDATE main._lattice_meta SET value=? WHERE key=?",{std::to_string(cookie()),row.at("key")});
-    owner->db().execute("DELETE FROM SchemaCacheTriggerProbe");const auto held=metadata();
+    ASSERT_EQ(count("_SchemaCacheTriggerProbe"),static_cast<int64_t>(before.size()));
+    owner->db().execute("DELETE FROM _SchemaCacheTriggerProbe");const auto held=metadata();
+    ASSERT_EQ(count("_SchemaCacheTriggerProbe"),0);
     open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
-    EXPECT_EQ(count("SchemaCacheTriggerProbe"),0);EXPECT_EQ(metadata(),held);
+    EXPECT_EQ(count("_SchemaCacheTriggerProbe"),0);EXPECT_EQ(metadata(),held);
 }
 TEST_F(CanonicalSchemaCacheContinuity, ActualMigrationCommitDenialRestoresCookieMarkersAndEveryPriorRow) {
     open();ASSERT_TRUE(setup.valid())<<last_bridge_error();setup.close_on_io();setup={};

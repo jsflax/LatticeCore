@@ -169,7 +169,7 @@ public:
 class ConfiguredConnectionOwner:public ::testing::Test {
 protected:
     TempDB unique{"configured-owner"};
-    std::filesystem::path container=unique.str()+".continuous";
+    std::filesystem::path container=unique.str()+".lattice-continuous";
     std::shared_ptr<network_factory> prior;
     std::shared_ptr<configured_test_factory> factory=std::make_shared<configured_test_factory>();
     std::shared_ptr<lattice_db> owner;
@@ -186,7 +186,15 @@ protected:
         config.tuning.base_delay_seconds=0.01;config.tuning.max_delay_seconds=0.01;
         config.tuning.checkpoint_passive_interval_ms=0;
         auto opened=recovery_continuous_producer::open(config,policy);
-        ASSERT_EQ(opened.settlement.state,recovery_install_state::committed);
+        const auto primary_error=[&] {
+            std::string message;
+            if(opened.settlement.primary_error)try{std::rethrow_exception(opened.settlement.primary_error);}
+            catch(const std::exception& error){const auto* text=error.what();
+                for(size_t n=0;text&&n<256&&text[n];++n)message+=text[n];}
+            catch(...){message="non-standard primary exception";}
+            return message;
+        };
+        ASSERT_EQ(opened.settlement.state,recovery_install_state::committed)<<primary_error();
         ASSERT_FALSE(opened.settlement.primary_error);ASSERT_FALSE(opened.settlement.postcommit_error);
         ASSERT_TRUE(opened.owner);owner=std::move(opened.owner);
         ASSERT_TRUE(factory->wire->wait(1));

@@ -76,6 +76,13 @@ unsealed_canonical_capture capture_canonical_source(lattice_db&,
     std::optional<int64_t> base, const std::vector<canonical_capture_request>&,
     const canonical_capture_limits&);
 namespace source_test_hooks {
+// Same unsealed, synchronous read primitive with an explicit namespaced
+// profile. Qualification only: no admission, publication or proof escapes.
+unsealed_canonical_capture capture_canonical_namespaced(lattice_db&,
+    const canonical_store_binding&, const std::vector<source_relation>&,
+    std::optional<int64_t>, const std::vector<canonical_capture_request>&,
+    const canonical_capture_limits&, const canonical_namespace_profile&,
+    const std::function<void(size_t,uint64_t)>& after_batch={});
 unsealed_canonical_capture capture_canonical(lattice_db&,
     const canonical_store_binding&, const std::vector<source_relation>&,
     std::optional<int64_t>, const std::vector<canonical_capture_request>&,

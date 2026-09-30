@@ -11,6 +11,46 @@
 #include <tuple>
 
 namespace lattice::detail::sync_recovery {
+class canonical_source_view {
+    std::unique_ptr<canonical_coverage_snapshot> coverage_;
+public:
+    lattice_db& owner;
+    uint64_t generation;
+    explicit canonical_source_view(lattice_db& db) : owner(db), generation(db.acquire_read_generation()) {
+        if(!generation)throw protocol_error("source view unavailable");
+    }
+    ~canonical_source_view() noexcept {
+        if (generation) {
+            try { owner.release_read_generation(generation); }
+            catch (...) {} // Preserve a failed capture; no successful artifact is returned.
+        }
+    }
+    void finish() {
+        const auto held = generation; generation = 0;
+        owner.release_read_generation(held); // success path propagates cleanup failure
+    }
+    std::vector<database::row_t> query(const std::string& sql, const std::vector<column_value_t>& params = {}) {
+        auto result = owner.query_at_generation(generation, sql, params);
+        if(!result)throw protocol_error("source view retired or read failed"); return std::move(*result);
+    }
+    void audit_coverage(const canonical_coverage_profile& profile) {
+        if(coverage_)throw protocol_error("source coverage already captured");
+        const auto read=[&](const std::string& sql,const std::vector<column_value_t>& values){return query(sql,values);};
+        audit_canonical_coverage(read,profile);
+        // Same actual pinned generation as the audit and every addressed read.
+        coverage_.reset(new canonical_coverage_snapshot(read,profile));
+    }
+    uint64_t coverage_revision()const {
+        if(!coverage_)throw protocol_error("source coverage unavailable");
+        return static_cast<uint64_t>(coverage_->state_.mutation);
+    }
+    canonical_coverage_lookup lookup_coverage(const std::string& original,const std::string& ns,
+        const recovery_receipt_binding& producer,const std::string& digest) {
+        if(!coverage_)throw protocol_error("source coverage unavailable");
+        return coverage_->lookup([&](const std::string& sql,const std::vector<column_value_t>& values){return query(sql,values);},
+            original,ns,producer,digest);
+    }
+};
 namespace {
 void check(bool value, const char* message) { if (!value) throw protocol_error(message); }
 std::string quote_source_identifier(const std::string& name) {
@@ -50,27 +90,7 @@ std::string nocase_key(std::string value) {
     return value;
 }
 
-struct view {
-    lattice_db& owner;
-    uint64_t generation;
-    explicit view(lattice_db& db) : owner(db), generation(db.acquire_read_generation()) {
-        check(generation != 0, "source view unavailable");
-    }
-    ~view() noexcept {
-        if (generation) {
-            try { owner.release_read_generation(generation); }
-            catch (...) {} // Preserve a failed capture; no successful artifact is returned.
-        }
-    }
-    void finish() {
-        const auto held = generation; generation = 0;
-        owner.release_read_generation(held); // success path propagates cleanup failure
-    }
-    std::vector<database::row_t> query(const std::string& sql, const std::vector<column_value_t>& params = {}) {
-        auto result = owner.query_at_generation(generation, sql, params);
-        check(result.has_value(), "source view retired or read failed"); return std::move(*result);
-    }
-};
+using view=canonical_source_view;
 
 void validate_budget(const source_limits& b) {
     // Same finite policy range as the codec, without manufacturing a manifest
@@ -338,9 +358,13 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     std::optional<int64_t> base,const std::vector<canonical_capture_request>& requests,
     const canonical_capture_limits& b,const std::function<void(size_t,uint64_t)>& after_batch,
     source_capture_selection* selection=nullptr, const std::function<void(uint64_t)>& verify_generation={},
-    const canonical_namespace_profile* namespaces=nullptr) {
+    const canonical_namespace_profile* namespace_input=nullptr) {
     validate_budget(b.rows);
-    if(namespaces)namespaces->validate();
+    if(namespace_input)namespace_input->validate();
+    // A caller/test callback may later edit its input profile. Only this bounded
+    // immutable copy participates in the pinned view's proof and lookups.
+    const auto namespace_snapshot=namespace_input?std::optional<canonical_namespace_profile>(*namespace_input):std::nullopt;
+    const auto* namespaces=namespace_snapshot?&*namespace_snapshot:nullptr;
     check(!scope.empty()&&scope.size()<=b.rows.tables&&b.requests>0&&b.requests<=8192&&
         b.requested_targets>0&&b.requested_targets<=8192&&b.marker_batch>0&&b.marker_batch<=4096&&
         requests.size()<=b.requests,"invalid canonical capture limits");
@@ -382,9 +406,8 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
     view held(owner);unsealed_canonical_capture result;
     if(verify_generation)verify_generation(held.generation);
     if(namespaces&&namespaces->coverage){
-        const auto query=[&](const std::string& sql,const std::vector<column_value_t>& values){return held.query(sql,values);};
-        audit_canonical_coverage(query,*namespaces->coverage);
-        result.coverage_revision=static_cast<uint64_t>(read_canonical_coverage(query,*namespaces->coverage).mutation);
+        held.audit_coverage(*namespaces->coverage);
+        result.coverage_revision=held.coverage_revision();
     }
     std::string state_sql="SELECT ";
     for(const char* name:{"id","version","head","floor","markers","marker_bytes","receipts","receipt_bytes",
@@ -527,9 +550,8 @@ unsealed_canonical_capture capture_canonical_impl(lattice_db& owner,
         check(rows.size()<=1,"canonical source receipt identity collision");
         canonical_source_receipt fact{asked.original_id,{}};fact.operation_digest=asked.operation_digest;charge(48+asked.original_id.size()+(asked.operation_digest?72:0));
         auto covered=canonical_coverage_lookup::legacy_original_namespace;
-        if(namespaces&&namespaces->coverage)covered=lookup_canonical_coverage(
-            [&](const std::string& sql,const std::vector<column_value_t>& values){return held.query(sql,values);},
-            *namespaces->coverage,asked.original_id,*asked.namespace_id,*asked.registered_producer,*asked.operation_digest);
+        if(namespaces&&namespaces->coverage)covered=held.lookup_coverage(
+            asked.original_id,*asked.namespace_id,*asked.registered_producer,*asked.operation_digest);
         if(!rows.empty()) {
             const auto& row=rows.front();const auto position=integer(row,"position"),outcome=integer(row,"outcome");
             check(position>0&&position<=result.head&&outcome>=1&&outcome<=3,"canonical source receipt is corrupt");
@@ -606,6 +628,12 @@ owned_canonical_capture canonical_source_session_access::capture(lattice_db& own
     return result;
 }
 namespace source_test_hooks {
+unsealed_canonical_capture capture_canonical_namespaced(lattice_db& owner,const canonical_store_binding& binding,
+    const std::vector<source_relation>& scope,std::optional<int64_t> base,
+    const std::vector<canonical_capture_request>& requests,const canonical_capture_limits& budget,
+    const canonical_namespace_profile& namespaces,const std::function<void(size_t,uint64_t)>& after_batch) {
+    return capture_canonical_impl(owner,binding,scope,base,requests,budget,after_batch,nullptr,{},&namespaces);
+}
 unsealed_canonical_capture capture_canonical(lattice_db& owner,const canonical_store_binding& binding,
     const std::vector<source_relation>& scope,std::optional<int64_t> base,
     const std::vector<canonical_capture_request>& requests,const canonical_capture_limits& budget,

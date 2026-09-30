@@ -20,6 +20,7 @@
 #include <recovery_export.hpp>
 #include <recovery_relay.hpp>
 #include <recovery_continuity.hpp>
+#include <lattice/platform_retirement.hpp>
 #include <list.hpp>
 #include <error.hpp>
 

@@ -58,8 +58,10 @@ void audit_canonical_coverage(const canonical_coverage_query& q,const canonical_
 }
 int64_t canonical_origin_charge(const recovery_producer_registration& p){p.validate();return 160+static_cast<int64_t>(p.registration_id.size()+p.incarnation.size());}
 int64_t canonical_coverage_charge(const std::string& ns){if(ns.empty()||ns.size()>256)refuse("receipt coverage namespace bound");return 80+static_cast<int64_t>(ns.size());}
-canonical_coverage_lookup lookup_canonical_coverage(const canonical_coverage_query& q,const canonical_coverage_profile& p,
-    const std::string& original,const std::string& ns,const recovery_receipt_binding& b,const std::string& digest,const std::optional<std::string>& operation){
+namespace {
+canonical_coverage_lookup lookup_coverage(const canonical_coverage_query& q,const canonical_coverage_profile& p,
+    const std::string& original,const std::string& ns,const recovery_receipt_binding& b,const std::string& digest,
+    const std::optional<std::string>& operation,const canonical_coverage_state* snapshot){
     binding(p,b,ns);if(original.size()!=36||digest.size()!=64)refuse("receipt coverage addressed identity bound");
     const auto rows=q("SELECT CASE WHEN typeof(namespace_id)='blob' AND length(namespace_id) BETWEEN 1 AND 256 THEN namespace_id END AS namespace_id,CASE WHEN typeof(outcome)='integer' THEN outcome END AS outcome FROM main._lattice_canonical_receipt WHERE original_id=? LIMIT 2",{bytes(original)});
     if(rows.empty())return canonical_coverage_lookup::no_original;if(rows.size()!=1)refuse("receipt global identity collision");
@@ -73,8 +75,19 @@ canonical_coverage_lookup lookup_canonical_coverage(const canonical_coverage_que
        (operation&&binary(r,"operation",6)!=*operation)||integer(r,"charge")!=canonical_origin_charge(b.producer))refuse("receipt immutable producer or operation differs");
     const auto cells=q("SELECT CASE WHEN typeof(revision)='integer' THEN revision END AS revision,CASE WHEN typeof(charge)='integer' THEN charge END AS charge FROM main._lattice_canonical_receipt_coverage WHERE original_id=? AND namespace_id=? LIMIT 2",{bytes(original),bytes(ns)});
     if(cells.empty())return canonical_coverage_lookup::missing;
-    const auto state=read_canonical_coverage(q,p);
+    const auto state=snapshot?*snapshot:read_canonical_coverage(q,p);
     if(cells.size()!=1||integer(cells[0],"revision")<=0||integer(cells[0],"revision")>state.mutation||integer(cells[0],"charge")!=canonical_coverage_charge(ns))refuse("receipt addressed coverage corrupt");
     return canonical_coverage_lookup::covered;
+}
+} // namespace
+canonical_coverage_lookup lookup_canonical_coverage(const canonical_coverage_query& q,const canonical_coverage_profile& p,
+    const std::string& original,const std::string& ns,const recovery_receipt_binding& b,const std::string& digest,const std::optional<std::string>& operation){
+    return lookup_coverage(q,p,original,ns,b,digest,operation,nullptr);
+}
+canonical_coverage_snapshot::canonical_coverage_snapshot(const canonical_coverage_query& q,const canonical_coverage_profile& p)
+    :profile_(p),state_(read_canonical_coverage(q,profile_)){}
+canonical_coverage_lookup canonical_coverage_snapshot::lookup(const canonical_coverage_query& q,const std::string& original,
+    const std::string& ns,const recovery_receipt_binding& b,const std::string& digest)const{
+    return lookup_coverage(q,profile_,original,ns,b,digest,std::nullopt,&state_);
 }
 }

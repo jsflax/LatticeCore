@@ -65,6 +65,7 @@ target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
 add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
     Sources/LatticeCore/src/ordinary_store_admission.cpp
+    Sources/LatticeCore/src/ordinary_owned_launch.cpp
     Sources/LatticeCore/src/managed_observation.cpp
     Sources/LatticeCore/src/schema.cpp
     Sources/LatticeCore/src/derived_profile.cpp
@@ -73,6 +74,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/recovery_export_adapter.cpp
     Sources/LatticeCore/src/recovery_server_export.cpp
     Sources/LatticeCore/src/sync_callback_lifetime.cpp
+    Sources/LatticeCore/src/configured_retirement.cpp
     Sources/LatticeCore/src/scoped_recovery_install.cpp
     Sources/LatticeCore/src/recovery_witness.cpp
     Sources/LatticeCore/src/recovery_refresh.cpp
@@ -313,7 +315,9 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
     Tests/LatticeCoreTests/DatabaseRetirementTests.cpp
+    Tests/LatticeCoreTests/ConfiguredRetirementTests.cpp
     Tests/LatticeCoreTests/OrdinaryStoreAdmissionTests.cpp
+    Tests/LatticeCoreTests/OrdinaryOwnedLaunchTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
     Tests/LatticeCoreTests/ManagedObservationTests.cpp

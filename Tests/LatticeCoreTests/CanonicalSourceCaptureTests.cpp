@@ -200,3 +200,125 @@ TEST_F(CanonicalSourceCapture, CounterDriftAndUnrequestedCorruptReceiptsRefuseBe
     const auto got=capture(0,{{id('8'),{key('1')}}});ASSERT_EQ(got.rows.size(),1u);
     ASSERT_TRUE(got.receipts[0].stored);EXPECT_EQ(got.head,h);EXPECT_EQ(db.local_read_generations_outstanding(),0u);
 }
+
+
+#include "../../Sources/LatticeCore/src/canonical_receipt_coverage.hpp"
+#include <type_traits>
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+class CanonicalCoverageSnapshot:public CanonicalSourceCapture {
+protected:
+    using blob=std::vector<uint8_t>;
+    canonical_namespace_profile namespaces{"app",{{"app","app-coverage",1},{"other","other-coverage",1}},
+        canonical_coverage_profile{id('f'),7,{"app","other"}}};
+    recovery_receipt_binding producer{{"capture-producer",id('e')},id('f'),7,1};
+    const std::string digest=std::string(64,'d');
+    static blob bytes(const std::string& value){return {value.begin(),value.end()};}
+    void SetUp()override {
+        db.begin_transaction();canonical_change_store(db,binding,store_limits,&namespaces).initialize();db.commit();
+        if(auto* notifier=lattice::instance_registry::instance().get_or_create_notifier(path.str()))notifier->stop_listening();
+    }
+    std::vector<sr::canonical_capture_request> seed(size_t count) {
+        if(count==0||count>8)throw std::runtime_error("coverage fixture seed bound");
+        std::vector<sr::canonical_capture_request> requests;
+        db.begin_transaction();
+        try {
+            db.db().execute("INSERT INTO CanonicalCaptureRecord(globalId,body,rank) VALUES(?,'stable',1)",{id('1')});
+            canonical_change_store store(db,binding,store_limits,&namespaces);
+            const auto origin_charge=canonical_origin_charge(producer.producer),cell_charge=canonical_coverage_charge("app");
+            for(size_t i=0;i<count;++i) {
+                const auto original=id(static_cast<char>('1'+i));
+                store.record({key('1')},canonical_receipt_request{original,canonical_receipt_outcome::applied,key('1'),"app"});
+                db.db().execute("INSERT INTO _lattice_canonical_receipt_origin VALUES(?,?,?,?,?,?)",
+                    {bytes(original),bytes(producer.producer.registration_id),bytes(producer.producer.incarnation),bytes(digest),bytes("INSERT"),origin_charge});
+                db.db().execute("INSERT INTO _lattice_canonical_receipt_coverage VALUES(?,?,?,?)",
+                    {bytes(original),bytes("app"),static_cast<int64_t>(i+1),cell_charge});
+                requests.push_back({original,{key('1')},"app",producer,digest});
+            }
+            db.db().execute("UPDATE _lattice_canonical_receipt_profile SET mutation=?,origins=?,origin_bytes=?,cells=?,cell_bytes=?",
+                {static_cast<int64_t>(count),static_cast<int64_t>(count),origin_charge*static_cast<int64_t>(count),
+                 static_cast<int64_t>(count),cell_charge*static_cast<int64_t>(count)});
+            store.audit();db.commit();return requests;
+        }catch(...){const auto error=std::current_exception();try{db.rollback();}catch(...){}std::rethrow_exception(error);}
+    }
+    sr::unsealed_canonical_capture covered(const std::vector<sr::canonical_capture_request>& requests,
+        const std::function<void(size_t,uint64_t)>& after={}) {
+        return sr::source_test_hooks::capture_canonical_namespaced(db,binding,scope,{},requests,limits,namespaces,after);
+    }
+};
+}
+TEST(CanonicalCoverageSnapshotAccess, ProofCannotBeConstructedFromMutableStateOrCopiedOut) {
+    static_assert(!std::is_default_constructible_v<canonical_coverage_snapshot>);
+    static_assert(!std::is_constructible_v<canonical_coverage_snapshot,const canonical_coverage_query&,const canonical_coverage_profile&>);
+    static_assert(!std::is_constructible_v<canonical_coverage_snapshot,canonical_coverage_state>);
+    static_assert(!std::is_copy_constructible_v<canonical_coverage_snapshot>);
+    static_assert(!std::is_move_constructible_v<canonical_coverage_snapshot>);
+    SUCCEED();
+}
+TEST_F(CanonicalCoverageSnapshot, CoveredReceiptLoopUsesFourActualStatementsPerOriginal) {
+    const auto requests=seed(8);(void)covered({}); // Warm the same keeper construction path.
+    const auto start=lattice::database::thread_statement_count();const auto empty=covered({});
+    const auto fixed=lattice::database::thread_statement_count()-start;
+    const auto begin=lattice::database::thread_statement_count();const auto captured=covered(requests);
+    const auto all=lattice::database::thread_statement_count()-begin;
+    EXPECT_EQ(all,fixed+4*requests.size());EXPECT_EQ(captured.coverage_revision,std::optional<uint64_t>{8});
+    ASSERT_EQ(captured.receipts.size(),8u);ASSERT_EQ(captured.rows.size(),1u);ASSERT_EQ(empty.rows.size(),1u);
+    EXPECT_EQ(captured.rows[0].payload,empty.rows[0].payload);
+    for(const auto& receipt:captured.receipts){ASSERT_TRUE(receipt.stored);EXPECT_FALSE(receipt.legacy_unbound);EXPECT_EQ(receipt.operation_digest,digest);}
+    // The generic writer/read utility keeps its original five addressed reads.
+    size_t generic_reads=0;const auto query=[&](const std::string& sql,const std::vector<lattice::column_value_t>& values){++generic_reads;return db.db().query(sql,values);};
+    EXPECT_EQ(lookup_canonical_coverage(query,*namespaces.coverage,requests[0].original_id,"app",producer,digest),canonical_coverage_lookup::covered);
+    EXPECT_EQ(generic_reads,5u);EXPECT_EQ(db.local_read_generations_outstanding(),0u);
+}
+TEST_F(CanonicalCoverageSnapshot, LaterProfileMutationCannotChangePinnedViewAndFreshCaptureRejectsIt) {
+    const auto requests=seed(2);bool changed=false;
+    const auto captured=covered(requests,[&](size_t batch,uint64_t){if(batch==0&&!changed){changed=true;
+        db.db().execute("UPDATE _lattice_canonical_receipt_profile SET max_cells=max_cells+1");}});
+    ASSERT_TRUE(changed);ASSERT_EQ(captured.receipts.size(),2u);for(const auto& r:captured.receipts)EXPECT_TRUE(r.stored);
+    EXPECT_EQ(captured.coverage_revision,std::optional<uint64_t>{2});EXPECT_ANY_THROW(covered(requests));
+    EXPECT_EQ(db.local_read_generations_outstanding(),0u);
+}
+TEST_F(CanonicalCoverageSnapshot, LaterMemberMutationCannotChangePinnedViewAndFreshCaptureRejectsIt) {
+    const auto requests=seed(1);bool changed=false;
+    const auto captured=covered(requests,[&](size_t batch,uint64_t){if(batch==0&&!changed){changed=true;
+        db.db().execute("DELETE FROM _lattice_canonical_receipt_member WHERE namespace_id=CAST('other' AS BLOB)");}});
+    ASSERT_TRUE(changed);ASSERT_EQ(captured.receipts.size(),1u);EXPECT_TRUE(captured.receipts[0].stored);
+    EXPECT_ANY_THROW(covered(requests));EXPECT_EQ(db.local_read_generations_outstanding(),0u);
+}
+TEST_F(CanonicalCoverageSnapshot, CallerProfileMutationCannotReplaceTheHeldProofInputs) {
+    const auto requests=seed(1);bool changed=false;
+    const auto captured=covered(requests,[&](size_t batch,uint64_t){if(batch==0&&!changed){changed=true;
+        namespaces.coverage.reset();namespaces.entries.clear();namespaces.local_namespace="changed";}});
+    ASSERT_TRUE(changed);ASSERT_EQ(captured.receipts.size(),1u);ASSERT_TRUE(captured.receipts[0].stored);
+    EXPECT_FALSE(captured.receipts[0].legacy_unbound);EXPECT_EQ(captured.coverage_revision,std::optional<uint64_t>{1});
+    EXPECT_ANY_THROW(covered(requests));EXPECT_EQ(db.local_read_generations_outstanding(),0u);
+}
+TEST_F(CanonicalCoverageSnapshot, AddressedProducerAndDigestDivergenceStillRefuse) {
+    const auto requests=seed(1);auto wrong=requests;wrong[0].operation_digest=std::string(64,'c');
+    EXPECT_ANY_THROW(covered(wrong));wrong=requests;wrong[0].registered_producer->producer.incarnation=id('d');
+    EXPECT_ANY_THROW(covered(wrong));const auto captured=covered(requests);ASSERT_TRUE(captured.receipts[0].stored);
+    EXPECT_EQ(db.local_read_generations_outstanding(),0u);
+}
+TEST_F(CanonicalCoverageSnapshot, CorruptCellRevisionAndDurableCountersAreNotCachedAway) {
+    const auto requests=seed(1);
+    db.db().execute("UPDATE _lattice_canonical_receipt_coverage SET revision=2");EXPECT_ANY_THROW(covered(requests));
+    db.db().execute("UPDATE _lattice_canonical_receipt_coverage SET revision=1");
+    db.db().execute("UPDATE _lattice_canonical_receipt_profile SET mutation=2");EXPECT_ANY_THROW(covered(requests));
+    db.db().execute("UPDATE _lattice_canonical_receipt_profile SET mutation=1");
+    const auto captured=covered(requests);ASSERT_TRUE(captured.receipts[0].stored);EXPECT_EQ(db.local_read_generations_outstanding(),0u);
+}
+TEST_F(CanonicalCoverageSnapshot, MissingCoverageAndLegacyNamespaceRulesRemainDistinct) {
+    auto requests=seed(1);requests[0].namespace_id="other";const auto missing=covered(requests);
+    ASSERT_EQ(missing.receipts.size(),1u);EXPECT_FALSE(missing.receipts[0].stored);
+    db.db().execute("DELETE FROM _lattice_canonical_receipt_coverage");db.db().execute("DELETE FROM _lattice_canonical_receipt_origin");
+    db.db().execute("UPDATE _lattice_canonical_receipt_profile SET mutation=0,origins=0,origin_bytes=0,cells=0,cell_bytes=0");
+    EXPECT_ANY_THROW(covered(requests));requests[0].namespace_id="app";const auto legacy=covered(requests);
+    ASSERT_EQ(legacy.receipts.size(),1u);ASSERT_TRUE(legacy.receipts[0].stored);EXPECT_TRUE(legacy.receipts[0].legacy_unbound);
+    requests[0].original_id=id('9');const auto unknown=covered(requests);ASSERT_EQ(unknown.receipts.size(),1u);EXPECT_FALSE(unknown.receipts[0].stored);
+}
+TEST_F(CanonicalCoverageSnapshot, RetiredGenerationCannotUsePreviouslyValidatedSnapshot) {
+    const auto requests=seed(1);bool retired=false;
+    EXPECT_THROW(covered(requests,[&](size_t batch,uint64_t generation){if(batch==0&&!retired){retired=true;db.release_read_generation(generation);}}),sr::protocol_error);
+    EXPECT_TRUE(retired);EXPECT_EQ(db.local_read_generations_outstanding(),0u);const auto fresh=covered(requests);ASSERT_TRUE(fresh.receipts[0].stored);
+}
+#endif

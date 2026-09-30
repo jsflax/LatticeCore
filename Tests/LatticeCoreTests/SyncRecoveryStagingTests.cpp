@@ -1,0 +1,568 @@
+#include "TestHelpers.hpp"
+#include "../../Sources/LatticeCore/src/recovery_staging.hpp"
+#include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
+#include <limits>
+
+namespace {
+using namespace lattice::detail;
+namespace protocol = lattice::detail::sync_recovery;
+using code = recovery_staging_code;
+using blob = std::vector<uint8_t>;
+blob encoded(const std::string& s) { return blob(s.begin(),s.end()); }
+struct OwnedTransaction {
+    lattice::lattice_db& owner; bool done=false;
+    explicit OwnedTransaction(lattice::lattice_db& value) : owner(value) { owner.begin_transaction(); }
+    ~OwnedTransaction() { if (!done) { try { owner.rollback(); } catch (...) {} } }
+    void commit() { owner.commit(); done=true; }
+    void rollback() { owner.rollback(); done=true; }
+};
+template<class F> void expect_error(code expected,F&& function) {
+    try { function(); FAIL() << "expected snapshot staging refusal"; }
+    catch (const recovery_staging_error& e) { EXPECT_EQ(e.code,expected) << e.what(); }
+}
+template<class F> void expect_stale_token(F&& function) {
+    try { function(); FAIL() << "expected stale ledger token refusal"; }
+    catch (const receive_ledger_error& e) { EXPECT_EQ(e.code,receive_ledger_error_code::stale_token); }
+}
+lattice::configuration config(const std::string& path) {
+    lattice::configuration c(path); c.audit_retention_seconds=0; c.busy_timeout_ms=100; return c;
+}
+void stop_notifier(lattice::lattice_db& owner) {
+    auto* notifier=lattice::instance_registry::instance().get_or_create_notifier(owner.config().path);
+    ASSERT_NE(notifier,nullptr); notifier->stop_listening(); ASSERT_FALSE(notifier->is_listening());
+}
+const receive_ledger_limits ledger_limits{4,64,16,256,16,256,64};
+const protocol::limits codec_limits{65536,16,8192,16384,64,64,256,1024*1024};
+const recovery_staging_limits storage_limits{4,64,256,1024*1024,1024*1024};
+protocol::binding identity() {
+    return {"11111111-1111-1111-1111-111111111111","22222222-2222-2222-2222-222222222222","logical-channel",
+        std::string(64,'a'),std::string(64,'b'),"33333333-3333-3333-3333-333333333333","44444444-4444-4444-4444-444444444444"};
+}
+struct Snapshot {
+    protocol::manifest offer;
+    std::vector<protocol::page> pages;
+    protocol::end end() const { return {offer.identity,offer.frontier,offer.page_count,offer.row_count,offer.content_bytes,offer.content_digest}; }
+};
+Snapshot snapshot(std::vector<protocol::row> rows={{"T","a","{}"},{"T","b","{\"value\":2}"}}) {
+    Snapshot value;
+    value.offer={identity(),std::nullopt,17,rows.size(),rows.size(),0,canonical_rows_sha256(rows)};
+    for (const auto& r:rows) {
+        const auto count=protocol::canonical_row_bytes(r);
+        value.pages.push_back({value.offer.identity,value.pages.size(),count,canonical_rows_sha256({r}),{r}});
+        value.offer.content_bytes+=count;
+    }
+    return value;
+}
+int64_t integer(lattice::lattice_db& owner,const std::string& sql) {
+    return std::get<int64_t>(owner.db().query(sql).at(0).at("n"));
+}
+void count_fault(lattice::lattice_db& owner,int& count) {
+    ASSERT_EQ(sqlite3_create_function(owner.db().handle(),"staging_fault_hit",0,SQLITE_UTF8,&count,
+        [](sqlite3_context* ctx,int,sqlite3_value**) noexcept {
+            ++*static_cast<int*>(sqlite3_user_data(ctx)); sqlite3_result_int(ctx,1);
+        },nullptr,nullptr),SQLITE_OK);
+}
+class SyncRecoveryStaging : public ::testing::Test {
+protected:
+    lattice::lattice_db owner{config(":memory:")};
+    protocol::limits codec=codec_limits;
+    recovery_staging_limits limits=storage_limits;
+    recovery_staging staging() { return recovery_staging(owner,ledger_limits,codec,limits); }
+    receive_ledger ledger() { return receive_ledger(owner,ledger_limits); }
+    receive_ledger_token create(const std::string& channel="channel") {
+        OwnedTransaction tx(owner); auto l=ledger(); l.initialize();
+        auto token=l.create(channel);
+        if (!token) throw std::runtime_error("test ledger admission failed");
+        staging().initialize(); tx.commit(); return *token;
+    }
+    void start(const receive_ledger_token& token,const Snapshot& value) {
+        OwnedTransaction tx(owner); staging().begin(token,value.offer,value.offer.identity); tx.commit();
+    }
+};
+}
+
+TEST(SyncRecoveryStagingHash, KnownSHA256AndCanonicalByteVectors) {
+    // Independent published SHA-256 vectors exercise the unmodified vendor.
+    EXPECT_EQ(picosha2::hash256_hex_string(std::string()),"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    EXPECT_EQ(picosha2::hash256_hex_string(std::string("abc")),"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(picosha2::hash256_hex_string(std::string("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    // Canonical vectors independently generated by Python hashlib over three
+    // struct.pack('>Q',len(UTF8)) prefixes per row, never JSON serialization.
+    EXPECT_EQ(canonical_rows_sha256({}),"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    EXPECT_EQ(canonical_rows_sha256({{"T","a","{}"}}),"9f48e4111c178b6d964d2f7fcef92f47d85eca67b1bcd2c3f3f6b6d68d9dd758");
+    EXPECT_EQ(canonical_rows_sha256({{"T","\xc3\xa9",std::string("a\0b",3)}}),"3b56d527d6ac74dddb2aca8bfcbc95ab64f2ffa34465ef575e101808d083f509");
+    EXPECT_EQ(canonical_rows_sha256({{"T","a",std::string(9000,'x')}}),"2326b98e87963676e94e8a8517904e433824d962e0dbc1ae0d18e109a2c5a6db");
+    EXPECT_EQ(canonical_rows_sha256({{"T","a","{}"},{"T","b","{\"value\":2}"}}),
+        "b28a5a9b8cf4ac4ececb7d023ba7844a15674c9dc73dc002b90b2f6735563c8a");
+}
+
+TEST_F(SyncRecoveryStaging, RequiresActualOwnedMainWriteTransaction) {
+    auto s=staging();
+    expect_error(code::transaction_required,[&]{s.initialize();});
+    owner.db().begin_transaction();
+    expect_error(code::transaction_required,[&]{s.initialize();});
+    owner.db().rollback();
+    const auto token=create();
+    OwnedTransaction tx(owner);
+    std::optional<code> wrong_thread;
+    std::thread other([&] { try { s.resume(token,identity()); } catch (const recovery_staging_error& e) { wrong_thread=e.code; } });
+    other.join(); ASSERT_TRUE(wrong_thread); EXPECT_EQ(*wrong_thread,code::transaction_required);
+    EXPECT_EQ(s.usage().channels,0); tx.commit();
+    expect_error(code::transaction_required,[&]{s.usage();});
+    owner.close();
+    expect_error(code::transaction_required,[&]{s.initialize();});
+}
+
+TEST_F(SyncRecoveryStaging, MissingLedgerPartialSchemaAndChangedLimitsRefuse) {
+    OwnedTransaction tx(owner);
+    EXPECT_THROW(staging().initialize(),lattice::db_error) << "staging does not create authority ledger implicitly";
+    ledger().initialize();
+    owner.db().execute("CREATE TABLE _lattice_recovery_store(inherited TEXT)");
+    expect_error(code::corrupt_state,[&]{staging().initialize();});
+    tx.rollback();
+    const auto token=create();
+    OwnedTransaction verify(owner);
+    auto different=limits; ++different.pages;
+    recovery_staging changed(owner,ledger_limits,codec,different);
+    expect_error(code::limits_mismatch,[&]{changed.initialize();});
+    EXPECT_EQ(staging().usage().channels,0);
+    verify.commit();
+    auto invalid=codec; invalid.total_bytes=std::numeric_limits<uint64_t>::max()/8+1;
+    expect_error(code::invalid_argument,[&]{recovery_staging rejected(owner,ledger_limits,invalid,limits);});
+}
+
+TEST_F(SyncRecoveryStaging, StateImageBudgetIsCheckedBeforeAttemptEffects) {
+    const auto value=snapshot();
+    const auto manifest=protocol::encode(value.offer,codec);
+    const auto state=protocol::encode_staging(protocol::begin(value.offer,value.offer.identity,codec),codec);
+    ASSERT_GT(state.size(),manifest.size());
+    codec.frame_bytes=manifest.size(); codec.string_bytes=128;
+    const auto token=create();
+    OwnedTransaction tx(owner);
+    EXPECT_NO_THROW(protocol::encode(value.offer,codec));
+    EXPECT_THROW(staging().begin(token,value.offer,value.offer.identity),protocol::protocol_error);
+    EXPECT_EQ(staging().usage().channels,0);
+    EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM _lattice_recovery_page"),0);
+    tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, ExactDuplicateDoesNotChargeAndAttemptOrGenerationCannotChange) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    OwnedTransaction tx(owner); auto s=staging();
+    const auto one=s.append(token,value.pages[0]);
+    const auto before=s.usage();
+    EXPECT_EQ(s.append(token,value.pages[0]).state,one.state);
+    EXPECT_EQ(s.usage().stored_bytes,before.stored_bytes);
+    EXPECT_EQ(s.begin(token,value.offer,value.offer.identity).state,one.state);
+    auto conflict=value.pages[0]; conflict.rows[0].payload="[]"; conflict.content_digest=canonical_rows_sha256(conflict.rows);
+    expect_error(code::conflicting_page,[&]{s.append(token,conflict);});
+    auto wrong=value.offer; wrong.identity.attempt_id="55555555-5555-5555-5555-555555555555";
+    expect_error(code::stale_attempt,[&]{s.begin(token,wrong,wrong.identity);});
+    auto changed_offer=value.offer; ++changed_offer.frontier;
+    expect_error(code::stale_attempt,[&]{s.begin(token,changed_offer,changed_offer.identity);});
+    auto reservation=ledger().reserve(token,{}); ASSERT_TRUE(reservation.admitted);
+    expect_stale_token([&]{s.append(token,value.pages[0]);});
+    expect_error(code::stale_attempt,[&]{s.append(reservation.token,value.pages[0]);});
+    // A fenced attempt stays stored/charged; initialize audits but never evicts.
+    EXPECT_NO_THROW(s.initialize()); EXPECT_EQ(s.usage().stored_bytes,before.stored_bytes);
+    tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, PageDigestAndBindingFailuresLeaveThePriorState) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    OwnedTransaction tx(owner); auto s=staging(); const auto before=s.usage();
+    auto wrong=value.pages[0]; wrong.content_digest=std::string(64,'f');
+    expect_error(code::digest_mismatch,[&]{s.append(token,wrong);});
+    wrong=value.pages[0]; wrong.identity.epoch="55555555-5555-5555-5555-555555555555";
+    expect_error(code::stale_attempt,[&]{s.append(token,wrong);});
+    EXPECT_THROW(s.append(token,value.pages[1]),protocol::protocol_error);
+    EXPECT_EQ(s.resume(token,value.offer.identity).state.next_page,0);
+    EXPECT_EQ(s.usage().stored_bytes,before.stored_bytes); tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, PageInsertAndStateUpdateAreOneSavepointForAbortAndIgnore) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    for (const auto action: {"ABORT,'injected state update failure'","IGNORE"}) {
+        OwnedTransaction tx(owner); auto s=staging(); const auto before=s.usage(); int hits=0;
+        ASSERT_NO_FATAL_FAILURE(count_fault(owner,hits));
+        owner.db().execute(std::string("CREATE TRIGGER reject_staging_state BEFORE UPDATE OF state ON _lattice_recovery_attempt ")+
+            "BEGIN SELECT staging_fault_hit(); SELECT RAISE("+action+"); END");
+        EXPECT_THROW(s.append(token,value.pages[0]),lattice::db_error);
+        EXPECT_EQ(hits,1) << "fault reached the state update after page INSERT";
+        EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM _lattice_recovery_page"),0);
+        EXPECT_EQ(s.resume(token,value.offer.identity).state.next_page,0);
+        EXPECT_EQ(s.usage().stored_bytes,before.stored_bytes);
+        owner.db().execute("DROP TRIGGER reject_staging_state");
+        ASSERT_EQ(sqlite3_create_function(owner.db().handle(),"staging_fault_hit",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
+        tx.commit(); // committing after caught helper failure cannot persist a page prefix
+    }
+    OwnedTransaction retry(owner); auto s=staging();
+    EXPECT_EQ(s.append(token,value.pages[0]).state.next_page,1);
+    EXPECT_EQ(s.append(token,value.pages[1]).state.next_page,2);
+    EXPECT_TRUE(s.verify_end(token,value.end()).content_verified); retry.commit();
+}
+
+TEST_F(SyncRecoveryStaging, OuterRollbackAndFailedCommitPublishNoProvisionalPage) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    { OwnedTransaction tx(owner); EXPECT_EQ(staging().append(token,value.pages[0]).state.next_page,1); tx.rollback(); }
+    {
+        OwnedTransaction tx(owner); staging().append(token,value.pages[0]); int attempts=0;
+        ASSERT_EQ(sqlite3_set_authorizer(owner.db().handle(),[](void* context,int action,const char* first,const char*,const char*,const char*) noexcept {
+            if (action==SQLITE_TRANSACTION && first && std::strcmp(first,"COMMIT")==0) {
+                ++*static_cast<int*>(context); return SQLITE_DENY;
+            }
+            return SQLITE_OK;
+        },&attempts),SQLITE_OK);
+        EXPECT_THROW(tx.commit(),lattice::db_error); EXPECT_EQ(attempts,1);
+        ASSERT_EQ(sqlite3_set_authorizer(owner.db().handle(),nullptr,nullptr),SQLITE_OK); tx.rollback();
+    }
+    OwnedTransaction check(owner);
+    EXPECT_EQ(staging().resume(token,value.offer.identity).state.next_page,0);
+    EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM _lattice_recovery_page"),0); check.commit();
+}
+
+TEST_F(SyncRecoveryStaging, CleanupFailureRetainsBothErrorsAndRequiresOuterRollback) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    {
+        OwnedTransaction tx(owner);
+        owner.db().execute("CREATE TRIGGER reject_staging_state BEFORE UPDATE OF state ON _lattice_recovery_attempt "
+            "BEGIN SELECT RAISE(ABORT,'injected state failure'); END");
+        int cleanup=0;
+        ASSERT_EQ(sqlite3_set_authorizer(owner.db().handle(),[](void* context,int action,const char* first,const char* second,const char*,const char*) noexcept {
+            if (action==SQLITE_SAVEPOINT && first && second && std::strcmp(first,"ROLLBACK")==0 && std::strcmp(second,"lattice_recovery_staging")==0) {
+                ++*static_cast<int*>(context); return SQLITE_DENY;
+            }
+            return SQLITE_OK;
+        },&cleanup),SQLITE_OK);
+        bool caught=false;
+        try { staging().append(token,value.pages[0]); }
+        catch (const recovery_staging_error& e) { caught=true; EXPECT_EQ(e.code,code::cleanup_failed); EXPECT_TRUE(e.primary_error); EXPECT_TRUE(e.cleanup_error); }
+        catch (...) { ADD_FAILURE() << "expected structured cleanup refusal"; }
+        sqlite3_set_authorizer(owner.db().handle(),nullptr,nullptr);
+        EXPECT_TRUE(caught); EXPECT_EQ(cleanup,1); tx.rollback();
+    }
+    OwnedTransaction check(owner);
+    EXPECT_EQ(staging().resume(token,value.offer.identity).state.next_page,0); check.commit();
+}
+
+TEST_F(SyncRecoveryStaging, WholeDigestCannotBeReplacedByValidIndividualPageDigests) {
+    const auto token=create(); auto value=snapshot(); value.offer.content_digest=std::string(64,'f'); start(token,value);
+    OwnedTransaction tx(owner); auto s=staging();
+    for (const auto& p:value.pages) s.append(token,p);
+    EXPECT_FALSE(s.resume(token,value.offer.identity).content_verified);
+    expect_error(code::digest_mismatch,[&]{s.verify_end(token,value.end());});
+    EXPECT_EQ(integer(owner,"SELECT verified AS n FROM _lattice_recovery_attempt"),0);
+    EXPECT_EQ(s.resume(token,value.offer.identity).state.status,protocol::phase::receiving); tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, VerificationStateFailureDoesNotPublishContentVerified) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    OwnedTransaction tx(owner); auto s=staging();
+    for (const auto& p:value.pages) s.append(token,p);
+    owner.db().execute("CREATE TRIGGER reject_verified BEFORE UPDATE OF verified ON _lattice_recovery_attempt "
+        "BEGIN SELECT RAISE(ABORT,'verified marker refused'); END");
+    EXPECT_THROW(s.verify_end(token,value.end()),lattice::db_error);
+    EXPECT_FALSE(s.resume(token,value.offer.identity).content_verified);
+    owner.db().execute("DROP TRIGGER reject_verified");
+    const auto verified=s.verify_end(token,value.end()); EXPECT_TRUE(verified.content_verified);
+    const auto usage=s.usage(); EXPECT_EQ(s.verify_end(token,value.end()).state,verified.state);
+    EXPECT_EQ(s.usage().stored_bytes,usage.stored_bytes); tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, EmptySnapshotRequiresExplicitCorrectEndAndNeverAdvancesLedger) {
+    const auto token=create(); const auto value=snapshot({}); start(token,value);
+    OwnedTransaction tx(owner); auto s=staging();
+    EXPECT_FALSE(s.resume(token,value.offer.identity).content_verified);
+    auto wrong=value.end(); ++wrong.frontier;
+    expect_error(code::stale_attempt,[&]{s.verify_end(token,wrong);});
+    EXPECT_TRUE(s.verify_end(token,value.end()).content_verified);
+    EXPECT_EQ(s.usage().pages,0); EXPECT_EQ(s.usage().rows,0); EXPECT_EQ(s.usage().canonical_bytes,0);
+    const auto channel=ledger().read(token.channel);
+    EXPECT_EQ(channel.token,token); EXPECT_EQ(channel.kind,receive_checkpoint_kind::initialized_null); EXPECT_FALSE(channel.checkpoint);
+    tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, AggregateDeclarationBudgetsReserveAllPagesBeforeArrival) {
+    limits.channels=2; limits.pages=2; limits.rows=2; limits.canonical_bytes=65;
+    const auto first=create("first"), second=create("second"); const auto value=snapshot(); start(first,value);
+    OwnedTransaction tx(owner); auto s=staging();
+    EXPECT_EQ(s.usage().channels,1); EXPECT_EQ(s.usage().pages,2); EXPECT_EQ(s.usage().rows,2); EXPECT_EQ(s.usage().canonical_bytes,65);
+    expect_error(code::capacity,[&]{s.begin(second,value.offer,value.offer.identity);});
+    EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM _lattice_recovery_page"),0);
+    EXPECT_EQ(s.usage().channels,1); tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, StoredBudgetChargesEscapingKeysAndStateRatherThanPayloadOnly) {
+    limits.stored_bytes=3500;
+    const auto token=create(); const auto value=snapshot({{"T","a",std::string(800,'\1')}}); start(token,value);
+    OwnedTransaction tx(owner); auto s=staging(); const auto before=s.usage();
+    ASSERT_GT(static_cast<int64_t>(protocol::encode(value.pages[0],codec).size()),limits.stored_bytes);
+    ASSERT_LT(value.offer.content_bytes,static_cast<uint64_t>(limits.stored_bytes-before.stored_bytes));
+    expect_error(code::capacity,[&]{s.append(token,value.pages[0]);});
+    EXPECT_EQ(s.usage().stored_bytes,before.stored_bytes); EXPECT_EQ(s.resume(token,value.offer.identity).state.next_page,0);
+    const auto actual=integer(owner,"SELECT length(configuration)+(SELECT SUM(length(channel)+length(manifest)+length(state)) "
+        "FROM _lattice_recovery_attempt) AS n FROM _lattice_recovery_store");
+    EXPECT_EQ(before.stored_bytes,actual); tx.commit();
+}
+
+TEST_F(SyncRecoveryStaging, MissingExtraAndCorruptPersistedPagesOrCountersRefuseResume) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    { OwnedTransaction tx(owner); staging().append(token,value.pages[0]); tx.commit(); }
+    const std::vector<std::string> corruptions={
+        "DELETE FROM _lattice_recovery_page",
+        "INSERT INTO _lattice_recovery_page SELECT channel,7,wire FROM _lattice_recovery_page",
+        "UPDATE _lattice_recovery_attempt SET rows=rows+1",
+        "UPDATE _lattice_recovery_attempt SET verified=1",
+        "UPDATE _lattice_recovery_page SET wire=X'7b7d'"};
+    for (const auto& sql:corruptions) {
+        OwnedTransaction tx(owner); owner.db().execute(sql);
+        expect_error(code::corrupt_state,[&]{staging().resume(token,value.offer.identity);});
+        tx.rollback();
+    }
+    OwnedTransaction tx(owner);
+    auto changed=value.pages[0]; changed.rows[0].payload="[]"; // valid structure, wrong stored page digest
+    owner.db().execute("UPDATE _lattice_recovery_page SET wire=?",{encoded(protocol::encode(changed,codec))});
+    expect_error(code::digest_mismatch,[&]{staging().resume(token,value.offer.identity);}); tx.rollback();
+}
+
+TEST_F(SyncRecoveryStaging, DurableRowsCannotHideBehindAConsistentButFalseStateImage) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    { OwnedTransaction tx(owner); staging().append(token,value.pages[0]); tx.commit(); }
+    OwnedTransaction tx(owner);
+    auto false_state=protocol::propose(protocol::begin(value.offer,value.offer.identity,codec),value.pages[0],codec);
+    false_state.last_identity=std::make_pair(std::string("T"),std::string("z"));
+    owner.db().execute("UPDATE _lattice_recovery_attempt SET state=?",{encoded(protocol::encode_staging(false_state,codec))});
+    expect_error(code::corrupt_state,[&]{staging().resume(token,value.offer.identity);}); tx.rollback();
+}
+
+TEST_F(SyncRecoveryStaging, PrivateMetadataDoesNotInstallModelsOrPublishObserverEvents) {
+    struct Observed {
+        lattice::lattice_db& owner; int metadata=0,model=0;
+        std::vector<std::pair<std::string,lattice::lattice_db::observer_id>> tokens;
+        explicit Observed(lattice::lattice_db& db):owner(db) {
+            for (const auto* table:{"_lattice_recovery_store","_lattice_recovery_attempt","_lattice_recovery_page"})
+                tokens.emplace_back(table,owner.add_table_observer(table,[this](const auto&){++metadata;}));
+            tokens.emplace_back("TestPerson",owner.add_table_observer("TestPerson",[this](const auto&){++model;}));
+        }
+        ~Observed() { for (const auto& [table,id]:tokens) owner.remove_table_observer(table,id); }
+    } observed(owner);
+    const auto token=create(); const auto value=snapshot({{"TestPerson","not-installed","{\"name\":\"snapshot\"}"}}); start(token,value);
+    int64_t audit_before=0;
+    {
+        OwnedTransaction tx(owner); audit_before=integer(owner,"SELECT COUNT(*) AS n FROM AuditLog");
+        staging().append(token,value.pages[0]); staging().verify_end(token,value.end());
+        EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM AuditLog"),audit_before);
+        EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM TestPerson"),0); tx.commit();
+    }
+    EXPECT_EQ(observed.model,0);
+    owner.add(TestPerson{"positive observer fence",1,std::nullopt});
+    EXPECT_GT(observed.model,0); EXPECT_EQ(observed.metadata,0);
+}
+
+TEST(SyncRecoveryStagingDurable, PagesResumeAndVerifyAcrossOwnerReopenWithoutInstalling) {
+    TempDB file{"sync_recovery_staging"}; const auto value=snapshot(); receive_ledger_token token;
+    recovery_staging_usage before;
+    {
+        lattice::lattice_db owner{config(file.str())}; ASSERT_NO_FATAL_FAILURE(stop_notifier(owner));
+        receive_ledger ledger(owner,ledger_limits); recovery_staging staging(owner,ledger_limits,codec_limits,storage_limits);
+        OwnedTransaction tx(owner); ledger.initialize(); const auto created=ledger.create("channel"); ASSERT_TRUE(created);
+        staging.initialize(); staging.begin(*created,value.offer,value.offer.identity); staging.append(*created,value.pages[0]);
+        before=staging.usage(); tx.commit(); token=*created;
+    }
+    {
+        lattice::lattice_db owner{config(file.str())}; ASSERT_NO_FATAL_FAILURE(stop_notifier(owner));
+        recovery_staging staging(owner,ledger_limits,codec_limits,storage_limits); OwnedTransaction tx(owner);
+        staging.initialize(); auto resumed=staging.resume(token,value.offer.identity);
+        EXPECT_EQ(resumed.state.next_page,1); EXPECT_FALSE(resumed.content_verified); EXPECT_EQ(staging.usage().stored_bytes,before.stored_bytes);
+        staging.append(token,value.pages[1]); EXPECT_TRUE(staging.verify_end(token,value.end()).content_verified); tx.commit();
+    }
+    {
+        lattice::lattice_db owner{config(file.str())}; ASSERT_NO_FATAL_FAILURE(stop_notifier(owner));
+        recovery_staging staging(owner,ledger_limits,codec_limits,storage_limits); OwnedTransaction tx(owner);
+        staging.initialize(); EXPECT_TRUE(staging.resume(token,value.offer.identity).content_verified);
+        receive_ledger ledger(owner,ledger_limits); EXPECT_EQ(ledger.read("channel").kind,receive_checkpoint_kind::initialized_null);
+        EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM TestPerson"),0); tx.commit();
+    }
+}
+
+TEST_F(SyncRecoveryStaging, VerifiedPageReadRequiresVerificationBindingAndReturnsOwnedBytes) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    OwnedTransaction tx(owner); auto s=staging();
+    expect_error(code::not_verified,[&]{s.read_verified_page(token,value.offer.identity,0);});
+    for (const auto& p:value.pages) s.append(token,p);
+    expect_error(code::not_verified,[&]{s.read_verified_page(token,value.offer.identity,0);});
+    s.verify_end(token,value.end());
+    const auto held=s.read_verified_page(token,value.offer.identity,0);
+    EXPECT_EQ(held,value.pages[0]);
+    auto wrong=value.offer.identity; wrong.scope_digest=std::string(64,'c');
+    expect_error(code::stale_attempt,[&]{s.read_verified_page(token,wrong,0);});
+    expect_error(code::invalid_argument,[&]{s.read_verified_page(token,value.offer.identity,2);});
+    expect_error(code::invalid_argument,[&]{s.read_verified_page(token,value.offer.identity,std::numeric_limits<uint64_t>::max());});
+    owner.db().execute("SAVEPOINT corrupt_page");
+    owner.db().execute("DELETE FROM _lattice_recovery_page WHERE page_index=0");
+    expect_error(code::corrupt_state,[&]{s.read_verified_page(token,value.offer.identity,0);});
+    owner.db().execute("ROLLBACK TO corrupt_page"); owner.db().execute("RELEASE corrupt_page");
+    auto changed=value.pages[0]; changed.rows[0].payload="[]";
+    owner.db().execute("UPDATE _lattice_recovery_page SET wire=? WHERE page_index=0",{encoded(protocol::encode(changed,codec))});
+    expect_error(code::digest_mismatch,[&]{s.read_verified_page(token,value.offer.identity,0);});
+    EXPECT_EQ(held,value.pages[0]) << "returned data owns its bytes despite later SQL changes";
+    tx.rollback();
+    OwnedTransaction stale(owner);
+    const auto replacement=ledger().reserve(token,{}); ASSERT_TRUE(replacement.admitted);
+    expect_stale_token([&]{s.read_verified_page(token,value.offer.identity,0);}); stale.rollback();
+}
+
+TEST_F(SyncRecoveryStaging, VerifiedPageReadRejectsRecodedJSONAndChangedIdentity) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    { OwnedTransaction tx(owner); auto s=staging(); for (const auto& p:value.pages) s.append(token,p); s.verify_end(token,value.end()); tx.commit(); }
+    for (const bool wrong_identity: {false,true}) {
+        OwnedTransaction tx(owner); auto page=value.pages[0];
+        if (wrong_identity) page.identity.source_id="55555555-5555-5555-5555-555555555555";
+        auto wire=protocol::encode(page,codec); if (!wrong_identity) wire=" "+wire;
+        owner.db().execute("UPDATE _lattice_recovery_page SET wire=? WHERE page_index=0",{encoded(wire)});
+        expect_error(code::corrupt_state,[&]{staging().read_verified_page(token,value.offer.identity,0);}); tx.rollback();
+    }
+}
+
+TEST_F(SyncRecoveryStaging, WholeDigestIsIndependentOfPagePartition) {
+    const auto first=create("first"),second=create("second");
+    const auto split=snapshot(); auto combined=split;
+    combined.offer.page_count=1;
+    combined.pages={{combined.offer.identity,0,combined.offer.content_bytes,combined.offer.content_digest,
+        {split.pages[0].rows[0],split.pages[1].rows[0]}}};
+    start(first,split); start(second,combined);
+    OwnedTransaction tx(owner); auto s=staging();
+    for (const auto& p:split.pages) s.append(first,p);
+    s.append(second,combined.pages[0]);
+    EXPECT_TRUE(s.verify_end(first,split.end()).content_verified);
+    EXPECT_TRUE(s.verify_end(second,combined.end()).content_verified);
+    EXPECT_EQ(s.read_verified_page(second,combined.offer.identity,0).rows.size(),2); tx.commit();
+}
+
+TEST(SyncRecoveryStagingBudgets, EachAggregateLimitIndependentlyRefusesWholeAttempt) {
+    const auto value=snapshot();
+    for (int dimension=0;dimension<4;++dimension) {
+        auto limits=storage_limits;
+        if (dimension==0) limits.channels=1;
+        if (dimension==1) limits.pages=3;
+        if (dimension==2) limits.rows=3;
+        if (dimension==3) limits.canonical_bytes=100;
+        lattice::lattice_db owner{config(":memory:")}; receive_ledger ledger(owner,ledger_limits);
+        recovery_staging staging(owner,ledger_limits,codec_limits,limits); OwnedTransaction tx(owner);
+        ledger.initialize(); const auto first=ledger.create("first"),second=ledger.create("second"); ASSERT_TRUE(first); ASSERT_TRUE(second);
+        staging.initialize(); staging.begin(*first,value.offer,value.offer.identity);
+        expect_error(code::capacity,[&]{staging.begin(*second,value.offer,value.offer.identity);});
+        EXPECT_EQ(staging.usage().channels,1); EXPECT_EQ(staging.usage().rows,2); tx.commit();
+    }
+}
+
+TEST_F(SyncRecoveryStaging, FullBoundariesRejectUsageAndPageChargeDriftWithoutRepair) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    { OwnedTransaction tx(owner); auto s=staging(); for (const auto& p:value.pages) s.append(token,p); s.verify_end(token,value.end()); tx.commit(); }
+    for (const auto* column:{"used_channels","used_pages","used_rows","used_canonical_bytes","used_stored_bytes"}) {
+        OwnedTransaction tx(owner); auto s=staging();
+        owner.db().execute(std::string("UPDATE _lattice_recovery_store SET ")+column+"="+column+"+1");
+        const auto before=integer(owner,std::string("SELECT ")+column+" AS n FROM _lattice_recovery_store");
+        expect_error(code::corrupt_state,[&]{s.initialize();});
+        expect_error(code::corrupt_state,[&]{s.audit();});
+        expect_error(code::corrupt_state,[&]{s.resume(token,value.offer.identity);});
+        expect_error(code::corrupt_state,[&]{s.verify_end(token,value.end());});
+        EXPECT_EQ(integer(owner,std::string("SELECT ")+column+" AS n FROM _lattice_recovery_store"),before);
+        tx.rollback();
+    }
+    OwnedTransaction tx(owner); auto s=staging();
+    owner.db().execute("UPDATE _lattice_recovery_attempt SET page_bytes=page_bytes+1");
+    owner.db().execute("UPDATE _lattice_recovery_store SET used_stored_bytes=used_stored_bytes+1");
+    expect_error(code::corrupt_state,[&]{s.initialize();});
+    expect_error(code::corrupt_state,[&]{s.resume(token,value.offer.identity);});
+    expect_error(code::corrupt_state,[&]{s.verify_end(token,value.end());}); tx.rollback();
+}
+
+TEST_F(SyncRecoveryStaging, ActualRowsMustMatchStateEvenWhenReservationCountersAgree) {
+    const auto token=create(); const auto value=snapshot(); start(token,value);
+    { OwnedTransaction tx(owner); auto s=staging(); for (const auto& p:value.pages) s.append(token,p); tx.commit(); }
+    OwnedTransaction tx(owner); auto s=staging();
+    auto fabricated=s.resume(token,value.offer.identity).state;
+    fabricated.offer.row_count=fabricated.rows=3;
+    fabricated.offer.content_bytes=fabricated.content_bytes=93;
+    const auto manifest=protocol::encode(fabricated.offer,codec),image=protocol::encode_staging(fabricated,codec);
+    // Same digit widths keep encoded byte accounting equal while the claimed
+    // row/canonical totals and mutable state all agree with one another.
+    ASSERT_EQ(static_cast<int64_t>(manifest.size()),integer(owner,"SELECT length(manifest) AS n FROM _lattice_recovery_attempt"));
+    ASSERT_EQ(static_cast<int64_t>(image.size()),integer(owner,"SELECT length(state) AS n FROM _lattice_recovery_attempt"));
+    owner.db().execute("UPDATE _lattice_recovery_attempt SET manifest=?,state=?,rows=3,canonical_bytes=93",{encoded(manifest),encoded(image)});
+    owner.db().execute("UPDATE _lattice_recovery_store SET used_rows=3,used_canonical_bytes=93");
+    expect_error(code::corrupt_state,[&]{s.resume(token,value.offer.identity);});
+    expect_error(code::corrupt_state,[&]{s.audit();}); tx.rollback();
+}
+
+TEST_F(SyncRecoveryStaging, CounterWriteFailureRollsBackBeginPageAndVerificationForAbortAndIgnore) {
+    const auto token=create(); const auto value=snapshot();
+    for (int phase=0;phase<3;++phase) {
+        if (phase==1) start(token,value);
+        if (phase==2) { OwnedTransaction tx(owner); for (const auto& p:value.pages) staging().append(token,p); tx.commit(); }
+        for (const auto* action:{"ABORT,'injected counter failure'","IGNORE"}) {
+            OwnedTransaction tx(owner); auto s=staging(); const auto before=s.usage(); int hits=0;
+            ASSERT_NO_FATAL_FAILURE(count_fault(owner,hits));
+            owner.db().execute(std::string("CREATE TRIGGER reject_staging_counters BEFORE UPDATE ON _lattice_recovery_store ")+
+                "BEGIN SELECT staging_fault_hit(); SELECT RAISE("+action+"); END");
+            if (phase==0) EXPECT_THROW(s.begin(token,value.offer,value.offer.identity),lattice::db_error);
+            if (phase==1) EXPECT_THROW(s.append(token,value.pages[0]),lattice::db_error);
+            if (phase==2) EXPECT_THROW(s.verify_end(token,value.end()),lattice::db_error);
+            EXPECT_EQ(hits,1) << "fault reached counter write after attempt/page/state mutation";
+            owner.db().execute("DROP TRIGGER reject_staging_counters");
+            ASSERT_EQ(sqlite3_create_function(owner.db().handle(),"staging_fault_hit",0,SQLITE_UTF8,nullptr,nullptr,nullptr,nullptr),SQLITE_OK);
+            const auto after=s.usage();
+            EXPECT_EQ(after.channels,before.channels); EXPECT_EQ(after.pages,before.pages); EXPECT_EQ(after.rows,before.rows);
+            EXPECT_EQ(after.canonical_bytes,before.canonical_bytes); EXPECT_EQ(after.stored_bytes,before.stored_bytes);
+            EXPECT_NO_THROW(s.audit());
+            if (phase==0) EXPECT_EQ(integer(owner,"SELECT COUNT(*) AS n FROM _lattice_recovery_attempt"),0);
+            else {
+                EXPECT_EQ(s.resume(token,value.offer.identity).state.next_page,phase==1 ? 0 : 2);
+                EXPECT_FALSE(s.resume(token,value.offer.identity).content_verified);
+            }
+            tx.commit(); // the caught fault cannot leak a state or charge prefix
+        }
+    }
+    OwnedTransaction retry(owner); EXPECT_TRUE(staging().verify_end(token,value.end()).content_verified); retry.commit();
+}
+
+TEST_F(SyncRecoveryStaging, OldMetadataVersionRefusesRatherThanMigrating) {
+    create(); OwnedTransaction tx(owner);
+    owner.db().execute("UPDATE _lattice_recovery_store SET version=1");
+    expect_error(code::corrupt_state,[&]{staging().initialize();});
+    EXPECT_EQ(integer(owner,"SELECT version AS n FROM _lattice_recovery_store"),1); tx.rollback();
+}
+
+TEST_F(SyncRecoveryStaging, AppendAndVerifiedPointReadsDoNotScanRetainedPageMetadata) {
+    codec.pages=codec.total_rows=4096; limits.pages=limits.rows=4096; limits.stored_bytes=8*1024*1024;
+    std::vector<protocol::row> rows;
+    for (int i=0;i<2049;++i) rows.push_back({"T","id"+std::to_string(100000+i),"{}"});
+    const auto value=snapshot(std::move(rows));
+    const auto token=create();
+    // Setup and required full verification are outside the work ceiling.
+    OwnedTransaction tx(owner); auto s=staging(); s.begin(token,value.offer,value.offer.identity);
+    for (size_t i=0;i<2048;++i) s.append(token,value.pages[i]);
+    auto* handle=owner.db().handle(); int callbacks=0;
+    const auto install_ceiling=[&] {
+        callbacks=0;
+        sqlite3_progress_handler(handle,10,[](void* context) noexcept {
+            return ++*static_cast<int*>(context)>2000 ? 1 : 0;
+        },&callbacks);
+    };
+    install_ceiling();
+    EXPECT_NO_THROW(s.append(token,value.pages.back()));
+    sqlite3_progress_handler(handle,0,nullptr,nullptr);
+    EXPECT_LE(callbacks,2000) << "an append must not SUM/COUNT the retained page set";
+    ASSERT_TRUE(s.verify_end(token,value.end()).content_verified);
+    for (const uint64_t index:{uint64_t{0},uint64_t{1024},uint64_t{2048}}) {
+        install_ceiling();
+        std::optional<protocol::page> read;
+        EXPECT_NO_THROW(read=s.read_verified_page(token,value.offer.identity,index));
+        sqlite3_progress_handler(handle,0,nullptr,nullptr);
+        EXPECT_LE(callbacks,2000) << "each indexed read has an independent fixed SQLite VM budget";
+        ASSERT_TRUE(read); EXPECT_EQ(*read,value.pages[index]);
+    }
+    tx.commit();
+}

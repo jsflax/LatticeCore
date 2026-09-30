@@ -111,9 +111,14 @@ public:
 };
 
 // A derived immediate scheduler may override dispatch policy; preserve it.
-inline std::shared_ptr<scheduler> make_synchronizer_scheduler(std::shared_ptr<scheduler> original) {
-    if (original && typeid(*original) == typeid(immediate_scheduler))
-        return std::make_shared<sync_immediate_scheduler>();
+inline std::shared_ptr<scheduler> make_synchronizer_scheduler(std::shared_ptr<scheduler> original,
+        bool* owns_private_adapter=nullptr) {
+    if(owns_private_adapter)*owns_private_adapter=false;
+    if (original && typeid(*original) == typeid(immediate_scheduler)) {
+        auto adapter=std::make_shared<sync_immediate_scheduler>();
+        if(owns_private_adapter)*owns_private_adapter=true;
+        return adapter;
+    }
     return original;
 }
 

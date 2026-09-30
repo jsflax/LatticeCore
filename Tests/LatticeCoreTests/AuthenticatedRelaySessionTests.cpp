@@ -1,0 +1,3248 @@
+#include "TestHelpers.hpp"
+#include "CanonicalWriterTestAccess.hpp"
+#include "CanonicalReadyAdoptionTestAccess.hpp"
+#include "../../Sources/LatticeCore/src/canonical_ready_named_profile.hpp"
+#include "../../Sources/LatticeCore/src/recovery_authenticated_session.hpp"
+#include "../../Sources/LatticeCore/src/recovery_writer_access.hpp"
+#include "../../Sources/LatticeCore/src/sync_recovery_values.hpp"
+#include <algorithm>
+#include <set>
+#include <cstring>
+#include <cctype>
+#include <filesystem>
+#include <lattice.hpp>
+#include "../../Sources/LatticeCore/src/canonical_writer_adapter.hpp"
+#include "../../Sources/LatticeCore/src/canonical_validated_sequence.hpp"
+#include <nlohmann/json.hpp>
+#include <atomic>
+#include <cstdio>
+#include <chrono>
+#include <thread>
+#include <condition_variable>
+#include <exception>
+#include <limits>
+#include "../../Sources/LatticeCore/src/vendor/picosha2/picosha2.h"
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace lattice::detail {
+struct authenticated_ready_test_access {
+    static uint64_t* setup_entries(uint64_t* value) {auto* prior=authenticated_relay_setup::setup_registry_entries_test_counter_;authenticated_relay_setup::setup_registry_entries_test_counter_=value;return prior;}
+    static void before_owned(const std::function<void()>* hook) {authenticated_relay_setup::ready_before_owned_test_hook_=hook;}
+    static void before_admin_open(const std::function<void()>* hook) {authenticated_relay_setup::admin_before_open_test_hook_=hook;}
+};
+struct authenticated_relay_catalog_test_access {
+    static const std::function<void(lattice_db&)>* before_write(const std::function<void(lattice_db&)>* hook) {
+        const auto* prior=canonical_writer_adapter::namespace_before_write_test_hook_;
+        canonical_writer_adapter::namespace_before_write_test_hook_=hook;return prior;
+    }
+    static const recovery_owner_schema& catalog(const lattice_db& owner) noexcept {
+        return canonical_writer_adapter::authenticated_catalog(owner);
+    }
+};
+}
+namespace {
+using namespace lattice;
+using json=nlohmann::json;
+std::string relay_uuid(unsigned n){char out[37];std::snprintf(out,sizeof(out),"00000000-0000-4000-8000-%012u",n);return out;}
+struct RelayRouteState {std::atomic<bool> current{true};std::atomic<int> destroyed{0};};
+struct RelayRoute {
+    std::shared_ptr<RelayRouteState> state;
+    static int32_t current(void* raw){return static_cast<RelayRoute*>(raw)->state->current.load()?1:0;}
+    static void destroy(void* raw){auto* route=static_cast<RelayRoute*>(raw);++route->state->destroyed;delete route;}
+};
+swift_schema_entry relay_schema() {
+    swift_schema_entry schema;schema.table_name="AuthenticatedRelayRow";
+    property_descriptor text{};text.name="text";text.type=column_type::text;schema.properties[text.name]=text;return schema;
+}
+class AuthenticatedRelaySession:public ::testing::Test {
+protected:
+    TempDB file{"authenticated-relay"};
+    std::unique_ptr<swift_lattice_ref> ref;
+    std::shared_ptr<lattice::swift_lattice> owner;
+    std::shared_ptr<RelayRouteState> route=std::make_shared<RelayRouteState>();
+    relay_recovery_setup setup;
+    json policy() {
+        return {{"version",1},{"authority","registered-test-service"},{"sourceID",relay_uuid(1)},{"epoch",relay_uuid(2)},
+            {"localNamespace","local"},{"namespaces",json::array({{{"namespaceID","local"},{"coverageID","local-v1"},{"revision",1}},
+                {{"namespaceID","app"},{"coverageID","app-v1"},{"revision",1}},{{"namespaceID","other"},{"coverageID","other-v1"},{"revision",1}}})},
+            {"receiptNamespace","app"},{"models",json::array({"AuthenticatedRelayRow"})},{"walFull",true},
+            {"maximumAuthorizationMilliseconds",10000},{"upload",{{"tables",json::array()},{"unlisted","allow"},{"maximumDeletes",256}}}};
+    }
+    json connection(unsigned replica=1) {
+        return {{"mount",relay_uuid(3)},{"connection",relay_uuid(100+replica)},{"channel","shared-channel"},{"authenticatedUserID",relay_uuid(4)},
+            {"peer",{{"replicaID","registered-replica-"+std::to_string(replica)},{"receiverIncarnation",relay_uuid(200+replica)},
+                {"channelIncarnation",relay_uuid(300+replica)}}}};
+    }
+    void SetUp()override {
+        swift_configuration c(file.str(),std::make_shared<immediate_scheduler>());c.audit_retention_seconds=0;c.busy_timeout_ms=100;
+#if LATTICE_HAS_FRT
+        ref.reset(swift_lattice_ref::create(c,{relay_schema()}));
+#else
+        ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(c,{relay_schema()}));
+#endif
+        owner=swift_lattice_ref::shared_for_lattice(ref->get());ASSERT_TRUE(owner);
+        if(auto* n=instance_registry::instance().get_or_create_notifier(file.str()))n->stop_listening();
+    }
+    void TearDown()override {setup.close_on_io();setup={};if(owner)owner->close();owner.reset();ref.reset();}
+    relay_recovery_setup open(const json& p,const json& c,std::shared_ptr<RelayRouteState> state={}) {
+        return ref->open_relay_recovery_setup(p.dump(),c.dump(),new RelayRoute{state?state:route},RelayRoute::current,RelayRoute::destroy);
+    }
+    void open(){setup=open(policy(),connection());ASSERT_TRUE(setup.valid())<<last_bridge_error();}
+    json outcome(const relay_recovery_setup& s) {
+        const auto context=json::parse(s.descriptor());return {{"context",context},{"authenticatedUserID",context["route"]["authenticatedUserID"]},
+            {"peer",context["route"]["peer"]},{"source",context["source"]},{"incomingScope",context["incomingScope"]},
+            {"authorizationRevision","actual-registration-7"},{"validForMilliseconds",10000}};
+    }
+    void authorize(){ASSERT_TRUE(setup.finish_authorization(outcome(setup).dump()))<<last_bridge_error();}
+    audit_log_entry entry(unsigned n=1,std::string value="accepted") {
+        audit_log_entry e;e.global_id=relay_uuid(1000+n);e.global_row_id=relay_uuid(2000+n);e.table_name="AuthenticatedRelayRow";
+        e.operation="INSERT";e.changed_fields_names={"text"};e.changed_fields={{"text",any_property(std::move(value))}};e.timestamp="1789819200.0";return e;
+    }
+    std::string frame(const audit_log_entry& e){return server_sent_event::make_audit_log({e}).to_json();}
+    int64_t count(const char* table){return std::get<int64_t>(owner->db().query("SELECT COUNT(*) AS n FROM "+std::string(table)).at(0).at("n"));}
+    std::vector<database::row_t> receipts(){return owner->db().query("SELECT * FROM _lattice_canonical_receipt ORDER BY original_id");}
+};
+TEST_F(AuthenticatedRelaySession, ActualSwiftCatalogPrecedesAuthorizationAndUnauthenticatedReceiveRefuses) {
+    open();const auto d=json::parse(setup.descriptor());EXPECT_EQ(d["source"]["schemaDigest"],lattice::detail::authenticated_relay_catalog_test_access::catalog(*owner).swift_digest);
+    EXPECT_EQ(d["incomingScope"]["models"].size(),1u);EXPECT_EQ(setup.receive(frame(entry())).status_code(),2);
+    EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
+}
+TEST_F(AuthenticatedRelaySession, AcceptedOriginalAndLostAckReplayHaveOnePositiveReceiptAndUnchangedRow) {
+    open();authorize();const auto e=entry();auto accepted=setup.receive(frame(e));ASSERT_EQ(accepted.status_code(),1);
+    EXPECT_EQ(accepted.ids(),std::vector<std::string>{e.global_id});const auto first=receipts();ASSERT_EQ(first.size(),1u);
+    auto altered=e;altered.changed_fields["text"]=any_property(std::string("must not replace"));
+    auto replay=setup.receive(frame(altered));EXPECT_EQ(replay.ids(),accepted.ids());EXPECT_EQ(receipts(),first);
+    EXPECT_EQ(std::get<std::string>(owner->db().query("SELECT text FROM AuthenticatedRelayRow").at(0).at("text")),"accepted");
+}
+TEST_F(AuthenticatedRelaySession, TwoRegisteredReplicasForOneUserSharePhysicalSourceWithDistinctSetups) {
+    open();authorize();auto other=open(policy(),connection(2));ASSERT_TRUE(other.valid());ASSERT_TRUE(other.finish_authorization(outcome(other).dump()));
+    auto a=setup.receive(frame(entry(1))),b=other.receive(frame(entry(2)));EXPECT_EQ(a.ids().size(),1u);EXPECT_EQ(b.ids().size(),1u);
+    EXPECT_EQ(count("AuthenticatedRelayRow"),2);EXPECT_EQ(count("_lattice_canonical_receipt"),2);
+    setup.close_on_io();EXPECT_FALSE(setup.stop_token().live());EXPECT_TRUE(other.stop_token().live());
+}
+TEST_F(AuthenticatedRelaySession, CrossConnectionApplicationOutcomeIsNotTransferable) {
+    open();auto other=open(policy(),connection(2));ASSERT_TRUE(other.valid());
+    EXPECT_FALSE(other.finish_authorization(outcome(setup).dump()));EXPECT_FALSE(other.stop_token().live());
+    EXPECT_EQ(other.receive(frame(entry())).status_code(),2);EXPECT_EQ(count("AuthenticatedRelayRow"),0);
+}
+TEST_F(AuthenticatedRelaySession, EveryIdentityAndScopeMismatchConsumesAuthorizationWithoutEffects) {
+    for(const char* field:{"authenticatedUserID","peer","source","incomingScope"}) {
+        auto actual=open(policy(),connection());ASSERT_TRUE(actual.valid());const auto valid=outcome(actual);auto answer=valid;
+        if(std::string(field)=="authenticatedUserID")answer[field]=relay_uuid(90);
+        if(std::string(field)=="peer")answer[field]["receiverIncarnation"]=relay_uuid(90);
+        if(std::string(field)=="source")answer[field]["coverageRevision"]=2;
+        if(std::string(field)=="incomingScope")answer[field]["models"][0]["incomingOperations"]=json::array({"INSERT"});
+        EXPECT_FALSE(actual.finish_authorization(answer.dump()));EXPECT_FALSE(actual.finish_authorization(valid.dump()));
+        EXPECT_EQ(actual.receive(frame(entry())).status_code(),2);actual={};
+    }
+    EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
+}
+TEST_F(AuthenticatedRelaySession, ActualRouteCloseBeforeCallbackConsumptionRejectsLateOutcome) {
+    open();const auto answer=outcome(setup);route->current=false;
+    EXPECT_FALSE(setup.finish_authorization(answer.dump()));EXPECT_EQ(setup.receive(frame(entry())).status_code(),2);
+    EXPECT_EQ(count("AuthenticatedRelayRow"),0);
+}
+TEST_F(AuthenticatedRelaySession, StopPreventsLatePublicationAndCountSettlesAfterLastResultCopy) {
+    open();authorize();auto stop=setup.stop_token();auto result=setup.receive(frame(entry()));auto copy=result;
+    ASSERT_EQ(result.ids().size(),1u);EXPECT_FALSE(stop.drained());stop.stop();EXPECT_FALSE(result.publishable());
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+    result={};EXPECT_FALSE(stop.drained());copy={};EXPECT_TRUE(stop.drained());
+    EXPECT_EQ(setup.receive(frame(entry(2))).status_code(),2);
+}
+TEST_F(AuthenticatedRelaySession, FiniteAuthorizationExpiryStopsNewEffectsWithoutClockOverride) {
+    open();auto answer=outcome(setup);answer["validForMilliseconds"]=100;
+    ASSERT_TRUE(setup.finish_authorization(answer.dump()));auto stop=setup.stop_token();
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(stop.live()&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+    ASSERT_FALSE(stop.live());EXPECT_EQ(setup.receive(frame(entry())).status_code(),2);
+    EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
+}
+TEST_F(AuthenticatedRelaySession, OwnerCloseInvalidatesAlreadyAuthorizedPhysicalAdmission) {
+    open();authorize();owner->close();const auto result=setup.receive(frame(entry()));EXPECT_NE(result.status_code(),1);EXPECT_TRUE(result.ids().empty());
+}
+TEST_F(AuthenticatedRelaySession, DenyAllObserverAllowsAckWithoutGrantingAnyUpload) {
+    auto p=policy();p["upload"]["unlisted"]="deny";setup=open(p,connection());ASSERT_TRUE(setup.valid());authorize();
+    auto denied=setup.receive(frame(entry()));EXPECT_EQ(denied.status_code(),4);EXPECT_TRUE(denied.ids().empty());
+    auto ack=setup.receive(server_sent_event::make_ack({relay_uuid(6000)}).to_json());EXPECT_EQ(ack.status_code(),1);EXPECT_TRUE(ack.ids().empty());
+    EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
+}
+TEST_F(AuthenticatedRelaySession, NativePolicyChecksMixedFrameBeforeAnyEntryEffects) {
+    auto p=policy();p["upload"]["maximumDeletes"]=0;setup=open(p,connection());ASSERT_TRUE(setup.valid());authorize();
+    auto deletion=entry(2);deletion.operation="DELETE";deletion.changed_fields.clear();deletion.changed_fields_names.clear();
+    auto result=setup.receive(server_sent_event::make_audit_log({entry(),deletion}).to_json());EXPECT_EQ(result.status_code(),4);
+    EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
+}
+TEST_F(AuthenticatedRelaySession, DuplicateKeysOversizedFramesAndMalformedMembersNeverBecomePartialUploads) {
+    open();authorize();auto valid=json::parse(frame(entry()));valid["auditLog"].push_back(17);
+    for(const auto& raw:{valid.dump(),std::string("{\"auditLog\":[],\"auditLog\":[]}"),std::string(1048577,' ')}) {
+        EXPECT_EQ(setup.receive(raw).status_code(),4);EXPECT_EQ(count("AuthenticatedRelayRow"),0);
+    }
+}
+TEST_F(AuthenticatedRelaySession, SameOwnerProfileMismatchRefusesWithoutRetiringOtherSession) {
+    open();authorize();auto p=policy();p["epoch"]=relay_uuid(99);auto other=open(p,connection(2));EXPECT_FALSE(other.valid());
+    EXPECT_TRUE(setup.stop_token().live());EXPECT_EQ(setup.receive(frame(entry())).ids().size(),1u);
+}
+TEST_F(AuthenticatedRelaySession, EquivalentReopenPreservesFirstPositiveReceipt) {
+    open();authorize();const auto e=entry();auto result=setup.receive(frame(e));ASSERT_EQ(result.ids().size(),1u);const auto first=receipts();
+    result={};setup.close_on_io();setup={};open();authorize();EXPECT_EQ(setup.receive(frame(e)).ids().size(),1u);EXPECT_EQ(receipts(),first);
+}
+TEST_F(AuthenticatedRelaySession, DistinctEnrolledNamespaceCannotAdoptAnotherNamespacesOriginal) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);const auto first=receipts();
+    auto p=policy();p["receiptNamespace"]="other";auto other=open(p,connection(2));ASSERT_TRUE(other.valid());ASSERT_TRUE(other.finish_authorization(outcome(other).dump()));
+    EXPECT_TRUE(other.receive(frame(e)).ids().empty());EXPECT_EQ(receipts(),first);EXPECT_EQ(count("AuthenticatedRelayRow"),1);
+}
+TEST_F(AuthenticatedRelaySession, EmptyUploadHasNoReceiptAndLegacyReceiveCannotBypassProtectedNamespace) {
+    open();authorize();auto empty=setup.receive(server_sent_event::make_audit_log({}).to_json());EXPECT_EQ(empty.status_code(),1);EXPECT_TRUE(empty.ids().empty());
+    EXPECT_THROW(apply_remote_changes(*owner,{entry()}),db_error);EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
+}
+TEST_F(AuthenticatedRelaySession, FactoryFailureAndFinalCloseReleaseActualRouteExactlyOnce) {
+    auto p=policy();p["models"]=json::array();auto bad=open(p,connection());EXPECT_FALSE(bad.valid());EXPECT_EQ(route->destroyed.load(),1);
+    open();authorize();auto stop=setup.stop_token();setup.close_on_io();setup={};EXPECT_EQ(route->destroyed.load(),2);EXPECT_FALSE(stop.live());
+}
+TEST_F(AuthenticatedRelaySession, OwnedIdsOutliveResultsWithoutReleasingPublicationChargeEarly) {
+    open();authorize();const auto e=entry();auto result=setup.receive(frame(e));
+    auto stop=setup.stop_token();ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());
+    auto ids=result.take_ids();EXPECT_EQ(ids,std::vector<std::string>{e.global_id});
+    EXPECT_TRUE(result.ids().empty());EXPECT_TRUE(result.take_ids().empty());
+    EXPECT_EQ(result.status_code(),1);EXPECT_TRUE(result.publishable());EXPECT_FALSE(stop.drained());
+    auto copy=result;result={};EXPECT_FALSE(stop.drained());
+    stop.stop();EXPECT_FALSE(copy.publishable());EXPECT_FALSE(stop.drained());
+    copy={};EXPECT_TRUE(stop.drained());EXPECT_EQ(ids,std::vector<std::string>{e.global_id});
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+}
+
+namespace ready_wire=lattice::detail::canonical_range;
+class AuthenticatedReadySession:public AuthenticatedRelaySession {
+protected:
+    lattice::detail::canonical_ready_test_observation::observation last_prepare_trace;
+    lattice::detail::canonical_ready_read_test_observation::observation last_read_trace;
+    lattice::detail::canonical_range::sequence_test_observation::counters last_read_work;
+    uint64_t last_read_index=0;
+    std::string last_read_bridge_error;
+    static json cost_diagnostic(const lattice::detail::canonical_ready_cost_observation::observation& cost) {
+        return {{"inclusive",true},{"phases",{"retentionAudit","storeAudit","request","sequenceInit","rawFetchHash",
+            "frameDecode","canonicalEncode","sequenceAdvance","receiptEvidence","receiptBatch","fusedFrameValidation"}},
+            {"calls",cost.calls},{"microseconds",cost.microseconds},{"receiptBatches",cost.receipt_batches},{"receiptBatchIDs",cost.receipt_batch_ids}};
+    }
+    json source_policy(bool large=false){auto p=policy();p["maximumAuthorizationMilliseconds"]=600000;if(large)p["readyProfile"]="bounded48MiBV1";return p;}
+    relay_recovery_setup admitted(unsigned replica=1,bool large=false) {
+        auto value=open(source_policy(large),connection(replica));if(!value.valid())throw std::runtime_error("actual READY setup failed");
+        auto answer=outcome(value);answer["validForMilliseconds"]=600000;
+        if(!value.finish_authorization(answer.dump()))throw std::runtime_error("actual READY authorization failed");return value;
+    }
+    json control(const char* op){return {{"kind","recoveryReady"},{"version",1},{"operation",op},{"requestID",relay_uuid(9000)}};}
+    relay_ready_result invoke(const relay_recovery_setup& value,const json& command) {
+        const auto raw=command.dump();const auto charge=value.stop_token().reserve_ready(raw.size());
+        if(!charge.valid())throw std::runtime_error("actual READY input not admitted");return value.ready(raw,charge);
+    }
+    json description(const relay_recovery_setup& value) {
+        auto result=invoke(value,control("describe"));if(result.status_code()!=1||!result.publishable())throw std::runtime_error("READY describe unavailable");
+        return json::parse(result.wire());
+    }
+    ready_wire::limits codec(const json& d) {
+        const auto& p=d.at("profile");const auto& b=p.at("wire");const auto n=[&](const char* k){return std::stoull(b.at(k).get<std::string>());};
+        const auto& v=p.at("valueLimits");
+        return {{n("frame_bytes"),n("payload_bytes"),n("items_per_page"),n("content_pages"),n("content_identities"),n("content_bytes"),n("receipt_pages"),n("receipts"),n("receipt_bytes")},
+            p.at("parserDepth"),p.at("parserNodes"),p.at("scalarBytes"),p.at("requestEntries"),p.at("requestTargets"),p.at("requestTargetBytes"),p.at("restartBytes"),p.at("leaseMilliseconds"),
+            {v.at("rawBytes"),v.at("fields"),v.at("nameBytes"),v.at("valueBytes"),v.at("decodedBytes")}};
+    }
+    ready_wire::frame request(const json& d,uint64_t sequence=1) {
+        const auto& source=d.at("source");ready_wire::request q;
+        q.source={source.at("authority"),source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+        q.budget=codec(d).maximum;q.expected.binding=q.source;
+        ready_wire::attempt a{d.at("peer").at("receiverIncarnation"),d.at("peer").at("channelIncarnation"),d.at("channel"),sequence,relay_uuid(9100+static_cast<unsigned>(sequence))};
+        q.request_digest=ready_wire::request_sha256(a,q,codec(d));return {a,std::stoull(d.at("routeGeneration").get<std::string>()),q};
+    }
+    void seal(ready_wire::frame& f,const json& d) {auto& q=std::get<ready_wire::request>(f.body);q.request_digest=ready_wire::request_sha256(f.logical,q,codec(d));}
+    json command(const char* op,const ready_wire::frame& f,const json& d,int64_t duration=10000) {
+        auto value=control(op);value["routeGeneration"]=d.at("routeGeneration");value["request"]=ready_wire::encode(f,codec(d));
+        if(std::string(op)!="discard")value["durationMilliseconds"]=duration;return value;
+    }
+    json lease(const relay_recovery_setup& value,const ready_wire::frame& f,const json& d,const char* op="prepare",int64_t duration=10000) {
+        using namespace lattice::detail::canonical_ready_test_observation;
+        observation trace;const auto previous=current;current=&trace;
+        namespace counts=lattice::detail::canonical_range::sequence_test_observation;
+        counts::counters work;const auto previous_work=counts::current;counts::current=&work;
+        struct reset {observation* previous;counts::counters* work;~reset(){current=previous;counts::current=work;}} restore{previous,previous_work};
+        auto result=invoke(value,command(op,f,d,duration));
+        last_prepare_trace=trace; // Fixed diagnostic facts; never a lease or success oracle.
+        if(result.status_code()!=1||!result.publishable()) {
+            // Bounded local diagnostics even when the expired response MUST NOT
+            // be sent. The original failure and all workload/lease inputs stay.
+            const json diagnostic={{"status",result.status_code()},{"publishable",result.publishable()},
+                {"bridgeError",last_bridge_error().substr(0,2048)},{"response",result.wire().substr(0,4096)},
+                {"preparation",trace.preparation},{"publication",trace.publication},
+                {"preparationError",trace.preparation_error},{"publicationError",trace.publication_error},
+                {"captureError",trace.capture_error},{"leaseAvailable",trace.lease_available},
+                {"phases",{"entered","prepared","captured","assembled","publishRequested","publishBody","publicationSettled","auditBegin","auditEnd","finished"}},
+                {"visits",trace.visits},{"firstMicroseconds",trace.first_us},{"lastMicroseconds",trace.last_us},{"auditedFrames",trace.audited_frames},
+                {"requestValidations",work.request_validations},{"rebaseBuilds",work.rebase_builds},{"restartObjects",work.restart_objects},
+                {"cursors",work.cursors},{"pageTransitions",work.transitions},{"subphaseCost",cost_diagnostic(trace.cost)}};
+            throw std::runtime_error("READY lease response unavailable: "+diagnostic.dump());
+        }
+        auto answer=json::parse(result.wire());if(answer.at("leaseAvailable")!=true)throw std::runtime_error("READY lease did not commit: "+answer.dump());return answer;
+    }
+    std::string read_diagnostic(const relay_ready_result& result) const {
+        const auto& trace=last_read_trace;const auto& work=last_read_work;
+        // Format only when the actual assertion or canonical decoder fails.
+        // Every read retains its fixed measurements even if its lease expires
+        // after return; this later sample never substitutes for an assertion.
+        return json{{"requestedIndex",last_read_index},{"observedIndex",trace.index},
+            {"status",result.status_code()},{"publishable",result.publishable()},
+            {"bridgeError",last_read_bridge_error},{"response",result.wire().substr(0,4096)},
+            {"phases",{"entered","ownedRequested","bodyBegin","bodyEnd","settled","finished"}},
+            {"visits",trace.visits},{"firstMicroseconds",trace.first_us},{"lastMicroseconds",trace.last_us},
+            {"fullAudits",trace.full_audits},{"auditedFrames",trace.audited_frames},{"auditedBytes",trace.audited_bytes},
+            {"positiveReceiptLookups",trace.positive_receipt_lookups},
+            {"addressedFrames",trace.addressed_frames},{"addressedBytes",trace.addressed_bytes},
+            {"deadlineMilliseconds",trace.deadline_ms},{"clockBeforeBodyMilliseconds",trace.clock_before_ms},
+            {"clockAfterBodyMilliseconds",trace.clock_after_ms},{"clockAfterSettlementMilliseconds",trace.clock_settled_ms},
+            {"settlement",trace.settlement},{"primaryError",trace.primary_error},{"cleanupError",trace.cleanup_error},
+            {"postcommitError",trace.postcommit_error},{"notificationError",trace.notification_error},
+            {"requestValidations",work.request_validations},{"rebaseBuilds",work.rebase_builds},
+            {"restartObjects",work.restart_objects},{"cursors",work.cursors},{"pageTransitions",work.transitions},
+            {"subphaseCost",cost_diagnostic(trace.cost)}}.dump();
+    }
+    ready_wire::frame decode_read(const relay_ready_result& result,const json& d) {
+        try{return ready_wire::decode(result.wire(),codec(d));}
+        catch(...) {
+            // A structured frameAvailable=false response can have status 1 and
+            // a live ordinary authorization fence. The original frame decoder
+            // must still reject it, with the same exception and a bounded trace.
+            try{const auto diagnostic=read_diagnostic(result);std::fprintf(stderr,"READY frame decode failed: %s\n",diagnostic.c_str());}catch(...){}
+            throw;
+        }
+    }
+    relay_ready_result read(const relay_recovery_setup& value,const json& lease,uint64_t index) {
+        auto c=control("read");for(const auto* name:{"routeGeneration","leaseID","requestDigest","attemptID","sequence"})c[name]=lease.at(name);
+        c["index"]=std::to_string(index);
+        namespace reads=lattice::detail::canonical_ready_read_test_observation;
+        namespace counts=lattice::detail::canonical_range::sequence_test_observation;
+        last_read_trace={};last_read_work={};last_read_index=index;last_read_bridge_error.clear();
+        const auto prior=reads::current;const auto prior_work=counts::current;
+        reads::current=&last_read_trace;counts::current=&last_read_work;
+        struct reset {reads::observation* prior;counts::counters* work;~reset(){reads::current=prior;counts::current=work;}} restore{prior,prior_work};
+        auto result=invoke(value,c);last_read_bridge_error=last_bridge_error().substr(0,2048);return result;
+    }
+    std::vector<std::vector<database::row_t>> exact_source() {
+        std::vector<std::vector<database::row_t>> out;
+        for(const auto* table:{"AuthenticatedRelayRow","AuditLog","_lattice_canonical_store","_lattice_canonical_receipt","_lattice_canonical_touch",
+            "_lattice_canonical_ready_profile","_lattice_canonical_ready_binding","_lattice_canonical_ready_transfer","_lattice_canonical_ready_frame","_lattice_canonical_retention","_lattice_canonical_attempt"})
+            out.push_back(owner->db().query("SELECT * FROM "+std::string(table)+" ORDER BY 1"));return out;
+    }
+};
+TEST_F(AuthenticatedReadySession, DescribeUsesActualAuthorizationAndPreservesOriginalProfile) {
+    setup=open(source_policy(),connection());ASSERT_TRUE(setup.valid());EXPECT_FALSE(setup.stop_token().reserve_ready(128).valid());
+    auto answer=outcome(setup);answer["validForMilliseconds"]=600000;ASSERT_TRUE(setup.finish_authorization(answer.dump()));
+    const auto before=exact_source();const auto d=description(setup);
+    EXPECT_EQ(d["source"],json::parse(setup.descriptor())["source"]);EXPECT_EQ(d["peer"],connection()["peer"]);
+    EXPECT_EQ(d["profile"]["name"],"boundedV1");EXPECT_EQ(d["profile"]["transferBytes"],2097152);EXPECT_EQ(d["profile"]["wire"]["content_bytes"],"1048576");
+    EXPECT_EQ(d["upload"],json({{"maximumEntries",256},{"maximumWireBytes",1048576},{"maximumScalarBytes",65536},{"parserNodes",32768},{"parserDepth",16},{"maximumDeletes",256}}));
+    EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedReadySession, RealAcceptedAndMissingOriginalsProduceCommittedAndUnknownReceipts) {
+    setup=admitted();const auto present=entry(1),missing=entry(2);ASSERT_EQ(setup.receive(frame(present)).ids().size(),1u);
+    const auto before=receipts();auto d=description(setup);auto f=request(d);auto& q=std::get<ready_wire::request>(f.body);
+    q.receipts={{present.global_id,"app",{{present.table_name,present.global_row_id}}},{missing.global_id,"app",{{missing.table_name,missing.global_row_id}}}};seal(f,d);
+    auto offered=lease(setup,f,d);ASSERT_EQ(offered["publication"]["state"],"committed");size_t committed=0,unknown=0,rows=0;
+    for(uint64_t i=0;i<std::stoull(offered["frames"].get<std::string>());++i) {
+        auto value=read(setup,offered,i);ASSERT_EQ(value.status_code(),1);ASSERT_TRUE(value.publishable());
+        const auto decoded=ready_wire::decode(value.wire(),codec(d));EXPECT_EQ(decoded.logical,f.logical);EXPECT_EQ(decoded.route_generation,f.route_generation);
+        if(const auto* page=std::get_if<ready_wire::content_page>(&decoded.body))rows+=page->items.size();
+        if(const auto* page=std::get_if<ready_wire::receipt_page>(&decoded.body))for(const auto& receipt:page->items) {
+            if(std::holds_alternative<ready_wire::committed>(receipt.value)){++committed;EXPECT_EQ(receipt.original_id,present.global_id);}
+            if(std::holds_alternative<ready_wire::unknown>(receipt.value)){++unknown;EXPECT_EQ(receipt.original_id,missing.global_id);}
+            EXPECT_FALSE(std::holds_alternative<ready_wire::not_committed>(receipt.value));
+        }
+    }
+    EXPECT_EQ(committed,1u);EXPECT_EQ(unknown,1u);EXPECT_EQ(rows,2u);EXPECT_EQ(receipts(),before);EXPECT_EQ(count("AuthenticatedRelayRow"),1);
+}
+TEST_F(AuthenticatedReadySession, WrongSourcePeerChannelNamespaceAndTargetNeverReserveOrCapture) {
+    setup=admitted();const auto d=description(setup);const auto before=exact_source();
+    for(unsigned which=0;which<6;++which) {
+        auto f=request(d);auto& q=std::get<ready_wire::request>(f.body);
+        if(which==0)q.source.source_id=relay_uuid(99);
+        if(which==1)f.logical.receiver_incarnation=relay_uuid(99);
+        if(which==2)f.logical.channel_incarnation=relay_uuid(99);
+        if(which==3)f.logical.channel="other-channel";
+        if(which==4)q.receipts={{entry().global_id,"other",{{"AuthenticatedRelayRow",entry().global_row_id}}}};
+        if(which==5)q.receipts={{entry().global_id,"app",{{"NotInActualScope",entry().global_row_id}}}};
+        seal(f,d);EXPECT_EQ(invoke(setup,command("prepare",f,d)).status_code(),4);EXPECT_EQ(exact_source(),before);
+    }
+}
+TEST_F(AuthenticatedReadySession, SameAndCrossSessionResumeFencesQueuedFramesAndKeepsCapsuleBytes) {
+    setup=admitted();auto d=description(setup);auto f=request(d);const auto offered=lease(setup,f,d);
+    auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());const auto original=queued.wire();
+    auto same=lease(setup,f,d,"resume");EXPECT_FALSE(queued.publishable());EXPECT_EQ(read(setup,same,0).wire(),original);
+    auto keeper=admitted(2);auto successor=admitted();auto next=description(successor);auto retry=f;retry.route_generation=std::stoull(next["routeGeneration"].get<std::string>());
+    auto same_queued=read(setup,same,0);ASSERT_TRUE(same_queued.publishable());
+    auto renewed=lease(successor,retry,next,"resume");EXPECT_FALSE(same_queued.publishable());EXPECT_TRUE(keeper.stop_token().live());
+    auto current=read(successor,renewed,0);ASSERT_TRUE(current.publishable());auto a=json::parse(original),b=json::parse(current.wire());
+    a["latticeCanonicalRange"]["route_generation"]=b["latticeCanonicalRange"]["route_generation"];EXPECT_EQ(a,b);
+    EXPECT_EQ(read(successor,same,0).status_code(),4);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+}
+TEST_F(AuthenticatedReadySession, ActualAdapterReopenOrphansAndResumesExactDurableCapsule) {
+    setup=admitted();auto d=description(setup);auto f=request(d);auto offered=lease(setup,f,d);auto old=read(setup,offered,0);const auto wire=old.wire();
+    const auto stored=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index");
+    old={};setup.close_on_io();setup={};setup=admitted();auto after=description(setup);f.route_generation=std::stoull(after["routeGeneration"].get<std::string>());
+    auto renewed=lease(setup,f,after,"resume");auto current=read(setup,renewed,0);ASSERT_TRUE(current.publishable());
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index"),stored);
+    auto a=json::parse(wire),b=json::parse(current.wire());a["latticeCanonicalRange"]["route_generation"]=b["latticeCanonicalRange"]["route_generation"];EXPECT_EQ(a,b);
+}
+TEST_F(AuthenticatedReadySession, ExpiredSameProcessLeaseRequiresExactDiscardAndHigherSequence) {
+    setup=admitted();auto keeper=admitted(2);const auto d=description(setup);auto f=request(d);const auto offered=lease(setup,f,d,"prepare",1000);
+    auto queued=read(setup,offered,0);const auto observedAt=std::chrono::steady_clock::now();
+    const auto deadline=observedAt+std::chrono::seconds(3);const auto& trace=last_read_trace;
+    ASSERT_EQ(queued.status_code(),1);ASSERT_EQ(trace.settlement,static_cast<int>(lattice::detail::recovery_install_state::committed));
+    ASSERT_EQ(trace.index,0u);ASSERT_EQ(trace.addressed_frames,1u);ASSERT_GT(trace.addressed_bytes,0u);
+    ASSERT_GE(trace.clock_before_ms,0);ASSERT_GE(trace.clock_after_ms,trace.clock_before_ms);
+    ASSERT_GE(trace.clock_settled_ms,trace.clock_after_ms);ASSERT_GE(trace.deadline_ms,0);
+    const auto remaining=std::max<int64_t>(0,trace.deadline_ms-trace.clock_settled_ms);ASSERT_LE(remaining,1000);
+    // The queued publication fence starts earlier than the stored lease. This
+    // post-read anchor bounds durable expiry without changing either deadline.
+    const auto expiredBy=observedAt+std::chrono::milliseconds(remaining);
+    while((queued.publishable()||std::chrono::steady_clock::now()<expiredBy)&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+    ASSERT_FALSE(queued.publishable());ASSERT_TRUE(std::chrono::steady_clock::now()>=expiredBy);
+    auto resume=invoke(setup,command("resume",f,d));ASSERT_EQ(resume.status_code(),1);EXPECT_FALSE(json::parse(resume.wire())["leaseAvailable"].get<bool>());
+    const auto before=receipts();auto discarded=invoke(setup,command("discard",f,d));ASSERT_EQ(discarded.status_code(),1);
+    EXPECT_EQ(json::parse(discarded.wire())["settlement"]["state"],"committed");EXPECT_EQ(receipts(),before);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+    auto stale=invoke(setup,command("prepare",f,d));ASSERT_EQ(stale.status_code(),1);EXPECT_FALSE(json::parse(stale.wire())["leaseAvailable"].get<bool>());
+    auto next=request(d,2);EXPECT_TRUE(lease(setup,next,d)["leaseAvailable"].get<bool>());EXPECT_TRUE(keeper.stop_token().live());
+}
+TEST_F(AuthenticatedReadySession, SourceWideReservationsBoundPeersAndAreOneShot) {
+    setup=admitted();auto other=admitted(2);const auto c=control("describe");const auto raw=c.dump();
+    std::vector<relay_ready_charge> holds;
+    for(unsigned i=0;i<32;++i){auto held=(i%2?setup:other).stop_token().reserve_ready(raw.size());if(!held.valid())break;holds.push_back(std::move(held));}
+    ASSERT_GT(holds.size(),1u);EXPECT_LT(holds.size(),32u);EXPECT_FALSE(other.stop_token().reserve_ready(raw.size()).valid());
+    holds.pop_back();auto available=other.stop_token().reserve_ready(raw.size());ASSERT_TRUE(available.valid());
+    auto first=other.ready(raw,available);ASSERT_EQ(first.status_code(),1);EXPECT_EQ(other.ready(raw,available).status_code(),4);
+    available={};EXPECT_FALSE(setup.stop_token().reserve_ready(raw.size()).valid());first={};EXPECT_TRUE(setup.stop_token().reserve_ready(raw.size()).valid());
+    holds.clear();EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(other.stop_token().drained());
+}
+TEST_F(AuthenticatedReadySession, OriginalAndLargerProfilesCannotSilentlyAdoptEachOthersSource) {
+    setup=admitted();auto wrong=open(source_policy(true),connection(2));EXPECT_FALSE(wrong.valid());EXPECT_TRUE(setup.stop_token().live());
+    setup.close_on_io();setup={};wrong=open(source_policy(true),connection());EXPECT_FALSE(wrong.valid());
+    setup=admitted();EXPECT_EQ(description(setup)["profile"]["name"],"boundedV1");
+}
+TEST_F(AuthenticatedReadySession, DenyAllUploadsStillPermitAuthorizedCanonicalReadScope) {
+    auto p=source_policy();p["upload"]["unlisted"]="deny";setup=open(p,connection());ASSERT_TRUE(setup.valid());
+    auto answer=outcome(setup);answer["validForMilliseconds"]=600000;ASSERT_TRUE(setup.finish_authorization(answer.dump()));
+    EXPECT_EQ(setup.receive(frame(entry())).status_code(),4);auto d=description(setup);auto f=request(d);auto offered=lease(setup,f,d);
+    EXPECT_TRUE(read(setup,offered,0).publishable());EXPECT_EQ(count("AuthenticatedRelayRow"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);
+}
+TEST_F(AuthenticatedReadySession, MalformedMixedDuplicateAndForeignChargeRefuseWithoutEffects) {
+    setup=admitted();const auto before=exact_source();auto c=control("describe");c["auditLog"]=json::array();EXPECT_EQ(invoke(setup,c).status_code(),4);
+    c=control("describe");c["version"]=2;EXPECT_EQ(invoke(setup,c).status_code(),4);
+    const std::string duplicate="{\"kind\":\"recoveryReady\",\"kind\":\"recoveryReady\"}";
+    auto charge=setup.stop_token().reserve_ready(duplicate.size());ASSERT_TRUE(charge.valid());EXPECT_EQ(setup.ready(duplicate,charge).status_code(),4);
+    EXPECT_FALSE(setup.stop_token().reserve_ready(8388609).valid());EXPECT_EQ(setup.ready(control("describe").dump(),{}).status_code(),4);EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedReadySession, OwnerCloseInProgressRejectsAlreadyQueuedResultBeforeNotificationDrain) {
+    setup=admitted();auto d=description(setup);auto f=request(d);auto offered=lease(setup,f,d);auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());
+    std::atomic<bool> entered{false},release{false},finished{false};auto retained=owner;
+    std::thread notification([&]{instance_registry::instance().for_each_alive(file.str(),[&](lattice_db* value){if(value!=retained.get())return;
+        entered=true;const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+        while(!release.load()&&std::chrono::steady_clock::now()<until)std::this_thread::yield();});});
+    const auto entered_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(!entered.load()&&std::chrono::steady_clock::now()<entered_deadline)std::this_thread::yield();
+    if(!entered.load()){release=true;notification.join();FAIL()<<"actual notifier did not enter bounded hold";return;}
+    std::thread closing([&]{retained->close();finished=true;});
+    const auto close_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(!retained->is_closed()&&std::chrono::steady_clock::now()<close_deadline)std::this_thread::yield();
+    EXPECT_TRUE(retained->is_closed());EXPECT_FALSE(finished.load());EXPECT_FALSE(queued.publishable());
+    release=true;notification.join();closing.join();EXPECT_TRUE(finished.load());
+}
+TEST_F(AuthenticatedReadySession, LargerExplicitProfileCarriesEightThousandRowsAndRealReceiptRequests) {
+    // Preserve completed work when the next call fails before native entry.
+    // This emits only on an original assertion/exception, never changes a lease.
+    struct Progress {
+        using Clock=std::chrono::steady_clock;
+        Clock::time_point origin=Clock::now();int exceptions=std::uncaught_exceptions();
+        uint64_t prepare_us=0,read_us=0,consumer_us=0,reads=0;int phase=0;
+        detail::canonical_ready_test_observation::observation preparation;
+        detail::canonical_ready_read_test_observation::observation previous,current;
+        static uint64_t elapsed(Clock::time_point start) noexcept {
+            const auto value=std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-start).count();
+            return value>0?static_cast<uint64_t>(value):0;
+        }
+        static void add(uint64_t& total,uint64_t value) noexcept {
+            const auto maximum=std::numeric_limits<uint64_t>::max();total=value>maximum-total?maximum:total+value;
+        }
+        static json trace(const detail::canonical_ready_read_test_observation::observation& value) {
+            return {{"index",value.index},{"visits",value.visits},{"firstMicroseconds",value.first_us},{"lastMicroseconds",value.last_us},
+                {"deadlineMilliseconds",value.deadline_ms},{"clockBeforeBodyMilliseconds",value.clock_before_ms},
+                {"clockAfterBodyMilliseconds",value.clock_after_ms},{"clockAfterSettlementMilliseconds",value.clock_settled_ms},
+                {"fullAudits",value.full_audits},{"auditedFrames",value.audited_frames},{"auditedBytes",value.audited_bytes},
+                {"positiveReceiptLookups",value.positive_receipt_lookups},{"addressedFrames",value.addressed_frames},
+                {"settlement",value.settlement},{"primaryError",value.primary_error},{"inclusiveCostCalls",value.cost.calls},
+                {"inclusiveCostMicroseconds",value.cost.microseconds},{"receiptBatches",value.cost.receipt_batches}};
+        }
+        ~Progress() noexcept {
+            if(!::testing::Test::HasFailure()&&std::uncaught_exceptions()<=exceptions)return;
+            try {
+                const auto text=json{{"failureOnly",true},{"phase",phase},{"totalMicroseconds",elapsed(origin)},
+                    {"prepareMicroseconds",prepare_us},{"nativeReadMicroseconds",read_us},{"consumerMicroseconds",consumer_us},
+                    {"returnedReadCalls",reads},{"previousReturnedReadObserved",reads>1},{"currentReturnedReadObserved",reads>0},
+                    {"previousReturnedRead",trace(previous)},{"currentReturnedRead",trace(current)},
+                    {"prepareVisits",preparation.visits},{"prepareFirstMicroseconds",preparation.first_us},
+                    {"prepareLastMicroseconds",preparation.last_us},{"prepareInclusiveCostCalls",preparation.cost.calls},
+                    {"prepareInclusiveCostMicroseconds",preparation.cost.microseconds}}.dump();
+                if(text.size()<=8192)std::fprintf(stderr,"READY 8000 completed-work observation: %s\n",text.c_str());
+                else std::fprintf(stderr,"READY 8000 completed-work observation: bounded-output-unavailable\n");
+            }catch(...){} // Never replace the original assertion/exception.
+        }
+    } progress;
+    setup=admitted(1,true);const auto d=description(setup);ASSERT_EQ(d["profile"]["name"],"bounded48MiBV1");
+    std::vector<audit_log_entry> entries;entries.reserve(8000);const std::string payload(2048,'x');
+    for(unsigned i=0;i<8000;++i){auto e=entry(i,payload);e.global_id=relay_uuid(100000+i);e.global_row_id=relay_uuid(200000+i);entries.push_back(std::move(e));}
+    for(size_t begin=0;begin<entries.size();begin+=256) {
+        const auto end=std::min(entries.size(),begin+256);std::vector<audit_log_entry> page(entries.begin()+begin,entries.begin()+end);
+        auto accepted=setup.receive(server_sent_event::make_audit_log(page).to_json());ASSERT_EQ(accepted.status_code(),1);ASSERT_EQ(accepted.ids().size(),page.size());
+    }
+    ASSERT_EQ(count("AuthenticatedRelayRow"),8000);ASSERT_EQ(count("_lattice_canonical_receipt"),8000);
+    const auto before=receipts();auto f=request(d);auto& q=std::get<ready_wire::request>(f.body);
+    for(const auto& e:entries)q.receipts.push_back({e.global_id,"app",{{e.table_name,e.global_row_id}}});seal(f,d);
+    progress.phase=1;const auto preparation_start=Progress::Clock::now();
+    const auto offered=lease(setup,f,d,"prepare",300000);progress.prepare_us=Progress::elapsed(preparation_start);progress.preparation=last_prepare_trace;
+    const auto frames=std::stoull(offered["frames"].get<std::string>());ASSERT_LE(frames,770u);
+    const auto measured_read=[&](uint64_t index) {
+        progress.phase=2;const auto start=Progress::Clock::now();auto result=read(setup,offered,index);
+        Progress::add(progress.read_us,Progress::elapsed(start));Progress::add(progress.reads,1);
+        progress.previous=progress.current;progress.current=last_read_trace;return result;
+    };
+    auto first=measured_read(0);ASSERT_TRUE(first.publishable())<<read_diagnostic(first);
+    progress.phase=3;auto consumer_start=Progress::Clock::now();auto manifest=decode_read(first,d);
+    const auto& m=std::get<ready_wire::manifest>(manifest.body);auto sequence=ready_wire::begin(f.logical,q,m,codec(d));
+    ready_wire::stream_hasher contents(m,ready_wire::stream_kind::content,codec(d)),receipts_hash(m,ready_wire::stream_kind::receipts,codec(d));
+    std::set<std::string> row_ids,original_ids;size_t bytes=first.wire().size();
+    Progress::add(progress.consumer_us,Progress::elapsed(consumer_start));
+    for(uint64_t index=1;index<frames;++index) {
+        auto result=measured_read(index);ASSERT_EQ(result.status_code(),1)<<read_diagnostic(result);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);bytes+=result.wire().size();
+        progress.phase=3;consumer_start=Progress::Clock::now();const auto frame=decode_read(result,d);sequence=ready_wire::propose(sequence,frame,codec(d));
+        if(const auto* page=std::get_if<ready_wire::content_page>(&frame.body))for(const auto& item:page->items) {
+            ASSERT_TRUE(std::holds_alternative<ready_wire::present>(item.value));contents.append(item);EXPECT_TRUE(row_ids.insert(item.key.id).second);
+            const auto values=lattice::detail::sync_recovery::decode_values(std::get<ready_wire::present>(item.value).payload,codec(d).values);
+            EXPECT_EQ(std::get<std::string>(values.at("text")),payload);
+        }
+        if(const auto* page=std::get_if<ready_wire::receipt_page>(&frame.body))for(const auto& item:page->items) {
+            receipts_hash.append(item);ASSERT_TRUE(std::holds_alternative<ready_wire::committed>(item.value));EXPECT_TRUE(original_ids.insert(item.original_id).second);
+        }
+        Progress::add(progress.consumer_us,Progress::elapsed(consumer_start));
+    }
+    progress.phase=4;
+    EXPECT_EQ(sequence.status,ready_wire::phase::sequence_complete_unverified);EXPECT_EQ(contents.finish(),m.content_digest);EXPECT_EQ(receipts_hash.finish(),m.receipt_digest);
+    EXPECT_EQ(row_ids.size(),8000u);EXPECT_EQ(original_ids.size(),8000u);EXPECT_EQ(receipts(),before);EXPECT_LE(bytes,41943040u);
+    for(const auto& e:entries){EXPECT_EQ(row_ids.count(e.global_row_id),1u);EXPECT_EQ(original_ids.count(e.global_id),1u);}
+}
+
+TEST_F(AuthenticatedReadySession, DelayedOldReservationCannotReplaceLaterSessionsCommittedLease) {
+    setup=admitted();auto later=admitted();const auto d=description(setup),other=description(later);auto f=request(d),next=f;
+    next.route_generation=std::stoull(other["routeGeneration"].get<std::string>());
+    std::atomic<bool> entered{false},release{false};relay_ready_result delayed;std::exception_ptr worker_error;
+    std::thread worker([&]{
+        const std::function<void()> hook=[&]{entered=true;const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+            while(!release.load()&&std::chrono::steady_clock::now()<end)std::this_thread::yield();};
+        lattice::detail::authenticated_ready_test_access::before_owned(&hook);
+        try{delayed=invoke(setup,command("prepare",f,d));}catch(...){worker_error=std::current_exception();}
+        lattice::detail::authenticated_ready_test_access::before_owned(nullptr);
+    });
+    const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(!entered.load()&&std::chrono::steady_clock::now()<until)std::this_thread::yield();
+    json accepted;std::exception_ptr later_error;
+    try{if(entered.load())accepted=lease(later,next,other);}catch(...){later_error=std::current_exception();}
+    release=true;worker.join();ASSERT_TRUE(entered.load());ASSERT_FALSE(worker_error);ASSERT_FALSE(later_error);
+    ASSERT_EQ(delayed.status_code(),1);EXPECT_FALSE(json::parse(delayed.wire())["leaseAvailable"].get<bool>());
+    auto actual=read(later,accepted,0);EXPECT_TRUE(actual.publishable());EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+}
+namespace {
+struct AuthenticatedReadyFault {
+    static thread_local AuthenticatedReadyFault* current;
+    bool publication;int commits=0,hits=0;
+    lattice::detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const lattice::detail::canonical_upstream_test_hooks::authorizer_fault* prior;
+    AuthenticatedReadyFault(database& db,bool p):publication(p),fault{lattice::detail::canonical_writer_custody_test_access::fault_handle(db),deny},
+        prior(lattice::detail::canonical_retention_test_hooks::fault){current=this;lattice::detail::canonical_retention_test_hooks::fault=&fault;}
+    ~AuthenticatedReadyFault(){lattice::detail::canonical_retention_test_hooks::fault=prior;current=nullptr;}
+    static int deny(int action,const char* table,const char*,const char* origin)noexcept {
+        auto& f=*current;if(origin)return SQLITE_OK;
+        if(f.publication&&action==SQLITE_TRANSACTION&&table&&std::strcmp(table,"COMMIT")==0&&++f.commits==3){++f.hits;return SQLITE_DENY;}
+        if(!f.publication&&action==SQLITE_READ&&table&&std::strcmp(table,"_lattice_canonical_ready_frame")==0){++f.hits;return SQLITE_DENY;}
+        return SQLITE_OK;
+    }
+};
+thread_local AuthenticatedReadyFault* AuthenticatedReadyFault::current=nullptr;
+}
+TEST_F(AuthenticatedReadySession, FailedPublicationReportsKnownPreparationAndExactDiscardRecoversCapacity) {
+    setup=admitted();const auto d=description(setup);auto f=request(d);const auto before=receipts();relay_ready_result result;
+    {AuthenticatedReadyFault fault(owner->db(),true);result=invoke(setup,command("prepare",f,d));EXPECT_EQ(fault.hits,1);}
+    ASSERT_EQ(result.status_code(),1);const auto answer=json::parse(result.wire());EXPECT_EQ(answer["preparation"]["state"],"committed");
+    EXPECT_EQ(answer["publication"]["state"],"rolledBack");EXPECT_EQ(answer["leaseAvailable"],false);
+    EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);EXPECT_EQ(count("_lattice_canonical_attempt"),1);EXPECT_EQ(receipts(),before);
+    auto discard=invoke(setup,command("discard",f,d));ASSERT_EQ(discard.status_code(),1);
+    EXPECT_EQ(json::parse(discard.wire())["settlement"]["state"],"committed");EXPECT_EQ(count("_lattice_canonical_attempt"),0);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);EXPECT_EQ(receipts(),before);
+    EXPECT_TRUE(lease(setup,request(d,2),d)["leaseAvailable"].get<bool>());
+}
+TEST_F(AuthenticatedReadySession, ReadDenialReturnsNoFrameAndPreservesExactCapsule) {
+    setup=admitted();const auto d=description(setup);auto offered=lease(setup,request(d),d);const auto before=exact_source();relay_ready_result result;
+    {AuthenticatedReadyFault fault(owner->db(),false);result=read(setup,offered,0);EXPECT_GT(fault.hits,0);}
+    ASSERT_EQ(result.status_code(),1);auto answer=json::parse(result.wire());EXPECT_EQ(answer["frameAvailable"],false);
+    EXPECT_NE(answer["settlement"]["state"],"committed");EXPECT_EQ(exact_source(),before);EXPECT_TRUE(read(setup,offered,0).publishable());
+}
+TEST_F(AuthenticatedReadySession, NewPeerPreparationReclaimsOnlyExpiredCurrentIncarnationCapsule) {
+    setup=admitted();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);const auto evidence=receipts();
+    const auto d=description(setup);auto offer=lease(setup,request(d),d,"prepare",1000);auto queued=read(setup,offer,0);
+    const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+    while(queued.publishable()&&std::chrono::steady_clock::now()<end)std::this_thread::yield();ASSERT_FALSE(queued.publishable());
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);auto other=admitted(2);const auto next=description(other);
+    const auto committed=lease(other,request(next),next);EXPECT_EQ(committed["expiration"]["state"],"committed");
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);EXPECT_EQ(receipts(),evidence);
+    EXPECT_TRUE(read(other,committed,0).publishable());
+}
+TEST_F(AuthenticatedReadySession, ChangedFrozenRequestCannotRecaptureOrAlterStoredCapsule) {
+    setup=admitted();const auto d=description(setup);auto f=request(d);const auto offered=lease(setup,f,d);auto queued=read(setup,offered,0);
+    const auto before=exact_source();auto changed=f;--std::get<ready_wire::request>(changed.body).budget.content_pages;seal(changed,d);
+    auto refused=invoke(setup,command("resume",changed,d));ASSERT_EQ(refused.status_code(),1);
+    EXPECT_FALSE(json::parse(refused.wire())["leaseAvailable"].get<bool>());EXPECT_FALSE(queued.publishable());EXPECT_EQ(exact_source(),before);
+    auto renewed=lease(setup,f,d,"resume");EXPECT_TRUE(read(setup,renewed,0).publishable());
+}
+
+TEST_F(AuthenticatedReadySession, HeldQueuedFrameAndResultsKeepSourceBudgetAcrossLastSetupReopen) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);
+    std::vector<relay_ready_result> held;
+    held.push_back(read(setup,offered,0));ASSERT_EQ(held.front().status_code(),1);ASSERT_TRUE(held.front().publishable());
+    // Match the SDK handoff: move bytes to the socket queue and retain only
+    // the stripped result token until the send completion releases it.
+    const auto queued_wire=held.front().take_wire();ASSERT_FALSE(queued_wire.empty());EXPECT_TRUE(held.front().wire().empty());
+    const auto raw=control("describe").dump();
+    for(unsigned i=0;i<32;++i) {
+        auto charge=setup.stop_token().reserve_ready(raw.size());if(!charge.valid())break;
+        auto result=setup.ready(raw,charge);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());held.push_back(std::move(result));
+    }
+    ASSERT_GT(held.size(),1u);ASSERT_LT(held.size(),16u);EXPECT_FALSE(setup.stop_token().reserve_ready(raw.size()).valid());
+    const auto evidence=receipts();const auto frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index");
+    setup.close_on_io();setup={};EXPECT_EQ(route->destroyed.load(),1);
+    for(const auto& result:held)EXPECT_FALSE(result.publishable());
+    // Each pass tears down the actual native setup and adapter. No keeper
+    // setup or qualification counter keeps the mounted source alive.
+    for(unsigned pass=0;pass<3;++pass) {
+        setup=admitted(2);EXPECT_FALSE(setup.stop_token().reserve_ready(raw.size()).valid());
+        EXPECT_EQ(receipts(),evidence);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index"),frames);
+        if(pass<2){setup.close_on_io();setup={};}
+    }
+    const auto before_release=exact_source();held.pop_back();
+    auto available=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(available.valid());
+    auto fresh=setup.ready(raw,available);ASSERT_EQ(fresh.status_code(),1);EXPECT_TRUE(fresh.publishable());
+    available={};EXPECT_FALSE(setup.stop_token().reserve_ready(raw.size()).valid());
+    for(const auto& result:held)EXPECT_FALSE(result.publishable());
+    held.clear();fresh={};EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(setup.stop_token().reserve_ready(raw.size()).valid());
+    EXPECT_EQ(exact_source(),before_release);EXPECT_FALSE(queued_wire.empty());
+}
+TEST_F(AuthenticatedReadySession, FailedOrChangedProfileReopenCannotDiscardHeldResultCharges) {
+    setup=admitted();const auto raw=control("describe").dump();std::vector<relay_ready_result> held;
+    for(unsigned i=0;i<32;++i) {
+        auto charge=setup.stop_token().reserve_ready(raw.size());if(!charge.valid())break;
+        auto result=setup.ready(raw,charge);ASSERT_EQ(result.status_code(),1);held.push_back(std::move(result));
+    }
+    ASSERT_GT(held.size(),1u);ASSERT_LT(held.size(),16u);setup.close_on_io();setup={};
+    const auto before=exact_source();auto changed=open(source_policy(true),connection(2));
+    EXPECT_FALSE(changed.valid());EXPECT_NE(last_bridge_error().find("source profile differs on actual owner"),std::string::npos);
+    EXPECT_EQ(exact_source(),before);
+    // Exercise the real source factory's idle-owner refusal after registry
+    // reservation; the failed constructor must preserve the old charge domain.
+    owner->db().begin_transaction();auto refused=open(source_policy(),connection(2));const auto error=last_bridge_error();owner->db().rollback();
+    EXPECT_FALSE(refused.valid());EXPECT_NE(error.find("explicit idle WAL/FULL owner"),std::string::npos);EXPECT_EQ(exact_source(),before);
+    setup=admitted(2);EXPECT_FALSE(setup.stop_token().reserve_ready(raw.size()).valid());
+    for(const auto& result:held)EXPECT_FALSE(result.publishable());
+    held.pop_back();auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    auto current=setup.ready(raw,charge);EXPECT_EQ(current.status_code(),1);EXPECT_TRUE(current.publishable());
+    charge={};EXPECT_FALSE(setup.stop_token().reserve_ready(raw.size()).valid());held.clear();current={};EXPECT_TRUE(setup.stop_token().drained());
+}
+TEST_F(AuthenticatedReadySession, HeldReadyResultRetainsNoActualOwnerAfterSetupAndRefRelease) {
+    setup=admitted();auto queued=invoke(setup,control("describe"));ASSERT_TRUE(queued.publishable());
+    const std::weak_ptr<lattice::swift_lattice> observed=owner;
+    setup.close_on_io();setup={};owner->close();owner.reset();ref.reset();
+    EXPECT_TRUE(observed.expired());EXPECT_FALSE(queued.publishable());
+    queued={};EXPECT_TRUE(observed.expired());
+}
+
+class AuthenticatedReceiptCoverageV3:public AuthenticatedReadySession {
+protected:
+    using Rows=std::vector<database::row_t>;
+    using Snapshot=std::map<std::string,Rows>;
+    detail::recovery_producer_registration producer(unsigned n=1) {
+        return {"explicit-installation-"+std::to_string(n),relay_uuid(5000+n)};
+    }
+    json covered_policy(const std::string& selected="app") {
+        auto p=policy();p["version"]=2;p["readyProfile"]="bounded48MiBV1";p["receiptNamespace"]=selected;
+        p["receiptCoverage"]={{"kind","registeredProducerV3"},{"cohortID",relay_uuid(5100)},
+            {"cohortRevision",7},{"operationCodec",1},{"namespaces",json::array({"app","other"})}};
+        return p;
+    }
+    json covered_answer(const relay_recovery_setup& actual,unsigned registration=1) {
+        auto answer=outcome(actual);const auto p=producer(registration);
+        answer["receiptCoverage"]={{"kind","registeredProducer"},{"registrationID",p.registration_id},
+            {"incarnation",p.incarnation},{"cohortID",relay_uuid(5100)},{"cohortRevision",7}};
+        return answer;
+    }
+    relay_recovery_setup covered_setup(const std::string& selected="app",unsigned peer=1,unsigned registration=1) {
+        auto actual=open(covered_policy(selected),connection(peer),std::make_shared<RelayRouteState>());
+        if(!actual.valid())throw std::runtime_error("actual v3 source setup refused: "+last_bridge_error());
+        if(!actual.finish_authorization(covered_answer(actual,registration).dump()))
+            throw std::runtime_error("actual v3 source authorization refused: "+last_bridge_error());
+        return actual;
+    }
+    audit_log_entry identified(audit_log_entry value,unsigned registration=1) {
+        const auto& catalog=detail::authenticated_relay_catalog_test_access::catalog(*owner);
+        value.original_identity=detail::make_original_identity(value,{{"text",column_type::text}},{},catalog.swift_digest,producer(registration));
+        return value;
+    }
+    Snapshot global_state() {
+        Snapshot result;
+        for(const auto* table:{"AuthenticatedRelayRow","AuditLog","_lattice_canonical_store","_lattice_canonical_receipt",
+                              "_lattice_canonical_touch","_lattice_canonical_namespace"})
+            result[table]=owner->db().query("SELECT * FROM "+std::string(table)+" ORDER BY 1");
+        return result;
+    }
+    Snapshot all_state() {
+        Snapshot result;const auto tables=owner->db().query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+        if(tables.size()>128)throw std::runtime_error("v3 fixture table inventory bound");
+        for(const auto& row:tables) {
+            const auto& name=std::get<std::string>(row.at("name"));
+            if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='_';}))
+                throw std::runtime_error("v3 fixture table name refused");
+            result[name]=owner->db().query("SELECT * FROM \""+name+"\" ORDER BY 1");
+        }
+        result["sqlite_schema"]=owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");return result;
+    }
+    // The private adoption helper leaves its writer administratively closed.
+    // Observe the actual committed WAL through a separate READONLY connection,
+    // never by broadening that writer's retained authorizer.
+    Snapshot read_only_all_state(const physical_store_identity& expected) {
+        database reader(file.str(),database::open_mode::read_only,100);
+        const auto require_identity=[&]{
+            const auto actual=reader.physical_identity("main",{},true);
+            if(!actual||actual->device!=expected.device||actual->inode!=expected.inode||actual->filename!=expected.filename)
+                throw std::runtime_error("v3 readonly snapshot physical identity changed");
+        };
+        require_identity();reader.execute("BEGIN");
+        try {
+            Snapshot result;const auto tables=reader.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+            if(tables.size()>128)throw std::runtime_error("v3 fixture table inventory bound");
+            for(const auto& row:tables) {
+                const auto& name=std::get<std::string>(row.at("name"));
+                if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='_';}))
+                    throw std::runtime_error("v3 fixture table name refused");
+                result[name]=reader.query("SELECT * FROM \""+name+"\" ORDER BY 1");
+            }
+            result["sqlite_schema"]=reader.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+            require_identity();reader.execute("COMMIT");require_identity();return result;
+        }catch(...){const auto primary=std::current_exception();try{reader.execute("ROLLBACK");}catch(...){}std::rethrow_exception(primary);}
+    }
+    void expect_administrative_writer_closed() {
+        EXPECT_FALSE(owner->db().is_in_transaction());
+        EXPECT_THROW(owner->db().execute("UPDATE _lattice_meta SET value=value WHERE key='schema_version'"),db_error);
+        EXPECT_THROW(owner->db().execute("UPDATE AuthenticatedRelayRow SET text=text"),db_error);
+        EXPECT_FALSE(owner->db().is_in_transaction());
+    }
+    Rows coverage() {return owner->db().query("SELECT * FROM _lattice_canonical_receipt_coverage ORDER BY original_id,namespace_id");}
+    static std::vector<uint8_t> bytes(const std::string& text) {return {text.begin(),text.end()};}
+};
+
+TEST_F(AuthenticatedReceiptCoverageV3, DistinctAuthenticatedPeersShareOneGlobalApplicationAndAddOnlyNamespaceCoverage) {
+    setup=covered_setup();auto other=covered_setup("other",2);
+    const auto a=json::parse(setup.descriptor()),b=json::parse(other.descriptor());
+    EXPECT_NE(a["route"]["peer"],b["route"]["peer"]);EXPECT_EQ(a["source"]["receiptCoverage"],b["source"]["receiptCoverage"]);
+    const auto e=identified(entry());auto first=setup.receive(frame(e));
+    ASSERT_EQ(first.status_code(),1);ASSERT_EQ(first.take_ids(),std::vector<std::string>{e.global_id});ASSERT_TRUE(first.publishable());
+    const auto global=global_state();const auto original_receipts=receipts();ASSERT_EQ(original_receipts.size(),1u);
+    ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);ASSERT_EQ(coverage().size(),1u);
+    const auto first_origin=owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin");
+    auto second=other.receive(frame(e));ASSERT_EQ(second.status_code(),1);ASSERT_EQ(second.take_ids(),std::vector<std::string>{e.global_id});ASSERT_TRUE(second.publishable());
+    EXPECT_EQ(global_state(),global);EXPECT_EQ(receipts(),original_receipts);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin"),first_origin);
+    const auto cells=coverage();ASSERT_EQ(cells.size(),2u);
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[0].at("namespace_id")),bytes("app"));
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[1].at("namespace_id")),bytes("other"));
+    for(const auto& cell:cells)EXPECT_EQ(std::get<std::vector<uint8_t>>(cell.at("original_id")),bytes(e.global_id));
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("AuditLog"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+    const auto complete=all_state();
+    EXPECT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(all_state(),complete);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, DifferentProducerAndChangedOrdinaryContentCannotAdoptTheOriginal) {
+    setup=covered_setup();const auto e=identified(entry());ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    auto different=covered_setup("other",2,2);auto same=covered_setup("other",3);
+    const auto before=all_state();auto wrong_producer=identified(entry(),2);
+    EXPECT_TRUE(different.receive(frame(wrong_producer)).ids().empty());EXPECT_EQ(all_state(),before);
+    auto changed=e;changed.changed_fields["text"]=any_property("different content with old identity");
+    EXPECT_TRUE(same.receive(frame(changed)).ids().empty());EXPECT_EQ(all_state(),before);
+    changed=identified(changed); // Valid current encoding, but not the accepted immutable operation.
+    EXPECT_TRUE(same.receive(frame(changed)).ids().empty());EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(same.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(coverage().size(),2u);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, DenyAllCannotAddCoverageEvenForAnAlreadyAcceptedOriginal) {
+    setup=covered_setup();const auto e=identified(entry());ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    auto p=covered_policy("other");p["upload"]["unlisted"]="deny";auto denied=open(p,connection(2));ASSERT_TRUE(denied.valid());
+    ASSERT_TRUE(denied.finish_authorization(covered_answer(denied).dump()));const auto before=all_state();
+    const auto result=denied.receive(frame(e));EXPECT_EQ(result.status_code(),4);EXPECT_TRUE(result.ids().empty());
+    EXPECT_EQ(all_state(),before);EXPECT_EQ(coverage().size(),1u);
+    EXPECT_EQ(denied.receive(server_sent_event::make_ack({relay_uuid(9999)}).to_json()).status_code(),1);
+    EXPECT_EQ(coverage().size(),1u);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, AuthorizationRequiresTheActualContextAndExactExplicitCohort) {
+    setup=covered_setup();const auto baseline=all_state();
+    for(const auto* mismatch:{"missing","cohort","revision","context"}) {
+        SCOPED_TRACE(mismatch);auto actual=open(covered_policy("other"),connection(2));ASSERT_TRUE(actual.valid());
+        auto answer=covered_answer(actual);const auto correct=answer;
+        if(std::string(mismatch)=="missing")answer.erase("receiptCoverage");
+        if(std::string(mismatch)=="cohort")answer["receiptCoverage"]["cohortID"]=relay_uuid(5199);
+        if(std::string(mismatch)=="revision")answer["receiptCoverage"]["cohortRevision"]=8;
+        if(std::string(mismatch)=="context")answer["context"]=json::parse(setup.descriptor());
+        EXPECT_FALSE(actual.finish_authorization(answer.dump()));EXPECT_FALSE(actual.finish_authorization(correct.dump()));
+        EXPECT_EQ(actual.receive(frame(identified(entry()))).status_code(),2);EXPECT_EQ(all_state(),baseline);
+    }
+    const auto missing=setup.receive(frame(entry()));EXPECT_TRUE(missing.ids().empty());EXPECT_NE(missing.status_code(),1);
+    EXPECT_EQ(all_state(),baseline);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, RegisteredSourceRequiresExplicitLargeProfileAndCannotImplicitlyUpgradeV2) {
+    const auto fresh=all_state();auto invalid=covered_policy();invalid.erase("readyProfile");
+    auto refused=open(invalid,connection());EXPECT_FALSE(refused.valid());EXPECT_EQ(all_state(),fresh);
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    setup.close_on_io();setup={};const auto before=all_state(),global=global_state();
+    auto implicit=open(covered_policy(),connection(2));EXPECT_FALSE(implicit.valid());EXPECT_EQ(all_state(),before);
+    setup=open(policy(),connection(3));ASSERT_TRUE(setup.valid());authorize();
+    EXPECT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(global_state(),global);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, ExplicitOwnedMigrationPreservesLegacyReceiptWithoutInventingProducerCoverage) {
+    open();authorize();const auto legacy=entry();ASSERT_EQ(setup.receive(frame(legacy)).ids().size(),1u);
+    const auto original_receipts=receipts();auto expected=global_state();
+    setup.close_on_io();setup={};ASSERT_FALSE(owner->is_closed());
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};
+    EXPECT_EQ(global_state(),expected);EXPECT_EQ(receipts(),original_receipts);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    const auto migrated=all_state();auto old=open(policy(),connection(2));EXPECT_FALSE(old.valid());EXPECT_EQ(all_state(),migrated);
+    setup=covered_setup("app",3);auto other=covered_setup("other",4);const auto retained=identified(legacy);
+    EXPECT_EQ(global_state(),expected);const auto reopened=all_state();
+    EXPECT_EQ(setup.receive(frame(retained)).take_ids(),std::vector<std::string>{legacy.global_id});
+    EXPECT_TRUE(other.receive(frame(retained)).ids().empty());EXPECT_EQ(all_state(),reopened);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    const auto next=identified(entry(2,"new registered operation"));ASSERT_EQ(setup.receive(frame(next)).ids().size(),1u);
+    const auto after_first=global_state();ASSERT_EQ(other.receive(frame(next)).ids().size(),1u);EXPECT_EQ(global_state(),after_first);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(coverage().size(),2u);
+    EXPECT_EQ(count("AuthenticatedRelayRow"),2);EXPECT_EQ(count("_lattice_canonical_receipt"),2);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, MigrationWaitsForActualSetupAndHeldReadyResultWithoutAnySqlEffects) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    auto held=invoke(setup,control("describe"));ASSERT_TRUE(held.publishable());const auto before=all_state();
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),2);EXPECT_TRUE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    setup.close_on_io();EXPECT_FALSE(held.publishable());
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),2);EXPECT_EQ(all_state(),before);
+    setup={};
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),2);EXPECT_TRUE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    held={};
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);
+    setup=covered_setup();EXPECT_TRUE(setup.stop_token().live());
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, InvalidMigrationPolicyLeavesTheExistingSourceExactlyReopenable) {
+    open();authorize();ASSERT_EQ(setup.receive(frame(entry())).ids().size(),1u);setup.close_on_io();setup={};
+    const auto before=all_state(),global=global_state();auto changed=covered_policy();changed["epoch"]=relay_uuid(5999);
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),changed.dump()),4);EXPECT_FALSE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    auto stale=policy();stale["epoch"]=relay_uuid(5999);auto corresponding=covered_policy();corresponding["epoch"]=relay_uuid(5999);
+    EXPECT_EQ(ref->migrate_relay_receipt_coverage(stale.dump(),corresponding.dump()),4);EXPECT_FALSE(last_bridge_error().empty());EXPECT_EQ(all_state(),before);
+    setup=open(policy(),connection(2));ASSERT_TRUE(setup.valid())<<last_bridge_error();authorize();
+    EXPECT_EQ(setup.receive(frame(entry())).ids().size(),1u);EXPECT_EQ(global_state(),global);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, MigrationDisposesActualOldReadyCapsuleButPreservesBindingHighWaterAndGlobalData) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    const auto d=description(setup);auto request_frame=request(d);auto& q=std::get<ready_wire::request>(request_frame.body);
+    q.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(request_frame,d);
+    const auto offered=lease(setup,request_frame,d,"prepare",1000);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);ASSERT_GT(count("_lattice_canonical_ready_frame"),0);
+    const auto binding=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");ASSERT_EQ(binding.size(),1u);
+    auto expected=global_state();setup.close_on_io();setup={};
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),binding);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    setup=covered_setup();EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),binding);
+}
+
+class AuthenticatedReceiptMigrationClosure:public AuthenticatedReceiptCoverageV3 {
+protected:
+    void recreate_owner() {
+        if(owner||ref)throw std::runtime_error("migration fixture requires complete prior owner release");
+        swift_configuration c(file.str(),std::make_shared<immediate_scheduler>());c.audit_retention_seconds=0;c.busy_timeout_ms=100;
+#if LATTICE_HAS_FRT
+        ref.reset(swift_lattice_ref::create(c,{relay_schema()}));
+#else
+        ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(c,{relay_schema()}));
+#endif
+        if(!ref)throw std::runtime_error("replacement migration ref unavailable");
+        owner=swift_lattice_ref::shared_for_lattice(ref->get());
+        if(!owner)throw std::runtime_error("replacement migration owner unavailable");
+        if(auto* n=instance_registry::instance().get_or_create_notifier(file.str()))n->stop_listening();
+        // Reopen starts with ordinary connection durability. Migration is
+        // deliberately forbidden from changing it while settling source state.
+        owner->db().execute("PRAGMA main.synchronous=FULL");
+        ASSERT_EQ(std::get<int64_t>(owner->db().query("PRAGMA main.synchronous").at(0).at("synchronous")),2);
+    }
+    static json migration_cell_summary(const column_value_t* value,size_t limit=96) {
+        if(!value)return {{"missing",true}};
+        json result={{"type",value->index()}};
+        if(const auto* text=std::get_if<std::string>(value)){result["bytes"]=text->size();result["prefix"]=text->substr(0,limit);result["truncated"]=text->size()>limit;}
+        else if(const auto* bytes=std::get_if<std::vector<uint8_t>>(value)){result["bytes"]=bytes->size();std::string hex;const char* digits="0123456789abcdef";
+            for(size_t n=0;n<std::min<size_t>(16,bytes->size());++n){hex+=digits[(*bytes)[n]>>4];hex+=digits[(*bytes)[n]&15];}result["prefixHex"]=std::move(hex);}
+        else if(const auto* number=std::get_if<int64_t>(value))result["value"]=*number;
+        else if(const auto* number=std::get_if<double>(value))result["value"]=*number;
+        else result["value"]=nullptr;
+        return result;
+    }
+    // Failure-only explanation of the two exact already-compared snapshots.
+    // No resampling SQL and no change to the complete equality oracle.
+    static std::string migration_state_difference(const Snapshot& expected,const Snapshot& actual,const char* phase) {
+        try {
+            json report={{"phase",phase},{"exactComparedSnapshots",true},{"equal",actual==expected},{"tables",json::array()}};
+            const auto schema_expected=expected.find("sqlite_schema"),schema_actual=actual.find("sqlite_schema");
+            report["sqliteSchemaEqual"]=schema_expected!=expected.end()&&schema_actual!=actual.end()&&schema_expected->second==schema_actual->second;
+            const auto fingerprint_rows=[](const Snapshot& snapshot){
+                json rows=json::array();size_t total=0;const auto table=snapshot.find("_lattice_meta");
+                if(table!=snapshot.end())for(const auto& row:table->second){
+                    const auto key=row.find("key");if(key==row.end())continue;const auto* text=std::get_if<std::string>(&key->second);
+                    if(!text||text->rfind("schema_fingerprint:",0)!=0)continue;++total;
+                    if(rows.size()<8){const auto value=row.find("value");rows.push_back({{"key",migration_cell_summary(&key->second,128)},
+                        {"value",migration_cell_summary(value==row.end()?nullptr:&value->second)}});}
+                }
+                return json{{"total",total},{"rows",std::move(rows)},{"truncated",total>8}};
+            };
+            report["expectedFingerprints"]=fingerprint_rows(expected);report["actualFingerprints"]=fingerprint_rows(actual);
+            std::set<std::string> tables;for(const auto& [table,_]:expected)tables.insert(table);for(const auto& [table,_]:actual)tables.insert(table);
+            size_t changed=0;
+            for(const auto& table:tables){const auto e=expected.find(table),a=actual.find(table);
+                if(e!=expected.end()&&a!=actual.end()&&e->second==a->second)continue;
+                ++changed;if(report["tables"].size()>=8)continue;
+                const auto en=e==expected.end()?0:e->second.size(),an=a==actual.end()?0:a->second.size();
+                json difference={{"table",table},{"expectedPresent",e!=expected.end()},{"actualPresent",a!=actual.end()},
+                    {"expectedRows",en},{"actualRows",an},{"rows",json::array()}};
+                size_t different_rows=0;const size_t row_limit=table=="_lattice_meta"?8:1;
+                for(size_t row=0;row<std::max(en,an);++row){const auto* er=row<en?&e->second[row]:nullptr;const auto* ar=row<an?&a->second[row]:nullptr;
+                    if(er&&ar&&*er==*ar)continue;++different_rows;if(difference["rows"].size()>=row_limit)continue;
+                    json detail={{"orderedRow",row},{"expectedPresent",er!=nullptr},{"actualPresent",ar!=nullptr},{"cells",json::array()}};
+                    if(table=="_lattice_meta"){
+                        const auto* ek=er&&er->count("key")?&er->at("key"):nullptr;const auto* ak=ar&&ar->count("key")?&ar->at("key"):nullptr;
+                        detail["expectedKey"]=migration_cell_summary(ek,128);detail["actualKey"]=migration_cell_summary(ak,128);
+                        detail["sameKey"]=ek&&ak&&*ek==*ak;
+                    }
+                    std::set<std::string> columns;if(er)for(const auto& [column,_]:*er)columns.insert(column);if(ar)for(const auto& [column,_]:*ar)columns.insert(column);
+                    size_t different_cells=0;
+                    for(const auto& column:columns){const auto* ev=er&&er->count(column)?&er->at(column):nullptr;const auto* av=ar&&ar->count(column)?&ar->at(column):nullptr;
+                        if(ev&&av&&*ev==*av)continue;++different_cells;
+                        if(detail["cells"].size()<4)detail["cells"].push_back({{"column",column},{"expected",migration_cell_summary(ev)},{"actual",migration_cell_summary(av)}});
+                    }
+                    detail["differentCells"]=different_cells;detail["cellsTruncated"]=different_cells>4;difference["rows"].push_back(std::move(detail));
+                }
+                difference["differentOrderedRows"]=different_rows;difference["rowsTruncated"]=different_rows>row_limit;report["tables"].push_back(std::move(difference));
+            }
+            report["differentTables"]=changed;report["tablesTruncated"]=changed>8;
+            // Truncating diagnostic UTF-8 byte prefixes must not mask the original assertion.
+            return report.dump(-1,' ',false,json::error_handler_t::replace);
+        }catch(...){return "{}";}
+    }
+    void require_pending_without_sql(const Snapshot& expected,const char* phase) {
+        const auto statements=database::thread_statement_count();
+        const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
+        EXPECT_EQ(database::thread_statement_count(),statements);
+        EXPECT_EQ(result,2)<<last_bridge_error();EXPECT_TRUE(last_bridge_error().empty());
+        const auto actual=all_state();EXPECT_EQ(actual,expected)<<migration_state_difference(expected,actual,phase);
+    }
+};
+
+struct ReceiptMigrationCommitDenial {
+    static thread_local ReceiptMigrationCommitDenial* active;
+    int hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* previous;
+    ReceiptMigrationCommitDenial* prior;
+    explicit ReceiptMigrationCommitDenial(database& db):
+        fault{detail::canonical_writer_custody_test_access::fault_handle(db),deny},
+        previous(detail::canonical_retention_test_hooks::fault),prior(active) {
+        active=this;detail::canonical_retention_test_hooks::fault=&fault;
+    }
+    ~ReceiptMigrationCommitDenial(){detail::canonical_retention_test_hooks::fault=previous;active=prior;}
+    ReceiptMigrationCommitDenial(const ReceiptMigrationCommitDenial&)=delete;
+    ReceiptMigrationCommitDenial& operator=(const ReceiptMigrationCommitDenial&)=delete;
+    static int deny(int action,const char* operation,const char*,const char* origin)noexcept {
+        if(active&&!origin&&action==SQLITE_TRANSACTION&&operation&&std::strcmp(operation,"COMMIT")==0) {
+            ++active->hits;return SQLITE_DENY;
+        }
+        return SQLITE_OK;
+    }
+};
+thread_local ReceiptMigrationCommitDenial* ReceiptMigrationCommitDenial::active=nullptr;
+
+TEST_F(AuthenticatedReceiptMigrationClosure, ReplacementOwnerMigrationWaitsForEveryActualDescribeResultAndStopFence) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    auto held=invoke(setup,control("describe"));ASSERT_EQ(held.status_code(),1);ASSERT_TRUE(held.publishable());
+    auto copied=held;auto stopped=setup.stop_token();EXPECT_FALSE(stopped.drained());
+    const auto before=all_state();auto expected=global_state();
+    const auto physical=owner->db().physical_identity("main",{},true);ASSERT_TRUE(physical);
+    const std::weak_ptr<lattice::swift_lattice> prior_owner=owner;
+    setup.close_on_io();setup={};owner->close();owner.reset();ref.reset();
+    ASSERT_TRUE(prior_owner.expired());EXPECT_FALSE(held.publishable());EXPECT_FALSE(copied.publishable());EXPECT_FALSE(stopped.live());
+    recreate_owner();const auto replacement=owner->db().physical_identity("main",{},true);ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->device,physical->device);EXPECT_EQ(replacement->inode,physical->inode);
+    const auto reopened=all_state();EXPECT_EQ(reopened,before)<<migration_state_difference(before,reopened,"replacement-open");
+    require_pending_without_sql(before,"all-describe-results-held");
+    held={};EXPECT_FALSE(stopped.drained());require_pending_without_sql(before,"one-describe-copy-held");
+    copied={};EXPECT_TRUE(stopped.drained());
+    // A drained, stopped fence still retains this source's capacity domain.
+    // Releasing the final actual fence is required before changing its recipe.
+    require_pending_without_sql(before,"stopped-fence-held");stopped={};
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    setup=covered_setup();EXPECT_TRUE(setup.stop_token().live());EXPECT_EQ(global_state(),expected);
+}
+
+TEST_F(AuthenticatedReceiptMigrationClosure, ActualMigrationCommitDenialRestoresWholeV2CapsuleAndRetryPreservesGlobalHistory) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto d=description(setup);auto requested=request(d);auto& q=std::get<ready_wire::request>(requested.body);
+    q.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(requested,d);
+    const auto offered=lease(setup,requested,d,"prepare",1000);ASSERT_GT(std::stoull(offered.at("frames").get<std::string>()),0u);
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);ASSERT_GT(count("_lattice_canonical_ready_frame"),0);
+    const auto binding=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");ASSERT_EQ(binding.size(),1u);
+    setup.close_on_io();setup={};const auto before=all_state();auto expected=global_state();
+    {
+        ReceiptMigrationCommitDenial fault(owner->db());
+        const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
+        const auto error=last_bridge_error();EXPECT_EQ(fault.hits,1);EXPECT_EQ(result,4);EXPECT_FALSE(error.empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(std::get<int64_t>(before.at("_lattice_canonical_store").at(0).at("version")),2);
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),binding);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    const auto migrated=all_state();auto old=open(policy(),connection(2));EXPECT_FALSE(old.valid());EXPECT_EQ(all_state(),migrated);
+    setup=covered_setup("app",3);EXPECT_TRUE(setup.stop_token().live());EXPECT_EQ(global_state(),expected);
+}
+
+
+// The only rendezvous is before either actual API call, outside all production
+// locks/callbacks. SQL admission remains serialized by the real owned writer.
+struct ReceiptIngressWorkers {
+    struct Outcome {int32_t status=0;bool publishable=false;std::vector<std::string> ids;std::exception_ptr error;};
+    std::atomic<unsigned> arrived{0},completed{0};std::atomic<bool> released{false},cancelled{false},timed_out{false};
+    Outcome results[2];std::vector<std::thread> threads;
+    ReceiptIngressWorkers(){threads.reserve(2);}
+    ~ReceiptIngressWorkers(){cancelled.store(true);released.store(true);for(auto& worker:threads)if(worker.joinable())worker.join();}
+    void launch(size_t index,relay_recovery_setup actual,std::string raw){
+        threads.emplace_back([this,index,actual=std::move(actual),raw=std::move(raw)]{
+            ++arrived;const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+            while(!released.load()&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+            if(!released.load())timed_out.store(true);
+            if(released.load()&&!cancelled.load())try{auto result=actual.receive(raw);results[index].status=result.status_code();
+                results[index].publishable=result.publishable();results[index].ids=result.take_ids();}catch(...){results[index].error=std::current_exception();}
+            ++completed;
+        });
+    }
+    bool wait(const std::atomic<unsigned>& count,unsigned expected){const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(count.load()!=expected&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();return count.load()==expected;}
+    void join(){for(auto& worker:threads)if(worker.joinable())worker.join();}
+};
+struct ReceiptIngressCommitDenial {
+    static thread_local ReceiptIngressCommitDenial* active;
+    unsigned hits=0;detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* previous;ReceiptIngressCommitDenial* prior;
+    explicit ReceiptIngressCommitDenial(database& db):fault{detail::canonical_writer_custody_test_access::fault_handle(db),deny},
+        previous(detail::canonical_upstream_test_hooks::fault),prior(active){active=this;detail::canonical_upstream_test_hooks::fault=&fault;}
+    ~ReceiptIngressCommitDenial(){detail::canonical_upstream_test_hooks::fault=previous;active=prior;}
+    static int deny(int action,const char* operation,const char*,const char* origin)noexcept{
+        if(active&&!origin&&action==SQLITE_TRANSACTION&&operation&&std::strcmp(operation,"COMMIT")==0){++active->hits;return SQLITE_DENY;}return SQLITE_OK;
+    }
+};
+thread_local ReceiptIngressCommitDenial* ReceiptIngressCommitDenial::active=nullptr;
+
+TEST_F(AuthenticatedReceiptCoverageV3, ConcurrentApiStartsAcceptOneGlobalOriginalThroughTwoAuthorizedNamespaces) {
+    setup=covered_setup();auto c=connection(2);c["channel"]="other-channel";
+    auto other=open(covered_policy("other"),c,std::make_shared<RelayRouteState>());ASSERT_TRUE(other.valid());
+    ASSERT_TRUE(other.finish_authorization(covered_answer(other).dump()));
+    const auto e=identified(entry());const auto raw=frame(e);ASSERT_EQ(count("_lattice_canonical_receipt"),0);
+    ReceiptIngressWorkers workers;workers.launch(0,setup,raw);workers.launch(1,other,raw);
+    ASSERT_TRUE(workers.wait(workers.arrived,2));workers.released.store(true);
+    ASSERT_TRUE(workers.wait(workers.completed,2));workers.join();EXPECT_FALSE(workers.timed_out.load());
+    for(const auto& result:workers.results){EXPECT_FALSE(result.error);EXPECT_EQ(result.status,1);EXPECT_TRUE(result.publishable);EXPECT_EQ(result.ids,std::vector<std::string>{e.global_id});}
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("AuditLog"),1);EXPECT_EQ(count("_lattice_canonical_receipt"),1);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    // The first INSERT records its model touch, then its original receipt.
+    // The other namespace adds coverage without advancing either position.
+    const auto head=owner->db().query("SELECT head FROM _lattice_canonical_store");ASSERT_EQ(head.size(),1u);EXPECT_EQ(std::get<int64_t>(head[0].at("head")),2);
+    const auto accepted=receipts();ASSERT_EQ(accepted.size(),1u);EXPECT_EQ(std::get<int64_t>(accepted[0].at("position")),2);
+    const auto touches=owner->db().query("SELECT position FROM _lattice_canonical_touch ORDER BY relation,identity");
+    ASSERT_EQ(touches.size(),1u);EXPECT_EQ(std::get<int64_t>(touches[0].at("position")),1);
+    const auto coverage_state=owner->db().query("SELECT mutation,origins,cells FROM _lattice_canonical_receipt_profile");
+    ASSERT_EQ(coverage_state.size(),1u);EXPECT_EQ(std::get<int64_t>(coverage_state[0].at("mutation")),2);
+    EXPECT_EQ(std::get<int64_t>(coverage_state[0].at("origins")),1);EXPECT_EQ(std::get<int64_t>(coverage_state[0].at("cells")),2);
+    const auto cells=coverage();ASSERT_EQ(cells.size(),2u);
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[0].at("namespace_id")),bytes("app"));EXPECT_EQ(std::get<std::vector<uint8_t>>(cells[1].at("namespace_id")),bytes("other"));
+    for(const auto& cell:cells)EXPECT_EQ(std::get<std::vector<uint8_t>>(cell.at("original_id")),bytes(e.global_id));
+    EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(other.stop_token().drained());
+    const auto complete=all_state();EXPECT_EQ(setup.receive(raw).take_ids(),std::vector<std::string>{e.global_id});
+    EXPECT_EQ(other.receive(raw).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(all_state(),complete);
+}
+TEST_F(AuthenticatedReceiptCoverageV3, BothActualCommitAttemptsRollbackNewOriginAndLaterChannelCoverageBeforeRetry) {
+    setup=covered_setup();auto c=connection(2);c["channel"]="other-channel";
+    auto other=open(covered_policy("other"),c,std::make_shared<RelayRouteState>());ASSERT_TRUE(other.valid());
+    ASSERT_TRUE(other.finish_authorization(covered_answer(other).dump()));const auto e=identified(entry());const auto raw=frame(e);
+    const auto empty=all_state();
+    {
+        ReceiptIngressCommitDenial fault(owner->db());const auto failed=other.receive(raw);
+        EXPECT_EQ(fault.hits,2u);EXPECT_EQ(failed.status_code(),1);EXPECT_TRUE(failed.ids().empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(all_state(),empty);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_EQ(count("_lattice_canonical_receipt"),0);EXPECT_TRUE(coverage().empty());
+    ASSERT_EQ(other.receive(raw).take_ids(),std::vector<std::string>{e.global_id});const auto one=all_state(),global=global_state();
+    ASSERT_EQ(coverage().size(),1u);ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    {
+        ReceiptIngressCommitDenial fault(owner->db());const auto failed=setup.receive(raw);
+        EXPECT_EQ(fault.hits,2u);EXPECT_EQ(failed.status_code(),1);EXPECT_TRUE(failed.ids().empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(all_state(),one);EXPECT_EQ(global_state(),global);
+    ASSERT_EQ(setup.receive(raw).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(global_state(),global);
+    EXPECT_EQ(coverage().size(),2u);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("AuditLog"),1);
+    const auto complete=all_state();EXPECT_EQ(other.receive(raw).take_ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(all_state(),complete);
+}
+TEST_F(AuthenticatedReceiptCoverageV3, OrdinaryIngressCountAndWireByteLimitsRefuseWithoutChangingDurableCapacityOrState) {
+    setup=covered_setup();const auto actual=description(setup);ASSERT_EQ(actual.at("upload").at("maximumEntries"),256);
+    ASSERT_EQ(actual.at("upload").at("maximumWireBytes"),1048576);ASSERT_EQ(actual.at("upload").at("maximumScalarBytes"),65536);
+    ASSERT_EQ(actual.at("upload").at("maximumDeletes"),256);
+    const auto profile=owner->db().query("SELECT max_origins,max_origin_bytes,max_cells,max_cell_bytes FROM _lattice_canonical_receipt_profile");ASSERT_EQ(profile.size(),1u);
+    EXPECT_EQ(std::get<int64_t>(profile[0].at("max_origins")),65536);EXPECT_EQ(std::get<int64_t>(profile[0].at("max_origin_bytes")),67108864);
+    EXPECT_EQ(std::get<int64_t>(profile[0].at("max_cells")),4194304);EXPECT_EQ(std::get<int64_t>(profile[0].at("max_cell_bytes")),1610612736);
+    const auto before=all_state();std::vector<audit_log_entry> too_many;too_many.reserve(257);
+    for(unsigned n=1;n<=257;++n)too_many.push_back(identified(entry(n)));
+    const auto count_frame=server_sent_event::make_audit_log(too_many).to_json();ASSERT_LT(count_frame.size(),1048576u);
+    const auto count_refusal=setup.receive(count_frame);EXPECT_EQ(count_refusal.status_code(),4);EXPECT_TRUE(count_refusal.ids().empty());EXPECT_EQ(all_state(),before);
+    std::vector<audit_log_entry> too_wide;too_wide.reserve(32);
+    for(unsigned n=1;n<=32;++n)too_wide.push_back(identified(entry(1000+n,std::string(40000,'x'))));
+    const auto byte_frame=server_sent_event::make_audit_log(too_wide).to_json();ASSERT_GT(byte_frame.size(),1048576u);ASSERT_LE(too_wide.size(),256u);
+    const auto byte_refusal=setup.receive(byte_frame);EXPECT_EQ(byte_refusal.status_code(),4);EXPECT_TRUE(byte_refusal.ids().empty());EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(owner->db().query("SELECT max_origins,max_origin_bytes,max_cells,max_cell_bytes FROM _lattice_canonical_receipt_profile"),profile);
+    EXPECT_TRUE(setup.stop_token().live());EXPECT_TRUE(setup.stop_token().drained());
+    const auto valid=identified(entry(800));ASSERT_EQ(setup.receive(frame(valid)).take_ids(),std::vector<std::string>{valid.global_id});
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);EXPECT_EQ(coverage().size(),1u);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+struct AddressedReadAuthorizerFault {
+    using fault_type=detail::canonical_upstream_test_hooks::authorizer_fault;
+    static thread_local AddressedReadAuthorizerFault* active;
+    bool deny_commit;unsigned commits=0;
+    fault_type fault;const fault_type** slot;const fault_type* previous;AddressedReadAuthorizerFault* prior;
+    AddressedReadAuthorizerFault(database& db,bool upstream,bool deny=false):deny_commit(deny),
+        fault{detail::canonical_writer_custody_test_access::fault_handle(db),restrict_action},
+        slot(upstream?&detail::canonical_upstream_test_hooks::fault:&detail::canonical_retention_test_hooks::fault),
+        previous(*slot),prior(active){active=this;*slot=&fault;}
+    ~AddressedReadAuthorizerFault(){*slot=previous;active=prior;}
+    static int restrict_action(int action,const char* operation,const char*,const char* origin)noexcept {
+        if(active&&!origin&&action==SQLITE_TRANSACTION&&operation&&std::strcmp(operation,"COMMIT")==0){
+            ++active->commits;if(active->deny_commit)return SQLITE_DENY;
+        }
+        return SQLITE_OK;
+    }
+};
+thread_local AddressedReadAuthorizerFault* AddressedReadAuthorizerFault::active=nullptr;
+struct AddressedReadInvalidationHook {
+    std::shared_ptr<lattice::swift_lattice> owner;uint64_t token;
+    ~AddressedReadInvalidationHook(){owner->remove_invalidation_hook(token);}
+};
+
+TEST_F(AuthenticatedReadySession, EveryAuthenticatedReadAuditsAllCapsulesOnceAndReturnsExactStoredFrames) {
+    setup=admitted();auto other=admitted(2);const auto a=entry(41,"first"),b=entry(42,"second");
+    ASSERT_EQ(setup.receive(frame(a)).ids().size(),1u);ASSERT_EQ(other.receive(frame(b)).ids().size(),1u);
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    for(auto* q:{&qa,&qb})std::get<ready_wire::request>(q->body).budget.items_per_page=1;
+    std::get<ready_wire::request>(qa.body).receipts={{a.global_id,std::string("app"),{{a.table_name,a.global_row_id}}}};
+    std::get<ready_wire::request>(qb.body).receipts={{b.global_id,std::string("app"),{{b.table_name,b.global_row_id}}}};
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);
+    const auto before=exact_source();const auto stored=owner->db().query("SELECT frame_index,data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);uint64_t bytes=0;
+    for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const auto* selected:{&setup,&other}) {
+        const auto& d=selected==&setup?da:db;const auto& offered=selected==&setup?la:lb;const auto& q=selected==&setup?qa:qb;
+        const auto frames=std::stoull(offered.at("frames").get<std::string>());ASSERT_GT(frames,3u);
+        for(uint64_t index=0;index<frames;++index) {
+            const auto result=read(*selected,offered,index);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+            EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.audited_frames,stored.size());EXPECT_EQ(last_read_trace.audited_bytes,bytes);
+            EXPECT_EQ(last_read_trace.positive_receipt_lookups,2u);EXPECT_EQ(last_read_trace.addressed_frames,1u);
+            EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.postcommit_error||last_read_trace.notification_error);
+            unsigned matches=0;
+            for(const auto& row:stored)if(std::get<int64_t>(row.at("frame_index"))==static_cast<int64_t>(index)) {
+                const auto& data=std::get<std::vector<uint8_t>>(row.at("data"));auto expected=ready_wire::decode(std::string(data.begin(),data.end()),codec(d));
+                if(expected.logical!=q.logical)continue;++matches;expected.route_generation=q.route_generation;
+                EXPECT_EQ(result.wire(),ready_wire::encode(expected,codec(d)));
+            }
+            EXPECT_EQ(matches,1u);EXPECT_EQ(exact_source(),before);
+        }
+    }
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, RegisteredNamespaceReadAuditsBothPositiveCoverageCapsulesOnce) {
+    auto policy_a=covered_policy();policy_a["maximumAuthorizationMilliseconds"]=600000;
+    auto policy_b=policy_a;policy_b["receiptNamespace"]="other";
+    setup=open(policy_a,connection());auto other=open(policy_b,connection(2),std::make_shared<RelayRouteState>());
+    for(const auto* actual:{&setup,&other}){ASSERT_TRUE(actual->valid());auto answer=covered_answer(*actual);answer["validForMilliseconds"]=600000;
+        ASSERT_TRUE(actual->finish_authorization(answer.dump()));}
+    const auto e=identified(entry(51));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(coverage().size(),2u);
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    for(auto* f:{&qa,&qb}) {
+        const auto ns=f==&qa?std::string("app"):std::string("other");auto& q=std::get<ready_wire::request>(f->body);
+        f->version=3;q.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};q.receipt_namespace=ns;
+        q.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};
+    }
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);const auto before=all_state();
+    const auto stored=owner->db().query("SELECT data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    uint64_t bytes=0;for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const auto* selected:{&setup,&other}) {
+        const auto& d=selected==&setup?da:db;const auto& offered=selected==&setup?la:lb;const auto ns=selected==&setup?"app":"other";
+        size_t positives=0;const auto frames=std::stoull(offered.at("frames").get<std::string>());
+        for(uint64_t index=0;index<frames;++index) {
+            const auto result=read(*selected,offered,index);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+            EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.audited_frames,stored.size());EXPECT_EQ(last_read_trace.audited_bytes,bytes);
+            EXPECT_EQ(last_read_trace.positive_receipt_lookups,2u);const auto decoded=decode_read(result,d);EXPECT_EQ(decoded.version,3u);
+            if(const auto* page=std::get_if<ready_wire::receipt_page>(&decoded.body))for(const auto& item:page->items) {
+                const auto* positive=std::get_if<ready_wire::committed>(&item.value);ASSERT_NE(positive,nullptr);++positives;
+                EXPECT_EQ(positive->namespace_id,ns);EXPECT_EQ(item.original_id,e.global_id);EXPECT_EQ(item.operation_digest,e.original_identity->digest);EXPECT_FALSE(item.legacy_unbound);
+            }
+            EXPECT_EQ(all_state(),before);
+        }
+        EXPECT_EQ(positives,1u);
+    }
+}
+
+TEST_F(AuthenticatedReadySession, OffPageCorruptionBeforeAnotherReadStillFailsItsWholePreAudit) {
+    setup=admitted();const auto e=entry(61);ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto good=read(setup,offered,0);
+    ASSERT_TRUE(good.publishable());EXPECT_EQ(last_read_trace.full_audits,1u);const auto before=exact_source();
+    const auto tail=owner->db().query("SELECT binding,frame_index,data FROM _lattice_canonical_ready_frame ORDER BY frame_index DESC LIMIT 1").at(0);
+    ASSERT_GT(std::get<int64_t>(tail.at("frame_index")),0);
+    const auto replace=[&](const std::vector<uint8_t>& data) {
+        // Deliberate external SQL corruption before the next call. Restore the
+        // exact guard so the oracle must inspect off-page content, not DDL drift.
+        database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.begin_transaction();raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",{data,tail.at("binding"),tail.at("frame_index")});
+        raw.execute(guard);raw.commit();
+    };
+    replace(std::vector<uint8_t>{'{','}'});const auto corrupt=exact_source();const auto refused=read(setup,offered,0);
+    ASSERT_EQ(refused.status_code(),1);const auto answer=json::parse(refused.wire());EXPECT_EQ(answer.at("frameAvailable"),false);
+    EXPECT_NE(answer.at("settlement").at("state"),"committed");EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.addressed_frames,0u);
+    EXPECT_EQ(exact_source(),corrupt);replace(std::get<std::vector<uint8_t>>(tail.at("data")));EXPECT_EQ(exact_source(),before);
+    const auto restored=read(setup,offered,0);EXPECT_TRUE(restored.publishable());EXPECT_EQ(restored.wire(),good.wire());EXPECT_EQ(last_read_trace.full_audits,1u);
+}
+
+TEST_F(AuthenticatedReadySession, EitherAuthorizerFaultUsesBothAuditsAndCommitRefusalReturnsNoFrame) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();const auto frames=std::stoull(offered.at("frames").get<std::string>());
+    for(const bool upstream:{false,true}) {
+        SCOPED_TRACE(upstream);
+        {AddressedReadAuthorizerFault fault(owner->db(),upstream);const auto result=read(setup,offered,0);
+            EXPECT_EQ(result.wire(),baseline.wire());EXPECT_TRUE(result.publishable());EXPECT_EQ(fault.commits,1u);
+            EXPECT_EQ(last_read_trace.full_audits,2u);EXPECT_EQ(last_read_trace.audited_frames,2*frames);}
+        {AddressedReadAuthorizerFault fault(owner->db(),upstream,true);const auto result=read(setup,offered,0);
+            ASSERT_EQ(result.status_code(),1);const auto answer=json::parse(result.wire());EXPECT_EQ(answer.at("frameAvailable"),false);
+            EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_EQ(answer.at("settlement").at("primaryError"),true);
+            EXPECT_EQ(fault.commits,1u);EXPECT_EQ(last_read_trace.full_audits,2u);EXPECT_EQ(last_read_trace.audited_frames,2*frames);}
+        EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(exact_source(),before);
+        const auto retry=read(setup,offered,0);EXPECT_EQ(retry.wire(),baseline.wire());EXPECT_TRUE(retry.publishable());EXPECT_EQ(last_read_trace.full_audits,1u);
+    }
+}
+
+TEST_F(AuthenticatedReadySession, ReadPostcommitObserverErrorKeepsTheExistingCommittedFrameContract) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();unsigned calls=0;
+    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw std::runtime_error("addressed read observer");})};
+    const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);EXPECT_EQ(result.status_code(),1);EXPECT_TRUE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());
+    EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+    EXPECT_TRUE(last_read_trace.postcommit_error);EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.notification_error);
+    EXPECT_EQ(exact_source(),before);
+}
+
+TEST_F(AuthenticatedReadySession, ReadPostcommitRevocationStillPreventsPublicationOfCommittedBytes) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();const auto stop=setup.stop_token();unsigned calls=0;
+    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;stop.stop();})};
+    const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);EXPECT_EQ(result.status_code(),1);EXPECT_FALSE(result.publishable());EXPECT_FALSE(baseline.publishable());
+    EXPECT_EQ(result.wire(),baseline.wire());EXPECT_EQ(last_read_trace.full_audits,1u);
+    EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(exact_source(),before);
+}
+
+TEST_F(AuthenticatedReadySession, ReadPostcommitLeaseExpiryStillPreventsPublicationAndLaterRead) {
+    setup=admitted();const auto d=description(setup);const auto offered=lease(setup,request(d),d,"prepare",1000);const auto baseline=read(setup,offered,0);
+    ASSERT_TRUE(baseline.publishable());const auto before=exact_source();bool reached_expiry=false;unsigned calls=0;
+    {
+        AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){
+            ++calls;const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+            while(baseline.publishable()&&std::chrono::steady_clock::now()<end)std::this_thread::yield();reached_expiry=!baseline.publishable();
+        })};
+        const auto result=read(setup,offered,0);EXPECT_EQ(calls,1u);ASSERT_TRUE(reached_expiry);EXPECT_EQ(result.status_code(),1);
+        EXPECT_FALSE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());EXPECT_EQ(last_read_trace.full_audits,1u);
+        EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+    }
+    const auto expired=read(setup,offered,0);EXPECT_NE(expired.status_code(),1);EXPECT_EQ(last_read_trace.full_audits,0u);EXPECT_EQ(exact_source(),before);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <condition_variable>
+namespace {
+struct ReadyLifecycleGate {
+    std::mutex mutex;std::condition_variable changed;bool entered=false,released=false,timed_out=false;
+    void wait(){std::unique_lock lock(mutex);entered=true;changed.notify_all();if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return released;}))timed_out=true;}
+    bool arrived(){std::lock_guard lock(mutex);return entered;}
+    void release(){std::lock_guard lock(mutex);released=true;changed.notify_all();}
+    bool timedOut(){std::lock_guard lock(mutex);return timed_out;}
+};
+struct ReadyLifecycleEvents {
+    std::mutex mutex;std::function<void(const char*)> callback;
+    std::atomic<unsigned> settled{0},published{0};
+    void observe(const char* point){
+        if(std::strcmp(point,"maintenance-settled")==0)++settled;
+        if(std::strcmp(point,"maintenance-published")==0)++published;
+        std::function<void(const char*)> current;{std::lock_guard lock(mutex);current=callback;}if(current)current(point);
+    }
+    void set(std::function<void(const char*)> next){std::lock_guard lock(mutex);callback=std::move(next);}
+};
+struct ReadyLifecycleFault {
+    static thread_local ReadyLifecycleFault* current;
+    bool ignore_charge;unsigned hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* prior;
+    ReadyLifecycleFault(database& db,bool ignore=false):ignore_charge(ignore),fault{detail::canonical_writer_custody_test_access::fault_handle(db),apply},prior(detail::canonical_retention_test_hooks::fault){current=this;detail::canonical_retention_test_hooks::fault=&fault;}
+    ~ReadyLifecycleFault(){detail::canonical_retention_test_hooks::fault=prior;current=nullptr;}
+    static int apply(int action,const char* table,const char* column,const char* origin)noexcept {
+        if(origin||!table)return SQLITE_OK;auto& value=*current;
+        if(!value.ignore_charge&&action==SQLITE_TRANSACTION&&std::strcmp(table,"COMMIT")==0){++value.hits;return SQLITE_DENY;}
+        if(value.ignore_charge&&action==SQLITE_UPDATE&&std::strcmp(table,"_lattice_canonical_ready_profile")==0&&column&&std::strcmp(column,"charged")==0){++value.hits;return SQLITE_IGNORE;}
+        return SQLITE_OK;
+    }
+};
+thread_local ReadyLifecycleFault* ReadyLifecycleFault::current=nullptr;
+class AuthenticatedReadyLifecycle:public AuthenticatedReadySession {
+protected:
+    std::shared_ptr<ReadyLifecycleEvents> events=std::make_shared<ReadyLifecycleEvents>();
+    std::shared_ptr<const detail::authenticated_ready_maintenance_test_observation::probe> prior_probe;
+    std::vector<std::shared_ptr<ReadyLifecycleGate>> gates;
+    void SetUp()override {
+        AuthenticatedReadySession::SetUp();auto probe=std::make_shared<detail::authenticated_ready_maintenance_test_observation::probe>();
+        probe->owner=owner.get();probe->observed=[keep=events](const char* point){keep->observe(point);};
+        prior_probe=detail::authenticated_ready_maintenance_test_observation::exchange(std::move(probe));
+    }
+    void TearDown()override {
+        events->set({});for(const auto& gate:gates)gate->release();
+        for(const auto& gate:gates)EXPECT_FALSE(gate->timedOut())<<"maintenance race gate timed out before release";
+        detail::authenticated_ready_maintenance_test_observation::exchange(std::move(prior_probe));
+        AuthenticatedReadySession::TearDown();
+    }
+    template<class F> bool until(F condition){const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(5);while(!condition()&&std::chrono::steady_clock::now()<limit)std::this_thread::sleep_for(std::chrono::milliseconds(2));return condition();}
+    std::shared_ptr<ReadyLifecycleGate> gate(){auto value=std::make_shared<ReadyLifecycleGate>();gates.push_back(value);return value;}
+    json lifecycle_policy(int64_t grace=10000){auto p=source_policy(true);p["readyProfile"]="bounded48MiBOrphanV1";p["orphanResumeGraceMilliseconds"]=grace;return p;}
+    relay_recovery_setup lifecycle_setup(unsigned replica=1,int64_t grace=10000) {
+        auto value=open(lifecycle_policy(grace),connection(replica),std::make_shared<RelayRouteState>());
+        if(!value.valid())throw std::runtime_error("actual lifecycle setup failed: "+last_bridge_error());
+        auto answer=outcome(value);answer["validForMilliseconds"]=600000;
+        if(!value.finish_authorization(answer.dump()))throw std::runtime_error("actual lifecycle authorization failed");return value;
+    }
+    json lifecycle_command(const char* op,const ready_wire::frame& f,const json& d){auto value=command(op,f,d);value.erase("durationMilliseconds");return value;}
+    json lifecycle_result(const relay_recovery_setup& actual,const char* op,const ready_wire::frame& f,const json& d){
+        const auto response=invoke(actual,lifecycle_command(op,f,d));if(response.status_code()!=1||!response.publishable())throw std::runtime_error("actual lifecycle response unavailable: "+last_bridge_error());return json::parse(response.wire());
+    }
+    int64_t number(const char* sql){return std::get<int64_t>(owner->db().query(sql).at(0).begin()->second);}
+    void reopen_owner(){
+        setup.close_on_io();setup={};const std::weak_ptr<lattice::swift_lattice> prior=owner;
+        owner->close();owner.reset();ref.reset();
+        if(!until([&]{return prior.expired();}))throw std::runtime_error("closed lifecycle owner retained beyond bounded worker observation");
+        AuthenticatedReadySession::SetUp();
+        auto probe=std::make_shared<detail::authenticated_ready_maintenance_test_observation::probe>();probe->owner=owner.get();
+        probe->observed=[keep=events](const char* point){keep->observe(point);};detail::authenticated_ready_maintenance_test_observation::exchange(std::move(probe));
+    }
+};
+TEST_F(AuthenticatedReadyLifecycle, ProfileRequiresExplicitBoundedGraceAndLeavesOldNamesUnchanged) {
+    const auto schema=owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name");
+    auto invalid=lifecycle_policy();invalid.erase("orphanResumeGraceMilliseconds");EXPECT_FALSE(open(invalid,connection()).valid());
+    for(const auto value:{0,3600001}){invalid=lifecycle_policy(value);EXPECT_FALSE(open(invalid,connection()).valid());}
+    invalid=source_policy(true);invalid["orphanResumeGraceMilliseconds"]=1000;EXPECT_FALSE(open(invalid,connection()).valid());
+    EXPECT_EQ(owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"),schema);
+    setup=lifecycle_setup();const auto d=description(setup);EXPECT_EQ(d["profile"]["name"],"bounded48MiBOrphanV1");
+    EXPECT_EQ(d["profile"]["orphanResumeGraceMilliseconds"],10000);EXPECT_EQ(d["profile"]["transfers"],8);EXPECT_EQ(d["profile"]["bindings"],1024);
+    EXPECT_FALSE(open(source_policy(true),connection(2)).valid());EXPECT_FALSE(open(lifecycle_policy(9999),connection(2)).valid());
+}
+TEST_F(AuthenticatedReadyLifecycle, InspectUnstartedIsReadOnlyAndDiscardFencesDelayedPrepareWithExactHighWater) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);const auto before=exact_source();
+    const auto unseen=lifecycle_result(setup,"inspect",q,d);EXPECT_EQ(unseen["lifecycle"]["state"],"unstarted");EXPECT_EQ(unseen["lifecycle"]["bindingHighWater"],"0");EXPECT_EQ(exact_source(),before);
+    const auto disposed=lifecycle_result(setup,"discard",q,d);ASSERT_EQ(disposed["settlement"]["state"],"committed");EXPECT_EQ(disposed["lifecycle"]["state"],"terminal");
+    EXPECT_EQ(disposed["lifecycle"]["requestDigest"],std::get<ready_wire::request>(q.body).request_digest);EXPECT_EQ(disposed["lifecycle"]["attemptID"],q.logical.attempt_id);
+    EXPECT_EQ(disposed["lifecycle"]["sequence"],"1");EXPECT_EQ(disposed["lifecycle"]["bindingHighWater"],"1");EXPECT_EQ(disposed["lifecycle"]["namespaceID"],"app");
+    EXPECT_EQ(disposed["lifecycle"]["replicaID"],d["peer"]["replicaID"]);EXPECT_EQ(disposed["lifecycle"]["receiverIncarnation"],q.logical.receiver_incarnation);
+    EXPECT_EQ(disposed["lifecycle"]["channelIncarnation"],q.logical.channel_incarnation);EXPECT_EQ(disposed["lifecycle"]["channel"],q.logical.channel);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);EXPECT_EQ(count("_lattice_canonical_attempt"),0);
+    EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),number("SELECT SUM(charge) FROM _lattice_canonical_ready_binding"));
+    const auto terminal=exact_source();const auto delayed=invoke(setup,command("prepare",q,d));ASSERT_EQ(delayed.status_code(),1);EXPECT_FALSE(json::parse(delayed.wire())["leaseAvailable"].get<bool>());
+    EXPECT_EQ(exact_source(),terminal);EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");EXPECT_EQ(exact_source(),terminal);
+    EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"terminal");
+    auto next=request(d,2);EXPECT_TRUE(lease(setup,next,d)["leaseAvailable"].get<bool>());
+    const auto stale=lifecycle_result(setup,"inspect",q,d);EXPECT_FALSE(stale.contains("lifecycle"));EXPECT_NE(stale["settlement"]["state"],"committed");
+}
+TEST_F(AuthenticatedReadyLifecycle, PrepareBeforeDiscardKeepsReadOnlyInspectionAndRejectsChangedActiveQ) {
+    setup=lifecycle_setup();const auto d=description(setup);auto q=request(d);const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    std::get<ready_wire::request>(q.body).receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}}}};seal(q,d);
+    const auto offered=lease(setup,q,d);auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());const auto before=exact_source();const auto accepted=receipts();
+    EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"available");EXPECT_TRUE(queued.publishable());EXPECT_EQ(exact_source(),before);
+    auto changed=q;--std::get<ready_wire::request>(changed.body).budget.content_pages;seal(changed,d);
+    for(const auto* op:{"inspect","discard"}){const auto result=lifecycle_result(setup,op,changed,d);EXPECT_FALSE(result.contains("lifecycle"));EXPECT_NE(result["settlement"]["state"],"committed");EXPECT_EQ(exact_source(),before);}
+    const auto discarded=lifecycle_result(setup,"discard",q,d);EXPECT_EQ(discarded["lifecycle"]["state"],"terminal");EXPECT_FALSE(queued.publishable());
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(receipts(),accepted);EXPECT_EQ(count("AuthenticatedRelayRow"),1);
+}
+TEST_F(AuthenticatedReadyLifecycle, DiscardCommitDenialAndIgnoredChargeNeverPublishTerminalOrRetireSequence) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);const auto before=exact_source();
+    for(bool ignore:{false,true}){ReadyLifecycleFault fault(owner->db(),ignore);const auto result=lifecycle_result(setup,"discard",q,d);
+        EXPECT_GT(fault.hits,0u);EXPECT_NE(result["settlement"]["state"],"committed");EXPECT_FALSE(result.contains("lifecycle"));}
+    EXPECT_EQ(exact_source(),before);EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"unstarted");
+    EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");
+}
+TEST_F(AuthenticatedReadyLifecycle, KnownDiscardCommitWithSecondaryErrorRetainsTerminalForLostReplyRetry) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);const auto this_thread=std::this_thread::get_id();
+    const auto hook=owner->lattice_db::add_invalidation_hook([this_thread](const auto&,auto){if(std::this_thread::get_id()==this_thread)throw std::runtime_error("lifecycle committed observer");});
+    const auto result=lifecycle_result(setup,"discard",q,d);owner->remove_invalidation_hook(hook);
+    EXPECT_EQ(result["settlement"]["state"],"committed");EXPECT_EQ(result["settlement"]["postcommitError"],true);EXPECT_EQ(result["lifecycle"]["state"],"terminal");
+    const auto exact=exact_source();EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");EXPECT_EQ(exact_source(),exact);
+}
+TEST_F(AuthenticatedReadyLifecycle, ForeignPeerAndNamespaceCannotInspectOrDiscardAnotherBinding) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);lease(setup,q,d);const auto before=exact_source();
+    auto peer=lifecycle_setup(2);auto other_description=description(peer);auto foreign=q;foreign.route_generation=std::stoull(other_description["routeGeneration"].get<std::string>());
+    EXPECT_EQ(invoke(peer,lifecycle_command("discard",foreign,other_description)).status_code(),4);EXPECT_EQ(exact_source(),before);
+    auto changed=q;std::get<ready_wire::request>(changed.body).source.epoch=relay_uuid(9901);seal(changed,d);
+    EXPECT_EQ(invoke(setup,lifecycle_command("inspect",changed,d)).status_code(),4);EXPECT_EQ(exact_source(),before);
+    changed=q;std::get<ready_wire::request>(changed.body).receipts={{relay_uuid(9902),"other",{{"AuthenticatedRelayRow",relay_uuid(9903)}}}};seal(changed,d);
+    EXPECT_EQ(invoke(setup,lifecycle_command("discard",changed,d)).status_code(),4);EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedReadyLifecycle, AutomaticMaintenanceReclaimsFullSpoolWithoutPrepareCapacityOrReturningClients) {
+    std::vector<relay_recovery_setup> clients;std::vector<relay_ready_charge> held;
+    for(unsigned n=1;n<=8;++n){auto client=lifecycle_setup(n);const auto d=description(client);lease(client,request(d),d,"prepare",10000);clients.push_back(std::move(client));}
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),8);const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");
+    // Shorten only after observing all eight simultaneously retained slots.
+    for(auto& client:clients){const auto d=description(client);const auto response=invoke(client,command("resume",request(d),d,1000));
+        ASSERT_EQ(response.status_code(),1);ASSERT_TRUE(json::parse(response.wire())["leaseAvailable"].get<bool>());}
+    for(unsigned n=0;n<64;++n){auto charge=clients[0].stop_token().reserve_ready(128);if(!charge.valid())break;held.push_back(std::move(charge));}
+    ASSERT_FALSE(clients[0].stop_token().reserve_ready(128).valid());ASSERT_FALSE(held.empty());
+    for(auto& client:clients){client.close_on_io();client={};}clients.clear();
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),bindings);
+    EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),number("SELECT SUM(charge) FROM _lattice_canonical_ready_binding"));
+}
+TEST_F(AuthenticatedReadyLifecycle, EmptyDecisionRacingPrepareAndLastSetupCloseKeepsCurrentIncarnationUntilExpiry) {
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,once](const char* point){if(std::strcmp(point,"empty-before-retire")==0&&!once->exchange(true))paused->wait();});
+    setup=lifecycle_setup();ASSERT_TRUE(until([&]{return paused->arrived();}));const auto d=description(setup);const auto q=request(d);
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");lease(setup,q,d,"prepare",1000);
+    setup.close_on_io();setup={};paused->release();ASSERT_TRUE(until([&]{return events->published.load()>0;}));
+    setup=lifecycle_setup();EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation);
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));const auto next=description(setup);auto exact=q;exact.route_generation=std::stoull(next["routeGeneration"].get<std::string>());
+    EXPECT_EQ(lifecycle_result(setup,"inspect",exact,next)["lifecycle"]["state"],"terminal");
+}
+TEST_F(AuthenticatedReadyLifecycle, RegistrationFailurePrecedesEnrollmentAndDoesNotCreatePermanentUnarmedKeeper) {
+    const auto before=owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name");auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([once](const char* point){if(std::strcmp(point,"before-maintenance-register")==0&&!once->exchange(true))throw std::runtime_error("fixture worker registration failure");});
+    EXPECT_FALSE(open(lifecycle_policy(),connection()).valid());EXPECT_EQ(owner->db().query("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"),before);
+    events->set({});setup=lifecycle_setup();const auto d=description(setup);EXPECT_EQ(lifecycle_result(setup,"discard",request(d),d)["lifecycle"]["state"],"terminal");
+}
+TEST_F(AuthenticatedReadyLifecycle, TransientMaintenanceCallbackFailureIsNotAnEmptySourceOrNewIncarnation) {
+    setup=lifecycle_setup();const auto d=description(setup);lease(setup,request(d),d,"prepare",1000);
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,once](const char* point){if(std::strcmp(point,"before-maintenance")==0&&!once->exchange(true)){
+        paused->wait();throw std::runtime_error("fixture transient maintenance refusal");}});
+    setup.close_on_io();setup={};ASSERT_TRUE(until([&]{return paused->arrived();}));const auto published=events->published.load();paused->release();
+    ASSERT_TRUE(until([&]{return events->published.load()>published;}));events->set({});
+    setup=lifecycle_setup();EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation);
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+}
+TEST_F(AuthenticatedReadyLifecycle, ActualSourceReopenReclaimsDepartedCompletedOrphanAfterExplicitNewGrace) {
+    setup=lifecycle_setup(1,100);const auto d=description(setup);const auto q=request(d);lease(setup,q,d,"prepare",10000);
+    const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");
+    reopen_owner();setup=lifecycle_setup(1,100);const auto resumed_description=description(setup);
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    setup.close_on_io();setup={};ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));
+    EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),bindings);
+}
+TEST_F(AuthenticatedReadyLifecycle, PostEnrollmentSetupFailureKeepsOrphanMaintenanceArmedWithoutAnyReturningClient) {
+    setup=lifecycle_setup(1,100);const auto d=description(setup);lease(setup,request(d),d,"prepare",10000);
+    const auto incarnation=number("SELECT incarnation FROM _lattice_canonical_retention");reopen_owner();
+    auto registrations=std::make_shared<std::atomic<unsigned>>(0);
+    events->set([registrations](const char* point){if(std::strcmp(point,"before-maintenance-register")==0&&++*registrations==2)
+        throw std::runtime_error("fixture setup allocation after enrolled worker armed");});
+    EXPECT_FALSE(open(lifecycle_policy(100),connection()).valid());events->set({});
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+    ASSERT_TRUE(until([&]{return count("_lattice_canonical_ready_transfer")==0;}));EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+    EXPECT_EQ(number("SELECT incarnation FROM _lattice_canonical_retention"),incarnation+1);
+}
+TEST_F(AuthenticatedReadyLifecycle, ClosedOwnerAfterMaintenanceCommitCannotRetainOrTouchReplacementOwner) {
+    const auto paused=gate();auto enabled=std::make_shared<std::atomic<bool>>(false),once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,enabled,once](const char* point){if(enabled->load()&&std::strcmp(point,"maintenance-settled")==0&&!once->exchange(true))paused->wait();});
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);lease(setup,q,d);
+    const auto frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    enabled->store(true);auto temporary=lifecycle_setup(2);ASSERT_TRUE(until([&]{return paused->arrived();}));
+    temporary.close_on_io();temporary={};setup.close_on_io();setup={};owner->close();paused->release();events->set({});reopen_owner();
+    setup=lifecycle_setup();const auto next=description(setup);auto resumed=q;resumed.route_generation=std::stoull(next["routeGeneration"].get<std::string>());
+    EXPECT_TRUE(lease(setup,resumed,next,"resume")["leaseAvailable"].get<bool>());
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),frames);
+}
+TEST_F(AuthenticatedReadyLifecycle, IncompletePublicationIsAvailableTransportStateUntilExactDiscard) {
+    setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);
+    {AuthenticatedReadyFault fault(owner->db(),true);const auto failed=invoke(setup,command("prepare",q,d));ASSERT_EQ(failed.status_code(),1);
+        const auto body=json::parse(failed.wire());EXPECT_EQ(body["preparation"]["state"],"committed");EXPECT_EQ(body["publication"]["state"],"rolledBack");}
+    EXPECT_EQ(count("_lattice_canonical_attempt"),1);EXPECT_EQ(lifecycle_result(setup,"inspect",q,d)["lifecycle"]["state"],"available");
+    EXPECT_EQ(lifecycle_result(setup,"discard",q,d)["lifecycle"]["state"],"terminal");EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+TEST_F(AuthenticatedReadyLifecycle, PermanentBindingCapRefusesNewRetirementButExistingBindingCanAdvance) {
+    setup=lifecycle_setup();
+    for(unsigned n=1;n<=1024;++n){auto peer=lifecycle_setup(n);const auto d=description(peer);const auto result=lifecycle_result(peer,"discard",request(d),d);
+        ASSERT_EQ(result["lifecycle"]["state"],"terminal")<<n;}
+    ASSERT_EQ(count("_lattice_canonical_ready_binding"),1024);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);const auto charged=number("SELECT charged FROM _lattice_canonical_ready_profile");
+    auto extra=lifecycle_setup(1025);const auto d=description(extra);const auto failed=lifecycle_result(extra,"discard",request(d),d);
+    EXPECT_NE(failed["settlement"]["state"],"committed");EXPECT_FALSE(failed.contains("lifecycle"));EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),charged);
+    const auto original=description(setup);EXPECT_EQ(lifecycle_result(setup,"discard",request(original,2),original)["lifecycle"]["state"],"terminal");
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),1024);EXPECT_EQ(number("SELECT charged FROM _lattice_canonical_ready_profile"),charged);
+}
+TEST_F(AuthenticatedReceiptCoverageV3, LifecycleDiscardKeepsRegisteredOriginalsAndEveryNamespaceCoverageCell) {
+    const auto admitted=[&](const std::string& ns,unsigned peer){auto p=covered_policy(ns);p["readyProfile"]="bounded48MiBOrphanV1";p["orphanResumeGraceMilliseconds"]=1000;
+        auto value=open(p,connection(peer),std::make_shared<RelayRouteState>());if(!value.valid())throw std::runtime_error(last_bridge_error());
+        if(!value.finish_authorization(covered_answer(value).dump()))throw std::runtime_error(last_bridge_error());return value;};
+    setup=admitted("app",1);auto other=admitted("other",2);const auto e=identified(entry());ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);ASSERT_EQ(other.receive(frame(e)).ids().size(),1u);
+    const auto globals=global_state();const auto cells=coverage();const auto origins=owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin ORDER BY original_id");
+    for(auto* client:{&setup,&other}){const auto d=description(*client);auto q=request(d);auto& body=std::get<ready_wire::request>(q.body);
+        body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace=d["source"]["receiptNamespace"].get<std::string>();seal(q,d);
+        auto foreign=q;std::get<ready_wire::request>(foreign.body).receipt_namespace=*body.receipt_namespace=="app"?"other":"app";seal(foreign,d);
+        const auto before=all_state();const auto refused=invoke(*client,command("discard",foreign,d));ASSERT_EQ(refused.status_code(),1);
+        EXPECT_FALSE(json::parse(refused.wire()).contains("lifecycle"));EXPECT_EQ(all_state(),before);
+        EXPECT_TRUE(lease(*client,q,d,"prepare",1000)["leaseAvailable"].get<bool>());EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+        auto discard=command("discard",q,d);const auto result=invoke(*client,discard);ASSERT_EQ(result.status_code(),1);EXPECT_EQ(json::parse(result.wire())["lifecycle"]["state"],"terminal");}
+    EXPECT_EQ(global_state(),globals);EXPECT_EQ(coverage(),cells);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_receipt_origin ORDER BY original_id"),origins);
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+// Read the real owner's existing protected key calculation without creating,
+// casting or modifying an owner. The inherited member pointer still names a
+// lattice_db member; this test-only access cannot publish schema/admission.
+struct AdministrativeFingerprintKeys: lattice_db {
+    static std::string core(const lattice_db& actual) {
+        const auto member=&AdministrativeFingerprintKeys::compute_core_fingerprint_key;
+        return (actual.*member)();
+    }
+};
+class AuthenticatedReceiptFileAdministration:public AuthenticatedReceiptCoverageV3 {
+protected:
+    int migrate_file(int64_t version=1,const SchemaVector& schema={relay_schema()}) {
+        return swift_lattice_ref::migrate_relay_receipt_coverage_file(file.str(),schema,version,100,policy().dump(),covered_policy().dump());
+    }
+    void release_owner() {setup.close_on_io();setup={};if(owner)owner->close();owner.reset();ref.reset();}
+    static Snapshot read_file(const std::string& path,int64_t* schema_cookie=nullptr) {
+        database reader(path,database::open_mode::read_only,100);Snapshot result;
+        // Only the explicit cookie caller requests one consistent read view.
+        // All prior callers retain their original SQL and snapshot contents.
+        if(schema_cookie) {
+            reader.execute("BEGIN");
+            *schema_cookie=std::get<int64_t>(reader.query("PRAGMA main.schema_version").at(0).at("schema_version"));
+        }
+        const auto tables=reader.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+        if(tables.size()>128)throw std::runtime_error("administration fixture inventory bound");
+        for(const auto& row:tables){const auto& name=std::get<std::string>(row.at("name"));
+            if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](unsigned char c){return std::isalnum(c)||c=='_';}))
+                throw std::runtime_error("administration fixture table name bound");
+            result[name]=reader.query("SELECT * FROM \""+name+"\" ORDER BY 1");}
+        result["sqlite_schema"]=reader.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+        result["user_version"]=reader.query("PRAGMA user_version");result["journal_mode"]=reader.query("PRAGMA journal_mode");
+        if(schema_cookie)reader.execute("COMMIT");return result;
+    }
+    struct observation {
+        std::function<void()> callback;
+        explicit observation(std::function<void()> value):callback(std::move(value)){detail::authenticated_ready_test_access::before_admin_open(&callback);}
+        ~observation(){detail::authenticated_ready_test_access::before_admin_open(nullptr);}
+    };
+};
+TEST_F(AuthenticatedReceiptFileAdministration, OneShotUsesActualExistingFileAndPreservesGlobalReceipts) {
+    open();authorize();const auto e=entry();ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    auto expected=global_state();const auto original_receipts=receipts();setup.close_on_io();setup={};
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+    expected.at("_lattice_canonical_store").at(0).at("version")=int64_t{3};EXPECT_EQ(global_state(),expected);EXPECT_EQ(receipts(),original_receipts);
+    EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    setup=covered_setup();EXPECT_EQ(global_state(),expected);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, LiveAndRetainedResultCustodyRefusesBeforeAnyOpenSQL) {
+    open();authorize();const auto before=read_file(file.str());auto result=invoke(setup,control("describe"));ASSERT_EQ(result.status_code(),1);
+    auto copy=result;auto stop=setup.stop_token();const std::weak_ptr<lattice::swift_lattice> prior=owner;
+    const auto pending=[&]{const auto statements=database::thread_statement_count();EXPECT_EQ(migrate_file(),2)<<last_bridge_error();EXPECT_EQ(database::thread_statement_count(),statements);};
+    pending();release_owner();EXPECT_TRUE(prior.expired());pending();result={};pending();copy={};EXPECT_TRUE(stop.drained());pending();
+    EXPECT_EQ(read_file(file.str()),before);stop={};ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, MissingMainAfterCapturedIdentityIsNotRecreatedAndReservationRetires) {
+    open();authorize();release_owner();const auto before=read_file(file.str());const auto saved=file.str()+".admin-saved";
+    {observation race([&]{std::filesystem::rename(file.str(),saved);});EXPECT_EQ(migrate_file(),4);EXPECT_FALSE(std::filesystem::exists(file.str()));}
+    std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),before);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, ReplacementMainCannotBeAdoptedOrRepaired) {
+    open();authorize();release_owner();const auto before=read_file(file.str());const auto saved=file.str()+".admin-saved";
+    TempDB replacement{"receipt-admin-replacement"};
+    {database seed(replacement.str());seed.execute("CREATE TABLE KeepExact(value INTEGER)");seed.execute("INSERT INTO KeepExact VALUES(19)");seed.execute("PRAGMA user_version=1");}
+    const auto other=read_file(replacement.str());
+    {observation race([&]{std::filesystem::rename(file.str(),saved);std::filesystem::copy_file(replacement.str(),file.str());});EXPECT_EQ(migrate_file(),4);}
+    EXPECT_EQ(read_file(file.str()),other);std::filesystem::remove(file.str());std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),before);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, NonWalSourceRefusesWithoutJournalConversionOrCleanup) {
+    open();authorize();release_owner();
+    {database change(file.str());const auto mode=change.query("PRAGMA journal_mode=DELETE");ASSERT_EQ(std::get<std::string>(mode.at(0).at("journal_mode")),"delete");}
+    const auto before=read_file(file.str());ASSERT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    EXPECT_NE(last_bridge_error().find("existing WAL"),std::string::npos);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, DeclaredVersionAndCatalogMismatchNeverRunSchemaRepair) {
+    open();authorize();release_owner();const auto before=read_file(file.str());
+    EXPECT_EQ(migrate_file(2),4);EXPECT_EQ(read_file(file.str()),before);
+    auto changed=relay_schema();property_descriptor extra{};extra.name="must_not_be_created";extra.type=column_type::text;changed.properties.emplace(extra.name,extra);
+    EXPECT_EQ(migrate_file(1,{changed}),4);EXPECT_EQ(read_file(file.str()),before);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, PreOpenObservationThrowLeavesEveryTableAndReservationUnchanged) {
+    open();authorize();release_owner();const auto before=read_file(file.str());
+    {observation fail([]{throw std::runtime_error("passive administration observation");});EXPECT_EQ(migrate_file(),4);}
+    EXPECT_EQ(read_file(file.str()),before);ASSERT_EQ(migrate_file(),1)<<last_bridge_error();
+}
+TEST_F(AuthenticatedReceiptFileAdministration, UnadmittedExistingSchemaIsNotHealedOrPublished) {
+    // Ordinary fixture construction has no canonical source enrollment yet.
+    release_owner();const auto before=read_file(file.str());
+    EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db*){++published;});EXPECT_EQ(published,0u);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, ActualClosedOwnerSettlesSameValueHeaderWithoutOrdinaryPublication) {
+    open();authorize();setup.close_on_io();setup={};const auto before=all_state();size_t observations=0;
+    const std::function<void(lattice_db&)> inspect=[&](lattice_db& actual) {
+        ++observations;EXPECT_NE(&actual,owner.get());
+        size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db* value){EXPECT_NE(value,&actual);++published;});
+        EXPECT_EQ(published,1u);
+        const auto header=[&] {
+            const auto rows=actual.db().query("PRAGMA main.user_version");
+            return rows.size()==1&&rows[0].size()==1&&std::holds_alternative<int64_t>(rows[0].begin()->second)&&
+                std::get<int64_t>(rows[0].begin()->second)==0;
+        };
+        ASSERT_TRUE(header());
+        // The production factory strongly retains actual for this entire
+        // synchronous callback. This alias tests settlement, not lifetime.
+        auto borrowed=std::shared_ptr<lattice_db>(&actual,[](lattice_db*){});
+        using state=detail::recovery_install_state;
+        const auto committed=detail::recovery_writer_access::install(borrowed,[&](database& writer){
+            EXPECT_EQ(detail::recovery_writer_access::active_writer(actual),&writer);
+            writer.execute("PRAGMA main.user_version=0");
+        });
+        EXPECT_EQ(committed.state,state::committed);EXPECT_FALSE(committed.primary_error);EXPECT_FALSE(committed.postcommit_error);
+        EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
+        const auto rolled=detail::recovery_writer_access::install(borrowed,[](database& writer){
+            writer.execute("PRAGMA main.user_version=0");throw std::runtime_error("owned administration rollback");
+        });
+        EXPECT_EQ(rolled.state,state::rolled_back);EXPECT_TRUE(rolled.primary_error);EXPECT_FALSE(rolled.cleanup_error);EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
+        const auto premature=detail::recovery_writer_access::install(borrowed,[](database& writer){
+            writer.execute("PRAGMA main.user_version=0");writer.commit();
+        });
+        EXPECT_EQ(premature.state,state::rolled_back);EXPECT_TRUE(premature.primary_error);EXPECT_FALSE(premature.cleanup_error);
+        EXPECT_FALSE(premature.unexpected_commit_observed);EXPECT_EQ(all_state(),before);EXPECT_TRUE(header());
+    };
+    struct restore {const std::function<void(lattice_db&)>* prior;~restore(){detail::authenticated_relay_catalog_test_access::before_write(prior);}}
+        restored{detail::authenticated_relay_catalog_test_access::before_write(&inspect)};
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();EXPECT_EQ(observations,1u);
+    // The normal receipt migration adds its documented coverage tables; the
+    // hook's three header transactions leave every pre-migration table unchanged.
+    EXPECT_EQ(receipts(),before.at("_lattice_canonical_receipt"));
+}
+
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReadySession, SmallLifecycleNameKeepsOldSmallDescriptionExceptExplicitLifecycleFields) {
+    setup=admitted();const auto old=description(setup);setup.close_on_io();setup={};
+    // A fresh source can explicitly select the small lifecycle profile. An
+    // existing old source still requires administration; opening cannot adopt.
+    auto p=source_policy();p["readyProfile"]="boundedV1OrphanV1";p["orphanResumeGraceMilliseconds"]=10000;
+    const auto unchanged=exact_source();auto implicit=open(p,connection(2));EXPECT_FALSE(implicit.valid());EXPECT_EQ(exact_source(),unchanged);
+    detail::canonical_namespaced_writer_profile native;
+    const auto& source=old.at("source");native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+    native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+    native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+    const auto ready=detail::canonical_named_ready_profile(source.at("authority"),native.writer.limits,false,"boundedV1");
+    const auto adopted=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"boundedV1",10000);
+    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);
+    setup=open(p,connection(3));ASSERT_TRUE(setup.valid())<<last_bridge_error();authorize();auto current=description(setup).at("profile");
+    EXPECT_EQ(current.at("name"),"boundedV1OrphanV1");EXPECT_EQ(current.at("orphanResumeGraceMilliseconds"),10000);
+    current["name"]="boundedV1";current.erase("orphanResumeGraceMilliseconds");EXPECT_EQ(current,old.at("profile"));
+}
+TEST_F(AuthenticatedReceiptCoverageV3, ExplicitAdoptionKeepsActualTwoNamespaceCapsulesAndAllRegisteredReceiptState) {
+    setup=covered_setup();auto other=covered_setup("other",2);const auto e=identified(entry(72));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(coverage().size(),2u);
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    for(auto* f:{&qa,&qb}) {
+        const auto ns=f==&qa?std::string("app"):std::string("other");auto& q=std::get<ready_wire::request>(f->body);
+        f->version=3;q.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};q.receipt_namespace=ns;
+        q.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};
+    }
+    seal(qa,da);seal(qb,db);(void)lease(setup,qa,da,"prepare",1000);(void)lease(other,qb,db,"prepare",1000);
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);ASSERT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    const auto physical=owner->db().physical_identity("main",{},true);ASSERT_TRUE(physical);
+    const auto preserved=[&]{auto value=read_only_all_state(*physical);value.erase("sqlite_schema");
+        for(auto& row:value.at("_lattice_canonical_ready_profile")){row.erase("policy");row.erase("predecessor");}return value;};
+    const auto before=preserved();const auto exact_frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    other.close_on_io();other={};setup.close_on_io();setup={}; // No setup, result, charge or stop token remains.
+    detail::canonical_namespaced_writer_profile native;const auto& source=da.at("source");
+    native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+    native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+    native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+    native.namespaces.coverage=detail::canonical_coverage_profile{relay_uuid(5100),7,{"app","other"}};
+    const auto ready=detail::canonical_named_ready_profile(source.at("authority"),native.writer.limits,true,"bounded48MiBV1");
+    const auto adopted=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);EXPECT_EQ(preserved(),before);expect_administrative_writer_closed();EXPECT_EQ(preserved(),before);
+    const auto retry=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+    ASSERT_EQ(retry.settlement.state,detail::recovery_install_state::committed);EXPECT_EQ(retry.record,adopted.record);EXPECT_EQ(preserved(),before);expect_administrative_writer_closed();EXPECT_EQ(preserved(),before);
+    auto target=covered_policy();target["readyProfile"]="bounded48MiBOrphanV1";target["orphanResumeGraceMilliseconds"]=10000;
+    setup=open(target,connection(),std::make_shared<RelayRouteState>());ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));const auto current=description(setup);
+    qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume",1000);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),exact_frames);
+    size_t positives=0;for(uint64_t i=0;i<std::stoull(resumed.at("frames").get<std::string>());++i) {
+        const auto actual=read(setup,resumed,i);ASSERT_EQ(actual.status_code(),1);ASSERT_TRUE(actual.publishable())<<read_diagnostic(actual);
+        const auto decoded=decode_read(actual,current);if(const auto* page=std::get_if<ready_wire::receipt_page>(&decoded.body))for(const auto& item:page->items) {
+            ASSERT_TRUE(std::holds_alternative<ready_wire::committed>(item.value));EXPECT_EQ(item.original_id,e.global_id);
+            EXPECT_EQ(item.operation_digest,e.original_identity->digest);EXPECT_FALSE(item.legacy_unbound);++positives;
+        }
+    }
+    EXPECT_EQ(positives,1u);EXPECT_EQ(coverage().size(),2u);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);
+    EXPECT_EQ(global_state().at("_lattice_canonical_receipt"),before.at("_lattice_canonical_receipt"));
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+class AuthenticatedLifecycleFileAdministration:public AuthenticatedReceiptFileAdministration {
+protected:
+    static json lifecycle(json prior,int64_t grace=10000) {
+        prior["readyProfile"]=prior.value("readyProfile",std::string("boundedV1"))=="boundedV1"?"boundedV1OrphanV1":"bounded48MiBOrphanV1";
+        prior["orphanResumeGraceMilliseconds"]=grace;return prior;
+    }
+    relay_lifecycle_adoption_result adopt_file(const json& prior,int64_t grace=10000,int64_t version=1,const SchemaVector& schema={relay_schema()}) {
+        return swift_lattice_ref::adopt_relay_lifecycle_file(file.str(),schema,version,100,prior.dump(),lifecycle(prior,grace).dump());
+    }
+    static Snapshot retained(Snapshot value) {
+        value.erase("sqlite_schema");
+        for(auto& row:value.at("_lattice_canonical_ready_profile")){row.erase("policy");row.erase("predecessor");}return value;
+    }
+    static void committed(const relay_lifecycle_adoption_result& value) {
+        ASSERT_FALSE(value.pending());ASSERT_EQ(value.phase(),2)<<value.primary_error()<<value.cleanup_error()<<value.postcommit_error();
+        ASSERT_FALSE(value.has_error());ASSERT_NE(value.disposition(),0);ASSERT_EQ(value.transition_id().size(),36u);ASSERT_EQ(value.record_digest().size(),64u);
+    }
+    detail::canonical_namespaced_writer_profile native_profile(const json& description) {
+        const auto& source=description.at("source");detail::canonical_namespaced_writer_profile native;
+        native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+        native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+        native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};return native;
+    }
+};
+struct LifecycleAdministrationFault {
+    enum Kind {deny_frames,ignore_policy,ignore_record,deny_alter,deny_commit};
+    static thread_local LifecycleAdministrationFault* current;
+    Kind kind;int hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* prior;LifecycleAdministrationFault* previous;
+    LifecycleAdministrationFault(database& db,Kind k):kind(k),fault{detail::canonical_writer_custody_test_access::fault_handle(db),restrict_action},
+        prior(detail::canonical_retention_test_hooks::fault),previous(current){current=this;detail::canonical_retention_test_hooks::fault=&fault;}
+    ~LifecycleAdministrationFault(){detail::canonical_retention_test_hooks::fault=prior;current=previous;}
+    static int restrict_action(int action,const char* one,const char* two,const char* origin)noexcept {
+        auto& f=*current;if(f.hits||origin)return SQLITE_OK;
+        const auto same=[](const char* a,const char* b){return a&&std::strcmp(a,b)==0;};
+        if(f.kind==deny_frames&&action==SQLITE_INSERT&&same(one,"_lattice_canonical_ready_frame")){++f.hits;return SQLITE_DENY;}
+        if(action==SQLITE_UPDATE&&same(one,"_lattice_canonical_ready_profile")&&
+           (f.kind==ignore_policy&&same(two,"policy")||f.kind==ignore_record&&same(two,"predecessor"))){++f.hits;return SQLITE_IGNORE;}
+        if(f.kind==deny_alter&&action==SQLITE_ALTER_TABLE){++f.hits;return SQLITE_DENY;}
+        if(f.kind==deny_commit&&action==SQLITE_TRANSACTION&&same(one,"COMMIT")){++f.hits;return SQLITE_DENY;}
+        return SQLITE_OK;
+    }
+};
+thread_local LifecycleAdministrationFault* LifecycleAdministrationFault::current=nullptr;
+struct LifecycleBeforeWrite {
+    std::function<void(lattice_db&)> callback;
+    const std::function<void(lattice_db&)>* prior;
+    explicit LifecycleBeforeWrite(std::function<void(lattice_db&)> body):callback(std::move(body)),prior(detail::authenticated_relay_catalog_test_access::before_write(&callback)){}
+    ~LifecycleBeforeWrite(){detail::authenticated_relay_catalog_test_access::before_write(prior);}
+};
+TEST_F(AuthenticatedLifecycleFileAdministration, ActualSmallSixteenCapsulesUseClosedFactoryAndResumeOriginalRequest) {
+    setup=admitted();const auto d=description(setup);auto first=request(d);(void)lease(setup,first,d);
+    std::vector<relay_recovery_setup> peers;
+    for(unsigned i=2;i<=16;++i){auto actual=admitted(i);const auto info=description(actual);(void)lease(actual,request(info),info);peers.push_back(std::move(actual));}
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),16);const auto before=retained(read_file(file.str()));
+    for(auto& peer:peers)peer.close_on_io();peers.clear();setup.close_on_io();setup={};
+    const auto first_result=adopt_file(source_policy());committed(first_result);EXPECT_EQ(first_result.disposition(),1);EXPECT_EQ(retained(read_file(file.str())),before);
+    const auto retry=adopt_file(source_policy());committed(retry);EXPECT_EQ(retry.disposition(),2);
+    EXPECT_EQ(retry.transition_id(),first_result.transition_id());EXPECT_EQ(retry.record_digest(),first_result.record_digest());EXPECT_EQ(retained(read_file(file.str())),before);
+    setup=open(lifecycle(source_policy()),connection());ASSERT_TRUE(setup.valid());auto answer=outcome(setup);answer["validForMilliseconds"]=600000;
+    ASSERT_TRUE(setup.finish_authorization(answer.dump()));const auto current=description(setup);
+    EXPECT_EQ(current.at("profile").at("transfers"),16);EXPECT_EQ(current.at("profile").at("durableBytes"),67108864);
+    EXPECT_EQ(current.at("profile").at("transferBytes"),2097152);
+    first.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,first,current,"resume");
+    const auto frame=read(setup,resumed,0);ASSERT_TRUE(frame.publishable());EXPECT_EQ(decode_read(frame,current).logical,first.logical);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),16);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, ActualFactoryKeepsLargePreparingOrdinaryReservationsAndNoNotificationPublication) {
+    setup=admitted(1,true);const auto d=description(setup);auto q=request(d);(void)lease(setup,q,d);setup.close_on_io();setup={};
+    const auto native=native_profile(d);const auto ready=detail::canonical_named_ready_profile(d.at("source").at("authority"),native.writer.limits,false,"bounded48MiBV1");
+    auto adapter=detail::canonical_writer_adapter::attach_ready_for_qualification(owner,native,{256,65536,1048576},{64,3600000},ready);
+    auto admission=adapter->admit_namespace_for_qualification(owner,"app","registered-replica-1");q.logical.channel="preparing-for-administration";seal(q,d);
+    {
+        LifecycleAdministrationFault fault(owner->db(),LifecycleAdministrationFault::deny_frames);
+        auto prepared=adapter->prepare_ready_owned(owner,admission,q.logical,std::get<ready_wire::request>(q.body),10000,q.route_generation);
+        EXPECT_EQ(fault.hits,1);ASSERT_EQ(prepared.preparation.state,detail::recovery_install_state::committed);
+        EXPECT_NE(prepared.publication.state,detail::recovery_install_state::committed);
+    }
+    const auto head=std::get<int64_t>(owner->db().query("SELECT head FROM _lattice_canonical_store").at(0).at("head"));
+    auto ordinary=adapter->reserve_recovery_owned(owner,head,10000);ASSERT_EQ(ordinary.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(ordinary.reservation);
+    ASSERT_EQ(count("_lattice_canonical_attempt"),2);ASSERT_EQ(count("_lattice_canonical_ready_transfer"),2);
+    const auto before=retained(read_file(file.str()));adapter.reset();int published=0,observed=0;
+    const auto hook=owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++published;});
+    {
+        LifecycleBeforeWrite inspect([&](lattice_db& actual){++observed;EXPECT_NE(&actual,owner.get());
+            instance_registry::instance().for_each_alive(file.str(),[&](lattice_db* value){EXPECT_NE(value,&actual);});
+            actual.add_invalidation_hook([&](const auto&,auto){++published;});
+        });
+        const auto result=adopt_file(source_policy(true));committed(result);
+    }
+    owner->remove_invalidation_hook(hook);EXPECT_EQ(observed,1);EXPECT_EQ(published,0);EXPECT_EQ(retained(read_file(file.str())),before);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, RegisteredTwoNamespaceCapsulesAndOriginalReceiptSurviveActualFactory) {
+    setup=covered_setup();auto other=covered_setup("other",2);const auto e=identified(entry(83));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto a=description(setup),b=description(other);auto qa=request(a),qb=request(b);
+    for(auto* f:{&qa,&qb}){auto& request=std::get<ready_wire::request>(f->body);const std::string ns=f==&qa?"app":"other";
+        f->version=3;request.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};request.receipt_namespace=ns;
+        request.receipts={{e.global_id,ns,{{e.table_name,e.global_row_id}},e.original_identity->digest}};}
+    seal(qa,a);seal(qb,b);(void)lease(setup,qa,a,"prepare",1000);(void)lease(other,qb,b,"prepare",1000);
+    const auto before=retained(read_file(file.str()));other.close_on_io();other={};setup.close_on_io();setup={};
+    const auto result=adopt_file(covered_policy());committed(result);EXPECT_EQ(retained(read_file(file.str())),before);
+    setup=open(lifecycle(covered_policy()),connection());ASSERT_TRUE(setup.valid());ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));
+    const auto current=description(setup);qa.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());const auto resumed=lease(setup,qa,current,"resume",1000);
+    size_t positives=0;for(uint64_t i=0;i<std::stoull(resumed.at("frames").get<std::string>());++i){const auto actual=read(setup,resumed,i);ASSERT_TRUE(actual.publishable());
+        auto f=decode_read(actual,current);if(auto* page=std::get_if<ready_wire::receipt_page>(&f.body))for(const auto& item:page->items){EXPECT_TRUE(std::holds_alternative<ready_wire::committed>(item.value));EXPECT_EQ(item.operation_digest,e.original_identity->digest);++positives;}}
+    EXPECT_EQ(positives,1u);EXPECT_EQ(coverage().size(),2u);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),1);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, RegistryBlocksActualResultCopiesStopTokenAndConcurrentAdministrationBeforeOpen) {
+    setup=admitted();auto result=invoke(setup,control("describe"));auto copy=result;auto stop=setup.stop_token();
+    const auto pending=[&]{auto n=database::thread_statement_count();auto value=adopt_file(source_policy());EXPECT_TRUE(value.pending());EXPECT_EQ(value.disposition(),0);EXPECT_EQ(database::thread_statement_count(),n);};
+    pending();release_owner();pending();result={};pending();copy={};pending();stop={};
+    bool observed=false;
+    {
+        observation held([&]{observed=true;auto n=database::thread_statement_count();
+            auto other=adopt_file(source_policy());EXPECT_TRUE(other.pending());EXPECT_EQ(database::thread_statement_count(),n);
+        });
+        committed(adopt_file(source_policy()));
+    }
+    EXPECT_TRUE(observed);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, ActualClosedWriterRestrictionFaultsRollbackAndKeepExactTransitionTruth) {
+    setup=admitted();const auto d=description(setup);(void)lease(setup,request(d),d);setup.close_on_io();setup={};const auto before=read_file(file.str());
+    for(auto kind:{LifecycleAdministrationFault::ignore_policy,LifecycleAdministrationFault::ignore_record,LifecycleAdministrationFault::deny_alter,LifecycleAdministrationFault::deny_commit}) {
+        std::unique_ptr<LifecycleAdministrationFault> fault;
+        {LifecycleBeforeWrite arm([&](lattice_db& actual){fault=std::make_unique<LifecycleAdministrationFault>(actual.db(),kind);});
+            auto result=adopt_file(source_policy());ASSERT_TRUE(fault);EXPECT_EQ(fault->hits,1);EXPECT_FALSE(result.pending());EXPECT_EQ(result.phase(),1);
+            EXPECT_TRUE(result.has_error());EXPECT_FALSE(result.primary_error().empty());EXPECT_EQ(result.disposition(),0);EXPECT_TRUE(result.take_record().empty());}
+        fault.reset();EXPECT_EQ(read_file(file.str()),before);
+    }
+    committed(adopt_file(source_policy()));
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, WrongCatalogVersionNonWalAndMissingReplacementKeepIntendedFileUnrepaired) {
+    setup=admitted();setup.close_on_io();setup={};const auto prior=source_policy();const auto original=read_file(file.str());
+    auto wrong=relay_schema();property_descriptor extra{};extra.name="must_not_exist";extra.type=column_type::text;wrong.properties.emplace(extra.name,extra);
+    EXPECT_EQ(adopt_file(prior,10000,2).phase(),0);EXPECT_NE(adopt_file(prior,10000,1,{wrong}).phase(),2);EXPECT_EQ(read_file(file.str()),original);
+    release_owner();const auto saved=file.str()+".adoption-saved";
+    {observation missing([&]{std::filesystem::rename(file.str(),saved);});auto result=adopt_file(prior);EXPECT_FALSE(result.pending());EXPECT_EQ(result.phase(),0);EXPECT_FALSE(std::filesystem::exists(file.str()));}
+    std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),original);
+    TempDB replacement{"lifecycle-admin-replacement"};{database raw(replacement.str());raw.execute("CREATE TABLE KeepExact(value INTEGER)");raw.execute("INSERT INTO KeepExact VALUES(23)");raw.execute("PRAGMA user_version=1");}
+    const auto alternate=read_file(replacement.str());
+    {observation changed([&]{std::filesystem::rename(file.str(),saved);std::filesystem::copy_file(replacement.str(),file.str());});auto result=adopt_file(prior);EXPECT_EQ(result.phase(),0);EXPECT_EQ(result.disposition(),0);}
+    EXPECT_EQ(read_file(file.str()),alternate);std::filesystem::remove(file.str());std::filesystem::rename(saved,file.str());EXPECT_EQ(read_file(file.str()),original);
+    {database raw(file.str());ASSERT_EQ(std::get<std::string>(raw.query("PRAGMA journal_mode=DELETE").at(0).at("journal_mode")),"delete");}
+    const auto before=read_file(file.str());auto nonwal=adopt_file(prior);EXPECT_EQ(nonwal.phase(),0);EXPECT_FALSE(nonwal.pending());EXPECT_EQ(read_file(file.str()),before);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, ReceiptConversionMustPrecedeAdoptionAndExactOldHandleRetryDoesNotChangeGrace) {
+    open();authorize();const auto e=entry(88);ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});setup.close_on_io();setup={};
+    ASSERT_EQ(migrate_file(),1);const auto migrated=read_file(file.str());const auto adopted=adopt_file(covered_policy());committed(adopted);
+    EXPECT_EQ(retained(read_file(file.str())),retained(migrated));
+    const auto exact=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),exact);
+    const auto changed=adopt_file(covered_policy(),10001);EXPECT_FALSE(changed.pending());EXPECT_NE(changed.phase(),2);EXPECT_EQ(changed.disposition(),0);EXPECT_EQ(read_file(file.str()),exact);
+    const auto retry=adopt_file(covered_policy());committed(retry);EXPECT_EQ(retry.disposition(),2);EXPECT_EQ(retry.transition_id(),adopted.transition_id());EXPECT_EQ(read_file(file.str()),exact);
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, EmptyUnadmittedFileAndPreOpenThrowNeverPublishAClosedOwner) {
+    release_owner();const auto before=read_file(file.str());const auto refused=adopt_file(source_policy());EXPECT_FALSE(refused.pending());EXPECT_NE(refused.phase(),2);EXPECT_EQ(refused.disposition(),0);EXPECT_EQ(read_file(file.str()),before);
+    size_t published=0;instance_registry::instance().for_each_alive(file.str(),[&](lattice_db*){++published;});EXPECT_EQ(published,0u);
+    {observation fail([]{throw std::runtime_error("passive adoption observation");});const auto result=adopt_file(source_policy());EXPECT_EQ(result.phase(),0);EXPECT_FALSE(result.pending());}
+    EXPECT_EQ(read_file(file.str()),before);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedLifecycleFileAdministration, ReservedAdministrationRefusesActualSourceOpenUntilItsOwnerRetires) {
+    setup=admitted();setup.close_on_io();setup={};const auto before=retained(read_file(file.str()));bool attempted=false;
+    {
+        observation held([&]{attempted=true;const auto statements=database::thread_statement_count();
+            auto competing=open(source_policy(),connection(29),std::make_shared<RelayRouteState>());
+            EXPECT_FALSE(competing.valid());EXPECT_EQ(database::thread_statement_count(),statements);
+        });
+        committed(adopt_file(source_policy()));
+    }
+    EXPECT_TRUE(attempted);EXPECT_EQ(retained(read_file(file.str())),before);
+    setup=open(lifecycle(source_policy()),connection(29),std::make_shared<RelayRouteState>());ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    auto answer=outcome(setup);answer["validForMilliseconds"]=600000;EXPECT_TRUE(setup.finish_authorization(answer.dump()));
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, UnregisteredDirectoryCustodianIsRefusalNotFabricatedRegistryPending) {
+    setup=admitted();const auto d=description(setup);setup.close_on_io();setup={};
+    const auto native=native_profile(d);const auto ready=detail::canonical_named_ready_profile(d.at("source").at("authority"),native.writer.limits,false,"boundedV1");
+    auto actual=detail::canonical_writer_adapter::attach_ready_for_qualification(owner,native,{256,65536,1048576},{64,3600000},ready);
+    const auto before=read_file(file.str());const auto result=adopt_file(source_policy());EXPECT_FALSE(result.pending());
+    EXPECT_NE(result.phase(),2);EXPECT_EQ(result.disposition(),0);EXPECT_TRUE(result.has_error());EXPECT_EQ(read_file(file.str()),before);
+    actual.reset();committed(adopt_file(source_policy()));
+}
+TEST_F(AuthenticatedLifecycleFileAdministration, FreshLifecycleEnrollmentCannotInventAnOldProfilePredecessor) {
+    setup=open(lifecycle(source_policy()),connection());ASSERT_TRUE(setup.valid());auto answer=outcome(setup);answer["validForMilliseconds"]=600000;
+    ASSERT_TRUE(setup.finish_authorization(answer.dump()));setup.close_on_io();setup={};const auto before=read_file(file.str());
+    const auto result=adopt_file(source_policy());EXPECT_FALSE(result.pending());EXPECT_NE(result.phase(),2);EXPECT_EQ(result.disposition(),0);EXPECT_EQ(read_file(file.str()),before);
+}
+class AuthenticatedLifecycleDirectoryAdministration:public AuthenticatedLifecycleFileAdministration {
+protected:
+    std::filesystem::path parent;
+    void SetUp()override {
+        parent=file.path.string()+".owned-parent";std::filesystem::create_directory(parent);file.path=parent/"source.sqlite";
+        AuthenticatedLifecycleFileAdministration::SetUp();
+    }
+};
+TEST_F(AuthenticatedLifecycleDirectoryAdministration, ReplacedIntendedParentNeverCreatesOrUsesANewMainFile) {
+    setup=admitted();release_owner();const auto before=read_file(file.str());const auto saved=parent.string()+".held";
+    {
+        observation moved([&]{std::filesystem::rename(parent,saved);std::filesystem::create_directory(parent);});
+        const auto result=adopt_file(source_policy());EXPECT_FALSE(result.pending());EXPECT_EQ(result.phase(),0);EXPECT_EQ(result.disposition(),0);
+        EXPECT_FALSE(std::filesystem::exists(file.str()));
+    }
+    ASSERT_TRUE(std::filesystem::is_empty(parent));std::filesystem::remove(parent);std::filesystem::rename(saved,parent);
+    EXPECT_EQ(read_file(file.str()),before);committed(adopt_file(source_policy()));
+    // Existing custody directories stay bound to their original inode; no
+    // test or administration unlink/rebind is used to make the retry succeed.
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReceiptFileAdministration, OrdinaryCreatedFileUsesMetadataVersionAndPreservesIndependentHeader) {
+    // SetUp calls the real swift_lattice constructor; no fixture version PRAGMA.
+    ASSERT_EQ(std::get<int64_t>(owner->db().query("PRAGMA main.user_version").at(0).at("user_version")),0);
+    ASSERT_EQ(std::get<std::string>(owner->db().query("SELECT value FROM _lattice_meta WHERE key='schema_version'").at(0).at("value")),"1");
+    open();authorize();const auto original=entry(301);ASSERT_EQ(setup.receive(frame(original)).take_ids(),std::vector<std::string>{original.global_id});
+    const std::set<std::string> owner_keys{AdministrativeFingerprintKeys::core(*owner),
+        detail::authenticated_relay_catalog_test_access::catalog(*owner).swift_fingerprint};
+    ASSERT_EQ(owner_keys.size(),2u);ASSERT_FALSE(owner_keys.count(""));
+    const auto receipts_before=receipts();release_owner();int64_t before_cookie=-1,after_cookie=-1;
+    const auto before=read_file(file.str(),&before_cookie);
+    ASSERT_EQ(migrate_file(),1)<<last_bridge_error();const auto after=read_file(file.str(),&after_cookie);
+    ASSERT_GE(before_cookie,0);EXPECT_GT(after_cookie,before_cookie);
+    auto expected_metadata=before.at("_lattice_meta");std::set<std::string> refreshed;
+    for(auto& row:expected_metadata) {
+        const auto& key=std::get<std::string>(row.at("key"));
+        if(owner_keys.count(key)) {
+            // Only the two exact already-current owner keys may carry the DDL
+            // cookie. Every other metadata row/key/value stays byte-for-byte.
+            ASSERT_EQ(row.at("value"),column_value_t{std::to_string(before_cookie)});
+            ASSERT_TRUE(refreshed.insert(key).second);row.at("value")=std::to_string(after_cookie);
+        }
+    }
+    ASSERT_EQ(refreshed,owner_keys);
+    EXPECT_EQ(after.at("_lattice_meta"),expected_metadata);EXPECT_EQ(after.at("user_version"),before.at("user_version"));
+    EXPECT_EQ(after.at("_lattice_canonical_receipt"),receipts_before);EXPECT_EQ(after.at("AuthenticatedRelayRow"),before.at("AuthenticatedRelayRow"));
+}
+TEST_F(AuthenticatedReceiptFileAdministration, MetadataVersionCannotBeAbsentMalformedOrReplacedByMatchingHeader) {
+    open();authorize();release_owner();
+    const std::vector<std::string> malformed={"", "0", "01", "+1", "1 ", "1tail", "-1", "2147483648", "999999999999999999999999"};
+    for(const auto& spelling:malformed) {
+        {database raw(file.str());raw.execute("UPDATE _lattice_meta SET value=? WHERE key='schema_version'",{spelling});raw.execute("PRAGMA user_version=1");}
+        const auto before=read_file(file.str());EXPECT_EQ(migrate_file(),4)<<spelling;EXPECT_EQ(read_file(file.str()),before);
+    }
+    {database raw(file.str());raw.execute("UPDATE _lattice_meta SET value=CAST(X'31' AS BLOB) WHERE key='schema_version'");}
+    auto before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("DELETE FROM _lattice_meta WHERE key='schema_version'");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("INSERT INTO _lattice_meta(key,value) VALUES('schema_version','2')");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+}
+TEST_F(AuthenticatedReceiptFileAdministration, ViewAndDuplicateMetadataRefuseWithoutRepairOrFallback) {
+    open();authorize();release_owner();
+    {database raw(file.str());raw.execute("DROP TABLE _lattice_meta");raw.execute("CREATE VIEW _lattice_meta AS SELECT 'schema_version' AS key,'1' AS value");}
+    auto before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("DROP VIEW _lattice_meta");raw.execute("CREATE TABLE _lattice_meta(key TEXT,value TEXT NOT NULL)");
+        raw.execute("INSERT INTO _lattice_meta VALUES('schema_version','1'),('schema_version','1')");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+    {database raw(file.str());raw.execute("DROP TABLE _lattice_meta");}
+    before=read_file(file.str());EXPECT_EQ(migrate_file(),4);EXPECT_EQ(read_file(file.str()),before);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#include "../../Sources/LatticeCore/src/recovery_predecessor_wire.hpp"
+namespace {
+class AuthenticatedPredecessor : public AuthenticatedReadySession {
+protected:
+    json prior,current;
+    ready_wire::frame frozen;
+    struct CapacityAdmissionState {
+        using clock=std::chrono::steady_clock;
+        struct turn {clock::time_point entered,busy_returned;};
+        const clock::time_point started=clock::now(),deadline=started+std::chrono::seconds(5);
+        std::atomic<bool> current{true};
+        std::atomic<unsigned> created{0},destroyed{0};
+        std::vector<turn> turns;
+        uint64_t registry_entries=0;
+        std::string failure;
+        CapacityAdmissionState(){turns.reserve(32);}
+    };
+    struct CapacityAdmissionRoute {
+        std::shared_ptr<CapacityAdmissionState> state;
+        explicit CapacityAdmissionRoute(std::shared_ptr<CapacityAdmissionState> s):state(std::move(s)){++state->created;}
+        static int32_t current(void* raw){return static_cast<CapacityAdmissionRoute*>(raw)->state->current?1:0;}
+        static int32_t admissible(void* raw){const auto& s=static_cast<CapacityAdmissionRoute*>(raw)->state;
+            const auto now=CapacityAdmissionState::clock::now();return s->current&&now>=s->started&&now<s->deadline?1:0;}
+        static void destroy(void* raw){auto* route=static_cast<CapacityAdmissionRoute*>(raw);++route->state->destroyed;delete route;}
+    };
+    relay_recovery_setup open_capacity_automatically(const json& p,const json& c,
+        std::shared_ptr<CapacityAdmissionState>* observed=nullptr) {
+        // Explicit native automatic contract for this capacity fixture only.
+        // The strict100ms open() helper and all existing refusal tests stay unchanged.
+        const auto actual_owner=owner;const auto policy_bytes=p.dump(),connection_bytes=c.dump();
+        const auto state=std::make_shared<CapacityAdmissionState>();if(observed)*observed=state;
+        struct episode_cleanup {std::shared_ptr<CapacityAdmissionState> state;bool admitted=false;
+            ~episode_cleanup(){if(!admitted)state->current=false;}} cleanup{state};
+        struct registry_counter {uint64_t count=0;uint64_t* prior=detail::authenticated_ready_test_access::setup_entries(&count);
+            ~registry_counter(){detail::authenticated_ready_test_access::setup_entries(prior);}} entries;
+        const auto fail=[&](std::string message)->relay_recovery_setup{state->failure=std::move(message);throw db_error(state->failure);};
+        for(;;) {
+            const auto now=CapacityAdmissionState::clock::now();
+            if(!state->current||!actual_owner||owner!=actual_owner||actual_owner->is_closed()||!ref||ref->get()!=actual_owner.get())
+                return fail("capacity automatic setup owner or route retired");
+            if(now<state->started||now>=state->deadline||state->turns.size()>=32)
+                return fail("capacity automatic pre-effect admission budget exhausted");
+            state->turns.push_back({now,{}});
+            auto next=ref->open_relay_recovery_setup_automatic(policy_bytes,connection_bytes,new CapacityAdmissionRoute(state),
+                CapacityAdmissionRoute::current,CapacityAdmissionRoute::admissible,CapacityAdmissionRoute::destroy);
+            const auto error=last_bridge_error();state->registry_entries=entries.count;
+            if(next.valid()) {
+                if(next.pending_before_enrollment()||entries.count!=1||!error.empty()) {
+                    next.close_on_io();return fail("capacity automatic setup returned inconsistent enrolled state: "+error);
+                }
+                // The deadline governs pre-effect admission, not work after enrollment.
+                cleanup.admitted=true;return next;
+            }
+            if(!next.pending_before_enrollment())return fail("capacity automatic terminal setup refusal: "+error);
+            if(!error.empty()||entries.count!=0)return fail("capacity automatic pending result had effects or error: "+error);
+            const auto returned=CapacityAdmissionState::clock::now();state->turns.back().busy_returned=returned;
+            if(state->destroyed.load()!=state->created.load())return fail("capacity automatic failed attempt retained route context");
+            if(state->turns.size()>=32||returned>=state->deadline)return fail("capacity automatic pre-effect admission budget exhausted");
+            // Native has returned and released all locks before this fixture-only wait.
+            std::this_thread::sleep_until(std::min(state->deadline,returned+std::chrono::milliseconds(100)));
+        }
+    }
+
+    void adopt(bool large=false,bool capsule=true) {
+        setup=admitted(1,large);prior=description(setup);frozen=request(prior);
+        if(capsule)(void)lease(setup,frozen,prior);
+        setup.close_on_io();setup={};
+        detail::canonical_namespaced_writer_profile p;const auto& s=prior.at("source");
+        p.writer.binding={s.at("sourceID"),s.at("epoch"),s.at("scopeDigest"),s.at("schemaDigest")};
+        p.writer.limits={65536,16777216,65536,16777216,256,128,64};p.writer.models={"AuthenticatedRelayRow"};p.writer.upstream_requested=true;
+        p.namespaces.local_namespace="local";p.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+        const std::string name=large?"bounded48MiBV1":"boundedV1";
+        const auto result=detail::adopt_ready_lifecycle_for_test(owner,p,{256,65536,1048576},{64,3600000},
+            detail::canonical_named_ready_profile(s.at("authority"),p.writer.limits,false,name),name,60000);
+        ASSERT_EQ(result.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(result.record);
+        auto target=source_policy(large);target["readyProfile"]=large?"bounded48MiBOrphanV1":"boundedV1OrphanV1";target["orphanResumeGraceMilliseconds"]=60000;
+        setup=open(target,connection());ASSERT_TRUE(setup.valid())<<last_bridge_error();auto authorized=outcome(setup);authorized["validForMilliseconds"]=600000;
+        ASSERT_TRUE(setup.finish_authorization(authorized.dump()));current=description(setup);
+        frozen.route_generation=std::stoull(current.at("routeGeneration").get<std::string>());
+    }
+    json proof_command() {
+        auto c=command("predecessor",frozen,current);c.erase("durationMilliseconds");c["priorProfile"]=prior.at("profile");return c;
+    }
+    json proof() {
+        const auto result=invoke(setup,proof_command());if(result.status_code()!=1||!result.publishable())throw db_error("fixture predecessor unavailable: "+last_bridge_error());
+        return json::parse(result.wire());
+    }
+};
+TEST_F(AuthenticatedPredecessor, ActualSmallAdoptionProofKeepsLiveLeaseAndEveryDurableCounter) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto resumed=lease(setup,frozen,current,"resume");const auto frame=read(setup,resumed,0);ASSERT_TRUE(frame.publishable());
+    const auto before=exact_source();detail::canonical_ready_read_test_observation::observation trace;
+    const auto previous=detail::canonical_ready_read_test_observation::current;detail::canonical_ready_read_test_observation::current=&trace;
+    struct restore {detail::canonical_ready_read_test_observation::observation* previous;~restore(){detail::canonical_ready_read_test_observation::current=previous;}} reset{previous};
+    const auto answer=proof();ASSERT_EQ(answer.at("settlement").at("state"),"committed");ASSERT_TRUE(answer.contains("predecessor"));EXPECT_EQ(answer.at("leaseAvailable"),false);
+    EXPECT_EQ(answer.at("predecessor").at("requestDigest"),std::get<ready_wire::request>(frozen.body).request_digest);
+    EXPECT_EQ(answer.at("predecessor").at("beforeProfileDigest"),detail::predecessor_wire::profile_digest(prior.at("profile")));
+    EXPECT_EQ(answer.at("predecessor").at("afterProfileDigest"),detail::predecessor_wire::profile_digest(current.at("profile")));
+    EXPECT_EQ(trace.full_audits,2u);EXPECT_EQ(exact_source(),before);EXPECT_TRUE(frame.publishable());EXPECT_EQ(read(setup,resumed,0).wire(),frame.wire());
+}
+TEST_F(AuthenticatedPredecessor, ActualLargeEmptyBindingProofDoesNotInventCapsuleOrHistory) {
+    adopt(true,false);ASSERT_FALSE(HasFatalFailure());const auto before=exact_source();const auto answer=proof();ASSERT_TRUE(answer.contains("predecessor"));
+    EXPECT_FALSE(answer.contains("lifecycle"));EXPECT_FALSE(answer.contains("bindingHighWater"));EXPECT_FALSE(answer.contains("leaseID"));
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),0);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(exact_source(),before);
+    const auto repeated=proof();EXPECT_EQ(repeated.at("predecessor"),answer.at("predecessor"));EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, FreshOrphanCannotManufactureRecordFromMatchingConfiguration) {
+    auto p=source_policy();p["readyProfile"]="boundedV1OrphanV1";p["orphanResumeGraceMilliseconds"]=60000;
+    setup=open(p,connection());ASSERT_TRUE(setup.valid());authorize();current=description(setup);prior=current;
+    prior["profile"]["name"]="boundedV1";prior["profile"].erase("orphanResumeGraceMilliseconds");frozen=request(current);
+    const auto before=exact_source();const auto answer=proof();EXPECT_NE(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, ExactProfileTypesMembersAndEveryAuthenticatedQBindingRemainMandatory) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto before=exact_source();const auto original=proof_command();
+    std::vector<json> invalid;
+    for(const auto& value:std::vector<json>{16.0,true,"16"}){auto c=original;c["priorProfile"]["transfers"]=value;invalid.push_back(c);}
+    {auto c=original;c["priorProfile"]["extra"]=1;invalid.push_back(c);}
+    {auto c=original;c["priorProfile"]["orphanResumeGraceMilliseconds"]=60000;invalid.push_back(c);}
+    {auto c=original;c["routeGeneration"]="1";if(c["routeGeneration"]==current["routeGeneration"])c["routeGeneration"]="2";invalid.push_back(c);}
+    for(unsigned kind=0;kind<5;++kind){auto q=frozen;auto& body=std::get<ready_wire::request>(q.body);
+        if(kind==0)q.logical.receiver_incarnation=relay_uuid(9911);if(kind==1)q.logical.channel_incarnation=relay_uuid(9912);
+        if(kind==2)q.logical.channel="wrong-channel";if(kind==3){body.source.epoch=relay_uuid(9913);body.expected.binding=body.source;}
+        if(kind==4)body.receipts={{relay_uuid(9914),"other",{{"AuthenticatedRelayRow",relay_uuid(9915)}}}};
+        seal(q,current);auto c=original;c["request"]=ready_wire::encode(q,codec(current));invalid.push_back(c);
+    }
+    for(const auto& c:invalid){SCOPED_TRACE(c.dump().substr(0,256));const auto result=invoke(setup,c);EXPECT_NE(result.status_code(),1);EXPECT_EQ(exact_source(),before);}
+    EXPECT_TRUE(proof().contains("predecessor"));
+}
+TEST_F(AuthenticatedPredecessor, CommitDenialWithholdsFactsAndSecondaryErrorKeepsKnownCommit) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto before=exact_source();
+    {AddressedReadAuthorizerFault fault(owner->db(),false,true);const auto answer=proof();EXPECT_EQ(fault.commits,1u);EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_FALSE(answer.contains("predecessor"));}
+    EXPECT_EQ(exact_source(),before);unsigned calls=0;
+    {AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw db_error("predecessor secondary observer");})};
+        const auto answer=proof();EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_EQ(answer.at("settlement").at("postcommitError"),true);EXPECT_TRUE(answer.contains("predecessor"));}
+    EXPECT_EQ(calls,1u);EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, PostcommitRevocationWithholdsFactsWithoutRelabelingCommit) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto c=proof_command();const auto before=exact_source();const auto stop=setup.stop_token();
+    const auto callback_thread=std::this_thread::get_id();const auto callbacks=std::make_shared<std::atomic<unsigned>>(0);
+    // Copied callbacks own all captured state even after hook removal.
+    // Only this synchronous proof COMMIT may revoke, never background maintenance.
+    AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([stop,callback_thread,callbacks](const auto&,auto reason){
+        if(std::this_thread::get_id()!=callback_thread||reason!=lattice_db::invalidation_reason::commit)return;
+        callbacks->fetch_add(1,std::memory_order_relaxed);stop.stop();
+    })};
+    const auto result=invoke(setup,c);EXPECT_EQ(callbacks->load(std::memory_order_relaxed),1u);
+    ASSERT_EQ(result.status_code(),1);EXPECT_FALSE(result.publishable());const auto answer=json::parse(result.wire());
+    EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
+}
+TEST_F(AuthenticatedPredecessor, OffPageCorruptionPreventsProvenancePublicationBeforeAnyCleanup) {
+    adopt();ASSERT_FALSE(HasFatalFailure());const auto tail=owner->db().query("SELECT binding,frame_index,data FROM _lattice_canonical_ready_frame ORDER BY frame_index DESC LIMIT 1").at(0);
+    const auto replace=[&](const std::vector<uint8_t>& data){database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.begin_transaction();raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");raw.execute("UPDATE _lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",{data,tail.at("binding"),tail.at("frame_index")});raw.execute(guard);raw.commit();};
+    replace({'{','}'});const auto corrupted=exact_source();const auto answer=proof();EXPECT_NE(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),corrupted);
+    replace(std::get<std::vector<uint8_t>>(tail.at("data")));EXPECT_TRUE(proof().contains("predecessor"));
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedPredecessor, FullSmallTransferInventoryDoesNotChargeInspectionAsAnotherTransfer) {
+    adopt();ASSERT_FALSE(HasFatalFailure());std::vector<relay_recovery_setup> active;
+    for(unsigned n=2;n<=16;++n){auto p=source_policy();p["readyProfile"]="boundedV1OrphanV1";p["orphanResumeGraceMilliseconds"]=60000;
+        SCOPED_TRACE("automatic capacity route "+std::to_string(n));auto next=open_capacity_automatically(p,connection(n));ASSERT_TRUE(next.valid())<<last_bridge_error();auto authorized=outcome(next);authorized["validForMilliseconds"]=600000;ASSERT_TRUE(next.finish_authorization(authorized.dump()));
+        const auto d=description(next);(void)lease(next,request(d),d,"prepare",590000);active.push_back(std::move(next));}
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),16);const auto before=exact_source();
+    const auto answer=proof();EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_TRUE(answer.contains("predecessor"));EXPECT_EQ(exact_source(),before);
+    for(auto& next:active)next.close_on_io();
+}
+TEST(PredecessorWire, FixedDomainLengthFramingAndStrictNamedEnvelopeVectors) {
+    EXPECT_EQ(detail::predecessor_wire::profile_digest(json::object()),"880fb25a80b731fab82d0a81fbb353e19a1b55016a74dcb9da65f2568afabd1d");
+    EXPECT_EQ(detail::predecessor_wire::transition_digest("abc"),"48a8220dee0fc435f3d7dd270a8cb3025d989147d0be0e2087f1400c52182906");
+    for(const auto registered:{false,true})for(const auto large:{false,true}){
+        if(registered&&!large)continue;const std::string name=large?"bounded48MiBV1":"boundedV1";const auto target=large?"bounded48MiBOrphanV1":"boundedV1OrphanV1";
+        const auto before=detail::canonical_ready_profile_description(detail::canonical_named_ready_profile("test",{},registered,name),name);
+        const auto after=detail::canonical_ready_profile_description(detail::canonical_named_ready_profile("test",{},registered,target,60000),target);
+        EXPECT_NO_THROW(detail::predecessor_wire::pair(before,after,registered));
+        for(const auto& value:std::vector<json>{60000.0,true,"60000",0,3600001}){auto bad=after;bad["orphanResumeGraceMilliseconds"]=value;EXPECT_THROW(detail::predecessor_wire::pair(before,bad,registered),db_error);}
+        auto bad=after;bad["valueLimits"]["rawBytes"]=bad["valueLimits"]["rawBytes"].get<double>();EXPECT_THROW(detail::predecessor_wire::pair(before,bad,registered),db_error);
+        bad=after;bad["unknown"]=false;EXPECT_THROW(detail::predecessor_wire::pair(before,bad,registered),db_error);
+    }
+}
+TEST_F(AuthenticatedReceiptCoverageV3, ActualAdoptedV3ProofBindsRegisteredProducerAndLeavesReceiptCoverageExact) {
+    setup=covered_setup();auto other=covered_setup("other",2);const auto e=identified(entry(85));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});ASSERT_EQ(other.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto prior=description(setup);auto q=request(prior);q.version=3;auto& body=std::get<ready_wire::request>(q.body);
+    body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace="app";
+    body.receipts={{e.global_id,"app",{{e.table_name,e.global_row_id}},e.original_identity->digest}};seal(q,prior);(void)lease(setup,q,prior,"prepare",1000);
+    other.close_on_io();other={};setup.close_on_io();setup={};detail::canonical_namespaced_writer_profile p;const auto& s=prior.at("source");
+    p.writer.binding={s.at("sourceID"),s.at("epoch"),s.at("scopeDigest"),s.at("schemaDigest")};p.writer.limits={65536,16777216,65536,16777216,256,128,64};
+    p.writer.models={"AuthenticatedRelayRow"};p.writer.upstream_requested=true;p.namespaces.local_namespace="local";
+    p.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};p.namespaces.coverage=detail::canonical_coverage_profile{relay_uuid(5100),7,{"app","other"}};
+    const auto adopted=detail::adopt_ready_lifecycle_for_test(owner,p,{256,65536,1048576},{64,3600000},detail::canonical_named_ready_profile(s.at("authority"),p.writer.limits,true,"bounded48MiBV1"),"bounded48MiBV1",60000);
+    ASSERT_EQ(adopted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(adopted.record);
+    auto policy=covered_policy();policy["readyProfile"]="bounded48MiBOrphanV1";policy["orphanResumeGraceMilliseconds"]=60000;
+    setup=open(policy,connection());ASSERT_TRUE(setup.valid());ASSERT_TRUE(setup.finish_authorization(covered_answer(setup).dump()));const auto d=description(setup);q.route_generation=std::stoull(d.at("routeGeneration").get<std::string>());
+    auto control=command("predecessor",q,d);control.erase("durationMilliseconds");control["priorProfile"]=prior.at("profile");const auto before=all_state();
+    const auto result=invoke(setup,control);ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable());const auto answer=json::parse(result.wire());
+    EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_TRUE(answer.contains("predecessor"));EXPECT_EQ(all_state(),before);EXPECT_EQ(coverage().size(),2u);
+    auto wrong=q;std::get<ready_wire::request>(wrong.body).registered_producer->producer=producer(2);seal(wrong,d);control["request"]=ready_wire::encode(wrong,codec(d));
+    const auto refused=invoke(setup,control);EXPECT_EQ(all_state(),before);
+    ASSERT_EQ(refused.status_code(),1);ASSERT_TRUE(refused.publishable());
+    const auto refusal=json::parse(refused.wire());
+    const json expected_settlement={{"state","refused"},{"unexpectedCommitObserved",false},{"primaryError",true},
+        {"cleanupError",false},{"postcommitError",false},{"notificationError",false}};
+    EXPECT_EQ(refusal.at("settlement"),expected_settlement);
+    EXPECT_EQ(refusal.at("leaseAvailable"),false);EXPECT_FALSE(refusal.contains("predecessor"));
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReadySession, ReadCostObservationSaturatesWithoutChangingRealBytesOrSettlement) {
+    setup=admitted();const auto e=entry(62001);ASSERT_EQ(setup.receive(frame(e)).ids().size(),1u);
+    const auto d=description(setup);auto f=request(d);std::get<ready_wire::request>(f.body).receipts={{e.global_id,std::string("app"),{{e.table_name,e.global_row_id}}}};seal(f,d);
+    const auto offered=lease(setup,f,d);const auto baseline=read(setup,offered,0);ASSERT_TRUE(baseline.publishable());
+    ASSERT_TRUE(std::holds_alternative<ready_wire::manifest>(decode_read(baseline,d).body));const auto before=exact_source();
+    auto command=control("read");for(const auto* name:{"routeGeneration","leaseID","requestDigest","attemptID","sequence"})command[name]=offered.at(name);command["index"]="0";
+    namespace reads=lattice::detail::canonical_ready_read_test_observation;reads::observation trace;
+    const auto maximum=~uint64_t(0);trace.cost.calls.fill(maximum-1);trace.cost.microseconds.fill(maximum);
+    trace.cost.receipt_batches=maximum;trace.cost.receipt_batch_ids=maximum;
+    const auto previous=reads::current;reads::current=&trace;
+    struct reset {reads::observation* previous;~reset(){reads::current=previous;}} restore{previous};
+    const auto result=invoke(setup,command);EXPECT_TRUE(result.publishable());EXPECT_EQ(result.wire(),baseline.wire());
+    EXPECT_EQ(trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(trace.full_audits,1u);
+    using cp=detail::canonical_ready_cost_observation::phase;
+    for(size_t i=0;i<trace.cost.calls.size();++i) {
+        const auto phase=static_cast<cp>(i);
+        // These three stages are performed by the fused validator now. Their
+        // independent counters must remain untouched, while active ones saturate.
+        const bool fused=phase==cp::frame_decode||phase==cp::canonical_encode||phase==cp::sequence_advance;
+        EXPECT_EQ(trace.cost.calls[i],fused?maximum-1:maximum)<<i;
+    }
+    for(const auto value:trace.cost.microseconds)EXPECT_EQ(value,maximum);
+    EXPECT_EQ(trace.cost.receipt_batches,maximum);EXPECT_EQ(trace.cost.receipt_batch_ids,maximum);EXPECT_EQ(exact_source(),before);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+using CompletedDisposalSnapshot=std::map<std::string,std::vector<database::row_t>>;
+CompletedDisposalSnapshot completed_disposal_state(database& db) {
+    CompletedDisposalSnapshot state;
+    const auto tables=db.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 129");
+    if(tables.size()>128)throw db_error("completed disposal fixture table inventory bound");
+    for(const auto& row:tables) {
+        const auto& name=std::get<std::string>(row.at("name"));
+        if(name.empty()||name.size()>128||!std::all_of(name.begin(),name.end(),[](char c){return c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='_';}))
+            throw db_error("completed disposal fixture table name refused");
+        state[name]=db.query("SELECT * FROM \""+name+"\" ORDER BY 1");
+    }
+    state["sqlite_schema"]=db.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+    return state;
+}
+// Failure-only summary of the exact two compared snapshots. No SQL resampling,
+// normalization, raw IDs, payload text or arbitrary table/column names.
+std::string completed_disposal_difference(const CompletedDisposalSnapshot& expected,const CompletedDisposalSnapshot& actual) noexcept {
+    try {
+        const std::set<std::string> named_tables{"_lattice_meta","sqlite_schema","sqlite_stat1","sqlite_stat4",
+            "_lattice_canonical_ready_frame","_lattice_canonical_ready_transfer","_lattice_canonical_ready_profile",
+            "_lattice_canonical_ready_binding","_lattice_canonical_attempt","_lattice_canonical_retention"};
+        const std::set<std::string> named_columns{"key","value","type","name","tbl_name","rootpage","sql","binding","frame_index","data","sha256","tbl","idx","stat"};
+        const auto cell=[](const column_value_t* value,bool schema_number) {
+            if(!value)return json{{"missing",true}};
+            json out={{"type",value->index()}};
+            const auto bytes=[&](const auto& v) {
+                const size_t count=std::min<size_t>(v.size(),256);
+                out["bytes"]=v.size();out["prefixBytes"]=count;
+                out["prefixSHA256"]=picosha2::hash256_hex_string(v.begin(),v.begin()+count);
+            };
+            if(const auto* text=std::get_if<std::string>(value))bytes(*text);
+            else if(const auto* blob=std::get_if<std::vector<uint8_t>>(value))bytes(*blob);
+            else if(schema_number)if(const auto* number=std::get_if<int64_t>(value))out["value"]=*number;
+            return out;
+        };
+        json report={{"exactComparedSnapshots",true},{"tables",json::array()}};size_t changed=0;
+        std::set<std::string> tables;for(const auto& [k,_]:expected)tables.insert(k);for(const auto& [k,_]:actual)tables.insert(k);
+        for(const auto& table:tables) {
+            const auto e=expected.find(table),a=actual.find(table);if(e!=expected.end()&&a!=actual.end()&&e->second==a->second)continue;
+            ++changed;if(report["tables"].size()==4)continue;
+            const size_t en=e==expected.end()?0:e->second.size(),an=a==actual.end()?0:a->second.size();
+            json difference={{"tableCategory",named_tables.count(table)?table:"other"},{"expectedPresent",e!=expected.end()},
+                {"actualPresent",a!=actual.end()},{"expectedRows",en},{"actualRows",an},{"rows",json::array()}};size_t changed_rows=0;
+            for(size_t r=0;r<std::max(en,an);++r) {
+                const auto* er=r<en?&e->second[r]:nullptr;const auto* ar=r<an?&a->second[r]:nullptr;
+                if(er&&ar&&*er==*ar)continue;++changed_rows;if(difference["rows"].size()==2)continue;
+                json row={{"orderedRow",r},{"cells",json::array()}};size_t changed_cells=0;std::set<std::string> columns;
+                if(er)for(const auto& [k,_]:*er)columns.insert(k);if(ar)for(const auto& [k,_]:*ar)columns.insert(k);
+                for(const auto& column:columns) {
+                    const auto* ev=er&&er->count(column)?&er->at(column):nullptr;const auto* av=ar&&ar->count(column)?&ar->at(column):nullptr;
+                    if(ev&&av&&*ev==*av)continue;++changed_cells;if(row["cells"].size()==2)continue;
+                    const bool schema_number=table=="sqlite_schema"&&column=="rootpage";
+                    row["cells"].push_back({{"columnCategory",named_columns.count(column)?column:"other"},{"expected",cell(ev,schema_number)},{"actual",cell(av,schema_number)}});
+                }
+                row["changedCells"]=changed_cells;row["cellsTruncated"]=changed_cells>2;difference["rows"].push_back(std::move(row));
+            }
+            difference["changedRows"]=changed_rows;difference["rowsTruncated"]=changed_rows>2;report["tables"].push_back(std::move(difference));
+        }
+        report["changedTables"]=changed;report["tablesTruncated"]=changed>4;const auto text=report.dump();
+        return text.size()<=8192?text:json{{"changedTables",changed},{"boundedOutputUnavailable",true}}.dump();
+    }catch(...){return "{}";}
+}
+struct CompletedDisposalAudit {
+    detail::canonical_ready_read_test_observation::observation trace;
+    detail::canonical_ready_read_test_observation::observation* previous=detail::canonical_ready_read_test_observation::current;
+    CompletedDisposalAudit(){detail::canonical_ready_read_test_observation::current=&trace;}
+    ~CompletedDisposalAudit(){detail::canonical_ready_read_test_observation::current=previous;}
+};
+json completed_disposal_answer(const relay_ready_result& result) {
+    if(result.status_code()!=1||!result.publishable())throw db_error("completed disposal response unavailable: "+last_bridge_error());
+    auto answer=json::parse(result.wire());
+    if(answer.at("operation")!="discard"||answer.at("leaseAvailable")!=false||answer.contains("lifecycle")||answer.contains("leaseID"))
+        throw db_error("original-profile disposal response shape changed");
+    return answer;
+}
+class AuthenticatedCompletedDisposal:public AuthenticatedReadySession {
+protected:
+    void start_disposal() {
+        setup=open(policy(),connection());
+        if(!setup.valid()||!setup.finish_authorization(outcome(setup).dump()))
+            throw db_error("completed disposal actual source authorization failed: "+last_bridge_error());
+    }
+    json discard(const ready_wire::frame& q,const json& d) {return completed_disposal_answer(invoke(setup,command("discard",q,d)));}
+    CompletedDisposalSnapshot state(){return completed_disposal_state(owner->db());}
+};
+
+TEST_F(AuthenticatedCompletedDisposal, LostCompletedDiscardReplyRetriesWithOneBindingAndNoDurableChanges) {
+    start_disposal();const auto original=entry(801,"retained application row");
+    ASSERT_EQ(setup.receive(frame(original)).ids(),std::vector<std::string>{original.global_id});
+    const auto d=description(setup);ASSERT_EQ(d.at("profile").at("name"),"boundedV1");const auto q=request(d);
+    const auto offered=lease(setup,q,d,"prepare",1000);auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());
+    const auto bindings=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");
+    const auto old_receipts=receipts();ASSERT_EQ(bindings.size(),1u);ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);
+    auto first=invoke(setup,command("discard",q,d));const auto answer=completed_disposal_answer(first);
+    ASSERT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(queued.publishable());
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(receipts(),old_receipts);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),bindings);
+    const auto disposed=state();first={}; // The original response is lost after the real COMMIT.
+    {CompletedDisposalAudit audit;AddressedReadAuthorizerFault commit(owner->db(),false);
+        const auto retry=discard(q,d);EXPECT_EQ(retry.at("settlement").at("state"),"committed");
+        EXPECT_EQ(commit.commits,1u);EXPECT_EQ(audit.trace.full_audits,2u);}
+    EXPECT_EQ(state(),disposed);
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),disposed);
+    const auto stale=invoke(setup,command("prepare",q,d,1000));ASSERT_EQ(stale.status_code(),1);
+    EXPECT_FALSE(json::parse(stale.wire()).at("leaseAvailable").get<bool>());EXPECT_EQ(state(),disposed);
+    EXPECT_TRUE(lease(setup,request(d,2),d,"prepare",1000).at("leaseAvailable").get<bool>());
+    EXPECT_EQ(count("AuthenticatedRelayRow"),1);EXPECT_EQ(receipts(),old_receipts);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, ExtantCapsuleRequiresExactAttemptRequestAndSequence) {
+    start_disposal();const auto d=description(setup);const auto q=request(d,2);(void)lease(setup,q,d,"prepare",1000);
+    const auto before=state();
+    for(unsigned kind=0;kind<4;++kind) {
+        SCOPED_TRACE(kind);auto changed=q;
+        if(kind==0)changed.logical.attempt_id=relay_uuid(9810);
+        if(kind==1)std::get<ready_wire::request>(changed.body).receipts={{relay_uuid(9811),"app",{{"AuthenticatedRelayRow",relay_uuid(9812)}}}};
+        if(kind==2)changed.logical.sequence=1;
+        if(kind==3)changed.logical.sequence=3;
+        seal(changed,d);const auto refused=discard(changed,d);
+        EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(state(),before);
+    }
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, NeverStartedOrWrongHighWaterCannotRetireOrAdvanceASequence) {
+    start_disposal();const auto d=description(setup);const auto q=request(d,2);const auto empty=state();
+    EXPECT_NE(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),empty);
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),0);
+    (void)lease(setup,q,d,"prepare",1000);ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");
+    const auto terminal=state();
+    for(const uint64_t sequence:{uint64_t{1},uint64_t{3}}) {
+        SCOPED_TRACE(sequence);EXPECT_NE(discard(request(d,sequence),d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),terminal);
+    }
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),terminal);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, AbsentCapsuleProvesCurrentSequenceStateWithoutInventingHistoricalQBytes) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto terminal=state();
+    // Deleted capsules do not retain a historical attempt-ID/request digest.
+    // This different, valid Q names the same actual binding and exact high-water.
+    auto different=q;different.logical.attempt_id=relay_uuid(9820);
+    std::get<ready_wire::request>(different.body).receipts={{relay_uuid(9821),"app",{{"AuthenticatedRelayRow",relay_uuid(9822)}}}};seal(different,d);
+    ASSERT_NE(std::get<ready_wire::request>(different.body).request_digest,std::get<ready_wire::request>(q.body).request_digest);
+    const auto answer=discard(different,d);EXPECT_EQ(answer.at("settlement").at("state"),"committed");
+    EXPECT_FALSE(answer.contains("receipts"));EXPECT_FALSE(answer.contains("predecessor"));EXPECT_EQ(state(),terminal);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, AbsentRetryStillRequiresActualSourcePeerNamespaceAndExistingBinding) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto terminal=state();
+    for(unsigned kind=0;kind<4;++kind) {
+        SCOPED_TRACE(kind);auto foreign=q;auto& body=std::get<ready_wire::request>(foreign.body);
+        if(kind==0){body.source.epoch=relay_uuid(9830);body.expected.binding=body.source;}
+        if(kind==1)foreign.logical.receiver_incarnation=relay_uuid(9831);
+        if(kind==2)foreign.logical.channel_incarnation=relay_uuid(9832);
+        if(kind==3)foreign.logical.channel="another-channel";
+        seal(foreign,d);const auto result=invoke(setup,command("discard",foreign,d));EXPECT_NE(result.status_code(),1);EXPECT_EQ(state(),terminal);
+    }
+    auto other_peer=open(policy(),connection(2));ASSERT_TRUE(other_peer.valid());ASSERT_TRUE(other_peer.finish_authorization(outcome(other_peer).dump()));
+    const auto peer_d=description(other_peer);const auto peer_q=request(peer_d);const auto before_peer=state();
+    EXPECT_NE(completed_disposal_answer(invoke(other_peer,command("discard",peer_q,peer_d))).at("settlement").at("state"),"committed");EXPECT_EQ(state(),before_peer);
+    auto p=policy();p["receiptNamespace"]="other";auto other_namespace=open(p,connection());ASSERT_TRUE(other_namespace.valid());
+    ASSERT_TRUE(other_namespace.finish_authorization(outcome(other_namespace).dump()));const auto ns_d=description(other_namespace);const auto ns_q=request(ns_d);const auto before_ns=state();
+    EXPECT_NE(completed_disposal_answer(invoke(other_namespace,command("discard",ns_q,ns_d))).at("settlement").at("state"),"committed");EXPECT_EQ(state(),before_ns);
+    EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");
+}
+
+TEST_F(AuthenticatedCompletedDisposal, AbsentRetryStillAuditsAnotherCapsulesOffPageContentBeforeAnyCommit) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");
+    auto other=open(policy(),connection(2));ASSERT_TRUE(other.valid());ASSERT_TRUE(other.finish_authorization(outcome(other).dump()));
+    const auto other_d=description(other);(void)lease(other,request(other_d),other_d,"prepare",1000);
+    const auto before=state();const auto tail=owner->db().query("SELECT binding,frame_index,data FROM _lattice_canonical_ready_frame ORDER BY frame_index DESC LIMIT 1").at(0);
+    ASSERT_GT(std::get<int64_t>(tail.at("frame_index")),0);
+    const auto replace=[&](const std::vector<uint8_t>& data){
+        database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
+        raw.begin_transaction();raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",{data,tail.at("binding"),tail.at("frame_index")});
+        raw.execute(guard);raw.commit();
+    };
+    replace({'{','}'});const auto corrupt=state();
+    {CompletedDisposalAudit audit;AddressedReadAuthorizerFault commit(owner->db(),false);const auto refused=discard(q,d);
+        EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(audit.trace.full_audits,1u);EXPECT_EQ(commit.commits,0u);}
+    EXPECT_EQ(state(),corrupt);EXPECT_FALSE(owner->db().is_in_transaction());
+    replace(std::get<std::vector<uint8_t>>(tail.at("data")));const auto restored=state();
+    EXPECT_EQ(restored,before)<<completed_disposal_difference(before,restored);
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto retried=state();
+    EXPECT_EQ(retried,before)<<completed_disposal_difference(before,retried);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, CommitDenialRestoresExtantCapsuleAndCannotPublishAnAbsentRetryCommit) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);const auto offered=lease(setup,q,d,"prepare",1000);
+    const auto queued=read(setup,offered,0);ASSERT_TRUE(queued.publishable());const auto before=state();
+    {AddressedReadAuthorizerFault fault(owner->db(),false,true);const auto answer=discard(q,d);
+        EXPECT_EQ(fault.commits,1u);EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_EQ(answer.at("settlement").at("primaryError"),true);}
+    EXPECT_FALSE(queued.publishable());EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(state(),before);
+    ASSERT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto terminal=state();
+    {AddressedReadAuthorizerFault fault(owner->db(),false,true);const auto answer=discard(q,d);
+        EXPECT_EQ(fault.commits,1u);EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");EXPECT_EQ(answer.at("settlement").at("primaryError"),true);}
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(state(),terminal);
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),terminal);
+}
+
+TEST_F(AuthenticatedCompletedDisposal, ObserverErrorKeepsKnownCommittedDisposalAndNoChangeRetryTruth) {
+    start_disposal();const auto d=description(setup);const auto q=request(d);(void)lease(setup,q,d,"prepare",1000);unsigned calls=0;
+    {AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw db_error("completed disposal observer");})};
+        const auto answer=discard(q,d);EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_EQ(answer.at("settlement").at("postcommitError"),true);
+        EXPECT_EQ(answer.at("settlement").at("primaryError"),false);EXPECT_EQ(answer.at("settlement").at("cleanupError"),false);}
+    ASSERT_EQ(calls,1u);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);const auto terminal=state();
+    {AddressedReadInvalidationHook hook{owner,owner->lattice_db::add_invalidation_hook([&](const auto&,auto){++calls;throw db_error("completed disposal retry observer");})};
+        const auto answer=discard(q,d);EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_EQ(answer.at("settlement").at("postcommitError"),true);}
+    EXPECT_EQ(calls,2u);EXPECT_EQ(state(),terminal);EXPECT_FALSE(owner->db().is_in_transaction());
+}
+
+TEST_F(AuthenticatedCompletedDisposal, LostResultStaysRouteFencedAndReopenedSameBindingCanRetryWithoutCapsule) {
+    start_disposal();auto d=description(setup);auto q=request(d);(void)lease(setup,q,d,"prepare",1000);
+    auto first=invoke(setup,command("discard",q,d));ASSERT_EQ(completed_disposal_answer(first).at("settlement").at("state"),"committed");
+    const auto stop=setup.stop_token();ASSERT_TRUE(stop.live());
+    route->current=false;stop.stop();EXPECT_FALSE(first.publishable());EXPECT_FALSE(stop.drained());
+    first={};EXPECT_TRUE(stop.drained());setup.close_on_io();setup={};route=std::make_shared<RelayRouteState>();
+    start_disposal();d=description(setup);q.route_generation=std::stoull(d.at("routeGeneration").get<std::string>());
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),0);ASSERT_EQ(count("_lattice_canonical_ready_binding"),1);const auto reopened=state();
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),reopened);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, CompletedAbsentDiscardStillRequiresActualRegisteredProducerAndReceiptNamespace) {
+    setup=covered_setup();const auto original=identified(entry(802,"registered immutable original"));
+    ASSERT_EQ(setup.receive(frame(original)).ids(),std::vector<std::string>{original.global_id});const auto d=description(setup);auto q=request(d);
+    q.version=3;auto& body=std::get<ready_wire::request>(q.body);
+    body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace="app";
+    body.receipts={{original.global_id,"app",{{original.table_name,original.global_row_id}},original.original_identity->digest}};seal(q,d);
+    (void)lease(setup,q,d,"prepare",1000);const auto coverage_before=coverage(),receipts_before=receipts();const auto global_before=global_state();
+    ASSERT_EQ(completed_disposal_answer(invoke(setup,command("discard",q,d))).at("settlement").at("state"),"committed");
+    const auto terminal=all_state();EXPECT_EQ(coverage(),coverage_before);EXPECT_EQ(receipts(),receipts_before);EXPECT_EQ(global_state(),global_before);
+    for(unsigned kind=0;kind<3;++kind) {
+        SCOPED_TRACE(kind);auto wrong=q;auto& changed=std::get<ready_wire::request>(wrong.body);
+        if(kind==0)changed.registered_producer->producer=producer(2);
+        if(kind==1){changed.receipt_namespace="other";changed.receipts.clear();}
+        if(kind==2){wrong.version=2;changed.registered_producer.reset();changed.receipt_namespace.reset();changed.receipts.clear();}
+        seal(wrong,d);const auto refused=completed_disposal_answer(invoke(setup,command("discard",wrong,d)));
+        EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(all_state(),terminal);
+    }
+    EXPECT_EQ(completed_disposal_answer(invoke(setup,command("discard",q,d))).at("settlement").at("state"),"committed");EXPECT_EQ(all_state(),terminal);
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedReadySession, CompletedLargePrepareReleasesWorkspaceWhileBothActualRepliesRemainHeld) {
+    setup=admitted(1,true);auto other=admitted(2,true);
+    const auto original=entry(901,"workspace positive");ASSERT_EQ(setup.receive(frame(original)).ids().size(),1u);
+    const auto evidence=receipts();const auto d=description(setup),other_d=description(other);
+    auto q=request(d),other_q=request(other_d);
+    for(auto* value:{&q,&other_q})std::get<ready_wire::request>(value->body).receipts={{original.global_id,"app",{{original.table_name,original.global_row_id}}}};
+    seal(q,d);seal(other_q,other_d);
+    auto first=invoke(setup,command("prepare",q,d));ASSERT_EQ(first.status_code(),1);ASSERT_TRUE(first.publishable());
+    const auto offered=json::parse(first.wire());ASSERT_EQ(offered.at("publication").at("state"),"committed");ASSERT_EQ(offered.at("leaseAvailable"),true);
+    auto second=invoke(other,command("prepare",other_q,other_d));ASSERT_EQ(second.status_code(),1)<<last_bridge_error();ASSERT_TRUE(second.publishable());
+    const auto other_offered=json::parse(second.wire());ASSERT_EQ(other_offered.at("publication").at("state"),"committed");ASSERT_EQ(other_offered.at("leaseAvailable"),true);
+    EXPECT_TRUE(first.publishable());EXPECT_FALSE(setup.stop_token().drained());EXPECT_FALSE(other.stop_token().drained());
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),2);EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);EXPECT_EQ(count("_lattice_canonical_attempt"),0);
+    {
+        const auto a=read(setup,offered,0),b=read(other,other_offered,0);ASSERT_TRUE(a.publishable());ASSERT_TRUE(b.publishable());
+        const auto one=decode_read(a,d),two=decode_read(b,other_d);
+        EXPECT_EQ(one.logical,q.logical);EXPECT_EQ(two.logical,other_q.logical);
+        EXPECT_EQ(std::get<ready_wire::manifest>(one.body).request_digest,std::get<ready_wire::request>(q.body).request_digest);
+        EXPECT_EQ(std::get<ready_wire::manifest>(two.body).request_digest,std::get<ready_wire::request>(other_q.body).request_digest);
+    }
+    EXPECT_EQ(receipts(),evidence);EXPECT_EQ(count("AuthenticatedRelayRow"),1);
+    first={};EXPECT_TRUE(setup.stop_token().drained());EXPECT_FALSE(other.stop_token().drained());
+    second={};EXPECT_TRUE(other.stop_token().drained());
+}
+
+TEST_F(AuthenticatedReadySession, FailedLargePublicationReleasesWorkspaceButKeepsExactPreparingAndResponseState) {
+    setup=admitted(1,true);const auto d=description(setup);const auto q=request(d);const auto evidence=receipts();
+    relay_ready_result failed;
+    {AuthenticatedReadyFault fault(owner->db(),true);failed=invoke(setup,command("prepare",q,d));EXPECT_EQ(fault.hits,1);}
+    ASSERT_EQ(failed.status_code(),1);ASSERT_TRUE(failed.publishable());const auto response=json::parse(failed.wire());
+    ASSERT_EQ(response.at("preparation").at("state"),"committed");ASSERT_EQ(response.at("publication").at("state"),"rolledBack");
+    EXPECT_EQ(response.at("publication").at("primaryError"),true);EXPECT_EQ(response.at("leaseAvailable"),false);
+    EXPECT_FALSE(setup.stop_token().drained());EXPECT_EQ(count("_lattice_canonical_ready_frame"),0);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(count("_lattice_canonical_attempt"),1);
+    auto disposed=invoke(setup,command("discard",q,d));ASSERT_EQ(disposed.status_code(),1);
+    ASSERT_EQ(json::parse(disposed.wire()).at("settlement").at("state"),"committed");
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);EXPECT_EQ(count("_lattice_canonical_attempt"),0);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);
+    const auto next=request(d,2);auto current=invoke(setup,command("prepare",next,d));ASSERT_EQ(current.status_code(),1)<<last_bridge_error();ASSERT_TRUE(current.publishable());
+    const auto answer=json::parse(current.wire());ASSERT_EQ(answer.at("publication").at("state"),"committed");ASSERT_EQ(answer.at("leaseAvailable"),true);
+    EXPECT_EQ(answer.at("sequence"),"2");EXPECT_EQ(failed.wire(),response.dump());EXPECT_EQ(receipts(),evidence);
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);EXPECT_EQ(count("_lattice_canonical_ready_binding"),1);EXPECT_EQ(count("_lattice_canonical_attempt"),0);
+    failed={};EXPECT_FALSE(setup.stop_token().drained());disposed={};EXPECT_FALSE(setup.stop_token().drained());current={};EXPECT_TRUE(setup.stop_token().drained());
+}
+
+TEST_F(AuthenticatedReadySession, PausedLargePrepareKeepsSourceWorkspaceUntilItsActualNativeCallReturns) {
+    setup=admitted(1,true);auto other=admitted(2,true);const auto d=description(setup),other_d=description(other);
+    const auto q=request(d),other_q=request(other_d);const auto before=exact_source();
+    auto gate=std::make_shared<ReadyLifecycleGate>();relay_ready_result first;std::exception_ptr worker_error;
+    std::thread worker([&]{
+        try {
+            const std::function<void()> hook=[gate]{gate->wait();};
+            struct reset {~reset(){detail::authenticated_ready_test_access::before_owned(nullptr);}} restore;
+            detail::authenticated_ready_test_access::before_owned(&hook);
+            first=invoke(setup,command("prepare",q,d));
+        }catch(...){worker_error=std::current_exception();}
+    });
+    // Also releases and joins after a fatal assertion or exception below.
+    struct cleanup {ReadyLifecycleGate& gate;std::thread& worker;~cleanup(){gate.release();if(worker.joinable())worker.join();}} joined{*gate,worker};
+    const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(!gate->arrived()&&std::chrono::steady_clock::now()<until)std::this_thread::yield();
+    ASSERT_TRUE(gate->arrived());EXPECT_FALSE(setup.stop_token().drained());
+    const auto refused=invoke(other,command("prepare",other_q,other_d));const auto refused_error=last_bridge_error();
+    EXPECT_EQ(refused.status_code(),4);EXPECT_EQ(refused_error,"READY source capture workspace unavailable");
+    EXPECT_FALSE(refused.publishable());EXPECT_TRUE(other.stop_token().drained());EXPECT_EQ(exact_source(),before);
+    gate->release();worker.join();ASSERT_FALSE(gate->timedOut());ASSERT_FALSE(worker_error);
+    ASSERT_EQ(first.status_code(),1);ASSERT_TRUE(first.publishable());ASSERT_EQ(json::parse(first.wire()).at("leaseAvailable"),true);
+    auto second=invoke(other,command("prepare",other_q,other_d));ASSERT_EQ(second.status_code(),1)<<last_bridge_error();ASSERT_TRUE(second.publishable());
+    EXPECT_EQ(json::parse(second.wire()).at("publication").at("state"),"committed");EXPECT_EQ(json::parse(second.wire()).at("leaseAvailable"),true);
+    EXPECT_TRUE(first.publishable());EXPECT_EQ(count("_lattice_canonical_ready_transfer"),2);EXPECT_EQ(count("_lattice_canonical_ready_binding"),2);
+    first={};second={};EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(other.stop_token().drained());
+}
+
+TEST_F(AuthenticatedReadySession, RetiredPrepareWorkspaceDoesNotReleaseQueuedInputReplyOrOperationCharges) {
+    setup=admitted(1,true);const auto d=description(setup);const auto raw=command("prepare",request(d),d).dump();
+    auto input=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(input.valid());
+    auto prepared=setup.ready(raw,input);input={};ASSERT_EQ(prepared.status_code(),1);ASSERT_TRUE(prepared.publishable());
+    ASSERT_EQ(json::parse(prepared.wire()).at("leaseAvailable"),true);auto copied=prepared;const auto queued=prepared.take_wire();ASSERT_FALSE(queued.empty());
+    const auto describe=control("describe").dump();const uint64_t reply_bytes=4194304;
+    ASSERT_EQ(d.at("profile").at("pendingInputAndReplyBytes"),67108864);ASSERT_EQ(d.at("profile").at("pendingRequests"),64);
+    ASSERT_LT(raw.size()+reply_bytes,uint64_t(67108864));
+    const auto expected=(uint64_t(67108864)-raw.size()-reply_bytes)/(describe.size()+reply_bytes);
+    ASSERT_LT(expected,32u);std::vector<relay_ready_result> held;
+    for(unsigned i=0;i<32;++i) {
+        auto charge=setup.stop_token().reserve_ready(describe.size());if(!charge.valid())break;
+        auto result=setup.ready(describe,charge);ASSERT_EQ(result.status_code(),1);held.push_back(std::move(result));
+    }
+    ASSERT_EQ(held.size(),expected);ASSERT_GT(held.size(),1u);EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());
+    const auto evidence=receipts();const auto frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index");
+    auto old_stop=setup.stop_token();setup.close_on_io();setup={};EXPECT_FALSE(old_stop.drained());
+    setup=admitted(2,true);EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());EXPECT_FALSE(copied.publishable());
+    EXPECT_EQ(receipts(),evidence);EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY frame_index"),frames);
+    const auto reopened=exact_source();prepared={};EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());
+    copied={};auto charge=setup.stop_token().reserve_ready(describe.size());ASSERT_TRUE(charge.valid());
+    auto current=setup.ready(describe,charge);charge={};ASSERT_EQ(current.status_code(),1);ASSERT_TRUE(current.publishable());
+    EXPECT_FALSE(setup.stop_token().reserve_ready(describe.size()).valid());EXPECT_FALSE(old_stop.drained());
+    held.clear();EXPECT_TRUE(old_stop.drained());EXPECT_FALSE(setup.stop_token().drained());
+    current={};EXPECT_TRUE(setup.stop_token().drained());EXPECT_TRUE(setup.stop_token().reserve_ready(describe.size()).valid());
+    EXPECT_EQ(exact_source(),reopened);EXPECT_FALSE(queued.empty());
+}
+
+TEST_F(AuthenticatedReadySession, PrepareExceptionRetiresWorkspaceWhileItsConsumedInputReservationRemainsHeld) {
+    setup=admitted(1,true);const auto d=description(setup);const auto q=request(d);const auto before=exact_source();
+    auto malformed=command("prepare",q,d);malformed["unexpected"]=true;const auto raw=malformed.dump();
+    auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    const auto failed=setup.ready(raw,charge);const auto original_error=last_bridge_error();
+    ASSERT_EQ(failed.status_code(),4);EXPECT_EQ(original_error,"relay unexpected object shape");EXPECT_FALSE(failed.publishable());
+    EXPECT_TRUE(charge.valid());EXPECT_TRUE(setup.stop_token().drained());EXPECT_EQ(exact_source(),before);
+    const auto reused=setup.ready(raw,charge);EXPECT_EQ(reused.status_code(),4);
+    EXPECT_EQ(last_bridge_error(),"READY actual one-shot source input reservation required");EXPECT_EQ(exact_source(),before);
+    auto current=invoke(setup,command("prepare",q,d));ASSERT_EQ(current.status_code(),1)<<last_bridge_error();ASSERT_TRUE(current.publishable());
+    const auto answer=json::parse(current.wire());EXPECT_EQ(answer.at("publication").at("state"),"committed");EXPECT_EQ(answer.at("leaseAvailable"),true);
+    EXPECT_TRUE(charge.valid());EXPECT_FALSE(setup.stop_token().drained());EXPECT_EQ(original_error,"relay unexpected object shape");
+    current={};EXPECT_TRUE(setup.stop_token().drained());charge={};EXPECT_TRUE(setup.stop_token().reserve_ready(raw.size()).valid());
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+struct AutomaticSetupRouteState {
+    std::atomic<bool> current{true}, admissible{true};
+    std::atomic<unsigned> current_calls{0}, admission_calls{0}, destroyed{0}, wrong_thread{0};
+    unsigned veto_on_call=0, retire_on_current_call=0;
+    const std::thread::id io=std::this_thread::get_id();
+};
+struct AutomaticSetupRoute {
+    std::shared_ptr<AutomaticSetupRouteState> state;
+    static void check_thread(const std::shared_ptr<AutomaticSetupRouteState>& s) {
+        if(std::this_thread::get_id()!=s->io)++s->wrong_thread;
+    }
+    static int32_t current(void* raw) {
+        const auto& s=static_cast<AutomaticSetupRoute*>(raw)->state;check_thread(s);
+        const auto call=++s->current_calls;
+        if(s->retire_on_current_call&&call>=s->retire_on_current_call)s->current=false;
+        return s->current?1:0;
+    }
+    static int32_t admissible(void* raw) {
+        const auto& s=static_cast<AutomaticSetupRoute*>(raw)->state;check_thread(s);
+        const auto call=++s->admission_calls;
+        return s->admissible&&(!s->veto_on_call||call<s->veto_on_call)?1:0;
+    }
+    static void destroy(void* raw) {
+        auto* value=static_cast<AutomaticSetupRoute*>(raw);check_thread(value->state);
+        ++value->state->destroyed;delete value;
+    }
+};
+struct SetupRegistryEntries {
+    uint64_t count=0;
+    uint64_t* prior=detail::authenticated_ready_test_access::setup_entries(&count);
+    ~SetupRegistryEntries(){detail::authenticated_ready_test_access::setup_entries(prior);}
+};
+class ActualSetupMutexHold {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool acquired=false,released=false;
+    std::thread worker;
+public:
+    explicit ActualSetupMutexHold(sqlite3_mutex* target) {
+        // Start only after every field has been initialized.
+        worker=std::thread([this,target]{
+            sqlite3_mutex_enter(target);
+            {std::unique_lock lock(mutex);acquired=true;changed.notify_all();changed.wait(lock,[&]{return released;});}
+            sqlite3_mutex_leave(target);
+        });
+    }
+    bool ready(){std::unique_lock lock(mutex);return changed.wait_for(lock,std::chrono::seconds(2),[&]{return acquired;});}
+    ~ActualSetupMutexHold(){
+        {std::lock_guard lock(mutex);released=true;}changed.notify_all();worker.join();
+    }
+};
+class AutomaticRelaySetup:public AuthenticatedRelaySession {
+protected:
+    relay_recovery_setup attempt(const std::shared_ptr<AutomaticSetupRouteState>& state,const json& p,const json& c) {
+        return ref->open_relay_recovery_setup_automatic(p.dump(),c.dump(),new AutomaticSetupRoute{state},
+            AutomaticSetupRoute::current,AutomaticSetupRoute::admissible,AutomaticSetupRoute::destroy);
+    }
+    relay_recovery_setup attempt(const std::shared_ptr<AutomaticSetupRouteState>& state){return attempt(state,policy(),connection());}
+    sqlite3_mutex* actual_mutex(){return sqlite3_db_mutex(detail::canonical_writer_custody_test_access::fault_handle(owner->db()));}
+    auto schema(){return owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name");}
+};
+
+TEST_F(AutomaticRelaySetup, ActualHeldMutexReturnsOnlyPreEffectBusyThenSameOwnerEnrollsOnce) {
+    SetupRegistryEntries entries;const auto before=schema();
+    const auto actual_owner=owner.get();const auto p=policy(),c=connection();
+    auto first=std::make_shared<AutomaticSetupRouteState>();
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+        const auto statements=database::thread_statement_count();
+        const auto busy=attempt(first,p,c);
+        EXPECT_EQ(database::thread_statement_count(),statements);
+        EXPECT_FALSE(busy.valid());EXPECT_TRUE(busy.pending_before_enrollment());EXPECT_TRUE(last_bridge_error().empty());
+        EXPECT_EQ(entries.count,0u);EXPECT_EQ(first->admission_calls,2u);EXPECT_EQ(first->destroyed,1u);
+        EXPECT_EQ(first->wrong_thread,0u);
+    }
+    EXPECT_EQ(schema(),before);EXPECT_EQ(owner.get(),actual_owner);
+    auto second=std::make_shared<AutomaticSetupRouteState>();setup=attempt(second,p,c);
+    ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_FALSE(setup.pending_before_enrollment());EXPECT_EQ(entries.count,1u);
+    EXPECT_EQ(second->destroyed,0u);EXPECT_EQ(setup.receive(frame(entry())).status_code(),2);
+    ASSERT_TRUE(setup.finish_authorization(outcome(setup).dump()));
+    const auto e=entry();auto accepted=setup.receive(frame(e));ASSERT_EQ(accepted.status_code(),1);
+    EXPECT_EQ(accepted.ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(receipts().size(),1u);
+    accepted={};setup.close_on_io();setup={};EXPECT_EQ(second->destroyed,1u);EXPECT_EQ(second->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, FalseInitialVetoIsTerminalEvenWithActualMutexBusy) {
+    SetupRegistryEntries entries;const auto before=schema();auto state=std::make_shared<AutomaticSetupRouteState>();state->admissible=false;
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto result=attempt(state);
+        EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+        EXPECT_EQ(state->admission_calls,1u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+        EXPECT_EQ(last_bridge_error(),"automatic relay setup admission retired or vetoed");
+    }
+    EXPECT_EQ(schema(),before);
+}
+
+TEST_F(AutomaticRelaySetup, VetoAfterActualCapturePreventsRegistryEntryAndSQL) {
+    SetupRegistryEntries entries;const auto before=schema();auto state=std::make_shared<AutomaticSetupRouteState>();state->veto_on_call=2;
+    const auto statements=database::thread_statement_count();
+    const auto result=attempt(state);
+    EXPECT_EQ(database::thread_statement_count(),statements);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_EQ(last_bridge_error(),"automatic relay setup admission retired or vetoed");EXPECT_EQ(schema(),before);
+}
+
+TEST_F(AutomaticRelaySetup, VetoRacingActualBusyResultCannotBecomePending) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();state->veto_on_call=2;
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto result=attempt(state);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_EQ(last_bridge_error(),"automatic relay setup admission retired or vetoed");
+}
+
+TEST_F(AutomaticRelaySetup, ActualRouteRetirementRacingBusyTakesPrecedenceOverPending) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();state->retire_on_current_call=3;
+    auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto result=attempt(state);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_FALSE(state->current);EXPECT_EQ(state->current_calls,3u);EXPECT_EQ(state->admission_calls,1u);
+    EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, ClosedActualOwnerIsTerminalBeforeCapture) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();owner->close();
+    const auto result=attempt(state);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(state->admission_calls,0u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_EQ(last_bridge_error(),"authenticated physical owner retired");
+}
+
+TEST_F(AutomaticRelaySetup, MissingAdmissionCallbackAndMalformedPolicyNeverBecomeBusy) {
+    SetupRegistryEntries entries;auto missing=std::make_shared<AutomaticSetupRouteState>();
+    const auto no_callback=ref->open_relay_recovery_setup_automatic(policy().dump(),connection().dump(),new AutomaticSetupRoute{missing},
+        AutomaticSetupRoute::current,nullptr,AutomaticSetupRoute::destroy);
+    EXPECT_FALSE(no_callback.valid());EXPECT_FALSE(no_callback.pending_before_enrollment());EXPECT_EQ(missing->destroyed,1u);
+    auto malformed=std::make_shared<AutomaticSetupRouteState>();auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+        const auto invalid=ref->open_relay_recovery_setup_automatic("{",connection().dump(),new AutomaticSetupRoute{malformed},
+            AutomaticSetupRoute::current,AutomaticSetupRoute::admissible,AutomaticSetupRoute::destroy);
+        EXPECT_FALSE(invalid.valid());EXPECT_FALSE(invalid.pending_before_enrollment());EXPECT_EQ(malformed->destroyed,1u);
+        EXPECT_EQ(malformed->admission_calls,0u);EXPECT_EQ(entries.count,0u);
+    }
+    EXPECT_EQ(missing->wrong_thread,0u);EXPECT_EQ(malformed->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, NullDestroyKeepsCallerCustodyAndNoPendingClaim) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();auto* context=new AutomaticSetupRoute{state};
+    const auto result=ref->open_relay_recovery_setup_automatic(policy().dump(),connection().dump(),context,
+        AutomaticSetupRoute::current,AutomaticSetupRoute::admissible,nullptr);
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(state->destroyed,0u);
+    EXPECT_EQ(entries.count,0u);AutomaticSetupRoute::destroy(context);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, PostRegistryIdleOwnerRefusalIsTerminalAndNeverReplayed) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();
+    owner->db().begin_transaction();
+    const auto result=attempt(state);const auto error=last_bridge_error();
+    owner->db().rollback();
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,1u);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+    EXPECT_NE(error.find("explicit idle WAL/FULL owner"),std::string::npos);
+    auto fresh=std::make_shared<AutomaticSetupRouteState>();setup=attempt(fresh);
+    ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_EQ(entries.count,2u);EXPECT_FALSE(setup.pending_before_enrollment());
+}
+
+TEST_F(AutomaticRelaySetup, StrictLegacyBusyRemainsInvalidWithoutAutomaticPending) {
+    SetupRegistryEntries entries;auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+    const auto strict=open(policy(),connection());
+    EXPECT_FALSE(strict.valid());EXPECT_FALSE(strict.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_EQ(last_bridge_error(),"authenticated physical store identity unavailable: metadata_busy");EXPECT_EQ(route->destroyed,1);
+}
+
+TEST_F(AutomaticRelaySetup, SuccessfulSessionIgnoresLaterAdmissionVetoButCurrentRouteStillFences) {
+    SetupRegistryEntries entries;auto state=std::make_shared<AutomaticSetupRouteState>();setup=attempt(state);
+    ASSERT_TRUE(setup.valid())<<last_bridge_error();ASSERT_TRUE(setup.finish_authorization(outcome(setup).dump()));
+    ASSERT_EQ(state->admission_calls,2u);state->admissible=false;
+    const auto e=entry();auto accepted=setup.receive(frame(e));ASSERT_EQ(accepted.status_code(),1);
+    EXPECT_EQ(accepted.ids(),std::vector<std::string>{e.global_id});EXPECT_EQ(state->admission_calls,2u);
+    const auto preserved=receipts();ASSERT_EQ(preserved.size(),1u);state->current=false;
+    const auto retired=setup.receive(frame(entry(2)));EXPECT_EQ(retired.status_code(),2);EXPECT_EQ(receipts(),preserved);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(entries.count,1u);accepted={};setup.close_on_io();setup={};
+    EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+
+TEST_F(AutomaticRelaySetup, ActualFileSubstitutionAfterBusyCannotUseTheCachedIdentity) {
+    SetupRegistryEntries entries;auto first=std::make_shared<AutomaticSetupRouteState>();auto* mutex=actual_mutex();ASSERT_NE(mutex,nullptr);
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());const auto busy=attempt(first);
+        ASSERT_TRUE(busy.pending_before_enrollment());EXPECT_FALSE(busy.valid());
+    }
+    TempDB successor("automatic_setup_successor"),moved("automatic_setup_original");
+    {database replacement(successor.str());replacement.execute("CREATE TABLE ForeignValue(id INTEGER)");}
+    struct restore_path {
+        std::filesystem::path from,to;
+        restore_path(std::filesystem::path a,std::filesystem::path b):from(std::move(a)),to(std::move(b)){std::filesystem::rename(from,to);}
+        ~restore_path(){std::error_code ignored;std::filesystem::rename(to,from,ignored);}
+    };
+    auto state=std::make_shared<AutomaticSetupRouteState>();relay_recovery_setup result;std::string error;
+    {
+        restore_path original(file.path,moved.path),other(successor.path,file.path);
+        result=attempt(state);error=last_bridge_error();
+    }
+    EXPECT_FALSE(result.valid());EXPECT_FALSE(result.pending_before_enrollment());EXPECT_EQ(entries.count,0u);
+    EXPECT_NE(error.find("authenticated physical store identity unavailable:"),std::string::npos);
+    EXPECT_EQ(state->admission_calls,2u);EXPECT_EQ(state->destroyed,1u);EXPECT_EQ(state->wrong_thread,0u);
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+struct AdoptionSnapshotFault {
+    static thread_local AdoptionSnapshotFault* active;
+    bool commit;unsigned hits=0;
+    detail::canonical_upstream_test_hooks::authorizer_fault fault;
+    const detail::canonical_upstream_test_hooks::authorizer_fault* previous;
+    AdoptionSnapshotFault* prior;
+    AdoptionSnapshotFault(database& db,bool at_commit):commit(at_commit),
+        fault{detail::canonical_writer_custody_test_access::fault_handle(db),deny},
+        previous(detail::canonical_retention_test_hooks::fault),prior(active){active=this;detail::canonical_retention_test_hooks::fault=&fault;}
+    ~AdoptionSnapshotFault(){detail::canonical_retention_test_hooks::fault=previous;active=prior;}
+    static int deny(int action,const char* one,const char* two,const char* origin)noexcept {
+        if(!active||origin)return SQLITE_OK;
+        const bool selected=active->commit?
+            action==SQLITE_TRANSACTION&&one&&std::strcmp(one,"COMMIT")==0:
+            action==SQLITE_UPDATE&&one&&two&&std::strcmp(one,"_lattice_canonical_ready_profile")==0&&std::strcmp(two,"policy")==0;
+        if(selected){++active->hits;return SQLITE_DENY;}return SQLITE_OK;
+    }
+};
+thread_local AdoptionSnapshotFault* AdoptionSnapshotFault::active=nullptr;
+TEST_F(AuthenticatedReceiptCoverageV3, ReadonlyWholeSnapshotPreservesAdministrativeRefusalAfterBodyAndCommitRollback) {
+    setup=covered_setup();const auto e=identified(entry(972));
+    ASSERT_EQ(setup.receive(frame(e)).take_ids(),std::vector<std::string>{e.global_id});
+    const auto description_before=description(setup);setup.close_on_io();setup={};
+    const auto physical=owner->db().physical_identity("main",{},true);ASSERT_TRUE(physical);
+    const auto before=read_only_all_state(*physical);EXPECT_EQ(before,all_state());
+    detail::canonical_namespaced_writer_profile native;const auto& source=description_before.at("source");
+    native.writer.binding={source.at("sourceID"),source.at("epoch"),source.at("scopeDigest"),source.at("schemaDigest")};
+    native.writer.limits={65536,16777216,65536,16777216,256,128,64};native.writer.models={"AuthenticatedRelayRow"};native.writer.upstream_requested=true;
+    native.namespaces.local_namespace="local";native.namespaces.entries={{"app","app-v1",1},{"local","local-v1",1},{"other","other-v1",1}};
+    native.namespaces.coverage=detail::canonical_coverage_profile{relay_uuid(5100),7,{"app","other"}};
+    const auto ready=detail::canonical_named_ready_profile(source.at("authority"),native.writer.limits,true,"bounded48MiBV1");
+    for(const bool at_commit:{false,true}) {
+        SCOPED_TRACE(at_commit?"commit-refusal":"body-refusal");
+        {
+            AdoptionSnapshotFault fault(owner->db(),at_commit);
+            const auto refused=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+            EXPECT_EQ(fault.hits,1u);EXPECT_EQ(refused.settlement.state,detail::recovery_install_state::rolled_back);
+            EXPECT_NE(refused.settlement.primary_error,nullptr);EXPECT_FALSE(refused.record);
+        }
+        EXPECT_EQ(read_only_all_state(*physical),before);expect_administrative_writer_closed();EXPECT_EQ(read_only_all_state(*physical),before);
+    }
+    const auto accepted=detail::adopt_ready_lifecycle_for_test(owner,native,{256,65536,1048576},{64,3600000},ready,"bounded48MiBV1",10000);
+    ASSERT_EQ(accepted.settlement.state,detail::recovery_install_state::committed);ASSERT_TRUE(accepted.record);
+    const auto after=read_only_all_state(*physical);expect_administrative_writer_closed();EXPECT_EQ(read_only_all_state(*physical),after);
+    EXPECT_EQ(after.at("_lattice_canonical_receipt"),before.at("_lattice_canonical_receipt"));
+    EXPECT_EQ(after.at("_lattice_canonical_receipt_origin"),before.at("_lattice_canonical_receipt_origin"));
+    EXPECT_EQ(after.at("_lattice_canonical_receipt_coverage"),before.at("_lattice_canonical_receipt_coverage"));
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedPredecessor, CapacityAutomaticAdmissionExhaustsWhileActualWriterMutexRemainsHeld) {
+    const auto schema_before=owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
+    const auto actual_owner=owner;const auto p=source_policy(),c=connection(972);
+    auto* mutex=sqlite3_db_mutex(detail::canonical_writer_custody_test_access::fault_handle(owner->db()));ASSERT_NE(mutex,nullptr);
+    std::shared_ptr<CapacityAdmissionState> observed;
+    {
+        ActualSetupMutexHold held(mutex);ASSERT_TRUE(held.ready());
+        const auto statements=database::thread_statement_count();
+        EXPECT_THROW((void)open_capacity_automatically(p,c,&observed),db_error);
+        EXPECT_EQ(database::thread_statement_count(),statements);ASSERT_TRUE(observed);
+        EXPECT_FALSE(observed->failure.empty());EXPECT_FALSE(observed->current);
+        ASSERT_GE(observed->turns.size(),1u);ASSERT_LE(observed->turns.size(),32u);
+        EXPECT_EQ(observed->registry_entries,0u);EXPECT_EQ(observed->created.load(),observed->turns.size());
+        EXPECT_EQ(observed->destroyed.load(),observed->created.load());
+        for(size_t i=0;i<observed->turns.size();++i) {
+            EXPECT_GE(observed->turns[i].entered,observed->started);EXPECT_LT(observed->turns[i].entered,observed->deadline);
+            if(i)EXPECT_GE(observed->turns[i].entered,observed->turns[i-1].busy_returned+std::chrono::milliseconds(100));
+        }
+        // The real SQLite hold is still in force through all exhaustion assertions.
+        EXPECT_EQ(owner,actual_owner);
+    }
+    EXPECT_EQ(owner->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name"),schema_before);
+    // Real strict admission remains available after releasing the actual mutex.
+    setup=open(p,c);ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_FALSE(setup.pending_before_enrollment());
+    setup.close_on_io();setup={};EXPECT_EQ(observed->destroyed.load(),observed->created.load());
+}
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+std::string same_row_expected_frame(const std::vector<database::row_t>& stored,
+    const ready_wire::frame& request,const ready_wire::limits& limits,uint64_t index) {
+    std::optional<std::string> expected;
+    for(const auto& row:stored)if(std::get<int64_t>(row.at("frame_index"))==static_cast<int64_t>(index)) {
+        const auto& raw=std::get<std::vector<uint8_t>>(row.at("data"));
+        auto decoded=ready_wire::decode(std::string(raw.begin(),raw.end()),limits);
+        if(decoded.logical!=request.logical)continue;
+        if(expected)throw db_error("same-row request fixture found duplicate addressed frame");
+        decoded.route_generation=request.route_generation;expected=ready_wire::encode(decoded,limits);
+    }
+    if(!expected)throw db_error("same-row request fixture missed actual stored frame");
+    return *expected;
+}
+
+TEST_F(AuthenticatedReadySession, SameRowRequestReuseStillAuditsEveryCapsuleAndReturnsExactCommittedBytes) {
+    setup=admitted();auto other=admitted(2);const auto a=entry(64001,"first"),b=entry(64002,"second");
+    ASSERT_EQ(setup.receive(frame(a)).take_ids(),std::vector<std::string>{a.global_id});
+    ASSERT_EQ(other.receive(frame(b)).take_ids(),std::vector<std::string>{b.global_id});
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    std::get<ready_wire::request>(qa.body).receipts={{a.global_id,std::string("app"),{{a.table_name,a.global_row_id}}}};
+    std::get<ready_wire::request>(qb.body).receipts={{b.global_id,std::string("app"),{{b.table_name,b.global_row_id}}}};
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);
+    constexpr uint64_t capsules=2;ASSERT_EQ(count("_lattice_canonical_ready_transfer"),capsules);
+    const auto before=completed_disposal_state(owner->db());
+    const auto stored=owner->db().query("SELECT frame_index,data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    uint64_t bytes=0;for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const auto* selected:{&setup,&other}) {
+        const auto& d=selected==&setup?da:db;const auto& q=selected==&setup?qa:qb;const auto& offered=selected==&setup?la:lb;
+        const auto frames=std::stoull(offered.at("frames").get<std::string>());ASSERT_GE(frames,4u);
+        for(uint64_t index=0;index<frames;++index) {
+            const auto expected=same_row_expected_frame(stored,q,codec(d),index);
+            const auto result=read(*selected,offered,index);
+            ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+            ASSERT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+            EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.postcommit_error||last_read_trace.notification_error);
+            EXPECT_EQ(result.wire(),expected);const auto decoded=decode_read(result,d);
+            EXPECT_EQ(decoded.logical,q.logical);EXPECT_EQ(decoded.route_generation,q.route_generation);
+            EXPECT_EQ(last_read_trace.full_audits,1u);EXPECT_EQ(last_read_trace.audited_frames,stored.size());EXPECT_EQ(last_read_trace.audited_bytes,bytes);
+            EXPECT_EQ(last_read_trace.positive_receipt_lookups,capsules);EXPECT_EQ(last_read_trace.addressed_frames,1u);
+            // One strict request decode for each pre-audit row plus this exact
+            // addressed row. Before factoring, the same body decoded twice.
+            EXPECT_EQ(last_read_trace.cost.calls[static_cast<size_t>(detail::canonical_ready_cost_observation::phase::request)],capsules+1);
+            EXPECT_EQ(completed_disposal_state(owner->db()),before);
+        }
+    }
+}
+
+TEST_F(AuthenticatedReadySession, SameRowRequestReuseKeepsBothFaultAuditsAndFreshRequestValidation) {
+    setup=admitted();auto other=admitted(2);const auto a=entry(64003,"first"),b=entry(64004,"second");
+    ASSERT_EQ(setup.receive(frame(a)).take_ids(),std::vector<std::string>{a.global_id});
+    ASSERT_EQ(other.receive(frame(b)).take_ids(),std::vector<std::string>{b.global_id});
+    const auto da=description(setup),db=description(other);auto qa=request(da),qb=request(db);
+    std::get<ready_wire::request>(qa.body).receipts={{a.global_id,std::string("app"),{{a.table_name,a.global_row_id}}}};
+    std::get<ready_wire::request>(qb.body).receipts={{b.global_id,std::string("app"),{{b.table_name,b.global_row_id}}}};
+    seal(qa,da);seal(qb,db);const auto la=lease(setup,qa,da),lb=lease(other,qb,db);
+    constexpr uint64_t capsules=2;ASSERT_EQ(count("_lattice_canonical_ready_transfer"),capsules);
+    const auto before=completed_disposal_state(owner->db());
+    const auto stored=owner->db().query("SELECT frame_index,data FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
+    uint64_t bytes=0;for(const auto& row:stored)bytes+=std::get<std::vector<uint8_t>>(row.at("data")).size();
+    for(const bool upstream:{false,true}) {
+        SCOPED_TRACE(upstream);
+        for(const auto* selected:{&setup,&other}) {
+            const auto& d=selected==&setup?da:db;const auto& q=selected==&setup?qa:qb;const auto& offered=selected==&setup?la:lb;
+            const auto frames=std::stoull(offered.at("frames").get<std::string>());ASSERT_GE(frames,4u);
+            for(uint64_t index=0;index<frames;++index) {
+                const auto expected=same_row_expected_frame(stored,q,codec(d),index);
+                {
+                    AddressedReadAuthorizerFault fault(owner->db(),upstream);
+                    const auto result=read(*selected,offered,index);
+                    ASSERT_EQ(result.status_code(),1);ASSERT_TRUE(result.publishable())<<read_diagnostic(result);
+                    ASSERT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));EXPECT_EQ(fault.commits,1u);
+                    EXPECT_FALSE(last_read_trace.primary_error||last_read_trace.cleanup_error||last_read_trace.postcommit_error||last_read_trace.notification_error);
+                    EXPECT_EQ(result.wire(),expected);const auto decoded=decode_read(result,d);
+                    EXPECT_EQ(decoded.logical,q.logical);EXPECT_EQ(decoded.route_generation,q.route_generation);
+                    EXPECT_EQ(last_read_trace.full_audits,2u);EXPECT_EQ(last_read_trace.audited_frames,2*stored.size());EXPECT_EQ(last_read_trace.audited_bytes,2*bytes);
+                    EXPECT_EQ(last_read_trace.positive_receipt_lookups,2*capsules);EXPECT_EQ(last_read_trace.addressed_frames,1u);
+                    EXPECT_EQ(last_read_trace.cost.calls[static_cast<size_t>(detail::canonical_ready_cost_observation::phase::request)],2*capsules+1);
+                }
+                EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(completed_disposal_state(owner->db()),before);
+            }
+        }
+        // Retiring either restriction restores the closed authenticated path;
+        // no decoded request or authorization proof survives this new call.
+        const auto retry=read(setup,la,0);ASSERT_TRUE(retry.publishable())<<read_diagnostic(retry);
+        EXPECT_EQ(last_read_trace.settlement,static_cast<int>(detail::recovery_install_state::committed));
+        EXPECT_EQ(retry.wire(),same_row_expected_frame(stored,qa,codec(da),0));EXPECT_EQ(last_read_trace.full_audits,1u);
+        EXPECT_EQ(last_read_trace.cost.calls[static_cast<size_t>(detail::canonical_ready_cost_observation::phase::request)],capsules+1);
+        EXPECT_EQ(completed_disposal_state(owner->db()),before);
+    }
+}
+
+TEST(ReadyControlObservation, ClosedRefusalClassificationPreservesSettlementAndUnknowns) {
+    namespace diagnostic=lattice::detail::canonical_ready_control_observation;
+    using refusal=diagnostic::refusal;
+    const std::pair<const char*,refusal> cases[]{
+        {"canonical READY current lease expired; explicit disposal required",refusal::current_lease_expired},
+        {"canonical READY incomplete preparation cannot resume",refusal::incomplete_preparation},
+        {"canonical READY logical request or coverage changed; abandon and use a new attempt",refusal::request_or_coverage_changed},
+        {"canonical READY physical lease sequence exhausted",refusal::physical_lease_sequence_exhausted},
+        {"canonical READY physical lease write ignored or postimage differs",refusal::postimage_mismatch},
+        {"canonical READY current lease expired; explicit disposal required suffix",refusal::other_db_error}
+    };
+    EXPECT_EQ(diagnostic::settlement{}.primary,refusal::unobserved);
+    EXPECT_EQ(diagnostic::classify({}),refusal::none);
+    for(const auto& [message,expected]:cases) {
+        SCOPED_TRACE(message);
+        lattice::detail::recovery_install_result original;
+        original.state=lattice::detail::recovery_install_state::rolled_back;
+        original.primary_error=std::make_exception_ptr(db_error(message));
+        original.cleanup_error=std::make_exception_ptr(std::runtime_error("cleanup"));
+        original.postcommit_error=std::make_exception_ptr(std::runtime_error("postcommit"));
+        original.notification_error=std::make_exception_ptr(std::runtime_error("notification"));
+        original.unexpected_commit_observed=true;
+        const auto retained=original.primary_error;const auto snapshot=diagnostic::copy(original);
+        EXPECT_EQ(snapshot.state,static_cast<int32_t>(original.state));EXPECT_EQ(snapshot.errors,15);
+        EXPECT_TRUE(snapshot.unexpected_commit);EXPECT_EQ(snapshot.primary,expected);
+        EXPECT_EQ(original.primary_error,retained);
+        try {std::rethrow_exception(original.primary_error);FAIL()<<"retained original must still throw";}
+        catch(const db_error& error){EXPECT_STREQ(error.what(),message);}
+    }
+    EXPECT_EQ(diagnostic::classify(std::make_exception_ptr(std::runtime_error(cases[0].first))),refusal::other_exception);
+    EXPECT_EQ(diagnostic::classify(std::make_exception_ptr(71)),refusal::other_exception);
+}
+TEST(ReadyControlObservation, InvalidSetupKeepsMissingStagesUnobservedAndRestoresAllSlots) {
+    namespace prep=lattice::detail::canonical_ready_test_observation;
+    namespace read=lattice::detail::canonical_ready_read_test_observation;
+    namespace control=lattice::detail::authenticated_ready_control_test_observation;
+    namespace resume=lattice::detail::canonical_ready_resume_test_observation;
+    prep::observation p;read::observation r;control::observation c;resume::observation s;
+    const auto old_p=prep::current;const auto old_r=read::current;const auto old_c=control::current;const auto old_s=resume::current;
+    struct reset {prep::observation* p;read::observation* r;control::observation* c;resume::observation* s;
+        ~reset(){prep::current=p;read::current=r;control::current=c;resume::current=s;}} restore{old_p,old_r,old_c,old_s};
+    prep::current=&p;read::current=&r;control::current=&c;resume::current=&s;
+    relay_recovery_setup empty;auto observed=empty.ready_observed("{}",{});const auto facts=observed.diagnostics();
+    EXPECT_EQ(observed.take_result().status_code(),0);EXPECT_EQ(facts.bridge_status,0);EXPECT_EQ(facts.operation,0);
+    EXPECT_TRUE(facts.request_id().empty());EXPECT_EQ(facts.authenticated_clock_ms,-1);
+    EXPECT_EQ(prep::current,&p);EXPECT_EQ(read::current,&r);EXPECT_EQ(control::current,&c);EXPECT_EQ(resume::current,&s);
+    for(uint32_t family=0;family<4;++family)for(uint32_t point=0;point<10;++point)EXPECT_EQ(facts.stage_visits(family,point),0u);
+    for(uint32_t i=0;i<5;++i){EXPECT_EQ(facts.settlement_state(i),-1);EXPECT_EQ(facts.settlement_refusal(i),0);}
+    EXPECT_EQ(facts.stage_visits(UINT32_MAX,UINT32_MAX),0u);EXPECT_EQ(facts.cost_calls(UINT32_MAX,UINT32_MAX),0u);
+    EXPECT_EQ(facts.cost_us(UINT32_MAX,UINT32_MAX),0u);EXPECT_EQ(facts.cost_counter(UINT32_MAX,UINT32_MAX),0u);
+    EXPECT_EQ(facts.settlement_state(UINT32_MAX),-1);EXPECT_EQ(facts.settlement_errors(UINT32_MAX),0);
+    EXPECT_FALSE(facts.settlement_unexpected_commit(UINT32_MAX));
+}
+TEST_F(AuthenticatedReadySession, ObservedDescribePreservesExactWireAndCountedResultCustody) {
+    setup=admitted();const auto before=exact_source();const auto request=control("describe");
+    auto ordinary=invoke(setup,request);ASSERT_EQ(ordinary.status_code(),1);const auto expected=ordinary.wire();ordinary={};
+    const auto raw=request.dump();auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    auto observed=setup.ready_observed(raw,charge);const auto facts=observed.diagnostics();auto result=observed.take_result();
+    ASSERT_EQ(result.status_code(),1);EXPECT_EQ(result.wire(),expected);EXPECT_EQ(result.request_id(),relay_uuid(9000));
+    EXPECT_EQ(facts.request_id(),result.request_id());EXPECT_EQ(facts.operation,1);EXPECT_EQ(facts.bridge_status,1);
+    EXPECT_EQ(facts.stage_visits(2,0),1u);EXPECT_EQ(facts.stage_visits(2,1),1u);EXPECT_EQ(facts.stage_visits(2,7),1u);
+    EXPECT_EQ(facts.stage_visits(2,2),0u);EXPECT_EQ(facts.authenticated_deadline_ms,-1);EXPECT_EQ(facts.settlement_state(0),-1);
+    EXPECT_TRUE(result.publishable());EXPECT_EQ(exact_source(),before);EXPECT_EQ(observed.take_result().status_code(),0);
+    auto stop=setup.stop_token();EXPECT_FALSE(stop.drained());stop.stop();EXPECT_FALSE(result.publishable());
+    result={};EXPECT_TRUE(stop.drained());EXPECT_EQ(facts.request_id(),relay_uuid(9000));
+}
+TEST_F(AuthenticatedReadySession, ObservedMalformedInputPreservesErrorAndOneShotCharge) {
+    setup=admitted();const auto before=exact_source();const std::string raw="{";
+    auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    auto observed=setup.ready_observed(raw,charge);const auto failure=last_bridge_error();const auto facts=observed.diagnostics();
+    EXPECT_EQ(observed.take_result().status_code(),4);EXPECT_FALSE(failure.empty());EXPECT_EQ(last_bridge_error(),failure);
+    EXPECT_EQ(facts.stage_visits(2,0),1u);EXPECT_EQ(facts.stage_visits(2,7),1u);EXPECT_EQ(facts.stage_visits(2,1),0u);
+    EXPECT_EQ(facts.operation,0);EXPECT_TRUE(facts.request_id().empty());EXPECT_EQ(facts.settlement_state(3),-1);
+    EXPECT_EQ(setup.ready(raw,charge).status_code(),4);
+    EXPECT_EQ(last_bridge_error(),"READY actual one-shot source input reservation required");EXPECT_EQ(exact_source(),before);
+    EXPECT_EQ(lattice::detail::authenticated_ready_control_test_observation::current,nullptr);
+    EXPECT_EQ(lattice::detail::canonical_ready_resume_test_observation::current,nullptr);
+}
+TEST_F(AuthenticatedReadySession, ObservedPrepareReadAndResumeCopyActualSettlementsAndClockDomains) {
+    setup=admitted();const auto d=description(setup);const auto f=request(d);const auto original=receipts();
+    const auto invoke_observed=[&](const json& command) {
+        const auto raw=command.dump();auto charge=setup.stop_token().reserve_ready(raw.size());
+        if(!charge.valid())throw std::runtime_error("observed fixture input not admitted");return setup.ready_observed(raw,charge);
+    };
+    auto prepared=invoke_observed(command("prepare",f,d));const auto prepare=prepared.diagnostics();auto offer=prepared.take_result();
+    ASSERT_EQ(offer.status_code(),1);const auto wire=json::parse(offer.wire());ASSERT_TRUE(wire.at("leaseAvailable").get<bool>());
+    EXPECT_EQ(prepare.operation,2);EXPECT_EQ(prepare.duration_ms,10000);EXPECT_GE(prepare.authenticated_clock_ms,0);
+    EXPECT_EQ(prepare.authenticated_deadline_ms-prepare.authenticated_clock_ms,10000);
+    for(uint32_t phase=0;phase<3;++phase){EXPECT_EQ(prepare.settlement_state(phase),2);EXPECT_EQ(prepare.settlement_errors(phase),0);}
+    EXPECT_TRUE(prepare.lease_available);EXPECT_FALSE(prepare.capture_error);EXPECT_EQ(prepare.stage_visits(0,0),1u);EXPECT_EQ(prepare.stage_visits(0,9),1u);
+    auto read_command=control("read");for(const auto* key:{"routeGeneration","leaseID","requestDigest","attemptID","sequence"})read_command[key]=wire.at(key);
+    read_command["index"]="0";auto read=invoke_observed(read_command);const auto read_facts=read.diagnostics();auto frame=read.take_result();
+    ASSERT_EQ(frame.status_code(),1);EXPECT_EQ(ready_wire::decode(frame.wire(),codec(d)).logical,f.logical);
+    EXPECT_EQ(read_facts.operation,4);EXPECT_EQ(read_facts.settlement_state(4),2);EXPECT_EQ(read_facts.read_addressed_frames,1u);
+    EXPECT_GE(read_facts.read_clock_before_ms,0);EXPECT_GE(read_facts.read_clock_settled_ms,read_facts.read_clock_before_ms);
+    EXPECT_EQ(read_facts.authenticated_clock_ms,-1);EXPECT_EQ(read_facts.settlement_refusal(4),0);
+    EXPECT_FALSE(read_facts.settlement_unexpected_commit_observed(4));
+    auto resumed=invoke_observed(command("resume",f,d));const auto resume=resumed.diagnostics();const auto next=resumed.take_result();
+    ASSERT_EQ(next.status_code(),1);EXPECT_TRUE(json::parse(next.wire()).at("leaseAvailable").get<bool>());
+    EXPECT_EQ(resume.operation,3);EXPECT_EQ(resume.settlement_state(3),2);EXPECT_EQ(resume.settlement_refusal(3),1);
+    EXPECT_TRUE(resume.resume_expiration_present);EXPECT_TRUE(resume.resume_expiry_clock_observed);
+    EXPECT_LT(resume.resume_expiry_clock_ms,resume.resume_expiration_ms);EXPECT_GT(resume.resume_new_deadline_ms,resume.resume_expiry_clock_ms);
+    EXPECT_EQ(resume.stage_visits(3,0),1u);EXPECT_EQ(resume.stage_visits(3,6),1u);EXPECT_TRUE(resume.resume_lease_available);
+    EXPECT_FALSE(frame.publishable());EXPECT_EQ(receipts(),original);
+}
+TEST_F(AuthenticatedReadySession, ObservedResumeRefusalCopiesActualPrimaryWithoutEvaluatingLaterExpiry) {
+    setup=admitted();const auto d=description(setup);auto f=request(d);const auto offered=lease(setup,f,d);
+    ASSERT_TRUE(offered.at("leaseAvailable").get<bool>());const auto before=exact_source();
+    f.logical.attempt_id=relay_uuid(9200);seal(f,d);const auto raw=command("resume",f,d).dump();
+    const auto charge=setup.stop_token().reserve_ready(raw.size());ASSERT_TRUE(charge.valid());
+    auto observed=setup.ready_observed(raw,charge);const auto facts=observed.diagnostics();const auto result=observed.take_result();
+    ASSERT_EQ(result.status_code(),1);const auto response=json::parse(result.wire());
+    EXPECT_EQ(response.at("settlement").at("state"),"rolledBack");EXPECT_TRUE(response.at("settlement").at("primaryError").get<bool>());
+    EXPECT_FALSE(response.at("leaseAvailable").get<bool>());EXPECT_EQ(facts.settlement_state(3),1);EXPECT_EQ(facts.settlement_errors(3),1);
+    EXPECT_EQ(facts.settlement_refusal(3),4);EXPECT_EQ(facts.stage_visits(3,2),1u);EXPECT_EQ(facts.stage_visits(3,3),0u);
+    EXPECT_FALSE(facts.resume_expiry_clock_observed);EXPECT_EQ(facts.resume_expiry_clock_ms,-1);EXPECT_FALSE(facts.resume_lease_available);
+    EXPECT_EQ(exact_source(),before);
+}
+
+class CanonicalSchemaCacheContinuity:public AuthenticatedReceiptMigrationClosure {
+protected:
+    int64_t cookie() {return std::get<int64_t>(owner->db().query("PRAGMA main.schema_version").at(0).at("schema_version"));}
+    Rows markers() {return owner->db().query("SELECT key,value FROM main._lattice_meta WHERE substr(key,1,19)='schema_fingerprint:' ORDER BY key");}
+    Rows metadata() {return owner->db().query("SELECT key,value FROM main._lattice_meta ORDER BY key");}
+    std::string key(const Rows& rows,size_t n) {return std::get<std::string>(rows.at(n).at("key"));}
+    void expect_current(const Rows& original) {
+        const auto actual=markers();ASSERT_EQ(actual.size(),original.size());
+        for(size_t n=0;n<actual.size();++n) {
+            EXPECT_EQ(actual[n].at("key"),original[n].at("key"));
+            EXPECT_EQ(std::get<std::string>(actual[n].at("value")),std::to_string(cookie()));
+        }
+    }
+};
+TEST_F(CanonicalSchemaCacheContinuity, ValidOwnerMarkersSurviveCanonicalEnrollmentAndOrdinaryReopenWithoutRowChanges) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);expect_current(before);
+    const auto initial_cookie=cookie();open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_GT(cookie(),initial_cookie);expect_current(before);
+    setup.close_on_io();setup={};const auto enrolled=all_state();const auto enrolled_cookie=cookie();
+    owner->close();owner.reset();ref.reset();recreate_owner();
+    EXPECT_EQ(cookie(),enrolled_cookie);EXPECT_EQ(all_state(),enrolled);expect_current(before);
+    EXPECT_EQ(sqlite3_total_changes(detail::canonical_writer_custody_test_access::fault_handle(owner->db())),0);
+}
+TEST_F(CanonicalSchemaCacheContinuity, ExternalDdlLeavesStaleOwnerAndUnrelatedMarkersUntouched) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);expect_current(before);
+    owner->db().execute("CREATE TABLE SchemaCacheExternalDrift(value TEXT)");
+    const auto drift_cookie=cookie();
+    owner->db().execute("INSERT INTO main._lattice_meta(key,value) VALUES(?,?)",
+        {std::string("schema_fingerprint:unrelated-owner"),std::to_string(drift_cookie)});
+    const auto stale=metadata();open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_GT(cookie(),drift_cookie);EXPECT_EQ(metadata(),stale);
+}
+TEST_F(CanonicalSchemaCacheContinuity, MissingAndMalformedOwnerMarkersAreNeverCreatedOrNormalized) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);
+    owner->db().execute("DELETE FROM main._lattice_meta WHERE key=?",{key(before,0)});
+    owner->db().execute("UPDATE main._lattice_meta SET value=? WHERE key=?",{std::to_string(cookie())+"trailing",key(before,1)});
+    const auto untrusted=metadata();open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_EQ(metadata(),untrusted);EXPECT_EQ(markers().size(),1u);
+}
+TEST_F(CanonicalSchemaCacheContinuity, OnlyTheValidCurrentOwnerMarkerMovesAndForeignMarkersAreNotPruned) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);const auto stale_key=key(before,0),valid_key=key(before,1);
+    owner->db().execute("UPDATE main._lattice_meta SET value='-1' WHERE key=?",{stale_key});
+    owner->db().execute("INSERT INTO main._lattice_meta(key,value) VALUES('schema_fingerprint:other-binary','-7')");
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_EQ(owner->db().query("SELECT value FROM main._lattice_meta WHERE key=?",{stale_key}).at(0).at("value"),column_value_t{std::string("-1")});
+    EXPECT_EQ(owner->db().query("SELECT value FROM main._lattice_meta WHERE key=?",{valid_key}).at(0).at("value"),column_value_t{std::to_string(cookie())});
+    EXPECT_EQ(owner->db().query("SELECT value FROM main._lattice_meta WHERE key='schema_fingerprint:other-binary'").at(0).at("value"),column_value_t{std::string("-7")});
+    EXPECT_EQ(markers().size(),3u);
+}
+TEST_F(CanonicalSchemaCacheContinuity, BeforeWriteDdlCannotReuseThePreflightCookie) {
+    const auto before=metadata();unsigned calls=0;
+    const std::function<void(lattice_db&)> hook=[&](lattice_db& actual) {
+        if(&actual!=owner.get())throw std::runtime_error("schema-cache fixture owner mismatch");
+        ++calls;actual.db().execute("CREATE TABLE SchemaCacheBeforeWrite(value TEXT)");
+    };
+    struct Restore {
+        const std::function<void(lattice_db&)>* previous;
+        ~Restore(){detail::authenticated_relay_catalog_test_access::before_write(previous);}
+    } restore{detail::authenticated_relay_catalog_test_access::before_write(&hook)};
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();EXPECT_EQ(calls,1u);EXPECT_EQ(metadata(),before);
+}
+TEST_F(CanonicalSchemaCacheContinuity, MetadataTriggerPreventsCarryForwardAndNeverRunsDuringEnrollment) {
+    const auto before=markers();ASSERT_EQ(before.size(),2u);
+    // This is an internal counter, not a model with id/globalId columns.
+    owner->db().execute("CREATE TABLE _SchemaCacheTriggerProbe(value INTEGER)");
+    owner->db().execute("CREATE TRIGGER SchemaCacheUnknownMetadata AFTER UPDATE ON _lattice_meta BEGIN INSERT INTO _SchemaCacheTriggerProbe VALUES(1); END");
+    // Deliberately make both markers numerically current after the unknown DDL.
+    // This must not authorize the new implementation to invoke its trigger.
+    for(const auto& row:before)owner->db().execute("UPDATE main._lattice_meta SET value=? WHERE key=?",{std::to_string(cookie()),row.at("key")});
+    ASSERT_EQ(count("_SchemaCacheTriggerProbe"),static_cast<int64_t>(before.size()));
+    owner->db().execute("DELETE FROM _SchemaCacheTriggerProbe");const auto held=metadata();
+    ASSERT_EQ(count("_SchemaCacheTriggerProbe"),0);
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();
+    EXPECT_EQ(count("_SchemaCacheTriggerProbe"),0);EXPECT_EQ(metadata(),held);
+}
+TEST_F(CanonicalSchemaCacheContinuity, ActualMigrationCommitDenialRestoresCookieMarkersAndEveryPriorRow) {
+    open();ASSERT_TRUE(setup.valid())<<last_bridge_error();setup.close_on_io();setup={};
+    const auto before=all_state();const auto before_cookie=cookie();const auto prior_markers=markers();expect_current(prior_markers);
+    {
+        ReceiptMigrationCommitDenial fault(owner->db());
+        const auto result=ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump());
+        EXPECT_EQ(result,4);EXPECT_EQ(fault.hits,1);EXPECT_FALSE(last_bridge_error().empty());
+    }
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(cookie(),before_cookie);EXPECT_EQ(all_state(),before);
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    EXPECT_GT(cookie(),before_cookie);expect_current(prior_markers);
+}
+}
+#endif

@@ -18,6 +18,7 @@ class recovery_reconciliation_descriptor final {
     friend class recovery_continuous_producer;
     friend class recovery_receiver_route;
     friend class recovery_unknown_reconciliation;
+    friend class recovery_reconciliation_operation;
     // Issued only by the actual controller after correlated source inspection
     // and known owned local consumption. No raw reply/Q payload is retained.
     struct predecessor {
@@ -45,6 +46,7 @@ class recovery_reconciliation_descriptor final {
     std::shared_ptr<const recovery_reconciliation_cohort> cohort_;
     // One passive progress cell per immutable descriptor; its back-reference is weak.
     mutable std::mutex worker_mutex_;
+    mutable bool worker_initializing_=false;
     mutable std::shared_ptr<recovery_unknown_reconciliation> worker_;
     std::weak_ptr<lattice_db> owner_;
     std::weak_ptr<recovery_receiver_controller> controller_;

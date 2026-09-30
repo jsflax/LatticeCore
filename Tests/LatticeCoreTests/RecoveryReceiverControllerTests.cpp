@@ -983,6 +983,158 @@ TEST_F(RecoveryRestrictedFirstClaim, AuditValidMatchingContributionFirstClaimRew
     EXPECT_EQ(snapshot(),expected);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
 }
 
+// Separate real callback queues let a sibling run before an already parked
+// route. The normal factory, controller, claims and queue tickets stay real.
+class FirstClaimScheduledSynchronizer final : public synchronizer_base {
+public:
+    FirstClaimScheduledSynchronizer(std::shared_ptr<lattice_db> owner,const sync_config& config,
+        std::shared_ptr<scheduler> scheduled){owned_db_=std::move(owner);db_ptr_=owned_db_.get();init_sync(config,std::move(scheduled));}
+};
+thread_local std::function<void()> continuity_before_claim_action;
+void continuity_before_claim(){if(continuity_before_claim_action)continuity_before_claim_action();}
+class RecoveryFirstClaimContinuity : public RecoveryRestrictedFirstClaim {
+protected:
+    std::array<std::shared_ptr<FirstClaimScheduler>,2> route_queues{std::make_shared<FirstClaimScheduler>(),std::make_shared<FirstClaimScheduler>()};
+    std::vector<std::unique_ptr<FirstClaimScheduledSynchronizer>> routes;
+    std::array<std::vector<std::string>,2> route_errors;
+    std::array<size_t,2> executed{};
+    int running_route=-1,first_route=-1;
+    size_t park_commits=1;
+    std::function<void()> before_claim,before_refreeze;
+    void(*prior_before)()=nullptr;
+    std::function<void()> prior_before_action;
+    void SetUp()override{RecoveryRestrictedFirstClaim::SetUp();prior_before=detail::recovery_export_test_hooks::before_claim_commit;
+        prior_before_action=std::move(continuity_before_claim_action);}
+    bool route_error(size_t n){std::lock_guard lock(errors_mutex);return !route_errors[n].empty();}
+    bool selected(const std::function<bool()>& predicate,std::optional<size_t> only={}){
+        const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;manual->run_one();if(predicate())return true;
+            for(size_t n=0;n<2;++n)if(!only||*only==n){
+                struct Restore{int& slot;int prior;~Restore(){slot=prior;}} restore{running_route,running_route};running_route=static_cast<int>(n);
+                if(route_queues[n]->run_one())++executed[n];if(predicate())return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+        return predicate();
+    }
+    void start_mixed(){
+        configure(2,false);open_manual_receiver();const auto initial_ack=install_ack_gate();connect();
+        ASSERT_TRUE(drive([&]{return phase()==0;}));seed_local(1,700);const auto claimed=originals();ASSERT_EQ(claimed.size(),1u);
+        ASSERT_TRUE(drive([&]{return held_originals(0)==claimed&&held_originals(1)==claimed;}));
+        ASSERT_TRUE(observe([&]{return initial_ack->started.load()==2;}));
+        auto retired=std::make_shared<std::atomic<bool>>(false);manual->invoke([this,retired]{synchronizers.clear();retired->store(true);});
+        ASSERT_TRUE(drive([&]{return retired->load();}));ASSERT_TRUE(manual->can_invoke());manual->discard();
+        initial_ack->release();ASSERT_TRUE(observe([&]{return initial_ack->finished.load()==2;}));
+        seed_local(1,701);mixed_ids=originals();ASSERT_EQ(mixed_ids.size(),2u);
+        ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NULL"),2);
+        held_uploads.clear();restricted_begin=observed_uploads.size();restricted_ack=install_ack_gate();
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this](const char* stage){
+            if(std::strcmp(stage,"reconciliation-pending")!=0||phase()!=4)return;
+            ++phase4_publications;phase4_snapshot=snapshot();
+            continuity_before_claim_action=[this]{if(before_claim)before_claim();};
+            detail::recovery_export_test_hooks::before_claim_commit=continuity_before_claim;
+            first_claim_committed_action=[this]{
+                if(running_route<0)throw db_error("continuity fixture claim did not run on actual route queue");
+                if(first_route<0)first_route=running_route;
+                committed_claims.push_back(claims());committed_sequences.push_back(scalar(*receiver,"SELECT export_sequence AS n FROM _lattice_obligation_store"));
+                committed_snapshot=snapshot();
+                if(committed_claims.size()<=park_commits)writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);
+            };
+            detail::recovery_export_test_hooks::after_claim_commit=first_claim_committed;
+        },[this](const char* stage)->std::shared_ptr<void>{if(std::strcmp(stage,"reconcile-refreeze")==0&&before_refreeze)before_refreeze();return {};});
+        for(size_t n=0;n<2;++n){const auto& peer=peers[n];sync_config config;config.websocket_url=peer.endpoint;
+            config.authorization_token="registered-token";config.sync_id=peer.channel;
+            for(const auto& active:peers)config.all_active_sync_ids.push_back(active.channel);
+            config.recovery_source_expectation=peer.expectation.dump();config.checkpoint_passive_interval_ms=0;config.upload_coalesce_ms=0;config.chunk_size=upload_chunk;
+            auto route=std::make_unique<FirstClaimScheduledSynchronizer>(receiver,config,route_queues[n]);
+            route->set_on_error([this,n](const std::string& error){std::lock_guard lock(errors_mutex);errors.push_back(error);route_errors[n].push_back(error);});
+            routes.push_back(std::move(route));routes.back()->connect();
+        }
+    }
+    void release_writer(){ASSERT_TRUE(writer_hold);writer_hold->release();EXPECT_FALSE(writer_hold->timed_out);writer_hold.reset();}
+    void rewrite(size_t peer,int64_t value){
+        sqlite3* raw=nullptr;const auto opened=sqlite3_open_v2(receiver->config().path.c_str(),&raw,SQLITE_OPEN_READWRITE|SQLITE_OPEN_NOMUTEX,nullptr);
+        std::unique_ptr<sqlite3,decltype(&sqlite3_close)> db(raw,sqlite3_close);ASSERT_EQ(opened,SQLITE_OK);ASSERT_EQ(sqlite3_busy_timeout(db.get(),100),SQLITE_OK);
+        sqlite3_stmt* raw_statement=nullptr;const auto prepared=sqlite3_prepare_v2(db.get(),"UPDATE _lattice_obligation_entry SET first_export=? WHERE channel=? AND actual_original=?",-1,&raw_statement,nullptr);
+        std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)> statement(raw_statement,sqlite3_finalize);ASSERT_EQ(prepared,SQLITE_OK);
+        const auto& channel=peers[peer].channel;const auto& original=mixed_ids[1];
+        ASSERT_EQ(sqlite3_bind_int64(statement.get(),1,value),SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_blob(statement.get(),2,channel.data(),static_cast<int>(channel.size()),SQLITE_TRANSIENT),SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_blob(statement.get(),3,original.data(),static_cast<int>(original.size()),SQLITE_TRANSIENT),SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(statement.get()),SQLITE_DONE);ASSERT_EQ(sqlite3_changes(db.get()),1);
+        ASSERT_EQ(sqlite3_finalize(statement.release()),SQLITE_OK);ASSERT_EQ(sqlite3_close(db.release()),SQLITE_OK);
+        const auto audited=detail::recovery_writer_access::install(receiver,[&](database&){
+            const auto inventory=detail::recovery_local_producer_adapter::export_inventory_for_owned_write(receiver);
+            detail::recovery_obligation_store journal(receiver,inventory.limits.obligations,inventory.limits.installations);journal.audit();});
+        ASSERT_EQ(audited.state,detail::recovery_install_state::committed);ASSERT_FALSE(audited.primary_error);
+    }
+    void no_new_send(const Snapshot& expected){
+        EXPECT_EQ(observed_uploads.size(),restricted_begin);EXPECT_EQ(restricted_ack->started.load(),0u);EXPECT_EQ(snapshot(),expected);
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+    }
+    void TearDown()override{
+        before_claim={};before_refreeze={};
+        if(writer_hold)writer_hold->release();routes.clear();for(const auto& queue:route_queues)queue->shutdown();
+        detail::recovery_export_test_hooks::before_claim_commit=prior_before;continuity_before_claim_action=std::move(prior_before_action);
+        RecoveryRestrictedFirstClaim::TearDown();
+    }
+};
+TEST_F(RecoveryFirstClaimContinuity, QueuedSiblingPreparesFirstAndRefusesAuditValidRewriteBeforeNewClaims) {
+    ASSERT_NO_FATAL_FAILURE(start_mixed());ASSERT_TRUE(selected([&]{return bool(writer_hold);}));
+    ASSERT_GE(first_route,0);const size_t a=static_cast<size_t>(first_route),b=1-a;const auto a_executed=executed[a];
+    ASSERT_EQ(committed_claims.size(),1u);ASSERT_NO_FATAL_FAILURE(release_writer());
+    const auto older=first_claim(peers[b].channel,mixed_ids[0]);ASSERT_LT(older,first_claim(peers[b].channel,mixed_ids[1]));
+    ASSERT_NO_FATAL_FAILURE(rewrite(b,older));const auto expected=snapshot();hold_uploads=false;
+    ASSERT_TRUE(selected([&]{return route_error(b);},b));EXPECT_EQ(executed[a],a_executed);EXPECT_EQ(committed_claims.size(),1u);
+    no_new_send(expected);ASSERT_TRUE(selected([&]{return route_error(a);},a));no_new_send(expected);
+}
+TEST_F(RecoveryFirstClaimContinuity, QueuedSiblingPreservesEarlierActualClaimsAndBothRoutesSend) {
+    ASSERT_NO_FATAL_FAILURE(start_mixed());ASSERT_TRUE(selected([&]{return bool(writer_hold);}));
+    ASSERT_GE(first_route,0);const size_t a=static_cast<size_t>(first_route),b=1-a;const auto a_executed=executed[a];
+    const auto earlier=committed_claims.at(0);ASSERT_NO_FATAL_FAILURE(release_writer());
+    ASSERT_TRUE(selected([&]{return observed_originals(b,restricted_begin)==mixed_ids;},b));EXPECT_EQ(executed[a],a_executed);
+    ASSERT_EQ(committed_claims.size(),2u);EXPECT_EQ(committed_claims[1],earlier);EXPECT_GT(committed_sequences[1],committed_sequences[0]);
+    ASSERT_TRUE(selected([&]{return observed_originals(a,restricted_begin)==mixed_ids;},a));
+    ASSERT_EQ(observed_uploads.size(),restricted_begin+2);EXPECT_EQ(claims(),earlier);
+    EXPECT_FALSE(has_error());EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+}
+TEST_F(RecoveryFirstClaimContinuity, FailedRouteFencesAlreadyClaimedSiblingEvenAfterExternalValueRestored) {
+    park_commits=2;ASSERT_NO_FATAL_FAILURE(start_mixed());ASSERT_TRUE(selected([&]{return bool(writer_hold);}));
+    ASSERT_GE(first_route,0);const size_t a=static_cast<size_t>(first_route),b=1-a;ASSERT_NO_FATAL_FAILURE(release_writer());
+    ASSERT_TRUE(selected([&]{return committed_claims.size()==2&&bool(writer_hold);},b));ASSERT_NO_FATAL_FAILURE(release_writer());
+    const auto unchanged=committed_snapshot;const auto exact=first_claim(peers[b].channel,mixed_ids[1]);
+    const auto older=first_claim(peers[b].channel,mixed_ids[0]);ASSERT_LT(older,exact);ASSERT_NO_FATAL_FAILURE(rewrite(b,older));
+    hold_uploads=false;ASSERT_TRUE(selected([&]{return route_error(a);},a));
+    ASSERT_NO_FATAL_FAILURE(rewrite(b,exact));ASSERT_EQ(snapshot(),unchanged);
+    ASSERT_TRUE(selected([&]{return route_error(b);},b));no_new_send(unchanged);EXPECT_EQ(committed_claims.size(),2u);
+    {std::lock_guard lock(errors_mutex);ASSERT_FALSE(route_errors[a].empty());ASSERT_FALSE(route_errors[b].empty());EXPECT_EQ(route_errors[a].front(),route_errors[b].front());}
+}
+TEST_F(RecoveryFirstClaimContinuity, DeniedOwnedClaimCommitNeverPublishesCandidateToQueuedSibling) {
+    park_commits=0;std::atomic<unsigned> denied{0};std::unique_ptr<ControllerCommitFault> fault;
+    before_claim=[&]{if(!fault)fault=std::make_unique<ControllerCommitFault>(receiver.get(),denied);};
+    ASSERT_NO_FATAL_FAILURE(start_mixed());hold_uploads=false;ASSERT_TRUE(selected([&]{return has_error();}));
+    fault.reset();ASSERT_GT(denied.load(),0u);EXPECT_TRUE(committed_claims.empty());no_new_send(phase4_snapshot);
+    ASSERT_TRUE(selected([&]{return route_error(0)&&route_error(1);}));no_new_send(phase4_snapshot);
+}
+TEST_F(RecoveryFirstClaimContinuity, ReentrantBodyCommitCannotPublishOrPermitSiblingSourceMutation) {
+    park_commits=0;unsigned attempted=0;before_claim=[&]{++attempted;receiver->db().execute("COMMIT");};
+    ASSERT_NO_FATAL_FAILURE(start_mixed());hold_uploads=false;ASSERT_TRUE(selected([&]{return has_error();}));
+    EXPECT_EQ(attempted,1u);EXPECT_TRUE(committed_claims.empty());EXPECT_FALSE(receiver->db().is_in_transaction());no_new_send(phase4_snapshot);
+    ASSERT_TRUE(selected([&]{return route_error(0)&&route_error(1);}));no_new_send(phase4_snapshot);
+}
+TEST_F(RecoveryFirstClaimContinuity, RefreezeRejectsAuditValidRewriteAfterBothActualHandoffs) {
+    park_commits=0;bool corrupted=false;Snapshot expected;
+    before_refreeze=[&]{if(corrupted)return;corrupted=true;
+        for(size_t n=0;n<64&&observed_uploads.size()<restricted_begin+2&&pump();++n){}
+        EXPECT_EQ(observed_uploads.size(),restricted_begin+2);
+        const auto older=first_claim(peers[1].channel,mixed_ids[0]);EXPECT_LT(older,first_claim(peers[1].channel,mixed_ids[1]));
+        rewrite(1,older);expected=snapshot();};
+    ASSERT_NO_FATAL_FAILURE(start_mixed());ASSERT_TRUE(selected([&]{return corrupted&&has_error();}));
+    EXPECT_EQ(committed_claims.size(),2u);EXPECT_EQ(observed_uploads.size(),restricted_begin+2);EXPECT_EQ(phase(),4);
+    EXPECT_EQ(snapshot(),expected);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    {std::lock_guard lock(errors_mutex);EXPECT_TRUE(std::any_of(errors.begin(),errors.end(),[](const auto& error){return error.find("first claim changed")!=std::string::npos;}));}
+}
+
 TEST_F(RecoveryReceiverController, LateClaimedAckWhileFrozenPreservesBothCanonicalNamespaces) {
     configure(2);auto armed=std::make_shared<std::atomic<bool>>(false);
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,

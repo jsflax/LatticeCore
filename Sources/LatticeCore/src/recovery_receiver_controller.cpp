@@ -1546,6 +1546,9 @@ recovery_reconciliation_result recovery_receiver_controller::controller_reconcil
         runtime.running=true;runtime.reconciliation_reservation=reservation.get();reservation->active=true;}
     result.descriptor_=descriptor;result.step_=step;result.reservation_=reservation;
     const bool cancel=step==recovery_reconciliation_step::cancelled;
+    const auto continuity=cancel?std::shared_ptr<recovery_unknown_reconciliation>{}:recovery_unknown_reconciliation::acquire(descriptor);
+    require(cancel||continuity,"controller reconciliation first-claim worker unavailable");
+    const auto first_claims=continuity?continuity->refreeze_claims():std::shared_ptr<const std::vector<int64_t>>{};
     require(descriptor->phase_==(cancel?2:4),"controller reconciliation step/phase differs");
     require(!cancel||(descriptor->barrier_<INT64_MAX&&descriptor->attempt_<INT64_MAX),"controller reconciliation sequence exhausted");
     result.next_barrier_=descriptor->barrier_+(cancel?1:0);result.next_attempt_=descriptor->attempt_+(cancel?1:0);
@@ -1569,14 +1572,16 @@ recovery_reconciliation_result recovery_receiver_controller::controller_reconcil
         recovery_obligation_store journal(owner,runtime.caps.obligations,runtime.caps.install.installations);
         receive_install_store receiver(owner,runtime.caps.install.installations);receiver.audit();journal.audit();
         std::vector<recovery_obligation_snapshot> journals;std::vector<receive_install_snapshot> receivers;
-        for(const auto& c:descriptor->contributions_) {
+        for(size_t contribution=0;contribution<descriptor->contributions_.size();++contribution) {
+            const auto& c=descriptor->contributions_[contribution];
             require(requests.read(c.framing.journal.channel)==std::optional<recovery_request_row>{c.framing},"controller reconciliation frozen Q/M changed");
             const auto scope=journal.read(c.framing.journal.channel);const auto installed=receiver.read(c.framing.journal.channel);
             require(scope&&installed&&scope->profile==c.journal.scope.profile&&scope->address==c.journal.scope.address,"controller reconciliation journal address changed");
             auto snapshot=cancel?journal.snapshot_for_install(scope->address,descriptor->attempt_):journal.snapshot_for_reconciliation(scope->address);
             require(snapshot.entries.size()==c.journal.entries.size(),"controller reconciliation pending inventory changed");
             for(size_t n=0;n<snapshot.entries.size();++n){auto current=snapshot.entries[n],original=c.journal.entries[n];
-                if(!cancel&&!original.first_export_claim)original.first_export_claim=current.first_export_claim;
+                if(!cancel){const auto first=first_claims->at(continuity->claim_offsets_[contribution]+n);
+                    original.first_export_claim=first?std::optional<int64_t>{first}:std::nullopt;}
                 require(current==original,"controller reconciliation original, order, receipt or first claim changed");}
             if(cancel)require(snapshot.scope==c.journal.scope,"controller frozen reconciliation scope changed");
             else require(scope->mode==recovery_obligation_mode::recording&&scope->last_attempt==c.framing.sequence&&scope->revision>=c.journal.scope.revision,

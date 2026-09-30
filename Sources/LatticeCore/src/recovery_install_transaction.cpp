@@ -643,7 +643,7 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
     // Payloads and callback copies likewise die outside those scopes.
     if (result.state == recovery_install_state::committed) {
         try {
-            if (after_unlock) after_unlock(); // private deterministic test rendezvous only
+            if (after_unlock) after_unlock(); // private committed publication/test boundary, before delivery
             deliver(*owner, batch);
         } catch (...) { result.postcommit_error = std::current_exception(); }
     } else if (writer && settlement.state != phase::not_started) {

@@ -3,3 +3,5 @@
 #include "platform_transport_fixture.hpp"
 
 #include "platform_tls_fixture.hpp"
+
+#include "platform_retirement_fixture.hpp"

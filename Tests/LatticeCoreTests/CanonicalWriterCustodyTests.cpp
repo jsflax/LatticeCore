@@ -479,12 +479,51 @@ TEST(PhysicalIdentityObservation, ActualFileReplacementRemainsRefusedWithoutLeak
         legacy = writer.physical_identity("main", {}, true);
     }
     EXPECT_FALSE(actual.identity) << identity_failure_details(actual, original_restore.value(), successor_restore.value());
+#if defined(__APPLE__)
+    // Apple's SQLite can permanently refuse this handle after observing the
+    // deliberate rename. That exact extension error is also a refusal, never
+    // proof that the pathname still identifies the opened file.
+    if (actual.details.first_move.observed && actual.details.first_move.rc == SQLITE_IOERR_VNODE) {
+        EXPECT_STREQ(actual.failure, "move_check_unavailable");
+        EXPECT_FALSE(actual.details.first_move.moved_valid);
+    } else
+#endif
     EXPECT_STREQ(actual.failure, "file_moved") << identity_failure_details(actual, original_restore.value(), successor_restore.value());
     EXPECT_FALSE(legacy) << identity_failure_details(actual, original_restore.value(), successor_restore.value());
+    ASSERT_FALSE(original_restore) << original_restore.message();
+    ASSERT_FALSE(successor_restore) << successor_restore.message();
     const auto restored = identity_access::observe_identity_details(writer);
-    ASSERT_TRUE(restored.identity) << identity_failure_details(restored, original_restore.value(), successor_restore.value());
-    EXPECT_EQ(restored.failure, nullptr) << identity_failure_details(restored, original_restore.value(), successor_restore.value());
-    EXPECT_EQ(*restored.identity, *before);
+#if defined(__APPLE__)
+    // The asynchronous vnode notification may arrive before or after the first
+    // observation. Restoring the name does not repair an invalidated handle.
+    const bool first_vnode = restored.details.first_move.observed && restored.details.first_move.rc == SQLITE_IOERR_VNODE;
+    const bool second_vnode = restored.details.second_move.observed && restored.details.second_move.rc == SQLITE_IOERR_VNODE;
+    if (first_vnode || second_vnode) {
+        EXPECT_FALSE(restored.identity);
+        if (first_vnode) {
+            EXPECT_STREQ(restored.failure, "move_check_unavailable");
+            EXPECT_FALSE(restored.details.first_move.moved_valid);
+            EXPECT_FALSE(restored.details.second_move.observed);
+        } else {
+            EXPECT_STREQ(restored.failure, "recheck_unavailable");
+            EXPECT_TRUE(restored.details.first_move.observed);
+            EXPECT_EQ(restored.details.first_move.rc, SQLITE_OK);
+            EXPECT_TRUE(restored.details.first_move.moved_valid);
+            EXPECT_EQ(restored.details.first_move.moved, 0);
+            EXPECT_FALSE(restored.details.second_move.moved_valid);
+        }
+        database reopened(original.str(), database::open_mode::read_only);
+        const auto current = identity_access::observe_identity_details(reopened);
+        ASSERT_TRUE(current.identity) << identity_failure_details(current, original_restore.value(), successor_restore.value());
+        EXPECT_EQ(current.failure, nullptr);
+        EXPECT_EQ(*current.identity, *before);
+    } else
+#endif
+    {
+        ASSERT_TRUE(restored.identity) << identity_failure_details(restored, original_restore.value(), successor_restore.value());
+        EXPECT_EQ(restored.failure, nullptr) << identity_failure_details(restored, original_restore.value(), successor_restore.value());
+        EXPECT_EQ(*restored.identity, *before);
+    }
 }
 
 TEST(PhysicalIdentityDetail, ActualSuccessReportsBothChecksAndMatchesNilDetailsPath) {

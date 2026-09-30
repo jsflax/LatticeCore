@@ -666,10 +666,35 @@ struct validated_sequence::state {
             :progress(std::move(p)),content(std::move(c)),receipts(std::move(r)){}
     };
     std::unique_ptr<pending> live;
-    state(const attempt& a,const request& r,const manifest& m,const limits& b)
-        :initial(begin(a,r,m,b)),budget(b),effective(narrowed(b,r.budget)),ids(rebase(r)),
-         whole_size(package_size(state_json(initial))),dynamic_size(package_size(progress_json({}))),
-         live(std::make_unique<pending>(sequence_progress{},stream_hasher(m,stream_kind::content,effective),stream_hasher(m,stream_kind::receipts,effective))) {}
+    struct fresh_initial {
+        sequence_state initial;
+        std::vector<identity> ids;
+        package_json_size whole_size;
+    };
+    static fresh_initial prepare(const attempt& a,const request& r,const manifest& m,const limits& b) {
+        // Keep the strict public begin's first validation and error order.
+        // Only this private path creates its progress; it accepts no restart,
+        // caller-supplied bitmap or imported validation/provenance token.
+        bound_offer(a,r,m,b);
+        (void)encode(frame{a,1,r},b);(void)encode(frame{a,1,m},narrowed(b,r.budget));
+        fresh_initial value;
+        value.initial.logical=a;value.initial.frozen_request=r;value.initial.offer=m;
+        value.ids=rebase(r);value.initial.rebase_seen.resize(value.ids.size(),uint8_t{0});
+        // Fresh receiving state has zero counters, no last identity and an
+        // all-zero exact-size bitmap. Its consumed streams are empty; remaining
+        // streams are exactly the totals already checked by manifest_shape.
+        // Every passed/seen relation is therefore false/zero. Mutable public
+        // DTO/restart callers still use the unchanged complete state_valid.
+        const auto encoded=state_json(value.initial);
+        (void)dump(encoded,b,b.restart_bytes); // Real escaped bytes, SAX and DOM.
+        value.whole_size=package_size(encoded);
+        return value;
+    }
+    state(fresh_initial fresh,const limits& b)
+        :initial(std::move(fresh.initial)),budget(b),effective(narrowed(b,initial.frozen_request.budget)),ids(std::move(fresh.ids)),
+         whole_size(fresh.whole_size),dynamic_size(package_size(progress_json({}))),
+         live(std::make_unique<pending>(sequence_progress{},stream_hasher(initial.offer,stream_kind::content,effective),stream_hasher(initial.offer,stream_kind::receipts,effective))) {}
+    state(const attempt& a,const request& r,const manifest& m,const limits& b):state(prepare(a,r,m,b),b) {}
     void restart_fits(const sequence_progress& p) const {
         // Same fixed field names, bitmap width and immutable objects as the
         // already parsed initial restart. Only these ten values can change.

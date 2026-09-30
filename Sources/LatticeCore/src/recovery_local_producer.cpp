@@ -2,6 +2,9 @@
 #include "recovery_producer_continuity.hpp"
 #include "recovery_receiver_controller.hpp"
 #include "recovery_request_store.hpp"
+#ifndef __EMSCRIPTEN__
+#include "configured_recovery_connection.hpp"
+#endif
 #include <filesystem>
 #include <limits>
 #if defined(__APPLE__) || defined(__linux__)
@@ -871,3 +874,38 @@ recovery_local_export_inventory recovery_local_producer_adapter::export_inventor
     return result;
 }
 } // namespace lattice::detail
+
+namespace lattice {
+std::shared_ptr<detail::configured_recovery_connection> lattice_db::configured_connection()const noexcept{
+#ifndef __EMSCRIPTEN__
+    const auto admission=recovery_continuous_;if(!admission)return {};
+    std::lock_guard<std::mutex> lock(admission->configured_mutex);return admission->configured;
+#else
+    return {};
+#endif
+}
+bool lattice_db::configured_sync_present()const noexcept{return bool(configured_connection());}
+#ifndef __EMSCRIPTEN__
+bool lattice_db::configured_sync_connected()const{const auto owner=configured_connection();return owner&&owner->connected();}
+void lattice_db::configured_sync_now(){if(auto owner=configured_connection())owner->sync_now();}
+void lattice_db::configured_sync_upload(){if(auto owner=configured_connection())owner->trigger_upload();}
+void lattice_db::configured_sync_connect(){if(auto owner=configured_connection())owner->connect();}
+void lattice_db::configured_sync_disconnect(){if(auto owner=configured_connection())owner->disconnect();}
+void lattice_db::configured_sync_state(std::function<void(bool)> handler){if(auto owner=configured_connection())owner->set_state(std::move(handler));}
+void lattice_db::configured_sync_error(std::function<void(const std::string&)> handler){if(auto owner=configured_connection())owner->set_error(std::move(handler));}
+void lattice_db::configured_sync_progress(synchronizer::on_progress_handler handler){if(auto owner=configured_connection())owner->set_progress(std::move(handler));}
+synchronizer::sync_progress lattice_db::configured_sync_progress()const{if(auto owner=configured_connection())return owner->progress();return {};}
+lattice_close_result lattice_db::configured_sync_close(std::chrono::steady_clock::time_point deadline)noexcept{if(auto owner=configured_connection())return owner->close(deadline);return {};}
+#else
+bool lattice_db::configured_sync_connected()const{return false;}
+void lattice_db::configured_sync_now(){}
+void lattice_db::configured_sync_upload(){}
+void lattice_db::configured_sync_connect(){}
+void lattice_db::configured_sync_disconnect(){}
+void lattice_db::configured_sync_state(std::function<void(bool)>){ }
+void lattice_db::configured_sync_error(std::function<void(const std::string&)>){ }
+void lattice_db::configured_sync_progress(synchronizer::on_progress_handler){ }
+synchronizer::sync_progress lattice_db::configured_sync_progress()const{return {};}
+lattice_close_result lattice_db::configured_sync_close(std::chrono::steady_clock::time_point)noexcept{return {};}
+#endif
+}

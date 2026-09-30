@@ -7,16 +7,17 @@
 namespace lattice { class sync_transport; }
 namespace lattice::detail {
 struct configured_retirement_test_access;
+class configured_platform_bridge;
+class configured_attempt_custody;
 struct configured_retirement_snapshot {
     bool valid=false,requested=false,adapter_complete=false,native_complete=false;
     bool owner_live=false,transport_retained=false,quarantined=false;
     int32_t first_error=0;
 };
-// Inactive custody primitives. No existing factory, synchronizer or retirement
-// lane calls this class. The eventual configured owner must reserve BEFORE any
-// factory allocation, deliver requests, settle actual native work/borrows and
-// collect on its off-callback executor. This does not yet own the complete
-// wrapper/pacer/child bundle or prove those future integration obligations.
+// The private configured owner reserves before child/factory allocation and
+// collects on its off-callback executor after actual native/adapter settlement.
+// Manual factories retain their existing single-use path. Connected source is
+// not platform qualification; successor dialing remains privately gated.
 class configured_retirement_registry : public std::enable_shared_from_this<configured_retirement_registry> {
     friend class lattice::platform_retirement_receipt;
     friend struct configured_retirement_test_access;
@@ -47,6 +48,9 @@ public:
     // invoke once immediately, off leaf. The adapter request must be nonblocking
     // and retain its cleanup state until completion. No polling is required.
     bool bind_request(const platform_retirement_receipt&,request_handler);
+    bool bind_platform_bridge(const platform_retirement_receipt&,
+        std::shared_ptr<configured_platform_bridge>,request_handler);
+    std::shared_ptr<configured_attempt_custody> attempt_custody(const platform_retirement_receipt&) const noexcept;
     bool retain_transport(const platform_retirement_receipt&,std::shared_ptr<sync_transport>);
     bool request_retirement(const platform_retirement_receipt&) noexcept;
     // Internal coordinator assertion, not exposed through the SDK receipt.
@@ -54,7 +58,7 @@ public:
     // borrows. A cancel request or wrapper deletion alone cannot prove this.
     bool complete_native_cleanup(const platform_retirement_receipt&,int32_t) noexcept;
     configured_retirement_snapshot snapshot(const platform_retirement_receipt&) const noexcept;
-    // Only the future off-callback collector may call this. Adapter completion
+    // Only the off-callback collector may call this. Adapter completion
     // NEVER destroys custody. Nonzero first error permanently refuses release.
     // Also supports orphaned successful attempts, without resurrecting owner.
     bool collect_completed(const platform_retirement_receipt&) noexcept;
@@ -68,6 +72,8 @@ private:
         int32_t first_error=0;
         std::shared_ptr<const request_handler> request;
         std::shared_ptr<sync_transport> transport;
+        std::shared_ptr<configured_platform_bridge> bridge;
+        std::shared_ptr<configured_attempt_custody> custody;
     };
     mutable std::mutex mutex_;
     std::array<slot,maximum_owners> slots_{};

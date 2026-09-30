@@ -2075,6 +2075,7 @@ public:
     /// Used by Swift to decide whether to observe progress from the in-process
     /// synchronizer or fall back to AuditLog-based passive observation.
     bool is_sync_agent() const {
+        if (configured_sync_present()) return true;
         if (sync_lock_fd_ >= 0) return true;
         for (const auto& ipc : ipc_synchronizers_) {
             if (ipc.lock_fd >= 0) return true;
@@ -6108,6 +6109,18 @@ protected:
     friend class detail::recovery_local_producer_adapter;
     friend class detail::recovery_continuous_producer;
     std::shared_ptr<detail::recovery_continuous_admission> recovery_continuous_;
+    std::shared_ptr<detail::configured_recovery_connection> configured_connection() const noexcept;
+    bool configured_sync_present() const noexcept;
+    bool configured_sync_connected() const;
+    void configured_sync_now();
+    void configured_sync_upload();
+    void configured_sync_connect();
+    void configured_sync_disconnect();
+    void configured_sync_state(std::function<void(bool)>);
+    void configured_sync_error(std::function<void(const std::string&)>);
+    void configured_sync_progress(synchronizer::on_progress_handler);
+    synchronizer::sync_progress configured_sync_progress() const;
+    lattice_close_result configured_sync_close(std::chrono::steady_clock::time_point) noexcept;
     const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
     bool recovery_producer_bootstrapped_=false;
     bool administrative_owner_=false;
@@ -8863,6 +8876,7 @@ inline lattice_close_result lattice_db::teardown_sync_checked(bool fire_handoff)
         try {operation();}catch(...) {result.remember(std::current_exception());}
     };
     const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(2000);
+    if(configured_sync_present())result.merge(configured_sync_close(deadline));
     const auto drain=[&](synchronizer_base* sync) noexcept {
         if(!sync)return;const auto outcome=sync->drain_checked(deadline);
         result.remember(outcome.error,false);
@@ -9004,16 +9018,19 @@ inline lattice_db::~lattice_db() {
 }
 
 inline bool lattice_db::is_sync_connected() const {
+    if(configured_sync_present())return configured_sync_connected();
     return synchronizer_ && synchronizer_->is_connected();
 }
 
 inline void lattice_db::sync_now() {
+    if(configured_sync_present()){configured_sync_now();return;}
     if (synchronizer_) {
         synchronizer_->sync_now();
     }
 }
 
 inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     LOG_INFO("lattice_db", "update_sync_filter: %zu entries, wss=%d, ipc_syncs=%zu (db=%s)",
              filter.size(), synchronizer_ ? 1 : 0, ipc_synchronizers_.size(), config_.path.c_str());
     if (synchronizer_) {
@@ -9033,6 +9050,7 @@ inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter
 
 inline void lattice_db::update_sync_filter(const std::string& channel,
                                            std::vector<sync_filter_entry> filter) {
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     if (channel.empty()) {
         LOG_INFO("lattice_db", "update_sync_filter(wss): %zu entries (db=%s)",
                  filter.size(), config_.path.c_str());
@@ -9059,6 +9077,7 @@ inline void lattice_db::update_sync_filter(const std::string& channel,
 }
 
 inline void lattice_db::clear_sync_filter() {
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     if (synchronizer_) {
         synchronizer_->clear_sync_filter();
     }
@@ -9070,6 +9089,7 @@ inline void lattice_db::clear_sync_filter() {
 }
 
 inline void lattice_db::clear_sync_filter(const std::string& channel) {
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     if (channel.empty()) {
         config_.sync_filter = std::nullopt;
         if (synchronizer_) synchronizer_->clear_sync_filter();
@@ -9088,6 +9108,7 @@ inline void lattice_db::clear_sync_filter(const std::string& channel) {
 }
 
 inline void lattice_db::trigger_sync_upload() {
+    if(configured_sync_present()){configured_sync_upload();return;}
     // Dispatch via scheduler instead of calling sync_now() synchronously.
     // This method is called from the WAL hook; a synchronous sync_now()
     // would call upload_pending_changes() which sends data over the transport.
@@ -9113,6 +9134,7 @@ inline void lattice_db::trigger_sync_upload() {
 }
 
 inline void lattice_db::connect_sync() {
+    if(configured_sync_present()){configured_sync_connect();return;}
     if (synchronizer_) {
         synchronizer_->connect();
     } else if (config_.is_sync_enabled()) {
@@ -9122,12 +9144,14 @@ inline void lattice_db::connect_sync() {
 }
 
 inline void lattice_db::disconnect_sync() {
+    if(configured_sync_present()){configured_sync_disconnect();return;}
     if (synchronizer_) {
         synchronizer_->disconnect();
     }
 }
 
 inline void lattice_db::set_on_sync_state_change(std::function<void(bool connected)> handler) {
+    if(configured_sync_present()){configured_sync_state(std::move(handler));return;}
     on_sync_state_change_ = std::move(handler);
     if (synchronizer_) {
         synchronizer_->set_on_state_change(on_sync_state_change_);
@@ -9135,6 +9159,7 @@ inline void lattice_db::set_on_sync_state_change(std::function<void(bool connect
 }
 
 inline void lattice_db::set_on_sync_error(std::function<void(const std::string& error)> handler) {
+    if(configured_sync_present()){configured_sync_error(std::move(handler));return;}
     on_sync_error_ = std::move(handler);
     if (synchronizer_) {
         synchronizer_->set_on_error(on_sync_error_);
@@ -9146,6 +9171,10 @@ inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
     synchronizer::sync_progress agg;
     instance_registry::instance().for_each_alive(config_.path,
         [&agg](lattice_db* sibling) {
+            if(sibling->configured_sync_present()){
+                const auto p=sibling->configured_sync_progress();
+                agg.pending_upload+=p.pending_upload;agg.total_upload+=p.total_upload;agg.acked+=p.acked;agg.received+=p.received;
+            }
             if (sibling->synchronizer_) {
                 auto p = sibling->synchronizer_->get_progress();
                 agg.pending_upload += p.pending_upload;
@@ -9174,6 +9203,10 @@ inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler h
     // callback, which creates synchronizers on the accept thread.
     instance_registry::instance().for_each_alive(config_.path,
         [&handler](lattice_db* sibling) {
+            if(sibling->configured_sync_present()){
+                sibling->configured_sync_progress(handler);
+                return; // Continuous configuration excludes IPC targets.
+            }
             std::lock_guard<std::mutex> lock(sibling->ipc_callbacks_mutex_);
             sibling->on_sync_progress_ = handler;
             LOG_INFO("lattice_db", "  visiting sibling=%p, sync=%p, ipc_count=%zu",

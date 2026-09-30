@@ -5,5 +5,6 @@ module LatticeServerExportTestSupport {
     textual header "server_export_fixture.hpp"
     textual header "platform_transport_fixture.hpp"
     textual header "platform_retirement_fixture.hpp"
+    textual header "configured_platform_fixture.hpp"
     export *
 }

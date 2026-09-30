@@ -1265,6 +1265,9 @@ void lattice_db::setup_sync_if_configured() {
                 [&](lattice_db* sibling) {
                     if (kicked) return;
                     if (sibling == this) return;
+                    // Configured continuous owners require their actual full
+                    // retirement receipt; legacy URL kicking cannot replace it.
+                    if (sibling->configured_sync_present()) return;
                     if (sibling->synchronizer_ == nullptr) return;
                     if (sibling->config_.websocket_url == config_.websocket_url) return;
                     LOG_INFO("lattice_db",

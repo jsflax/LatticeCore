@@ -21,6 +21,7 @@
 #include <recovery_relay.hpp>
 #include <recovery_continuity.hpp>
 #include <lattice/platform_retirement.hpp>
+#include <lattice/configured_platform.hpp>
 #include <list.hpp>
 #include <error.hpp>
 

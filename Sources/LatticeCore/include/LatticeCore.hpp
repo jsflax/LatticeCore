@@ -36,6 +36,7 @@
 #include "lattice/schema.hpp"
 #include "lattice/scheduler.hpp"
 #include "lattice/network.hpp"
+#include "lattice/configured_platform.hpp"
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
 

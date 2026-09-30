@@ -5,3 +5,4 @@
 #include "platform_tls_fixture.hpp"
 
 #include "platform_retirement_fixture.hpp"
+#include "configured_platform_fixture.hpp"

@@ -1,4 +1,5 @@
 #include "sync_callback_lifetime.hpp"
+#include "configured_attempt_custody.hpp"
 #include <lattice/lattice.hpp>
 #include <limits>
 
@@ -9,10 +10,20 @@ struct sync_callback_lifetime::execution {
     sync_callback_lifetime& cell;uint64_t generation;execution* prior;
     std::shared_ptr<lattice_db> database;
     execution(sync_callback_lifetime& c,uint64_t g,std::shared_ptr<lattice_db> db):cell(c),generation(g),prior(current_),database(std::move(db)){current_=this;}
-    ~execution(){current_=prior;{std::lock_guard<std::mutex> lock(cell.mutex_);--cell.active_;}cell.settled_.notify_all();}
+    ~execution(){
+        if(cell.configured_)database.reset();
+        current_=prior;{std::lock_guard<std::mutex> lock(cell.mutex_);--cell.active_;}
+        cell.settled_.notify_all();if(cell.configured_)cell.configured_->wake();
+    }
 };
 thread_local sync_callback_lifetime::execution* sync_callback_lifetime::current_=nullptr;
 sync_callback_lifetime::sync_callback_lifetime(synchronizer_base* owner,const std::shared_ptr<lattice_db>& db):owner_(owner),database_(db){}
+void sync_callback_lifetime::configure(std::shared_ptr<configured_attempt_custody> custody,std::weak_ptr<configured_attempt> attempt){
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(configured_||ever_connected_||active_)throw db_error("configured callback custody must precede publication");
+    configured_=std::move(custody);configured_attempt_=std::move(attempt);
+}
+uint64_t sync_callback_lifetime::active_callbacks(){std::lock_guard<std::mutex> lock(mutex_);return active_;}
 uint64_t sync_callback_lifetime::dispatch_generation(){
     for(auto* e=current_;e;e=e->prior)if(&e->cell==this)return e->generation;
     std::lock_guard<std::mutex> lock(mutex_);return generation_;
@@ -63,12 +74,46 @@ void sync_callback_lifetime::platform_callback(uint64_t generation,const platfor
 void sync_callback_lifetime::platform_terminal_callback(uint64_t generation,const platform_transport_callbacks& attempt,const std::function<void()>& work){run(generation,work,true,&attempt,true);}
 void sync_callback_lifetime::terminal_notification(uint64_t generation,const std::function<void()>& work){run(generation,work,false);}
 namespace {
+struct configured_scheduled_payload {
+    // Reverse member destruction destroys ALL actual work captures before the
+    // final queue charge is released. Lambda copies retain this same payload.
+    configured_attempt_custody::lease charge;
+    std::shared_ptr<configured_attempt_custody> custody;
+    std::atomic<bool> entered{false};
+    std::function<void()> work;
+    configured_scheduled_payload(configured_attempt_custody::lease held,
+        std::shared_ptr<configured_attempt_custody> owner,std::function<void()>&& fn)
+        :charge(std::move(held)),custody(std::move(owner)),work(std::move(fn)){}
+    configured_scheduled_payload(configured_scheduled_payload&& prior)noexcept
+        :charge(std::move(prior.charge)),custody(std::move(prior.custody)),
+         entered(prior.entered.load(std::memory_order_relaxed)),work(std::move(prior.work)){}
+    ~configured_scheduled_payload(){if(custody&&!entered.load(std::memory_order_acquire))custody->fail(-3);}
+};
+void invoke_configured_payload(const std::shared_ptr<scheduler>& target,
+    const std::shared_ptr<sync_callback_lifetime>& lifetime,uint64_t generation,
+    std::function<void()>&& fn,bool terminal){
+    const auto custody=lifetime->configured();
+    auto charge=custody->admit(configured_attempt_custody::kind::payload,terminal);
+    if(!charge)throw db_error("configured scheduled payload admission closed");
+    configured_scheduled_payload pending(std::move(charge),custody,std::move(fn));
+    if(!target->can_invoke()){custody->fail(-3);throw db_error("configured scheduler refused submission");}
+    // Reserve before make_shared or the target's new retained callable copy.
+    // The stack envelope also releases work before the charge if allocation
+    // fails, before a retained envelope exists.
+    auto payload=std::make_shared<configured_scheduled_payload>(std::move(pending));
+    target->invoke([lifetime,generation,payload,terminal]{
+        payload->entered.store(true,std::memory_order_release);
+        if(terminal)lifetime->terminal_notification(generation,payload->work);
+        else lifetime->queued(generation,payload->work);
+    });
+}
 class lifetime_scheduler final : public scheduler {
     std::shared_ptr<scheduler> target_;std::shared_ptr<sync_callback_lifetime> lifetime_;
 public:
     lifetime_scheduler(std::shared_ptr<scheduler> target,std::shared_ptr<sync_callback_lifetime> lifetime):target_(std::move(target)),lifetime_(std::move(lifetime)){}
     void invoke(std::function<void()>&& fn)override{
         auto lifetime=lifetime_;const auto generation=lifetime->dispatch_generation();
+        if(lifetime->configured()){invoke_configured_payload(target_,lifetime,generation,std::move(fn),false);return;}
         // Construct/copy all user-owned captures before any leaf admission.
         auto work=std::make_shared<std::function<void()>>(std::move(fn));
         const auto target=target_;
@@ -87,6 +132,7 @@ void schedule_sync_terminal_notification(std::shared_ptr<scheduler> target,std::
     // Only copied terminal notification payloads use this seam. It bypasses
     // ended-attempt admission, never owner retirement or generation fencing.
     if(const auto wrapper=std::dynamic_pointer_cast<lifetime_scheduler>(target))target=wrapper->target();
+    if(lifetime->configured()){invoke_configured_payload(target,lifetime,generation,std::move(work),true);return;}
     target->invoke([lifetime,generation,work=std::move(work)]{lifetime->terminal_notification(generation,work);});
 }
 void report_sync_background_error(std::shared_ptr<scheduler> scheduled,std::shared_ptr<sync_callback_lifetime> lifetime,uint64_t generation,
@@ -129,14 +175,28 @@ std::shared_ptr<sync_retirement_lane> sync_retirement_lane::instance(){
 sync_retirement_lane::reservation::reservation(std::shared_ptr<sync_retirement_lane> lane,size_t slot,uint64_t serial):lane_(std::move(lane)),slot_(slot),serial_(serial){}
 sync_retirement_lane::reservation::reservation(reservation&& other)noexcept:lane_(std::move(other.lane_)),slot_(other.slot_),serial_(other.serial_),published_(other.published_){}
 sync_retirement_lane::reservation::~reservation(){if(lane_){if(published_)lane_->request(slot_,serial_);else lane_->cancel(slot_,serial_);}}
+void sync_retirement_lane::reservation::bind(std::shared_ptr<sync_transport> transport,
+    std::shared_ptr<sync_callback_lifetime> lifetime,std::function<void(sync_retirement_result)> callback){
+    if(!lane_||!transport)throw db_error("configured native reservation requires actual transport");
+    auto retained=std::make_shared<const std::function<void(sync_retirement_result)>>(std::move(callback));
+    std::lock_guard<std::mutex> lock(lane_->mutex_);auto& slot=lane_->slots_[slot_];
+    if(slot.serial!=serial_||slot.state!=phase::reserved||slot.transport||slot.completed)
+        throw db_error("configured native reservation already bound or retired");
+    slot.transport=std::move(transport);slot.lifetime=std::move(lifetime);slot.completed=std::move(retained);
+}
 void sync_retirement_lane::reservation::retire(std::thread pacer)noexcept{if(lane_){lane_->request(slot_,serial_,std::move(pacer));lane_.reset();}else if(pacer.joinable())std::terminate();}
 sync_retirement_lane::reservation sync_retirement_lane::reserve(std::shared_ptr<sync_transport> transport,std::shared_ptr<sync_callback_lifetime> lifetime){
     if(!transport)throw db_error("protected retirement requires actual transport");
+    auto reserved=reserve_empty();
+    {std::lock_guard<std::mutex> lock(mutex_);auto& slot=slots_[reserved.slot_];slot.transport=std::move(transport);slot.lifetime=std::move(lifetime);}
+    return reserved;
+}
+sync_retirement_lane::reservation sync_retirement_lane::reserve_empty(){
     auto keep=shared_from_this();
     std::lock_guard<std::mutex> lock(mutex_);if(stopping_||next_order_==std::numeric_limits<uint64_t>::max())throw db_error("protected retirement lane stopped or serial exhausted");
     for(size_t i=0;i<capacity_;++i){auto& slot=slots_[i];if(slot.state!=phase::free)continue;
         if(slot.serial==std::numeric_limits<uint64_t>::max())continue;
-        ++slot.serial;slot.queued_order=++next_order_;slot.transport=std::move(transport);slot.lifetime=std::move(lifetime);slot.state=phase::reserved;return {std::move(keep),i,slot.serial};
+        ++slot.serial;slot.queued_order=++next_order_;slot.state=phase::reserved;return {std::move(keep),i,slot.serial};
     }
     throw db_error("protected retirement capacity exhausted before publication");
 }
@@ -148,7 +208,8 @@ void sync_retirement_lane::request(size_t i,uint64_t serial,std::thread pacer)no
 }
 void sync_retirement_lane::cancel(size_t i,uint64_t serial)noexcept{
     std::shared_ptr<sync_transport> discarded;std::shared_ptr<sync_callback_lifetime> discarded_lifetime;
-    {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[i];if(s.serial==serial&&s.state==phase::reserved){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);s.state=phase::free;}}
+    std::shared_ptr<const std::function<void(sync_retirement_result)>> callback;
+    {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[i];if(s.serial==serial&&s.state==phase::reserved){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);callback=std::move(s.completed);s.state=phase::free;}}
     settled_.notify_all(); // discarded captures are released outside leaf lock
 }
 void sync_retirement_lane::loop(){
@@ -159,23 +220,25 @@ void sync_retirement_lane::loop(){
             if(index==slots_.size()){if(stopping_)return;continue;}
             auto& s=slots_[index];s.state=phase::active;held=s.transport;
         }
-        bool complete=false;
-        try{
-            held->disconnect();
-            auto& slot=slots_[index]; // Active slot is exclusively worker-owned.
-            if(slot.pacer.joinable()){
-                if(slot.pacer.get_id()==std::this_thread::get_id())throw db_error("protected retirement self join refused");
-                slot.pacer.join();
-            }
-            // disconnect() is not a quiescence contract. Wait the independent
-            // admitted turns too, retaining actual transport through the wait.
-            if(slot.lifetime)slot.lifetime->wait_for_foreign();
-            complete=true;
-        }catch(...){}
+        sync_retirement_result result;
+        const auto attempt=[&](auto&& work){try{work();}catch(...){if(!result.first_error)result.first_error=-4;}};
+        auto& active=slots_[index]; // Active slot is exclusively worker-owned.
+        attempt([&]{if(held)held->disconnect();result.disconnect_returned=true;});
+        result.pacer_present=active.pacer.joinable();
+        attempt([&]{if(active.pacer.joinable()){
+            if(active.pacer.get_id()==std::this_thread::get_id())throw db_error("protected retirement self join refused");
+            active.pacer.join();result.pacer_joined=true;
+        }});
+        // A failed disconnect never skips the actual join/callback settlement.
+        attempt([&]{if(active.lifetime)active.lifetime->wait_for_foreign();result.callbacks_settled=true;});
+        const bool complete=result.first_error==0;
         std::shared_ptr<sync_transport> discarded;std::shared_ptr<sync_callback_lifetime> discarded_lifetime;
-        {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[index];if(complete){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);}else s.state=phase::quarantined;}
-        held.reset();discarded.reset();
+        std::shared_ptr<const std::function<void(sync_retirement_result)>> callback;
+        {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[index];callback=std::move(s.completed);if(complete){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);}else s.state=phase::quarantined;}
+        held.reset();discarded.reset();discarded_lifetime.reset();
         if(complete){std::lock_guard<std::mutex> lock(mutex_);slots_[index].state=phase::free;}
+        if(callback&&*callback)try{(*callback)(result);}catch(...){}
+        callback.reset();
         settled_.notify_all();
     }
 }

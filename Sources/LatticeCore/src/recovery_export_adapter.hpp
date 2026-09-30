@@ -73,12 +73,16 @@ class recovery_export_route {
     std::shared_ptr<sync_callback_lifetime> lifetime_;
 #ifndef __EMSCRIPTEN__
     std::optional<sync_retirement_lane::reservation> retirement_;
+    bool configured_reservation_=false;
 #endif
     uint64_t generation_=0;
     bool open_=false, retired_=false, protected_=false;
 public:
     explicit recovery_export_route(std::shared_ptr<sync_transport>,std::shared_ptr<sync_callback_lifetime>);
     void prepare_protected(uint64_t generation);
+#ifndef __EMSCRIPTEN__
+    void install_configured_retirement(sync_retirement_lane::reservation);
+#endif
     bool retire_protected(std::thread = {}) noexcept;
     void publish(uint64_t generation,bool open) noexcept;
     void retire() noexcept;

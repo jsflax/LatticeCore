@@ -903,11 +903,24 @@ void recovery_export_adapter::revalidate_claimed_frame(const committed_export_fr
     recovery_export_adapter::require_committed(result);
 }
 recovery_export_route::recovery_export_route(std::shared_ptr<sync_transport> transport,std::shared_ptr<sync_callback_lifetime> lifetime):transport_(std::move(transport)),lifetime_(std::move(lifetime)){}
+#ifndef __EMSCRIPTEN__
+void recovery_export_route::install_configured_retirement(sync_retirement_lane::reservation reservation){
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(retired_||retirement_||protected_)refuse("configured native reservation already published");
+    retirement_.emplace(std::move(reservation));retirement_->publish();configured_reservation_=true;
+}
+#endif
 void recovery_export_route::prepare_protected(uint64_t generation){
 #ifdef __EMSCRIPTEN__
     refuse("protected export retirement is not available in the browser graph");
 #else
     if(!lifetime_->can_begin_protected(generation))refuse("protected export requires a fresh physical endpoint");
+    {std::lock_guard<std::mutex> lock(mutex_);
+        if(configured_reservation_){
+            if(retired_||protected_||!retirement_)refuse("configured protected route already published or retired");
+            lifetime_->begin_connect(generation,true);protected_=true;return;
+        }
+    }
     // Worker launch and capacity reservation happen before any route/handler
     // publication. The reserved slot owns the transport throughout callbacks.
     auto reservation=sync_retirement_lane::instance()->reserve(transport_,lifetime_);

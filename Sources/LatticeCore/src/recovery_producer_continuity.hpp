@@ -93,10 +93,12 @@ public:
 };
 class recovery_continuous_route {
     friend class recovery_continuous_producer;
+    friend struct configured_attempt;
     std::shared_ptr<recovery_continuous_state> state_;
     std::weak_ptr<lattice_db> owner_;
     uint64_t route_=0;
     int64_t incarnation_=0;
+    std::function<void()> configured_unregistered_;
     recovery_continuous_route()=default;
 public:
     ~recovery_continuous_route();

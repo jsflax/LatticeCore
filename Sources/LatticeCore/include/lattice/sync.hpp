@@ -35,6 +35,7 @@ struct sync_drain_result {
 // Forward declaration
 class lattice_db;
 namespace detail {class recovery_continuous_producer;class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;struct automatic_export_admission_test_access;}
+namespace detail {class configured_recovery_connection;struct configured_attempt;}
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -409,6 +410,10 @@ protected:
     /// Common init — call from subclass constructors after db is set up.
     void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched);
     void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
+                   std::shared_ptr<detail::configured_attempt> configured);
+    void begin_configured_retirement();
+    friend class detail::configured_recovery_connection;
+    void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
                    std::unique_ptr<sync_transport> transport);
 
     sync_config config_;
@@ -674,7 +679,9 @@ public:
 class synchronizer : public synchronizer_base {
     enum class scheduler_ownership { borrowed, owned };
     synchronizer(std::shared_ptr<lattice_db>,const sync_config&,scheduler_ownership);
+    synchronizer(std::shared_ptr<lattice_db>,const sync_config&,std::shared_ptr<detail::configured_attempt>);
     friend class detail::recovery_continuous_producer;
+    friend class detail::configured_recovery_connection;
 public:
     synchronizer(std::shared_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);

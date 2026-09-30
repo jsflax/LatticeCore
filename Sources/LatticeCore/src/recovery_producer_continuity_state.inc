@@ -56,6 +56,12 @@ struct recovery_continuous_admission {
     std::shared_ptr<recovery_continuous_state> state;
     lattice_db* owner=nullptr;
     database* writer=nullptr;
+    std::weak_ptr<lattice_db> retained_owner;
+#ifndef __EMSCRIPTEN__
+    mutable std::mutex configured_mutex;
+    std::shared_ptr<configured_recovery_connection> configured;
+    bool configuring=false;
+#endif
     bool counted=false;
     ~recovery_continuous_admission(){if(counted){std::lock_guard<std::mutex> lock(state->mutex);--state->owners;}}
 };

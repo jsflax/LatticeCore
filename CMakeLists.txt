@@ -75,6 +75,9 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/recovery_server_export.cpp
     Sources/LatticeCore/src/sync_callback_lifetime.cpp
     Sources/LatticeCore/src/configured_retirement.cpp
+    Sources/LatticeCore/src/configured_attempt_custody.cpp
+    Sources/LatticeCore/src/configured_platform.cpp
+    Sources/LatticeCore/src/configured_recovery_connection.cpp
     Sources/LatticeCore/src/scoped_recovery_install.cpp
     Sources/LatticeCore/src/recovery_witness.cpp
     Sources/LatticeCore/src/recovery_refresh.cpp
@@ -316,6 +319,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
     Tests/LatticeCoreTests/DatabaseRetirementTests.cpp
     Tests/LatticeCoreTests/ConfiguredRetirementTests.cpp
+    Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp
     Tests/LatticeCoreTests/OrdinaryStoreAdmissionTests.cpp
     Tests/LatticeCoreTests/OrdinaryOwnedLaunchTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp

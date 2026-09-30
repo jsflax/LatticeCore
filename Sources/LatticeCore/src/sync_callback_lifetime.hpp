@@ -9,6 +9,8 @@
 
 namespace lattice {class lattice_db;class synchronizer_base;}
 namespace lattice::detail {
+class configured_attempt_custody;
+struct configured_attempt;
 namespace sync_background_test_hooks {
 // Private bounded rendezvous copied at worker creation. Production is null.
 // Callbacks may only coordinate a test; completion must not throw.
@@ -64,9 +66,15 @@ class sync_callback_lifetime {
     std::weak_ptr<lattice_db> database_;
     uint64_t generation_=1, active_=0, protected_generation_=0;
     bool retired_=false, ever_connected_=false, protected_=false, attempt_live_=false;
+    std::shared_ptr<configured_attempt_custody> configured_;
+    std::weak_ptr<configured_attempt> configured_attempt_;
     bool run(uint64_t,const std::function<void()>&,bool require_live=true,const platform_transport_callbacks* attempt=nullptr,bool terminal=false);
 public:
     sync_callback_lifetime(synchronizer_base*,const std::shared_ptr<lattice_db>&);
+    void configure(std::shared_ptr<configured_attempt_custody>,std::weak_ptr<configured_attempt>);
+    std::shared_ptr<configured_attempt_custody> configured() const noexcept{return configured_;}
+    std::shared_ptr<configured_attempt> configured_attempt_owner()const noexcept{return configured_attempt_.lock();}
+    uint64_t active_callbacks();
     uint64_t dispatch_generation();
     void publish_generation(uint64_t);
     bool can_begin_protected(uint64_t);
@@ -97,9 +105,14 @@ std::shared_ptr<scheduler> make_sync_lifetime_scheduler(std::shared_ptr<schedule
 
 #ifndef __EMSCRIPTEN__
 struct sync_retirement_test_access;
+struct sync_retirement_result {
+    int32_t first_error=0;
+    bool disconnect_returned=false,pacer_present=false,pacer_joined=false,callbacks_settled=false;
+    bool unstarted_reservation_canceled=false;
+};
 class sync_retirement_lane : public std::enable_shared_from_this<sync_retirement_lane> {
     enum class phase { free,reserved,queued,active,quarantined };
-    struct slot {phase state=phase::free;uint64_t serial=0,queued_order=0;std::shared_ptr<sync_transport> transport;std::shared_ptr<sync_callback_lifetime> lifetime;std::thread pacer;};
+    struct slot {phase state=phase::free;uint64_t serial=0,queued_order=0;std::shared_ptr<sync_transport> transport;std::shared_ptr<sync_callback_lifetime> lifetime;std::thread pacer;std::shared_ptr<const std::function<void(sync_retirement_result)>> completed;};
     std::array<slot,64> slots_{};
     std::mutex mutex_;
     std::condition_variable ready_,settled_;
@@ -125,6 +138,8 @@ public:
         reservation& operator=(reservation&&)=delete;
         reservation(const reservation&)=delete;
         ~reservation();
+        void bind(std::shared_ptr<sync_transport>,std::shared_ptr<sync_callback_lifetime>,
+            std::function<void(sync_retirement_result)>);
         void publish()noexcept{published_=true;}
         void retire(std::thread = {})noexcept;
     };
@@ -133,6 +148,9 @@ public:
     // All 64 states share the ceiling. Reserve before protected publication;
     // a slow/failed retirement keeps its slot and refuses excess new opens.
     reservation reserve(std::shared_ptr<sync_transport>,std::shared_ptr<sync_callback_lifetime> = {});
+    // Configured path reserves the SAME native slot before entering a foreign
+    // factory. Binding later supplies actual resources, without another slot.
+    reservation reserve_empty();
 };
 #endif
 } // namespace lattice::detail

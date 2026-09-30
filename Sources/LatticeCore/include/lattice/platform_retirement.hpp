@@ -4,14 +4,15 @@
 #include <cstdint>
 #include <memory>
 
-namespace lattice::detail { class configured_retirement_registry; }
+namespace lattice::detail { class configured_retirement_registry; struct configured_platform_access; }
 namespace lattice {
-// Internal SDK boundary, inactive until a configured owner supplies it. This
+// Internal SDK boundary supplied by the private configured owner. This
 // is resource-lifetime provenance, never source/TLS/recovery authority. Copies
 // retain only a fixed registry and exact slot/attempt, not a native owner,
 // transport, socket or synchronizer. A default value is always invalid.
 class platform_retirement_receipt {
     friend class detail::configured_retirement_registry;
+    friend struct detail::configured_platform_access;
     std::shared_ptr<detail::configured_retirement_registry> registry_;
     size_t slot_=0;
     uint64_t owner_=0,attempt_=0;

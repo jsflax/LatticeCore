@@ -150,6 +150,7 @@ recovery_continuous_open_result recovery_continuous_producer::open_owned(const c
         if(!owner||owner->recovery_continuous_!=admission||owner->db_.get()!=admission->writer)
             refuse("continuous recipe did not retain the admitted physical owner");
         admission->owner=owner.get();
+        admission->retained_owner=owner;
         output.settlement=enroll(owner);
         if(output.settlement.state!=recovery_install_state::committed||output.settlement.postcommit_error){
             try{owner->close();}catch(...){output.settlement.cleanup_error=std::current_exception();}
@@ -272,7 +273,10 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
     if(candidate&&result.state!=recovery_install_state::committed)candidate->active->store(false,std::memory_order_release);
     return result;
 }
-recovery_continuous_route::~recovery_continuous_route(){if(state_){std::lock_guard<std::mutex> lock(state_->mutex);--state_->routes;}}
+recovery_continuous_route::~recovery_continuous_route(){
+    if(state_){std::lock_guard<std::mutex> lock(state_->mutex);--state_->routes;}
+    if(configured_unregistered_)configured_unregistered_();
+}
 recovery_continuous_work::~recovery_continuous_work(){if(state_){std::lock_guard<std::mutex> lock(state_->mutex);--state_->operations;}}
 std::shared_ptr<recovery_continuous_route> recovery_continuous_producer::admit_route(std::shared_ptr<lattice_db> owner,const sync_config& config,bool injected) {
     if(!owner)return {};
@@ -480,6 +484,47 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     bool admitted=false;for(const auto& route:state->policy.routes)if(route.sync_id==config.sync_id&&route.endpoint==config.websocket_url)admitted=true;
     if(!admitted||config.sync_filter)refuse("continuous configured route outside immutable coverage");
     if(owner.synchronizer_)return;
+    const auto admission=owner.recovery_continuous_;
+    const auto actual_owner=admission->retained_owner.lock();
+    if(!actual_owner||actual_owner.get()!=&owner||actual_owner->recovery_continuous_!=admission||owner.is_closed())
+        refuse("configured route lost actual retained parent");
+    const auto factory=get_network_factory();
+    if(auto* typed=dynamic_cast<configured_platform_factory*>(factory.get())){
+        {
+            std::lock_guard<std::mutex> lock(admission->configured_mutex);
+            if(admission->configured)return;
+            if(admission->configuring)refuse("configured route construction already in progress");
+            admission->configuring=true;
+        }
+        std::shared_ptr<configured_recovery_connection> configured;
+        try{
+            const auto path=owner.config_.path;const auto busy_timeout=owner.config_.busy_timeout_ms;
+            const auto schema_version=owner.config_.target_schema_version;const auto recipe=admission->recipe;
+            const auto policy=state->policy;
+            configured=configured_recovery_connection::create(actual_owner,config,factory,typed,[path,busy_timeout,schema_version,recipe,policy]{
+                configuration child(path,std::make_shared<std_thread_scheduler>());
+                child.busy_timeout_ms=busy_timeout;child.target_schema_version=schema_version;
+                auto opened=open_owned(child,policy,recipe);
+                if(!opened.owner||opened.settlement.state!=recovery_install_state::committed||opened.settlement.postcommit_error){
+                    if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);
+                    if(opened.settlement.postcommit_error)std::rethrow_exception(opened.settlement.postcommit_error);
+                    refuse("configured dedicated facade open failed");
+                }
+                return opened.owner;
+            });
+            configured->set_state(owner.on_sync_state_change_);configured->set_error(owner.on_sync_error_);
+            configured->set_progress(owner.on_sync_progress_);
+            {std::lock_guard<std::mutex> lock(admission->configured_mutex);admission->configured=configured;admission->configuring=false;}
+            configured->start();
+        }catch(...){
+            if(configured)configured->abandon_start(std::current_exception());
+            {std::lock_guard<std::mutex> lock(admission->configured_mutex);admission->configuring=false;}
+            throw;
+        }
+        return;
+    }
+    // Unsupported factories preserve their one physical/manual path. They
+    // never acquire an automatic replacement grant or a new registry charge.
     configuration child(owner.config_.path,std::make_shared<std_thread_scheduler>());
     child.busy_timeout_ms=owner.config_.busy_timeout_ms;child.target_schema_version=owner.config_.target_schema_version;
     auto opened=open_owned(child,state->policy,owner.recovery_continuous_->recipe);

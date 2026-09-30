@@ -8,6 +8,9 @@
 #include "canonical_writer_adapter.hpp"
 #include "receive_delivery_guard.hpp"
 #include "recovery_export_adapter.hpp"
+#ifndef __EMSCRIPTEN__
+#include "configured_recovery_connection.hpp"
+#endif
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
 #include <nlohmann/json.hpp>
@@ -685,6 +688,10 @@ synchronizer_base::synchronizer_base()
      progress_pending_upload_(upload_tracking_->pending) {}
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched) {
+    init_sync(config,std::move(sched),std::shared_ptr<detail::configured_attempt>{});
+}
+void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
+    std::shared_ptr<detail::configured_attempt> configured) {
     continuous_route_=detail::recovery_continuous_producer::admit_route(owned_db_,config,false);
     config_ = config;
     log_label_cache_ = config_.log_label;
@@ -698,6 +705,9 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     scheduler_ = sched;
 #endif
     callback_lifetime_=std::make_shared<detail::sync_callback_lifetime>(this,owned_db_);
+#ifndef __EMSCRIPTEN__
+    if(configured){callback_lifetime_->configure(configured->custody,configured);configured->install_lifetime(callback_lifetime_);}
+#endif
     pacer_state_=std::make_shared<detail::sync_pacer_state>();
     discovery_deferral_=std::make_shared<detail::sync_discovery_deferral>();
     scheduler_=detail::make_sync_lifetime_scheduler(std::move(scheduler_),callback_lifetime_);
@@ -705,10 +715,24 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     counted_instance_=true;
     LOG_INFO("synchronizer", "[%s] CREATED (WSS, this=%p, db=%s, alive=%lld)",
              log_id(), (void*)this, db().config().path.c_str(), (long long)n);
-    auto factory = get_network_factory();
-    ws_client_ = factory->create_sync_transport(scheduler_);
+#ifndef __EMSCRIPTEN__
+    if(configured){
+        auto factory_use=configured->custody->admit(detail::configured_attempt_custody::kind::command);
+        if(!factory_use)throw db_error("configured factory admission closed before allocation");
+        configured->factory_entered=true;
+        ws_client_=configured->typed_factory->create_configured_sync_transport(scheduler_,configured->receipt);
+    }else
+#endif
+    {auto factory=get_network_factory();ws_client_=factory->create_sync_transport(scheduler_);}
     if(!ws_client_)throw db_error("synchronizer requires transport");
     recovery_export_route_ = std::make_shared<detail::recovery_export_route>(ws_client_,callback_lifetime_);
+#ifndef __EMSCRIPTEN__
+    if(configured){
+        configured->bind(ws_client_,callback_lifetime_,continuous_route_);
+        recovery_export_route_->install_configured_retirement(std::move(*configured->native_reservation));
+        configured->native_reservation.reset();
+    }
+#endif
     setup_transport_handlers();
     setup_observer();
     // Validate before first dial, before the pacer can observe these members.
@@ -718,7 +742,11 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     if(receiver_controller_) {
         const auto life=callback_lifetime_;
         receiver_controller_->notifications([this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});},
-            [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{connect();});},
+            [this,life]{
+#ifndef __EMSCRIPTEN__
+                if(auto configured=life->configured_attempt_owner()){configured->request_renewal();return;}
+#endif
+                const auto generation=life->dispatch_generation();life->queued(generation,[this]{connect();});},
             [this,life](std::exception_ptr error){const auto generation=life->dispatch_generation();life->queued(generation,[this,error]{
                 detail::report_sync_background_error(scheduler_,callback_lifetime_,callback_lifetime_->dispatch_generation(),on_error_,error,"canonical receiver");});},
             [this,life]{const auto generation=life->dispatch_generation();life->queued(generation,[this]{request_upload(true);});});
@@ -1132,7 +1160,7 @@ void synchronizer_base::stop_pacer() {
 bool synchronizer_base::retire_protected_transport() noexcept {
 #ifndef __EMSCRIPTEN__
     const auto lifetime=callback_lifetime_;const auto route=recovery_export_route_;const auto state=pacer_state_;
-    if(!lifetime||!route||!state||!lifetime->protected_route())return false;
+    if(!lifetime||!route||!state||(!lifetime->protected_route()&&!lifetime->configured()))return false;
     {
         // Serialize the thread move with the FIRST retirement publication.
         // retire_protected only closes admission and queues the pre-reserved
@@ -1145,6 +1173,17 @@ bool synchronizer_base::retire_protected_transport() noexcept {
 #else
     return false;
 #endif
+}
+
+void synchronizer_base::begin_configured_retirement(){
+    if(!callback_lifetime_||!callback_lifetime_->configured())throw db_error("configured retirement requires exact attempt custody");
+    callback_lifetime_->end_protected_attempt();
+    is_connected_=false;
+    if(discovery_deferral_)discovery_deferral_->cancel(reconnect_lifecycle_.load(),true);
+    // Keep copied terminal notifications admitted by this lifetime runnable.
+    // Full lifetime retirement waits for queued payload/callback settlement.
+    retire_protected_transport();
+    {std::lock_guard<std::mutex> lock(ack_guard_->m);ack_guard_->alive=false;}
 }
 
 void synchronizer_base::setup_transport_handlers() {
@@ -1784,6 +1823,9 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
 void synchronizer_base::on_websocket_error(const std::string& error) {
     if(callback_lifetime_->protected_route()) {
         const auto scheduled=scheduler_;const auto lifetime=callback_lifetime_;
+#ifndef __EMSCRIPTEN__
+        struct renewal_on_exit {std::shared_ptr<detail::configured_attempt> attempt;~renewal_on_exit(){if(attempt)attempt->request_renewal();}} renewal{lifetime->configured_attempt_owner()};
+#endif
         const auto generation=lifetime->dispatch_generation();const auto callback=on_error_;
         is_connected_=false;
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);upload_tracking_->clear_ids_locked();progress_pending_upload_.store(0);}
@@ -1844,6 +1886,9 @@ void synchronizer_base::on_websocket_error(const std::string& error) {
 void synchronizer_base::on_websocket_close(int code, const std::string& reason) {
     if(callback_lifetime_->protected_route()) {
         const auto scheduled=scheduler_;const auto lifetime=callback_lifetime_;
+#ifndef __EMSCRIPTEN__
+        struct renewal_on_exit {std::shared_ptr<detail::configured_attempt> attempt;~renewal_on_exit(){if(attempt)attempt->request_renewal();}} renewal{lifetime->configured_attempt_owner()};
+#endif
         const auto generation=lifetime->dispatch_generation();const auto callback=on_state_change_;
         is_connected_=false;
         {std::lock_guard<std::mutex> lock(in_flight_mutex_);upload_tracking_->clear_ids_locked();progress_pending_upload_.store(0);}
@@ -2882,15 +2927,19 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
     // them from in-flight and re-upload; applies are idempotent
     // (ON CONFLICT(globalId) DO UPDATE), so re-delivery is safe.
     //
-    // Runs on a detached thread, NOT the scheduler: ACK processing is
+    // Runs off the scheduler: ACK processing is
     // serialized through the (single-threaded) scheduler, so a blocking
     // wait there would deadlock its own exit condition. Lifetime is
-    // guarded by ack_guard_ (see its declaration).
+    // guarded by ack_guard_ (see its declaration). Configured attempts retain
+    // and join the real worker; legacy/manual routes retain their detached path.
     //
     // Not on Emscripten: the WASM build has no pthreads. Browser clients
     // forgo the client-side resend — a dropped frame is recovered on the
     // next reconnect (tab visibility / socket cycle) instead.
 #ifndef __EMSCRIPTEN__
+    const auto configured_custody=callback_lifetime_->configured();
+    auto launcher_charge=configured_custody?configured_custody->admit(detail::configured_attempt_custody::kind::payload):detail::configured_attempt_custody::lease{};
+    if(configured_custody&&!launcher_charge)throw db_error("configured ACK launcher admission closed");
     std::vector<std::string> sent_ids;
     sent_ids.reserve(entries.size());
     for (const auto& e : entries) sent_ids.push_back(e.global_id);
@@ -2902,15 +2951,17 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
     const auto scheduled=scheduler_;const auto test_schedule=detail::sync_background_test_hooks::ack;
     // This launcher owns every input before a foreign send. It may execute
     // after that send synchronously ACKed or destroyed the owner.
-    return [guard = ack_guard_, self = this, sent_ids = std::move(sent_ids),
-            ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule,after_handoff,delivery_token,delivery_retry=std::move(delivery_retry)]() mutable {
+    auto launcher=[guard = ack_guard_, self = this, sent_ids = std::move(sent_ids),
+            ack_timeout_base_ms, resend_failures,lifetime,generation,scheduled,test_schedule,after_handoff,delivery_token,configured_custody,delivery_retry=std::move(delivery_retry)]() mutable {
       if(after_handoff){
           std::lock_guard<std::mutex> g(guard->m);
           if(!guard->alive||!lifetime->current(generation))return;
           std::lock_guard<std::mutex> lock(self->in_flight_mutex_);
           if(std::none_of(sent_ids.begin(),sent_ids.end(),[&](const auto& id){return self->upload_tracking_->matches_locked(id,generation,delivery_token,true);}))return;
       }
-      std::thread([guard,self,sent_ids=std::move(sent_ids),ack_timeout_base_ms,resend_failures,
+      auto worker_charge=configured_custody?configured_custody->admit(detail::configured_attempt_custody::kind::payload):detail::configured_attempt_custody::lease{};
+      if(configured_custody&&!worker_charge)throw db_error("configured ACK worker admission closed");
+      auto worker=[guard,self,sent_ids=std::move(sent_ids),ack_timeout_base_ms,resend_failures,
                    lifetime,generation,scheduled,test_schedule,delivery_token,delivery_retry=std::move(delivery_retry)] {
         struct completion {
             std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> test;
@@ -2993,8 +3044,12 @@ std::function<void()> synchronizer_base::prepare_ack_retry(const std::vector<aud
             if(lifetime->current(generation))self->request_upload(true);
         });
         }catch(...) {detail::report_sync_background_error(scheduled,lifetime,generation,{},std::current_exception(),"ACK retry worker");}
-      }).detach();
+      };
+      if(configured_custody)configured_custody->launch_worker(std::move(worker_charge),std::move(worker));
+      else std::thread(std::move(worker)).detach();
     };
+    if(configured_custody)return detail::retain_configured_payload(std::move(launcher_charge),std::move(launcher));
+    return launcher;
 #else
     return []{};
 #endif  // !__EMSCRIPTEN__
@@ -3598,6 +3653,15 @@ synchronizer::synchronizer(std::shared_ptr<lattice_db> db,const sync_config& con
     owned_db_=std::move(db);db_ptr_=owned_db_.get();
     auto sched=owned_db_->get_scheduler()?owned_db_->get_scheduler():std::make_shared<immediate_scheduler>();
     init_sync(config,std::move(sched));
+}
+
+synchronizer::synchronizer(std::shared_ptr<lattice_db> db,const sync_config& config,
+    std::shared_ptr<detail::configured_attempt> configured){
+    if(!db||!configured)throw db_error("configured synchronizer requires retained child and issued attempt");
+    owned_db_=std::move(db);db_ptr_=owned_db_.get();
+    auto scheduled=owned_db_->get_scheduler();
+    if(!scheduled)throw db_error("configured synchronizer requires actual dedicated scheduler");
+    init_sync(config,std::move(scheduled),std::move(configured));
 }
 
 synchronizer::synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config)

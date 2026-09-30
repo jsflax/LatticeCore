@@ -388,4 +388,70 @@ TEST(ConfiguredConnectionConstruction, FailedConstructorRetainsActualDestructorE
         }
     }
 }
+
+TEST_F(ConfiguredConnectionOwner, ConnectedReplaySurvivesFalseCheckOpenThenRegistrationAndCanClose) {
+    open();ASSERT_TRUE(owner);EXPECT_FALSE(owner->is_sync_connected());
+    struct result_state {
+        std::mutex mutex;std::condition_variable changed;bool opened=false,replayed=false;
+        std::thread::id replay_thread;lattice_close_result close;
+    };
+    const auto result=std::make_shared<result_state>();
+    owner->set_on_sync_state_change([result](bool connected){
+        if(!connected)return;
+        {std::lock_guard<std::mutex> lock(result->mutex);result->opened=true;}result->changed.notify_all();
+    });
+    factory->wire->endpoint(0).trigger_on_open();
+    {
+        std::unique_lock<std::mutex> lock(result->mutex);
+        ASSERT_TRUE(result->changed.wait_for(lock,std::chrono::seconds(5),[&]{return result->opened;}));
+    }
+    // The one real open was delivered before this listener is registered:
+    // replay is required to close the check/register race, without another dial.
+    const std::weak_ptr<lattice_db> weak=owner;const auto caller=std::this_thread::get_id();
+    owner->set_on_sync_state_change([result,weak](bool connected){
+        if(!connected)return;
+        const auto current=weak.lock();if(!current)return;
+        const auto closed=current->close_checked();
+        {std::lock_guard<std::mutex> lock(result->mutex);result->close=closed;
+            result->replay_thread=std::this_thread::get_id();result->replayed=true;}
+        result->changed.notify_all();
+    });
+    {
+        std::unique_lock<std::mutex> lock(result->mutex);
+        ASSERT_TRUE(result->changed.wait_for(lock,std::chrono::seconds(5),[&]{return result->replayed;}));
+        EXPECT_NE(result->replay_thread,caller);
+        EXPECT_FALSE(result->close.cleanup_complete);EXPECT_EQ(result->close.sync,sync_drain_state::reentrant_pending);
+    }
+    ASSERT_TRUE(factory->wire->wait(1,1));EXPECT_TRUE(owner->close_checked().cleanup_complete);
+    EXPECT_EQ(factory->wire->snapshot().dials,1u);EXPECT_EQ(factory->wire->snapshot().factories,1u);
+}
+TEST_F(ConfiguredConnectionOwner, QueuedConnectedReplayCannotCrossActualAttemptRetirement) {
+    open();ASSERT_TRUE(owner);
+    struct rendezvous {
+        std::mutex mutex;std::condition_variable changed;
+        bool held=false,released=false,safety_release=false;std::atomic<size_t> replayed{0};
+    };
+    const auto gate=std::make_shared<rendezvous>();
+    struct release_gate {
+        std::shared_ptr<rendezvous> gate;
+        ~release_gate(){std::lock_guard<std::mutex> lock(gate->mutex);gate->released=true;gate->changed.notify_all();}
+    } release{gate};
+    owner->set_on_sync_state_change([gate](bool connected){
+        if(!connected)return;
+        std::unique_lock<std::mutex> lock(gate->mutex);gate->held=true;gate->changed.notify_all();
+        if(!gate->changed.wait_for(lock,std::chrono::seconds(5),[&]{return gate->released;}))gate->safety_release=true;
+    });
+    factory->wire->endpoint(0).trigger_on_open();
+    {
+        std::unique_lock<std::mutex> lock(gate->mutex);
+        ASSERT_TRUE(gate->changed.wait_for(lock,std::chrono::seconds(5),[&]{return gate->held;}));
+    }
+    owner->set_on_sync_state_change([gate](bool connected){if(connected)++gate->replayed;});
+    owner->disconnect_sync();
+    EXPECT_EQ(factory->wire->snapshot().releases,0u); // Actual callback/payload custody remains held.
+    {std::lock_guard<std::mutex> lock(gate->mutex);gate->released=true;}gate->changed.notify_all();
+    ASSERT_TRUE(factory->wire->wait(1,1));EXPECT_TRUE(owner->close_checked().cleanup_complete);
+    {std::lock_guard<std::mutex> lock(gate->mutex);EXPECT_FALSE(gate->safety_release);}
+    EXPECT_EQ(gate->replayed.load(),0u);EXPECT_EQ(factory->wire->snapshot().dials,1u);
+}
 #endif

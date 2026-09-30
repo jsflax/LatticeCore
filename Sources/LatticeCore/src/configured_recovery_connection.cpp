@@ -364,7 +364,33 @@ void configured_recovery_connection::progress_event(const std::shared_ptr<config
 }
 void configured_recovery_connection::set_state(synchronizer::on_state_change_handler handler){
     auto replacement=std::make_shared<const synchronizer::on_state_change_handler>(std::move(handler));
+    const auto installed=replacement;
     {std::lock_guard<std::mutex> lock(state_->mutex);state_->state_handler.swap(replacement);}
+    if(!*installed)return;
+    // Preserve the public connected-state replay. Publish the listener BEFORE
+    // checking connection state, so an intervening real open either reaches
+    // this listener or is observed below. Retain N through actual submission;
+    // its lifetime scheduler separately counts the queued payload and execution.
+    auto held=command();if(!held.pointer||!held.pointer->is_connected())return;
+    const std::weak_ptr<configured_recovery_connection> weak=shared_from_this();
+    auto attempt=held.attempt;auto* physical=held.pointer;
+    // This capture envelope and the scheduler's own envelope are separately
+    // charged. Reserve before either retained callable allocation/copy.
+    auto capture_charge=attempt->custody->admit(configured_attempt_custody::kind::payload);
+    if(!capture_charge)return;
+    auto replay=retain_configured_payload(std::move(capture_charge),[weak,attempt,physical,installed]{
+        if(!physical->is_connected())return;
+        auto owner=weak.lock();if(!owner)return;
+        {
+            std::lock_guard<std::mutex> lock(owner->state_->mutex);
+            if(owner->state_->attempt!=attempt||owner->state_->closing||
+               attempt->retirement_started||owner->state_->state_handler!=installed)return;
+        }
+        // Already admitted callback; stop/close may now race and must wait for
+        // this exact execution/capture rather than making a successor visible.
+        (*installed)(true);
+    });
+    physical->scheduler_->invoke(std::move(replay));
 }
 void configured_recovery_connection::set_error(synchronizer::on_error_handler handler){
     auto replacement=std::make_shared<const synchronizer::on_error_handler>(std::move(handler));

@@ -129,19 +129,54 @@ struct child_owner {
     ~child_owner() {
         if (pid <= 0) return;
         const auto owned = pid;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        // WNOWAIT checks actual child custody without releasing the leader's
+        // identity. Every attempt, including EINTR retries, uses this budget.
+        siginfo_t info{};
+        int observed;
+        do {
+            if (std::chrono::steady_clock::now() >= end) {
+                ADD_FAILURE() << "admission child cleanup custody observation deadline";
+                return;
+            }
+            observed = ::waitid(P_PID, static_cast<id_t>(owned), &info, WEXITED | WNOHANG | WNOWAIT);
+        } while (observed < 0 && errno == EINTR);
+        if (observed != 0 || (info.si_pid != 0 && info.si_pid != owned)) {
+            pid = -1; // Lost custody: never signal a reusable numeric identity.
+            ADD_FAILURE() << "admission child cleanup custody unproved";
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= end) {
+            ADD_FAILURE() << "admission child cleanup deadline before termination";
+            return;
+        }
         // Signal the group only while its unreaped leader remains our child;
         // never signal a remembered numeric PGID after releasing that custody.
-        (void)::kill(group ? -owned : owned, SIGKILL);
-        int status; pid_t waited;
-        do { waited = ::waitpid(owned, &status, 0); } while (waited < 0 && errno == EINTR);
-        if (waited != owned) ADD_FAILURE() << "admission child cleanup could not join owned leader";
+        if (::kill(group ? -owned : owned, SIGKILL) < 0 && errno != ESRCH)
+            ADD_FAILURE() << "admission child cleanup termination failed";
+        bool joined = false;
+        while (std::chrono::steady_clock::now() < end) {
+            int status = 0;
+            const auto waited = ::waitpid(owned, &status, WNOHANG);
+            if (waited == owned) { pid = -1; joined = true; break; }
+            if (waited < 0 && errno != EINTR) {
+                pid = -1;
+                ADD_FAILURE() << "admission child cleanup lost leader custody";
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!joined) {
+            ADD_FAILURE() << "admission child cleanup deadline: leader completion unproved";
+            return;
+        }
         if (group) {
-            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             bool gone = false;
-            do {
+            // Observation only after reaping; no later signal is authorized.
+            while (std::chrono::steady_clock::now() < end) {
                 if (::kill(-owned, 0) < 0 && errno == ESRCH) { gone = true; break; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            } while (std::chrono::steady_clock::now() < end);
+            }
             if (!gone) ADD_FAILURE() << "admission child group completion unproved";
         }
     }
@@ -156,7 +191,7 @@ struct child_owner {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        return -1; // Destructor still kills and joins on every failure path.
+        return -1; // Destructor still attempts bounded cleanup after this deadline.
     }
 };
 bool wait_file(const std::filesystem::path& path) {

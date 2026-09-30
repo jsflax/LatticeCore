@@ -441,7 +441,37 @@ void reset_sync_channel_with_producer_fence(lattice_db& owner,const std::string&
     recovery_writer_access::reset_channel(owner,channel,retire);
 }
 
+// Recovery entry retains its real shared owner; the separate synchronous
+// ordinary entry has the existing caller-outlives-call C++ reference contract.
+// Both run this same engine to completion, including off-lock notification.
+struct recovery_writer_access::install_owner {
+    std::shared_ptr<lattice_db> retained;
+    lattice_db* pointer=nullptr;
+    explicit install_owner(std::shared_ptr<lattice_db> owner)
+        :retained(std::move(owner)),pointer(retained.get()){}
+    explicit install_owner(lattice_db& owner) noexcept:pointer(&owner){}
+    install_owner(install_owner&&) noexcept=default;
+    install_owner(const install_owner&)=delete;
+    lattice_db* get()const noexcept{return pointer;}
+    lattice_db* operator->()const noexcept{return pointer;}
+    lattice_db& operator*()const noexcept{return *pointer;}
+    explicit operator bool()const noexcept{return pointer!=nullptr;}
+};
+
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
+    const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
+    const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try) {
+    return install_owned_impl(install_owner{std::move(owner)},body,after_unlock,after_writer_capture,
+                              initial_admission_busy,controller_try);
+}
+
+recovery_install_result recovery_writer_access::ordinary_owned_write(lattice_db& owner,
+    const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
+    const std::function<void()>& after_writer_capture) {
+    return install_owned_impl(install_owner{owner},body,after_unlock,after_writer_capture,nullptr,false);
+}
+
+recovery_install_result recovery_writer_access::install_owned_impl(install_owner owner,
     const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
     const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try) {
     recovery_install_result result;

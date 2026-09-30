@@ -45,6 +45,8 @@ extern thread_local void (*after_write_admission)();
 struct recovery_install_test_access;
 struct recovery_install_admission_test_access;
 class recovery_local_producer_adapter;
+class ordinary_export_access;
+struct ordinary_owned_transaction_test_access;
 namespace recovery_channel_reset_test_hooks {
 // Private bounded deterministic rendezvous; production leaves both null.
 extern thread_local void (*after_writer_capture)();
@@ -83,6 +85,17 @@ struct recovery_writer_access {
     static recovery_install_result install(std::shared_ptr<lattice_db> owner,
                                            const std::function<void(database&)>& body);
 private:
+    // Synchronous ordinary engine entry only. The public lattice_db& caller
+    // retains the parent through this entire call, including observer delivery.
+    // The common engine strongly retains the exact physical writer. No alias
+    // shared_ptr, asynchronous parent escape or borrowed recovery API is added.
+    static recovery_install_result ordinary_owned_write(lattice_db&,
+        const std::function<void(database&)>&, const std::function<void()>& after_unlock = {},
+        const std::function<void()>& after_writer_capture = {});
+    struct install_owner;
+    static recovery_install_result install_owned_impl(install_owner,
+        const std::function<void(database&)>&, const std::function<void()>& after_unlock,
+        const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try);
     static void legacy_sync_write_impl(database&, lattice_db*, const std::function<void(database&)>&);
     struct legacy_frame;
     static thread_local legacy_frame* legacy_current_;
@@ -109,5 +122,7 @@ private:
     friend class recovery_continuous_producer;
     friend class canonical_writer_adapter;
     friend struct receive_delivery_guard_access;
+    friend class ordinary_export_access;
+    friend struct ordinary_owned_transaction_test_access;
 };
 } // namespace lattice::detail

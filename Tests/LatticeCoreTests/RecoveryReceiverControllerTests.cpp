@@ -426,6 +426,7 @@ protected:
     }
     void close_receiver(){boundary_trace.add(ControllerBoundaryTrace::Event::close_receiver);{std::lock_guard lock(errors_mutex);errors.clear();}held_uploads.clear();synchronizers.clear();if(receiver)receiver->close();receiver.reset();receiver_ref.reset();}
     void TearDown()override {
+        if(HasFailure())report_until_failure();
         for(const auto& pause:pauses)pause->release();
         close_receiver();for(const auto& pause:pauses)EXPECT_FALSE(pause->timedOut());probe.reset();for(auto& peer:peers){peer.live->store(false);peer.setup.close_on_io();peer.setup={};}peers.clear();
         {std::lock_guard lock(wire->mutex);wire->frames.clear();wire->dials.clear();wire->endpoints.clear();}
@@ -2381,8 +2382,9 @@ TEST_F(LateLifecycleReceiverController, LateReservationRacingOutgoingBuildDefers
     auto armed=std::make_shared<std::atomic<bool>>(false),paused=std::make_shared<std::atomic<bool>>(false);
     auto deferred=std::make_shared<std::atomic<unsigned>>(0),discarded=std::make_shared<std::atomic<unsigned>>(0);
     std::string late;
-    after_control=[&](size_t,const json& control,std::string& outgoing){if(control.at("operation")=="inspect"){late=outgoing;armed->store(true);}};
+    after_control=[&](size_t,const json& control,std::string& outgoing){if(control.at("operation")=="inspect"){late=outgoing;}};
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[=](const char* stage){
+        if(std::strcmp(stage,"terminal-request-committed")==0)armed->store(true);
         if(std::strcmp(stage,"outgoing-built-before-publication")==0&&armed->load()&&!paused->exchange(true))gap->wait();
         if(std::strcmp(stage,"late-control-handoff-deferred")==0)++*deferred;
         if(std::strcmp(stage,"late-lifecycle-discarded")==0)++*discarded;});

@@ -25,7 +25,11 @@ constexpr size_t pending_bytes=16777216;
 constexpr unsigned admission_retry_attempts=32;
 constexpr int64_t admission_retry_window_ms=5000,admission_retry_tick_ms=100;
 [[noreturn]] void refuse(const char* reason){throw db_error(reason);}
-class controller_admission_wait final {};
+class controller_admission_wait final {
+public:
+    const recovery_install_deferred reason;
+    explicit controller_admission_wait(recovery_install_deferred value):reason(value){}
+};
 class delivery_retry_wait final : public db_error {
 public:
     delivery_retry_wait():db_error("controller UNKNOWN persisted after one restricted pass; new external source/request generation or actual delivery timeout required"){}
@@ -208,7 +212,7 @@ void known(const recovery_install_result& result) {
         require(result.state==recovery_install_state::refused&&!result.primary_error&&!result.cleanup_error&&
             !result.postcommit_error&&!result.notification_error&&!result.unexpected_commit_observed,
             "controller invalid no-effect admission outcome");
-        throw controller_admission_wait{};
+        throw controller_admission_wait{result.deferred};
     }
     if(result.state!=recovery_install_state::committed){if(result.primary_error)std::rethrow_exception(result.primary_error);refuse("controller transaction outcome unavailable; gate remains closed");}
     // Postcommit notification failure cannot roll back or justify model replay.
@@ -1428,7 +1432,8 @@ void recovery_receiver_controller::turn() {
     }catch(...){
         auto error=std::current_exception();std::shared_ptr<state::pending> released;
         bool admission_busy=false;
-        try{std::rethrow_exception(error);}catch(const controller_admission_wait&){admission_busy=true;}catch(...){}
+        recovery_install_deferred admission_reason=recovery_install_deferred::none;
+        try{std::rethrow_exception(error);}catch(const controller_admission_wait& wait){admission_busy=true;admission_reason=wait.reason;}catch(...){}
         if(admission_busy) {
             bool deferred=false;
             {std::lock_guard lock(runtime.mutex);auto& wait=runtime.admission_wait;
@@ -1445,6 +1450,11 @@ void recovery_receiver_controller::turn() {
             if(deferred){
                 try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)
                     runtime.probe->observed("admission-deferred");}catch(...){}
+                // The owned admission has already unwound and the original
+                // observation retains its order and behavior. No SQL or lock
+                // re-probe is used to explain this actual deferred result.
+                try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->admission_deferred)
+                    runtime.probe->admission_deferred(admission_reason);}catch(...){}
                 return;
             }
             error=std::make_exception_ptr(db_error("controller admission retry budget exhausted; gate remains closed"));

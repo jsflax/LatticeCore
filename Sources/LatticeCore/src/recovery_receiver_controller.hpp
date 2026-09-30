@@ -6,6 +6,7 @@
 #include <lattice/scheduler.hpp>
 
 namespace lattice::detail {
+enum class recovery_install_deferred;
 class recovery_receiver_route;
 class committed_export_frame;
 
@@ -24,6 +25,9 @@ class recovery_receiver_controller final : public std::enable_shared_from_this<r
         const lattice_db* owner=nullptr;
         std::function<std::shared_ptr<void>(const char*)> scope;
         std::function<void(const char*)> observed;
+        // Passive copy of the actual no-effect admission result; never decides
+        // whether a retry is admitted. Default empty in production and old tests.
+        std::function<void(recovery_install_deferred)> admission_deferred;
     };
     static std::mutex test_mutex_;
     static std::shared_ptr<const test_probe> test_probe_;

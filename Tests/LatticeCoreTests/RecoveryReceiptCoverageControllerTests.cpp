@@ -19,8 +19,10 @@ struct recovery_receiver_controller_test_access {
     using probe=recovery_receiver_controller::test_probe;
     std::shared_ptr<const probe> prior;
     recovery_receiver_controller_test_access(const lattice_db* owner,std::function<void(const char*)> observed,
-        std::function<std::shared_ptr<void>(const char*)> scope={}) {
+        std::function<std::shared_ptr<void>(const char*)> scope={},
+        std::function<void(recovery_install_deferred)> deferred={}) {
         auto value=std::make_shared<probe>();value->owner=owner;value->observed=std::move(observed);value->scope=std::move(scope);
+        value->admission_deferred=std::move(deferred);
         std::lock_guard lock(recovery_receiver_controller::test_mutex_);prior=std::move(recovery_receiver_controller::test_probe_);recovery_receiver_controller::test_probe_=std::move(value);
     }
     ~recovery_receiver_controller_test_access(){std::shared_ptr<const probe> old;{std::lock_guard lock(recovery_receiver_controller::test_mutex_);old=std::move(recovery_receiver_controller::test_probe_);recovery_receiver_controller::test_probe_=std::move(prior);}}

@@ -462,11 +462,11 @@ protected:
         return true;
     }
     std::function<void(const char*)> worker_observer(bool idle,std::function<void(const char*)> prior={}) {
-        worker_trace=std::make_shared<ControllerWorkerTrace>(idle);const auto trace=worker_trace;
+        worker_trace=std::make_shared<ControllerWorkerTrace>(idle);const std::weak_ptr<ControllerWorkerTrace> trace=worker_trace;
         return [trace,prior=std::move(prior)](const char* stage){
             // Preserve any original restriction/side effect before observing.
             // If it throws, its original error wins and this event is unobserved.
-            if(prior)prior(stage);trace->observe(stage);
+            if(prior)prior(stage);if(const auto active=trace.lock())active->observe(stage);
         };
     }
     void report_until_failure() noexcept {
@@ -2229,6 +2229,7 @@ protected:
         // The first install releases the UNSENT original. Its real upload
         // and legacy ACK request the second, receipt-bearing installation.
         connect();ASSERT_TRUE(until([&]{worker_trace->begin_predicate();return worker_trace->value(2,installed(2))&&worker_trace->value(3,scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=2"))==1;}));
+        worker_trace.reset(); // Later lifecycle callbacks keep their original restrictions only.
         ASSERT_FALSE(has_error());ASSERT_FALSE(actual_describe.empty());ASSERT_EQ(observed_uploads.size(),1u);
         ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)>0"),1);
         ASSERT_EQ(json::parse(full_requests.at(0).at("request").get<std::string>()).at("latticeCanonicalRange").at("attempt").at("sequence"),"2");

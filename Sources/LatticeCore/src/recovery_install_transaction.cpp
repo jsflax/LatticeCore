@@ -560,7 +560,8 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
             }
             {
                 std::lock_guard<std::mutex> lock(owner->change_buffer_mutex_);
-                if (owner->is_flushing_ || owner->recovery_change_buffer_reserved_ || !owner->change_buffer_.empty())
+                if (owner->is_flushing_ || owner->topology_delivery_depth_ != 0 ||
+                    owner->recovery_change_buffer_reserved_ || !owner->change_buffer_.empty())
                     throw db_error("recovery install: existing notification delivery is unsettled");
                 owner->recovery_change_buffer_reserved_ = true;
                 settlement.owns_recovery_reservation = true;

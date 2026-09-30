@@ -12,6 +12,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <exception>
+#include <vector>
 
 namespace lattice {
 
@@ -106,6 +108,7 @@ public:
 
 class database {
     friend class lattice_db;
+    friend struct topology_admission_test_access;
     friend struct detail::exact_vector_rows_access;
     friend struct detail::recovery_writer_access;
     friend struct detail::recovery_witness_access;
@@ -141,7 +144,8 @@ class database {
     enum class continuous_classification { unknown, ordinary, protected_file };
     std::atomic<continuous_classification> continuous_file_{continuous_classification::unknown};
     bool txn_hooks_external_ = false;
-    void set_txn_hooks_owned_(std::function<void()>, std::function<void()>);
+    void set_txn_hooks_owned_(std::function<void()>, std::function<void()>,
+        std::function<std::function<void()>(database&, bool)> = {});
     void rebind_txn_hooks_owned_() noexcept;
     // Private receiver producer admission. Heap custody follows the physical
     // connection across wrapper moves; no all-route capability is implied.
@@ -483,9 +487,63 @@ private:
     std::atomic<bool> txn_dirty_{false};
     struct txn_hook_callbacks {
         std::function<void()> settled, rolled_back;
-        txn_hook_callbacks(std::function<void()>&& success, std::function<void()>&& rollback)
-            : settled(std::move(success)), rolled_back(std::move(rollback)) {}
+        // Engine-only state capture. It may inspect the already admitted exact
+        // writer, but returns all observer delivery for the off-lock tail.
+        // Public opaque hooks do not gain an in-lock callback through this API.
+        std::function<std::function<void()>(database&, bool)> capture_owned;
+        txn_hook_callbacks(std::function<void()>&& success, std::function<void()>&& rollback,
+                           std::function<std::function<void()>(database&, bool)>&& capture = {})
+            : settled(std::move(success)), rolled_back(std::move(rollback)),
+              capture_owned(std::move(capture)) {}
     };
+    // One absolute admission/retry budget for a complete public topology call.
+    // This is not a timer for SQL, filesystem work, callbacks or destruction.
+    struct attachment_operation {
+        using clock = std::chrono::steady_clock;
+        const clock::time_point deadline = clock::now() + std::chrono::seconds(2);
+        attachment_operation() = default;
+        attachment_operation(const attachment_operation&) = delete;
+        attachment_operation& operator=(const attachment_operation&) = delete;
+        struct delivery {
+            std::shared_ptr<txn_hook_callbacks> hooks;
+            bool rollback = false, active = false;
+            std::function<void()> captured;
+        };
+        std::vector<delivery> deliveries;
+        database* capturing_owner = nullptr; // Internal read tails cannot settle recursively.
+        // Retain exact wrappers and retired extension captures through off-lock
+        // delivery; final releases must not occur beneath topology/SQLite locks.
+        std::vector<std::shared_ptr<database>> handles;
+        std::shared_ptr<const void> retired_metadata; // At most one invalidated alias per public call.
+        void check() const;
+        void wait(std::chrono::milliseconds interval = std::chrono::milliseconds(1)) const;
+        std::unique_lock<std::mutex> lock(std::mutex&) const;
+        void capture_settlement_locked(database&, bool failed);
+        void settle_locked(database&, bool failed, std::exception_ptr primary);
+        void finish(std::exception_ptr primary);
+    };
+    struct attachment_delivery_error : db_error {
+        std::exception_ptr primary, delivery;
+        size_t delivery_failures;
+        attachment_delivery_error(std::exception_ptr p, std::exception_ptr d, size_t count)
+            : db_error("topology operation and off-lock delivery both failed"),
+              primary(std::move(p)), delivery(std::move(d)), delivery_failures(count) {}
+    };
+    class attachment_sql_scope {
+        database& owner_;
+        attachment_operation& operation_;
+        sqlite3_mutex* mutex_ = nullptr;
+        attachment_sql_scope* previous_ = nullptr;
+        static thread_local attachment_sql_scope* current_;
+    public:
+        attachment_sql_scope(database&, attachment_operation&);
+        ~attachment_sql_scope();
+        attachment_sql_scope(const attachment_sql_scope&) = delete;
+        attachment_sql_scope& operator=(const attachment_sql_scope&) = delete;
+        static attachment_operation* operation_for(const database*) noexcept;
+    };
+    void execute_attachment_sql(const std::string&, attachment_operation&);
+    std::shared_ptr<const physical_store_identity> attachment_physical_identity(attachment_operation&);
     // Construct/destroy callable targets outside SQLite. Under its mutex only
     // shared_ptr ownership moves; std::function moves/swaps may run user code.
     std::shared_ptr<txn_hook_callbacks> txn_hooks_;
@@ -500,7 +558,7 @@ private:
     // execution scope, before a competing writer can win a second acquisition.
     // This captures only internal metadata; deferred user delivery stays after it.
     std::shared_ptr<const physical_store_identity> attach_and_capture_identity(
-        const std::string& attach_sql, const std::string& schema);
+        const std::string& attach_sql, const std::string& schema, attachment_operation&);
     // Caller owns this handle's recursive SQLite mutex.
     std::shared_ptr<const physical_store_identity> physical_identity_locked(
         const std::string& schema,
@@ -549,7 +607,7 @@ private:
     // Attachment schema metadata only. Run the existing single read statement
     // inside one SQLite execution scope; keep original SQLite types and names.
     std::vector<std::string> query_attachment_text_metadata(
-        const std::string& sql, const std::string& column);
+        const std::string& sql, const std::string& column, attachment_operation&);
     void drain_if_settled();
     void discard_if_rolled_back();
 };

@@ -155,3 +155,61 @@ TEST(OrdinaryOwnedTransaction, CallRetainsPendingDeliveryUntilTheActualObserverR
     EXPECT_TRUE(returned.load());EXPECT_EQ(result.state,state::committed);EXPECT_EQ(result.postcommit_error,nullptr);
     EXPECT_EQ(count(owner.db(),"held-observer"),1);
 }
+
+
+TEST(OrdinaryOwnedTransaction, CapturedTopologyObserverRefusesOwnedWriteBeforeBeginThenLaterSucceeds) {
+    bounded_case bounded;
+    lattice::lattice_db parent{config()};
+    lattice::lattice_db arm{config("file:topology_owned_write_admission_arm?mode=memory&cache=shared")};
+    for (auto* owner : {&parent, &arm}) {
+        owner->db().execute("CREATE TABLE TopologyFixture(id INTEGER PRIMARY KEY,globalId TEXT NOT NULL,n INTEGER)");
+        owner->db().execute("INSERT INTO TopologyFixture VALUES(1,'topology-row',7)");
+    }
+    int callbacks = 0, begin_attempts = 0;
+    bool premature_body = false, callback_had_no_transaction = false;
+    lattice::detail::recovery_install_result callback_result;
+    const auto token = parent.add_table_observer("TopologyFixture", [&](const auto&) {
+        ++callbacks;
+        if (callbacks != 1) return;
+        callback_had_no_transaction = !parent.db().is_in_transaction();
+        callback_result = access::run(parent, [&](auto& writer) {
+            premature_body = true;
+            writer.execute("UPDATE main.TopologyFixture SET n=999 WHERE id=1");
+        });
+    });
+    parent.db().execute("BEGIN");
+    parent.db().execute("UPDATE main.TopologyFixture SET n=n+1 WHERE id=1");
+    ASSERT_EQ(sqlite3_exec(parent.db().handle(), "COMMIT", nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(callbacks, 0);
+    auto* handle = parent.db().handle();
+    authorizer_reset reset{handle};
+    ASSERT_EQ(sqlite3_set_authorizer(handle,
+        [](void* raw, int action, const char* first, const char*, const char*, const char*) noexcept {
+            if (action == SQLITE_TRANSACTION && first && std::strcmp(first, "BEGIN") == 0)
+                ++*static_cast<int*>(raw);
+            return SQLITE_OK;
+        }, &begin_attempts), SQLITE_OK);
+    EXPECT_NO_THROW(parent.attach(arm));
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_TRUE(callback_had_no_transaction);
+    EXPECT_FALSE(premature_body);
+    EXPECT_EQ(begin_attempts, 0);
+    EXPECT_EQ(callback_result.state, state::refused);
+    EXPECT_NE(callback_result.primary_error, nullptr);
+    EXPECT_EQ(callback_result.cleanup_error, nullptr);
+    EXPECT_FALSE(parent.db().is_in_transaction());
+    const auto later = access::run(parent, [](auto& writer) {
+        writer.execute("UPDATE main.TopologyFixture SET n=n+1 WHERE id=1");
+    });
+    EXPECT_EQ(later.state, state::committed);
+    EXPECT_EQ(later.primary_error, nullptr);
+    EXPECT_EQ(later.postcommit_error, nullptr);
+    EXPECT_EQ(later.notification_error, nullptr);
+    EXPECT_EQ(begin_attempts, 1);
+    EXPECT_EQ(callbacks, 2);
+    const auto rows = parent.db().query("SELECT n FROM main.TopologyFixture WHERE id=1");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("n")), 9);
+    parent.remove_table_observer("TopologyFixture", token);
+    EXPECT_NO_THROW(parent.detach(arm));
+}

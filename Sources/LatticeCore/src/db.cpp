@@ -197,15 +197,181 @@ database::physical_identity_attempt database::try_current_physical_identity(cons
     return result;
 }
 
+void database::attachment_operation::check() const {
+    if (clock::now() >= deadline)
+        throw db_error("topology admission deadline exceeded");
+}
+
+void database::attachment_operation::wait(std::chrono::milliseconds interval) const {
+    check();
+    const auto remaining = deadline - clock::now();
+    if (remaining > clock::duration::zero())
+        std::this_thread::sleep_for(std::min(remaining,
+            std::chrono::duration_cast<clock::duration>(interval)));
+    check();
+}
+
+std::unique_lock<std::mutex> database::attachment_operation::lock(std::mutex& mutex) const {
+    std::unique_lock<std::mutex> held(mutex, std::defer_lock);
+    for (;;) {
+        check();
+        if (held.try_lock()) { check(); return held; }
+        wait();
+    }
+}
+
+thread_local database::attachment_sql_scope* database::attachment_sql_scope::current_ = nullptr;
+database::attachment_sql_scope::attachment_sql_scope(database& owner, attachment_operation& operation)
+    : owner_(owner), operation_(operation) {
+    operation_.check();
+    if (!owner_.db_ || owner_.closed_.load(std::memory_order_acquire))
+        throw db_error("topology admission: database closed");
+    // Reading the mutex pointer does not enter SQLite. The operation's strong
+    // wrapper custody keeps the handle alive even during logical close.
+    auto* mutex = sqlite3_db_mutex(owner_.db_);
+    for (;;) {
+        operation_.check();
+        if (!mutex || sqlite3_mutex_try(mutex) == SQLITE_OK) break;
+        operation_.wait();
+    }
+    try {
+        operation_.check();
+        if (owner_.closed_.load(std::memory_order_acquire))
+            throw db_error("topology admission: database closed");
+    } catch (...) {
+        if (mutex) sqlite3_mutex_leave(mutex);
+        throw;
+    }
+    mutex_ = mutex;
+    previous_ = current_;
+    current_ = this;
+}
+database::attachment_sql_scope::~attachment_sql_scope() {
+    current_ = previous_;
+    if (mutex_) sqlite3_mutex_leave(mutex_);
+}
+database::attachment_operation* database::attachment_sql_scope::operation_for(const database* owner) noexcept {
+    for (auto* scope = current_; scope; scope = scope->previous_)
+        if (&scope->owner_ == owner) return &scope->operation_;
+    return nullptr;
+}
+
+void database::attachment_operation::capture_settlement_locked(database& owner, bool failed) {
+    // Resolving an engine-owned committed snapshot performs read-only queries
+    // on this already held writer. Their wrapper tails do not create a second
+    // success claim or defensively discard the original committed buffer.
+    if (capturing_owner == &owner) return;
+    // The successful tail keeps every existing outer-operation deferral rule.
+    if (!failed && (update_hook_scope::active_for(owner.db_) ||
+        maintenance_scope::active_for(owner.db_) || detail::managed_route_scope::active_for(&owner) ||
+        engine_query_scope::defers_delivery_for(owner))) return;
+    if (sqlite3_get_autocommit(owner.db_) == 0) return;
+    const auto hooks = owner.txn_hooks_;
+    if (!hooks || !(failed ? static_cast<bool>(hooks->rolled_back)
+                         : (hooks->settled && owner.txn_dirty_.load(std::memory_order_relaxed)))) {
+        if (failed) owner.txn_dirty_.store(false, std::memory_order_relaxed);
+        return;
+    }
+    // Allocate and retain the exact bundle before claiming anything. Keep even
+    // an inactive entry through off-lock finish: no displaced public callable
+    // can be finally destroyed beneath this SQLite/topology scope.
+    deliveries.push_back({hooks, failed, false, {}});
+    const auto index = deliveries.size() - 1;
+    if (hooks->capture_owned) {
+        struct capture_scope {
+            attachment_operation& operation; database* previous;
+            ~capture_scope() { operation.capturing_owner = previous; }
+        } scope{*this, capturing_owner};
+        capturing_owner = &owner;
+        auto captured = hooks->capture_owned(owner, failed);
+        // An existing active flush/reserved recovery batch retains its own
+        // buffer and dirty flag. No empty substitute claims that obligation.
+        if (!captured) return;
+        deliveries[index].captured = std::move(captured);
+    }
+    deliveries[index].active = true;
+    owner.txn_dirty_.store(false, std::memory_order_relaxed);
+}
+void database::attachment_operation::settle_locked(database& owner, bool failed, std::exception_ptr primary) {
+    try { capture_settlement_locked(owner, failed); }
+    catch (...) {
+        if (primary) throw attachment_delivery_error(primary, std::current_exception(), 1);
+        throw;
+    }
+    if (primary) std::rethrow_exception(primary);
+}
+void database::attachment_operation::finish(std::exception_ptr primary) {
+    std::exception_ptr first_delivery_error;
+    size_t delivery_failures = 0;
+    for (const auto& item : deliveries) {
+        try {
+            if (!item.active) continue;
+            if (item.captured) item.captured();
+            else if (item.rollback) item.hooks->rolled_back();
+            else item.hooks->settled();
+        } catch (...) {
+            if (!first_delivery_error) first_delivery_error = std::current_exception();
+            ++delivery_failures;
+        }
+    }
+    if (primary && first_delivery_error)
+        throw attachment_delivery_error(std::move(primary), std::move(first_delivery_error), delivery_failures);
+    if (primary) std::rethrow_exception(primary);
+    if (first_delivery_error) std::rethrow_exception(first_delivery_error);
+}
+
+std::shared_ptr<const physical_store_identity> database::attachment_physical_identity(attachment_operation& operation) {
+    attachment_sql_scope admitted(*this, operation);
+    // An unsupported physical identity remains a legacy null identity; timeout
+    // and logical close are separate errors and must not be swallowed. Legacy
+    // single-thread/no-mutex SQL may run, but never gains projected provenance.
+    if (!sqlite3_db_mutex(db_)) return {};
+    return physical_identity_locked("main", {});
+}
+
+void database::execute_attachment_sql(const std::string& sql, attachment_operation& operation) {
+    int rc = SQLITE_OK, extended_code = 0, system_errno = 0;
+    std::string error;
+    {
+        attachment_sql_scope admitted(*this, operation);
+        if (channel_reset_unsettled_.load(std::memory_order_acquire))
+            throw db_error("channel reset unsettled; explicit rollback required");
+        record_statement();
+        char* message = nullptr;
+        rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &message);
+        const std::unique_ptr<char, decltype(&sqlite3_free)> free_message(message, &sqlite3_free);
+        if (rc != SQLITE_OK) {
+            extended_code = sqlite3_extended_errcode(db_);
+            system_errno = sqlite3_system_errno(db_);
+            error = message ? message : "Unknown error";
+        }
+        // This tail uses the mutex already admitted above. If retaining the
+        // tail fails, keep the original SQL failure as well as that failure.
+        try { operation.capture_settlement_locked(*this, rc != SQLITE_OK); }
+        catch (...) {
+            if (rc != SQLITE_OK) throw attachment_delivery_error(
+                std::make_exception_ptr(db_error("SQL execution failed: " + error + " (SQL: " + sql + ")")),
+                std::current_exception(), 1);
+            throw;
+        }
+    }
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("db", "SQL execution failed: %s (SQL: %s) [rc=%d extended_code=%d system_errno=%d sqlite_version=%s sqlite_source_id=%s]",
+            error.c_str(), sql.c_str(), rc, extended_code, system_errno, sqlite3_libversion(), sqlite3_sourceid());
+        throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
+    }
+}
+
 std::shared_ptr<const physical_store_identity> database::attach_and_capture_identity(
-    const std::string& attach_sql, const std::string& schema) {
-    if (closed_.load(std::memory_order_acquire)) return {};
+    const std::string& attach_sql, const std::string& schema, attachment_operation& operation) {
+    attachment_sql_scope admitted(*this, operation);
     struct capture_context {
         database* owner;
+        attachment_operation* operation;
         const std::string* schema;
         std::shared_ptr<const physical_store_identity> identity;
         std::exception_ptr error;
-    } context{this, &schema, {}, {}};
+    } context{this, &operation, &schema, {}, {}};
     // ATTACH produces no rows. This single constant row provides an internal
     // capture point inside the same sqlite3_exec as the successful ATTACH.
     const std::string sql = attach_sql + "; SELECT 1";
@@ -218,6 +384,7 @@ std::shared_ptr<const physical_store_identity> database::attach_and_capture_iden
                 // Also tolerate legacy PRAGMA empty_result_callbacks: the
                 // rowless ATTACH itself must never act as the capture point.
                 if (columns != 1) return 0;
+                capture.operation->check();
                 database::record_statement();
                 auto* mutex = sqlite3_db_mutex(capture.owner->db_);
                 // FULLMUTEX connections have a recursive mutex. Verify usable
@@ -237,27 +404,28 @@ std::shared_ptr<const physical_store_identity> database::attach_and_capture_iden
         }, &context, &message);
     const std::unique_ptr<char, decltype(&sqlite3_free)> free_message(message, &sqlite3_free);
     if (rc != SQLITE_OK) {
-        discard_if_rolled_back();
-        if (context.error) std::rethrow_exception(context.error);
-        throw db_error("SQL execution failed: " + std::string(message ? message : "Unknown error") +
-                       " (SQL: " + attach_sql + ")");
+        auto primary = context.error ? context.error : std::make_exception_ptr(
+            db_error("SQL execution failed: " + std::string(message ? message : "Unknown error") +
+                     " (SQL: " + attach_sql + ")"));
+        operation.settle_locked(*this, true, std::move(primary));
     }
-    drain_if_settled();
+    operation.capture_settlement_locked(*this, false);
     return context.identity;
 }
 
 std::vector<std::string> database::query_attachment_text_metadata(
-    const std::string& sql, const std::string& column) {
-    if (closed_.load(std::memory_order_acquire)) return {};
+    const std::string& sql, const std::string& column, attachment_operation& operation) {
+    attachment_sql_scope admitted(*this, operation);
     struct metadata_context {
         database* owner;
+        attachment_operation* operation;
         const std::string* sql;
         const std::string* column;
         std::vector<std::string> values;
         std::exception_ptr error;
         bool entered = false;
         bool statement_failed = false;
-    } context{this, &sql, &column, {}, {}};
+    } context{this, &operation, &sql, &column, {}, {}};
     // Do not use pragma_* table-valued functions: ordinary tables can shadow
     // those names. The nested original PRAGMA/SELECT also preserves real SQLite
     // types, which sqlite3_exec's string-only result callback would erase.
@@ -271,6 +439,7 @@ std::vector<std::string> database::query_attachment_text_metadata(
                 if (columns != 1 || capture.entered)
                     throw db_error("Unexpected attachment metadata rendezvous shape");
                 capture.entered = true;
+                capture.operation->check();
                 auto* mutex = sqlite3_db_mutex(capture.owner->db_);
                 if (mutex && sqlite3_mutex_try(mutex) != SQLITE_OK)
                     throw db_error("Attachment metadata execution scope unavailable");
@@ -299,7 +468,10 @@ std::vector<std::string> database::query_attachment_text_metadata(
                     if (*capture.column == name) selected = index;
                 }
                 int step_rc = SQLITE_OK;
-                while ((step_rc = sqlite3_step(statement.get())) == SQLITE_ROW) {
+                for (;;) {
+                    capture.operation->check();
+                    step_rc = sqlite3_step(statement.get());
+                    if (step_rc != SQLITE_ROW) break;
                     if (selected < 0 || sqlite3_column_type(statement.get(), selected) != SQLITE_TEXT)
                         continue; // Existing callers ignore missing/non-TEXT name values.
                     const auto* value = sqlite3_column_text(statement.get(), selected);
@@ -321,13 +493,13 @@ std::vector<std::string> database::query_attachment_text_metadata(
         }, &context, &message);
     const std::unique_ptr<char, decltype(&sqlite3_free)> free_message(message, &sqlite3_free);
     if (rc != SQLITE_OK || context.error) {
-        if (context.statement_failed) discard_if_rolled_back();
-        if (context.error) std::rethrow_exception(context.error);
-        throw db_error("Attachment metadata execution failed: " +
-            std::string(message ? message : "Unknown error"));
+        auto primary = context.error ? context.error : std::make_exception_ptr(
+            db_error("Attachment metadata execution failed: " + std::string(message ? message : "Unknown error")));
+        if (context.statement_failed) operation.settle_locked(*this, true, primary);
+        std::rethrow_exception(primary);
     }
     if (!context.entered) throw db_error("Attachment metadata rendezvous did not execute");
-    drain_if_settled();
+    operation.capture_settlement_locked(*this, false);
     return std::move(context.values);
 }
 
@@ -648,8 +820,10 @@ void database::set_txn_hooks(std::function<void()> settled, std::function<void()
     }
 }
 
-void database::set_txn_hooks_owned_(std::function<void()> settled, std::function<void()> rolled_back) {
-    auto replacement = std::make_shared<txn_hook_callbacks>(std::move(settled), std::move(rolled_back));
+void database::set_txn_hooks_owned_(std::function<void()> settled, std::function<void()> rolled_back,
+        std::function<std::function<void()>(database&, bool)> capture_owned) {
+    auto replacement = std::make_shared<txn_hook_callbacks>(
+        std::move(settled), std::move(rolled_back), std::move(capture_owned));
     {
         auto* mutex=sqlite3_db_mutex(db_);sqlite3_mutex_enter(mutex);
         struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
@@ -677,6 +851,10 @@ void database::rebind_txn_hooks_owned_() noexcept {
 }
 
 void database::drain_if_settled() {
+    if (auto* operation = attachment_sql_scope::operation_for(this)) {
+        operation->capture_settlement_locked(*this, false);
+        return;
+    }
     // A nested query from the update hook can finish before the outer
     // implicit statement does. Autocommit alone does not identify that
     // callback frame. Leave dirty state for the actual statement's tail.
@@ -712,6 +890,10 @@ void database::drain_if_settled() {
 }
 
 void database::discard_if_rolled_back() {
+    if (auto* operation = attachment_sql_scope::operation_for(this)) {
+        operation->capture_settlement_locked(*this, true);
+        return;
+    }
     // Failed statement with autocommit restored: the implicit transaction
     // (if any) already rolled back. SQLite's rollback hook covers most of
     // these paths; clear defensively so a hook-buffered row from the failed

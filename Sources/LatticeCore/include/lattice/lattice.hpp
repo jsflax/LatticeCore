@@ -1588,9 +1588,74 @@ public:
     bool flush_changes_once() { return flush_changes_once_impl(nullptr, nullptr); }
 
 private:
-    // Only the private owned recovery frame supplies a batch/writer. Ordinary
-    // delivery retains its historical queries, callbacks and bounded drain.
-    bool flush_changes_once_impl(database* recovery_writer, recovery_commit_batch* batch) {
+    std::function<void()> capture_topology_settlement(database& writer) {
+        {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            // Match the ordinary empty-buffer tail without stealing a flush or
+            // an owned recovery/delivery reservation that is still in progress.
+            if (change_buffer_.empty() && !is_flushing_ &&
+                !recovery_change_buffer_reserved_ && topology_delivery_depth_ == 0)
+                return [] {};
+        }
+        auto batch = std::make_shared<recovery_commit_batch>();
+        std::function<void()> delivery = [this, batch] { deliver_topology_settlement(*batch); };
+        if (!flush_changes_once_impl(&writer, batch.get(), true)) return {};
+        return delivery;
+    }
+
+    void deliver_topology_settlement(const recovery_commit_batch& batch) {
+        {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if (topology_delivery_depth_ == std::numeric_limits<size_t>::max())
+                throw db_error("topology delivery depth exhausted");
+            ++topology_delivery_depth_;
+        }
+        struct delivery_depth {
+            lattice_db& owner;
+            bool active = true;
+            bool release() {
+                std::lock_guard<std::mutex> lock(owner.change_buffer_mutex_);
+                active = false;
+                return --owner.topology_delivery_depth_ == 0;
+            }
+            ~delivery_depth() { if (active) release(); }
+        } depth{*this};
+        auto alive = [&](auto&& fn) {
+            if (storage_shared_across_instances())
+                instance_registry::instance().for_each_alive(config_.path, fn);
+            else fn(this);
+        };
+        if (batch.audit_frontier) alive([&](lattice_db* owner) {
+            auto seen = owner->last_seen_audit_id_.load(std::memory_order_acquire);
+            while (seen < *batch.audit_frontier &&
+                   !owner->last_seen_audit_id_.compare_exchange_weak(
+                       seen, *batch.audit_frontier, std::memory_order_release,
+                       std::memory_order_acquire)) {}
+        });
+        alive([&](lattice_db* owner) {
+            owner->fire_invalidation_hooks_local(batch.invalidations, invalidation_reason::commit);
+        });
+        if (!batch.events.empty()) alive([&](lattice_db* owner) {
+            owner->notify_changes_batched_impl(batch.events, &batch.typed_event_indices);
+        });
+        if (batch.needs_upload_hint) trigger_sync_upload();
+        if (shared_xproc_notifier_ && !config_.read_only) shared_xproc_notifier_->post_notification();
+        if (depth.release()) {
+            // One captured batch plus at most 63 callback-write batches keeps
+            // the original 64-pass drain bound. No later rollback can mutate
+            // the already resolved captured events delivered above.
+            for (int i = 1; i < 64; ++i) if (!flush_changes_once()) return;
+            LOG_WARN("flush_changes", "change buffer still non-empty after %d drain iterations — "
+                     "an observer callback writes on every fire; remaining entries deliver on the next write", 64);
+        }
+    }
+
+    // Only engine-owned frames supply a batch/writer. Topology captures use
+    // ordinary event semantics and resolve through the exact admitted writer;
+    // recovery retains its distinct audit/changed-field rules.
+    bool flush_changes_once_impl(database* recovery_writer, recovery_commit_batch* batch,
+                                 bool ordinary_capture = false) {
+        const bool recovery_capture = batch && !ordinary_capture;
         if(administrative_owner_) {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             if(!change_buffer_.empty()||is_flushing_)
@@ -1599,14 +1664,27 @@ private:
         }
         LOG_DEBUG("flush_changes", "Called");
         std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> changes;
+        decltype(changes) original_changes;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
             LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
-            if (change_buffer_.empty() || is_flushing_ ||
-                (recovery_change_buffer_reserved_ && !batch)) return false;
+            // An owned transaction may not turn an active delivery into an
+            // empty captured batch and then commit. Actual admission refuses
+            // this state first; retain refusal at the final capture boundary.
+            if (recovery_capture && topology_delivery_depth_ != 0)
+                throw db_error("owned notification capture during topology delivery");
+            if (change_buffer_.empty() || is_flushing_ || topology_delivery_depth_ != 0 ||
+                (recovery_change_buffer_reserved_ && !recovery_capture)) return false;
+            if (ordinary_capture) {
+                // Build the detached ordinary batch before consuming its live
+                // records. Allocation/query failures keep the original pending.
+                changes = change_buffer_;
+                original_changes = changes;
+            } else {
+                changes = std::move(change_buffer_);
+                change_buffer_.clear();
+            }
             is_flushing_ = true;
-            changes = std::move(change_buffer_);
-            change_buffer_.clear();
         }
 
         // Exception-safe reset: observer exceptions propagate to the writer
@@ -1627,11 +1705,26 @@ private:
         // Cleared up-front (before any throwing DB query) so an exception can't leak it.
         const bool notify_local_objects = tls_notify_local_object_observers_;
         tls_notify_local_object_observers_ = false;
+        struct capture_flag_restore {
+            bool capture, original; int exceptions = std::uncaught_exceptions();
+            ~capture_flag_restore() {
+                if (capture && original && std::uncaught_exceptions() > exceptions)
+                    lattice_db::tls_notify_local_object_observers_ = true;
+            }
+        } restore_flag{ordinary_capture, notify_local_objects};
 
         LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
         const auto batch_query = [&](const std::string& sql,
                                      const std::vector<column_value_t>& params = {}) {
+            if (ordinary_capture) {
+                if (auto* operation = database::attachment_sql_scope::operation_for(recovery_writer))
+                    operation->check();
+                if (recovery_writer->is_closed()) throw db_error("topology settlement writer closed");
+                auto rows = recovery_writer->query(sql, params);
+                if (recovery_writer->is_closed()) throw db_error("topology settlement writer closed");
+                return rows;
+            }
             return recovery_writer ? recovery_writer->query(sql, params) : query_read(sql, params);
         };
 
@@ -1667,7 +1760,7 @@ private:
                         if (it != gid_by_id.end()) global_id = it->second;
                     }
                 }
-                if (batch) {
+                if (recovery_capture) {
                     // ROLLBACK TO does not invoke SQLite's rollback hook. A
                     // nested failed helper can leave a buffered audit row that
                     // no longer exists, or whose rowid a later insert reused.
@@ -1702,7 +1795,7 @@ private:
         // BEFORE notifying observers. This prevents any instance's
         // cross-process handler from re-dispatching entries that
         // flush_changes is about to (or just did) deliver.
-        if (batch) {
+        if (recovery_capture) {
             // Recovery buffers the actual inserted audit rows, including file
             // stores. A suppressed model edit has no new audit frontier and
             // must not adopt an unrelated historical MAX(id).
@@ -1714,12 +1807,15 @@ private:
         } else if (shared_xproc_notifier_) {
             // The committing writer sees this commit even if an ordinary
             // reader still holds an older implicit snapshot.
-            auto max_rows = db_->query("SELECT MAX(id) AS max_id FROM AuditLog");
+            auto max_rows = ordinary_capture
+                ? batch_query("SELECT MAX(id) AS max_id FROM AuditLog")
+                : db_->query("SELECT MAX(id) AS max_id FROM AuditLog");
             if (!max_rows.empty()) {
                 auto it = max_rows[0].find("max_id");
                 if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
                     const auto max_id = std::get<int64_t>(it->second);
-                    for_each_alive([max_id](lattice_db* inst) {
+                    if (ordinary_capture) batch->audit_frontier = max_id;
+                    else for_each_alive([max_id](lattice_db* inst) {
                         inst->last_seen_audit_id_.store(max_id, std::memory_order_release);
                     });
                 }
@@ -1853,7 +1949,7 @@ private:
                 // For local setter changes, changed_fields stays empty — the Swift setter
                 // already handles observation via withMutation.
                 std::string changed_fields;
-                if (batch && row_id > 0 && table != "AuditLog" &&
+                if (recovery_capture && row_id > 0 && table != "AuditLog" &&
                     !table.empty() && table.front() != '_') {
                     changed_fields = recovery_fields(table);
                 } else if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
@@ -1888,7 +1984,7 @@ private:
 #ifdef __EMSCRIPTEN__
         constexpr bool audit_inserts_buffered_directly = true;
 #else
-        const bool audit_inserts_buffered_directly = batch || config_.is_in_memory();
+        const bool audit_inserts_buffered_directly = recovery_capture || config_.is_in_memory();
 #endif
         bool triggered_regular_audit = false;
         for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
@@ -2002,7 +2098,7 @@ private:
                 }
                 // The recovery list is conservative refresh information, not
                 // an exact changed-field proof for query-disjointness skips.
-                if (batch || op != "UPDATE" || cfn.empty() ||
+                if (recovery_capture || op != "UPDATE" || cfn.empty() ||
                     !parse_changed_fields_names(cfn, fields[idx])) {
                     update_only[idx] = 0;  // fields unknown or membership may change
                 }
@@ -2045,7 +2141,7 @@ private:
         // within the WAL hook — synchronous calls race with WebSocket ACK handlers.
         // Recovery's genuine audit INSERT events already provide upload hints.
         // Audit-suppressed canonical/link changes create no outgoing operation.
-        if (batch) batch->needs_upload_hint = false;
+        if (batch) batch->needs_upload_hint = ordinary_capture && had_internal_changes && !triggered_regular_audit;
         else if (had_internal_changes && !triggered_regular_audit) {
             trigger_sync_upload();
         }
@@ -2055,6 +2151,16 @@ private:
             shared_xproc_notifier_->post_notification();
         }
 
+        if (ordinary_capture) {
+            // No callback has run and all queries used the still-held writer.
+            // Unknown recursive mutation is refusal, never consumption of a
+            // different transaction's buffer. The old records remain intact
+            // until the complete resolved batch and its delivery are owned.
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if (change_buffer_ != original_changes)
+                throw db_error("topology settlement buffer changed during capture");
+            change_buffer_.clear();
+        }
         // is_flushing_ cleared by reset_guard on scope exit (also on unwind).
         LOG_DEBUG("flush_changes", "Done");
         return true;
@@ -6125,6 +6231,7 @@ protected:
     bool recovery_producer_bootstrapped_=false;
     bool administrative_owner_=false;
     friend struct managed_attachment_test_access;
+    friend struct topology_admission_test_access;
     struct managed_attachment_binding {
         std::string alias, filename;
         int64_t token;
@@ -6145,30 +6252,45 @@ protected:
 
     // Only these attachment helpers access database's private metadata funnel.
     static std::vector<std::string> attachment_column_names(
-        database* db, const std::string& schema_sql, const std::string& table_name);
-    static std::unordered_set<std::string> attachment_model_tables(database* db, const char* master);
+        database* db, const std::string& schema_sql, const std::string& table_name,
+        database::attachment_operation&);
+    static std::unordered_set<std::string> attachment_model_tables(
+        database* db, const char* master, database::attachment_operation&);
 
     /// Owned snapshots survive reader retirement through topology operations.
     /// The owning vector must outlive the attachment lock so final releases
     /// cannot invoke database/function destructors under that lock.
     std::vector<std::shared_ptr<database>> view_handles();
     void restore_attached_views(database& connection);
-    void rebuild_attached_views(const std::vector<std::shared_ptr<database>>& handles);
+    void rebuild_attached_views(const std::vector<std::shared_ptr<database>>& handles,
+                                database::attachment_operation&);
+    // Preserve the existing protected caller/test entry; it creates one budget.
     void detach_alias_if_current(const std::string& alias,
                                  const std::optional<std::string>& expected_path,
                                  std::optional<int64_t> expected_token);
+    void detach_alias_if_current(const std::string& alias,
+                                 const std::optional<std::string>& expected_path,
+                                 std::optional<int64_t> expected_token, database::attachment_operation&);
 
     // Opaque immutable extension metadata shares the topology lock/lifetime.
     // The Swift bridge supplies its own schema snapshot; Core never inspects it.
     void attach_with_metadata(lattice_db& source, std::shared_ptr<const void> metadata);
-    void invalidate_attachment_route(const std::string& alias) noexcept {
+    void attach_with_metadata_impl(lattice_db& source, std::shared_ptr<const void>& metadata,
+                                   database::attachment_operation&);
+    void invalidate_attachment_route(const std::string& alias, database::attachment_operation& operation) {
         auto it = attached_route_tokens_.find(alias);
         if (it == attached_route_tokens_.end()) return;
         if (auto view = std::atomic_load(&managed_attachment_view_)) {
             for (const auto& route : *view)
                 if (route->token == it->second) route->valid.store(false, std::memory_order_release);
         }
-        attached_route_metadata_.erase(it->second);
+        auto metadata = attached_route_metadata_.find(it->second);
+        if (metadata != attached_route_metadata_.end()) {
+            // One alias can retire per public call. Move to its fixed slot:
+            // no allocation or final capture destruction under attach_mutex_.
+            operation.retired_metadata = std::move(metadata->second);
+            attached_route_metadata_.erase(metadata);
+        }
         attached_route_tokens_.erase(it);
     }
 
@@ -6285,6 +6407,9 @@ private:
     // admitted recovery transaction's rows, including a preexisting drain
     // that already cleared txn_dirty_ before this frame acquired SQLite.
     bool recovery_change_buffer_reserved_ = false;
+    // Only off-lock topology delivery holds this depth. Callback writes keep
+    // their existing bounded outer drain instead of recursively delivering.
+    size_t topology_delivery_depth_ = 0; // guarded by change_buffer_mutex_
     // Physical-writer publication also refuses same-thread recursive SQLite
     // callbacks during an admitted private install; whole-owner close may fence
     // new admission without replacing the retained writer.

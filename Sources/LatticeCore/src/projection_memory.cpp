@@ -356,7 +356,7 @@ void database_projection_capture::restore() noexcept {
     // ownership. No user callbacks are delivered, and no interrupt is issued.
     if (statement_) { sqlite3_finalize(statement_); statement_ = nullptr; }
     if (installed_) {
-        sqlite3_set_authorizer(handle_, nullptr, nullptr);
+        detail::restore_ordinary_attachment_guard(handle_);
         sqlite3_progress_handler(handle_, 0, nullptr, nullptr);
         sqlite3_busy_timeout(handle_, prior_busy_timeout_);
         installed_ = false;

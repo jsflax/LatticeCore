@@ -391,7 +391,7 @@ std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattic
     }
     if (!writer) return std::nullopt;
     if (!probe) {
-        probe = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */);
+        probe = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */, std::shared_ptr<database_read_control>{}, owner.config_.ordinary_context);
         std::lock_guard<std::mutex> lock(shared->mutex);
         shared->probe_reader = probe;
     }
@@ -450,7 +450,7 @@ std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattic
     const auto probe_identity = probe->physical_identity("main", {}, true);
     if (!writer_identity || !probe_identity || !(*probe_identity == *writer_identity))
         throw db_error("recovery refresh physical store changed");
-    auto fresh = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */);
+    auto fresh = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */, std::shared_ptr<database_read_control>{}, owner.config_.ordinary_context);
     const auto fresh_identity = fresh->physical_identity("main", {}, true);
     if (!fresh_identity || !(*fresh_identity == *writer_identity))
         throw db_error("recovery refresh reader physical store changed");

@@ -1,6 +1,7 @@
 #pragma once
 
 #ifdef __cplusplus
+#include "ordinary_context.hpp"
 
 #include "types.hpp"
 #include <sqlite3.h>
@@ -14,6 +15,12 @@
 #include <thread>
 
 namespace lattice {
+namespace detail {
+// Restores the primary-only native guard after a temporary stricter engine
+// authorizer. No userdata pointer, query, allocation or global mutex is used.
+int restore_ordinary_attachment_guard(sqlite3*) noexcept;
+}
+
 
 /// Default statement-level busy timeout. Headless/server processes tolerate long
 /// waits; interactive apps should pass a smaller value (e.g. 5000) via
@@ -191,7 +198,7 @@ class database {
         initialization_key(const initialization_key&) = default;
     };
     static std::shared_ptr<database> make_read_keeper(const std::string& path,
-                                                    int busy_timeout_ms);
+                                                    int busy_timeout_ms, detail::ordinary_context context = {});
     template<typename T, typename Enable> friend struct managed;
     friend class swift_lattice;
     friend class projection_service;
@@ -307,10 +314,12 @@ public:
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
                       int busy_timeout_ms = kDefaultBusyTimeoutMs,
-                      std::shared_ptr<database_read_control> read_control = {});
+                      std::shared_ptr<database_read_control> read_control = {},
+                      detail::ordinary_context ordinary_context = {});
     // Private construction capability; no caller can manufacture the key.
     database(const std::string& path, open_mode mode, int busy_timeout_ms,
-             std::shared_ptr<database_read_control> read_control, initialization_key key);
+             std::shared_ptr<database_read_control> read_control, initialization_key key,
+             detail::ordinary_context ordinary_context = {});
     ~database();
 
     /// No SQL statements. Best-effort for legacy callers; nullptr means an
@@ -467,6 +476,7 @@ private:
     // Follows this exact SQLite connection through moves. A retained state
     // outlives the wrapper; close_v2 success is never physical-close proof.
     std::shared_ptr<detail::database_retirement_state> retirement_;
+    detail::ordinary_context ordinary_context_;
     void retire_connection_(bool detach_callbacks = true) noexcept;
     mutable std::atomic<bool> raw_handle_escaped_{false};
     std::string path_;

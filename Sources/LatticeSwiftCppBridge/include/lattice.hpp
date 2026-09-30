@@ -22,6 +22,7 @@
 #include <recovery_continuity.hpp>
 #include <lattice/platform_retirement.hpp>
 #include <lattice/configured_platform.hpp>
+#include "../../LatticeCore/src/ordinary_normal_startup.hpp"
 #include <list.hpp>
 #include <error.hpp>
 
@@ -429,6 +430,24 @@ inline std::optional<std::vector<uint8_t>> column_value_as_blob(const column_val
 // (Defined early so swift_configuration can use it)
 // ============================================================================
 
+// Immutable receiver-issued ownership. Default construction is empty and
+// cannot grant an open; the only positive factory consumes the real inherited
+// launch exchange before any native file/cache admission.
+class swift_ordinary_open_context {
+    friend struct swift_configuration;
+    detail::ordinary_context context_;
+public:
+    swift_ordinary_open_context() = default;
+    static swift_ordinary_open_context receive_engram_primary() noexcept {
+        swift_ordinary_open_context result;
+        try { result.context_=detail::ordinary_installation::normal_receiver::receive(
+            std::chrono::steady_clock::now()+std::chrono::seconds(30)); } catch(...) {}
+        return result;
+    }
+    bool valid() const noexcept { return static_cast<bool>(context_); }
+    std::string primary_path() const { return context_ ? context_->primary_path() : std::string{}; }
+};
+
 /// Swift-specific configuration that extends the core configuration.
 struct swift_configuration : public configuration {
     struct SchemaPair { SwiftSchema from, to; };
@@ -517,6 +536,8 @@ struct swift_configuration : public configuration {
 
     // From base configuration
     swift_configuration(const configuration& base) : configuration(base) {}
+
+    void set_ordinary_open_context(const swift_ordinary_open_context& context) { ordinary_context=context.context_; }
 
     void set_recovery_source_expectation(const std::string& value) { recovery_source_expectation=value; }
 
@@ -3327,8 +3348,10 @@ template <typename ConfigT>
         std::string ipc_fingerprint; // Channels + socket paths + sync filter (see ipc_targets_fingerprint)
         std::string tuning_fingerprint; // sync_tuning overlay (different tuning must not share an instance)
         std::string recovery_expectation; // never reuse a cached owner for changed source policy
+        detail::ordinary_context ordinary_context; // same opaque process/launch capability
 
         bool operator<(const LatticeRefCacheKey& other) const {
+            if (ordinary_context != other.ordinary_context) return ordinary_context.owner_before(other.ordinary_context);
             if (path != other.path) return path < other.path;
             if (websocket_url != other.websocket_url) return websocket_url < other.websocket_url;
             if (schema_hash != other.schema_hash) return schema_hash < other.schema_hash;
@@ -3345,6 +3368,7 @@ template <typename ConfigT>
         }
 
         bool operator==(const LatticeRefCacheKey& other) const {
+            if (ordinary_context != other.ordinary_context) return false;
             if (path != other.path) return false;
             if (websocket_url != other.websocket_url) return false;
             if (schema_hash != other.schema_hash) return false;
@@ -3367,6 +3391,7 @@ template <typename ConfigT>
         // Template to preserve swift_configuration type for constructor overload resolution
         template<typename ConfigT>
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
+            detail::ordinary_before_open(config.path, config.ordinary_context);
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
 
             // Build schema hash from table names and properties (sorted for
@@ -3405,7 +3430,7 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, config.ordinary_context};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,
@@ -3519,6 +3544,7 @@ template <typename ConfigT>
         /// the subsequent ATTACH would mutate the parent's own connection.
         std::shared_ptr<swift_lattice> create_uncached(const swift_configuration& config,
                                                        const SchemaVector& schemas) {
+            detail::ordinary_before_open(config.path, config.ordinary_context);
             auto inst = std::make_shared<swift_lattice>(config, schemas);
             register_pointer(inst);
             return inst;

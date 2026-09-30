@@ -41,6 +41,8 @@ let package = Package(
         .iOS(.v15)
     ],
     products: [
+        .executable(name: "LatticeInstallationLauncher", targets: ["LatticeInstallationLauncher"]),
+        .library(name: "LatticeInstallationChannel", targets: ["LatticeInstallationChannel"]),
         .library(
             name: "LatticeCore",
             targets: ["LatticeCore"]
@@ -65,6 +67,28 @@ let package = Package(
         ),
     ] + capiTestProducts,
     targets: [
+        .executableTarget(
+            name: "LatticeInstallationSeedChild",
+            dependencies: ["LatticeCore"],
+            path: "Tests/LatticeInstallationSeedChild",
+            cxxSettings: [.unsafeFlags(["-std=c++20"])],
+            linkerSettings: [.linkedLibrary("pthread", .when(platforms: [.linux]))]
+        ),
+        // Dedicated native installer: no LatticeCore/SQLite/Swift app dependency.
+        .executableTarget(
+            name: "LatticeInstallationLauncher",
+            path: "Tools/LatticeInstallationLauncher",
+            cxxSettings: [.unsafeFlags(["-std=c++20"])],
+            linkerSettings: [.linkedLibrary("pthread", .when(platforms: [.linux]))]
+        ),
+        .target(
+            name: "LatticeInstallationChannel",
+            dependencies: ["LatticeCore"],
+            path: "Sources/LatticeInstallationChannel",
+            sources: ["src"],
+            publicHeadersPath: "include",
+            cxxSettings: [.unsafeFlags(["-std=c++20"])]
+        ),
         .target(
             name: "SqliteVec",
             path: "Sources/SqliteVec",
@@ -190,7 +214,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "LatticeCoreTests",
-            dependencies: ["LatticeCore", "LatticeSwiftCppBridge", "GoogleTest", "LatticeCAPIHeaderCheck"],
+            dependencies: ["LatticeCore", "LatticeSwiftCppBridge", "GoogleTest", "LatticeCAPIHeaderCheck", "LatticeInstallationSeedChild"],
             path: "Tests/LatticeCoreTests",
             exclude: ["vendor", "LatticeCoreTests_legacy.cpp.bak", "IPCTests.hpp", "SyncIntegrationTests.hpp"],
             cxxSettings: [

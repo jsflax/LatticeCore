@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +33,9 @@ struct process_identity {
     bool operator==(const process_identity&) const = default;
 };
 process_identity current_process();
+// Actual current parent observation for the inherited startup exchange. This
+// is a kernel incarnation fact, not retained child custody or launch authority.
+process_identity current_parent_process();
 
 // The launching authority must own approved executable/invocation validation.
 // This lower-level primitive performs no approval by inspecting these strings.
@@ -94,6 +98,10 @@ public:
     // child. The caller must separately retain every actual store-owning role
     // and descendant; this primitive never promotes a group census to proof.
     terminal_observation stop_and_join(deadline);
+    // Observe/reap only an already-terminal direct child. Empty means no
+    // terminal event was observed; custody loss/errors are never empty.
+    // Does not signal an active child or consume/poison its valid channel.
+    std::optional<terminal_observation> observe_terminal(deadline);
     // A failed teardown remains process-retained. Wrapper destruction cannot
     // turn unknown cleanup into a successful observation or release its PID.
     static std::size_t unresolved_lifetimes();

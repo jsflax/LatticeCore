@@ -503,6 +503,10 @@ class lattice_db;
 using migration_block_t = std::function<void(migration_context& context)>;
 
 struct configuration {
+    // Explicit receiver-issued capability; copying configuration preserves the
+    // same process/generation ownership. Paths never select this capability.
+    detail::ordinary_context ordinary_context;
+
     /// Database file path. Use ":memory:" for in-memory database.
     std::string path = ":memory:";
 
@@ -945,11 +949,11 @@ protected:
         , config_(config)
         , db_(recovery_continuous_ ? detail::open_continuous_writer(config,recovery_continuous_) : std::make_shared<database>(resolve_path(config),
               config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
-              config.busy_timeout_ms))
+              config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context))
         , read_db_(config.read_only ? nullptr :
-                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
+                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
-                         std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
+                         std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context) : nullptr)
         , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
@@ -2642,7 +2646,7 @@ public:
             if (!conn) {
                 // Select the final 2,000-page keeper cache at construction.
                 // Ordinary readers retain their 50,000-page default.
-                conn = database::make_read_keeper(config_.path, config_.busy_timeout_ms);
+                conn = database::make_read_keeper(config_.path, config_.busy_timeout_ms, config_.ordinary_context);
             }
             conn->execute("BEGIN");
             conn->query("SELECT 1 FROM sqlite_schema LIMIT 1");  // the pin/fence

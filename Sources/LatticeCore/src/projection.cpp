@@ -96,6 +96,7 @@ public:
     void shutdown();
     struct topology {
         std::string path;
+        detail::ordinary_context ordinary_context;
         bool memory = false;
         std::vector<std::pair<std::string, std::string>> attachments;
         std::vector<std::shared_ptr<const physical_store_identity>> identities;
@@ -528,6 +529,7 @@ projection_service::topology projection_service::capture(const std::shared_ptr<d
     if (!owner_->db_) fail(projection_status::snapshot_expired, "writer is unavailable during exclusive maintenance");
     if (!owner_->attachment_topology_valid_) fail(projection_status::snapshot_expired, "attachment topology is incomplete");
     topology result;
+    result.ordinary_context = owner_->config_.ordinary_context;
     if (owner_->config_.path.empty())
         fail(projection_status::unsupported, "temporary empty-filename projection storage is unsupported");
     result.memory = owner_->config_.is_in_memory();
@@ -792,7 +794,8 @@ void projection_operation_state::initialize() {
         initialized = true;
         return;
     }
-    connection = std::make_unique<database>(readonly_uri(topology.path), database::open_mode::read_only, 0, control);
+    connection = std::make_unique<database>(topology.ordinary_context ? topology.path : readonly_uri(topology.path),
+        database::open_mode::read_only, 0, control, topology.ordinary_context);
     auto private_identity = connection->physical_identity("main", control, true);
     check();
     if (!private_identity || !(*private_identity == *topology.identities.front()))

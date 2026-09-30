@@ -23,8 +23,10 @@ void validate(const record& value) {
         empty(value.binding.epoch) || !value.binding.main.inode || !value.binding.parent.inode ||
         !value.control.inode || !value.entry.inode || !value.generation.inode ||
         value.entry == value.generation ||
-        (value.state != stage::unadopted && value.state != stage::retirement_requested) ||
-        (value.state == stage::unadopted ? !empty(value.cutover) : empty(value.cutover)))
+        (value.state != stage::unadopted && value.state != stage::retirement_requested && value.state != stage::ordinary_admitted) ||
+        (value.state == stage::retirement_requested ? empty(value.cutover) : !empty(value.cutover)) ||
+        (value.state == stage::ordinary_admitted && empty(value.normal_launch)) ||
+        (value.state == stage::unadopted && !empty(value.normal_launch)))
         fail(error_code::invalid_record, "ordinary admission record invalid");
 }
 void put64(encoded_record& bytes, std::size_t& at, std::uint64_t value) {
@@ -42,7 +44,7 @@ encoded_record encode(const record& value) {
     encoded_record bytes{};
     constexpr std::array<std::uint8_t, 8> magic{'L','A','T','A','D','M','1',0};
     std::copy(magic.begin(), magic.end(), bytes.begin());
-    bytes[8] = 1; // u32 version, little endian
+    bytes[8] = empty(value.normal_launch) ? 1 : 2; // Old bytes remain exact; old readers refuse v2.
     bytes[13] = 1; // u32 length = 256
     std::size_t at = 16;
     put64(bytes, at, value.revision);
@@ -54,6 +56,7 @@ encoded_record encode(const record& value) {
     for (const auto* identity : {&value.binding.main, &value.binding.parent, &value.control, &value.entry, &value.generation}) {
         put64(bytes, at, identity->device); put64(bytes, at, identity->inode);
     }
+    std::copy(value.normal_launch.begin(), value.normal_launch.end(), bytes.begin() + 176);
     picosha2::hash256(bytes.begin(), bytes.begin() + 224, bytes.begin() + 224, bytes.end());
     return bytes;
 }
@@ -70,6 +73,7 @@ record decode(const encoded_record& bytes) {
     for (auto* identity : {&value.binding.main, &value.binding.parent, &value.control, &value.entry, &value.generation}) {
         identity->device = get64(bytes, at); identity->inode = get64(bytes, at);
     }
+    std::copy_n(bytes.begin() + 176, value.normal_launch.size(), value.normal_launch.begin());
     // Re-encoding also verifies magic/version/size, reserved zeros, enum/ID
     // invariants, and the complete checksum. No permissive version fallback.
     if (encode(value) != bytes) fail(error_code::invalid_record, "ordinary admission bytes invalid");
@@ -282,6 +286,30 @@ generation_hold journal::try_hold_generation() const {
     impl_->check_named("generation.lock", lease.fd, value.generation);
     lock(lease.fd, LOCK_SH); return generation_hold(lease.release());
 }
+record journal::admit_ordinary(const record& expected, const identifier& launch) {
+    if (!impl_ || empty(launch) || expected.state != stage::unadopted ||
+        !empty(expected.normal_launch)) fail(error_code::invalid_record, "ordinary launch transition invalid");
+    auto entry = impl_->entry(); auto value = impl_->load(entry.fd);
+    // No retries after uncertain publication and no reopening an old admitted
+    // or retiring generation. The owning controller retains the first result.
+    if (value != expected) fail(error_code::identity_changed, "ordinary launch predecessor changed");
+    if (value.revision == std::numeric_limits<std::uint64_t>::max())
+        fail(error_code::revision_exhausted, "ordinary launch revision exhausted");
+    auto generation = file(impl_->directory.fd, "generation.lock");
+    impl_->check_named("generation.lock", generation.fd, value.generation);
+    lock(generation.fd, LOCK_EX);
+    ++value.revision; value.state = stage::ordinary_admitted; value.normal_launch = launch;
+    impl_->save(value); return value;
+}
+generation_hold journal::hold_ordinary(const record& expected) const {
+    if (!impl_ || expected.state != stage::ordinary_admitted || empty(expected.normal_launch))
+        fail(error_code::invalid_record, "ordinary launch hold invalid");
+    auto entry = impl_->entry(); const auto value = impl_->load(entry.fd);
+    if (value != expected) fail(error_code::identity_changed, "ordinary launch admission changed");
+    auto lease = file(impl_->directory.fd, "generation.lock");
+    impl_->check_named("generation.lock", lease.fd, value.generation);
+    lock(lease.fd, LOCK_SH); return generation_hold(lease.release());
+}
 record journal::begin_retirement(const identifier& cutover) {
     if (!impl_) fail(error_code::unavailable, "ordinary admission moved journal");
     if (empty(cutover)) fail(error_code::invalid_record, "ordinary admission cutover is empty");
@@ -316,6 +344,8 @@ journal journal::open_existing(int, const store_binding&) { unsupported(); }
 journal journal::open_existing(int, const store_binding&, const control_binding&) { unsupported(); }
 record journal::read() const { unsupported(); }
 generation_hold journal::try_hold_generation() const { unsupported(); }
+record journal::admit_ordinary(const record&, const identifier&) { unsupported(); }
+generation_hold journal::hold_ordinary(const record&) const { unsupported(); }
 record journal::begin_retirement(const identifier&) { unsupported(); }
 bool journal::generation_busy() const { unsupported(); }
 generation_hold::~generation_hold() = default;

@@ -331,24 +331,40 @@ std::vector<std::string> database::query_attachment_text_metadata(
     return std::move(context.values);
 }
 
-database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
-                   std::shared_ptr<database_read_control> read_control)
-    : database(path, mode, busy_timeout_ms, std::move(read_control), initialization_key(false)) {}
-
-std::shared_ptr<database> database::make_read_keeper(const std::string& path,
-                                                   int busy_timeout_ms) {
-    return std::make_shared<database>(path, open_mode::read_only, busy_timeout_ms,
-                                     std::shared_ptr<database_read_control>{}, initialization_key(true));
+int detail::restore_ordinary_attachment_guard(sqlite3* connection) noexcept {
+    if (!ordinary_requires_attachment_guard()) return sqlite3_set_authorizer(connection,nullptr,nullptr);
+    return sqlite3_set_authorizer(connection,
+        [](void*,int action,const char*,const char*,const char*,const char*) {
+            return action==SQLITE_ATTACH || action==SQLITE_DETACH ? SQLITE_DENY : SQLITE_OK;
+        },nullptr);
 }
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
-                   std::shared_ptr<database_read_control> read_control, initialization_key key)
-    : administrative_connection_(key.administrative_), retirement_(std::make_shared<detail::database_retirement_state>()),
+                   std::shared_ptr<database_read_control> read_control, detail::ordinary_context ordinary_context)
+    : database(path, mode, busy_timeout_ms, std::move(read_control), initialization_key(false), std::move(ordinary_context)) {}
+
+std::shared_ptr<database> database::make_read_keeper(const std::string& path,
+                                                   int busy_timeout_ms, detail::ordinary_context ordinary_context) {
+    return std::make_shared<database>(path, open_mode::read_only, busy_timeout_ms,
+                                     std::shared_ptr<database_read_control>{}, initialization_key(true), std::move(ordinary_context));
+}
+
+database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
+                   std::shared_ptr<database_read_control> read_control, initialization_key key, detail::ordinary_context ordinary_context)
+    : administrative_connection_(key.administrative_), retirement_(std::make_shared<detail::database_retirement_state>()), ordinary_context_(std::move(ordinary_context)),
       path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
+    detail::ordinary_before_open(path, ordinary_context_);
     suppress_destructor_optimize_=key.administrative_;
     if(mode==open_mode::read_write && !key.continuous_)detail::require_continuous_path_unowned(path);
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
+    if (ordinary_context_) {
+#ifdef SQLITE_OPEN_NOFOLLOW
+        flags |= SQLITE_OPEN_NOFOLLOW;
+#else
+        throw db_error("managed ordinary open requires no-follow SQLite support");
+#endif
+    }
     int rc;
 
     if (mode == open_mode::read_only) {
@@ -396,6 +412,16 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     }
 
     try {
+    if (ordinary_context_) {
+        const auto actual = physical_identity("main", {}, true);
+        if (!actual) throw db_error("managed ordinary physical identity unavailable");
+        ordinary_context_->validate_physical(actual->device, actual->inode);
+    }
+    // No SQL text inspection and no per-query/global lock. SQLite rejects the
+    // actual ATTACH opcode before it can open a second domain, including raw
+    // SQL issued against a private in-memory connection in this process.
+    if (detail::ordinary_requires_attachment_guard() && detail::restore_ordinary_attachment_guard(db_) != SQLITE_OK)
+        throw db_error("managed ordinary attachment guard unavailable");
     if (const auto* probe = detail::database_retirement_test_hooks::current; probe && probe->after_open)
         probe->after_open(*this, db_);
     if(key.administrative_) {
@@ -604,6 +630,7 @@ void database::close() {
 }
 
 sqlite3* database::handle() const {
+    detail::ordinary_require_no_raw_escape(ordinary_context_);
     // The connection stays allocated through logical close. As with every raw
     // access, callers must keep the database wrapper alive and not move it.
     if (!db_) return nullptr;
@@ -731,7 +758,7 @@ void database::discard_if_rolled_back() {
 }
 
 database::database(database&& other) noexcept
-    : db_(other.db_), retirement_(std::move(other.retirement_)), path_(std::move(other.path_)), mode_(other.mode_),
+    : db_(other.db_), retirement_(std::move(other.retirement_)), ordinary_context_(std::move(other.ordinary_context_)), path_(std::move(other.path_)), mode_(other.mode_),
       busy_timeout_ms_(other.busy_timeout_ms_), read_control_(std::move(other.read_control_)),
       main_physical_identity_(std::atomic_load(&other.main_physical_identity_)) {
     canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
@@ -772,6 +799,7 @@ database& database::operator=(database&& other) noexcept {
         lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
         db_ = other.db_;
         retirement_ = std::move(other.retirement_);
+        ordinary_context_ = std::move(other.ordinary_context_);
         txn_dirty_.store(other.txn_dirty_.exchange(false));
         txn_hooks_ = std::move(other.txn_hooks_);
         // The SQLite update/WAL userdata address has not changed. The rollback

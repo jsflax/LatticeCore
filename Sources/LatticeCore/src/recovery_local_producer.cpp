@@ -340,6 +340,8 @@ struct recovery_local_producer_adapter::context {
         sqlite3_result_int(sql,ok?1:0);
     }
     static int authorize(void* raw,int action,const char* one,const char* two,const char* schema,const char* origin) noexcept {
+        if((action==SQLITE_ATTACH || action==SQLITE_DETACH) && ordinary_requires_attachment_guard())
+            return SQLITE_DENY; // Management scopes cannot expand the managed primary profile.
         auto& root=*static_cast<context*>(raw);
         const auto normal=[&]() noexcept -> int {
         for(auto* m=management_;m;m=m->previous)if(m->connection==root.connection)return SQLITE_OK;

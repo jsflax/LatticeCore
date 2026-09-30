@@ -8,6 +8,7 @@
 // Private, inactive substrate. Neither a journal nor an OS lease authorizes a
 // database open, application work, legacy enrollment or recovery adoption.
 // Installation-owned launcher and source-intake custody is still required.
+namespace lattice::detail::ordinary_installation { class normal_origin_authority; struct normal_receiver; }
 namespace lattice::detail::ordinary_admission {
 
 using identifier = std::array<std::uint8_t, 16>;
@@ -27,12 +28,15 @@ struct control_binding {
     file_identity control{}, entry{}, generation{};
     bool operator==(const control_binding&) const = default;
 };
-enum class stage : std::uint8_t { unadopted = 1, retirement_requested = 2 };
+enum class stage : std::uint8_t { unadopted = 1, retirement_requested = 2, ordinary_admitted = 3 };
 struct record {
     std::uint64_t revision = 1;
     stage state = stage::unadopted;
     store_binding binding;
     identifier cutover{};
+    // Nonzero only for the exact admitted ordinary launch. This is not a
+    // recovery generation, produced-history claim or authorization by itself.
+    identifier normal_launch{};
     file_identity control{}, entry{}, generation{};
     bool operator==(const record&) const = default;
 };
@@ -66,9 +70,15 @@ public:
 };
 
 class journal {
+    friend class ordinary_installation::normal_origin_authority;
+    friend struct ordinary_installation::normal_receiver;
     struct implementation;
     std::unique_ptr<implementation> impl_;
     explicit journal(std::unique_ptr<implementation>);
+    // Only the retained product issuer can publish this one-way transition.
+    // Generic journal users cannot manufacture normal-open authority.
+    record admit_ordinary(const record& expected_closed, const identifier& exact_launch);
+    generation_hold hold_ordinary(const record& expected_admitted) const;
 public:
     // Caller owns selection of an existing empty 0700 directory. This API
     // duplicates that descriptor; it creates no parent/default/global catalog.

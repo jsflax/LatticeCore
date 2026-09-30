@@ -458,7 +458,7 @@ void lattice_db::reopen_write_db() {
         previous_writer = db_;
     }
     auto staged = std::make_shared<database>(config_.path,
-        database::open_mode::read_write, config_.busy_timeout_ms);
+        database::open_mode::read_write, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context);
     register_sql_functions(*staged);
     {
         // Never wait behind topology while a caller may own the writer mutex.
@@ -521,9 +521,9 @@ void lattice_db::reopen_read_db() {
     }
     // No half-pair publication if either open or topology restoration fails.
     auto reader = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
+        database::open_mode::read_only, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context);
     auto xproc = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
+        database::open_mode::read_only, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context);
     // A maintenance caller can already own the writer SQLite mutex. Never
     // wait behind attach while it may be waiting for that writer. A busy
     // topology is an explicit failed reopen, with prior publication intact.
@@ -1328,6 +1328,7 @@ void lattice_db::setup_sync_if_configured() {
     std::string sync_path = resolve_path(config_);
     configuration sync_db_config(sync_path,
                                  std::make_shared<std_thread_scheduler>());
+    sync_db_config.ordinary_context = config_.ordinary_context;
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
     auto sync_db = std::make_unique<lattice_db>(sync_db_config);
@@ -1475,6 +1476,7 @@ void lattice_db::setup_ipc_if_configured() {
                 // Create dedicated lattice_db for this IPC synchronizer
                 configuration ipc_db_config(config_.path,
                                             std::make_shared<std_thread_scheduler>());
+                ipc_db_config.ordinary_context = config_.ordinary_context;
                 ipc_db_config.target_schema_version = config_.target_schema_version;
                 ipc_db_config.migration_block = config_.migration_block;
                 auto ipc_db = std::make_unique<lattice_db>(ipc_db_config);
@@ -1569,6 +1571,7 @@ void lattice_db::attach(lattice_db &lattice) {
 }
 
 void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const void> metadata) {
+    detail::ordinary_require_no_attachment(config_.ordinary_context);
     if(recovery_continuous_||lattice.recovery_continuous_)throw db_error("continuous attachment topology requires admitted same-file facades");
     if (detail::managed_route_scope::active_for(this))
         throw db_error("attach: topology mutation during managed scalar access");

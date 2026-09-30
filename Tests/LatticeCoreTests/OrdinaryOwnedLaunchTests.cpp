@@ -415,6 +415,69 @@ TEST(OrdinaryOwnedLaunch, RetirementCancelsAndJoinsTheActualChannelReaderBeforeC
     EXPECT_TRUE(WTERMSIG(terminal.wait_status) == SIGTERM || WTERMSIG(terminal.wait_status) == SIGKILL);
 }
 
+TEST(OrdinaryOwnedLaunch, ActiveAndExpiredTerminalObservationLeaveTheRealChannelUsable) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    auto child = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));
+    const auto identity = child.identity();
+    child.send({3, 9, 1}, within());
+    EXPECT_FALSE(child.observe_terminal(within()).has_value());
+    EXPECT_EQ(child.receive(within()), (launch::frame{3, 9, 1}));
+    expect_error(launch::error_code::timed_out, [&] {
+        (void)child.observe_terminal(std::chrono::steady_clock::now());
+    });
+    child.send({4, 9, 2}, within());
+    EXPECT_EQ(child.receive(within()), (launch::frame{4, 9, 2}));
+    EXPECT_EQ(child.identity(), identity);
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+    (void)child.stop_and_join(within());
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before);
+}
+
+TEST(OrdinaryOwnedLaunch, ActualTerminalObservationReapsAndRetainsTheExactReceipt) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    auto child = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));
+    const auto identity = child.identity();
+    child.send({7, 6}, within());
+    EXPECT_EQ(child.receive(within()), (launch::frame{7, 6}));
+    // The fixture causes a real terminal event; observe_terminal itself never
+    // requests child retirement and cannot invent this status.
+    ASSERT_EQ(::kill(static_cast<pid_t>(identity.pid), SIGTERM), 0);
+    std::optional<launch::terminal_observation> terminal;
+    const auto end = within();
+    while (std::chrono::steady_clock::now() < end && !(terminal = child.observe_terminal(end)))
+        std::this_thread::sleep_for(2ms);
+    ASSERT_TRUE(terminal.has_value());
+    EXPECT_EQ(terminal->child, identity);
+    ASSERT_TRUE(WIFSIGNALED(terminal->wait_status));
+    EXPECT_EQ(WTERMSIG(terminal->wait_status), SIGTERM);
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before);
+    const auto again = child.observe_terminal(within());
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->child, identity);
+    EXPECT_EQ(again->wait_status, terminal->wait_status);
+    EXPECT_EQ(child.stop_and_join(within()).wait_status, terminal->wait_status);
+    int status = 0; errno = 0;
+    EXPECT_EQ(::waitpid(static_cast<pid_t>(identity.pid), &status, WNOHANG), -1);
+    EXPECT_EQ(errno, ECHILD);
+}
+
+TEST(OrdinaryOwnedLaunch, LostReaperObservationIsAnErrorRatherThanAnActiveResult) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    {
+        auto child = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));
+        const auto identity = child.identity();
+        ASSERT_EQ(::kill(static_cast<pid_t>(identity.pid), SIGTERM), 0);
+        fixture_child external_reaper(static_cast<pid_t>(identity.pid));
+        const auto status = external_reaper.join(within());
+        ASSERT_GE(status, 0);
+        expect_error(launch::error_code::terminal_unproved, [&] { (void)child.observe_terminal(within()); });
+        EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+    }
+    // Actual child is gone, but the owner did not reap it. Its negative custody
+    // evidence survives wrapper destruction and no false active result escapes.
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+}
+
 TEST(OrdinaryOwnedLaunch, InterruptedObservationDeadlineRetainsTheActualChildForLaterJoin) {
     const auto before = launch::owned_child::unresolved_lifetimes();
     auto child = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));

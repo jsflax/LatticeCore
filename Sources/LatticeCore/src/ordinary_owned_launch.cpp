@@ -175,6 +175,12 @@ void exclusive_reaper() {
 
 #if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
 process_identity current_process() { return read_identity(::getpid()); }
+process_identity current_parent_process() {
+    const auto parent = ::getppid();
+    const auto observed = read_identity(parent);
+    if (::getppid() != parent) fail(error_code::identity_unproved);
+    return observed;
+}
 struct inherited_channel::implementation {
     descriptor fd;
     const pid_t creator = ::getpid();
@@ -193,6 +199,7 @@ inherited_channel::inherited_channel(int fd) {
 }
 #else
 process_identity current_process() { fail(error_code::unavailable); }
+process_identity current_parent_process() { fail(error_code::unavailable); }
 struct inherited_channel::implementation {};
 inherited_channel::inherited_channel(int) { fail(error_code::unavailable); }
 #endif
@@ -295,6 +302,10 @@ struct owned_child::implementation {
                 fail(error_code::cleanup_unproved);
             while (!(done = exited(until))) { bound(until); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
         }
+        return reap_terminal(until);
+    }
+    // Caller holds retirement custody and has a positive WNOWAIT observation.
+    terminal_observation reap_terminal(deadline until) {
         // No descriptor close can race a still-running read/write worker. Stop
         // makes those bounded polls unwind; failure to join retains everything.
         std::unique_lock channel(io, std::defer_lock);
@@ -313,6 +324,19 @@ struct owned_child::implementation {
         fd = descriptor(); // close-only; no inherited OFD unlock or arbitrary callback.
         release_retained();
         return {child, status};
+    }
+    std::optional<terminal_observation> observe(deadline until) {
+        owner(creator);
+        bound(until);
+        std::unique_lock gate(retirement, std::defer_lock);
+        if (!gate.try_lock_until(until)) fail(error_code::cleanup_unproved);
+        if (reaped) return terminal_observation{child, status};
+        if (custody_lost) fail(error_code::terminal_unproved);
+        if (!exited(until)) return std::nullopt;
+        // Only actual terminal observation closes the channel to fresh I/O.
+        // A live-child poll or failed wait cannot poison an active exchange.
+        stopped.store(true, std::memory_order_release);
+        return reap_terminal(until);
     }
     void abandon_wrapper() noexcept {
         // A forked copy never signals/reaps the parent's child or locks its
@@ -477,6 +501,13 @@ frame owned_child::receive(deadline until) {
 terminal_observation owned_child::stop_and_join(deadline until) {
 #if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
     if (!impl_) fail(error_code::unavailable); return impl_->stop(until);
+#else
+    (void)until; fail(error_code::unavailable);
+#endif
+}
+std::optional<terminal_observation> owned_child::observe_terminal(deadline until) {
+#if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
+    if (!impl_) fail(error_code::unavailable); return impl_->observe(until);
 #else
     (void)until; fail(error_code::unavailable);
 #endif

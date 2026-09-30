@@ -499,7 +499,7 @@ canonical_writer_adapter::canonical_writer_adapter(lattice_db& owner,const canon
     };
     bool began=false;
     try {
-        if(writer_->canonical_callback_custody_)sqlite3_set_authorizer(writer_->internal_handle(),nullptr,nullptr);
+        if(writer_->canonical_callback_custody_)restore_ordinary_attachment_guard(writer_->internal_handle());
         register_shared();
         if(retention) {
             auto* held=new std::shared_ptr<context>(context_);

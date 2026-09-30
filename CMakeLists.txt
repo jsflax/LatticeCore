@@ -66,6 +66,11 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
     Sources/LatticeCore/src/ordinary_store_admission.cpp
     Sources/LatticeCore/src/ordinary_owned_launch.cpp
+    Sources/LatticeCore/src/ordinary_installation_manifest.cpp
+    Sources/LatticeCore/src/ordinary_installation_cohort.cpp
+    Sources/LatticeCore/src/ordinary_installation_files.cpp
+    Sources/LatticeCore/src/ordinary_installation_seed.cpp
+    Sources/LatticeCore/src/ordinary_normal_startup.cpp
     Sources/LatticeCore/src/managed_observation.cpp
     Sources/LatticeCore/src/schema.cpp
     Sources/LatticeCore/src/derived_profile.cpp
@@ -128,6 +133,28 @@ target_link_libraries(LatticeCore PUBLIC
     SqliteVec
     SQLite::SQLite3
 )
+
+# The installer owns every child/reaper path before any application runtime.
+# Its link graph deliberately excludes LatticeCore, SQLite, Swift and the app.
+find_package(Threads REQUIRED)
+add_executable(LatticeInstallationLauncher
+    Tools/LatticeInstallationLauncher/main.cpp
+    Tools/LatticeInstallationLauncher/owned_launch.cpp
+    Tools/LatticeInstallationLauncher/installation_manifest.cpp
+    Tools/LatticeInstallationLauncher/installation_cohort.cpp
+    Tools/LatticeInstallationLauncher/installation_files.cpp
+    Tools/LatticeInstallationLauncher/installation_seed.cpp
+    Tools/LatticeInstallationLauncher/normal_startup.cpp
+    Tools/LatticeInstallationLauncher/store_admission.cpp
+    Tools/LatticeInstallationLauncher/engram_product_installer.cpp
+)
+target_link_libraries(LatticeInstallationLauncher PRIVATE Threads::Threads)
+add_library(LatticeInstallationChannel STATIC Sources/LatticeInstallationChannel/src/channel.cpp)
+target_include_directories(LatticeInstallationChannel PUBLIC Sources/LatticeInstallationChannel/include)
+target_link_libraries(LatticeInstallationChannel PRIVATE LatticeCore)
+# Real process fixture only; never installed or linked into the launcher.
+add_executable(LatticeInstallationSeedChild Tests/LatticeInstallationSeedChild/main.cpp)
+target_link_libraries(LatticeInstallationSeedChild PRIVATE LatticeCore Threads::Threads)
 
 # =============================================================================
 # LatticeSwiftCppBridge - Bridge layer (used by CAPI, despite "Swift" name)
@@ -322,6 +349,11 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp
     Tests/LatticeCoreTests/OrdinaryStoreAdmissionTests.cpp
     Tests/LatticeCoreTests/OrdinaryOwnedLaunchTests.cpp
+    Tests/LatticeCoreTests/OrdinaryInstallationManifestTests.cpp
+    Tests/LatticeCoreTests/OrdinaryInstallationCohortTests.cpp
+    Tests/LatticeCoreTests/OrdinaryInstallationFilesTests.cpp
+    Tests/LatticeCoreTests/OrdinaryInstallationSeedTests.cpp
+    Tests/LatticeCoreTests/OrdinaryNormalStartupTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
     Tests/LatticeCoreTests/ManagedObservationTests.cpp
@@ -359,6 +391,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
 )
 target_link_libraries(LatticeCoreTests PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)
+add_dependencies(LatticeCoreTests LatticeInstallationSeedChild)
 target_include_directories(LatticeCoreTests PRIVATE
     Tests/LatticeCoreTests
     Tests/LatticeCAPIHeaderCheck/include

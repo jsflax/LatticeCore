@@ -3125,8 +3125,12 @@ TEST_F(BinaryRecoveryReceiverController, ActualDescribePrepareReadAndCompletedDi
     expect_binary_messages();
     const auto rows=receiver->db().query("SELECT * FROM ControllerRow ORDER BY id");
     ASSERT_EQ(rows.size(),1u);const auto old=peers[0].physical;
-    synchronizers[0]->disconnect();synchronizers[0]->connect();
+    const auto initial_dials=boundary_trace.connection;ASSERT_EQ(initial_dials,1u);ASSERT_EQ(synchronizers.size(),1u);
+    // A protected wrapper owns one physical attempt. Retain the retired
+    // wrapper while a fresh wrapper uses the same live receiver scheduler.
+    synchronizers[0]->disconnect();connect();ASSERT_EQ(synchronizers.size(),2u);
     ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
+    EXPECT_EQ(boundary_trace.connection,initial_dials+1);EXPECT_FALSE(old.matches(peers[0].physical));EXPECT_TRUE(peers[0].physical.is_current());
     EXPECT_FALSE(old.trigger_on_message(transport_message::from_string("{}")));
     EXPECT_EQ(controls["describe"],2u);EXPECT_EQ(controls["prepare"],2u);EXPECT_GT(controls["discard"],0u);
     EXPECT_GT(controls["read"],1u);expect_binary_messages();

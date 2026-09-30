@@ -380,9 +380,9 @@ owned_child owned_child::spawn(const launch_specification& spec) {
     if (::posix_spawnattr_init(&attributes) != 0) fail(error_code::launch_failed);
     struct destroy_attributes { posix_spawnattr_t* value; ~destroy_attributes() { ::posix_spawnattr_destroy(value); } } attribute_guard{&attributes};
     sigset_t mask, defaults;
-    if (::sigemptyset(&mask) != 0 || ::sigemptyset(&defaults) != 0) fail(error_code::launch_failed);
+    if (sigemptyset(&mask) != 0 || sigemptyset(&defaults) != 0) fail(error_code::launch_failed);
     for (const int number : {SIGTERM, SIGINT, SIGHUP, SIGPIPE, SIGCHLD})
-        if (::sigaddset(&defaults, number) != 0) fail(error_code::launch_failed);
+        if (sigaddset(&defaults, number) != 0) fail(error_code::launch_failed);
     short flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
 #if defined(__APPLE__)
     flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;

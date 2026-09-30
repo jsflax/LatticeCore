@@ -5,6 +5,7 @@
 #include "configured_retirement.hpp"
 #include "configured_attempt_custody.hpp"
 #include "sync_callback_lifetime.hpp"
+#include "configured_recovery_observation.hpp"
 #include <condition_variable>
 #include <optional>
 
@@ -38,6 +39,7 @@ struct configured_attempt : public std::enable_shared_from_this<configured_attem
     const std::shared_ptr<network_factory> factory;
     configured_platform_factory* const typed_factory;
     std::weak_ptr<configured_recovery_connection> control;
+    std::shared_ptr<configured_recovery_observer> observer;
     std::optional<sync_retirement_lane::reservation> native_reservation;
 private:
     std::shared_ptr<sync_callback_lifetime> lifetime_;
@@ -60,6 +62,7 @@ public:
     void lane_settled(sync_retirement_result) noexcept;
     void route_settled() noexcept;
     void request_renewal() noexcept;
+    void transport_created() noexcept;
     void install_lifetime(std::shared_ptr<sync_callback_lifetime>);
     std::shared_ptr<sync_callback_lifetime> lifetime()const noexcept;
     void bind(std::shared_ptr<sync_transport>,std::shared_ptr<sync_callback_lifetime>,
@@ -82,6 +85,8 @@ class configured_recovery_connection : public std::enable_shared_from_this<confi
     void cleanup_returned() noexcept;
     void control_payload_destroyed(bool) noexcept;
     void construct_attempt();
+    void observe(configured_recovery_stage,const std::shared_ptr<configured_attempt>&,
+        std::optional<configured_retirement_snapshot> = {}) noexcept;
     void notify() noexcept;
     void state_event(const std::shared_ptr<configured_attempt>&,bool);
     void error_event(const std::shared_ptr<configured_attempt>&,const std::string&);

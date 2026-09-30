@@ -6,3 +6,4 @@
 
 #include "platform_retirement_fixture.hpp"
 #include "configured_platform_fixture.hpp"
+#include "configured_recovery_qualification.hpp"

@@ -25,6 +25,7 @@ configured_recovery_test_hooks::successor_permission::successor_permission()noex
 configured_recovery_test_hooks::successor_permission::~successor_permission(){qualifying_configured_successors=prior_;}
 thread_local std::function<void()> configured_recovery_test_hooks::before_service_registration;
 thread_local std::function<void()> configured_recovery_test_hooks::after_transport_creation;
+thread_local std::shared_ptr<configured_recovery_observer> configured_recovery_test_hooks::observation;
 thread_local std::shared_ptr<const std::function<void(uint64_t,uint64_t)>> configured_recovery_test_hooks::before_backoff_publication;
 
 // Fixed records, one event/timer dispatcher and one bounded cleanup lane. The
@@ -137,6 +138,7 @@ struct configured_recovery_connection::state {
     bool needs_action=false,control_queued=false,finalizer_queued=false,worker_join_queued=false,cleanup_running=false;
     bool child_closed=false,scheduler_joined=false,close_release_ready=false;
     const bool successors_permitted=qualifying_configured_successors;
+    const std::shared_ptr<configured_recovery_observer> observer=configured_recovery_test_hooks::observation;
     const std::shared_ptr<const std::function<void(uint64_t,uint64_t)>> backoff_probe=configured_recovery_test_hooks::before_backoff_publication;
     bool successor_refusal_reported=false;
     uint64_t intent_epoch=1,retries=0;
@@ -164,6 +166,7 @@ void configured_attempt::route_settled()noexcept{
     wake();
 }
 void configured_attempt::request_renewal()noexcept{if(auto owner=control.lock())owner->request_renewal(shared_from_this());}
+void configured_attempt::transport_created()noexcept{if(observer)if(auto owner=control.lock())owner->observe(configured_recovery_stage::transport_created,shared_from_this());}
 void configured_attempt::install_lifetime(std::shared_ptr<sync_callback_lifetime> value){
     std::lock_guard<std::mutex> lock(facts_mutex);
     if(lifetime_&&lifetime_!=value)throw db_error("configured attempt lifetime already installed");
@@ -185,6 +188,26 @@ configured_recovery_connection::configured_recovery_connection(std::weak_ptr<lat
     std::shared_ptr<network_factory> factory,configured_platform_factory* typed)
     :state_(std::make_unique<state>(std::move(parent),std::move(config),std::move(factory),typed)){}
 configured_recovery_connection::~configured_recovery_connection()=default;
+void configured_recovery_connection::observe(configured_recovery_stage stage,const std::shared_ptr<configured_attempt>& attempt,
+    std::optional<configured_retirement_snapshot> before_collection)noexcept {
+    if(!state_->observer)return;
+    configured_recovery_observation fact;fact.stage=stage;fact.owner=reinterpret_cast<std::uintptr_t>(this);
+    {std::lock_guard<std::mutex> lock(state_->mutex);fact.child_closed=state_->child_closed;fact.scheduler_joined=state_->scheduler_joined;}
+    if(attempt){
+        fact.attempt=reinterpret_cast<std::uintptr_t>(attempt.get());
+        const auto counts=attempt->custody->snapshot();fact.commands=counts.commands;fact.payloads=counts.payloads;fact.workers=counts.workers;
+        const auto status=before_collection?*before_collection:attempt->registry->snapshot(attempt->receipt);
+        fact.adapter_complete=status.adapter_complete;fact.native_complete=status.native_complete;fact.quarantined=status.quarantined;
+        fact.first_error=status.first_error;fact.receipt_invalid=!attempt->receipt.valid();fact.wrapper_destroyed=attempt->wrapper_destroyed;
+        {std::lock_guard<std::mutex> lock(attempt->facts_mutex);
+            fact.lane_complete=attempt->lane_complete;fact.disconnect_returned=attempt->lane_result.disconnect_returned;
+            fact.pacer_present=attempt->lane_result.pacer_present;fact.pacer_joined=attempt->lane_result.pacer_joined;
+            fact.callbacks_settled=attempt->lane_result.callbacks_settled;
+            fact.route_unregistered=!attempt->route_registered||attempt->route_unregistered;
+        }
+    }
+    state_->observer->record(fact); // Passive, fixed-capacity, off every leaf.
+}
 std::shared_ptr<configured_recovery_connection> configured_recovery_connection::create(
     const std::shared_ptr<lattice_db>& parent,const sync_config& config,const std::shared_ptr<network_factory>& factory,
     configured_platform_factory* typed,const std::function<std::shared_ptr<lattice_db>()>& make_child){
@@ -201,6 +224,7 @@ std::shared_ptr<configured_recovery_connection> configured_recovery_connection::
             s.registry->complete_native_cleanup(receipt,0);s.registry->collect_completed(receipt);throw;
         }
         s.attempt->control=owner;
+        s.attempt->observer=s.observer;
         const std::weak_ptr<configured_recovery_connection> weak=owner;
         s.attempt->custody->bind_wakeup([weak]{if(auto held=weak.lock())held->notify();});
         if(configured_recovery_test_hooks::before_service_registration)configured_recovery_test_hooks::before_service_registration();
@@ -355,6 +379,7 @@ void configured_recovery_connection::state_event(const std::shared_ptr<configure
 void configured_recovery_connection::error_event(const std::shared_ptr<configured_attempt>& attempt,const std::string& error){
     std::shared_ptr<const synchronizer::on_error_handler> callback;
     {std::lock_guard<std::mutex> lock(state_->mutex);if(state_->attempt!=attempt)return;callback=state_->error_handler;}
+    observe(configured_recovery_stage::transport_error,attempt);
     if(callback&&*callback)(*callback)(error);
 }
 void configured_recovery_connection::progress_event(const std::shared_ptr<configured_attempt>& attempt,const synchronizer::sync_progress& progress){
@@ -466,6 +491,7 @@ void configured_recovery_connection::advance()noexcept{
             if(!lane_complete)return;
             if(lane.first_error){
                 state_->registry->complete_native_cleanup(attempt->receipt,lane.first_error);
+                observe(configured_recovery_stage::native_completed,attempt);
                 {std::lock_guard<std::mutex> lock(state_->mutex);state_->quarantined=true;state_->close_result.remember(configured_error("configured native lane cleanup failed"));}
                 state_->settled.notify_all();return;
             }
@@ -489,6 +515,7 @@ void configured_recovery_connection::advance()noexcept{
             if(!attempt->native_asserted){
                 const auto error=attempt->cleanup_error?-4:counts.first_error;
                 state_->registry->complete_native_cleanup(attempt->receipt,error);attempt->native_asserted=true;
+                observe(configured_recovery_stage::native_completed,attempt);
             }
             const auto status=state_->registry->snapshot(attempt->receipt);
             if(status.quarantined){
@@ -536,7 +563,8 @@ void configured_recovery_connection::advance()noexcept{
         std::shared_ptr<configured_attempt> replacement;
         try{
             replacement=std::make_shared<configured_attempt>(receipt,state_->registry,state_->factory,state_->typed);
-            replacement->control=shared_from_this();const std::weak_ptr<configured_recovery_connection> weak=shared_from_this();
+            replacement->control=shared_from_this();replacement->observer=state_->observer;
+            const std::weak_ptr<configured_recovery_connection> weak=shared_from_this();
             replacement->custody->bind_wakeup([weak]{if(auto owner=weak.lock())owner->notify();});
         }catch(...){
             replacement.reset(); // Cancel only the still-empty native slot.
@@ -585,7 +613,10 @@ void configured_recovery_connection::finalize()noexcept{
     }
     if(attempt){
         if(attempt->wrapper_destroyed){
+            std::optional<configured_retirement_snapshot> before_collection;
+            if(state_->observer)before_collection=state_->registry->snapshot(attempt->receipt);
             const bool collected=state_->registry->collect_completed(attempt->receipt);
+            if(collected)observe(configured_recovery_stage::collected,attempt,before_collection);
             bool pending=false;
             {std::lock_guard<std::mutex> lock(state_->mutex);state_->cleanup_running=false;if(collected)state_->attempt.reset();pending=state_->needs_action;}
             if(collected){attempt.reset();notify();}
@@ -628,6 +659,7 @@ void configured_recovery_connection::cleanup_returned()noexcept{
     {std::lock_guard<std::mutex> lock(state_->mutex);if(!state_->close_release_ready)return;}
     if(!configured_control_service::instance().release(state_->service_slot,this))return;
     {std::lock_guard<std::mutex> lock(state_->mutex);state_->close_release_ready=false;state_->closed=true;state_->cleanup_running=false;}
+    observe(configured_recovery_stage::logical_closed,{});
     state_->settled.notify_all();
 }
 lattice_close_result configured_recovery_connection::close(clock::time_point deadline)noexcept{

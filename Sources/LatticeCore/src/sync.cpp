@@ -731,6 +731,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     {auto factory=get_network_factory();ws_client_=factory->create_sync_transport(scheduler_);}
     if(!ws_client_)throw db_error("synchronizer requires transport");
 #ifndef __EMSCRIPTEN__
+    if(configured)configured->transport_created();
     if(configured&&detail::configured_recovery_test_hooks::after_transport_creation)
         detail::configured_recovery_test_hooks::after_transport_creation();
 #endif

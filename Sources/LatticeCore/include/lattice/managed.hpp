@@ -5,9 +5,11 @@
 #include "types.hpp"
 #include "db.hpp"
 #include "observation.hpp"
+#include "managed_observation.hpp"
 #include "../nlohmann/json.hpp"
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <ostream>
 #include <unordered_map>
 #include <map>
@@ -90,23 +92,136 @@ struct managed;
 // managed_base - Base for property wrappers (holds DB binding info)
 // ============================================================================
 
+// Managed identities keep their historical logical/attached route strings for
+// schema lookup and observation. SQL must pin an unqualified identity to main:
+// ATTACH can later install a same-named TEMP UNION view over multiple stores.
+struct managed_table_route {
+    std::string schema_sql = "main";
+    std::string table;
+};
+
+inline std::string managed_quote_identifier(const std::string& name) {
+    if (name.empty() || name.find('\0') != std::string::npos)
+        throw std::invalid_argument("invalid managed SQL identifier");
+    std::string result = "\"";
+    for (char c : name) { result += c; if (c == '\"') result += c; }
+    return result + '\"';
+}
+
+inline managed_table_route managed_route(const std::string& name) {
+    managed_table_route route;
+    route.table = name;
+    const auto dot = name.find('.');
+    const auto bare_identifier = [](const std::string& text) {
+        if (text.empty()) return false;
+        for (size_t i = 0; i < text.size(); ++i) {
+            const char c = text[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+                (i != 0 && c >= '0' && c <= '9')) continue;
+            return false;
+        }
+        return true;
+    };
+    if (dot != std::string::npos && bare_identifier(name.substr(0, dot))) {
+        route.schema_sql = name.substr(0, dot);
+        route.table = name.substr(dot + 1);
+    } else if (!name.empty() && name.front() == '\"') {
+        // Attached hydration emits a double-quoted schema, escaping quotes.
+        for (size_t i = 1; i < name.size(); ++i) {
+            if (name[i] != '\"') continue;
+            if (i + 1 < name.size() && name[i + 1] == '\"') { ++i; continue; }
+            if (i + 1 < name.size() && name[i + 1] == '.') {
+                route.schema_sql = name.substr(0, i + 1);
+                route.table = name.substr(i + 2);
+            }
+            break;
+        }
+    }
+    // Accept an already quoted table token as well as the raw table suffix
+    // emitted by hydrate(). Decode only a complete valid quoted identifier.
+    if (route.table.size() >= 2 && route.table.front() == '\"') {
+        std::string decoded;
+        for (size_t i = 1; i < route.table.size(); ++i) {
+            if (route.table[i] != '\"') { decoded += route.table[i]; continue; }
+            if (i + 1 < route.table.size() && route.table[i + 1] == '\"') {
+                decoded += '\"'; ++i; continue;
+            }
+            if (i + 1 == route.table.size()) route.table = std::move(decoded);
+            break;
+        }
+    }
+    return route;
+}
+
+inline std::string managed_table_sql(const std::string& name) {
+    const auto route = managed_route(name);
+    return route.schema_sql + '.' + managed_quote_identifier(route.table);
+}
+
+namespace detail {
+// The common model name needs no route decoding or quote escaping. Keep the
+// existing parser for every other spelling, including attached and quoted
+// names. Column SQL is intentionally appended unchanged, as in the old getter.
+inline std::string managed_scalar_select_sql(const std::string& table,
+                                             const std::string& column) {
+    bool bare = !table.empty();
+    for (size_t i = 0; i < table.size() && bare; ++i) {
+        const char c = table[i];
+        bare = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+               (i != 0 && c >= '0' && c <= '9');
+    }
+    const std::string routed = bare ? std::string{} : managed_table_sql(table);
+    std::string sql;
+    auto remaining = sql.max_size();
+    const auto account = [&remaining](size_t count) {
+        if (count > remaining) throw std::length_error("managed scalar SQL is too long");
+        remaining -= count;
+    };
+    account(sizeof("SELECT  FROM  WHERE id = ?") - 1);
+    account(column.size());
+    if (bare) {
+        account(sizeof("main.\"\"") - 1);
+        account(table.size());
+    } else {
+        account(routed.size());
+    }
+    sql.reserve(sql.max_size() - remaining);
+    sql.append("SELECT ").append(column).append(" FROM ");
+    if (bare) sql.append("main.\"").append(table).push_back('"');
+    else sql.append(routed);
+    sql.append(" WHERE id = ?");
+    return sql;
+}
+} // namespace detail
+
+inline std::string managed_sidecar_sql(const std::string& model, const std::string& suffix) {
+    const auto route = managed_route(model);
+    return route.schema_sql + '.' + managed_quote_identifier("_" + route.table + "_" + suffix);
+}
+
 struct managed_base {
     database* db = nullptr;
     lattice_db* lattice = nullptr;
     std::string table_name;
     std::string column_name;
     primary_key_t row_id = 0;
+    // Captured with the parent; never recover a generation from a reused alias.
+    int64_t attachment_token = 0;
+    std::weak_ptr<database> attachment_writer;
     bool is_vector_column = false;  // True if this column is a vector for similarity search
 
     bool is_bound() const { return db != nullptr && row_id != 0; }
 
     void assign(database* d, lattice_db* l, const std::string& table,
-                const std::string& col, primary_key_t id) {
+                const std::string& col, primary_key_t id, int64_t token = 0,
+                std::weak_ptr<database> writer = {}) {
         db = d;
         lattice = l;
         table_name = table;
         column_name = col;
         row_id = id;
+        attachment_token = token;
+        attachment_writer = std::move(writer);
     }
 
     // Called by LATTICE_BIND_PROP macro - implementation below after model_base
@@ -196,11 +311,12 @@ public:
 
     virtual void set_value(const std::string& name, const column_value_t& value) {
         if (is_managed()) {
-            db_->update(table_name_, id_, {{name, value}});
+            detail::managed_route_scope route_guard(db_, lattice_, table_name_, attachment_token_, attachment_writer_);
+            db_->update(managed_table_sql(table_name_), id_, {{name, value}});
         }
         unmanaged_values_[name] = value;
         // Notify observers of property change
-        notify_property_change(name);
+        if (!lattice_) notify_property_change(name);
     }
 
     void set_schema(const std::string& table,
@@ -228,37 +344,21 @@ public:
 
     using object_observer_t = object_observer_registry::object_observer_t;
 
-    /// Register an observer for this object. Returns token that unregisters on destruction.
-    notification_token observe_base(object_observer_t callback) {
-        if (!is_managed() || global_id_.empty()) {
-            // Can't observe unmanaged objects
-            return notification_token();
-        }
-        auto key = std::make_pair(table_name_, global_id_);
-        auto observer_id = object_observer_registry::instance().add_observer(key, std::move(callback));
-        return notification_token([key, observer_id]() {
-            object_observer_registry::instance().remove_observer(key, observer_id);
-        });
-    }
+    /// Register committed changes on the owning store's scheduler. The observed
+    /// wrapper must remain alive and unmoved through admitted callbacks. Token
+    /// invalidation fences queued/new admission without waiting for callbacks
+    /// already running; it is safe after owner destruction. Attached routes are
+    /// currently refused because their physical generation is not in this API.
+    notification_token observe_base(object_observer_t callback);
 
-    /// Notify observers of a property change
-    void notify_property_change(const std::string& property_name) {
-        if (is_managed() && !global_id_.empty()) {
-            auto key = std::make_pair(table_name_, global_id_);
-            object_observer_registry::instance().notify(key, false, {property_name});
-        }
-    }
-
-    /// Notify observers of deletion
-    void notify_deleted() {
-        if (is_managed() && !global_id_.empty()) {
-            auto key = std::make_pair(table_name_, global_id_);
-            object_observer_registry::instance().notify_deleted(key);
-        }
-    }
+    /// Explicit typed notifications use the same owner and cancellation gate.
+    void notify_property_change(const std::string& property_name);
+    void notify_deleted();
 
 protected:
+    void notify_managed_observers(bool deleted, const std::vector<std::string>& fields);
     friend class lattice_db;
+    friend class swift_lattice;
     friend struct managed_base;  // For bind_to_parent access
     template<typename U, typename> friend struct managed;
     template<typename U> friend class query;
@@ -268,6 +368,10 @@ protected:
     std::string table_name_;
     primary_key_t id_ = 0;
     global_id_t global_id_;
+    // Nonpersisted physical-route generation, captured by query SQL. Zero is
+    // main; positive values identify one attachment lifetime; -1 is invalid.
+    int64_t attachment_token_ = 0;
+    std::weak_ptr<database> attachment_writer_;
 
     std::vector<std::string> property_names_;
     std::unordered_map<std::string, column_type> property_types_;
@@ -281,6 +385,8 @@ inline void managed_base::bind_to_parent(model_base* parent, const char* prop_na
     table_name = parent->table_name_;
     column_name = prop_name;
     row_id = parent->id_;
+    attachment_token = parent->attachment_token_;
+    attachment_writer = parent->attachment_writer_;
 }
 
 // ============================================================================
@@ -300,7 +406,8 @@ struct CONFORMS_TO_MANAGED managed<int64_t> : managed_base {
 
     managed& operator=(int64_t v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, v}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
         }
         unmanaged_value = v;
         return *this;
@@ -308,14 +415,12 @@ struct CONFORMS_TO_MANAGED managed<int64_t> : managed_base {
 
     [[nodiscard]] int64_t detach() const {
         if (is_bound()) {
-            auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
-                {row_id});
-            if (!rows.empty()) {
-                auto it = rows[0].find(column_name);
-                if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    return std::get<int64_t>(it->second);
-                }
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            auto cell = db->query_managed_cell(
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
+                column_name, row_id);
+            if (cell && std::holds_alternative<int64_t>(*cell)) {
+                return std::get<int64_t>(std::move(*cell));
             }
         }
         return unmanaged_value;
@@ -339,7 +444,8 @@ struct CONFORMS_TO_MANAGED managed<int> : managed_base {
 
     managed& operator=(int v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, static_cast<int64_t>(v)}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<int64_t>(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -347,8 +453,9 @@ struct CONFORMS_TO_MANAGED managed<int> : managed_base {
 
     [[nodiscard]] int detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -376,7 +483,8 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
     
     managed& operator=(double v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, v}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
         }
         unmanaged_value = v;
         return *this;
@@ -384,14 +492,12 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
 
     [[nodiscard]] double detach() const {
         if (is_bound()) {
-            auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
-                {row_id});
-            if (!rows.empty()) {
-                auto it = rows[0].find(column_name);
-                if (it != rows[0].end() && std::holds_alternative<double>(it->second)) {
-                    return std::get<double>(it->second);
-                }
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            auto cell = db->query_managed_cell(
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
+                column_name, row_id);
+            if (cell && std::holds_alternative<double>(*cell)) {
+                return std::get<double>(std::move(*cell));
             }
         }
         return unmanaged_value;
@@ -413,7 +519,8 @@ struct CONFORMS_TO_MANAGED managed<float> : managed_base {
 
     managed& operator=(float v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, static_cast<double>(v)}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<double>(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -421,8 +528,9 @@ struct CONFORMS_TO_MANAGED managed<float> : managed_base {
 
     [[nodiscard]] float detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -450,7 +558,8 @@ struct CONFORMS_TO_MANAGED managed<bool> : managed_base {
 
     managed& operator=(bool v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, static_cast<int64_t>(v ? 1 : 0)}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<int64_t>(v ? 1 : 0)}});
         }
         unmanaged_value = v;
         return *this;
@@ -458,8 +567,9 @@ struct CONFORMS_TO_MANAGED managed<bool> : managed_base {
 
     [[nodiscard]] bool detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -505,7 +615,8 @@ struct CONFORMS_TO_MANAGED managed<std::string> : managed_base {
     
     managed& operator=(std::string v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, v}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
         }
         unmanaged_value = v;
         return *this;
@@ -515,14 +626,12 @@ struct CONFORMS_TO_MANAGED managed<std::string> : managed_base {
     
     [[nodiscard]] std::string detach() const {
         if (is_bound()) {
-            auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
-                {row_id});
-            if (!rows.empty()) {
-                auto it = rows[0].find(column_name);
-                if (it != rows[0].end() && std::holds_alternative<std::string>(it->second)) {
-                    return std::get<std::string>(it->second);
-                }
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            auto cell = db->query_managed_cell(
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
+                column_name, row_id);
+            if (cell && std::holds_alternative<std::string>(*cell)) {
+                return std::get<std::string>(std::move(*cell));
             }
         }
         return unmanaged_value;
@@ -542,7 +651,8 @@ struct CONFORMS_TO_MANAGED managed<timestamp_t> : managed_base {
 
     managed& operator=(timestamp_t v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, detail::to_column_value(v)}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, detail::to_column_value(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -550,8 +660,9 @@ struct CONFORMS_TO_MANAGED managed<timestamp_t> : managed_base {
 
     [[nodiscard]] timestamp_t detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -581,7 +692,8 @@ struct CONFORMS_TO_MANAGED managed<uuid_t> : managed_base {
 
     managed& operator=(const uuid_t& v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, detail::to_column_value(v)}});
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {{column_name, detail::to_column_value(v)}});
         }
         unmanaged_value = v;
         return *this;
@@ -589,8 +701,9 @@ struct CONFORMS_TO_MANAGED managed<uuid_t> : managed_base {
 
     [[nodiscard]] uuid_t detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -631,17 +744,13 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
     // Override bind_to_parent to set up R*Tree table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        rtree_table_ = "_" + parent->table_name_ + "_" + prop_name + "_rtree";
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
     }
 
     // For dynamic objects with property_descriptor
     void bind_to_parent(model_base* parent, const property_descriptor& p) {
-        db = parent->db_;
-        lattice = parent->lattice_;
-        table_name = parent->table_name_;
-        column_name = p.name;
-        row_id = parent->id_;
-        rtree_table_ = "_" + parent->table_name_ + "_" + p.name + "_rtree";
+        managed_base::bind_to_parent(parent, p.name.c_str());
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(p.name) + "_rtree");
     }
 
     // Column names for the 4 components (main table)
@@ -655,7 +764,8 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
 
     managed& operator=(const geo_bounds& v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            db->update(table_name, row_id, {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {
                 {col_min_lat(), v.min_lat},
                 {col_max_lat(), v.max_lat},
                 {col_min_lon(), v.min_lon},
@@ -669,10 +779,11 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds> : managed_base {
 
     [[nodiscard]] geo_bounds detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
                 "SELECT " + col_min_lat() + ", " + col_max_lat() + ", " +
                 col_min_lon() + ", " + col_max_lon() +
-                " FROM " + table_name + " WHERE id = ?",
+                " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 const auto& row = rows[0];
@@ -728,16 +839,12 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
     // Override bind_to_parent to set up R*Tree table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        rtree_table_ = "_" + parent->table_name_ + "_" + prop_name + "_rtree";
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
     }
 
     void bind_to_parent(model_base* parent, const property_descriptor& p) {
-        db = parent->db_;
-        lattice = parent->lattice_;
-        table_name = parent->table_name_;
-        column_name = p.name;
-        row_id = parent->id_;
-        rtree_table_ = "_" + parent->table_name_ + "_" + p.name + "_rtree";
+        managed_base::bind_to_parent(parent, p.name.c_str());
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(p.name) + "_rtree");
     }
 
     // Column names
@@ -757,15 +864,16 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
 
     managed& operator=(std::optional<geo_bounds> v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             if (v) {
-                db->update(table_name, row_id, {
+                db->update(managed_table_sql(table_name), row_id, {
                     {col_min_lat(), v->min_lat},
                     {col_max_lat(), v->max_lat},
                     {col_min_lon(), v->min_lon},
                     {col_max_lon(), v->max_lon}
                 });
             } else {
-                db->update(table_name, row_id, {
+                db->update(managed_table_sql(table_name), row_id, {
                     {col_min_lat(), nullptr},
                     {col_max_lat(), nullptr},
                     {col_min_lon(), nullptr},
@@ -779,7 +887,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
 
     managed& operator=(std::nullopt_t) {
         if (is_bound()) {
-            db->update(table_name, row_id, {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            db->update(managed_table_sql(table_name), row_id, {
                 {col_min_lat(), nullptr},
                 {col_max_lat(), nullptr},
                 {col_min_lon(), nullptr},
@@ -796,10 +905,11 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<geo_bounds>> : managed
 
     [[nodiscard]] std::optional<geo_bounds> detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
                 "SELECT " + col_min_lat() + ", " + col_max_lat() + ", " +
                 col_min_lon() + ", " + col_max_lon() +
-                " FROM " + table_name + " WHERE id = ?",
+                " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 const auto& row = rows[0];
@@ -862,8 +972,8 @@ struct CONFORMS_TO_MANAGED managed<std::vector<geo_bounds>> : managed_base {
     // Bind to parent - sets up list table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        list_table_ = "_" + parent->table_name_ + "_" + std::string(prop_name);
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name));
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -873,8 +983,8 @@ struct CONFORMS_TO_MANAGED managed<std::vector<geo_bounds>> : managed_base {
         table_name = parent->table_name_;
         column_name = p.name;
         row_id = parent->id_;
-        list_table_ = "_" + parent->table_name_ + "_" + p.name;
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, p.name);
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, p.name + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -1045,8 +1155,15 @@ struct CONFORMS_TO_MANAGED managed<geo_bounds*> : managed_base {
                 {"minLon", v.min_lon},
                 {"maxLon", v.max_lon}
             });
-            // Update R*Tree if it exists
-            if (db->table_exists(rtree_table_)) {
+            // table_exists() accepts a bare main-schema name, whereas this
+            // sidecar follows the managed row's physical schema. Generated
+            // lists also have an UPDATE trigger; preserve this explicit
+            // fallback for bound list rows without those triggers.
+            const auto rtree_route = managed_route(rtree_table_);
+            const auto rtree_exists = db->query("SELECT 1 AS present FROM " +
+                rtree_route.schema_sql + ".sqlite_master WHERE type = 'table' AND name = ?",
+                {rtree_route.table});
+            if (!rtree_exists.empty()) {
                 db->execute("UPDATE " + rtree_table_ + " SET minLat = ?, maxLat = ?, minLon = ?, maxLon = ? WHERE id = ?",
                     {v.min_lat, v.max_lat, v.min_lon, v.max_lon, list_row_id_});
             }
@@ -1120,8 +1237,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<geo_bounds*>> : managed_
     // Bind to parent - sets up list table name
     void bind_to_parent(model_base* parent, const char* prop_name) {
         managed_base::bind_to_parent(parent, prop_name);
-        list_table_ = "_" + parent->table_name_ + "_" + std::string(prop_name);
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name));
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, std::string(prop_name) + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -1131,8 +1248,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<geo_bounds*>> : managed_
         table_name = parent->table_name_;
         column_name = p.name;
         row_id = parent->id_;
-        list_table_ = "_" + parent->table_name_ + "_" + p.name;
-        rtree_table_ = list_table_ + "_rtree";
+        list_table_ = managed_sidecar_sql(parent->table_name_, p.name);
+        rtree_table_ = managed_sidecar_sql(parent->table_name_, p.name + "_rtree");
         parent_global_id_ = parent->global_id_;
     }
 
@@ -1257,15 +1374,23 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
     }
     managed& operator=(std::optional<T> v) SWIFT_NAME(set(_:)) {
         if (is_bound()) {
-            if (v) {
+            constexpr bool is_blob = std::is_same_v<T, std::vector<uint8_t>>;
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token,
+                                                    attachment_writer, is_blob && is_vector_column);
+            if constexpr (is_blob) {
+                // Blob optionals are scalar bytes, not a generic vector/list.
+                // Keep sidecar admission and SQL on this captured route writer.
+                managed<T>::set_optional_value_on(*db, lattice, table_name, column_name,
+                                                  row_id, v, is_vector_column);
+            } else if (v) {
                 if constexpr (is_vector<T>::value) {
                     
                 } else {
                     column_value_t cv = detail::to_column_value(*v);
-                    db->update(table_name, row_id, {{column_name, cv}});
+                    db->update(managed_table_sql(table_name), row_id, {{column_name, cv}});
                 }
             } else {
-                db->update(table_name, row_id, {{column_name, nullptr}});
+                db->update(managed_table_sql(table_name), row_id, {{column_name, nullptr}});
             }
         } else {
             unmanaged_value = v;
@@ -1274,26 +1399,18 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
     }
 
     managed& operator=(std::nullopt_t) {
-        if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, nullptr}});
-        } else {
-            unmanaged_value = std::nullopt;
-        }
-        return *this;
+        return operator=(std::optional<T>{});
     }
 
     void set_nil() {
-        if (is_bound()) {
-            db->update(table_name, row_id, {{column_name, nullptr}});
-        } else {
-            unmanaged_value = std::nullopt;
-        }
+        operator=(std::optional<T>{});
     }
     
     [[nodiscard]] std::optional<T> detach() const {
         if (is_bound()) {
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             auto rows = db->query(
-                "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+                "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                 {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -1303,7 +1420,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
                     }
                     if constexpr (is_vector<T>::value) {
                         managed<T> m;
-                        m.assign(this->db, lattice, table_name, column_name, row_id);
+                        m.assign(this->db, lattice, table_name, column_name, row_id, attachment_token, attachment_writer);
                         return m;
                     } else {
                         return detail::from_column_value<T>(it->second);
@@ -1318,7 +1435,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::optional<T>> : managed_base {
 
     bool has_value() const SWIFT_NAME(hasValue()) {
         if (is_bound()) {
-            auto rows = db->query("SELECT " + column_name + " FROM " + table_name + " WHERE id = ?",
+            detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
+            auto rows = db->query("SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?",
                                   {row_id});
             if (!rows.empty()) {
                 auto it = rows[0].find(column_name);
@@ -1388,8 +1506,9 @@ struct CONFORMS_TO_MANAGED managed<std::vector<T>, std::enable_if_t<is_primitive
     // Read from database (JSON decode)
     std::vector<T> detach() const {
         if (!is_bound()) return unmanaged_value;
+        detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
 
-        std::string sql = "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?";
+        std::string sql = "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?";
         auto rows = db->query(sql, {row_id});
         if (rows.empty()) return unmanaged_value;
 
@@ -1412,9 +1531,10 @@ struct CONFORMS_TO_MANAGED managed<std::vector<T>, std::enable_if_t<is_primitive
     void set_value(const std::vector<T>& val) {
         unmanaged_value = val;
         if (!is_bound()) return;
+        detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
 
         std::string json_str = nlohmann::json(val).dump();
-        std::string sql = "UPDATE " + table_name + " SET " + column_name + " = ? WHERE id = ?";
+        std::string sql = "UPDATE " + managed_table_sql(table_name) + " SET " + column_name + " = ? WHERE id = ?";
         db->execute(sql, {json_str, row_id});
     }
 
@@ -1462,8 +1582,9 @@ struct CONFORMS_TO_MANAGED managed<std::vector<uint8_t>> : managed_base {
     // Read from database (BLOB)
     std::vector<uint8_t> detach() const {
         if (!is_bound()) return unmanaged_value;
+        detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
 
-        std::string sql = "SELECT " + column_name + " FROM " + table_name + " WHERE id = ?";
+        std::string sql = "SELECT " + column_name + " FROM " + managed_table_sql(table_name) + " WHERE id = ?";
         auto rows = db->query(sql, {row_id});
         if (rows.empty()) return unmanaged_value;
 
@@ -1483,6 +1604,13 @@ struct CONFORMS_TO_MANAGED managed<std::vector<uint8_t>> : managed_base {
     // Implementation helper - defined in lattice.hpp
     static void ensure_vec0_for_blob(lattice_db* lattice, const std::string& table,
                                      const std::string& column, const std::vector<uint8_t>& val);
+
+    // Implementation helper: caller already retains this exact managed route.
+    // A NULL/empty vector uses existing-sidecar-only admission, never inference.
+    static void set_optional_value_on(database& writer, lattice_db* lattice,
+                                      const std::string& table, const std::string& column,
+                                      int64_t row, const std::optional<std::vector<uint8_t>>& val,
+                                      bool is_vector_column);
 
     // Assignment operator
     managed& operator=(const std::vector<uint8_t>& val) SWIFT_NAME(set(_:)) {

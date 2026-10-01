@@ -22,12 +22,16 @@
 // dependencies first, exactly as the synthesized umbrella did.
 #include <LatticeBridge.hpp>
 #include <bridging.hpp>
+#include <bulk_mutation.hpp>
 #include <dynamic_object.hpp>
 #include <error.hpp>
 #include <geo_bounds.hpp>
 #include <lattice.hpp>
 #include <list.hpp>
 #include <managed_object.hpp>
+#include <projection.hpp>
+#include <recovery_continuity.hpp>
+#include <recovery_export.hpp>
 #include <unmanaged_object.hpp>
 #include <util.hpp>
 

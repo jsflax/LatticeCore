@@ -75,6 +75,8 @@ public:
     std::shared_ptr<configured_attempt_custody> configured() const noexcept{return configured_;}
     std::shared_ptr<configured_attempt> configured_attempt_owner()const noexcept{return configured_attempt_.lock();}
     uint64_t active_callbacks();
+    // Diagnostic-only, one try-lock; failure leaves output unobserved.
+    bool try_active_callbacks(uint64_t&) noexcept;
     uint64_t dispatch_generation();
     void publish_generation(uint64_t);
     bool can_begin_protected(uint64_t);

@@ -115,6 +115,10 @@ void configured_attempt_custody::fail(int32_t error) noexcept {
     {std::lock_guard<std::mutex> lock(mutex_);if(error&&!first_error_)first_error_=error;}
     wake();
 }
+bool configured_attempt_custody::try_snapshot(observation& out)const noexcept {
+    std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);if(!lock.owns_lock())return false;
+    out={commands_,payloads_,closed_,first_error_,worker_count_,finished_worker_count_};return true;
+}
 configured_attempt_custody::observation configured_attempt_custody::snapshot()const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);return {commands_,payloads_,closed_,first_error_,worker_count_,finished_worker_count_};
 }

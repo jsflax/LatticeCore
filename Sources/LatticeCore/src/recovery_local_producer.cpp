@@ -1,4 +1,5 @@
 #include "recovery_local_producer.hpp"
+#include "recovery_admission_test_probe.hpp"
 #include "recovery_producer_continuity.hpp"
 #include "recovery_receiver_controller.hpp"
 #include "recovery_request_store.hpp"

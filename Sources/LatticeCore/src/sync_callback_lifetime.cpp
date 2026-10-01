@@ -23,6 +23,10 @@ void sync_callback_lifetime::configure(std::shared_ptr<configured_attempt_custod
     if(configured_||ever_connected_||active_)throw db_error("configured callback custody must precede publication");
     configured_=std::move(custody);configured_attempt_=std::move(attempt);
 }
+bool sync_callback_lifetime::try_active_callbacks(uint64_t& out)noexcept {
+    std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);if(!lock.owns_lock())return false;
+    out=active_;return true;
+}
 uint64_t sync_callback_lifetime::active_callbacks(){std::lock_guard<std::mutex> lock(mutex_);return active_;}
 uint64_t sync_callback_lifetime::dispatch_generation(){
     for(auto* e=current_;e;e=e->prior)if(&e->cell==this)return e->generation;

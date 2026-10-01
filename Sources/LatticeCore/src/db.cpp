@@ -1460,8 +1460,14 @@ bool database::maintenance_scope::idle(database& db) noexcept {
 }
 
 void database::maintenance_scope::probe_before_store_gate(database& db) {
-    if (!try_probe_before_store_gate(db))
+    detail::recovery_admission_test_hooks::route_maintenance_entered();
+    if (!try_probe_before_store_gate(db)) {
+        detail::recovery_admission_test_hooks::route_maintenance(
+            detail::recovery_admission_test_hooks::route_maintenance_point::mutex_busy);
         throw db_error("audit maintenance connection is busy");
+    }
+    detail::recovery_admission_test_hooks::route_maintenance(
+        detail::recovery_admission_test_hooks::route_maintenance_point::passed);
 }
 
 bool database::maintenance_scope::try_probe_before_store_gate(database& db) {

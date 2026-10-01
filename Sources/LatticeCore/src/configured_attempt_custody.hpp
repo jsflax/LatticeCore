@@ -47,6 +47,8 @@ public:
     void seal_payloads() noexcept;
     void fail(int32_t) noexcept;
     observation snapshot() const noexcept;
+    // Diagnostic-only, one try-lock; failure leaves output unobserved.
+    bool try_snapshot(observation&) const noexcept;
     void wake() const noexcept;
 private:
     mutable std::mutex mutex_;

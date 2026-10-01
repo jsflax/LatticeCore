@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "CanonicalWriterTestAccess.hpp"
+#include "../../Sources/LatticeCore/src/recovery_admission_test_probe.hpp"
 #include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include "../../Sources/LatticeCore/src/sync_callback_lifetime.hpp"
@@ -373,11 +374,43 @@ protected:
         receiver=swift_lattice_ref::shared_for_lattice(receiver_ref->get());ASSERT_TRUE(receiver);
         if(auto* notifier=instance_registry::instance().get_or_create_notifier(receiver->config().path))notifier->stop_listening();
     }
+    struct ConnectFailureObservation {
+        detail::recovery_admission_test_hooks::route_admission_observation admission;
+        unsigned char boundary=0, peer=0, wrappers=0;
+        bool observed=false;
+    } connect_failure;
+    static unsigned char finite_connect_count(size_t count)noexcept {
+        return static_cast<unsigned char>(std::min<size_t>(count,255));
+    }
+    void report_connect_failure(const detail::recovery_admission_test_hooks::route_admission_observation& admission,
+        unsigned char boundary,size_t peer)noexcept {
+        // Called only after the exact throwing operation unwinds. Copy only
+        // this thread's passive scalar record and fixture-owned vector size.
+        // No owner/SQLite/controller/transport/scheduler inspection, exception
+        // retention, mutex, callback, timestamp, identifier or error text.
+        connect_failure={admission,boundary,finite_connect_count(peer),finite_connect_count(synchronizers.size()),true};
+        std::fprintf(stderr,"controller connect exception observation: {\"boundary\":%u,\"peer\":%u,\"wrappers\":%u,\"routeCalls\":%u,\"point\":%u,\"maintenanceCalls\":%u,\"maintenance\":%u,\"installState\":%u,\"primary\":%u,\"cleanup\":%u,\"postcommit\":%u,\"notification\":%u,\"unexpectedCommit\":%u}\n",
+            unsigned(connect_failure.boundary),unsigned(connect_failure.peer),unsigned(connect_failure.wrappers),
+            unsigned(admission.route_calls),unsigned(admission.point),unsigned(admission.maintenance_calls),unsigned(admission.maintenance),
+            unsigned(admission.install_state),unsigned(admission.primary),unsigned(admission.cleanup),unsigned(admission.postcommit),
+            unsigned(admission.notification),unsigned(admission.unexpected_commit));
+    }
     void connect() {
+        size_t peer_index=0;
         for(auto& peer:peers){sync_config config;config.websocket_url=peer.endpoint;config.authorization_token="registered-token";config.sync_id=peer.channel;for(const auto& active:peers)config.all_active_sync_ids.push_back(active.channel);
             config.recovery_source_expectation=peer.expectation.dump();config.checkpoint_passive_interval_ms=0;config.upload_coalesce_ms=0;config.chunk_size=upload_chunk;
-            auto sync=std::make_unique<synchronizer>(std::static_pointer_cast<lattice_db>(receiver),config);
-            sync->set_on_error([this](const std::string& e){std::lock_guard lock(errors_mutex);errors.push_back(e);});synchronizers.push_back(std::move(sync));synchronizers.back()->connect();}
+            detail::recovery_admission_test_hooks::route_admission_observation admission;
+            detail::recovery_admission_test_hooks::route_observation_scope observation(admission);
+            unsigned char boundary=1; // exact synchronous constructor
+            try {
+                auto sync=std::make_unique<synchronizer>(std::static_pointer_cast<lattice_db>(receiver),config);
+                boundary=2; // existing callback registration/vector publication
+                sync->set_on_error([this](const std::string& e){std::lock_guard lock(errors_mutex);errors.push_back(e);});synchronizers.push_back(std::move(sync));
+                boundary=3; // exact synchronous public connect
+                synchronizers.back()->connect();
+            }catch(...){report_connect_failure(admission,boundary,peer_index);throw;}
+            ++peer_index;
+        }
     }
     std::vector<std::string> originals() {
         std::vector<std::string> result;for(const auto& row:receiver->db().query("SELECT globalId FROM AuditLog ORDER BY id"))result.push_back(std::get<std::string>(row.at("globalId")));return result;
@@ -3451,6 +3484,48 @@ TEST_F(ControlledGenerationReceiverController, LiveDeselectedWrapperDoesNotInher
     EXPECT_EQ(actual_description(old_source.setup),old_description);
     EXPECT_EQ(actual_description(peers[0].setup),selected_description);
     EXPECT_EQ(phase(),2);EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),original_rows);
+}
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(ControlledGenerationReceiverController, ConstructorMutexRefusalObservationPreservesExactFailureAndStore) {
+    configure();insert(*source,controller_uuid(9964),"actual constructor admission");
+    const auto original=snapshot();
+    auto* mutex=sqlite3_db_mutex(detail::canonical_writer_custody_test_access::fault_handle(receiver->db()));
+    ASSERT_NE(mutex,nullptr);
+    struct HeldMutex {
+        sqlite3_mutex* mutex;
+        std::promise<void> entered, release;
+        std::future<void> ready=entered.get_future(), resume=release.get_future();
+        std::atomic<bool> timed_out{false};
+        std::thread worker;
+        explicit HeldMutex(sqlite3_mutex* value):mutex(value),worker([this]{
+            sqlite3_mutex_enter(mutex);entered.set_value();
+            timed_out.store(resume.wait_for(std::chrono::seconds(5))!=std::future_status::ready);
+            sqlite3_mutex_leave(mutex);
+        }){}
+        void finish(){if(worker.joinable()){release.set_value();worker.join();}}
+        ~HeldMutex(){finish();}
+    } held(mutex);
+    ASSERT_EQ(held.ready.wait_for(std::chrono::seconds(2)),std::future_status::ready);
+    try {connect();FAIL()<<"actual serialized writer mutex was not refused";}
+    catch(const db_error& error){EXPECT_EQ(std::string(error.what()),"audit maintenance connection is busy");}
+    ASSERT_TRUE(connect_failure.observed);
+    const auto& observed=connect_failure.admission;
+    EXPECT_EQ(connect_failure.boundary,1u);EXPECT_EQ(connect_failure.peer,0u);EXPECT_EQ(connect_failure.wrappers,0u);
+    EXPECT_EQ(observed.route_calls,1u);EXPECT_EQ(observed.maintenance_calls,1u);
+    EXPECT_EQ(observed.point,detail::recovery_admission_test_hooks::route_admission_point::primary_rethrow);
+    EXPECT_EQ(observed.maintenance,detail::recovery_admission_test_hooks::route_maintenance_point::mutex_busy);
+    EXPECT_EQ(observed.install_state,static_cast<unsigned char>(detail::recovery_install_state::refused));
+    EXPECT_TRUE(observed.primary);EXPECT_FALSE(observed.cleanup);EXPECT_FALSE(observed.postcommit);
+    EXPECT_FALSE(observed.notification);EXPECT_FALSE(observed.unexpected_commit);EXPECT_FALSE(observed.inside_install);
+    EXPECT_TRUE(synchronizers.empty());EXPECT_FALSE(has_error());
+    held.finish();EXPECT_FALSE(held.timed_out.load());EXPECT_EQ(snapshot(),original);
+    // A separately requested construction after the held physical mutex ends
+    // follows the unchanged admission path. The refusal creates no retry.
+    connect();ASSERT_TRUE(until([&]{return installed();}));EXPECT_FALSE(has_error());
 }
 }
 #endif

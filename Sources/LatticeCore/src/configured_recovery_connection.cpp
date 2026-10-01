@@ -110,6 +110,18 @@ public:
         {std::lock_guard<std::mutex> lock(mutex_);if(i>=slots_.size()||slots_[i].owner.get()!=owner)return;slots_[i].cleanup=true;}
         cleanup_ready_.notify_one();
     }
+    struct diagnostic_sample {uint32_t flags=0;size_t collector_busy=0,dispatcher_busy=0;bool available=false;};
+    diagnostic_sample sample(size_t i,const configured_recovery_connection* owner)noexcept{
+        diagnostic_sample out;
+        std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);if(!lock.owns_lock())return out;
+        out.available=true;
+        for(const auto& s:slots_){out.collector_busy+=s.busy;out.dispatcher_busy+=s.dispatching;}
+        if(i<slots_.size()&&slots_[i].owner.get()==owner){
+            const auto& s=slots_[i];out.flags=1u|(uint32_t(s.dirty)<<1)|(uint32_t(s.cleanup)<<2)|
+                (uint32_t(s.busy)<<3)|(uint32_t(s.dispatching)<<4)|(uint32_t(s.release_pending)<<5);
+        }
+        return out; // Plain copies only; no owner/callback destruction here.
+    }
     bool release(size_t i,const configured_recovery_connection* owner)noexcept{
         std::shared_ptr<configured_recovery_connection> displaced;
         {std::lock_guard<std::mutex> lock(mutex_);if(i>=slots_.size()||slots_[i].owner.get()!=owner)return false;
@@ -139,6 +151,7 @@ struct configured_recovery_connection::state {
     bool child_closed=false,scheduler_joined=false,close_release_ready=false;
     const bool successors_permitted=qualifying_configured_successors;
     const std::shared_ptr<configured_recovery_observer> observer=configured_recovery_test_hooks::observation;
+    std::atomic<bool> first_close_observed{false}; // Diagnostic invocation fence only.
     const std::shared_ptr<const std::function<void(uint64_t,uint64_t)>> backoff_probe=configured_recovery_test_hooks::before_backoff_publication;
     bool successor_refusal_reported=false;
     uint64_t intent_epoch=1,retries=0;
@@ -172,6 +185,10 @@ void configured_attempt::install_lifetime(std::shared_ptr<sync_callback_lifetime
     if(lifetime_&&lifetime_!=value)throw db_error("configured attempt lifetime already installed");
     if(!lifetime_)lifetime_=std::move(value);
 }
+bool configured_attempt::try_lifetime(std::shared_ptr<sync_callback_lifetime>& out)const noexcept{
+    std::unique_lock<std::mutex> lock(facts_mutex,std::try_to_lock);if(!lock.owns_lock())return false;
+    out=lifetime_;return true;
+}
 std::shared_ptr<sync_callback_lifetime> configured_attempt::lifetime()const noexcept{
     std::lock_guard<std::mutex> lock(facts_mutex);return lifetime_;
 }
@@ -195,6 +212,7 @@ void configured_recovery_connection::observe(configured_recovery_stage stage,con
     {std::lock_guard<std::mutex> lock(state_->mutex);fact.child_closed=state_->child_closed;fact.scheduler_joined=state_->scheduler_joined;}
     if(attempt){
         fact.attempt=reinterpret_cast<std::uintptr_t>(attempt.get());
+        fact.interval=attempt->registry->comparison_identity(attempt->receipt);
         const auto counts=attempt->custody->snapshot();fact.commands=counts.commands;fact.payloads=counts.payloads;fact.workers=counts.workers;
         const auto status=before_collection?*before_collection:attempt->registry->snapshot(attempt->receipt);
         fact.adapter_complete=status.adapter_complete;fact.native_complete=status.native_complete;fact.quarantined=status.quarantined;
@@ -663,6 +681,78 @@ void configured_recovery_connection::cleanup_returned()noexcept{
     state_->settled.notify_all();
 }
 lattice_close_result configured_recovery_connection::close(clock::time_point deadline)noexcept{
+    // Only the first actual invocation is sampled. Missing observations stay
+    // missing; later explicit/destructor closes cannot replace the first call.
+    const bool diagnostic=state_->observer&&!state_->first_close_observed.exchange(true,std::memory_order_relaxed);
+    const auto diagnostic_started=diagnostic?clock::now():clock::time_point{};
+    bool diagnostic_drain_called=false;
+    const auto sample_close=[&](uint32_t point,const std::shared_ptr<configured_attempt>& sampled,
+                               const lattice_close_result& report,bool reentrant)noexcept{
+        if(!diagnostic)return;
+        configured_close_observation out;out.point=point;out.owner=reinterpret_cast<std::uintptr_t>(this);
+        out.sync=static_cast<uint32_t>(report.sync);
+        out.report_flags=uint32_t(report.cleanup_complete)|(uint32_t(bool(report.error))<<1)|
+            (uint32_t(bool(report.cleanup_error))<<2)|(uint32_t(reentrant)<<3)|
+            (uint32_t(diagnostic_drain_called)<<4)|(uint32_t(bool(sampled))<<5);
+        size_t service_slot=64;
+        {std::unique_lock<std::mutex> lock(state_->mutex,std::try_to_lock);
+            if(lock.owns_lock()){
+                out.sampled_leaves|=1u;
+                const bool bits[]={state_->initializing,state_->desired,state_->closing,state_->closed,state_->quarantined,
+                    state_->needs_action,state_->control_queued,state_->finalizer_queued,state_->worker_join_queued,
+                    state_->cleanup_running,state_->child_closed,state_->scheduler_joined,state_->close_release_ready,
+                    bool(sampled)&&state_->attempt==sampled,bool(state_->close_result.error),bool(state_->close_result.cleanup_error)};
+                for(size_t i=0;i<16;++i)out.state_flags|=uint32_t(bits[i])<<i;
+                service_slot=state_->service_slot;
+            }
+        }
+        if(sampled){
+            out.attempt=reinterpret_cast<std::uintptr_t>(sampled.get());
+            out.interval=sampled->registry->comparison_identity(sampled->receipt);
+            configured_attempt_custody::observation counts;
+            if(sampled->custody->try_snapshot(counts)){
+                out.sampled_leaves|=1u<<1;out.commands=counts.commands;out.payloads=counts.payloads;
+                out.workers=counts.workers;out.finished_workers=counts.finished_workers;out.custody_error=counts.first_error;
+            }
+            configured_retirement_snapshot status;
+            if(sampled->registry->try_snapshot(sampled->receipt,status)){
+                out.sampled_leaves|=1u<<2;
+                const bool bits[]={status.valid,status.requested,status.adapter_complete,status.native_complete,
+                    status.owner_live,status.transport_retained,status.quarantined};
+                for(size_t i=0;i<7;++i)out.registry_flags|=uint32_t(bits[i])<<i;
+                out.registry_error=status.first_error;
+            }
+            {std::unique_lock<std::mutex> lock(sampled->facts_mutex,std::try_to_lock);
+                if(lock.owns_lock()){
+                    out.sampled_leaves|=1u<<3;
+                    const bool bits[]={sampled->construction_finished.load(),sampled->wrapper_destroyed.load(),
+                        sampled->factory_entered.load(),sampled->retirement_started.load(),sampled->lane_complete,
+                        sampled->route_registered,sampled->route_unregistered,sampled->lane_result.disconnect_returned,
+                        sampled->lane_result.pacer_present,sampled->lane_result.pacer_joined,sampled->lane_result.callbacks_settled};
+                    for(size_t i=0;i<11;++i)out.attempt_flags|=uint32_t(bits[i])<<i;
+                }
+            }
+            std::shared_ptr<sync_callback_lifetime> lifetime;
+            if(sampled->try_lifetime(lifetime)){
+                if(lifetime){out.attempt_flags|=1u<<11;if(lifetime->try_active_callbacks(out.active_callbacks))out.sampled_leaves|=1u<<4;}
+                else out.sampled_leaves|=1u<<4; // Actual no-lifetime observation.
+            }
+        }
+        if(service_slot<64){
+            const auto service=configured_control_service::instance().sample(service_slot,this);
+            if(service.available){out.sampled_leaves|=1u<<5;out.service_flags=service.flags;
+                out.collector_busy=service.collector_busy;out.dispatcher_busy=service.dispatcher_busy;}
+        }
+        const auto now=clock::now();
+        const auto milliseconds=[&](clock::duration value)noexcept{
+            if(value<=clock::duration::zero())return uint32_t(0);
+            const auto count=std::chrono::duration_cast<std::chrono::milliseconds>(value).count();
+            if(count>65535){out.time_clamped=true;return uint32_t(65535);}
+            return static_cast<uint32_t>(count);
+        };
+        out.elapsed_ms=milliseconds(now-diagnostic_started);out.remaining_ms=milliseconds(deadline-now);
+        state_->observer->record_close(out); // One try-lock; never retries/waits.
+    };
     lattice_close_result result;
     std::optional<borrow> held;
     // Try to retain the exact existing attempt for drain. Even admission
@@ -672,14 +762,17 @@ lattice_close_result configured_recovery_connection::close(clock::time_point dea
     {std::lock_guard<std::mutex> lock(state_->mutex);
         state_->closing=true;state_->desired=false;attempt=state_->attempt;scheduled=state_->scheduled;
     }
+    sample_close(1,attempt,result,false);
     bool reentrant=false;
     try{
         reentrant=configured_control_service::on_cleanup_thread()||(scheduled&&scheduled->is_on_thread());
         if(attempt)if(auto lifetime=attempt->lifetime())if(lifetime->executing_here())reentrant=true;
         if(held&&held->pointer){
+            diagnostic_drain_called=true;
             const auto drained=held->pointer->drain_checked(deadline);result.sync=drained.state;result.remember(drained.error,false);
         }
     }catch(...){result.remember(std::current_exception(),false);}
+    sample_close(2,held&&held->attempt?held->attempt:attempt,result,reentrant);
     held.reset(); // Actual drain captures/borrow settle before retirement.
     {std::lock_guard<std::mutex> lock(state_->mutex);state_->close_result.merge(result);}
     if(attempt)request_renewal(attempt);else notify();
@@ -689,6 +782,8 @@ lattice_close_result configured_recovery_connection::close(clock::time_point dea
     result.cleanup_complete=state_->closed&&state_->child_closed&&state_->scheduler_joined;
     if(!result.cleanup_complete&&result.sync!=sync_drain_state::failed)
         result.sync=reentrant?sync_drain_state::reentrant_pending:sync_drain_state::deadline_pending;
+    lock.unlock(); // Sample off the original wait/result leaf.
+    sample_close(3,attempt,result,reentrant);
     return result;
 }
 }

@@ -65,6 +65,8 @@ public:
     void transport_created() noexcept;
     void install_lifetime(std::shared_ptr<sync_callback_lifetime>);
     std::shared_ptr<sync_callback_lifetime> lifetime()const noexcept;
+    // Diagnostic-only, one try-lock; failure leaves output unobserved.
+    bool try_lifetime(std::shared_ptr<sync_callback_lifetime>&)const noexcept;
     void bind(std::shared_ptr<sync_transport>,std::shared_ptr<sync_callback_lifetime>,
         const std::shared_ptr<recovery_continuous_route>&);
 };

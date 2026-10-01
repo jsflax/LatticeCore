@@ -9,6 +9,22 @@ namespace lattice::detail {
 struct configured_retirement_test_access;
 class configured_platform_bridge;
 class configured_attempt_custody;
+class configured_retirement_registry;
+// Passive interval comparison only: no receipt, cleanup, currentness, issuer
+// or metadata reconstruction API. Configured owners use a process-lived registry.
+class configured_retirement_identity final {
+    friend class configured_retirement_registry;
+    const configured_retirement_registry* registry_=nullptr;
+    size_t slot_=0;
+    uint64_t owner_=0,attempt_=0;
+    configured_retirement_identity(const configured_retirement_registry* registry,size_t slot,uint64_t owner,uint64_t attempt)noexcept
+        :registry_(registry),slot_(slot),owner_(owner),attempt_(attempt){}
+public:
+    configured_retirement_identity()noexcept=default;
+    bool matches(const configured_retirement_identity& other)const noexcept {
+        return registry_&&registry_==other.registry_&&owner_&&attempt_&&slot_==other.slot_&&owner_==other.owner_&&attempt_==other.attempt_;
+    }
+};
 struct configured_retirement_snapshot {
     bool valid=false,requested=false,adapter_complete=false,native_complete=false;
     bool owner_live=false,transport_retained=false,quarantined=false;
@@ -58,6 +74,9 @@ public:
     // borrows. A cancel request or wrapper deletion alone cannot prove this.
     bool complete_native_cleanup(const platform_retirement_receipt&,int32_t) noexcept;
     configured_retirement_snapshot snapshot(const platform_retirement_receipt&) const noexcept;
+    configured_retirement_identity comparison_identity(const platform_retirement_receipt&) const noexcept;
+    // Diagnostic-only, one try-lock; failure leaves output unobserved.
+    bool try_snapshot(const platform_retirement_receipt&,configured_retirement_snapshot&) const noexcept;
     // Only the off-callback collector may call this. Adapter completion
     // NEVER destroys custody. Nonzero first error permanently refuses release.
     // Also supports orphaned successful attempts, without resurrecting owner.

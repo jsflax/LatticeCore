@@ -279,18 +279,34 @@ recovery_continuous_route::~recovery_continuous_route(){
 }
 recovery_continuous_work::~recovery_continuous_work(){if(state_){std::lock_guard<std::mutex> lock(state_->mutex);--state_->operations;}}
 std::shared_ptr<recovery_continuous_route> recovery_continuous_producer::admit_route(std::shared_ptr<lattice_db> owner,const sync_config& config,bool injected) {
+    recovery_admission_test_hooks::route_entered();
     if(!owner)return {};
     if(!owner->recovery_continuous_){require_no_continuous_export(*owner->db_);return {};}
     auto state=owner->recovery_continuous_->state;
     if(injected||config.sync_filter)refuse("continuous injected/filtered export topology not implemented");
     bool allowed=false;for(const auto& route:state->policy.routes)if(route.sync_id==config.sync_id&&route.endpoint==config.websocket_url)allowed=true;
     if(!allowed)refuse("continuous WSS route absent from immutable policy");
+    recovery_admission_test_hooks::route_point(recovery_admission_test_hooks::route_admission_point::policy_checked);
+    recovery_admission_test_hooks::route_install_observation_scope observation;
     const auto checked=recovery_writer_access::install(owner,[&](database& db){continuous_verify_row(db,*state);recovery_local_producer_adapter::profiles_for_owned_write(owner,state->policy.limits);});
-    if(checked.state!=recovery_install_state::committed){if(checked.primary_error)std::rethrow_exception(checked.primary_error);refuse("continuous route admission did not commit");}
+    observation.finish();
+    if(auto* out=recovery_admission_test_hooks::route_observation){
+        out->point=recovery_admission_test_hooks::route_admission_point::install_returned;
+        out->install_state=static_cast<unsigned char>(checked.state);
+        out->primary=bool(checked.primary_error);out->cleanup=bool(checked.cleanup_error);
+        out->postcommit=bool(checked.postcommit_error);out->notification=bool(checked.notification_error);
+        out->unexpected_commit=checked.unexpected_commit_observed;
+    }
+    if(checked.state!=recovery_install_state::committed){if(checked.primary_error){
+        recovery_admission_test_hooks::route_point(recovery_admission_test_hooks::route_admission_point::primary_rethrow);
+        std::rethrow_exception(checked.primary_error);
+    }refuse("continuous route admission did not commit");}
+    recovery_admission_test_hooks::route_point(recovery_admission_test_hooks::route_admission_point::committed);
     auto route=std::shared_ptr<recovery_continuous_route>(new recovery_continuous_route);
     {std::lock_guard<std::mutex> lock(state->mutex);
      if(!state->initialized||(!state->dml_open.load(std::memory_order_acquire)&&!continuous_receiver_enabled(*state))||state->routes==state->policy.physical_routes||state->next_route==std::numeric_limits<uint64_t>::max())refuse("continuous route gate closed or full");
      route->route_=++state->next_route;route->incarnation_=state->incarnation;route->owner_=owner;route->state_=state;++state->routes;}
+    recovery_admission_test_hooks::route_point(recovery_admission_test_hooks::route_admission_point::registered);
     return route;
 }
 std::shared_ptr<recovery_continuous_work> recovery_continuous_producer::admit_work(const std::shared_ptr<recovery_continuous_route>& route,std::shared_ptr<lattice_db> owner,uint64_t physical) {

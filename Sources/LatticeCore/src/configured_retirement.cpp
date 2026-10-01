@@ -148,6 +148,18 @@ bool configured_retirement_registry::complete(const platform_retirement_receipt&
     return true;
 }
 bool configured_retirement_registry::complete_native_cleanup(const platform_retirement_receipt& receipt,int32_t error) noexcept {return complete(receipt,error,false);}
+bool configured_retirement_registry::try_snapshot(const platform_retirement_receipt& receipt,configured_retirement_snapshot& out)const noexcept {
+    std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);if(!lock.owns_lock())return false;
+    if(!current_locked(receipt)){out={};return true;}
+    const auto& s=slots_[receipt.slot_];
+    out={true,s.requested,s.adapter_complete,s.native_complete,s.owner_live,bool(s.transport),bool(s.first_error),s.first_error};return true;
+}
+configured_retirement_identity configured_retirement_registry::comparison_identity(const platform_retirement_receipt& receipt)const noexcept {
+    // Receipt identity fields are immutable, assigned only by this real native
+    // issuer. Deliberately no current-slot lookup or receipt cleanup capability.
+    if(receipt.registry_.get()!=this||receipt.slot_>=capacity_||!receipt.owner_||!receipt.attempt_)return {};
+    return {this,receipt.slot_,receipt.owner_,receipt.attempt_};
+}
 configured_retirement_snapshot configured_retirement_registry::snapshot(const platform_retirement_receipt& receipt) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if(!current_locked(receipt))return {};

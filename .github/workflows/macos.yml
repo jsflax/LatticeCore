@@ -11,8 +11,8 @@ jobs:
   build-and-test:
     runs-on: macos-26
     env:
-      CORE_SOURCE_SHA: ${{ github.sha }}
-      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
+      CORE_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
     steps:
       - name: Fetch exact source into owned localdev directory
         shell: bash
@@ -46,3 +46,16 @@ jobs:
             --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
             --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
             LatticeCoreTests
+
+      - name: Preserve parent and fresh-process test logs
+        if: always() && env.CORE_JOB_ROOT != ''
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-native-macos-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CORE_JOB_ROOT }}/test-logs/*.log
+            ${{ env.CORE_JOB_ROOT }}/tmp/**/*.log
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

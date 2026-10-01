@@ -10,6 +10,7 @@
 #include <functional>
 #include <tuple>
 #include <array>
+#include <optional>
 
 namespace lattice {
 
@@ -157,6 +158,7 @@ public:
     const model_schema* get_schema(const std::string& table_name) const;
 
     std::vector<const model_schema*> all_schemas() const;
+    std::optional<std::vector<const model_schema*>> bounded_schemas(size_t maximum) const;
 
 private:
     schema_registry() = default;

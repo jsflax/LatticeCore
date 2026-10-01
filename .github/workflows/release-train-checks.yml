@@ -15,8 +15,8 @@ jobs:
   protocol:
     runs-on: ubuntu-latest
     env:
-      CORE_SOURCE_SHA: ${{ github.sha }}
-      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
+      CORE_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
     steps:
       - name: Fetch exact source into owned localdev directory
         shell: bash

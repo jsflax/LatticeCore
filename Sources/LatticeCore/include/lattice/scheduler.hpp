@@ -10,6 +10,7 @@
 #include <queue>
 #include <condition_variable>
 #include <atomic>
+#include <exception>
 
 namespace lattice {
 
@@ -150,85 +151,175 @@ using SharedScheduler = std::shared_ptr<scheduler>;
 // Not available on Emscripten/WASM — use immediate_scheduler instead.
 
 #ifndef __EMSCRIPTEN__
+namespace detail { struct std_thread_scheduler_test_access; }
+
 class std_thread_scheduler : public scheduler {
-public:
-    static std::atomic<int64_t>& alive_count() {
-        static std::atomic<int64_t> count{0};
-        return count;
-    }
+    // The worker owns this state independently of the scheduler wrapper. A
+    // callback may destroy the wrapper before already-admitted siblings drain.
+    // Those callbacks' captures still need valid targets of their own.
+    struct state {
+        std::mutex mutex;
+        std::condition_variable work_ready;
+        std::condition_variable settlement;
+        std::queue<std::function<void()>> queue;
+        std::atomic<bool> running{true};
+        std::thread worker;
+        std::thread::id thread_id;
+        bool joining = false;
+        bool joined = false;
+        bool detached = false;
+        bool loop_settled = false;
+        bool wrapper_destroying = false;
+        size_t detached_waiters = 0;
+        std::exception_ptr first_join_error;
+    };
+    std::shared_ptr<state> state_;
+    friend struct detail::std_thread_scheduler_test_access;
+    using launch_function = std::thread (*)(std::function<void()>);
+    using join_function = void (*)(std::thread&);
 
-    std_thread_scheduler() : running_(true) {
+    static std::thread launch_worker(std::function<void()> work) {
+        return std::thread(std::move(work));
+    }
+    static void join_worker(std::thread& worker) { worker.join(); }
+
+    // Private injection point: test launch unwinding without changing the
+    // public constructor or introducing a process-wide thread factory.
+    std_thread_scheduler(std::shared_ptr<state> shared, launch_function launch)
+        : state_(std::move(shared)) {
+        const auto keep = state_;
+        keep->worker = launch([keep] { run_loop(keep); });
+        keep->thread_id = keep->worker.get_id();
+        // An incomplete construction has no destructor to balance this count.
         auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
-        worker_ = std::thread([this] { run_loop(); });
-        thread_id_ = worker_.get_id();
-        LOG_INFO("scheduler", "std_thread_scheduler CREATED (this=%p, alive=%lld)", (void*)this, (long long)n);
-    }
-
-    ~std_thread_scheduler() override {
-        shutdown();
-        auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
-        LOG_INFO("scheduler", "std_thread_scheduler DESTROYED (this=%p, alive=%lld)", (void*)this, (long long)n);
-    }
-
-    void shutdown() override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!running_) return;  // already shut down
-            running_ = false;
+        try {
+            LOG_INFO("scheduler", "std_thread_scheduler CREATED (this=%p, alive=%lld)", (void*)this, (long long)n);
+        } catch (...) {
+            // Logging can allocate its initial lock. An exception after the
+            // thread launch must still stop and settle that launched worker.
+            const auto first = std::current_exception();
+            shutdown_state(keep, true);
+            alive_count().fetch_sub(1, std::memory_order_relaxed);
+            std::rethrow_exception(first);
         }
-        cv_.notify_one();
-        // Self-join guard: shutdown() can be reached from a task running ON
-        // the worker (an observer callback releasing the last lattice
-        // reference → ~lattice_db → scheduler shutdown). join(self) throws
-        // resource_deadlock_would_occur; detach instead — running_ is false,
-        // so the loop exits after the current task.
-        if (worker_.joinable()) {
-            if (std::this_thread::get_id() == worker_.get_id()) {
-                worker_.detach();
-            } else {
-                worker_.join();
+    }
+
+    static void request_stop(const std::shared_ptr<state>& shared) {
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            shared->running = false;
+        }
+        shared->work_ready.notify_all();
+    }
+
+    // Destructor-only: an external claimant owns its moved handle and joins
+    // it. Otherwise only independent state/captures survive the wrapper.
+    static void detach_unclaimed(const std::shared_ptr<state>& shared) {
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            if (shared->joining || !shared->worker.joinable()) return;
+            try {
+                shared->worker.detach();
+                shared->detached = true;
+            } catch (...) {
+                if (!shared->first_join_error)
+                    shared->first_join_error = std::current_exception();
+                // Preserve custody; never pretend a joinable handle retired.
+                throw;
             }
         }
+        shared->settlement.notify_all();
     }
 
-    void invoke(std::function<void()>&& fn) override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!running_) return;
-            queue_.push(std::move(fn));
+    static void shutdown_state(const std::shared_ptr<state>& shared,
+                               bool destroying, join_function join = join_worker) {
+        if (destroying) {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            shared->wrapper_destroying = true;
         }
-        cv_.notify_one();
+        request_stop(shared);
+        if (std::this_thread::get_id() == shared->thread_id) {
+            // Self-shutdown is request-only, including while another caller
+            // is joining us. Waiting on that caller would deadlock.
+            if (destroying) detach_unclaimed(shared);
+            return;
+        }
+        std::thread claimed;
+        {
+            std::unique_lock<std::mutex> lock(shared->mutex);
+            shared->settlement.wait(lock, [&] { return !shared->joining; });
+            if (shared->joined) return;
+            if (shared->detached) {
+                // The wrapper can self-destruct after an external caller
+                // copied state but before it claimed the handle. That caller
+                // still owes callback/FIFO settlement, even though an actual
+                // join is no longer available. Self callers returned above.
+                ++shared->detached_waiters;
+                shared->settlement.notify_all();
+                shared->settlement.wait(lock, [&] { return shared->loop_settled; });
+                --shared->detached_waiters;
+                return;
+            }
+            shared->joining = true;
+            claimed = std::move(shared->worker);
+        }
+        shared->settlement.notify_all();
+        try {
+            // The callback may call shutdown/admission or release the wrapper.
+            // It needs no lock held by this join claimant.
+            join(claimed);
+        } catch (...) {
+            std::exception_ptr first;
+            bool detach_without_owner;
+            {
+                std::lock_guard<std::mutex> lock(shared->mutex);
+                // Restore custody BEFORE throwing: a local joinable thread's
+                // destructor would otherwise terminate the process.
+                shared->worker = std::move(claimed);
+                shared->joining = false;
+                if (!shared->first_join_error)
+                    shared->first_join_error = std::current_exception();
+                first = shared->first_join_error;
+                detach_without_owner = shared->wrapper_destroying;
+            }
+            shared->settlement.notify_all();
+            if (detach_without_owner) {
+                // State-only detach is a last-owner fallback, not a join.
+                // If the platform also rejects detach, propagation through
+                // the noexcept destructor fails fast rather than claiming
+                // success, leaking, or freeing a joinable handle.
+                detach_unclaimed(shared);
+            }
+            if (destroying) return;
+            std::rethrow_exception(first);
+        }
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            shared->joining = false;
+            shared->joined = true;
+        }
+        shared->settlement.notify_all();
     }
 
-    [[nodiscard]] bool is_on_thread() const noexcept override {
-        return std::this_thread::get_id() == thread_id_;
-    }
-
-    [[nodiscard]] bool is_same_as(const scheduler* other) const noexcept override {
-        auto* g = dynamic_cast<const std_thread_scheduler*>(other);
-        return g && g->thread_id_ == thread_id_;
-    }
-
-    [[nodiscard]] bool can_invoke() const noexcept override {
-        return running_;
-    }
-
-private:
-    void run_loop() {
-        while (true) {
+    static void run_loop(const std::shared_ptr<state>& shared) {
+        for (;;) {
             std::function<void()> fn;
             {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
-
-                if (!running_ && queue_.empty()) {
+                std::unique_lock<std::mutex> lock(shared->mutex);
+                shared->work_ready.wait(lock, [&] {
+                    return !shared->queue.empty() || !shared->running;
+                });
+                if (!shared->running && shared->queue.empty()) {
+                    shared->loop_settled = true;
+                    lock.unlock();
+                    shared->settlement.notify_all();
                     return;
                 }
-
-                fn = std::move(queue_.front());
-                queue_.pop();
+                // The popped function is empty; captured destructors run only
+                // after the work item, outside this lock.
+                fn.swap(shared->queue.front());
+                shared->queue.pop();
             }
-
             if (fn) {
                 try {
                     fn();
@@ -238,15 +329,64 @@ private:
                     LOG_ERROR("scheduler", "Work item threw unknown exception");
                 }
             }
+            // fn and its captures die off-lock, before loop settlement.
         }
     }
 
-    std::thread worker_;
-    std::thread::id thread_id_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::queue<std::function<void()>> queue_;
-    std::atomic<bool> running_;
+public:
+    static std::atomic<int64_t>& alive_count() {
+        static std::atomic<int64_t> count{0};
+        return count;
+    }
+
+    std_thread_scheduler()
+        : std_thread_scheduler(std::make_shared<state>(), launch_worker) {}
+
+    std_thread_scheduler(const std_thread_scheduler&) = delete;
+    std_thread_scheduler& operator=(const std_thread_scheduler&) = delete;
+    std_thread_scheduler(std_thread_scheduler&&) = delete;
+    std_thread_scheduler& operator=(std_thread_scheduler&&) = delete;
+
+    ~std_thread_scheduler() override {
+        const auto shared = state_;
+        shutdown_state(shared, true);
+        auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
+        LOG_INFO("scheduler", "std_thread_scheduler DESTROYED (this=%p, alive=%lld)", (void*)this, (long long)n);
+    }
+
+    // External callers join. Calls on the worker request stop and return so
+    // the active callback can finish. Admitted work drains FIFO; new work is
+    // rejected. This does not retain the work's own raw callback targets.
+    void shutdown() override {
+        const auto shared = state_;
+        shutdown_state(shared, false);
+    }
+
+    void invoke(std::function<void()>&& fn) override {
+        const auto shared = state_;
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            if (!shared->running) return;
+            shared->queue.push(std::move(fn));
+        }
+        shared->work_ready.notify_one();
+    }
+
+    [[nodiscard]] bool is_on_thread() const noexcept override {
+        const auto shared = state_;
+        return std::this_thread::get_id() == shared->thread_id;
+    }
+
+    [[nodiscard]] bool is_same_as(const scheduler* other) const noexcept override {
+        const auto shared = state_;
+        auto* g = dynamic_cast<const std_thread_scheduler*>(other);
+        return g && g->state_->thread_id == shared->thread_id;
+    }
+
+    [[nodiscard]] bool can_invoke() const noexcept override {
+        const auto shared = state_;
+        return shared->running;
+    }
 };
 #endif // !__EMSCRIPTEN__
 

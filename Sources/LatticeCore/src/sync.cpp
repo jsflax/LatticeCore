@@ -1496,6 +1496,8 @@ void synchronizer_base::drain(std::chrono::steady_clock::time_point deadline) {
 }
 sync_drain_result synchronizer_base::drain_checked(std::chrono::steady_clock::time_point deadline) noexcept {
     try {
+        // Refuse this controller's inherited owner before its lifetime leaf.
+        if(receiver_controller_&&!receiver_controller_->creator_current())return {sync_drain_state::retired};
         const auto queue=discovery_deferral_;const auto lifetime=callback_lifetime_;
         if(!queue||!lifetime)return {sync_drain_state::not_attempted};
         const auto generation=lifetime->dispatch_generation();
@@ -1507,6 +1509,7 @@ sync_drain_result synchronizer_base::drain_checked(std::chrono::steady_clock::ti
         bool admitted=false,connected=false;
         lifetime->queued(generation,[this,queue,generation,&admitted,&connected] {
             admitted=true;connected=is_connected_&&!is_destroyed_;if(!connected)return;
+            if(receiver_controller_)if(const auto error=receiver_controller_->checked_disposal_failure(generation))std::rethrow_exception(error);
             if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
         });
         if(!admitted)return {sync_drain_state::retired};
@@ -1549,12 +1552,15 @@ sync_drain_result synchronizer_base::drain_checked(std::chrono::steady_clock::ti
             const auto result=completion->read();
             if(result.error)return {sync_drain_state::failed,result.error};
             bool live=false,online=false,negotiated_pending=false,recovery_pending=false;int64_t pending=0;
-            lifetime->queued(generation,[this,generation,&live,&online,&pending,&negotiated_pending,&recovery_pending] {
+            std::exception_ptr disposal_failure;
+            lifetime->queued(generation,[this,generation,&live,&online,&pending,&negotiated_pending,&recovery_pending,&disposal_failure] {
                 live=true;online=is_connected_.load()&&!is_destroyed_.load();
                 pending=progress_pending_upload_.load(std::memory_order_relaxed);
                 if(online&&receiver_source_&&continuous_route_)negotiated_pending=receiver_source_->upload_pending(generation);
                 recovery_pending=online&&receiver_controller_&&receiver_controller_->blocks_ordinary();
+                if(online&&receiver_controller_)disposal_failure=receiver_controller_->checked_disposal_failure(generation);
             });
+            if(disposal_failure)return {sync_drain_state::failed,std::move(disposal_failure)};
             if(queue->failed(generation))throw db_error("sync discovery deferral failed; explicit replay required");
             if(!live||!online) {
                 completion->cancel();const auto settled=completion->read();

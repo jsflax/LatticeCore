@@ -16,6 +16,9 @@
 #include <charconv>
 #include <chrono>
 #include <set>
+#if defined(__APPLE__) || defined(__linux__)
+#include <unistd.h>
+#endif
 
 namespace lattice::detail {
 namespace {
@@ -46,6 +49,32 @@ public:
     controller_generation_unsettled(const controller_generation_changed& primary,const recovery_install_result& result)
         :db_error(primary.what()),settlement(result){}
 };
+// A failed completed-disposal SQL turn retains the real primary and full
+// settlement. It is neither a fresh-demand retry nor a delivery wait. Keep
+// older generic install-failure drain behavior outside this narrow operation.
+class controller_disposal_refused final : public db_error {
+    static std::string reason(const std::exception_ptr& error) {
+        try {if(error)std::rethrow_exception(error);}
+        catch(const std::exception& value){
+            const char* text=value.what();size_t size=0;while(text&&size<2048&&text[size])++size;
+            return text?std::string(text,size):std::string("controller completed disposal failed");
+        }
+        catch(...){}
+        return "controller completed disposal failed";
+    }
+public:
+    const std::exception_ptr primary;
+    const recovery_install_result settlement;
+    controller_disposal_refused(std::exception_ptr error,const recovery_install_result& result)
+        :db_error(reason(error)),primary(std::move(error)),settlement(result){}
+};
+std::uint64_t controller_process()noexcept {
+#if defined(__APPLE__) || defined(__linux__)
+    return static_cast<std::uint64_t>(::getpid());
+#else
+    return 1; // Other targets retain existing admission; no added PID check.
+#endif
+}
 class delivery_retry_wait final : public db_error {
 public:
     delivery_retry_wait():db_error("controller UNKNOWN persisted after one restricted pass; new external source/request generation or actual delivery timeout required"){}
@@ -288,9 +317,14 @@ struct recovery_receiver_route::state {
     // Original-profile late discard is admitted only after this worker issued
     // a completed-predecessor disposal on the exact current physical view.
     std::weak_ptr<const receiver_source_binding::record> issued_discard_view;
+    // Current selected-cohort membership, replaced as one set under the
+    // controller mutex. Historical observation is not current membership.
+    // The worker-only observed map is never read by drain callers.
+    std::weak_ptr<const receiver_source_binding::record> checked_selected_view;
     std::function<void(std::exception_ptr)> error;
 };
 struct recovery_receiver_controller::state {
+    const std::uint64_t creator=controller_process();
     const recovery_continuous_policy policy;
     const canonical_scoped_limits caps;
     std::shared_ptr<const test_probe> probe;
@@ -552,6 +586,31 @@ std::function<void()> recovery_receiver_route::delivery_timeout_retry(const comm
     };
 }
 bool recovery_receiver_route::blocks_ordinary()const noexcept{return state_->blocked.load(std::memory_order_acquire);}
+bool recovery_receiver_route::creator_current()const noexcept{return controller_->state_->creator==controller_process();}
+std::exception_ptr recovery_receiver_route::checked_disposal_failure(uint64_t lifecycle)const {
+    // No inherited leaf, and no failure from a live but deselected physical
+    // wrapper or from a new route not yet selected by the actual controller.
+    if(!creator_current()||state_->retired.load()||!state_->lifetime->current(lifecycle))return {};
+    const auto view=state_->source->recovery_current();if(!view)return {};
+    std::exception_ptr error;
+    {std::lock_guard lock(controller_->state_->mutex);const auto& runtime=*controller_->state_;
+        if(state_->retired.load()||runtime.awaiting_delivery_retry)return {};
+        if(state_->checked_selected_view.lock()!=view->value)return {};
+        error=runtime.failure;
+    }
+    // Typed disposition comes only from the real controller SQL settlement;
+    // notification strings and caller flags cannot turn pending into failed.
+    try {if(error)std::rethrow_exception(error);else return {};}
+    catch(const controller_generation_unsettled&){}
+    catch(const controller_disposal_refused&){}
+    catch(...){return {};}
+    if(state_->retired.load()||!state_->lifetime->current(lifecycle)||!state_->source->recovery_live(*view))return {};
+    {std::lock_guard lock(controller_->state_->mutex);const auto& runtime=*controller_->state_;
+        if(state_->retired.load()||runtime.awaiting_delivery_retry||runtime.failure!=error||
+           state_->checked_selected_view.lock()!=view->value)return {};
+    }
+    return error;
+}
 void recovery_receiver_controller::dropped_turn()noexcept {std::lock_guard lock(state_->mutex);state_->scheduled=false;}
 void recovery_receiver_controller::wake(const std::shared_ptr<recovery_receiver_route>& route) {
     if(route->state_->retired.load())return;
@@ -744,9 +803,22 @@ void recovery_receiver_controller::turn() {
             require(key==common_domain,"controller overlapping replacement authority requires explicit configuration");
             require(c.description.value("receiptBinding",json{})==common_receipt_binding,"controller receipt producer or cohort differs across contributions");
         }
+        uint64_t changed_sources=0;
+        for(const auto& [channel,c]:connected_routes)
+            if(!runtime.observed.count(channel)||runtime.observed.at(channel).value!=c.view.value)++changed_sources;
+        {std::lock_guard lock(runtime.mutex);
+            require(changed_sources<=UINT64_MAX-runtime.revision&&changed_sources<=UINT64_MAX-runtime.external_revision,
+                "controller demand revision exhausted");
+            // One publication replaces the COMPLETE actual selected set and
+            // clears an old cohort's failure before any new member can read it.
+            // A still-live lower-generation sibling is explicitly deselected.
+            for(const auto& route:routes)route->state_->checked_selected_view.reset();
+            if(changed_sources){runtime.revision+=changed_sources;runtime.external_revision+=changed_sources;
+                runtime.demand=true;runtime.failure={};runtime.awaiting_delivery_retry=false;}
+            for(const auto& [_,c]:connected_routes)c.route->state_->checked_selected_view=c.view.value;
+        }
         for(const auto& [channel,c]:connected_routes) {
             if(!runtime.observed.count(channel)||runtime.observed.at(channel).value!=c.view.value){
-                {std::lock_guard lock(runtime.mutex);require(runtime.revision!=UINT64_MAX&&runtime.external_revision!=UINT64_MAX,"controller demand revision exhausted");++runtime.revision;++runtime.external_revision;runtime.demand=true;runtime.failure={};runtime.awaiting_delivery_retry=false;}
                 std::shared_ptr<const recovery_reconciliation_descriptor> retired;
                 {std::lock_guard lock(runtime.mutex);retired=std::move(runtime.reconciliation);}
                 runtime.observed[channel]=c.view;runtime.frozen.reset();runtime.framing_committed=false;
@@ -781,6 +853,15 @@ void recovery_receiver_controller::turn() {
         const auto probe_scope=[&](const char* stage)->std::shared_ptr<void>{return runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->scope?runtime.probe->scope(stage):nullptr;};
         const auto live=[&]{for(const auto& [_,c]:connected_routes)require(!c.route->state_->retired.load()&&c.route->state_->source->recovery_live(c.view),"controller authenticated source retired during owned operation");};
         const auto owned=[&](const std::function<void(database&)>& body){const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();},true);known(result);settle.keep_admission_wait=false;};
+        const auto owned_completed_disposal=[&](const std::function<void(database&)>& body){
+            const auto result=recovery_continuous_producer::controller_owned(*this,owner,[&](database& db){live();body(db);live();},true);
+            try {known(result);}
+            catch(const controller_admission_wait&){throw;}
+            catch(const controller_stale_turn_cancelled&){throw;}
+            catch(const controller_generation_unsettled&){throw;}
+            catch(...){throw controller_disposal_refused(std::current_exception(),result);}
+            settle.keep_admission_wait=false;
+        };
         // Read and validate the COMPLETE local precursor before any remote
         // disposal. The installed branch deliberately precedes old context
         // parsing; only canceled predecessors need compatibility authority.
@@ -1218,7 +1299,7 @@ void recovery_receiver_controller::turn() {
             if(!runtime.framing_committed) {
                 std::optional<recovery_request_row> selected_disposal;std::optional<state::disposal> selected_receipt;
                 auto disposal_probe=probe_scope("completed-disposal-validation");
-                owned([&](database&){
+                owned_completed_disposal([&](database&){
                     const auto candidates=disposal_snapshot(physical_incarnation,barrier,attempt,demand_revision);
                     recovery_request_store requests(owner);
                     for(const auto& [channel,receipt]:candidates) {
@@ -1238,7 +1319,7 @@ void recovery_receiver_controller::turn() {
             }
             if(!runtime.framing_committed) {
                 auto framing_probe=probe_scope("completed-disposal-framing");
-                owned([&](database& db){
+                owned_completed_disposal([&](database& db){
                 const auto candidates=disposal_snapshot(physical_incarnation,barrier,attempt,demand_revision);
                 for(const auto& [channel,receipt]:candidates){const auto at=runtime.disposals.find(channel);
                     require(at!=runtime.disposals.end()&&same_disposal(at->second,receipt),"controller framing replacement lacks whole-cohort disposal");}

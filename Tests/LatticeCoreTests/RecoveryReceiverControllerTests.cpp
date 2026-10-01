@@ -3353,3 +3353,104 @@ TEST_F(ControlledGenerationReceiverController, ActualSemanticRefusalWithNewDeman
 }
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(ControlledGenerationReceiverController, ActualDisposalFailureAfterDrainAdmissionDoesNotLeakIntoFreshRoute) {
+    configure();insert(*source,controller_uuid(9961),"retained across checked failure");
+    auto armed=std::make_shared<std::atomic<bool>>(false);
+    auto paused=std::make_shared<ControllerPause>();pauses.push_back(paused);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[armed,paused](const char* stage){
+        if(std::strcmp(stage,"disposal-before-generation-validation")==0&&armed->exchange(false)){
+            paused->wait();throw db_error("actual disposal refusal after checked drain admission");
+        }
+    });
+    connect();ASSERT_TRUE(until([&]{return installed();}));ASSERT_FALSE(has_error());
+    const auto original_rows=receiver->db().query("SELECT * FROM ControllerRow ORDER BY id");
+    armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return paused->ready();}));ASSERT_FALSE(has_error());
+    sync_drain_result drain;
+    {
+        struct restore_hook {
+            std::function<void()> previous=std::move(detail::sync_background_test_hooks::before_drain_admission);
+            ~restore_hook(){detail::sync_background_test_hooks::before_drain_admission=std::move(previous);}
+        } restore;
+        // The checked drain's initial live/fatal observation has already
+        // completed. Release the real SQL turn before its upload barrier.
+        detail::sync_background_test_hooks::before_drain_admission=[paused]{paused->release();};
+        drain=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+    }
+    EXPECT_EQ(drain.state,sync_drain_state::failed);ASSERT_TRUE(drain.error);
+    try{std::rethrow_exception(drain.error);}catch(const std::exception& error){
+        EXPECT_NE(std::string(error.what()).find("actual disposal refusal after checked drain admission"),std::string::npos);
+    }catch(...){FAIL()<<"actual primary exception type was lost";}
+    ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(phase(),2);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),original_rows);
+    EXPECT_FALSE(paused->timedOut());
+    const auto old=peers[0].physical;synchronizers[0]->disconnect();connect();
+    ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(old.matches(peers[0].physical));
+    const auto fresh=synchronizers.back()->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+    EXPECT_NE(fresh.state,sync_drain_state::failed);EXPECT_FALSE(fresh.error);
+    const auto retired=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+    EXPECT_NE(retired.state,sync_drain_state::failed);EXPECT_FALSE(retired.error);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),original_rows);
+}
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(ControlledGenerationReceiverController, LiveDeselectedWrapperDoesNotInheritSelectedCohortDisposalFailure) {
+    configure();insert(*source,controller_uuid(9962),"two live physical wrappers");
+    auto armed=std::make_shared<std::atomic<bool>>(false);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[armed](const char* stage){
+        if(std::strcmp(stage,"disposal-before-generation-validation")==0&&armed->exchange(false))
+            throw db_error("actual selected-cohort disposal refusal");
+    });
+    connect();ASSERT_TRUE(until([&]{return installed();}));ASSERT_FALSE(has_error());
+    ASSERT_EQ(synchronizers.size(),1u);const auto old_endpoint=peers[0].physical;
+    const auto original_rows=receiver->db().query("SELECT * FROM ControllerRow ORDER BY id");
+    // The ordinary pump closes its replaced server setup on redial. Retain
+    // this actual setup separately so BOTH authenticated sources stay live.
+    struct retained_source {
+        relay_recovery_setup setup;
+        ~retained_source(){setup.close_on_io();}
+    } old_source{std::move(peers[0].setup)};
+    peers[0].setup={};
+    const auto actual_description=[&](const relay_recovery_setup& setup){
+        const auto raw=json{{"kind","recoveryReady"},{"version",1},{"operation","describe"},
+            {"requestID",controller_uuid(9963)}}.dump();
+        auto charge=setup.stop_token().reserve_ready(raw.size());
+        if(!charge.valid())throw db_error("live source describe reservation refused");
+        const auto result=setup.ready(raw,charge);
+        if(result.status_code()!=1||!result.publishable())throw db_error("actual retained source is not live");
+        return json::parse(result.wire());
+    };
+    const auto old_description=actual_description(old_source.setup);
+    ASSERT_TRUE(old_endpoint.is_current());ASSERT_TRUE(old_source.setup.stop_token().live());
+    // No disconnect/close of the old wrapper: physical_routes permits both.
+    connect();ASSERT_EQ(synchronizers.size(),2u);
+    ASSERT_TRUE(until([&]{return installed(2);}));ASSERT_FALSE(has_error());
+    const auto selected_endpoint=peers[0].physical;
+    const auto selected_description=actual_description(peers[0].setup);
+    ASSERT_FALSE(old_endpoint.matches(selected_endpoint));
+    ASSERT_GT(std::stoull(selected_description.at("routeGeneration").get<std::string>()),
+              std::stoull(old_description.at("routeGeneration").get<std::string>()));
+    ASSERT_TRUE(old_endpoint.is_current());ASSERT_TRUE(selected_endpoint.is_current());
+    ASSERT_TRUE(old_source.setup.stop_token().live());ASSERT_TRUE(peers[0].setup.stop_token().live());
+    EXPECT_EQ(actual_description(old_source.setup),old_description);
+    armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return has_error();}));
+    const auto selected=synchronizers.back()->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+    EXPECT_EQ(selected.state,sync_drain_state::failed);ASSERT_TRUE(selected.error);
+    try{std::rethrow_exception(selected.error);}catch(const std::exception& error){
+        EXPECT_NE(std::string(error.what()).find("actual selected-cohort disposal refusal"),std::string::npos);
+    }catch(...){FAIL()<<"actual selected primary exception was lost";}
+    const auto old=synchronizers.front()->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+    EXPECT_EQ(old.state,sync_drain_state::deadline_pending);EXPECT_FALSE(old.error);
+    EXPECT_TRUE(old_endpoint.is_current());EXPECT_TRUE(selected_endpoint.is_current());
+    EXPECT_TRUE(old_source.setup.stop_token().live());EXPECT_TRUE(peers[0].setup.stop_token().live());
+    EXPECT_EQ(actual_description(old_source.setup),old_description);
+    EXPECT_EQ(actual_description(peers[0].setup),selected_description);
+    EXPECT_EQ(phase(),2);EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),original_rows);
+}
+}
+#endif

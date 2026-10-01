@@ -78,6 +78,8 @@ class recovery_receiver_route final : public std::enable_shared_from_this<recove
     void notifications(std::function<void()>,std::function<void()>,std::function<void(std::exception_ptr)>,std::function<void()> reconciliation={});
     bool receive(const platform_transport_callbacks&,uint64_t,const transport_message&);
     bool blocks_ordinary()const noexcept;
+    bool creator_current()const noexcept;
+    std::exception_ptr checked_disposal_failure(uint64_t lifecycle)const;
 public:
     ~recovery_receiver_route();
     recovery_receiver_route(const recovery_receiver_route&)=delete;

@@ -337,6 +337,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp
     Tests/LatticeCoreTests/BulkMutationTests.cpp
     Tests/LatticeCoreTests/ProjectionReadTests.cpp
+    Tests/LatticeCoreTests/TopologyAdmissionTests.cpp
     Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp
     Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp
     Tests/LatticeCoreTests/ProjectionMemoryServiceTests.cpp

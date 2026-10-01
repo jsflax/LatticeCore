@@ -26,6 +26,26 @@ constexpr unsigned admission_retry_attempts=32;
 constexpr int64_t admission_retry_window_ms=5000,admission_retry_tick_ms=100;
 [[noreturn]] void refuse(const char* reason){throw db_error(reason);}
 class controller_admission_wait final {};
+// Only the two exact disposal-generation guards create this primary marker.
+// A primary class alone never grants SQL replay or proves no source effect.
+class controller_generation_changed final : public db_error {
+public:
+    const uint64_t revision;
+    controller_generation_changed(uint64_t expected,const char* reason):db_error(reason),revision(expected){}
+};
+class controller_stale_turn_cancelled final : public db_error {
+public:
+    const uint64_t revision;
+    controller_stale_turn_cancelled(uint64_t expected,const char* reason):db_error(reason),revision(expected){}
+};
+class controller_generation_unsettled final : public db_error {
+public:
+    // Preserve every actual outcome/error, including secondary failures, in
+    // the fatal exception rather than promoting its primary marker to retry.
+    const recovery_install_result settlement;
+    controller_generation_unsettled(const controller_generation_changed& primary,const recovery_install_result& result)
+        :db_error(primary.what()),settlement(result){}
+};
 class delivery_retry_wait final : public db_error {
 public:
     delivery_retry_wait():db_error("controller UNKNOWN persisted after one restricted pass; new external source/request generation or actual delivery timeout required"){}
@@ -210,7 +230,16 @@ void known(const recovery_install_result& result) {
             "controller invalid no-effect admission outcome");
         throw controller_admission_wait{};
     }
-    if(result.state!=recovery_install_state::committed){if(result.primary_error)std::rethrow_exception(result.primary_error);refuse("controller transaction outcome unavailable; gate remains closed");}
+    if(result.state!=recovery_install_state::committed){
+        if(result.primary_error)try{std::rethrow_exception(result.primary_error);}
+        catch(const controller_generation_changed& primary){
+            if(result.state==recovery_install_state::rolled_back&&!result.cleanup_error&&!result.postcommit_error&&
+                !result.notification_error&&!result.unexpected_commit_observed)
+                throw controller_stale_turn_cancelled(primary.revision,primary.what());
+            throw controller_generation_unsettled(primary,result);
+        }
+        refuse("controller transaction outcome unavailable; gate remains closed");
+    }
     // Postcommit notification failure cannot roll back or justify model replay.
     // The next actual owned inspection observes the committed durable phase.
 }
@@ -762,7 +791,9 @@ void recovery_receiver_controller::turn() {
             const auto phase=writer->query("SELECT incarnation,phase,barrier,attempt FROM main._lattice_producer_continuity WHERE id=1");
             require(phase.size()==1&&integer(phase[0],"incarnation")==physical&&integer(phase[0],"phase")==2&&
                 integer(phase[0],"barrier")==barrier&&integer(phase[0],"attempt")==attempt,"controller disposal durable phase changed");
-            {std::lock_guard lock(runtime.mutex);require(runtime.revision==revision,"controller disposal generation changed");}
+            observe("disposal-before-generation-validation");
+            {std::lock_guard lock(runtime.mutex);if(runtime.revision!=revision)
+                throw controller_generation_changed(revision,"controller disposal generation changed");}
             recovery_request_store requests(owner);receive_install_store receiver(owner,runtime.caps.install.installations);receiver.audit();
             const auto fingerprints=requests.fingerprints();
             for(const auto& [channel,_]:fingerprints)require(connected_routes.count(channel),"controller disposal unknown request channel");
@@ -826,7 +857,10 @@ void recovery_receiver_controller::turn() {
             outgoing->reservation->shrink(outgoing->request_bytes.size());outgoing->deadline=now()+std::min<int64_t>(remaining,30000);
             observe("outgoing-built-before-publication");bool late_pending=false;
             {std::lock_guard lock(runtime.mutex);require(!runtime.outstanding,"controller overlapping request admission");
-                if(outgoing->completed_disposal)require(runtime.revision==outgoing->completed_disposal->key.revision,"controller disposal handoff generation changed");
+                // This payload has never been published or physically handed
+                // off. Throwing unwinds the leaf before its final owner drops.
+                if(outgoing->completed_disposal&&runtime.revision!=outgoing->completed_disposal->key.revision)
+                    throw controller_stale_turn_cancelled(outgoing->completed_disposal->key.revision,"controller disposal handoff generation changed");
                 late_pending=runtime.budget->slots.load()!=0;if(!late_pending)runtime.outstanding=outgoing;}
             if(late_pending){settle.keep_admission_wait=true;observe("late-control-handoff-deferred");return;}
             auto message=transport_message::from_string(outgoing->request_bytes);message.msg_type=transport_message::type::binary;
@@ -1183,6 +1217,7 @@ void recovery_receiver_controller::turn() {
             bool created=false;
             if(!runtime.framing_committed) {
                 std::optional<recovery_request_row> selected_disposal;std::optional<state::disposal> selected_receipt;
+                auto disposal_probe=probe_scope("completed-disposal-validation");
                 owned([&](database&){
                     const auto candidates=disposal_snapshot(physical_incarnation,barrier,attempt,demand_revision);
                     recovery_request_store requests(owner);
@@ -1193,6 +1228,7 @@ void recovery_receiver_controller::turn() {
                         }
                     }
                 });
+                disposal_probe.reset();
                 if(selected_disposal) {
                     const auto& c=connected_routes.at(selected_disposal->journal.channel);auto q=cr::decode(selected_disposal->request_frame,runtime.caps.codec);
                     q.route_generation=decimal(c.description,"routeGeneration");observe("completed-disposal-cohort-validated");
@@ -1427,6 +1463,31 @@ void recovery_receiver_controller::turn() {
         }
     }catch(...){
         auto error=std::current_exception();std::shared_ptr<state::pending> released;
+        uint64_t cancelled_revision=0;
+        try{std::rethrow_exception(error);}catch(const controller_stale_turn_cancelled& cancelled){cancelled_revision=cancelled.revision;}catch(...){}
+        if(cancelled_revision) {
+            bool current_demand=false;std::vector<std::shared_ptr<recovery_receiver_route>> current_routes;
+            current_routes.reserve(runtime.policy.physical_routes); // no vector allocation/final owner on the leaf
+            {std::lock_guard lock(runtime.mutex);
+                current_demand=runtime.revision!=cancelled_revision&&runtime.demand;
+                if(current_demand){
+                    // Neither a rollback nor an unsent payload proves remote
+                    // settlement. The current turn revalidates durable Q and
+                    // the actual source before acquiring any new authority.
+                    released=std::move(runtime.outstanding);
+                    for(const auto& weak:runtime.routes)if(auto route=weak.lock())current_routes.push_back(std::move(route));
+                    settle.keep_admission_wait=true;
+                }}
+            if(current_demand){
+                released.reset(); // old request/source/endpoint owners off leaf
+                try{if(auto owner=observed_owner.lock();owner&&runtime.probe&&runtime.probe->owner==owner.get()&&runtime.probe->observed)
+                    runtime.probe->observed("stale-generation-cancelled-before-current-turn");}catch(...){}
+                // request() could only coalesce while running. Settlement
+                // clears running before this actual bounded current-turn wake.
+                settle.after=[current_routes]{for(const auto& route:current_routes)if(!route->state_->retired.load()){route->wake();break;}};
+                return;
+            }
+        }
         bool admission_busy=false;
         try{std::rethrow_exception(error);}catch(const controller_admission_wait&){admission_busy=true;}catch(...){}
         if(admission_busy) {

@@ -3242,3 +3242,114 @@ TEST_F(RecoveryDeliveryTimeout, CompletedRestrictedPrefixesReleaseCustodyBeforeA
     EXPECT_EQ(receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original"),claims);
 }
 #endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct ControlledGenerationRollbackFault {
+    static thread_local ControlledGenerationRollbackFault* active;
+    std::atomic<unsigned>& hits;
+    detail::recovery_local_producer_test_hooks::authorizer_fault fault;
+    const detail::recovery_local_producer_test_hooks::authorizer_fault* prior;
+    ControlledGenerationRollbackFault* prior_active;
+    ControlledGenerationRollbackFault(const lattice_db* owner,std::atomic<unsigned>& count)
+        :hits(count),fault{owner,restrict_action},prior(detail::recovery_local_producer_test_hooks::fault),prior_active(active){
+        active=this;detail::recovery_local_producer_test_hooks::fault=&fault;
+    }
+    ~ControlledGenerationRollbackFault(){detail::recovery_local_producer_test_hooks::fault=prior;active=prior_active;}
+    static int restrict_action(int action,const char* one,const char*,const char*)noexcept{
+        if(active&&action==SQLITE_TRANSACTION&&one&&std::strcmp(one,"ROLLBACK")==0){++active->hits;return SQLITE_DENY;}
+        return SQLITE_OK;
+    }
+};
+thread_local ControlledGenerationRollbackFault* ControlledGenerationRollbackFault::active=nullptr;
+enum class ControlledGenerationLocation {sql_validation,unpublished_handoff};
+enum class ControlledGenerationFault {none,rollback_denied,semantic};
+class ControlledGenerationReceiverController:public CompletedPredecessorController {
+protected:
+    void actual_generation_race(ControlledGenerationLocation location,ControlledGenerationFault fault,bool orphan_profile){
+        orphan=orphan_profile;configure(2);insert(*source,controller_uuid(9960),"unchanged across admitted generations");
+        auto armed=std::make_shared<std::atomic<bool>>(false),paused=std::make_shared<std::atomic<bool>>(false);
+        auto cancelled=std::make_shared<std::atomic<unsigned>>(0),rollbacks=std::make_shared<std::atomic<unsigned>>(0);
+        auto old_turn=std::make_shared<ControllerPause>(),cancelled_turn=std::make_shared<ControllerPause>();
+        pauses.push_back(old_turn);pauses.push_back(cancelled_turn);
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+            [=](const char* stage){
+                const auto trigger=location==ControlledGenerationLocation::sql_validation?
+                    "disposal-before-generation-validation":"outgoing-built-before-publication";
+                if(armed->load()&&std::strcmp(stage,trigger)==0&&!paused->exchange(true)){
+                    old_turn->wait();
+                    if(fault==ControlledGenerationFault::semantic)throw db_error("actual controlled-generation semantic refusal");
+                }
+                if(std::strcmp(stage,"stale-generation-cancelled-before-current-turn")==0){++*cancelled;cancelled_turn->wait();}
+            },
+            [this,armed,rollbacks,fault](const char* stage)->std::shared_ptr<void>{
+                if(armed->load()&&fault==ControlledGenerationFault::rollback_denied&&std::strcmp(stage,"completed-disposal-validation")==0)
+                    return std::make_shared<ControlledGenerationRollbackFault>(receiver.get(),*rollbacks);
+                return {};
+            });
+        connect();ASSERT_TRUE(until([&]{return installed();}));ASSERT_FALSE(has_error());
+        const auto old_q=framing(),old_entries=entries(),old_allocators=allocators();
+        const auto old_rows=receiver->db().query("SELECT * FROM ControllerRow ORDER BY id");
+        const auto old_source=source_inventory();const auto old_controls=controls.size();
+        const auto endpoint=peers[0].physical;const auto descriptor=peers[0].setup.descriptor();
+        armed->store(true);request_recovery();ASSERT_TRUE(until([&]{return old_turn->ready();}));
+        // A real current endpoint admits a second demand while the actual
+        // controller is running. No test peer mutates controller generation.
+        request_recovery();old_turn->release();
+        if(fault!=ControlledGenerationFault::none){
+            ASSERT_TRUE(until([&]{return has_error();}));EXPECT_EQ(cancelled->load(),0u);
+            if(fault==ControlledGenerationFault::rollback_denied){
+                EXPECT_GT(rollbacks->load(),0u);
+                {std::lock_guard lock(errors_mutex);EXPECT_TRUE(std::any_of(errors.begin(),errors.end(),[](const auto& error){
+                    return error.find("controller disposal generation changed")!=std::string::npos;}));}
+            }else{
+                EXPECT_EQ(rollbacks->load(),0u);
+                {std::lock_guard lock(errors_mutex);EXPECT_TRUE(std::any_of(errors.begin(),errors.end(),[](const auto& error){
+                    return error.find("actual controlled-generation semantic refusal")!=std::string::npos;}));}
+                EXPECT_EQ(phase(),2);EXPECT_EQ(framing(),old_q);EXPECT_EQ(entries(),old_entries);
+            }
+            // Actual queued worker completion, not a scalar wake oracle.
+            auto barrier=std::make_shared<std::promise<void>>();auto done=barrier->get_future();
+            receiver->get_scheduler()->invoke([barrier]{barrier->set_value();});
+            ASSERT_EQ(done.wait_for(std::chrono::seconds(2)),std::future_status::ready);
+            for(unsigned n=0;n<64&&pump();++n){}
+            EXPECT_EQ(source_inventory(),old_source);
+            for(size_t n=old_controls;n<controls.size();++n)EXPECT_NE(controls[n].second.at("operation"),"discard");
+            const auto drain=synchronizers[0]->drain_checked(std::chrono::steady_clock::now()+std::chrono::seconds(2));
+            EXPECT_EQ(drain.state,sync_drain_state::failed);EXPECT_TRUE(drain.error);
+            EXPECT_EQ(cancelled->load(),0u);return;
+        }
+        ASSERT_TRUE(until([&]{return cancelled_turn->ready();}));EXPECT_EQ(cancelled->load(),1u);EXPECT_EQ(rollbacks->load(),0u);
+        // Cancellation is observed only after actual SQL settlement/off-leaf
+        // payload destruction. It cannot publish success, new Q or a discard.
+        EXPECT_EQ(phase(),2);EXPECT_EQ(framing(),old_q);EXPECT_EQ(entries(),old_entries);EXPECT_EQ(allocators(),old_allocators);
+        EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),old_rows);EXPECT_EQ(source_inventory(),old_source);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1 AND active IS NULL"),2);
+        for(size_t n=old_controls;n<controls.size();++n)EXPECT_NE(controls[n].second.at("operation"),"discard");
+        EXPECT_FALSE(has_error());EXPECT_TRUE(endpoint.matches(peers[0].physical));EXPECT_EQ(peers[0].setup.descriptor(),descriptor);
+        cancelled_turn->release();
+        // No third request, reconnect, ACK, timeout or manual revision change:
+        // the controlled catch must arrange the current actual worker turn.
+        ASSERT_TRUE(until([&]{return installed(2);}));EXPECT_FALSE(has_error());
+        EXPECT_EQ(receiver->db().query("SELECT * FROM ControllerRow ORDER BY id"),old_rows);
+        EXPECT_EQ(entries(),old_entries);EXPECT_EQ(allocators(),old_allocators);EXPECT_EQ(cancelled->load(),1u);
+        EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2 AND length(manifest_frame)>0"),2);
+        EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_ready_transfer WHERE sequence=2"),2);
+        size_t actual_discards=0;for(size_t n=old_controls;n<controls.size();++n)if(controls[n].second.at("operation")=="discard")++actual_discards;
+        EXPECT_EQ(actual_discards,2u);EXPECT_FALSE(old_turn->timedOut());EXPECT_FALSE(cancelled_turn->timedOut());
+    }
+};
+TEST_F(ControlledGenerationReceiverController, ActualSqlRollbackCancelsOldGenerationAndRevalidatesWholeOriginalCohort){
+    actual_generation_race(ControlledGenerationLocation::sql_validation,ControlledGenerationFault::none,false);
+}
+TEST_F(ControlledGenerationReceiverController, ActualUnpublishedHandoffCancelsOldGenerationAndRevalidatesWholeOrphanCohort){
+    actual_generation_race(ControlledGenerationLocation::unpublished_handoff,ControlledGenerationFault::none,true);
+}
+TEST_F(ControlledGenerationReceiverController, ActualRollbackDenialKeepsGenerationPrimaryFatalWithoutRetry){
+    actual_generation_race(ControlledGenerationLocation::sql_validation,ControlledGenerationFault::rollback_denied,false);
+}
+TEST_F(ControlledGenerationReceiverController, ActualSemanticRefusalWithNewDemandNeverBecomesGenerationRetry){
+    actual_generation_race(ControlledGenerationLocation::sql_validation,ControlledGenerationFault::semantic,false);
+}
+}
+#endif

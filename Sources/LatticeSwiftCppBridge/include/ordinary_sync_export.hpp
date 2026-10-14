@@ -76,7 +76,7 @@ public:
     ordinary_sync_export_ref()=default;
     bool valid()const noexcept SWIFT_NAME(isValid()) {return value_.has_value();}
     bool capacity_exhausted()const noexcept SWIFT_NAME(capacityExhausted()){return capacity_exhausted_;}
-    const std::string& failure()const noexcept {return failure_;}
+    std::string failure()const noexcept {try{return failure_;}catch(...){return {};}}
     size_t frame_count()const noexcept SWIFT_NAME(frameCount()) {
         if(!value_)return 0;try{return value_->frame_count();}catch(...){return 0;}
     }
@@ -142,7 +142,7 @@ class ordinary_sync_observation_ref {
 public:
     ordinary_sync_observation_ref()=default;
     bool valid()const noexcept SWIFT_NAME(isValid()) {return valid_;}
-    const std::string& failure()const noexcept{return failure_;}
+    std::string failure()const noexcept {try{return failure_;}catch(...){return {};}}
     size_t table_count()const noexcept SWIFT_NAME(tableCount()){return tables_.size();}
     std::string table(size_t index)const noexcept {
         try{return valid_&&index<tables_.size()?tables_[index]:std::string();}catch(...){return {};}
@@ -185,7 +185,7 @@ public:
     ordinary_history_export_ref()=default;
     bool valid()const noexcept SWIFT_NAME(isValid()){return value_.has_value();}
     bool capacity_exhausted()const noexcept SWIFT_NAME(capacityExhausted()){return capacity_exhausted_;}
-    const std::string& failure()const noexcept{return failure_;}
+    std::string failure()const noexcept {try{return failure_;}catch(...){return {};}}
     std::string stage_id()const noexcept SWIFT_NAME(stageID()){try{return value_?value_->stage_id():std::string();}catch(...){return {};}}
     std::string source_id()const noexcept SWIFT_NAME(sourceID()){try{return value_?value_->source_id():std::string();}catch(...){return {};}}
     int64_t epoch()const noexcept{try{return value_?value_->epoch():0;}catch(...){return 0;}}
@@ -222,7 +222,7 @@ public:
     ordinary_mounted_history_source_ref()=default;
     bool valid()const noexcept SWIFT_NAME(isValid()){return value_.has_value();}
     bool capacity_exhausted()const noexcept SWIFT_NAME(capacityExhausted()){return capacity_exhausted_;}
-    const std::string& failure()const noexcept{return failure_;}
+    std::string failure()const noexcept {try{return failure_;}catch(...){return {};}}
     ordinary_history_export_ref capture_with_lineage_observation(const std::vector<std::string>& selected)const noexcept SWIFT_NAME(captureWithLineageObservation(models:)){
         ordinary_history_export_ref result;if(!value_)return result;
         try{result.value_.emplace(value_->capture_with_lineage_observation(selected));}

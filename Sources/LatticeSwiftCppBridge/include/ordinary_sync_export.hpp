@@ -13,6 +13,25 @@
 
 namespace lattice {
 class swift_lattice_ref;
+// The real native observer alone retains this callback context. A canceled
+// in-flight snapshot may finish; fork-child native quarantine keeps its
+// inherited context. Every release is only a retry hint, never capacity.
+class ordinary_sync_export_capacity_ref {
+    std::optional<ordinary_export_capacity_observer> observer_;
+public:
+    ordinary_sync_export_capacity_ref()=default;
+    static ordinary_sync_export_capacity_ref observe(void* context,void(*notify)(void*),void(*release)(void*))noexcept SWIFT_NAME(observe(_:notify:release:)) {
+        ordinary_sync_export_capacity_ref result;
+        try {
+            std::shared_ptr<void> owned(context,[release](void* value){if(value&&release)release(value);});
+            if(!context||!notify||!release)return result;
+            result.observer_.emplace(observe_ordinary_export_capacity([owned,notify]{notify(owned.get());}));
+        }catch(...){}
+        return result;
+    }
+    bool valid()const noexcept SWIFT_NAME(isValid()){return observer_.has_value()&&observer_->valid();}
+    void cancel()noexcept{if(observer_)observer_->cancel();observer_.reset();}
+};
 // Value result; no exception crosses the Swift boundary. Failure is distinct
 // from an empty frame. Byte access borrows this result until the call returns.
 class ordinary_sync_frame_result {

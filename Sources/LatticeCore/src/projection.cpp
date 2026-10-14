@@ -1,3 +1,4 @@
+#include "ordinary_cohort_attachment.hpp"
 #include "lattice/projection.hpp"
 #include "lattice/lattice.hpp"
 #include "lattice/spatial_query.hpp"
@@ -96,6 +97,9 @@ public:
     void shutdown();
     struct topology {
         std::string path;
+        detail::ordinary_context ordinary_context;
+        std::shared_ptr<detail::database_open_ledger> connection_ledger;
+        std::map<std::string,detail::ordinary_cohort_attachment> cohort_bindings;
         bool memory = false;
         std::vector<std::pair<std::string, std::string>> attachments;
         std::vector<std::shared_ptr<const physical_store_identity>> identities;
@@ -121,7 +125,9 @@ struct projection_operation_state : std::enable_shared_from_this<projection_oper
     std::shared_ptr<database_read_control> control = std::make_shared<database_read_control>();
     std::mutex execution_mutex;
     std::atomic<bool> executing{false}, resources{false}, done{false};
-    std::unique_ptr<database> connection;
+    database::private_connection connection{nullptr,database::owned_connection_deleter{}};
+    database::private_connection retired_connection{nullptr,database::owned_connection_deleter{}};
+    std::atomic<bool> tracked_connection{false};
     sqlite3_stmt* statement = nullptr;
     bool leased = false, initialized = false;
     std::shared_ptr<projection_capture_budget> capture_budget;
@@ -403,6 +409,19 @@ void projection_operation_state::signal(projection_status reason) noexcept {
 #endif
 }
 void projection_operation_state::notify_released() noexcept {
+    if(tracked_connection.load(std::memory_order_acquire)){
+        database::private_connection retired{nullptr,database::owned_connection_deleter{}};
+        {
+            std::unique_lock lock(execution_mutex,std::try_to_lock);
+            if(!lock.owns_lock())return; // Executing owner retries after real unlock.
+            retired.swap(retired_connection);
+        }
+        if(retired){
+            const auto creator=detail::database_native_process();
+            retired.reset(); // OFF execution/callback leaves, before release callback.
+            if(creator!=detail::database_native_process())return;
+        }
+    }
     void (*callback)(void*) = nullptr;
     void* context = nullptr;
     {
@@ -424,7 +443,8 @@ void projection_operation_state::cleanup_locked() noexcept {
         sqlite3_busy_timeout(handle, 0);
         if (statement) { sqlite3_finalize(statement); statement = nullptr; }
         if (sqlite3_get_autocommit(handle) == 0) sqlite3_exec(handle, "ROLLBACK", nullptr, nullptr, nullptr);
-        connection.reset();
+        if(connection.get_deleter().ledger)retired_connection.swap(connection);
+        else connection.reset(); // Neutral existing disposal remains exact.
     }
     // Borrowed SQL scopes must already have finalized/unlocked before stored
     // rows reach this operation. Teardown owns only immutable backing here.
@@ -519,6 +539,8 @@ void projection_service::shutdown() {
 }
 
 projection_service::topology projection_service::capture(const std::shared_ptr<database_read_control>& control) {
+    detail::ordinary_require_creator(owner_->config_.ordinary_context);
+    detail::ordinary_before_open(owner_->config_.path,owner_->config_.ordinary_context);
     std::unique_lock<std::mutex> lock(owner_->attach_mutex_, std::defer_lock);
     while (!lock.try_lock()) {
         if (control->stopped()) fail(static_cast<projection_status>(control->stop_code.load()), "projection cancelled waiting for topology");
@@ -528,6 +550,9 @@ projection_service::topology projection_service::capture(const std::shared_ptr<d
     if (!owner_->db_) fail(projection_status::snapshot_expired, "writer is unavailable during exclusive maintenance");
     if (!owner_->attachment_topology_valid_) fail(projection_status::snapshot_expired, "attachment topology is incomplete");
     topology result;
+    result.ordinary_context=owner_->config_.ordinary_context;
+    result.connection_ledger=owner_->connection_ledger_;
+    result.cohort_bindings=owner_->attached_cohort_bindings_;
     if (owner_->config_.path.empty())
         fail(projection_status::unsupported, "temporary empty-filename projection storage is unsupported");
     result.memory = owner_->config_.is_in_memory();
@@ -542,7 +567,7 @@ projection_service::topology projection_service::capture(const std::shared_ptr<d
         auto main_identity = owner_->db_->physical_identity("main", control, true);
         if (control->stopped()) fail(static_cast<projection_status>(control->stop_code.load()), "projection stopped waiting for store metadata");
         if (!main_identity) fail(projection_status::unsupported, "projection requires a supported stable local file identity");
-        result.path = main_identity->filename;
+        result.path = result.ordinary_context?owner_->config_.path:main_identity->filename;
         result.identities.push_back(main_identity);
         result.files_by_schema.emplace("main", main_identity);
     }
@@ -558,7 +583,11 @@ projection_service::topology projection_service::capture(const std::shared_ptr<d
             fail(projection_status::snapshot_expired, "attachment physical file changed");
         result.identities.push_back(expected->second);
         result.files_by_schema.emplace(alias, expected->second);
-        path = expected->second->filename;
+        if(result.ordinary_context){
+            const auto at=result.cohort_bindings.find(alias);
+            if(at==result.cohort_bindings.end())fail(projection_status::snapshot_expired,"managed projection lost cohort binding");
+            detail::ordinary_cohort_attachment_access::validate_target(at->second,actual,control->deadline);
+        }else path = expected->second->filename;
     }
     for (const auto& [_, sql] : owner_->attached_view_sql_) result.views.push_back(sql);
     result.idle_ttl_ms = owner_->read_generation_ttl_ms_.load();
@@ -792,7 +821,10 @@ void projection_operation_state::initialize() {
         initialized = true;
         return;
     }
-    connection = std::make_unique<database>(readonly_uri(topology.path), database::open_mode::read_only, 0, control);
+    tracked_connection.store(bool(topology.connection_ledger),std::memory_order_release);
+    connection = database::make_private_connection(topology.ordinary_context?topology.path:readonly_uri(topology.path),
+        database::open_mode::read_only,0,control,topology.ordinary_context,topology.connection_ledger);
+    database::attachment_operation managed_operation(control->deadline);
     auto private_identity = connection->physical_identity("main", control, true);
     check();
     if (!private_identity || !(*private_identity == *topology.identities.front()))
@@ -800,7 +832,11 @@ void projection_operation_state::initialize() {
     size_t attachment_index = 1;
     for (const auto& [alias, path] : topology.attachments) {
         check();
-        connection->execute("ATTACH DATABASE ? AS " + quote_sql_identifier(alias), {readonly_uri(path)});
+        if(topology.ordinary_context){
+            const auto at=topology.cohort_bindings.find(alias);
+            if(at==topology.cohort_bindings.end())fail(projection_status::snapshot_expired,"managed projection binding unavailable");
+            detail::ordinary_cohort_attachment_access::attach(*connection,at->second,managed_operation,true);
+        }else connection->execute("ATTACH DATABASE ? AS " + quote_sql_identifier(alias), {readonly_uri(path)});
         if (sqlite3_db_readonly(connection->internal_handle(), alias.c_str()) != 1)
             fail(projection_status::database_failure, "projection attachment was not opened read-only");
         private_identity = connection->physical_identity(alias, control, true);
@@ -808,6 +844,7 @@ void projection_operation_state::initialize() {
         if (!private_identity || !(*private_identity == *topology.identities[attachment_index++]))
             fail(projection_status::snapshot_expired, "projection attached file changed before private open");
     }
+    if(topology.ordinary_context)managed_operation.finish({});
     for (const auto& view : topology.views) { check(); connection->execute(view); }
     connection->execute("PRAGMA query_only = ON");
     connection->execute("BEGIN");
@@ -1091,6 +1128,7 @@ column_value_t projection_read_batch::value(int64_t row, int64_t column) const {
 }
 
 projection_read_operation lattice_db::start_projection(const projection_query& query) {
+    note_history_uncaptured_connection(); // Before a private projection connection or service can be admitted.
     std::shared_ptr<projection_service> service;
     {
         std::lock_guard<std::mutex> lock(projection_service_mutex_);

@@ -1,3 +1,4 @@
+#include "ordinary_cohort_attachment.hpp"
 #include "recovery_local_producer.hpp"
 #include "recovery_admission_test_probe.hpp"
 #include "recovery_producer_continuity.hpp"
@@ -5,6 +6,7 @@
 #include "recovery_request_store.hpp"
 #ifndef __EMSCRIPTEN__
 #include "configured_recovery_connection.hpp"
+#include "ordinary_managed_wss_owner.hpp"
 #endif
 #include <filesystem>
 #include <limits>
@@ -342,6 +344,8 @@ struct recovery_local_producer_adapter::context {
     }
     static int authorize(void* raw,int action,const char* one,const char* two,const char* schema,const char* origin) noexcept {
         auto& root=*static_cast<context*>(raw);
+        const int managed=ordinary_composed_attachment_authorize(root.connection,action,one,two);
+        if(managed!=SQLITE_OK)return managed;
         const auto normal=[&]() noexcept -> int {
         for(auto* m=management_;m;m=m->previous)if(m->connection==root.connection)return SQLITE_OK;
         const auto* effective=root.effective();
@@ -877,8 +881,123 @@ recovery_local_export_inventory recovery_local_producer_adapter::export_inventor
 } // namespace lattice::detail
 
 namespace lattice {
-std::shared_ptr<detail::configured_recovery_connection> lattice_db::configured_connection()const noexcept{
+std::shared_ptr<detail::configured_managed_handlers> lattice_db::configured_listener_cell(){
+    require_creator_process();
 #ifndef __EMSCRIPTEN__
+    if(is_closed())throw db_error("application listener registration is retired");
+    detail::native_retirement_storage<std::shared_ptr<detail::configured_managed_handlers>,std::shared_ptr<detail::configured_managed_handlers>> held;
+    auto& current=held.get<0>();auto& candidate=held.get<1>();
+    current=std::atomic_load(&managed_wss_handlers_);if(current)return std::move(current);
+    candidate=std::make_shared<detail::configured_managed_handlers>();
+    if(detail::configured_recovery_test_hooks::before_listener_publication)
+        detail::configured_recovery_test_hooks::before_listener_publication();
+    if(!owns_creator_process())return {};
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);
+        if(is_closed())throw db_error("application listener registration is retired");
+        current=std::atomic_load(&managed_wss_handlers_);
+        if(!current){std::atomic_store(&managed_wss_handlers_,candidate);current=candidate;}
+    }
+    return std::move(current);
+#else
+    return {};
+#endif
+}
+bool lattice_db::remember_configured_state(const synchronizer::on_state_change_handler& handler){
+    require_creator_process();
+#ifndef __EMSCRIPTEN__
+    detail::native_retirement_storage<std::shared_ptr<const synchronizer::on_state_change_handler>,std::shared_ptr<detail::configured_managed_handlers>> held;
+    held.get<0>()=std::make_shared<const synchronizer::on_state_change_handler>(handler);
+    if(!owns_creator_process())return false;
+    held.get<1>()=configured_listener_cell();
+    if(!owns_creator_process()||!held.get<1>())return false;
+    const bool published=held.get<1>()->publish_state(std::move(held.get<0>()));
+    if(!owns_creator_process())return false;
+    return published;
+#else
+    return !is_closed();
+#endif
+}
+bool lattice_db::remember_configured_error(const synchronizer::on_error_handler& handler){
+    require_creator_process();
+#ifndef __EMSCRIPTEN__
+    detail::native_retirement_storage<std::shared_ptr<const synchronizer::on_error_handler>,std::shared_ptr<detail::configured_managed_handlers>> held;
+    held.get<0>()=std::make_shared<const synchronizer::on_error_handler>(handler);
+    if(!owns_creator_process())return false;
+    held.get<1>()=configured_listener_cell();
+    if(!owns_creator_process()||!held.get<1>())return false;
+    const bool published=held.get<1>()->publish_error(std::move(held.get<0>()));
+    if(!owns_creator_process())return false;
+    return published;
+#else
+    return !is_closed();
+#endif
+}
+bool lattice_db::remember_configured_progress(const synchronizer::on_progress_handler& handler){
+    require_creator_process();
+#ifndef __EMSCRIPTEN__
+    detail::native_retirement_storage<std::shared_ptr<const synchronizer::on_progress_handler>,std::shared_ptr<detail::configured_managed_handlers>> held;
+    held.get<0>()=std::make_shared<const synchronizer::on_progress_handler>(handler);
+    if(!owns_creator_process())return false;
+    held.get<1>()=configured_listener_cell();
+    if(!owns_creator_process()||!held.get<1>())return false;
+    const bool published=held.get<1>()->publish_progress(std::move(held.get<0>()));
+    if(!owns_creator_process())return false;
+    return published;
+#else
+    return !is_closed();
+#endif
+}
+void lattice_db::begin_configured_listener_retirement(){
+    require_creator_process();
+#ifndef __EMSCRIPTEN__
+    detail::native_retirement_storage<std::shared_ptr<detail::configured_managed_handlers>> held;
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);held.get<0>()=std::atomic_load(&managed_wss_handlers_);}
+    if(held.get<0>())held.get<0>()->retire_publication();
+#endif
+}
+bool lattice_db::retire_configured_listener_targets(){
+    require_creator_process();
+#ifndef __EMSCRIPTEN__
+    if(detail::configured_recovery_test_hooks::before_listener_retirement_preparation)
+        detail::configured_recovery_test_hooks::before_listener_retirement_preparation();
+    require_creator_process(); // Actual hook can throw or fork before preparation.
+#endif
+    detail::native_retirement_storage<synchronizer::on_state_change_handler,synchronizer::on_error_handler,
+        synchronizer::on_progress_handler,std::shared_ptr<detail::configured_managed_handlers>,
+        std::shared_ptr<detail::configured_recovery_connection>> held;
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);
+        if(!is_closed())return false;
+        held.get<0>().swap(on_sync_state_change_);held.get<1>().swap(on_sync_error_);held.get<2>().swap(on_sync_progress_);
+    }
+    if(!held.release<0>()||!held.release<1>()||!held.release<2>())return false;
+#ifndef __EMSCRIPTEN__
+    held.get<4>()=configured_connection();if(held.get<4>()&&!held.get<4>()->cleanup_complete())return false;
+    held.get<3>()=std::atomic_load(&managed_wss_handlers_);
+    const bool disposed=!held.get<3>()||held.get<3>()->dispose_retired();
+    if(!owns_creator_process())return false;
+    return disposed;
+#else
+    return true;
+#endif
+}
+bool lattice_db::finish_configured_listener_retirement(){
+    require_creator_process();
+    const bool disposed=retire_configured_listener_targets();
+    if(!owns_creator_process())return false;
+#ifndef __EMSCRIPTEN__
+    detail::native_retirement_storage<std::shared_ptr<const detail::ordinary_managed_owner_release>> held;
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);held.get<0>()=managed_wss_start_release_;}
+    if(held.get<0>()){
+        if(!held.get<0>()->start_fields_destroyed())return false;
+        if(const auto error=held.get<0>()->start_cleanup_error())std::rethrow_exception(error);
+    }
+#endif
+    return disposed;
+}
+std::shared_ptr<detail::configured_recovery_connection> lattice_db::configured_connection()const noexcept{
+    if(!owns_creator_process())return {};
+#ifndef __EMSCRIPTEN__
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);if(managed_wss_connection_)return managed_wss_connection_;}
     const auto admission=recovery_continuous_;if(!admission)return {};
     std::lock_guard<std::mutex> lock(admission->configured_mutex);return admission->configured;
 #else
@@ -892,9 +1011,24 @@ void lattice_db::configured_sync_now(){if(auto owner=configured_connection())own
 void lattice_db::configured_sync_upload(){if(auto owner=configured_connection())owner->trigger_upload();}
 void lattice_db::configured_sync_connect(){if(auto owner=configured_connection())owner->connect();}
 void lattice_db::configured_sync_disconnect(){if(auto owner=configured_connection())owner->disconnect();}
-void lattice_db::configured_sync_state(std::function<void(bool)> handler){if(auto owner=configured_connection())owner->set_state(std::move(handler));}
-void lattice_db::configured_sync_error(std::function<void(const std::string&)> handler){if(auto owner=configured_connection())owner->set_error(std::move(handler));}
-void lattice_db::configured_sync_progress(synchronizer::on_progress_handler handler){if(auto owner=configured_connection())owner->set_progress(std::move(handler));}
+void lattice_db::configured_sync_state(std::function<void(bool)> handler){
+    require_creator_process();
+    detail::native_retirement_storage<std::shared_ptr<detail::configured_recovery_connection>,synchronizer::on_state_change_handler> retained;
+    retained.get<1>().swap(handler);retained.get<0>()=configured_connection();
+    if(retained.get<0>())retained.get<0>()->set_state(std::move(retained.get<1>()));
+}
+void lattice_db::configured_sync_error(std::function<void(const std::string&)> handler){
+    require_creator_process();
+    detail::native_retirement_storage<std::shared_ptr<detail::configured_recovery_connection>,synchronizer::on_error_handler> retained;
+    retained.get<1>().swap(handler);retained.get<0>()=configured_connection();
+    if(retained.get<0>())retained.get<0>()->set_error(std::move(retained.get<1>()));
+}
+void lattice_db::configured_sync_progress(synchronizer::on_progress_handler handler){
+    require_creator_process();
+    detail::native_retirement_storage<std::shared_ptr<detail::configured_recovery_connection>,synchronizer::on_progress_handler> retained;
+    retained.get<1>().swap(handler);retained.get<0>()=configured_connection();
+    if(retained.get<0>())retained.get<0>()->set_progress(std::move(retained.get<1>()));
+}
 synchronizer::sync_progress lattice_db::configured_sync_progress()const{if(auto owner=configured_connection())return owner->progress();return {};}
 lattice_close_result lattice_db::configured_sync_close(std::chrono::steady_clock::time_point deadline)noexcept{if(auto owner=configured_connection())return owner->close(deadline);return {};}
 #else

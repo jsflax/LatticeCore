@@ -34,8 +34,10 @@ struct sync_drain_result {
 };
 // Forward declaration
 class lattice_db;
-namespace detail {class recovery_continuous_producer;class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;struct automatic_export_admission_test_access;}
-namespace detail {class configured_recovery_connection;struct configured_attempt;}
+namespace detail {
+struct ordinary_upload_ack;class ordinary_source_upload_delivery;class recovery_continuous_producer;class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;struct automatic_export_admission_test_access;}
+namespace detail {class ordinary_managed_product_credentials;class configured_recovery_connection;struct configured_attempt;class ordinary_receiver_session;}
+enum class ordinary_sync_policy : uint8_t { legacy_provisional=0, ordered_required=1, ordered_history_required=2 };
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -110,6 +112,14 @@ struct audit_original_identity {
     std::string digest;
     bool operator==(const audit_original_identity&) const = default;
 };
+// Passive uploader observation taken before no_history late binding. This
+// contains no source, epoch, cut, producer registration or acceptance grant.
+// The paired ordinary-v2 ABI must be rebuilt when this field is introduced.
+struct ordinary_upload_original final {
+    std::vector<std::string> fields;
+    std::vector<std::string> names;
+};
+
 struct audit_log_entry {
     int64_t id = 0;
     std::string global_id;
@@ -135,6 +145,11 @@ struct audit_log_entry {
     /// ignore it (legacy upsert behavior — acceptable, they predate groups).
     bool synthesized = false;
     std::optional<audit_original_identity> original_identity;
+    // Ordinary-v2 only; legacy serialization intentionally ignores it.
+    std::shared_ptr<const ordinary_upload_original> upload_original;
+    // Passive exact-delivery correlation; never source or projected-value authority.
+    // Legacy JSON/binary-original codecs intentionally do not serialize it.
+    std::optional<std::string> ordinary_delivery_version;
 
     // Generate SQL instruction from this audit entry
     // Returns {sql, params} for executing the change
@@ -163,6 +178,35 @@ struct audit_log_entry {
 
 // Type alias for Swift interop (can't specialize templates from Swift)
 using AuditLogEntryVector = std::vector<audit_log_entry>;
+
+namespace detail { struct ordinary_export_batch; class ordinary_export_access; class ordinary_child_origin; }
+/// Immutable local server-helper result. An engine-issued complete cut may
+/// establish one source for its receiving scope/channel. Unowned, historical or
+/// unsupported legacy exports remain provisional. Neither audit entries nor
+/// JSON can manufacture the retained cut. Copying this value to std::vector
+/// deliberately drops its ordered guarantee; rebuild C++ callers with this ABI.
+class server_export_batch final {
+    std::shared_ptr<const detail::ordinary_export_batch> value_;
+    explicit server_export_batch(std::shared_ptr<const detail::ordinary_export_batch>);
+    friend class detail::ordinary_export_access;
+public:
+    server_export_batch(const server_export_batch&) = default;
+    server_export_batch(server_export_batch&&) noexcept = default;
+    server_export_batch& operator=(const server_export_batch&) = default;
+    server_export_batch& operator=(server_export_batch&&) noexcept = default;
+    bool ordered() const;
+    const std::vector<audit_log_entry>& entries() const;
+    size_t size() const { return entries().size(); }
+    bool empty() const { return entries().empty(); }
+    const audit_log_entry& front() const { return entries().front(); }
+    const audit_log_entry& back() const { return entries().back(); }
+    const audit_log_entry& at(size_t n) const { return entries().at(n); }
+    const audit_log_entry& operator[](size_t n) const { return entries()[n]; }
+    auto begin() const { return entries().begin(); }
+    auto end() const { return entries().end(); }
+    operator std::vector<audit_log_entry>() const { return entries(); }
+};
+
 
 // ============================================================================
 // ServerSentEvent - matches Lattice.swift's ServerSentEvent enum
@@ -211,6 +255,9 @@ struct sync_filter_entry {
 };
 
 struct sync_config {
+    std::shared_ptr<detail::ordinary_managed_product_credentials> managed_product_credentials;
+    ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
+    std::string ordinary_model_profile; // Distinct from history effect/profile.
     std::string websocket_url;
     std::string authorization_token;
     std::string recovery_source_expectation; // explicit app expectation only
@@ -425,6 +472,10 @@ protected:
     std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
     std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
     std::shared_ptr<detail::receiver_source_binding> receiver_source_;
+    std::shared_ptr<detail::ordinary_receiver_session> ordinary_receiver_;
+    // Passive scan incompleteness, never payload/debt or source authority.
+    // Scheduler turns publish it; admitted checked-drain readers may be foreign.
+    std::atomic<bool> ordinary_scan_incomplete_{false};
     std::shared_ptr<detail::recovery_receiver_route> receiver_controller_;
     // Shutdown authority is independent of retaining the database. Publish it
     // before init can fail; borrowed owner/sibling schedulers must stay live.
@@ -611,8 +662,16 @@ protected:
         std::vector<audit_log_entry> to_send;
         std::vector<int64_t> to_mark_synced;
     };
-    // Continuation is a result of this specific pass, never shared state.
-    std::vector<audit_log_entry> query_pending_entries(bool& enumeration_hit_limit);
+    // Result of this actual pass. Empty entries prove exhaustion only when
+    // state is completed; not_enumerated carries no horizon or floor proof.
+    struct pending_entries_scan {
+        enum class outcome { not_enumerated,completed };
+        outcome state=outcome::not_enumerated;
+        std::vector<audit_log_entry> entries;
+        bool enumeration_hit_limit=false;
+        int64_t horizon=0;
+    };
+    pending_entries_scan query_pending_entries();
     classified_entries classify_entries(std::vector<audit_log_entry>& entries);
     void classify_delete(audit_log_entry& entry, classified_entries& result);
     void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
@@ -627,6 +686,7 @@ private:
     // Automatic admission is reachable only from this engine's queued work.
     std::optional<bool> try_has_automatic_export_protection();
     void mark_as_synced_after_discovery_impl(const std::vector<std::string>&,bool,bool*);
+    void mark_ordinary_as_synced(const std::vector<detail::ordinary_upload_ack>&);
 protected:
     void schedule_ack_retry(const std::vector<audit_log_entry>&);
     std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false,uint64_t delivery_token=0,
@@ -729,8 +789,15 @@ void mark_audit_entries_synced_for(lattice_db& db,
                                    const std::string& sync_id,
                                    const std::vector<std::string>& all_active_sync_ids);
 
-// Get events after a checkpoint (for server-side sync)
-std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
+// Get a retained local server batch after a checkpoint. The entry view keeps
+// legacy checkpoint spelling/unknown-checkpoint behavior; an ordered batch's
+// complete materialization cut covers its full bound scope, not just that view.
+// A borrowed database/owner must outlive the entire synchronous call, including
+// committed observer delivery. Issuance requires the actual owner's own WRITE.
+server_export_batch events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
+// Explicit legacy vector endpoint. C/Swift JSON callers gain no source authority.
+std::vector<audit_log_entry> events_after_provisional(database& db,
+    const std::optional<std::string>& checkpoint_global_id);
 
 /// no_history late-binding (1.5.0). A column flagged `no_history` records
 /// THAT it changed in its UPDATE audit rows, never its value (see
@@ -766,6 +833,11 @@ extern std::function<void(size_t chunk_start)> apply_chunk_begin;
 // Disables sync triggers, executes model SQL, inserts AuditLog records, re-enables triggers.
 // Returns global IDs of successfully applied entries (entries that failed SQL execution are excluded).
 std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries);
+/// Retains the actual private issuer envelope, including its complete cut.
+/// Copying entries into a vector invokes only the original provisional endpoint.
+/// Full helper provisional/upload/ACK/prune integration remains a required
+/// owning-source prerequisite; these declarations alone do not supply it.
+std::vector<std::string> apply_remote_changes(lattice_db& db, const server_export_batch& entries);
 
 /// Apply remote audit log entries and mark them as synced for the receiving sync_id.
 /// Unlike apply_remote_changes, this uses per-synchronizer sync state so that OTHER
@@ -774,6 +846,9 @@ std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<
 /// Returns global IDs of successfully applied entries.
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
+                              const std::string& sync_id);
+std::vector<std::string> apply_remote_changes_for(lattice_db& db,
+                              const server_export_batch& entries,
                               const std::string& sync_id);
 
 // Replication slot management for sync-safe compaction.

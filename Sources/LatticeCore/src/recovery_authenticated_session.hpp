@@ -1,4 +1,5 @@
 #pragma once
+#include <lattice/ordinary_context.hpp>
 #include "canonical_writer_adapter.hpp"
 #include <atomic>
 #include <chrono>
@@ -102,7 +103,7 @@ class authenticated_relay_setup {
     static thread_local uint64_t* setup_registry_entries_test_counter_;
     struct source_file_administration;
     static std::unique_ptr<source_file_administration> open_administrative_file(const std::string&,
-        recovery_owner_schema,int64_t,int);
+        recovery_owner_schema,int64_t,int,ordinary_context context = {});
     struct state;
     std::shared_ptr<state> state_;
     explicit authenticated_relay_setup(std::shared_ptr<state>);

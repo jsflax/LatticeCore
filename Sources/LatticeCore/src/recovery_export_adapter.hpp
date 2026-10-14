@@ -30,6 +30,7 @@ class recovery_server_export_page;
 class receiver_upload_view;
 class recovery_unknown_reconciliation;
 class recovery_reconciliation_export;
+class recovery_reconciliation_operation;
 class committed_export_frame {
     friend class recovery_export_adapter;
     friend class recovery_export_route;
@@ -112,7 +113,7 @@ class recovery_export_adapter {
     friend class recovery_unknown_reconciliation;
     static recovery_export_preparation prepare_reconciliation(std::shared_ptr<lattice_db>,
         std::shared_ptr<recovery_continuous_work>,std::shared_ptr<recovery_reconciliation_export>,
-        uint64_t,std::shared_ptr<const receiver_upload_view>,bool*);
+        uint64_t,std::shared_ptr<const receiver_upload_view>,bool*,const std::shared_ptr<recovery_reconciliation_operation>&);
     friend class ::lattice::synchronizer_base;
     static std::optional<bool> try_automatic_protected_store(std::shared_ptr<lattice_db>);
     static bool try_acknowledge_legacy(std::shared_ptr<lattice_db>,const std::string&,const std::vector<std::string>&);
@@ -124,12 +125,14 @@ class recovery_export_adapter {
     friend class recovery_server_export_endpoint;
     friend class recovery_server_export_page;
     static void validate_server_limits(const recovery_export_limits&);
-    static void revalidate_claimed_frame(const committed_export_frame&, bool* = nullptr,bool automatic=false);
+    static void revalidate_claimed_frame(const committed_export_frame&, bool* = nullptr,bool automatic=false,
+        const std::shared_ptr<recovery_reconciliation_operation>& = {});
     static recovery_export_preparation prepare(std::shared_ptr<lattice_db>,
         const std::string&,uint64_t,size_t,const std::vector<int64_t>&,bool,
         const recovery_export_limits&,std::optional<int64_t> history_after,bool* discovery_busy=nullptr,
         bool retained_delete_page=false,std::shared_ptr<recovery_continuous_work> = {},
-        std::shared_ptr<const receiver_upload_view> = {},std::shared_ptr<recovery_reconciliation_export> = {},bool automatic=false);
+        std::shared_ptr<const receiver_upload_view> = {},std::shared_ptr<recovery_reconciliation_export> = {},bool automatic=false,
+        const std::shared_ptr<recovery_reconciliation_operation>& = {});
 public:
     // These methods require genuine retained owner custody. No public caller
     // assertion or supplied frame can create a committed permit.

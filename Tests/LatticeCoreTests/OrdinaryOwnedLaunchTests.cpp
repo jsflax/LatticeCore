@@ -238,6 +238,62 @@ pid_t spawn_fork_helper(const helper_area& area) {
     return child;
 }
 
+pid_t spawn_observation_fork_helper(const helper_area& area) {
+    const auto args = ::testing::internal::GetArgvs();
+    if (args.empty()) throw std::runtime_error("owned-launch helper executable unavailable");
+    std::string executable = std::filesystem::absolute(args.front()).string();
+    std::string filter = "--gtest_filter=OrdinaryOwnedLaunch.ObservationProcessHelper";
+    std::string repeat = "--gtest_repeat=1", color = "--gtest_color=no", output = "--gtest_output=";
+    char* argv[] = {executable.data(), filter.data(), repeat.data(), color.data(), output.data(), nullptr};
+    std::vector<std::string> values;
+    for (char** item = environ; *item; ++item) {
+        const std::string value(*item);
+        if (!value.starts_with("LATTICE_ORDINARY_LAUNCH_OBSERVATION_HELPER_") &&
+            !value.starts_with("LATTICE_TEST_LOG_PATH=") &&
+            !value.starts_with("GTEST_TOTAL_SHARDS=") && !value.starts_with("GTEST_SHARD_INDEX=") &&
+            !value.starts_with("GTEST_SHARD_STATUS_FILE=")) values.push_back(value);
+    }
+    values.push_back("LATTICE_ORDINARY_LAUNCH_OBSERVATION_HELPER_DIRECTORY=" + area.path.string());
+    const auto* parent_log = std::getenv("LATTICE_TEST_LOG_PATH");
+    const auto native = parent_log && *parent_log ?
+        std::string(parent_log) + "." + area.path.filename().string() + ".native.log" :
+        area.path.string() + ".native.log";
+    // Preserve both logs outside the disposable marker directory.
+    fd_owner reserved(::open(native.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+    if (reserved.value < 0) throw std::runtime_error("owned-launch helper log collision");
+    values.push_back("LATTICE_TEST_LOG_PATH=" + native);
+    std::vector<char*> env; for (auto& value : values) env.push_back(value.data()); env.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions)) throw std::runtime_error("owned-launch helper actions unavailable");
+    struct action_owner { posix_spawn_file_actions_t& value; ~action_owner() { ::posix_spawn_file_actions_destroy(&value); } } own_actions{actions};
+    const auto terminal_log = native + ".terminal.log";
+    if (::posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, terminal_log.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600) ||
+        ::posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO))
+        throw std::runtime_error("owned-launch helper log actions unavailable");
+    posix_spawnattr_t attributes;
+    if (::posix_spawnattr_init(&attributes)) throw std::runtime_error("owned-launch helper attributes unavailable");
+    struct attribute_owner { posix_spawnattr_t& value; ~attribute_owner() { ::posix_spawnattr_destroy(&value); } } own_attributes{attributes};
+    short flags = POSIX_SPAWN_SETPGROUP;
+#if defined(__APPLE__)
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#elif defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34)
+    if (::posix_spawn_file_actions_addclosefrom_np(&actions, 3))
+        throw std::runtime_error("owned-launch helper descriptor closure unavailable");
+#else
+    throw std::runtime_error("owned-launch helper requires closefrom spawn support");
+#endif
+#else
+    throw std::runtime_error("owned-launch helper requires closefrom spawn support");
+#endif
+    if (::posix_spawnattr_setpgroup(&attributes, 0) || ::posix_spawnattr_setflags(&attributes, flags))
+        throw std::runtime_error("owned-launch helper group unavailable");
+    pid_t child = -1;
+    if (::posix_spawn(&child, executable.c_str(), &actions, &attributes, argv, env.data()))
+        throw std::runtime_error("owned-launch helper spawn failed");
+    return child;
+}
+
 }
 
 TEST(OrdinaryOwnedLaunch, RealChildEchoRetainsBirthAndActualTerminalObservation) {
@@ -537,4 +593,179 @@ TEST(OrdinaryOwnedLaunch, ProcessHelper) {
         ASSERT_GE(written.value, 0);
     }
 }
+TEST(OrdinaryOwnedLaunch, CurrentParentObservationUsesActualNativeBirthAndParent) {
+    const auto self = launch::current_process();
+    const auto parent = launch::current_parent_process();
+    EXPECT_EQ(parent.pid, self.parent);
+    EXPECT_EQ(parent.pid, ::getppid());
+    EXPECT_GT(parent.birth_major, 0u);
+    EXPECT_EQ(launch::current_process(), self);
+}
+
+TEST(OrdinaryOwnedLaunch, LiveNaturalObservationKeepsTheActualChannelAdmitted) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    auto child = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));
+    const auto identity = child.identity();
+    child.send({3, 4}, within());
+    EXPECT_EQ(child.receive(within()), (launch::frame{3, 4}));
+    EXPECT_FALSE(child.observe_terminal(within()).has_value());
+    EXPECT_EQ(child.identity(), identity);
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+    // Both directions still work: observation did not stop/cancel/close it.
+    child.send({8, 6}, within());
+    EXPECT_EQ(child.receive(within()), (launch::frame{8, 6}));
+    (void)child.stop_and_join(within());
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before);
+}
+
+TEST(OrdinaryOwnedLaunch, NaturalExitObservationReapsRealStatusWithoutSignalling) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    // Five actual frame bytes release this otherwise waiting direct child.
+    auto child = launch::owned_child::spawn(shell("dd bs=1 count=5 <&3 >/dev/null 2>/dev/null; exit 37"));
+    const auto identity = child.identity();
+    EXPECT_FALSE(child.observe_terminal(within()).has_value());
+    child.send({9}, within());
+    const auto end = within();
+    std::optional<launch::terminal_observation> terminal;
+    while (!(terminal = child.observe_terminal(end))) std::this_thread::sleep_for(2ms);
+    ASSERT_TRUE(terminal.has_value());
+    EXPECT_EQ(terminal->child, identity);
+    ASSERT_TRUE(WIFEXITED(terminal->wait_status));
+    EXPECT_EQ(WEXITSTATUS(terminal->wait_status), 37);
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before);
+    EXPECT_EQ(child.observe_terminal(within())->wait_status, terminal->wait_status);
+    EXPECT_EQ(child.stop_and_join(within()).wait_status, terminal->wait_status);
+    int status = 0; errno = 0;
+    EXPECT_EQ(::waitpid(static_cast<pid_t>(identity.pid), &status, WNOHANG), -1);
+    EXPECT_EQ(errno, ECHILD);
+}
+
+TEST(OrdinaryOwnedLaunch, NaturalObservationWrongThreadRefusesBeforeChangingChannel) {
+    auto child = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));
+    std::exception_ptr failure;
+    std::jthread other([&] {
+        try { (void)child.observe_terminal(within()); }
+        catch (...) { failure = std::current_exception(); }
+    });
+    other.join();
+    ASSERT_NE(failure, nullptr);
+    expect_error(launch::error_code::wrong_thread, [&] { std::rethrow_exception(failure); });
+    EXPECT_FALSE(child.observe_terminal(within()).has_value());
+    child.send({5, 2}, within());
+    EXPECT_EQ(child.receive(within()), (launch::frame{5, 2}));
+    (void)child.stop_and_join(within());
+}
+
+TEST(OrdinaryOwnedLaunch, InterruptedNaturalObservationKeepsOriginalDeadlineAndLiveAdmission) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    auto child = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));
+    child.send({7, 1}, within());
+    EXPECT_EQ(child.receive(within()), (launch::frame{7, 1}));
+    {
+        const auto end = within();
+        interrupted_wait_scope fault(launch::test_hooks::wait_boundary::observe, end);
+        expect_error(launch::error_code::timed_out, [&] { (void)child.observe_terminal(end); });
+        EXPECT_EQ(interrupted_attempts, 1u);
+    }
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+    child.send({9, 2}, within());
+    EXPECT_EQ(child.receive(within()), (launch::frame{9, 2}));
+    (void)child.stop_and_join(within());
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before);
+}
+
+TEST(OrdinaryOwnedLaunch, InterruptedNaturalReapRetainsRealTerminalForLaterObservation) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    auto child = launch::owned_child::spawn(shell("dd bs=1 count=5 <&3 >/dev/null 2>/dev/null; exit 41"));
+    const auto identity = child.identity();
+    child.send({6}, within());
+    {
+        const auto end = within();
+        interrupted_wait_scope fault(launch::test_hooks::wait_boundary::reap, end);
+        expect_error(launch::error_code::timed_out, [&] {
+            while (!child.observe_terminal(end)) std::this_thread::sleep_for(2ms);
+        });
+        // This requires an actual WNOWAIT exit before the failure-only hook.
+        EXPECT_EQ(interrupted_attempts, 1u);
+    }
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+    const auto terminal = child.observe_terminal(within());
+    ASSERT_TRUE(terminal.has_value());
+    EXPECT_EQ(terminal->child, identity);
+    ASSERT_TRUE(WIFEXITED(terminal->wait_status));
+    EXPECT_EQ(WEXITSTATUS(terminal->wait_status), 41);
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before);
+}
+
+TEST(OrdinaryOwnedLaunch, NaturalObservationLostReaperNeverReleasesUnprovedCustody) {
+    const auto before = launch::owned_child::unresolved_lifetimes();
+    {
+        auto child = launch::owned_child::spawn(shell("dd bs=1 count=5 <&3 >/dev/null 2>/dev/null; exit 43"));
+        const auto identity = child.identity();
+        child.send({4}, within());
+        // Deliberately violate exclusive ownership with a real external reap.
+        fixture_child stolen(static_cast<pid_t>(identity.pid));
+        const auto status = stolen.join(within());
+        ASSERT_GE(status, 0);
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(WEXITSTATUS(status), 43);
+        expect_error(launch::error_code::terminal_unproved, [&] { (void)child.observe_terminal(within()); });
+        EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+    }
+    // No live child remains, but this owner did not observe its actual reap.
+    EXPECT_EQ(launch::owned_child::unresolved_lifetimes(), before + 1);
+}
+
+TEST(OrdinaryOwnedLaunch, ForkedNaturalObservationRefusesBeforeInheritedOwnerLocks) {
+    helper_area area;
+    fixture_child helper(spawn_observation_fork_helper(area), true);
+    ASSERT_TRUE(wait_marker(area.path / "natural-fork-joined.signal"));
+    const auto status = helper.join(within());
+    ASSERT_GE(status, 0);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(OrdinaryOwnedLaunch, ObservationProcessHelper) {
+    const auto* path = std::getenv("LATTICE_ORDINARY_LAUNCH_OBSERVATION_HELPER_DIRECTORY");
+    if (!path) GTEST_SKIP() << "Requires the real parent-owned process fixture";
+    ASSERT_EQ(::getpgrp(), ::getpid());
+    ASSERT_TRUE(is_single_threaded_helper());
+    auto owned = launch::owned_child::spawn(shell("exec /bin/cat <&3 >&3"));
+    owned.send({1, 7}, within());
+    EXPECT_EQ(owned.receive(within()), (launch::frame{1, 7}));
+    const auto child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        int result = 1;
+        {
+            auto inherited = std::move(owned);
+            try { (void)inherited.observe_terminal(within()); }
+            catch (const launch::error& error) {
+                if (error.code == launch::error_code::inherited_use) result = 0;
+            } catch (...) {}
+            bool parent_refused = false;
+            try { (void)launch::current_parent_process(); }
+            catch (const launch::error& error) { parent_refused = error.code == launch::error_code::inherited_use; }
+            catch (...) {}
+            if (!parent_refused) result = 1;
+        }
+        ::_exit(result);
+    }
+    fixture_child descendant(child);
+    const auto status = descendant.join(within());
+    ASSERT_GE(status, 0);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    EXPECT_FALSE(owned.observe_terminal(within()).has_value());
+    owned.send({3, 5}, within());
+    EXPECT_EQ(owned.receive(within()), (launch::frame{3, 5}));
+    (void)owned.stop_and_join(within());
+    if (!::testing::Test::HasFailure()) {
+        const auto marker = std::filesystem::path(path) / "natural-fork-joined.signal";
+        fd_owner written(::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        ASSERT_GE(written.value, 0);
+    }
+}
+
 #endif

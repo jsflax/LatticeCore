@@ -1,5 +1,6 @@
 #include "receive_delivery_guard.hpp"
 #include "recovery_writer_access.hpp"
+#include <lattice/ordinary_schema_recipe.hpp>
 #include <lattice/lattice.hpp>
 #include <cstring>
 #include <limits>
@@ -7,11 +8,18 @@
 
 namespace lattice::detail {
 namespace receive_guard_test_hooks { thread_local std::function<void()> after_intake_commit; }
+// Only this three-literal producer is a recipe friend; namespace inventory
+// helpers receive no native writer, owner/current or arbitrary SQL capability.
+struct ordinary_receive_recipe_access final {
+    static constexpr const char* store() noexcept {return ordinary_schema_recipe::receive_store();}
+    static constexpr const char* channel() noexcept {return ordinary_schema_recipe::receive_channel();}
+    static constexpr const char* index() noexcept {return ordinary_schema_recipe::receive_index();}
+};
 namespace {
 constexpr receive_guard_limits caps{};
-constexpr const char* store_sql = "CREATE TABLE _lattice_receive_guard_store (id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,legacy_origin INTEGER NOT NULL,last_incarnation INTEGER NOT NULL,channels INTEGER NOT NULL,channel_bytes INTEGER NOT NULL,capacity_refused INTEGER NOT NULL) WITHOUT ROWID";
-constexpr const char* channel_sql = "CREATE TABLE _lattice_receive_guard (channel BLOB PRIMARY KEY NOT NULL CHECK(typeof(channel)='blob' AND length(channel)>0),incarnation INTEGER UNIQUE NOT NULL,generation INTEGER NOT NULL,state INTEGER NOT NULL,reason INTEGER NOT NULL,checkpoint BLOB) WITHOUT ROWID";
-constexpr const char* index_sql = "CREATE INDEX _lattice_receive_guard_state ON _lattice_receive_guard(state)";
+constexpr const char* store_sql = ordinary_receive_recipe_access::store();
+constexpr const char* channel_sql = ordinary_receive_recipe_access::channel();
+constexpr const char* index_sql = ordinary_receive_recipe_access::index();
 [[noreturn]] void refuse(const char* message) { throw db_error(std::string("receive guard: ") + message); }
 void key(const std::string& s, int64_t bound) {
     if (s.empty() || s.size() > static_cast<uint64_t>(bound)) refuse("opaque key exceeds qualification bound");

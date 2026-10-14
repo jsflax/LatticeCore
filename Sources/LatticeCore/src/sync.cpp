@@ -7,9 +7,15 @@
 #include "sync_upload_exclusion.hpp"
 #include "canonical_writer_adapter.hpp"
 #include "receive_delivery_guard.hpp"
+#include "ordinary_export.hpp"
+#include "ordinary_wire.hpp"
+#include "ordinary_receiver_session.hpp"
+#include "ordinary_source_upload.hpp"
+#include "ordinary_timestamp.hpp"
 #include "recovery_export_adapter.hpp"
 #ifndef __EMSCRIPTEN__
 #include "configured_recovery_connection.hpp"
+#include "ordinary_managed_wss_owner.hpp"
 #endif
 #include "lattice/sync.hpp"
 #include "lattice/lattice.hpp"
@@ -28,6 +34,18 @@ std::function<void(size_t chunk_start)> apply_chunk_begin;
 using json = nlohmann::json;
 
 static std::atomic<int64_t> g_sync_instance_count{0};
+static bool mark_audit_entries_synced_for_checked(lattice_db&,const std::vector<std::string>&,
+    const std::string&,const std::vector<std::string>&);
+
+static void validate_ordinary_sync_config_before_transport(const sync_config& config) {
+    if(config.ordinary_policy!=ordinary_sync_policy::legacy_provisional&&config.ordinary_policy!=ordinary_sync_policy::ordered_required&&config.ordinary_policy!=ordinary_sync_policy::ordered_history_required)throw db_error("unknown ordinary sync policy");
+    if(!config.ordinary_model_profile.empty()&&config.ordinary_policy==ordinary_sync_policy::legacy_provisional)throw db_error("model negotiation requires explicit ordinary ordering policy");
+    if(config.ordinary_policy!=ordinary_sync_policy::legacy_provisional&&!config.chunk_size)throw db_error("ordered ordinary sync requires nonzero chunk size");
+}
+static size_t ordinary_upload_window(const sync_config& config) noexcept {
+    const size_t maximum=ordinary_sync_limits::originals;
+    return config.chunk_size>=maximum/2?maximum:config.chunk_size*2;
+}
 
 // ============================================================================
 // any_property implementation
@@ -588,7 +606,7 @@ std::optional<server_sent_event> server_sent_event::from_json(const std::string&
     try {
         // Inspect the control VALUE, preserving ordinary kind auditLog/ack/
         // replayRequest. Any mixed/duplicate recoveryReady occurrence refuses.
-        if(detail::reserved_recovery_source_frame(json_str))return std::nullopt;
+        if(detail::reserved_recovery_source_frame(json_str)||detail::reserved_ordinary_wire_frame(json_str))return std::nullopt;
         json j = json::parse(json_str);
 
         if (j.contains("auditLog") && j["auditLog"].is_array()) {
@@ -661,6 +679,9 @@ struct discovery_charge {
         for(const auto& e:values) {
             for(const auto* value:{&e.global_id,&e.table_name,&e.operation,&e.global_row_id,&e.timestamp})add(value->capacity()+1);
             strings(e.changed_fields_names);
+            if(e.ordinary_delivery_version)add(e.ordinary_delivery_version->capacity()+1);
+            if(e.upload_original){add(1,sizeof(ordinary_upload_original)+4*sizeof(void*));
+                strings(e.upload_original->fields);strings(e.upload_original->names);}
             if(e.original_identity){strings(e.original_identity->changed_fields_names);add(e.original_identity->digest.capacity()+1);}
             add(e.changed_fields.bucket_count(),sizeof(void*));
             add(e.changed_fields.size(),sizeof(decltype(e.changed_fields)::value_type)+4*sizeof(void*));
@@ -697,6 +718,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     // setup can throw. No returned synchronizer is required to read it later.
     if(configured)configured->destructor_error=cleanup_error_;
 #endif
+    validate_ordinary_sync_config_before_transport(config);
     continuous_route_=detail::recovery_continuous_producer::admit_route(owned_db_,config,false);
     config_ = config;
     log_label_cache_ = config_.log_label;
@@ -738,7 +760,10 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     recovery_export_route_ = std::make_shared<detail::recovery_export_route>(ws_client_,callback_lifetime_);
 #ifndef __EMSCRIPTEN__
     if(configured){
-        configured->bind(ws_client_,callback_lifetime_,continuous_route_);
+        if(configured->managed_wss){
+            if(continuous_route_)throw db_error("managed WSS cannot borrow continuous route authority");
+            configured->bind_managed(ws_client_,callback_lifetime_,owned_db_,config_);
+        }else configured->bind(ws_client_,callback_lifetime_,continuous_route_);
         recovery_export_route_->install_configured_retirement(std::move(*configured->native_reservation));
         configured->native_reservation.reset();
     }
@@ -746,6 +771,13 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     setup_transport_handlers();
     setup_observer();
     // Validate before first dial, before the pacer can observe these members.
+    if(config_.ordinary_policy!=ordinary_sync_policy::legacy_provisional&&config_.ordinary_policy!=ordinary_sync_policy::ordered_required&&config_.ordinary_policy!=ordinary_sync_policy::ordered_history_required)throw db_error("unknown ordinary sync policy");
+    if(!config_.ordinary_model_profile.empty()&&config_.ordinary_policy==ordinary_sync_policy::legacy_provisional)throw db_error("model negotiation requires explicit ordinary ordering policy");
+    if(config_.ordinary_policy==ordinary_sync_policy::ordered_required||config_.ordinary_policy==ordinary_sync_policy::ordered_history_required) {
+        if(!config_.recovery_source_expectation.empty()||continuous_route_)throw db_error("ordinary ordered and recovery controller policies are distinct");
+        if(!std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_))throw db_error("ordered-required sync needs the actual owned SDK transport");
+        ordinary_receiver_=std::shared_ptr<detail::ordinary_receiver_session>(new detail::ordinary_receiver_session(owned_db_,callback_lifetime_,config_.sync_id,config_.websocket_url,config_.managed_product_credentials,config_.authorization_token,config_.ordinary_policy==ordinary_sync_policy::ordered_history_required,config_.ordinary_model_profile));
+    }
     if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
     receiver_controller_=detail::recovery_continuous_producer::attach_receiver(continuous_route_,owned_db_,receiver_source_,
         std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_),scheduler_,callback_lifetime_);
@@ -768,6 +800,7 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
 
 void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
                                    std::unique_ptr<sync_transport> transport) {
+    validate_ordinary_sync_config_before_transport(config);
     continuous_route_=detail::recovery_continuous_producer::admit_route(owned_db_,config,true);
     config_ = config;
     log_label_cache_ = config_.log_label;
@@ -794,6 +827,13 @@ void synchronizer_base::init_sync(const sync_config& config, std::shared_ptr<sch
     setup_transport_handlers();
     setup_observer();
     // Validate before first dial, before the pacer can observe these members.
+    if(config_.ordinary_policy!=ordinary_sync_policy::legacy_provisional&&config_.ordinary_policy!=ordinary_sync_policy::ordered_required&&config_.ordinary_policy!=ordinary_sync_policy::ordered_history_required)throw db_error("unknown ordinary sync policy");
+    if(!config_.ordinary_model_profile.empty()&&config_.ordinary_policy==ordinary_sync_policy::legacy_provisional)throw db_error("model negotiation requires explicit ordinary ordering policy");
+    if(config_.ordinary_policy==ordinary_sync_policy::ordered_required||config_.ordinary_policy==ordinary_sync_policy::ordered_history_required) {
+        if(!config_.recovery_source_expectation.empty()||continuous_route_)throw db_error("ordinary ordered and recovery controller policies are distinct");
+        if(!std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_))throw db_error("ordered-required sync needs the actual owned SDK transport");
+        ordinary_receiver_=std::shared_ptr<detail::ordinary_receiver_session>(new detail::ordinary_receiver_session(owned_db_,callback_lifetime_,config_.sync_id,config_.websocket_url,config_.managed_product_credentials,config_.authorization_token,config_.ordinary_policy==ordinary_sync_policy::ordered_history_required,config_.ordinary_model_profile));
+    }
     if(!config_.recovery_source_expectation.empty())receiver_source_=std::shared_ptr<detail::receiver_source_binding>(new detail::receiver_source_binding(owned_db_,callback_lifetime_,config_.recovery_source_expectation,config_.websocket_url));
     receiver_controller_=detail::recovery_continuous_producer::attach_receiver(continuous_route_,owned_db_,receiver_source_,
         std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_),scheduler_,callback_lifetime_);
@@ -1092,8 +1132,9 @@ void synchronizer_base::start_pacer() {
     const auto heartbeat=std::chrono::milliseconds(config_.checkpoint_passive_interval_ms > 0
         ? std::min(config_.checkpoint_passive_interval_ms,60'000) : 60'000);
     const bool receiver_tick=static_cast<bool>(receiver_controller_);
+    const auto ordinary=ordinary_receiver_;
     last_passive_ckpt_=std::chrono::steady_clock::now();last_truncate_ckpt_=last_passive_ckpt_;
-    pacer_thread_=std::thread([this,state,lifetime,scheduled,queue,heartbeat,receiver_tick,wait_schedule] {
+    pacer_thread_=std::thread([this,state,lifetime,scheduled,queue,heartbeat,receiver_tick,ordinary,wait_schedule] {
         try {
         if(wait_schedule&&wait_schedule->starting)wait_schedule->starting();
         auto maintenance_at=std::chrono::steady_clock::now()+heartbeat;
@@ -1103,12 +1144,14 @@ void synchronizer_base::start_pacer() {
             const auto revision=queue->revision();
             const bool requested=state->requested.load(std::memory_order_acquire);
             const auto coalesce=std::chrono::milliseconds(state->coalesce_milliseconds.load(std::memory_order_acquire));
-            auto wake=std::min({maintenance_at,queue->wake_at(),receiver_at});
+            const auto ordinary_at=ordinary?ordinary->deadline():std::chrono::steady_clock::time_point::max();
+            auto wake=std::min({maintenance_at,queue->wake_at(),receiver_at,ordinary_at});
             if(coalesce.count()>0&&requested)wake=std::min(wake,state->next_allowed_tick);
             state->ready.wait_until(lock,wake,[&]{
                 const bool changed=state->stop||queue->revision()!=revision||
                     state->requested.load(std::memory_order_acquire)!=requested||
-                    state->coalesce_milliseconds.load(std::memory_order_acquire)!=coalesce.count();
+                    state->coalesce_milliseconds.load(std::memory_order_acquire)!=coalesce.count()||
+                    (ordinary&&ordinary->deadline()!=ordinary_at);
                 if(!changed&&wait_schedule&&wait_schedule->before_wait)wait_schedule->before_wait();
                 return changed;
             });
@@ -1116,16 +1159,18 @@ void synchronizer_base::start_pacer() {
             const auto now=std::chrono::steady_clock::now();
             const bool maintenance=now>=maintenance_at;
             if(maintenance)maintenance_at=now+heartbeat;
+            const bool ordinary_ready=ordinary&&now>=ordinary->deadline();
             const bool receiver_ready=receiver_tick&&now>=receiver_at;
             if(receiver_ready)receiver_at=now+std::chrono::milliseconds(100);
             const bool upload=coalesce.count()>0&&now>=state->next_allowed_tick&&state->requested.exchange(false,std::memory_order_acq_rel);
             if(upload)state->next_allowed_tick=now+coalesce;
             lock.unlock();
             const auto generation=lifetime->dispatch_generation();
-            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload,receiver_ready,wait_schedule] {
+            lifetime->queued(generation,[this,lifetime,scheduled,generation,maintenance,upload,receiver_ready,ordinary,ordinary_ready,wait_schedule] {
                 on_error_handler error;
                 try {
                     error=on_error_;
+                    if(ordinary_ready&&ordinary->expire())return;
                     if(maintenance) {
                         maybe_checkpoint();if(!lifetime->current(generation))return;
                         db().run_read_pool_maintenance_all_instances();
@@ -1362,11 +1407,17 @@ bool synchronizer_base::connect_step_for_lifecycle(uint64_t lifecycle) {
     if(protected_route)route->prepare_protected(lifecycle);
     else lifetime->begin_connect(lifecycle,false);
     const auto dial = [this,transport,lifetime,lifecycle](const std::string& url, const HeadersMap& headers) {
+#ifndef __EMSCRIPTEN__
+        if(auto attempt=lifetime->configured_attempt_owner())if(attempt->managed_wss&&!attempt->managed_wss->current())
+            throw db_error("managed WSS authority closed before actual dial");
+#endif
         if (const auto platform = std::dynamic_pointer_cast<owned_platform_sync_transport>(transport)) {
             platform->connect_with_attempt_handlers(url, headers,
                 [this,lifetime,lifecycle,weak_platform=std::weak_ptr<owned_platform_sync_transport>(platform)](const platform_transport_callbacks& attempt) {
                     lifetime->platform_callback(lifecycle,attempt,[this,lifetime,lifecycle,&attempt,&weak_platform] {
                         background_operation("transport open",[this,lifetime,lifecycle,&attempt,&weak_platform] {
+                            const auto ordinary=ordinary_receiver_;
+                            if(ordinary){const auto retained=weak_platform.lock();if(!retained)return;const auto wake=pacer_state_;ordinary->opened(attempt,lifecycle,*retained);wake->wake_changed();if(!lifetime->current(lifecycle))return;}
                             const auto source=receiver_source_;
                             if(source) {
                                 const auto retained=weak_platform.lock();if(!retained)return;
@@ -1379,8 +1430,66 @@ bool synchronizer_base::connect_step_for_lifecycle(uint64_t lifecycle) {
                     });
                 },
                 [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const transport_message& message) {
-                    lifetime->platform_callback(lifecycle,attempt,[this,lifecycle,&attempt,&message] {
-                        background_operation("transport message",[this,lifecycle,&attempt,&message] {
+                    lifetime->platform_callback(lifecycle,attempt,[this,lifetime,lifecycle,&attempt,&message] {
+                        background_operation("transport message",[this,lifetime,lifecycle,&attempt,&message] {
+                            const auto ordinary=ordinary_receiver_;
+                            if(ordinary) {
+                                std::shared_ptr<detail::ordinary_received_cut> completed;
+                                std::vector<detail::ordinary_upload_ack> acknowledgments;
+                                std::shared_ptr<detail::ordinary_history_receive_operation> history;
+                                if(ordinary->receive(attempt,lifecycle,message,completed,&acknowledgments,&history)) {
+                                    const auto model_transport=std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_);
+                                    if(!model_transport)throw db_error("model negotiation lost actual owned transport");
+                                    ordinary->advance_model_negotiation(attempt,lifecycle,*model_transport);
+                                    // The foreign send may synchronously retire this owner.
+                                    if(!lifetime->current(lifecycle))return;
+
+                                    if(!acknowledgments.empty()) {
+                                        discovery_charge charge;charge.add(acknowledgments.size()*sizeof(detail::ordinary_upload_ack));
+                                        for(const auto& ack:acknowledgments){charge.add(ack.gid.capacity()+1);charge.add(ack.version.capacity()+1);}
+                                        enqueue_discovery(detail::sync_discovery_kind::ack,"ordinary versioned ACK",charge.bytes,
+                                            [this,lifecycle,acknowledgments=std::move(acknowledgments)](detail::sync_discovery_operation&) {
+                                                if(is_destroyed_||receive_lifecycle_stopped(lifecycle)||reconnect_lifecycle_.load()!=lifecycle)return true;
+                                                const auto protection=try_has_export_protection();if(!protection)return false;
+                                                if(*protection)throw db_error("ordinary ACK cannot enter protected route");
+                                                mark_ordinary_as_synced(acknowledgments);return true;
+                                            });
+                                    }
+                                    if(!lifetime->current(lifecycle))return;
+                                    pacer_state_->wake_changed();
+                                    if(ordinary_receiver_->uploads_ready())request_upload(true);
+                                    if(!lifetime->current(lifecycle))return;
+                                    if(completed) {
+                                        const auto receiver=ordinary_receiver_;
+                                        const auto transport=std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_);
+                                        // The independently bounded receive pool already retains
+                                        // and charges the full immutable cut. This queue charge
+                                        // covers only its envelope, never an uncharged payload copy.
+                                        enqueue_discovery(detail::sync_discovery_kind::intake,"ordinary ordered intake",4096,
+                                            [this,receiver,transport,completed,lifecycle](detail::sync_discovery_operation&) {
+                                                if(is_destroyed_||receive_lifecycle_stopped(lifecycle)||reconnect_lifecycle_.load()!=lifecycle)return true;
+                                                const auto protection=try_has_export_protection();if(!protection)return false;
+                                                if(*protection||!transport)throw db_error("ordinary ordered intake requires its ordinary owned transport");
+                                                receiver->install(completed,*transport);return true;
+                                            });
+                                        if(!lifetime->current(lifecycle))return;
+                                    }
+                                    if(history) {
+                                        const auto receiver=ordinary_receiver_;
+                                        const auto transport=std::dynamic_pointer_cast<owned_platform_sync_transport>(ws_client_);
+                                        // The same bounded receive pool retains one decoded page
+                                        // through queue cancellation/COMMIT and progress send.
+                                        enqueue_discovery(detail::sync_discovery_kind::intake,"ordinary history staging",4096,
+                                            [this,receiver,transport,history,lifecycle](detail::sync_discovery_operation&) {
+                                                if(is_destroyed_||receive_lifecycle_stopped(lifecycle)||reconnect_lifecycle_.load()!=lifecycle)return true;
+                                                const auto protection=try_has_export_protection();if(!protection)return false;
+                                                if(*protection||!transport)throw db_error("ordinary history staging requires its ordinary owned transport");
+                                                receiver->install_history(history,*transport);return true;
+                                            });
+                                    }
+                                    return;
+                                }
+                            }
                             if(receiver_controller_&&receiver_controller_->receive(attempt,lifecycle,message))return;
                             if(receiver_source_&&receiver_source_->receive(attempt,lifecycle,message)) {
                                 if(receiver_controller_)receiver_controller_->wake();
@@ -1391,10 +1500,10 @@ bool synchronizer_base::connect_step_for_lifecycle(uint64_t lifecycle) {
                         });
                     });
                 },
-                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const std::string& error) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,&error] { background_operation("transport error",[this,&error] { on_websocket_error(error); }); }); },
-                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,int code,const std::string& reason) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,code,&reason] { background_operation("transport close",[this,code,&reason] { on_websocket_close(code,reason); }); }); });
+                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,const std::string& error) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,lifecycle,&attempt,&error] { background_operation("transport error",[this,lifecycle,&attempt,&error] { if(ordinary_receiver_)ordinary_receiver_->closed(attempt,lifecycle);on_websocket_error(error); }); }); },
+                [this,lifetime,lifecycle](const platform_transport_callbacks& attempt,int code,const std::string& reason) { lifetime->platform_terminal_callback(lifecycle,attempt,[this,lifecycle,&attempt,code,&reason] { background_operation("transport close",[this,lifecycle,&attempt,code,&reason] { if(ordinary_receiver_)ordinary_receiver_->closed(attempt,lifecycle);on_websocket_close(code,reason); }); }); });
         } else {
-            if(receiver_source_)throw db_error("receiver source requires trusted owned SDK platform transport");
+            if(receiver_source_||ordinary_receiver_)throw db_error("receiver source requires trusted owned SDK platform transport");
             transport->connect(url, headers);
         }
     };
@@ -1557,6 +1666,7 @@ sync_drain_result synchronizer_base::drain_checked(std::chrono::steady_clock::ti
                 live=true;online=is_connected_.load()&&!is_destroyed_.load();
                 pending=progress_pending_upload_.load(std::memory_order_relaxed);
                 if(online&&receiver_source_&&continuous_route_)negotiated_pending=receiver_source_->upload_pending(generation);
+                if(online&&ordinary_receiver_)negotiated_pending=ordinary_scan_incomplete_.load(std::memory_order_acquire)||!ordinary_receiver_->uploads_ready();
                 recovery_pending=online&&receiver_controller_&&receiver_controller_->blocks_ordinary();
                 if(online&&receiver_controller_)disposal_failure=receiver_controller_->checked_disposal_failure(generation);
             });
@@ -1686,6 +1796,7 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
                  (void*)this, db().config().path.c_str());
 
         if (event->event_type == server_sent_event::type::audit_log) {
+            if(ordinary_receiver_)throw db_error("ordered-required connection refuses provisional server materialization");
             if(receiver_controller_){receiver_controller_->request();return;} // canonical refresh, never legacy replacement/ACK
             // Dispatch to scheduler to serialize with upload_pending_changes.
             // Running apply_remote_changes on the IPC read thread causes
@@ -1775,6 +1886,9 @@ void synchronizer_base::on_transport_message(const transport_message& msg) {
             });
 
         } else if (event->event_type == server_sent_event::type::ack) {
+            // Required-v2 handling is versioned and admitted by the exact
+            // physical receiver above. Never let an old GID-only ACK settle it.
+            if(ordinary_receiver_)return;
             // Dispatch to scheduler to serialize with upload_pending_changes.
             auto ids = std::move(event->acked_ids);
             const auto generation=reconnect_lifecycle_.load();
@@ -2395,7 +2509,22 @@ void synchronizer_base::reconcile_sync_filter() {
 // Upload pending changes (with sync filter support)
 // ============================================================================
 
-std::vector<audit_log_entry> synchronizer_base::query_pending_entries(bool& enumeration_hit_limit) {
+synchronizer_base::pending_entries_scan synchronizer_base::query_pending_entries() {
+    const auto lifetime=callback_lifetime_;
+    const auto generation=reconnect_lifecycle_.load();
+    const auto ordinary=ordinary_receiver_;
+    // A suppressed selection is not a completed empty scan. No horizon,
+    // enumeration bookkeeping or floor evidence is published from this path.
+    if(ordinary&&!ordinary->uploads_ready())return {};
+    reconcile_open_with_db();
+    if(!lifetime->current(generation))return {};
+    int64_t scan_horizon=0;
+    if(config_.use_upload_floor) {
+        auto h = db().db().query("SELECT COALESCE(MAX(id), 0) AS m FROM AuditLog", {});
+        if (!h.empty() && std::holds_alternative<int64_t>(h[0].at("m"))) {
+            scan_horizon = std::get<int64_t>(h[0].at("m"));
+        }
+    }
     int64_t floor = 0;
     size_t limit = 0;
     if (config_.use_upload_floor) {
@@ -2408,11 +2537,17 @@ std::vector<audit_log_entry> synchronizer_base::query_pending_entries(bool& enum
             std::lock_guard<std::mutex> lock(in_flight_mutex_);
             in_flight_count = in_flight_ids_.size();
         }
-        limit = config_.chunk_size * 2 + in_flight_count;
+        if(ordinary_receiver_)limit=ordinary_upload_window(config_);
+        else limit = config_.chunk_size * 2 + in_flight_count;
     }
-    auto entries = query_audit_log_for_sync(
-        db().db(), config_.sync_id, config_.sync_filter, floor, limit);
-    enumeration_hit_limit = (limit > 0 && entries.size() >= limit);
+    if(ordinary_receiver_)limit=ordinary_upload_window(config_);
+    auto entries = ordinary_receiver_
+        ? detail::query_ordinary_upload_entries(db().db(),config_.sync_id,config_.sync_filter,floor,limit)
+        : query_audit_log_for_sync(db().db(),config_.sync_id,config_.sync_filter,floor,limit);
+    const bool enumeration_hit_limit = (limit > 0 && entries.size() >= limit);
+    // SQL/observer work may have retired the physical endpoint after the
+    // admission sample. Publish no completed result or open IDs in that case.
+    if(!lifetime->current(generation)||(ordinary&&!ordinary->uploads_ready()))return {};
 
     // Filter out entries already in-flight (sent but not yet ACK'd), and
     // record every enumerated real audit id as OPEN — the floor may only
@@ -2443,7 +2578,7 @@ std::vector<audit_log_entry> synchronizer_base::query_pending_entries(bool& enum
     }
 
     LOG_DEBUG("synchronizer", "Found %zu unsynced entries to upload", entries.size());
-    return entries;
+    return {pending_entries_scan::outcome::completed,std::move(entries),enumeration_hit_limit,scan_horizon};
 }
 
 void synchronizer_base::classify_delete(audit_log_entry& entry, classified_entries& result) {
@@ -2704,6 +2839,7 @@ static int64_t required_sync_count_for_collapse(database& db,
 
 void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_synced) {
     if (to_mark_synced.empty()) return;
+    bool settlement_fenced=false;
 
     // Mark entries that were skipped as synchronized in the per-sync-id table.
     // Must use _lattice_sync_state (not global AuditLog.isSynchronized) because
@@ -2713,6 +2849,7 @@ void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_
     for (size_t i = 0; i < to_mark_synced.size(); i += kMarkChunkSize) {
         size_t end = std::min(i + kMarkChunkSize, to_mark_synced.size());
         detail::recovery_writer_access::legacy_sync_write(db(), [&](database& writer) {
+            if(!detail::ordinary_export_access::legacy_settlement_allowed(writer)){settlement_fenced=true;return;}
             for (size_t j = i; j < end; ++j) {
                 int64_t entry_id = to_mark_synced[j];
                 writer.execute(
@@ -2755,12 +2892,13 @@ void synchronizer_base::mark_skipped_synced(const std::vector<int64_t>& to_mark_
         });
     }
 
+    if(settlement_fenced)throw db_error("canonical filtered classification requires a durable versioned outbox");
     // No progress decrement needed — skipped entries are not counted in
     // progress_pending_upload_ (only to_send entries are counted).
 
     // Skipped entries are resolved for the upload floor: their sync_state
     // transactions committed above, so they can never be pending again.
-    if (config_.use_upload_floor && !to_mark_synced.empty()) {
+    if (config_.use_upload_floor && !settlement_fenced && !to_mark_synced.empty()) {
         resolve_audit_ids(to_mark_synced);
     }
 }
@@ -2798,6 +2936,9 @@ void synchronizer_base::resolve_audit_ids(const std::vector<int64_t>& audit_ids)
 
 void synchronizer_base::reconcile_open_with_db() {
     if (!config_.use_upload_floor) return;
+    // Derived legacy flags report request handling, not canonical repair.
+    // Actual versioned outcomes and installed cuts own this enrolled path.
+    if(detail::ordinary_export_access::has_delivery_obligations(db().db()))return;
     // Walk only the RESOLVED PREFIX: stop at the first genuinely-open id (the
     // floor is correctly pinned there). Part A keeps this prefix short in
     // steady state; after a late-ack burst it is bounded by one send window.
@@ -2872,8 +3013,29 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
     // un-ACKed ones (in-flight grew by 2*chunk_size per tick, unbounded).
     // With the cap, a stalled transport plateaus at one window and the next
     // ships only as ACKs (or the ack-timeout release) free space.
-    const size_t window_cap = config_.chunk_size * 2;
-    size_t window_end = 0;
+    const size_t window_cap = ordinary_receiver_?ordinary_upload_window(config_):config_.chunk_size * 2;
+    size_t window_end = 0;uint64_t ordinary_token=0;
+    struct ordinary_registration_rollback {
+        std::shared_ptr<detail::sync_upload_tracking> state;
+        const std::vector<audit_log_entry>& entries;uint64_t& token;bool transferred=false;
+        ~ordinary_registration_rollback(){
+            if(!token||transferred)return;
+            // No synchronizer/owner access after a possibly retiring callback.
+            // Allocation/send/scheduling failure releases only this exact send
+            // registration; actual durable rows remain pending for retry.
+            std::lock_guard lock(state->mutex);
+            for(const auto& entry:entries){const auto found=state->delivery_tokens.find(entry.global_id);
+                if(found==state->delivery_tokens.end()||found->second!=token)continue;
+                state->ids.erase(entry.global_id);state->ordinary_versions.erase(entry.global_id);state->delivery_tokens.erase(found);}
+            state->pending.store(static_cast<int64_t>(state->ids.size()));
+        }
+    } ordinary_registration{upload_tracking_,entries,ordinary_token};
+    if(ordinary_receiver_)for(const auto& entry:entries) {
+        if(entry.global_id.empty()||entry.global_id.size()>4096||entry.global_id.find('\0')!=std::string::npos)
+            throw db_error("ordinary upload original identity bound");
+        if(!entry.ordinary_delivery_version||!detail::ordinary_delivery_version_valid(*entry.ordinary_delivery_version))
+            throw db_error("ordinary upload lacks same-view delivery version");
+    }
 
     // Track only the entries actually sent as in-flight, and account progress
     // for exactly the windowed portion: pending mirrors the in-flight set
@@ -2885,9 +3047,17 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
         const size_t in_flight = in_flight_ids_.size();
         const size_t space = in_flight >= window_cap ? 0 : window_cap - in_flight;
         window_end = std::min(entries.size(), space);
+        if(ordinary_receiver_&&window_end){
+            if(upload_tracking_->next_token==std::numeric_limits<uint64_t>::max())throw db_error("ordinary upload registration exhausted");
+            ordinary_token=++upload_tracking_->next_token;
+            for(size_t i=0;i<window_end;++i)if(in_flight_ids_.count(entries[i].global_id))
+                throw db_error("ordinary original already has a live send registration");
+        }
         for (size_t i = 0; i < window_end; ++i) {
             // Map to the AuditLog id so an ACK can resolve the upload floor;
             // synthetic entries carry id 0 and never gate the floor.
+            if(ordinary_receiver_){upload_tracking_->delivery_tokens[entries[i].global_id]=ordinary_token;
+                upload_tracking_->ordinary_versions[entries[i].global_id]=*entries[i].ordinary_delivery_version;}
             in_flight_ids_[entries[i].global_id] = entries[i].id;
         }
         progress_pending_upload_.store(
@@ -2908,7 +3078,9 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
                  log_id(), window_end, entries.size());
     }
 
-    for (size_t i = 0; i < window_end; i += config_.chunk_size) {
+    const size_t wire_chunk=ordinary_receiver_?std::min<size_t>(config_.chunk_size,ordinary_sync_limits::records_per_page):config_.chunk_size;
+    if(ordinary_receiver_&&!wire_chunk)throw db_error("zero upload chunk size");
+    for (size_t i = 0; i < window_end; i += wire_chunk) {
         // Bail out early if connection dropped mid-send — remaining chunks
         // will be re-queried and sent on the next successful connection.
         if (!is_connected_) {
@@ -2917,11 +3089,11 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
             break;
         }
 
-        size_t end = std::min(i + config_.chunk_size, window_end);
+        size_t end = std::min(i + wire_chunk, window_end);
         std::vector<audit_log_entry> chunk(entries.begin() + i, entries.begin() + end);
 
         auto event = server_sent_event::make_audit_log(chunk);
-        auto json_str = event.to_json();
+        auto json_str = ordinary_receiver_?detail::encode_ordinary_source_upload(chunk):event.to_json();
         LOG_DEBUG("synchronizer", "Sending %zu entries to server: %s",
                   chunk.size(), json_str.substr(0, 200).c_str());
         transport->send(transport_message::from_binary({json_str.begin(), json_str.end()}));
@@ -2929,7 +3101,8 @@ void synchronizer_base::send_entries_after_discovery(std::vector<audit_log_entry
     }
     entries.resize(window_end);
 
-    schedule_ack_retry(entries);
+    if(ordinary_receiver_)prepare_ack_retry(entries,false,ordinary_token)();else schedule_ack_retry(entries);
+    ordinary_registration.transferred=true;
 }
 
 void synchronizer_base::schedule_ack_retry(const std::vector<audit_log_entry>& entries) {prepare_ack_retry(entries)();}
@@ -3247,19 +3420,19 @@ bool synchronizer_base::upload_pending_changes_step(detail::sync_upload_continua
         continuation.policy_revision=upload_policy_revision_.load(std::memory_order_acquire);
         // DB-truth belt for the floor (runs before the horizon read so a swept
         // prefix can advance the floor this same pass).
-        reconcile_open_with_db();
-        // Horizon BEFORE the scan: if the pass then enumerates nothing, no
-        // entry <= horizon is pending for this channel (writes that land after
-        // the horizon read are past it and unaffected).
-        int64_t scan_horizon = 0;
-        if (config_.use_upload_floor) {
-            auto h = db().db().query("SELECT COALESCE(MAX(id), 0) AS m FROM AuditLog", {});
-            if (!h.empty() && std::holds_alternative<int64_t>(h[0].at("m"))) {
-                scan_horizon = std::get<int64_t>(h[0].at("m"));
-            }
+        auto scan = query_pending_entries();
+        if(!lifetime->current(generation))return true;
+        const bool not_enumerated=scan.state!=pending_entries_scan::outcome::completed;
+        ordinary_scan_incomplete_.store(not_enumerated,std::memory_order_release);
+        if(not_enumerated) {
+            // Retire only this query shell. The genuine offer/model callback
+            // owns the next demand; do not retry a negotiation as SQL BUSY.
+            // The retained passive demand also prevents a false drained result.
+            return true;
         }
-        bool enumeration_hit_limit = false;
-        auto entries = query_pending_entries(enumeration_hit_limit);
+        const int64_t scan_horizon=scan.horizon;
+        const bool enumeration_hit_limit=scan.enumeration_hit_limit;
+        auto entries=std::move(scan.entries);
         if (entries.empty()) {
             // A channel whose filter matches nothing NEVER enumerates a row, so
             // its floor never advances and its slot pins compaction at 0 forever
@@ -3277,6 +3450,7 @@ bool synchronizer_base::upload_pending_changes_step(detail::sync_upload_continua
                 }
                 if (nothing_open) {
                     detail::recovery_writer_access::legacy_sync_write(db(), [&](database& writer) {
+                        if(!detail::ordinary_export_access::delivery_floor_allowed(writer,config_.sync_id))return;
                         writer.execute(R"(
                             INSERT INTO _lattice_replication_slots (sync_id, upload_floor, last_active_at)
                             VALUES (?, ?, datetime('now'))
@@ -3415,7 +3589,7 @@ void synchronizer_base::mark_as_synced_after_discovery_impl(const std::vector<st
         schedule_background("ACK continuation",[this,route,generation]{if(!route->current(generation))return;background_upload();});
         return; // No canonical receipt, floor advance or eager audit cleanup.
     }
-    mark_audit_entries_synced_for(db(), global_ids, config_.sync_id, config_.all_active_sync_ids);
+    if(!mark_audit_entries_synced_for_checked(db(), global_ids, config_.sync_id, config_.all_active_sync_ids))return;
     if(!lifetime->current(generation))return;
 
     // Remove ACK'd entries from in-flight set; pending mirrors the set size
@@ -3522,6 +3696,37 @@ void synchronizer_base::mark_as_synced_after_discovery_impl(const std::vector<st
             background_upload();
         });
     }
+}
+
+void synchronizer_base::mark_ordinary_as_synced(const std::vector<detail::ordinary_upload_ack>& acknowledgments) {
+    const auto lifetime=callback_lifetime_;const auto generation=reconnect_lifecycle_.load();
+    const auto outcomes=detail::ordinary_export_access::acknowledge_upload(db(),config_.sync_id,acknowledgments);
+    if(!lifetime->current(generation))return;
+    std::vector<int64_t> resolved;std::vector<std::string> settled_ids;size_t matched=0;
+    for(const auto& outcome:outcomes)if(outcome.settled){resolved.push_back(outcome.audit_id);settled_ids.push_back(outcome.gid);}
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        for(const auto id:resolved)if(open_audit_ids_.count(id)&&
+            std::none_of(in_flight_ids_.begin(),in_flight_ids_.end(),[&](const auto& item){return item.second==id;}))++matched;
+        // A late handled ACK may retire its own old send slot, but never a
+        // replacement version and never the replacement's durable floor debt.
+        for(const auto& ack:acknowledgments){const auto found=upload_tracking_->ordinary_versions.find(ack.gid);
+            if(found!=upload_tracking_->ordinary_versions.end()&&found->second==ack.version&&
+               upload_tracking_->erase_locked(ack.gid,generation,upload_tracking_->registration_locked(ack.gid),false))++matched;}
+        progress_pending_upload_.store(static_cast<int64_t>(in_flight_ids_.size()));
+    }
+    // Exact current-version late ACKs retain the Aug24 floor repair behavior
+    // even after timeout/reconnect discarded the local in-flight registration.
+    if(config_.use_upload_floor)resolve_audit_ids(resolved);
+    if(!lifetime->current(generation))return;
+    if(matched){
+        last_matching_ack_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        progress_acked_.fetch_add(static_cast<int64_t>(matched));ack_resend_failures_=0;
+    }
+    const auto completed=on_sync_complete_;
+    if(completed&&!settled_ids.empty())completed(settled_ids);
+    if(!lifetime->current(generation))return;
+    schedule_background("ordinary ACK continuation",[this]{if(!is_destroyed_)background_upload();});
 }
 
 void synchronizer_base::maybe_reset_backoff_after_stable_connection(bool was_open) {
@@ -3819,6 +4024,7 @@ std::vector<audit_log_entry> query_audit_log(database& db,
     bool only_unsynced,
     std::optional<std::string> after_global_id)
 {
+    return detail::ordinary_export_access::upload_query(db,only_unsynced,[&] {
     detail::require_continuous_legacy_export_absent(db);
     std::string sql = "SELECT * FROM AuditLog";
     std::vector<column_value_t> params;
@@ -3883,6 +4089,7 @@ std::vector<audit_log_entry> query_audit_log(database& db,
 
     late_bind_no_history(db, entries);   // fill no_history columns before anyone ships them
     return entries;
+    },false);
 }
 
 // Notify AuditLog observers on ALL instances sharing this database path.
@@ -3948,6 +4155,8 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
     size_t next = 0;
     while (next < global_ids.size()) {
         detail::recovery_writer_access::legacy_sync_write(db, [&](database& writer) {
+            if(!detail::ordinary_export_access::legacy_settlement_allowed(writer)){next=global_ids.size();return;}
+            detail::ordinary_export_access::preserve(db,writer);
             size_t changed = 0;
             while (next < global_ids.size() && changed < kAckChunk) {
                 const auto& gid = global_ids[next++];
@@ -3983,11 +4192,11 @@ void mark_audit_entries_synced(lattice_db& db, const std::vector<std::string>& g
 
 
 
-void mark_audit_entries_synced_for(lattice_db& db,
+static bool mark_audit_entries_synced_for_checked(lattice_db& db,
                                    const std::vector<std::string>& global_ids,
                                    const std::string& sync_id,
                                    const std::vector<std::string>& all_active_sync_ids) {
-    std::vector<std::pair<int64_t, std::string>> notify_list;
+    std::vector<std::pair<int64_t, std::string>> notify_list;bool permitted=true;
 
     // Process in chunks of 50 to avoid holding the write lock too long.
     constexpr size_t kChunkSize = 50;
@@ -3996,6 +4205,8 @@ void mark_audit_entries_synced_for(lattice_db& db,
         int64_t chunk_max_entry_id = 0;
 
         detail::recovery_writer_access::legacy_sync_write(db, [&](database& writer) {
+            if(!detail::ordinary_export_access::legacy_settlement_allowed(writer)){permitted=false;return;}
+            detail::ordinary_export_access::preserve(db,writer);
             for (size_t j = i; j < end; ++j) {
                 const auto& gid = global_ids[j];
 
@@ -4062,7 +4273,11 @@ void mark_audit_entries_synced_for(lattice_db& db,
         }
     }
 
-    notify_observers(db, notify_list);
+    notify_observers(db, notify_list);return permitted;
+}
+
+void mark_audit_entries_synced_for(lattice_db& db,const std::vector<std::string>& ids,const std::string& channel,const std::vector<std::string>& channels) {
+    (void)mark_audit_entries_synced_for_checked(db,ids,channel,channels);
 }
 
 std::vector<audit_log_entry> query_audit_log_for_sync(
@@ -4071,6 +4286,7 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
         const std::optional<std::vector<sync_filter_entry>>& sync_filter,
         int64_t min_id_exclusive,
         size_t limit) {
+    return detail::ordinary_export_access::upload_query(db,true,[&] {
     detail::require_continuous_legacy_export_absent(db);
     // Query entries not yet synced for this specific sync_id.
     // No isFromRemote filter — any entry not synced by this sync_id is pending,
@@ -4201,9 +4417,190 @@ std::vector<audit_log_entry> query_audit_log_for_sync(
 
     late_bind_no_history(db, entries);   // the upload path: latest value at upload time
     return entries;
+    },false);
 }
 
-std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id) {
+std::vector<audit_log_entry> query_audit_log_for_sync_impl(
+        database& db,
+        const std::string& sync_id,
+        const std::optional<std::vector<sync_filter_entry>>& sync_filter,
+        int64_t min_id_exclusive,
+        size_t limit,bool ordinary) {
+    return detail::ordinary_export_access::upload_query(db,true,[&] {
+    detail::require_continuous_legacy_export_absent(db);
+    // Query entries not yet synced for this specific sync_id.
+    // No isFromRemote filter — any entry not synced by this sync_id is pending,
+    // enabling cross-transport relay (IPC→WSS, WSS→BLE, etc.)
+    //
+    // The WHERE clause handles four cases:
+    //   1. sync_state row exists, is_synchronized=0 → pending for this sync_id
+    //   2. sync_state row exists, is_synchronized=1 → synced, EXCLUDED
+    //   3. No sync_state row, isSynchronized=0 → never tracked, pending
+    //   4. No sync_state row, isSynchronized=1 → eagerly cleaned up (all sync_ids
+    //      have synced), EXCLUDED. Without this check, entries bounce in an infinite
+    //      loop: sent → ACK'd → eager cleanup deletes row → re-queried as pending.
+    // Build the sync filter predicate (shared by both UNION branches).
+    // Pre-filters by table name AND where_clause predicate to avoid loading
+    // thousands of irrelevant entries from unrelated tables.
+    //
+    // For tables with a where_clause, we still pass through:
+    //   1. DELETE entries (row is gone — app layer checks sync_set membership)
+    //   2. Rows in _lattice_sync_set (may need synthetic DELETE if they left the filter)
+    //   3. Rows matching the where_clause predicate
+    // This is safe because reconcile_sync_filter() runs BEFORE upload_pending_changes()
+    // in on_websocket_open, so sync_set is already up-to-date by the time we query.
+    std::string filter_clause;
+    if (sync_filter && !sync_filter->empty()) {
+        // sync_id is embedded in the string-built clause (it repeats per
+        // filter entry, so a positional bind would be fragile against the
+        // params the caller appends). Escape single quotes — sync_ids carry
+        // URLs ("wss:...") and channel names, never trusted input, but
+        // correctness costs nothing.
+        std::string escaped_sync_id = sync_id;
+        for (size_t pos = 0; (pos = escaped_sync_id.find('\'', pos)) != std::string::npos; pos += 2) {
+            escaped_sync_id.replace(pos, 1, "''");
+        }
+        filter_clause = " AND (";
+        for (size_t i = 0; i < sync_filter->size(); ++i) {
+            if (i > 0) filter_clause += " OR ";
+            const auto& entry = (*sync_filter)[i];
+            if (!entry.where_clause || entry.where_clause->empty()) {
+                filter_clause += "a.tableName = '" + entry.table_name + "'";
+            } else {
+                filter_clause += "(a.tableName = '" + entry.table_name + "' AND ("
+                       "a.operation = 'DELETE'"
+                       " OR EXISTS (SELECT 1 FROM _lattice_sync_set"
+                       " WHERE sync_id = '" + escaped_sync_id + "'"
+                       " AND table_name = a.tableName AND global_row_id = a.globalRowId)"
+                       " OR EXISTS (SELECT 1 FROM " + entry.table_name +
+                       " WHERE globalId = a.globalRowId AND (" + *entry.where_clause + "))"
+                       "))";
+            }
+        }
+        filter_clause += " OR a.tableName LIKE '\\_%' ESCAPE '\\'";
+        filter_clause += ")";
+    }
+
+    // UNION query: two branches that each use indexed lookups instead of a
+    // full AuditLog scan. The LEFT JOIN formulation forced SQLite to scan every
+    // row; splitting into JOIN + NOT EXISTS lets each branch use its own index.
+    //
+    // Branch 1: entries explicitly marked pending in _lattice_sync_state
+    // Branch 2: entries with no sync_state row, using global isSynchronized flag
+    //           (uses partial index idx_audit_log_pending_sync)
+    // Branch 2 is additionally bounded below by the caller's upload floor
+    // (`a.id > ?`): explicit is_synchronized=0 sync_state rows (branch 1)
+    // ride idx_sync_state_pending and are ~empty in practice, so the floor
+    // invariant only has to hold for the no-sync-state flow we control. The
+    // LIMIT caps a pass at one send window — without it, a stalled server
+    // (nothing resolving, floor pinned) still re-reads and JSON-parses the
+    // whole backlog every resend cycle.
+    std::string sql =
+        "SELECT a.* FROM AuditLog a"
+        " JOIN _lattice_sync_state ss"
+        "   ON ss.audit_entry_id = a.id AND ss.sync_id = ?"
+        " WHERE ss.is_synchronized = 0" + filter_clause +
+
+        " UNION ALL"
+
+        " SELECT a.* FROM AuditLog a"
+        " WHERE a.isSynchronized = 0"
+        " AND a.id > ?"
+        " AND NOT EXISTS ("
+        "   SELECT 1 FROM _lattice_sync_state ss"
+        "   WHERE ss.audit_entry_id = a.id AND ss.sync_id = ?"
+        ")" + filter_clause +
+
+        " ORDER BY id ASC";
+
+    std::vector<column_value_t> params = {sync_id, min_id_exclusive, sync_id};
+    if(detail::ordinary_export_access::has_delivery_obligations(db)) {
+        // Unhandled versions remain discoverable below old upload floors.
+        // Handled requests await their separate canonical repair without resend.
+        // UNION removes rows already selected by the unchanged pending arms.
+        constexpr std::string_view order=" ORDER BY id ASC";
+        if(!sql.ends_with(order))throw db_error("ordinary repair query ordering");sql.resize(sql.size()-order.size());
+        sql+=" UNION SELECT a.* FROM AuditLog a JOIN _lattice_ordered_delivery_v1 d ON d.gid=a.globalId WHERE d.channel=? AND d.repair=1 AND d.handled=0"+filter_clause+std::string(order);
+        params.emplace_back(sync_id);
+    }
+    if (limit > 0) {
+        sql += " LIMIT ?";
+        params.push_back(static_cast<int64_t>(limit));
+    }
+    size_t ordinary_retained=0,ordinary_workspace=0;
+    const auto charge=[&](size_t n){if(n>ordinary_sync_limits::decoded_receive_bytes-ordinary_retained-ordinary_workspace)throw db_error("ordinary upload query retention bound");ordinary_retained+=n;};
+    const auto workspace=[&](size_t n)->std::shared_ptr<void>{
+        if(n>ordinary_sync_limits::parser_workspace_bytes||n>ordinary_sync_limits::decoded_receive_bytes-ordinary_retained-ordinary_workspace)throw db_error("ordinary upload query workspace bound");
+        auto* reserved=new size_t(n);
+        ordinary_workspace+=n;
+        return std::shared_ptr<void>(reserved,[&ordinary_workspace](void* raw){auto* value=static_cast<size_t*>(raw);ordinary_workspace-=*value;delete value;});};
+    if(ordinary){
+        const std::string from="SELECT a.* FROM AuditLog a";
+        for(size_t at=0;(at=sql.find(from,at))!=std::string::npos;){const std::string to="SELECT a.*,CAST(a.timestamp AS TEXT) AS __ordinary_timestamp FROM AuditLog a";sql.replace(at,from.size(),to);at+=to.size();}
+    }
+    auto rows = ordinary?detail::read_ordinary_upload_rows(db,sql,params,limit,charge):db.query(sql,params);
+
+    std::vector<audit_log_entry> entries;
+    for (const auto& row : rows) {
+        audit_log_entry entry;
+
+        auto get_str = [&row](const std::string& key) -> std::string {
+            auto it = row.find(key);
+            if (it != row.end() && std::holds_alternative<std::string>(it->second)) {
+                return std::get<std::string>(it->second);
+            }
+            return "";
+        };
+        auto get_int = [&row](const std::string& key) -> int64_t {
+            auto it = row.find(key);
+            if (it != row.end() && std::holds_alternative<int64_t>(it->second)) {
+                return std::get<int64_t>(it->second);
+            }
+            return 0;
+        };
+
+        const auto get_view=[&row](const char* key)->const std::string& {
+            static const std::string empty;const auto found=row.find(key);
+            if(found==row.end())return empty;const auto* value=std::get_if<std::string>(&found->second);return value?*value:empty;
+        };
+        if(ordinary){charge(sizeof(audit_log_entry));for(const auto& [key,value]:row)if(const auto* text=std::get_if<std::string>(&value))charge(text->size()+1);}
+        entry.id = get_int("id");
+        entry.global_id = get_str("globalId");
+        entry.table_name = get_str("tableName");
+        entry.operation = get_str("operation");
+        entry.row_id = get_int("rowId");
+        entry.global_row_id = get_str("globalRowId");
+        if(!ordinary) {
+            entry.changed_fields = audit_log_entry::parse_changed_fields(get_str("changedFields"));
+            entry.changed_fields_names = audit_log_entry::parse_changed_fields_names(get_str("changedFieldsNames"));
+        }
+        entry.timestamp = get_str("timestamp");
+        entry.is_from_remote = get_int("isFromRemote") != 0;
+        entry.is_synchronized = get_int("isSynchronized") != 0;
+        entry.synthesized = get_int("synthesized") != 0;
+
+        if(ordinary) {
+            detail::capture_ordinary_upload_original(entry,get_view("changedFields"),get_view("changedFieldsNames"),charge,workspace);
+            entry.timestamp=get_str("__ordinary_timestamp");
+            // A normalized remote AuditLog row is not its original. Only
+            // checked ingress/canonical custody may restore that observation.
+            if(entry.is_from_remote)entry.upload_original.reset();
+        }
+        entries.push_back(std::move(entry));
+    }
+
+    if(!ordinary)late_bind_no_history(db, entries); // exact mode hydrates first in the retained outer view
+    return entries;
+    },ordinary);
+}
+
+std::vector<audit_log_entry> detail::query_ordinary_upload_entries(database& db,const std::string& sync_id,
+    const std::optional<std::vector<sync_filter_entry>>& filter,int64_t floor,size_t limit) {
+    if(!limit||limit>ordinary_sync_limits::originals)throw db_error("ordinary upload enumeration limit required");
+    return query_audit_log_for_sync_impl(db,sync_id,filter,floor,limit,true);
+}
+
+std::vector<audit_log_entry> events_after_provisional(database& db, const std::optional<std::string>& checkpoint_global_id) {
     detail::require_continuous_legacy_export_absent(db);
     if (checkpoint_global_id) {
         // Resolve the checkpoint EXPLICITLY. The filter's correlated subquery
@@ -4335,6 +4732,7 @@ int64_t read_upload_floor(database& db, const std::string& sync_id) {
 
 void advance_upload_floor(database& db, const std::string& sync_id, int64_t floor) {
     detail::recovery_writer_access::legacy_sync_write(db, [&](database& writer) {
+        if(!detail::ordinary_export_access::delivery_floor_allowed(writer,sync_id))return;
         // Monotonic: a stale synchronizer instance (accept-side replacement race)
         // can only under-advance, never regress the floor.
         writer.execute(R"(
@@ -4371,6 +4769,10 @@ static double wire_timestamp_to_epoch(const std::string& ts) {
     return static_cast<double>(::time(nullptr));
 }
 
+double detail::ordinary_upload_timestamp_to_epoch(const std::string& timestamp) {
+    return normalize_required_ordinary_timestamp(timestamp);
+}
+
 // Unified implementation for applying remote changes.
 // receiving_sync_id = nullopt → global mode (server path): isSynchronized=1, no _lattice_sync_state row.
 // receiving_sync_id = value   → per-sync mode (relay path): isSynchronized=0, insert _lattice_sync_state row.
@@ -4385,6 +4787,22 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
     const std::optional<std::string>& receiving_sync_id,
     detail::canonical_upstream_delivery* upstream)
 {
+    return apply_remote_changes_impl_(entries,receiving_sync_id,upstream,nullptr);
+}
+std::vector<std::string> lattice_db::apply_remote_changes_impl_(
+    const std::vector<audit_log_entry>& entries,
+    const std::optional<std::string>& receiving_sync_id,
+    detail::canonical_upstream_delivery* upstream,
+    detail::ordinary_provisional_delivery* provisional)
+{
+    return apply_remote_changes_impl_(entries,receiving_sync_id,upstream,provisional,nullptr);
+}
+std::vector<std::string> lattice_db::apply_remote_changes_impl_(
+    const std::vector<audit_log_entry>& entries,const std::optional<std::string>& receiving_sync_id,
+    detail::canonical_upstream_delivery* upstream,detail::ordinary_provisional_delivery* provisional,
+    detail::ordinary_source_upload_delivery* source_upload)
+{
+    require_creator_process();
     auto& db = *this;
     std::vector<std::string> applied_ids;
     if (entries.empty()) return applied_ids;
@@ -4452,6 +4870,8 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                 } detach_marker{hook, &intake};
                 try {
                     receive_writer->begin_transaction(); intake.state = phase::active; hook->sync_chunk = &intake;
+                    if(provisional)provisional->admit(*this,*receive_writer);
+                    else detail::require_ordered_receiver_absent(*receive_writer);
                     receive_token = detail::receive_delivery_guard_access::begin(*this, *receive_writer, *receiving_sync_id);
                     receive_writer->commit();
                     intake.state = phase::committed; committed = true;
@@ -4553,6 +4973,9 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                 writer->begin_transaction();
                 chunk.state = chunk_state::phase::active;
                 hook.sync_chunk = &chunk;
+                if(source_upload)source_upload->admit(*this,*writer);
+                if(provisional)provisional->admit(*this,*writer);
+                else if(!upstream)detail::require_ordered_receiver_absent(*writer);
                 std::optional<detail::receive_guard_snapshot> receive_chunk_start;
                 if (receive_token)
                     receive_chunk_start = detail::receive_delivery_guard_access::require_current(*this, *writer, *receive_token);
@@ -4580,7 +5003,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                     }
                 }
                 execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
-                if ((upstream || receive_token) && (writer->changes() != 1 ||
+                if ((upstream || receive_token || source_upload) && (writer->changes() != 1 ||
                     query("SELECT disabled FROM _SyncControl WHERE id=1").at(0).at("disabled") != column_value_t(int64_t{1})))
                     throw db_error("owned sync audit suppression was refused");
 
@@ -4624,6 +5047,14 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                                 if (canonical_entry) canonical_entry->accept(outcome);
                                 applied_ids.push_back(entry.global_id);
                             };
+                            if(source_upload&&source_upload->duplicate(*writer,entry)) {
+                                applied_ids.push_back(entry.global_id);
+                                return;
+                            }
+                            if(provisional&&provisional->already_applied(entry)) {
+                                applied_ids.push_back(entry.global_id);
+                                return; // Real prior applied witness survives AuditLog/receipt pruning.
+                            }
                             // Re-check inside transaction (entry may have been inserted
                             // concurrently). A hit in EITHER AuditLog or the receipts
                             // table means already-applied: ack and move on.
@@ -4634,6 +5065,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                             auto existing = query(legacy_query, {entry.global_id});
                             if (!existing.empty()) {
                                 if (upstream) throw db_error("canonical upstream duplicate lacks canonical acceptance evidence");
+                                if (source_upload) throw db_error("ordinary upload duplicate lacks committed original custody");
                                 applied_ids.push_back(entry.global_id);
                                 return;
                             }
@@ -4906,12 +5338,16 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                                 entry.global_row_id,
                                 entry.changed_fields_to_json(),
                                 entry.changed_fields_names_to_json(),
-                                wire_timestamp_to_epoch(entry.timestamp),
+                                source_upload?detail::ordinary_upload_timestamp_to_epoch(entry.timestamp):wire_timestamp_to_epoch(entry.timestamp),
                                 static_cast<int64_t>(is_synchronized),
                                 static_cast<int64_t>(entry.synthesized ? 1 : 0)
                             });
                             if (upstream && writer->changes() != 1)
                                 throw db_error("canonical upstream required audit insert was ignored");
+
+                            // The exact input and actual local AuditLog association
+                            // enter the same savepoint as the real model/audit effect.
+                            if(source_upload)source_upload->inserted(*writer,entry);
 
                             // Per-sync mode: mark this entry as synced for the receiving sync_id (loop prevention).
                             if (receiving_sync_id) {
@@ -4969,6 +5405,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                     // rollback; neither error is swallowed as an entry failure.
                     execute("ROLLBACK TO lattice_sync_entry");
                     execute("RELEASE lattice_sync_entry");
+                    if(source_upload)source_upload->rolled_back_entry(entry);
                     {
                         std::lock_guard<std::mutex> lock(change_buffer_mutex_);
                         if (change_buffer_.size() < buffered_before_entry)
@@ -5028,7 +5465,7 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
 
                 // Re-enable sync triggers (restore the pre-existing flag value)
                 execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
-                if (upstream && (writer->changes() != 1 ||
+                if ((upstream||provisional||source_upload) && (writer->changes() != 1 ||
                     query("SELECT disabled FROM _SyncControl WHERE id=1").at(0).at("disabled") != column_value_t(prev_disabled)))
                     throw db_error("canonical upstream audit flag restoration was refused");
                 if (receive_postimage) {
@@ -5040,6 +5477,8 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
                         throw db_error("receive audit flag restoration postimage mismatch");
                 }
 
+                if(provisional)provisional->finish(*writer,applied_ids,applied_before_chunk);
+                if(source_upload)source_upload->finish(*writer,applied_ids,applied_before_chunk);
                 writer->commit();
                 // Memory/DELETE-journal builds settle here; file WAL consumes
                 // the marker before synchronous observer callbacks run.
@@ -5134,13 +5573,32 @@ std::vector<std::string> lattice_db::apply_remote_changes_impl_(
 }
 
 std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries) {
+    db.require_creator_process();
+    if(entries.empty())return {};
+    if(auto accepted=detail::ordinary_export_access::provisional(db,entries,std::nullopt))return std::move(*accepted);
     return db.apply_remote_changes_impl_(entries, std::nullopt);
 }
 
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
                               const std::string& sync_id) {
+    db.require_creator_process();
+    if(entries.empty())return {};
+    if(auto accepted=detail::ordinary_export_access::provisional(db,entries,sync_id))return std::move(*accepted);
     return db.apply_remote_changes_impl_(entries, sync_id);
+}
+
+server_export_batch events_after(database& db, const std::optional<std::string>& checkpoint_global_id) {
+    return detail::ordinary_export_access::events(db,checkpoint_global_id);
+}
+
+std::vector<std::string> apply_remote_changes(lattice_db& db, const server_export_batch& entries) {
+    return detail::ordinary_export_access::apply_helper(db,entries,std::nullopt);
+}
+
+std::vector<std::string> apply_remote_changes_for(lattice_db& db, const server_export_batch& entries,
+                              const std::string& sync_id) {
+    return detail::ordinary_export_access::apply_helper(db,entries,sync_id);
 }
 
 } // namespace lattice

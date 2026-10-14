@@ -23,6 +23,7 @@ module LatticeSwiftCppBridge {
     textual header "lattice.hpp"
     textual header "list.hpp"
     textual header "managed_object.hpp"
+    textual header "ordinary_sync_export.hpp"
     textual header "projection.hpp"
     textual header "recovery_continuity.hpp"
     textual header "recovery_export.hpp"

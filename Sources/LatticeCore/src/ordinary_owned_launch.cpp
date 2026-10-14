@@ -175,6 +175,19 @@ void exclusive_reaper() {
 
 #if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
 process_identity current_process() { return read_identity(::getpid()); }
+process_identity current_parent_process() {
+    // A forked receiver must reject inherited process state before observing
+    // or using any inherited launch/context owner.
+    owner(initial_process);
+    const auto self = read_identity(::getpid());
+    const auto parent = read_identity(static_cast<pid_t>(self.parent));
+    if (parent.pid != self.parent || ::getppid() != parent.pid ||
+        read_identity(::getpid()) != self ||
+        read_identity(static_cast<pid_t>(parent.pid)) != parent ||
+        ::getppid() != parent.pid) fail(error_code::identity_unproved);
+    // Point-in-time native observation, never a remembered PID permission.
+    return parent;
+}
 struct inherited_channel::implementation {
     descriptor fd;
     const pid_t creator = ::getpid();
@@ -193,6 +206,7 @@ inherited_channel::inherited_channel(int fd) {
 }
 #else
 process_identity current_process() { fail(error_code::unavailable); }
+process_identity current_parent_process() { fail(error_code::unavailable); }
 struct inherited_channel::implementation {};
 inherited_channel::inherited_channel(int) { fail(error_code::unavailable); }
 #endif
@@ -229,6 +243,7 @@ frame inherited_channel::receive(deadline until) {
 #if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
 struct owned_child::implementation {
     const pid_t creator = ::getpid();
+    const std::thread::id observer_thread = std::this_thread::get_id();
     descriptor fd;
     process_identity child;
     std::atomic<bool> stopped{false};
@@ -270,6 +285,38 @@ struct owned_child::implementation {
         if (rc != 0) { custody_lost = true; fail(error_code::terminal_unproved); }
         if (info.si_pid != 0 && info.si_pid != child.pid) { custody_lost = true; fail(error_code::terminal_unproved); }
         return info.si_pid == child.pid;
+    }
+    std::optional<terminal_observation> observe(deadline until) {
+        // These checks precede every inherited C++ mutex/native wait boundary.
+        owner(creator);
+        if (observer_thread != std::this_thread::get_id()) fail(error_code::wrong_thread);
+        bound(until);
+        std::unique_lock gate(retirement, std::defer_lock);
+        if (!gate.try_lock_until(until)) fail(error_code::cleanup_unproved);
+        if (reaped) return terminal_observation{child, status};
+        // The existing WNOWAIT observer requires the actual unreaped direct
+        // child. That OS reservation retains its proven birth and cannot be
+        // replaced by a remembered/reused PID. ECHILD loses custody forever.
+        if (!exited(until)) return std::nullopt;
+        // A live observation above never stopped I/O or signalled the child.
+        // Only a real terminal observation now closes admission and cancels
+        // workers before the same absolute-deadline I/O join and real reap.
+        stopped.store(true, std::memory_order_release);
+        std::unique_lock channel(io, std::defer_lock);
+        if (!channel.try_lock_until(until)) fail(error_code::cleanup_unproved);
+        int result = 0; pid_t observed;
+        do {
+            bound(until);
+            if (test_hooks::interrupt && test_hooks::interrupt(test_hooks::wait_boundary::reap)) {
+                errno = EINTR; observed = -1;
+            } else observed = ::waitpid(static_cast<pid_t>(child.pid), &result, WNOHANG);
+        } while (observed < 0 && errno == EINTR);
+        if (observed != child.pid) { custody_lost = true; fail(error_code::terminal_unproved); }
+        // Record the successful actual reap before any later fallible work.
+        status = result; reaped = true;
+        fd = descriptor();
+        release_retained();
+        return terminal_observation{child, status};
     }
     terminal_observation stop(deadline until) {
         owner(creator);
@@ -333,7 +380,8 @@ owned_child owned_child::spawn(const launch_specification& spec) {
     if (spec.executable.empty() || spec.executable.front() != '/' || !valid_text(spec.executable, 4096) ||
         spec.working_directory.empty() || spec.working_directory.front() != '/' || !valid_text(spec.working_directory, 4096) ||
         spec.arguments.size() > 128 || spec.environment.size() > 128 ||
-        spec.inherited_directories.size() > maximum_inherited_directories) fail(error_code::invalid_specification);
+        spec.inherited_directories.size() > maximum_inherited_directories ||
+        spec.inherited_channels.size() > maximum_inherited_channels) fail(error_code::invalid_specification);
     std::size_t total = spec.executable.size() + spec.working_directory.size();
     for (const auto& item : spec.arguments) {
         if (!valid_text(item, 8192)) fail(error_code::invalid_specification); total += item.size();
@@ -362,6 +410,15 @@ owned_child owned_child::spawn(const launch_specification& spec) {
     for (const auto fd : spec.inherited_directories) {
         struct stat value{};
         if (fd < 0 || ::fstat(fd, &value) != 0 || !S_ISDIR(value.st_mode)) fail(error_code::invalid_specification);
+        originals.push_back(fd);
+    }
+    for (const auto fd : spec.inherited_channels) {
+        struct stat value{}; int type=0; socklen_t length=sizeof(type);
+        sockaddr_storage peer{}; socklen_t peer_length=sizeof(peer);
+        if (fd < 0 || ::fstat(fd,&value) || !S_ISSOCK(value.st_mode) ||
+            ::getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&length) || length!=sizeof(type) || type!=SOCK_STREAM ||
+            ::getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peer_length) || peer.ss_family!=AF_UNIX)
+            fail(error_code::invalid_specification);
         originals.push_back(fd);
     }
     // Duplicate sources above the complete target range before adding any dup2
@@ -470,6 +527,13 @@ frame owned_child::receive(deadline until) {
     if (impl_->exchange_failed) fail(error_code::io);
     try { return read_frame(impl_->fd.value, until, &impl_->stopped); }
     catch (...) { impl_->exchange_failed = true; throw; }
+#else
+    (void)until; fail(error_code::unavailable);
+#endif
+}
+std::optional<terminal_observation> owned_child::observe_terminal(deadline until) {
+#if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
+    if (!impl_) fail(error_code::unavailable); return impl_->observe(until);
 #else
     (void)until; fail(error_code::unavailable);
 #endif

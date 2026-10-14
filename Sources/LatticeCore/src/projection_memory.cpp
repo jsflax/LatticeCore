@@ -1,3 +1,4 @@
+#include "ordinary_cohort_attachment.hpp"
 #include "projection_memory.hpp"
 #include "projection_capture_policy.hpp"
 #include <algorithm>
@@ -193,6 +194,7 @@ bool capture_stopped(database_read_control& control) noexcept {
 }
 
 void database_projection_capture::check() const {
+    database_.require_creator_();
     if (capture_stopped(*control_))
         capture_fail(static_cast<projection_status>(control_->stop_code.load(std::memory_order_acquire)),
                      "memory capture stopped");
@@ -249,6 +251,8 @@ void database_projection_capture::inventory_functions() {
 int database_projection_capture::authorize(void* context, int action, const char* first,
                                             const char* second, const char* schema, const char* trigger) noexcept {
     auto& capture = *static_cast<database_projection_capture*>(context);
+    const int managed=detail::ordinary_composed_attachment_authorize(capture.handle_,action,first,second);
+    if(managed!=SQLITE_OK)return managed;
     if (capture.policy_) return capture.policy_->authorize(action, first, second, schema, trigger);
     try {
         if (action == SQLITE_SELECT || action == SQLITE_READ || action == SQLITE_RECURSIVE)
@@ -268,6 +272,7 @@ int database_projection_capture::authorize(void* context, int action, const char
 database_projection_capture::database_projection_capture(
     database& database, const std::shared_ptr<database_read_control>& control, sqlite3_stmt*& statement)
     : database_(database), control_(control), statement_(statement) {
+    database_.require_creator_();
     if (!control_ || statement_)
         capture_fail(projection_status::invalid_request, "capture requires a control and empty statement slot");
     handle_ = database_.internal_handle();
@@ -352,11 +357,19 @@ void database_projection_capture::prepare_read(const std::string& sql) {
 }
 
 void database_projection_capture::restore() noexcept {
+    if(!database_.creator_current_()){statement_=nullptr;installed_=false;locked_=false;
+        if(current_==this)current_=previous_;return;}
     // Finalization and policy restoration happen under the same connection
     // ownership. No user callbacks are delivered, and no interrupt is issued.
     if (statement_) { sqlite3_finalize(statement_); statement_ = nullptr; }
     if (installed_) {
-        sqlite3_set_authorizer(handle_, nullptr, nullptr);
+        // A failed restoration must never leave the permissive capture gate.
+        if(detail::restore_ordinary_attachment_guard(handle_)!=SQLITE_OK){
+            installed_=false;
+            if(current_==this)current_=previous_;
+            if(locked_){sqlite3_mutex_leave(mutex_);locked_=false;}
+            database_.close();database_.retire_connection_();return;
+        }
         sqlite3_progress_handler(handle_, 0, nullptr, nullptr);
         sqlite3_busy_timeout(handle_, prior_busy_timeout_);
         installed_ = false;

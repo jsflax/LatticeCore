@@ -1,8 +1,13 @@
+#include "ordinary_cohort_attachment.hpp"
+#include "ordinary_export.hpp"
+#include "ordinary_managed_wss_owner.hpp"
+#include <algorithm>
 #include "recovery_producer_continuity.hpp"
 // lattice.cpp - Implementation moved to header (templates)
 // This file kept for potential non-template implementations
 
 #include "lattice/lattice.hpp"
+#include "ordinary_export.hpp"
 #include "lattice/ipc.hpp"
 #include <cstdlib>
 #include <set>
@@ -55,6 +60,8 @@ bool detail::managed_route_scope::active_for(const lattice_db* owner) noexcept {
 
 detail::managed_route_scope::managed_route_scope(database* db, lattice_db* owner,
     const std::string& table, int64_t token, const std::weak_ptr<database>& captured_writer, bool vector_write) {
+    if(db)db->require_creator_();
+    detail::ordinary_require_creator(owner?owner->config_.ordinary_context:detail::ordinary_context{});
     // Explicitly assigned ownerless fields retain their raw database contract.
     if (!db || !owner) return;
     if (vector_write && active_for(db))
@@ -134,6 +141,7 @@ detail::managed_route_scope::managed_route_scope(database* db, lattice_db* owner
 
 detail::managed_route_scope::~managed_route_scope() noexcept(false) {
     if (!db_) return;
+    if(!db_->creator_current_()){current_=previous_;vector_gate_.release();return;}
     struct complete_operation {
         std::atomic<size_t>& active;
         ~complete_operation() { active.fetch_sub(1, std::memory_order_release); }
@@ -196,15 +204,25 @@ static log_level initial_log_level() {
 }
 std::atomic<log_level> g_log_level{initial_log_level()};
 
+// Bind creator before any function-local singleton initialization guard can be
+// inherited in progress. This is native ownership, never admission authority.
+static const pid_t native_registry_creator_pid=::getpid();
+static void require_native_registry_creator() {
+    if(native_registry_creator_pid != ::getpid()) throw std::runtime_error("inherited native registries belong to another process");
+}
+
 // Singleton instance - defined here to ensure single copy across all translation units
 instance_registry& instance_registry::instance() {
+    require_native_registry_creator();
     // Intentionally leaked: prevents use-after-destroy when GCD callbacks
     // fire during process teardown (after atexit handlers run).
     static instance_registry* reg = new instance_registry();
+    reg->require_creator_process();
     return *reg;
 }
 
 cross_process_notifier* instance_registry::get_or_create_notifier(const std::string& path) {
+    require_creator_process();
     // No cross-PROCESS notifier for any memory path (incl. named shared-cache
     // URIs): memory DBs are process-local; same-process cross-instance
     // delivery rides the instance registry (keyed on the canonical URI).
@@ -314,7 +332,14 @@ void lattice_db::deactivate_projection_pressure() {
     if (current) for (const auto& [_, source] : *current) source->active.store(false);
 }
 
+void lattice_db::note_history_uncaptured_connection() {
+    require_creator_process();
+    detail::ordinary_export_access::note_history_uncaptured(*this);
+}
 std::shared_ptr<database> lattice_db::borrow_read_connection() {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    if(config_.ordinary_context)
+        detail::ordinary_before_open(config_.path,config_.ordinary_context);
     std::shared_ptr<database> writer, reader;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -324,16 +349,27 @@ std::shared_ptr<database> lattice_db::borrow_read_connection() {
     // No SQLite call under the publication mutex. A retired fallback writer
     // stays owned through this test and the caller's entire query.
     if (reader && writer &&
-        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id() &&
-        writer->is_in_transaction()) {
+        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+        // Validate outside the publication mutex, before the native
+        // transaction probe; creator PID alone is not currentness.
+        if(config_.ordinary_context)writer->validate_ordinary_current_();
+        if(writer->is_in_transaction())return writer;
+    }
+    if (reader) {
+        if(config_.ordinary_context)reader->validate_ordinary_current_();
+        return reader;
+    }
+    if (writer) {
+        if(config_.ordinary_context)writer->validate_ordinary_current_();
         return writer;
     }
-    if (reader) return reader;
-    if (writer) return writer;
     throw db_error("read connection unavailable during maintenance");
 }
 
 std::shared_ptr<database> lattice_db::borrow_xproc_read_connection() {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    if(config_.ordinary_context)
+        detail::ordinary_before_open(config_.path,config_.ordinary_context);
     std::shared_ptr<database> writer, reader, xproc;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -341,14 +377,25 @@ std::shared_ptr<database> lattice_db::borrow_xproc_read_connection() {
         reader = read_db_;
         xproc = xproc_read_db_;
     }
-    if (xproc) return xproc;
+    if (xproc) {
+        if(config_.ordinary_context)xproc->validate_ordinary_current_();
+        return xproc;
+    }
     if (reader && writer &&
-        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id() &&
-        writer->is_in_transaction()) {
+        txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+        // Validate outside the publication mutex, before the native
+        // transaction probe; creator PID alone is not currentness.
+        if(config_.ordinary_context)writer->validate_ordinary_current_();
+        if(writer->is_in_transaction())return writer;
+    }
+    if (reader) {
+        if(config_.ordinary_context)reader->validate_ordinary_current_();
+        return reader;
+    }
+    if (writer) {
+        if(config_.ordinary_context)writer->validate_ordinary_current_();
         return writer;
     }
-    if (reader) return reader;
-    if (writer) return writer;
     throw db_error("xproc read connection unavailable during maintenance");
 }
 
@@ -365,6 +412,8 @@ std::vector<database::row_t> lattice_db::query_xproc(
 }
 
 void lattice_db::close_read_db() {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    note_history_uncaptured_connection(); // A removed initial handle may already be retiring off-list.
     std::shared_ptr<database> reader, xproc;
     {
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
@@ -377,6 +426,8 @@ void lattice_db::close_read_db() {
 }
 
 void lattice_db::close_write_db() {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    note_history_uncaptured_connection(); // A removed initial handle may already be retiring off-list.
     if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
         throw db_error("writer close refused during owned recovery install");
     if (detail::managed_route_scope::active_for(this) ||
@@ -421,10 +472,20 @@ std::vector<std::shared_ptr<database>> lattice_db::view_handles() {
 }
 
 void lattice_db::restore_attached_views(database& connection) {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    detail::ordinary_before_open(config_.path,config_.ordinary_context);
     // Caller holds attachment admission; this connection is not published.
     if (!attachment_topology_valid_)
         throw db_error("cannot reopen an incomplete attachment topology");
+    database::attachment_operation managed_operation(config_.busy_timeout_ms);
+    if(config_.ordinary_context&&(connection.txn_hooks_||connection.txn_hooks_external_))
+        throw db_error("managed topology restoration requires unpublished callback-free handle");
     for (const auto& [alias, path] : attached_dbs_) {
+        if(config_.ordinary_context){
+            const auto at=attached_cohort_bindings_.find(alias);
+            if(at==attached_cohort_bindings_.end())throw db_error("managed restoration lost cohort binding");
+            detail::ordinary_cohort_attachment_access::attach(connection,at->second,managed_operation);continue;
+        }
         std::string quoted = "\"";
         for (char c : alias) { quoted += c; if (c == '"') quoted += '"'; }
         quoted += '"';
@@ -436,10 +497,17 @@ void lattice_db::restore_attached_views(database& connection) {
                 throw db_error("attached physical file changed during connection maintenance");
         }
     }
-    for (const auto& [_, sql] : attached_view_sql_) connection.execute(sql);
+    for (const auto& [_, sql] : attached_view_sql_) {
+        if(config_.ordinary_context)connection.execute_attachment_sql(sql,managed_operation);
+        else connection.execute(sql);
+    }
+    if(config_.ordinary_context)managed_operation.finish({});
 }
 
 void lattice_db::reopen_write_db() {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    note_history_uncaptured_connection(); // A staged or displaced connection is not a fixed-field snapshot.
+    detail::ordinary_before_open(config_.path,config_.ordinary_context);
     if(recovery_continuous_)throw db_error("continuous writer replacement requires a new admitted facade");
     if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
         throw db_error("writer reopen refused during owned recovery install");
@@ -457,8 +525,8 @@ void lattice_db::reopen_write_db() {
         revision = connection_revision_;
         previous_writer = db_;
     }
-    auto staged = std::make_shared<database>(config_.path,
-        database::open_mode::read_write, config_.busy_timeout_ms);
+    auto staged = database::make_owned_connection(config_.path,
+        database::open_mode::read_write, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_);
     register_sql_functions(*staged);
     {
         // Never wait behind topology while a caller may own the writer mutex.
@@ -510,6 +578,9 @@ void lattice_db::reopen_write_db() {
 }
 
 void lattice_db::reopen_read_db() {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    note_history_uncaptured_connection(); // A staged or displaced connection is not a fixed-field snapshot.
+    detail::ordinary_before_open(config_.path,config_.ordinary_context);
     if (config_.is_in_memory()) return;
     if (config_.read_only) { request_recovery_refresh(); return; }
     uint64_t revision;
@@ -520,10 +591,10 @@ void lattice_db::reopen_read_db() {
         revision = connection_revision_;
     }
     // No half-pair publication if either open or topology restoration fails.
-    auto reader = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
-    auto xproc = std::make_shared<database>(config_.path,
-        database::open_mode::read_only, config_.busy_timeout_ms);
+    auto reader = database::make_owned_connection(config_.path,
+        database::open_mode::read_only, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_);
+    auto xproc = database::make_owned_connection(config_.path,
+        database::open_mode::read_only, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_);
     // A maintenance caller can already own the writer SQLite mutex. Never
     // wait behind attach while it may be waiting for that writer. A busy
     // topology is an explicit failed reopen, with prior publication intact.
@@ -875,12 +946,14 @@ void lattice_db::setup_change_hook(database& connection) {
         });
 }
 void lattice_db::publish_local_audit_id_(int64_t row_id) {
+    require_creator_process();
     instance_registry::instance().for_each_alive(config_.path,
         [row_id](lattice_db* inst) {
             inst->last_seen_audit_id_.store(row_id, std::memory_order_release);
         });
 }
 void lattice_db::setup_cross_process_notifier() {
+    require_creator_process();
     // Use the shared per-path notifier from instance_registry.
     // Only ONE Darwin listener per path per process — prevents N^2
     // notification amplification when multiple lattice_db instances
@@ -902,6 +975,7 @@ void lattice_db::setup_cross_process_notifier() {
 }
 
 void lattice_db::handle_cross_process_notification() {
+    require_creator_process();
     // KILL-SWITCH: set LATTICE_DISABLE_XPROC=1 to suppress cross-process observer dispatch.
     // Used to diagnose whether xproc notifications cause main-thread stalls.
     static bool disabled = (std::getenv("LATTICE_DISABLE_XPROC") != nullptr);
@@ -1169,23 +1243,37 @@ void lattice_db::handle_cross_process_notification() {
 // Synchronizer registry — at most one synchronizer per {path, key}
 // Used for both WSS (key = websocket_url) and IPC (key = channel name).
 static std::mutex& sync_registry_mutex() {
+    // Preserve the existing intentionally retained owner. Never access its
+    // inherited mutex/reservations from the child, even through a new wrapper.
+    require_native_registry_creator();
     // Intentionally leaked: prevents use-after-destroy when destructors
     // run during process teardown (static destruction order is undefined).
     static auto* m = new std::mutex();
     return *m;
 }
 static std::set<std::pair<std::string, std::string>>& active_sync_keys() {
+    require_native_registry_creator();
     // Intentionally leaked: same reason as sync_registry_mutex.
     static auto* s = new std::set<std::pair<std::string, std::string>>();
     return *s;
 }
 
+static void validate_ordinary_reservation_input(ordinary_sync_policy mode,const std::string& model_profile) {
+    if(mode!=ordinary_sync_policy::legacy_provisional&&mode!=ordinary_sync_policy::ordered_required&&mode!=ordinary_sync_policy::ordered_history_required)throw db_error("unknown ordinary sync policy");
+    if(!model_profile.empty()&&mode==ordinary_sync_policy::legacy_provisional)throw db_error("model negotiation requires explicit ordinary ordering policy");
+    if(!model_profile.empty()&&(model_profile.size()>64||!std::all_of(model_profile.begin(),model_profile.end(),[](unsigned char c){return (c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='.';})))throw db_error("invalid configured model selector");
+}
+
 struct detail::sync_policy_reservation {
     const std::string policy;
-    explicit sync_policy_reservation(std::string value):policy(std::move(value)){}
+    const ordinary_sync_policy ordinary;
+    const std::string model_profile;
+    sync_policy_reservation(std::string value,ordinary_sync_policy mode,std::string profile):policy(std::move(value)),ordinary(mode),model_profile(std::move(profile)){}
 };
 static std::shared_ptr<const detail::sync_policy_reservation> reserve_sync_policy(
-    const std::string& path,const std::string& url,const std::string& policy) {
+    const std::string& path,const std::string& url,const std::string& policy,ordinary_sync_policy ordinary,const std::string& model_profile) {
+    require_native_registry_creator();
+    validate_ordinary_reservation_input(ordinary,model_profile);
     // Match the existing process-local sync key spelling. This is policy
     // agreement, not filesystem custody or cross-process authorization.
     using key=std::pair<std::string,std::string>;
@@ -1198,20 +1286,22 @@ static std::shared_ptr<const detail::sync_policy_reservation> reserve_sync_polic
     auto& slot=(*entries)[{path,url}];
     auto current=slot.lock();
     if(current) {
-        if(current->policy!=policy)throw db_error("WSS owners have different recovery source expectations");
+        if(current->policy!=policy||current->ordinary!=ordinary||current->model_profile!=model_profile)throw db_error("WSS owners have different source or ordinary ordering policies");
         return current;
     }
-    auto admitted=std::make_shared<const detail::sync_policy_reservation>(policy);
+    auto admitted=std::make_shared<const detail::sync_policy_reservation>(policy,ordinary,model_profile);
     slot=admitted;
     return admitted;
 }
 
 bool lattice_db::try_register_sync_key(const std::string& path, const std::string& key) {
+    require_native_registry_creator();
     std::lock_guard<std::mutex> lock(sync_registry_mutex());
     return active_sync_keys().emplace(path, key).second;
 }
 
 void lattice_db::unregister_sync_key(const std::string& path, const std::string& key) {
+    require_native_registry_creator();
     std::lock_guard<std::mutex> lock(sync_registry_mutex());
     active_sync_keys().erase({path, key});
 }
@@ -1229,7 +1319,26 @@ static std::vector<std::string> collect_all_sync_ids(const configuration& config
     return ids;
 }
 
+#ifndef __EMSCRIPTEN__
+std::shared_ptr<const detail::sync_policy_reservation> detail::reserve_managed_wss_policy(
+    const lattice_db& owner,const std::string& endpoint,const std::string& model_profile){
+    require_native_registry_creator();
+    validate_ordinary_reservation_input(ordinary_sync_policy::ordered_required,model_profile);
+    return reserve_sync_policy(owner.config().path,endpoint,{},ordinary_sync_policy::ordered_required,model_profile);
+}
+
+std::shared_ptr<const detail::sync_policy_reservation> detail::reserve_history_receiver_policy(
+    const lattice_db& owner,const std::string& endpoint,const std::string& model_profile){
+    require_native_registry_creator();
+    validate_ordinary_reservation_input(ordinary_sync_policy::ordered_history_required,model_profile);
+    return reserve_sync_policy(owner.config().path,endpoint,{},ordinary_sync_policy::ordered_history_required,model_profile);
+}
+#endif
+
 void lattice_db::setup_sync_if_configured() {
+    require_creator_process();
+    if(config_.managed_product_credentials)throw db_error("Managed WSS requires the private post-enrollment owner path");
+    validate_ordinary_reservation_input(config_.ordinary_policy,config_.ordinary_model_profile);
     if(recovery_continuous_) {if(config_.is_sync_enabled())detail::recovery_continuous_producer::setup_configured_route(*this);return;}
     if (!config_.is_sync_enabled()) {
         return;
@@ -1238,7 +1347,7 @@ void lattice_db::setup_sync_if_configured() {
     // Reserve before flock, instance registration or synchronizer publication.
     // A same-policy dormant owner keeps this token for its eventual handoff;
     // an in-flight constructor is visible even before its lattice is registered.
-    if(!sync_policy_)sync_policy_=reserve_sync_policy(config_.path,config_.websocket_url,config_.recovery_source_expectation);
+    if(!sync_policy_)sync_policy_=reserve_sync_policy(config_.path,config_.websocket_url,config_.recovery_source_expectation,config_.ordinary_policy,config_.ordinary_model_profile);
     bool registered_key=false;
     try {
 #ifndef __EMSCRIPTEN__
@@ -1312,6 +1421,9 @@ void lattice_db::setup_sync_if_configured() {
     sync_config sync_cfg;
     sync_cfg.websocket_url = config_.websocket_url;
     sync_cfg.authorization_token = config_.authorization_token;
+    sync_cfg.managed_product_credentials = config_.managed_product_credentials;
+    sync_cfg.ordinary_policy = config_.ordinary_policy;
+    sync_cfg.ordinary_model_profile = config_.ordinary_model_profile;
     sync_cfg.recovery_source_expectation = config_.recovery_source_expectation;
     sync_cfg.sync_filter = config_.sync_filter;
 
@@ -1346,7 +1458,10 @@ void lattice_db::setup_sync_if_configured() {
                                  std::make_shared<std_thread_scheduler>());
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
-    auto sync_db = std::make_unique<lattice_db>(sync_db_config);
+    sync_db_config.ordinary_context = config_.ordinary_context;
+    auto sync_db = (config_.ordinary_policy==ordinary_sync_policy::ordered_required||config_.ordinary_policy==ordinary_sync_policy::ordered_history_required)
+        ?detail::ordinary_export_access::child(*this,sync_db_config)
+        :std::make_unique<lattice_db>(sync_db_config);
 
     // Debug: verify sync db can see model tables
     LOG_INFO("lattice_db", "sync_db created for path=%s", sync_db_config.path.c_str());
@@ -1402,6 +1517,7 @@ void lattice_db::setup_sync_if_configured() {
 }
 
 void lattice_db::setup_ipc_if_configured() {
+    require_creator_process();
     if(config_.is_ipc_enabled())detail::recovery_continuous_producer::require_no_continuous_route(*this);
 #ifndef __EMSCRIPTEN__
     if (!config_.is_ipc_enabled()) {
@@ -1493,6 +1609,7 @@ void lattice_db::setup_ipc_if_configured() {
                                             std::make_shared<std_thread_scheduler>());
                 ipc_db_config.target_schema_version = config_.target_schema_version;
                 ipc_db_config.migration_block = config_.migration_block;
+                ipc_db_config.ordinary_context = config_.ordinary_context;
                 auto ipc_db = std::make_unique<lattice_db>(ipc_db_config);
 
                 LOG_INFO("ipc_sync", "[%s] Creating synchronizer (replacing old=%p)",
@@ -1604,6 +1721,8 @@ void lattice_db::attach(lattice_db &lattice) {
 }
 
 void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const void> metadata) {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    detail::ordinary_require_creator(lattice.config_.ordinary_context);
     database::attachment_operation operation(config_.busy_timeout_ms, lattice.config_.busy_timeout_ms);
     std::exception_ptr primary;
     try {
@@ -1615,6 +1734,12 @@ void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const
 
 void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<const void>& metadata,
                                          database::attachment_operation& operation) {
+    detail::ordinary_require_creator(config_.ordinary_context);
+    detail::ordinary_require_creator(lattice.config_.ordinary_context);
+    if((config_.ordinary_context||lattice.config_.ordinary_context)&&
+        (!ordinary_managed_profile_.load()||!lattice.ordinary_managed_profile_.load()))
+        throw db_error("managed attachment requires both actual enrolled profiles");
+    if(!config_.ordinary_context&&!lattice.config_.ordinary_context)detail::ordinary_require_no_attachment({});
     if(recovery_continuous_||lattice.recovery_continuous_)throw db_error("continuous attachment topology requires admitted same-file facades");
     if (detail::managed_route_scope::active_for(this))
         throw db_error("attach: topology mutation during managed scalar access");
@@ -1675,6 +1800,12 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
             if (existing_path == lattice.config_.path) {
                 if (!attached_route_tokens_.count(alias))
                     throw std::runtime_error("attach: incomplete prior topology change; detach before retry");
+                if(config_.ordinary_context){
+                    const auto at=attached_cohort_bindings_.find(alias);
+                    if(at==attached_cohort_bindings_.end())throw db_error("managed retained binding missing");
+                    detail::ordinary_cohort_attachment_access::validate_target(at->second,source_identity,operation.deadline);
+                    validate_source();auto lock=operation.lock(connection_ownership_mutex_);validate_recipient_locked();operation.check();
+                }
                 return;
             }
             throw std::runtime_error(
@@ -1738,6 +1869,19 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
     if (next_attachment_token_ == std::numeric_limits<int64_t>::max())
         throw std::runtime_error("attach: attachment generation exhausted");
     const int64_t token = next_attachment_token_++;
+    const auto recipient_identity=(config_.ordinary_context||lattice.config_.ordinary_context)?
+        writer->attachment_physical_identity(operation):std::shared_ptr<const physical_store_identity>{};
+    auto cohort=detail::ordinary_cohort_attachment_access::bind(*this,lattice,alias,token,source_identity,recipient_identity,operation);
+    if(cohort){
+        for(const auto& handle:handles)
+            for(const auto& present:handle->query_attachment_text_metadata("PRAGMA database_list","name",operation))
+                if(present==alias)throw db_error("managed alias already exists");
+        if(attached_cohort_bindings_.contains(alias))throw db_error("managed unfinished custody retained");
+        bool path_added=false,alias_added=false;
+        try{attached_dbs_.emplace_back(alias,lattice.config_.path);path_added=true;
+            attached_aliases_.push_back(alias);alias_added=true;attached_cohort_bindings_.emplace(alias,cohort);}
+        catch(...){if(alias_added)attached_aliases_.pop_back();if(path_added)attached_dbs_.pop_back();throw;}
+    }
     attachment_topology_valid_ = false;
     cancel_projection_reads(projection_status::snapshot_expired);
     try {
@@ -1753,7 +1897,9 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
                 if (c == '\"') escaped_alias += '\"';
             }
             const std::string attach_sql = "ATTACH DATABASE '" + escaped_path + "' AS \"" + escaped_alias + "\"";
-            if (handle.get() == writer.get())
+            if(cohort){const auto observed=detail::ordinary_cohort_attachment_access::attach(*handle,cohort,operation);
+                if(handle.get()==writer.get())actual_identity=observed;
+            } else if (handle.get() == writer.get())
                 actual_identity = handle->attach_and_capture_identity(attach_sql, alias, operation);
             else
                 handle->execute_attachment_sql(attach_sql, operation);
@@ -1766,8 +1912,8 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
             replace_projection_pressure_source(alias, {});
         }
         attached_route_tokens_[alias] = token;
-        attached_dbs_.emplace_back(alias, lattice.config_.path);
-        attached_aliases_.push_back(alias);
+        if(!cohort){attached_dbs_.emplace_back(alias, lattice.config_.path);attached_aliases_.push_back(alias);}
+        if(cohort)detail::ordinary_cohort_attachment_access::validate(cohort,operation.deadline);
         rebuild_attached_views(handles, operation);
         validate_source();
         auto publication_lock = operation.lock(connection_ownership_mutex_);
@@ -1787,6 +1933,7 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
 }
 
 void lattice_db::detach(lattice_db &lattice) {
+    detail::ordinary_require_creator(config_.ordinary_context);
     database::attachment_operation operation(config_.busy_timeout_ms);
     std::exception_ptr primary;
     try {
@@ -1808,6 +1955,8 @@ void lattice_db::detach(lattice_db &lattice) {
                 alias = it->first;
                 auto route = attached_route_tokens_.find(alias);
                 if (route != attached_route_tokens_.end()) token = route->second;
+                else if(auto at=attached_cohort_bindings_.find(alias);at!=attached_cohort_bindings_.end())
+                    token=detail::ordinary_cohort_attachment_access::token(at->second);
             }
             detach_alias_if_current(alias, lattice.config_.path, token, operation);
         }();
@@ -1816,6 +1965,7 @@ void lattice_db::detach(lattice_db &lattice) {
 }
 
 void lattice_db::detach_alias(const std::string& alias) {
+    detail::ordinary_require_creator(config_.ordinary_context);
     database::attachment_operation operation(config_.busy_timeout_ms);
     std::exception_ptr primary;
     try {
@@ -1828,6 +1978,7 @@ void lattice_db::detach_alias(const std::string& alias) {
 void lattice_db::detach_alias_if_current(const std::string& alias,
                                         const std::optional<std::string>& expected_path,
                                         std::optional<int64_t> expected_token) {
+    detail::ordinary_require_creator(config_.ordinary_context);
     database::attachment_operation operation(config_.busy_timeout_ms);
     std::exception_ptr primary;
     try {
@@ -1841,6 +1992,7 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
                                         const std::optional<std::string>& expected_path,
                                         std::optional<int64_t> expected_token,
                                         database::attachment_operation& operation) {
+    detail::ordinary_require_creator(config_.ordinary_context);
     if (detail::managed_route_scope::active_for(this))
         throw db_error("detach: topology mutation during managed scalar access");
     std::vector<std::shared_ptr<database>> handles;
@@ -1862,7 +2014,10 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
         [&](const auto& entry) { return entry.first == alias; });
     if (it == attached_dbs_.end()) return;  // idempotent no-op
     auto route = attached_route_tokens_.find(alias);
-    const int64_t token = route == attached_route_tokens_.end() ? -1 : route->second;
+    const auto at=attached_cohort_bindings_.find(alias);
+    const auto cohort=at==attached_cohort_bindings_.end()?detail::ordinary_cohort_attachment{}:at->second;
+    const int64_t token = route == attached_route_tokens_.end() ?
+        (cohort?detail::ordinary_cohort_attachment_access::token(cohort):-1):route->second;
     if ((expected_path && it->second != *expected_path) ||
         (expected_token && token != *expected_token)) return;
 
@@ -1893,7 +2048,8 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
     for (const auto& handle : handles) {
         for (;;) {
             try {
-                handle->execute_attachment_sql("DETACH DATABASE " + quoted_attach_alias(alias), operation);
+                if(cohort)detail::ordinary_cohort_attachment_access::detach(*handle,cohort,token,operation);
+                else handle->execute_attachment_sql("DETACH DATABASE " + quoted_attach_alias(alias), operation);
                 break;
             } catch (const db_error& e) {
                 const std::string msg = e.what();
@@ -1906,6 +2062,7 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
     }
 
     attached_projection_identities_.erase(alias);
+    attached_cohort_bindings_.erase(alias);
     replace_projection_pressure_source(alias, {});
     attached_dbs_.erase(it);
     attached_aliases_.erase(

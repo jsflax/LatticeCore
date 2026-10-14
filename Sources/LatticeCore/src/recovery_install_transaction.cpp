@@ -1,4 +1,5 @@
 #include "recovery_writer_access.hpp"
+#include "ordinary_history_final_install.hpp"
 #include "receive_delivery_guard.hpp"
 #include "recovery_admission_test_probe.hpp"
 
@@ -441,9 +442,44 @@ void reset_sync_channel_with_producer_fence(lattice_db& owner,const std::string&
     recovery_writer_access::reset_channel(owner,channel,retire);
 }
 
+// Recovery entry retains its real shared owner; the separate synchronous
+// ordinary entry has the existing caller-outlives-call C++ reference contract.
+// Both run this same engine to completion, including off-lock notification.
+struct recovery_writer_access::install_owner {
+    std::shared_ptr<lattice_db> retained;
+    lattice_db* pointer=nullptr;
+    explicit install_owner(std::shared_ptr<lattice_db> owner)
+        :retained(std::move(owner)),pointer(retained.get()){}
+    explicit install_owner(lattice_db& owner) noexcept:pointer(&owner){}
+    install_owner(install_owner&&) noexcept=default;
+    install_owner(const install_owner&)=delete;
+    lattice_db* get()const noexcept{return pointer;}
+    lattice_db* operator->()const noexcept{return pointer;}
+    lattice_db& operator*()const noexcept{return *pointer;}
+    explicit operator bool()const noexcept{return pointer!=nullptr;}
+};
+
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
     const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
     const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try) {
+    return install_owned_impl(install_owner{std::move(owner)},body,after_unlock,after_writer_capture,
+                              initial_admission_busy,controller_try);
+}
+
+recovery_install_result recovery_writer_access::ordinary_owned_write(lattice_db& owner,
+    const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
+    const std::function<void()>& after_writer_capture) {
+    return install_owned_impl(install_owner{owner},body,after_unlock,after_writer_capture,nullptr,false);
+}
+
+recovery_install_result recovery_writer_access::ordinary_owned_history_write(lattice_db& owner,
+    const std::function<void(database&)>& body,const ordinary_history_final_install_guard& guard) {
+    return install_owned_impl(install_owner{owner},body,{},{},nullptr,false,&guard);
+}
+
+recovery_install_result recovery_writer_access::install_owned_impl(install_owner owner,
+    const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
+    const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try, const ordinary_history_final_install_guard* final_guard) {
     recovery_install_result result;
     if (initial_admission_busy) *initial_admission_busy = false;
     std::shared_ptr<database> writer;
@@ -589,6 +625,14 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
                 // still pins its view. After COMMIT another handle may write.
                 owner->flush_changes_once_impl(writer.get(), &batch);
                 if (!current_body()) throw db_error("recovery install lost body ownership before finalization");
+                // Specific closed restart/session/staged-cut owner check. Default
+                // installs keep their original admitted-close settlement contract.
+                // A later close may still race COMMIT; durable and current results
+                // are classified independently by the caller after real settlement.
+                if (final_guard) {
+                    final_guard->validate(*owner,*writer);
+                    if (!current_body()) throw db_error("history final validation lost body ownership");
+                }
                 settlement.policy = database::sync_apply_chunk_state::commit_policy::owner_finalizing;
                 own_commit_started = true;
                 writer->commit();
@@ -644,7 +688,7 @@ recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lat
     // Payloads and callback copies likewise die outside those scopes.
     if (result.state == recovery_install_state::committed) {
         try {
-            if (after_unlock) after_unlock(); // private deterministic test rendezvous only
+            if (after_unlock) after_unlock(); // private committed publication/test boundary, before delivery
             deliver(*owner, batch);
         } catch (...) { result.postcommit_error = std::current_exception(); }
     } else if (writer && settlement.state != phase::not_started) {

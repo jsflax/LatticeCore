@@ -1142,7 +1142,7 @@ extern "C" char* lattice_db_events_after(lattice_db_t* db, const char* checkpoin
             checkpoint = std::string(checkpoint_global_id);
         }
 
-        auto entries = lattice::events_after(db_ref->get()->db(), checkpoint);
+        auto entries = lattice::events_after_provisional(db_ref->get()->db(), checkpoint);
 
         // Convert to JSON array
         nlohmann::json result = nlohmann::json::array();

@@ -189,6 +189,8 @@ struct recovery_refresh_worker {
 #endif
 
 std::shared_ptr<recovery_refresh_state> recovery_refresh_access::state(lattice_db& owner, bool create) {
+    ordinary_require_creator(owner.config_.ordinary_context);
+    ordinary_before_open(owner.config_.path,owner.config_.ordinary_context);
     auto fresh = create ? std::make_shared<recovery_refresh_state>() : nullptr;
     std::lock_guard<std::mutex> lock(owner.connection_ownership_mutex_);
     if (owner.closed_.load()) return {};
@@ -249,6 +251,7 @@ void recovery_refresh_access::subscriptions_changed(lattice_db& owner) {
     request(owner);
 }
 void recovery_refresh_access::request(lattice_db& owner) noexcept {
+    if(!ordinary_creator_current({}))return;
 #ifndef __EMSCRIPTEN__
     try {
         auto shared = state(owner, false);
@@ -260,6 +263,7 @@ void recovery_refresh_access::request(lattice_db& owner) noexcept {
 #endif
 }
 void recovery_refresh_access::signal(const std::shared_ptr<recovery_refresh_state>& shared) noexcept {
+    if(!ordinary_creator_current({}))return;
 #ifndef __EMSCRIPTEN__
     try {
         bool manual;
@@ -329,6 +333,7 @@ void recovery_refresh_test_access::use_manual_preparation(lattice_db& owner) {
     shared->manual = true;
 }
 void recovery_refresh_access::process(const std::shared_ptr<recovery_refresh_state>& shared) noexcept {
+    if(!ordinary_creator_current({}))return;
 #ifndef __EMSCRIPTEN__
     try {
         {
@@ -372,6 +377,8 @@ void recovery_refresh_access::process(const std::shared_ptr<recovery_refresh_sta
 }
 
 std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattice_db& owner, const std::shared_ptr<recovery_refresh_state>& shared) {
+    ordinary_require_creator(owner.config_.ordinary_context);
+    ordinary_before_open(owner.config_.path,owner.config_.ordinary_context);
     uint64_t subscription_revision, connection_revision, managed_revision;
     std::optional<recovery_witness> acknowledged;
     std::shared_ptr<database> probe, writer;
@@ -391,7 +398,8 @@ std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattic
     }
     if (!writer) return std::nullopt;
     if (!probe) {
-        probe = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */);
+        owner.note_history_uncaptured_connection(); // Before this reader exists off the published connection fields.
+        probe = database::make_owned_connection(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */, std::shared_ptr<database_read_control>{}, owner.config_.ordinary_context,owner.connection_ledger_);
         std::lock_guard<std::mutex> lock(shared->mutex);
         shared->probe_reader = probe;
     }
@@ -450,7 +458,8 @@ std::optional<recovery_refresh_prepared> recovery_refresh_access::prepare(lattic
     const auto probe_identity = probe->physical_identity("main", {}, true);
     if (!writer_identity || !probe_identity || !(*probe_identity == *writer_identity))
         throw db_error("recovery refresh physical store changed");
-    auto fresh = std::make_shared<database>(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */);
+    owner.note_history_uncaptured_connection(); // Retired/replacement readers require a future per-open ledger.
+    auto fresh = database::make_owned_connection(owner.config_.path, database::open_mode::read_only, 0 /* background probe retries instead of sleeping in SQLite busy handling */, std::shared_ptr<database_read_control>{}, owner.config_.ordinary_context,owner.connection_ledger_);
     const auto fresh_identity = fresh->physical_identity("main", {}, true);
     if (!fresh_identity || !(*fresh_identity == *writer_identity))
         throw db_error("recovery refresh reader physical store changed");

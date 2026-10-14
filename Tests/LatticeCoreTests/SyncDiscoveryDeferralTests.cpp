@@ -4,8 +4,15 @@
 #include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
 #include "../../Sources/LatticeCore/src/recovery_export_adapter.hpp"
 #include "../../Sources/LatticeCore/src/receive_delivery_guard.hpp"
+#include "../../Sources/LatticeCore/src/ordinary_managed_wss_owner.hpp"
+#include "../../Sources/LatticeCore/src/ordinary_wire_test_hooks.hpp"
 #include <future>
 #include <deque>
+#ifndef __EMSCRIPTEN__
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 namespace {
 using namespace lattice;
@@ -112,6 +119,14 @@ struct sync_discovery_test_access {
     static void disconnected(synchronizer_base& sync){sync.is_connected_=false;}
     static void filter(synchronizer_base& sync){sync.config_.sync_filter=std::vector<sync_filter_entry>{{"TestPerson",std::nullopt}};}
     static size_t in_flight(synchronizer_base& sync){std::lock_guard<std::mutex> lock(sync.in_flight_mutex_);return sync.in_flight_ids_.size();}
+    struct scan_observation {bool completed;size_t entries;bool hit_limit;int64_t horizon;};
+    static scan_observation scan(synchronizer_base& sync){
+        const auto pass=sync.query_pending_entries();
+        return {pass.state==synchronizer_base::pending_entries_scan::outcome::completed,
+            pass.entries.size(),pass.enumeration_hit_limit,pass.horizon};
+    }
+    static void upload_pass(synchronizer_base& sync){sync.upload_pending_changes();}
+    static bool waiting(synchronizer_base& sync){return sync.ordinary_scan_incomplete_.load(std::memory_order_acquire);}
 };
 }
 namespace {
@@ -673,3 +688,301 @@ TEST(SyncDiscoveryDeferral, FreshSuccessorSchedulerRejectionRetainsDemandAndCann
     EXPECT_TRUE(q.failed(1));EXPECT_TRUE(q.pending(1));EXPECT_EQ(successor.use_count(),2);
     EXPECT_EQ(work->completion->read().state,sync_discovery_completion::outcome::completed);q.cancel(3);EXPECT_EQ(successor.use_count(),1);
 }
+
+#ifndef __EMSCRIPTEN__
+namespace {
+struct ordinary_config_publication_probe final {
+    unsigned handler_sets=0,connects=0,sends=0,disconnects=0,destroyed=0;
+};
+struct ordinary_config_refusal_transport final:lattice::sync_transport {
+    std::shared_ptr<ordinary_config_publication_probe> probe;
+    explicit ordinary_config_refusal_transport(std::shared_ptr<ordinary_config_publication_probe> value):probe(std::move(value)){}
+    ~ordinary_config_refusal_transport()override{++probe->destroyed;}
+    void connect(const std::string&,const std::map<std::string,std::string>&)override{++probe->connects;}
+    void disconnect()override{++probe->disconnects;}
+    lattice::transport_state state()const override{return lattice::transport_state::closed;}
+    bool supports_reconnect()const override{return false;}
+    void send(const lattice::transport_message&)override{++probe->sends;}
+    void set_on_open(on_open_handler)override{++probe->handler_sets;}
+    void set_on_message(on_message_handler)override{++probe->handler_sets;}
+    void set_on_error(on_error_handler)override{++probe->handler_sets;}
+    void set_on_close(on_close_handler)override{++probe->handler_sets;}
+};
+void actual_ordinary_config_refusal(lattice::sync_config config,const char* expected) {
+    auto probe=std::make_shared<ordinary_config_publication_probe>();
+    lattice::configuration storage(":memory:");storage.audit_retention_seconds=0;
+    storage.sched=std::make_shared<lattice::immediate_scheduler>();
+    auto actual=std::make_unique<lattice::lattice_db>(storage);
+    bool refused=false;
+    try {
+        auto sync=std::make_unique<lattice::synchronizer>(std::move(actual),config,
+            std::make_unique<ordinary_config_refusal_transport>(probe));
+        ADD_FAILURE()<<"actual retained constructor accepted a forbidden ordinary selector";
+    }catch(const lattice::db_error& error){refused=true;EXPECT_EQ(std::string(error.what()),expected);}
+    EXPECT_TRUE(refused);EXPECT_EQ(probe->handler_sets,0u);EXPECT_EQ(probe->connects,0u);
+    EXPECT_EQ(probe->sends,0u);EXPECT_EQ(probe->disconnects,0u);EXPECT_EQ(probe->destroyed,1u);
+}
+}
+TEST(OrdinaryCurrentSynchronizerConfig, ActualOrderedZeroChunkRefusesBeforeTransportPublication) {
+    lattice::sync_config config;config.ordinary_policy=lattice::ordinary_sync_policy::ordered_required;
+    config.chunk_size=0;config.sync_id="wss:ordinary-config-refusal";
+    config.websocket_url="wss://ordinary-config-refusal.invalid";
+    actual_ordinary_config_refusal(config,"ordered ordinary sync requires nonzero chunk size");
+}
+TEST(OrdinaryCurrentSynchronizerConfig, ActualUnknownPolicyRefusesBeforeTransportPublication) {
+    lattice::sync_config config;config.ordinary_policy=static_cast<lattice::ordinary_sync_policy>(255);
+    config.sync_id="wss:ordinary-config-refusal";config.websocket_url="wss://ordinary-config-refusal.invalid";
+    actual_ordinary_config_refusal(config,"unknown ordinary sync policy");
+}
+TEST(OrdinaryCurrentSynchronizerConfig, ActualModelSelectionOnLegacyRefusesBeforeTransportPublication) {
+    lattice::sync_config config;config.ordinary_model_profile="engram-personal-v1";
+    config.sync_id="wss:ordinary-config-refusal";config.websocket_url="wss://ordinary-config-refusal.invalid";
+    actual_ordinary_config_refusal(config,"model negotiation requires explicit ordinary ordering policy");
+}
+#endif
+
+#ifndef __EMSCRIPTEN__
+#include <nlohmann/json.hpp>
+namespace {
+// Mechanical native transport boundary only. The real adapter owns its actual
+// dial/endpoint/terminal fences; this fixture is not OS TLS, a server issuer,
+// managed enrollment, a cut, a RESULT, or positive product recovery proof.
+struct ordinary_scan_peer {
+    std::mutex mutex;std::vector<lattice::platform_transport_callbacks> endpoints;
+    std::vector<std::string> sent;
+    std::unique_ptr<lattice::sync_transport> transport(){
+        return std::unique_ptr<lattice::sync_transport>(lattice::make_system_tls_platform_sync_transport(this,
+            [](void* p,const void*,const void*,const void* ep){auto& s=*static_cast<ordinary_scan_peer*>(p);std::lock_guard lock(s.mutex);s.endpoints.push_back(*static_cast<const lattice::platform_transport_callbacks*>(ep));},
+            [](void*){},[](void* p,const void* frame,const void*){auto& s=*static_cast<ordinary_scan_peer*>(p);std::lock_guard lock(s.mutex);s.sent.push_back(static_cast<const lattice::transport_message*>(frame)->as_string());},
+            [](void*){},this,[](void*,const void*,const void*)->int32_t{return 1;},[](void*){}));
+    }
+    lattice::platform_transport_callbacks endpoint(size_t n){std::lock_guard lock(mutex);return endpoints.at(n);}
+    std::vector<nlohmann::json> controls(const char* kind){
+        std::vector<nlohmann::json> out;std::lock_guard lock(mutex);
+        for(const auto& raw:sent){const auto v=nlohmann::json::parse(raw);if(v.contains("latticeOrdinarySync")&&v["latticeOrdinarySync"].value("kind","")==kind)out.push_back(v["latticeOrdinarySync"]);}return out;
+    }
+};
+struct ordinary_scan_fixture {
+    static constexpr const char* url="wss://ordinary-scan.invalid/relay";
+    const std::string channel=std::string("wss:")+url;
+    std::shared_ptr<discovery_stage_scheduler> scheduler=std::make_shared<discovery_stage_scheduler>();
+    std::shared_ptr<ordinary_scan_peer> peer=std::make_shared<ordinary_scan_peer>();
+    std::shared_ptr<lattice::lattice_db> owner;
+    std::unique_ptr<lattice::synchronizer> sync;
+    explicit ordinary_scan_fixture(bool row=false,bool resolved=false){
+        lattice::configuration storage(":memory:");storage.audit_retention_seconds=0;storage.busy_timeout_ms=100;storage.sched=scheduler;
+        auto db=std::make_unique<lattice::lattice_db>(storage);
+        if(row){db->add(TestPerson{"actual-unsent",1,std::nullopt});if(resolved)db->db().execute("UPDATE AuditLog SET isSynchronized=1");}
+        lattice::sync_config config;config.sync_id=channel;config.websocket_url=url;
+        config.ordinary_policy=lattice::ordinary_sync_policy::ordered_required;config.chunk_size=10;
+        config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;
+        sync=std::make_unique<lattice::synchronizer>(std::move(db),config,peer->transport());
+        owner=lattice::detail::sync_discovery_test_access::owner(*sync);
+    }
+    ~ordinary_scan_fixture(){sync.reset();owner.reset();}
+    void drain(){if(!scheduler->drain_current())throw std::runtime_error("bounded actual scan scheduler did not settle");}
+    void owned(std::function<void()> work){
+        auto done=std::make_shared<std::promise<void>>();auto future=done->get_future();
+        lattice::detail::sync_discovery_test_access::schedule(*sync,[done,work=std::move(work)]{try{work();done->set_value();}catch(...){done->set_exception(std::current_exception());}});
+        if(!scheduler->run_until([&]{return future.wait_for(std::chrono::seconds(0))==std::future_status::ready;}))throw std::runtime_error("bounded actual scan owner turn did not settle");
+        future.get();drain();
+    }
+    void open(size_t index=0){sync->connect();drain();if(!peer->endpoint(index).trigger_on_open())throw std::runtime_error("actual physical scan open refused");drain();}
+    void offer(size_t index=0){
+        const auto request=peer->controls("request");if(request.size()!=index+1)throw std::runtime_error("actual scan request absent");
+        const auto raw=nlohmann::json{{"latticeOrdinarySync",{{"version",2},{"kind","offer"},{"request",request.back().at("request")},{"uploadObservation",1},{"uploadAcknowledgment",1}}}}.dump();
+        if(!peer->endpoint(index).trigger_on_message(lattice::transport_message::from_string(raw)))throw std::runtime_error("actual correlated scan offer refused");drain();
+    }
+    int64_t floor(){return lattice::read_upload_floor(owner->db(),channel);}
+    int64_t horizon(){return std::get<int64_t>(owner->db().query("SELECT MAX(id) AS m FROM AuditLog").at(0).at("m"));}
+};
+}
+TEST(OrdinaryCurrentUploadScan, ActualInitialPreOfferRetainsFloorAndOfferWakesUnsentEnumeration) {
+    ordinary_scan_fixture f(true);f.open();ASSERT_GT(f.horizon(),0);EXPECT_EQ(f.floor(),0);
+    f.owned([&]{const auto scan=lattice::detail::sync_discovery_test_access::scan(*f.sync);
+        EXPECT_FALSE(scan.completed);EXPECT_EQ(scan.entries,0u);EXPECT_EQ(scan.horizon,0);
+        lattice::detail::sync_discovery_test_access::upload_pass(*f.sync);
+        EXPECT_TRUE(lattice::detail::sync_discovery_test_access::waiting(*f.sync));});
+    EXPECT_EQ(f.floor(),0);EXPECT_TRUE(f.peer->controls("upload").empty());
+    f.offer();EXPECT_EQ(f.floor(),0);ASSERT_FALSE(f.peer->controls("upload").empty());
+    EXPECT_FALSE(f.owner->db().query("SELECT id FROM AuditLog WHERE isSynchronized=0").empty());
+    f.owned([&]{EXPECT_FALSE(lattice::detail::sync_discovery_test_access::waiting(*f.sync));});
+}
+TEST(OrdinaryCurrentUploadScan, ActualReadyAttemptRetiresBeforeReplacementScanAndCannotProveEmpty) {
+    ordinary_scan_fixture f;f.open();f.offer();
+    f.owned([&]{const auto scan=lattice::detail::sync_discovery_test_access::scan(*f.sync);EXPECT_TRUE(scan.completed);EXPECT_EQ(scan.entries,0u);});
+    ASSERT_TRUE(f.peer->endpoint(0).trigger_on_close(1000,"actual readiness drop"));f.drain();
+    f.owner->add(TestPerson{"pending-after-real-retirement",2,std::nullopt});f.open(1);
+    ASSERT_GT(f.horizon(),0);EXPECT_EQ(f.floor(),0);
+    f.owned([&]{const auto scan=lattice::detail::sync_discovery_test_access::scan(*f.sync);EXPECT_FALSE(scan.completed);EXPECT_EQ(scan.horizon,0);
+        EXPECT_TRUE(lattice::detail::sync_discovery_test_access::waiting(*f.sync));});
+    EXPECT_TRUE(f.peer->controls("upload").empty());f.offer(1);
+    ASSERT_FALSE(f.peer->controls("upload").empty());EXPECT_EQ(f.floor(),0);
+}
+TEST(OrdinaryCurrentUploadScan, ActualCompletedEmptyScanRetainsOriginalHorizonFloorBehavior) {
+    // Storage flags are fixture facts, not an issued result or ACK. This
+    // schedule exercises the existing no-pending selection/floor branch only.
+    ordinary_scan_fixture f(true,true);f.open();ASSERT_GT(f.horizon(),0);EXPECT_EQ(f.floor(),0);
+    f.offer();EXPECT_EQ(f.floor(),f.horizon());EXPECT_TRUE(f.peer->controls("upload").empty());
+    f.owned([&]{const auto scan=lattice::detail::sync_discovery_test_access::scan(*f.sync);
+        EXPECT_TRUE(scan.completed);EXPECT_EQ(scan.entries,0u);EXPECT_FALSE(scan.hit_limit);EXPECT_EQ(scan.horizon,f.horizon());
+        EXPECT_FALSE(lattice::detail::sync_discovery_test_access::waiting(*f.sync));});
+}
+#endif
+
+#ifndef __EMSCRIPTEN__
+namespace {
+class ordinary_parent_setup_network final:public network_factory {
+public:
+    unsigned created=0;
+    const std::shared_ptr<ordinary_config_publication_probe> probe=std::make_shared<ordinary_config_publication_probe>();
+    std::unique_ptr<http_client> create_http_client()override{return std::make_unique<null_http_client>();}
+    std::unique_ptr<sync_transport> create_sync_transport()override{
+        ++created;return std::make_unique<ordinary_config_refusal_transport>(probe);
+    }
+};
+class OrdinaryCurrentNativeSetup:public ::testing::Test {
+protected:
+    TempDB file{"ordinary_parent_setup"};
+    std::shared_ptr<network_factory> prior;
+    const std::shared_ptr<ordinary_parent_setup_network> network=std::make_shared<ordinary_parent_setup_network>();
+    void SetUp()override{prior=get_network_factory();set_network_factory(network);}
+    void TearDown()override{set_network_factory(prior);}
+    configuration config(){configuration value(file.str());value.audit_retention_seconds=0;value.busy_timeout_ms=100;
+        value.websocket_url="wss://ordinary-parent-setup.invalid/sync";value.authorization_token="fixture-token";return value;}
+    void stop_notifier(){if(auto* notifier=instance_registry::instance().get_or_create_notifier(file.str()))notifier->stop_listening();}
+    void expect_parent_refusal(configuration value,const char* expected){
+        lattice_db parent(value,true);stop_notifier();parent.add(TestPerson{"before-refusal",1,std::nullopt});
+        bool refused=false;
+        try{parent.connect_sync();ADD_FAILURE()<<"actual parent setup accepted forbidden ordinary configuration";}
+        catch(const db_error& error){refused=true;EXPECT_EQ(std::string(error.what()),expected);}
+        EXPECT_TRUE(refused);EXPECT_EQ(sync_discovery_test_access::configured(parent),nullptr);
+        EXPECT_EQ(network->created,0u);EXPECT_EQ(network->probe->handler_sets,0u);EXPECT_EQ(network->probe->connects,0u);
+        EXPECT_EQ(std::get<std::string>(parent.db().query("SELECT name FROM TestPerson").at(0).at("name")),"before-refusal");
+        parent.close();configuration reopen(file.str());reopen.audit_retention_seconds=0;lattice_db actual(reopen);stop_notifier();
+        EXPECT_EQ(std::get<std::string>(actual.db().query("SELECT name FROM TestPerson").at(0).at("name")),"before-refusal");
+        actual.close();
+    }
+};
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualParentUnknownPolicyReachesRealConstructorRefusalBeforeFactory) {
+    auto value=config();value.ordinary_policy=static_cast<ordinary_sync_policy>(255);
+    expect_parent_refusal(value,"unknown ordinary sync policy");
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualParentLegacySelectorReachesRealConstructorRefusalBeforeFactory) {
+    auto value=config();value.ordinary_model_profile="engram-personal-v1";
+    expect_parent_refusal(value,"model negotiation requires explicit ordinary ordering policy");
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualScalarAndHistoryReservationsComparePolicySelectorAndEndpoint) {
+    auto value=config();lattice_db parent(value,true);stop_notifier();
+    const auto endpoint=value.websocket_url;
+    auto scalar=detail::reserve_managed_wss_policy(parent,endpoint,"policy-a");
+    auto same=detail::reserve_managed_wss_policy(parent,endpoint,"policy-a");EXPECT_EQ(scalar,same);
+    EXPECT_THROW(detail::reserve_history_receiver_policy(parent,endpoint,"policy-a"),db_error);
+    EXPECT_THROW(detail::reserve_managed_wss_policy(parent,endpoint,"policy-b"),db_error);
+    auto distinct=detail::reserve_history_receiver_policy(parent,endpoint+"/other","policy-a");EXPECT_NE(scalar,distinct);
+    // These are genuine process-local agreement tokens only. No model/source,
+    // enrollment, TLS, cut, result, ACK or prune authority is issued here.
+    EXPECT_THROW(parent.connect_sync(),db_error);EXPECT_EQ(network->created,0u);
+    scalar.reset();same.reset();
+    auto history=detail::reserve_history_receiver_policy(parent,endpoint,"policy-a");
+    auto history_same=detail::reserve_history_receiver_policy(parent,endpoint,"policy-a");EXPECT_EQ(history,history_same);
+    EXPECT_THROW(detail::reserve_managed_wss_policy(parent,endpoint,"policy-a"),db_error);
+    history.reset();history_same.reset();distinct.reset();parent.close();
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualOrderedSetupBorrowsGenuineSameFileChildAndStillRequiresOwnedSDKTransport) {
+    for(const auto policy:{ordinary_sync_policy::ordered_required,ordinary_sync_policy::ordered_history_required}){
+        auto value=config();value.ordinary_policy=policy;lattice_db parent(value,true);stop_notifier();
+        const auto before=parent.db().query("SELECT COUNT(*) AS n FROM TestPerson").at(0).at("n");
+        unsigned opened=0;
+        struct borrowed_hook_scope{
+            std::function<void(lattice_db&)> prior;
+            explicit borrowed_hook_scope(std::function<void(lattice_db&)> hook):prior(std::move(detail::ordinary_wire_test_hooks::after_child_open)){
+                detail::ordinary_wire_test_hooks::after_child_open=std::move(hook);
+            }
+            ~borrowed_hook_scope(){detail::ordinary_wire_test_hooks::after_child_open=std::move(prior);}
+        } hook([&](lattice_db& child){
+            ++opened;EXPECT_NE(&child,&parent);EXPECT_EQ(child.config().path,parent.config().path);
+            EXPECT_EQ(child.config().ordinary_context,parent.config().ordinary_context);
+            EXPECT_TRUE(child.config().websocket_url.empty());EXPECT_TRUE(child.config().ipc_targets.empty());
+            EXPECT_EQ(child.db().query("SELECT COUNT(*) AS n FROM TestPerson").at(0).at("n"),before);
+            // Borrow only: the hook neither retains the child nor fabricates
+            // post-COMMIT origin, managed admission, model/profile or TLS.
+        });
+        bool refused=false;
+        try{parent.connect_sync();ADD_FAILURE()<<"ordinary fixture transport unexpectedly acquired owned SDK authority";}
+        catch(const db_error& error){refused=true;EXPECT_EQ(std::string(error.what()),"ordered-required sync needs the actual owned SDK transport");}
+        EXPECT_TRUE(refused);EXPECT_EQ(opened,1u);EXPECT_EQ(sync_discovery_test_access::configured(parent),nullptr);
+        EXPECT_EQ(network->probe->connects,0u);EXPECT_EQ(network->probe->sends,0u);
+        EXPECT_EQ(parent.db().query("SELECT COUNT(*) AS n FROM TestPerson").at(0).at("n"),before);parent.close();
+    }
+    EXPECT_EQ(network->created,2u);EXPECT_EQ(network->probe->destroyed,2u);
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualLegacySetupKeepsGenericChildAndDefaultEffect) {
+    auto value=config();EXPECT_EQ(value.ordinary_policy,ordinary_sync_policy::legacy_provisional);
+    EXPECT_TRUE(value.ordinary_model_profile.empty());EXPECT_FALSE(value.managed_product_credentials);
+    lattice_db parent(value,true);stop_notifier();unsigned opened=0;
+    struct restore{std::function<void(lattice_db&)> prior;~restore(){detail::ordinary_wire_test_hooks::after_child_open=std::move(prior);}}
+        hook{std::move(detail::ordinary_wire_test_hooks::after_child_open)};
+    detail::ordinary_wire_test_hooks::after_child_open=[&](lattice_db&){++opened;};
+    parent.connect_sync();ASSERT_NE(sync_discovery_test_access::configured(parent),nullptr);
+    sync_discovery_test_access::flush_scheduler(*sync_discovery_test_access::configured(parent));
+    EXPECT_EQ(opened,0u);EXPECT_EQ(network->created,1u);EXPECT_EQ(network->probe->connects,1u);
+    parent.close();EXPECT_EQ(network->probe->destroyed,1u);
+}
+#endif
+
+
+#ifndef __EMSCRIPTEN__
+namespace {
+class ordinary_native_preflight_lock {
+    int fd_=-1;
+public:
+    explicit ordinary_native_preflight_lock(const std::string& path){
+        fd_=::open((path+".sync.lock").c_str(),O_CREAT|O_RDWR,0600);
+        if(fd_<0)throw std::runtime_error("fixture failed to open actual sync lock");
+        if(::flock(fd_,LOCK_EX|LOCK_NB)!=0){::close(fd_);fd_=-1;throw std::runtime_error("fixture failed to hold actual sync lock");}
+    }
+    ~ordinary_native_preflight_lock(){if(fd_>=0){::flock(fd_,LOCK_UN);::close(fd_);}}
+    ordinary_native_preflight_lock(const ordinary_native_preflight_lock&)=delete;
+    ordinary_native_preflight_lock& operator=(const ordinary_native_preflight_lock&)=delete;
+};
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualOverlongSelectorRefusesBeforeBusyStoreCanSkipValidation) {
+    auto value=config();value.ordinary_policy=ordinary_sync_policy::ordered_required;
+    value.ordinary_model_profile=std::string(65,'a');
+    lattice_db parent(value,true);stop_notifier();parent.add(TestPerson{"retained-after-selector-refusal",1,std::nullopt});
+    ordinary_native_preflight_lock held(file.str());
+    bool refused=false;
+    try{parent.connect_sync();ADD_FAILURE()<<"actual busy store skipped selector validation";}
+    catch(const db_error& error){refused=true;EXPECT_EQ(std::string(error.what()),"invalid configured model selector");}
+    EXPECT_TRUE(refused);EXPECT_EQ(network->created,0u);EXPECT_EQ(sync_discovery_test_access::configured(parent),nullptr);
+    EXPECT_EQ(std::get<std::string>(parent.db().query("SELECT name FROM TestPerson").at(0).at("name")),"retained-after-selector-refusal");
+    parent.close();
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualUnknownPolicyRefusesBeforeBusyStoreCanSkipValidation) {
+    auto value=config();value.ordinary_policy=static_cast<ordinary_sync_policy>(255);
+    lattice_db parent(value,true);stop_notifier();ordinary_native_preflight_lock held(file.str());
+    bool refused=false;
+    try{parent.connect_sync();ADD_FAILURE()<<"actual busy store skipped enum validation";}
+    catch(const db_error& error){refused=true;EXPECT_EQ(std::string(error.what()),"unknown ordinary sync policy");}
+    EXPECT_TRUE(refused);EXPECT_EQ(network->created,0u);EXPECT_EQ(sync_discovery_test_access::configured(parent),nullptr);
+    parent.close();
+}
+TEST_F(OrdinaryCurrentNativeSetup, ActualManagedReservationEntriesApplyRealSelectorGrammarBeforeOwningCopy) {
+    auto value=config();lattice_db parent(value,true);stop_notifier();
+    const std::vector<std::string> invalid={std::string(65,'a'),"Uppercase","under_score","contains/slash",std::string("a\0b",3)};
+    for(const auto& selector:invalid){
+        EXPECT_THROW(detail::reserve_managed_wss_policy(parent,value.websocket_url,selector),db_error);
+        EXPECT_THROW(detail::reserve_history_receiver_policy(parent,value.websocket_url,selector),db_error);
+    }
+    auto scalar=detail::reserve_managed_wss_policy(parent,value.websocket_url,std::string(64,'a'));
+    auto same=detail::reserve_managed_wss_policy(parent,value.websocket_url,std::string(64,'a'));EXPECT_EQ(scalar,same);
+    EXPECT_THROW(detail::reserve_history_receiver_policy(parent,value.websocket_url,std::string(64,'a')),db_error);
+    scalar.reset();same.reset();
+    auto history=detail::reserve_history_receiver_policy(parent,value.websocket_url,"a-9.profile");
+    auto same_history=detail::reserve_history_receiver_policy(parent,value.websocket_url,"a-9.profile");EXPECT_EQ(history,same_history);
+    history.reset();same_history.reset();EXPECT_EQ(network->created,0u);parent.close();
+    // Agreement tokens are not managed enrollment, model/TLS/source/cut/ACK authority.
+}
+#endif

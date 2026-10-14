@@ -6,6 +6,7 @@
 #include <lattice/spatial_query.hpp>
 #include <bridging.hpp>
 #include <cassert>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <concepts>
@@ -20,6 +21,11 @@
 #include <recovery_export.hpp>
 #include <recovery_relay.hpp>
 #include <recovery_continuity.hpp>
+#include <ordinary_sync_export.hpp>
+#include <managed_product_route.hpp>
+#include "../../LatticeCore/src/ordinary_normal_startup.hpp"
+#include "../../LatticeCore/src/ordinary_managed_history.hpp"
+#include "../../LatticeCore/src/ordinary_export.hpp"
 #include <lattice/platform_retirement.hpp>
 #include <lattice/configured_platform.hpp>
 #include <list.hpp>
@@ -33,6 +39,7 @@
 namespace lattice {
 class swift_lattice_ref;
 class swift_migration_context_ref;
+namespace detail { class LatticeCache; }
 }
 
 // Global retain/release functions for swift_lattice_ref
@@ -429,6 +436,79 @@ inline std::optional<std::vector<uint8_t>> column_value_as_blob(const column_val
 // (Defined early so swift_configuration can use it)
 // ============================================================================
 
+// Immutable receiver-issued ownership. Default construction is empty and
+// cannot grant an open; the only positive factory consumes the real inherited
+// launch exchange before any native file/cache admission.
+class swift_ordinary_open_context {
+    friend struct swift_configuration;
+    friend class detail::LatticeCache;
+    friend class swift_lattice_ref;
+    friend class swift_managed_history_startup;
+    detail::ordinary_context context_;
+    std::shared_ptr<const detail::ordinary_managed_child_admission> admission_;
+public:
+    swift_ordinary_open_context() = default;
+    static swift_ordinary_open_context receive_engram_primary() noexcept {
+        swift_ordinary_open_context result;
+        try { result.context_=detail::ordinary_installation::normal_receiver::receive(
+            std::chrono::steady_clock::now()+std::chrono::seconds(30)); } catch(...) {}
+        return result;
+    }
+    bool valid() const noexcept { return static_cast<bool>(context_); }
+    std::string primary_path() const noexcept { return sealed([&]{return context_ ? context_->primary_path() : std::string{};}); }
+    bool validate_path(const std::string& path) const noexcept {
+        return sealed([&]{
+            if(!context_)throw std::runtime_error("receiver-issued managed open context required");
+            detail::ordinary_require_creator(context_);
+            detail::ordinary_before_open(path,context_);return true;
+        });
+    }
+};
+
+// Strong historical launch custody is retained separately from every ordinary
+// open view. No path/Boolean/default instance creates a positive admission.
+class swift_managed_history_startup final {
+    friend class swift_lattice_ref;
+    detail::ordinary_context opens_;
+    std::shared_ptr<const detail::ordinary_managed_child_admission> admission_;
+    detail::ordinary_launch::deadline receive_end_{};
+public:
+    swift_managed_history_startup()=default;
+    static swift_managed_history_startup receive_engram_history() noexcept {
+        swift_managed_history_startup result;
+        const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+        try{auto issued=detail::ordinary_installation::managed_history_receiver::receive(end);
+            result.opens_=std::move(issued.opens);result.admission_=std::move(issued.admission);
+            result.receive_end_=end;
+        }catch(...){}return result;
+    }
+    static swift_managed_history_startup receive_engram_paired_history() noexcept {
+        swift_managed_history_startup result;
+        const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+        try{auto issued=detail::ordinary_installation::managed_history_receiver::receive_paired(end);
+            result.opens_=std::move(issued.opens);result.admission_=std::move(issued.admission);
+            result.receive_end_=end;
+        }catch(...){}return result;
+    }
+    static swift_managed_history_startup receive_engram_daemon_history() noexcept {
+        swift_managed_history_startup result;
+        const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+        try{auto issued=detail::ordinary_installation::managed_history_receiver::receive_daemon(end);
+            result.opens_=std::move(issued.opens);result.admission_=std::move(issued.admission);
+            result.receive_end_=end;
+        }catch(...){}return result;
+    }
+    bool valid()const noexcept{return bool(opens_)&&bool(admission_);}
+    std::string primary_path()const noexcept{return sealed([&]{return opens_?opens_->primary_path():std::string{};});}
+    std::vector<std::string> registered_paths()const noexcept {
+        try{if(valid())return opens_->managed_paths();}catch(...){}return {};
+    }
+    swift_ordinary_open_context context_for_path(const std::string& path)const noexcept {
+        swift_ordinary_open_context result;
+        try{if(valid()){result.context_=opens_->for_managed_path(path);result.admission_=admission_;}}catch(...){}return result;
+    }
+};
+
 /// Swift-specific configuration that extends the core configuration.
 struct swift_configuration : public configuration {
     struct SchemaPair { SwiftSchema from, to; };
@@ -519,6 +599,9 @@ struct swift_configuration : public configuration {
     swift_configuration(const configuration& base) : configuration(base) {}
 
     void set_recovery_source_expectation(const std::string& value) { recovery_source_expectation=value; }
+    void set_ordinary_sync_required(bool value) { ordinary_policy=value?ordinary_sync_policy::ordered_required:ordinary_sync_policy::legacy_provisional; }
+    void set_ordinary_history_required() { ordinary_policy=ordinary_sync_policy::ordered_history_required; }
+    void set_ordinary_model_profile(const std::string& value) { ordinary_model_profile=value; }
 
     void set_sync_filter(const SyncFilterVector& filter) {
         sync_filter = std::vector<sync_filter_entry>(filter.begin(), filter.end());
@@ -527,6 +610,11 @@ struct swift_configuration : public configuration {
     void set_ipc_targets(const IPCTargetVector& targets) {
         ipc_targets = std::vector<ipc_target>(targets.begin(), targets.end());
     }
+
+    // Copy only the actual opaque owners; open/route validators remain the
+    // issuers. Empty wrappers create no positive admission or credentials.
+    void set_ordinary_open_context(const swift_ordinary_open_context& context) { ordinary_context=context.context_; }
+    void set_managed_product_credentials(const swift_managed_product_credentials& credentials) { managed_product_credentials=credentials.value_; }
 
     // Sync tuning (1.0 item I1): forward-only overrides of sync_config
     // defaults. Snake_case value-type setters (same shape as set_sync_filter)
@@ -558,15 +646,18 @@ private:
 
     friend class swift_lattice;
     friend class swift_lattice_ref;
+    friend class detail::LatticeCache;
 };
 
 // Internal implementation - inherits from lattice_db
 class swift_lattice : public lattice_db {
+    struct owned_resources;
+    detail::process_bound_resource_owner<owned_resources> swift_resources_;
 public:
     // Construct with full configuration (including optional sync)
     explicit swift_lattice(swift_configuration&& config)
         : lattice_db(config),
-    swift_config_(std::move(config))
+    swift_resources_(std::move(config))
     {
     }
 
@@ -649,6 +740,7 @@ public:
     /// Block until background IVF training completes. No-op if no training is running.
     void wait_for_vec0_training()
         SWIFT_NAME(waitForVec0Training()) {
+        require_creator_process();
         if (vec0_training_future_.valid()) {
             vec0_training_future_.wait();
         }
@@ -704,6 +796,27 @@ public:
 
 private:
     friend class swift_lattice_ref;
+    swift_lattice(const swift_configuration&,const SchemaVector&,detail::recovery_owner_schema,
+        std::shared_ptr<database>,lattice_db::checked_managed_existing_key);
+    swift_lattice(const swift_configuration&,const SchemaVector&,detail::recovery_owner_schema,
+        std::shared_ptr<database>,lattice_db::checked_mounted_server_existing_key);
+    static std::shared_ptr<swift_lattice> open_checked_mounted_server(const swift_configuration&,const SchemaVector&);
+    void publish_managed_ordinary() { publish_checked_existing_facilities(); }
+    static void claim_managed_source_open(const std::shared_ptr<const detail::ordinary_managed_child_admission>& admission,const std::string& path) {
+        detail::ordinary_export_access::claim_managed_source_open(admission,path);
+    }
+    static void remember_managed_open_failure(const std::shared_ptr<const detail::ordinary_managed_child_admission>& admission,
+        const std::string& path,std::exception_ptr error) noexcept {
+        detail::ordinary_export_access::remember_managed_open_failure(admission,path,std::move(error));
+    }
+    static void open_managed_group_receiver(const swift_configuration&,const SchemaVector&,const detail::ordinary_context&,
+        const std::shared_ptr<const detail::ordinary_managed_child_admission>&,detail::ordinary_launch::deadline,
+        std::shared_ptr<swift_lattice>& retained,bool& opening_claimed);
+    void finish_managed_group_preparation_control(detail::ordinary_launch::deadline);
+    void validate_managed_ordinary() {
+        detail::ordinary_export_access::validate_checked_managed_schema(*this,
+            detail::ordinary_export_access::checked_reference_phase::enrolled);
+    }
     swift_lattice(const swift_configuration&,const SchemaVector&,
         const std::shared_ptr<detail::recovery_continuous_admission>&);
     /// Best-effort schema reconstruction for databases written before the
@@ -711,23 +824,23 @@ private:
     /// types via PRAGMA table_info, and detects link / vec / fts / geo sidecars.
     SchemaVector reconstruct_swift_schema_fallback();
     // Stored schemas for hydration
-    std::unordered_map<std::string, SwiftSchema> schemas_;
+    std::unordered_map<std::string, SwiftSchema>& schemas_ = swift_resources_.get().schemas_;
     // Immutable source-only schemas, owned by one attachment lifetime.
     // Guarded by Core attach_mutex_; never merges into this store's schemas_.
     using attached_schema_map = std::unordered_map<std::string, SwiftSchema>;
     // Stored constraints per table
-    std::unordered_map<std::string, ConstraintVector> constraints_;
+    std::unordered_map<std::string, ConstraintVector>& constraints_ = swift_resources_.get().constraints_;
     // Union table descriptors (union_table_name -> descriptor)
-    std::unordered_map<std::string, union_descriptor> union_schemas_;
+    std::unordered_map<std::string, union_descriptor>& union_schemas_ = swift_resources_.get().union_schemas_;
     // Swift-specific configuration (stores row migration callback)
-    swift_configuration swift_config_;
+    swift_configuration& swift_config_ = swift_resources_.get().swift_config_;
     // Error from last receive_sync_data call (nullopt if none)
-    OptionalString last_receive_error_;
-    OptionalString last_attach_error_;
-    mutable std::mutex attach_error_mutex_;  // guards last_attach_error_ (attach/detach can race a reader)
-    std::future<void> vec0_training_future_;
+    OptionalString& last_receive_error_ = swift_resources_.get().last_receive_error_;
+    OptionalString& last_attach_error_ = swift_resources_.get().last_attach_error_;
+    std::mutex& attach_error_mutex_ = swift_resources_.get().attach_error_mutex_;  // guards last_attach_error_ (attach/detach can race a reader)
+    std::future<void>& vec0_training_future_ = swift_resources_.get().vec0_training_future_;
     // Background vec0 gap healing dispatched after open (off the open path).
-    std::future<void> vec0_reconcile_future_;
+    std::future<void>& vec0_reconcile_future_ = swift_resources_.get().vec0_reconcile_future_;
 
     void ensure_swift_tables(const SchemaVector& schemas,bool publish_background=true);
     /// Fingerprint of the Swift-declared schemas covering every DDL-driving
@@ -735,6 +848,52 @@ private:
     std::string compute_swift_fingerprint_key(const SchemaVector& schemas) const;
     static std::string compute_swift_fingerprint_key_for(int32_t target_version,const SchemaVector& schemas);
     static detail::recovery_owner_schema recovery_catalog(const swift_configuration&,const SchemaVector&);
+    // Lossless bounded declaration identity, never enrollment or source authority.
+    // Swift constraints are bound by the actual recovery_catalog digest. Every
+    // native descriptor field is length/count encoded rather than a schema cookie.
+    static std::string managed_catalog_identity(const detail::recovery_owner_schema& catalog) {
+        if(!catalog.valid()||catalog.models.empty())throw std::runtime_error("managed open catalog unavailable");
+        std::ostringstream out;
+        auto text=[&](const std::string& value){out<<value.size()<<':'<<value;};
+        auto number=[&](auto value){out<<value<<';';};
+        text("managed-open-catalog-v2");text(catalog.swift_digest);text(catalog.swift_fingerprint);number(catalog.models.size());
+        for(const auto& [name,model]:catalog.models){
+            text(name);text(model.table_name);number(catalog.swift_models.count(name));number(model.properties.size());
+            const auto constraints=catalog.swift_constraints.find(name);
+            if(catalog.swift_models.count(name)&&constraints==catalog.swift_constraints.end())
+                throw std::runtime_error("managed Swift constraints catalog unavailable");
+            number(constraints!=catalog.swift_constraints.end());
+            number(constraints==catalog.swift_constraints.end()?0:constraints->second.size());
+            if(constraints!=catalog.swift_constraints.end())for(const auto& c:constraints->second){
+                number(c.allows_upsert);number(c.columns.size());for(const auto& column:c.columns)text(column);
+            }
+            std::vector<const property_descriptor*> properties;
+            for(const auto& property:model.properties)properties.push_back(&property);
+            if(catalog.swift_models.count(name))std::sort(properties.begin(),properties.end(),
+                [](const auto* a,const auto* b){return a->name<b->name;});
+            for(const auto* property:properties){const auto& p=*property;
+                text(p.name);number(static_cast<int>(p.type));number(static_cast<int>(p.kind));
+                text(p.target_table);text(p.link_table);text(p.column_name);
+                for(bool flag:{p.nullable,p.is_vector,p.is_geo_bounds,p.is_full_text,p.is_indexed,p.is_unique,p.is_union,p.no_history})number(flag);
+                text(p.union_desc.union_table_name);number(p.union_desc.cases.size());
+                for(const auto& c:p.union_desc.cases){text(c.case_name);number(c.values.size());
+                    for(const auto& v:c.values){text(v.param_name);number(static_cast<int>(v.type));number(v.is_link);text(v.link_target);}}
+            }
+        }
+        return out.str();
+    }
+    // REQUIRED PRIVATE OWNER UNIT: this declaration is a source prerequisite,
+    // not an existing issuer/definition. Its implementation must validate the
+    // retained native launch owner, physical file, exact current version and
+    // complete catalog before any Core/Swift DDL, preserve nonmutating existing
+    // open, and distinguish true seeded fresh origin without a caller flag.
+    // There is deliberately no generic constructor fallback here.
+    static std::shared_ptr<swift_lattice> open_managed_ordinary(const swift_configuration&,
+        const SchemaVector&,const detail::ordinary_context&,
+        const std::shared_ptr<const detail::ordinary_managed_child_admission>&,
+        const detail::ordinary_launch::deadline* dormant_end = nullptr,bool* dormant_claimed = nullptr);
+    friend class detail::LatticeCache;
+
     /// Populate schemas_/constraints_/union_schemas_ and the core link-table
     /// registries with zero SQL writes (write-free fast path).
     void populate_swift_in_memory_state(const SchemaVector& schemas);
@@ -3034,7 +3193,7 @@ public:
     // Sync-server helpers
     // ========================================================================
     AuditLogEntryVector events_after(const OptionalString& checkpoint_global_id) {
-        return ::lattice::events_after(this->db(), checkpoint_global_id);
+        return ::lattice::events_after_provisional(this->db(), checkpoint_global_id);
     }
     
     /// Receive sync data from a client (server-side)
@@ -3080,6 +3239,22 @@ public:
 
     /// Returns the error from the last receive_sync_data call, or nullopt if none.
     OptionalString last_receive_error() const { return last_receive_error_; }
+
+private:
+    struct owned_resources {
+        std::unordered_map<std::string, SwiftSchema> schemas_;
+        std::unordered_map<std::string, ConstraintVector> constraints_;
+        std::unordered_map<std::string, union_descriptor> union_schemas_;
+        swift_configuration swift_config_;
+        OptionalString last_receive_error_;
+        OptionalString last_attach_error_;
+        mutable std::mutex attach_error_mutex_;
+        std::future<void> vec0_training_future_;
+        std::future<void> vec0_reconcile_future_;
+
+        explicit owned_resources(const swift_configuration& config):swift_config_(config) {}
+        explicit owned_resources(swift_configuration&& config):swift_config_(std::move(config)) {}
+    };
 } SWIFT_UNSAFE_REFERENCE;
 
 // ============================================================================
@@ -3327,8 +3502,15 @@ template <typename ConfigT>
         std::string ipc_fingerprint; // Channels + socket paths + sync filter (see ipc_targets_fingerprint)
         std::string tuning_fingerprint; // sync_tuning overlay (different tuning must not share an instance)
         std::string recovery_expectation; // never reuse a cached owner for changed source policy
+        detail::ordinary_context managed_context;
+        std::shared_ptr<const detail::ordinary_managed_child_admission> managed_admission;
+        // Append policy selectors after actual managed custody; neither selector issues a grant.
+        ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
+        std::string ordinary_model_profile;
 
         bool operator<(const LatticeRefCacheKey& other) const {
+            if(managed_admission!=other.managed_admission)return managed_admission.owner_before(other.managed_admission);
+            if(!managed_admission&&managed_context!=other.managed_context)return managed_context.owner_before(other.managed_context);
             if (path != other.path) return path < other.path;
             if (websocket_url != other.websocket_url) return websocket_url < other.websocket_url;
             if (schema_hash != other.schema_hash) return schema_hash < other.schema_hash;
@@ -3336,6 +3518,8 @@ template <typename ConfigT>
             if (ipc_fingerprint != other.ipc_fingerprint) return ipc_fingerprint < other.ipc_fingerprint;
             if (tuning_fingerprint != other.tuning_fingerprint) return tuning_fingerprint < other.tuning_fingerprint;
             if (recovery_expectation != other.recovery_expectation) return recovery_expectation < other.recovery_expectation;
+            if (ordinary_policy != other.ordinary_policy) return ordinary_policy < other.ordinary_policy;
+            if (ordinary_model_profile != other.ordinary_model_profile) return ordinary_model_profile < other.ordinary_model_profile;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -3345,6 +3529,8 @@ template <typename ConfigT>
         }
 
         bool operator==(const LatticeRefCacheKey& other) const {
+            if(managed_admission!=other.managed_admission)return false;
+            if(!managed_admission&&managed_context!=other.managed_context)return false;
             if (path != other.path) return false;
             if (websocket_url != other.websocket_url) return false;
             if (schema_hash != other.schema_hash) return false;
@@ -3352,6 +3538,8 @@ template <typename ConfigT>
             if (ipc_fingerprint != other.ipc_fingerprint) return false;
             if (tuning_fingerprint != other.tuning_fingerprint) return false;
             if (recovery_expectation != other.recovery_expectation) return false;
+            if (ordinary_policy != other.ordinary_policy) return false;
+            if (ordinary_model_profile != other.ordinary_model_profile) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -3360,6 +3548,11 @@ template <typename ConfigT>
 
     // Cache for swift_lattice instances - provides both key-based and pointer-based lookups
     class LatticeCache {
+        struct owned_resources;
+        process_bound_resource_owner<owned_resources> cache_resources_;
+        void require_creator_process() const {
+            if (!cache_resources_.in_creator_process()) throw std::runtime_error("inherited LatticeCache belongs to another process");
+        }
     public:
         static LatticeCache& instance();
 
@@ -3367,6 +3560,9 @@ template <typename ConfigT>
         // Template to preserve swift_configuration type for constructor overload resolution
         template<typename ConfigT>
         std::shared_ptr<swift_lattice> get_or_create(const ConfigT& config, const SchemaVector& schemas) {
+            require_creator_process();
+            detail::ordinary_before_open(config.path,config.ordinary_context);
+            if(config.ordinary_context)throw std::runtime_error("managed opens require their receiver-issued cache entry");
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
 
             // Build schema hash from table names and properties (sorted for
@@ -3405,7 +3601,7 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, {}, {}, config.ordinary_policy, config.ordinary_model_profile};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,
@@ -3498,8 +3694,148 @@ template <typename ConfigT>
             return inst;
         }
 
+        // Separate receiver-issued local opening path. Normal open custody
+        // never becomes history admission; only a real history receiver supplies
+        // the stronger owner consumed by post-COMMIT enrollment below.
+        std::shared_ptr<swift_lattice> get_or_create_managed(swift_configuration config,
+            const SchemaVector& schemas,const swift_ordinary_open_context& startup) {
+            if(!startup.context_)throw std::runtime_error("receiver-issued managed open context required");
+            detail::ordinary_require_creator(startup.context_);
+            require_creator_process();
+            if(config.ordinary_context&&config.ordinary_context!=startup.context_)
+                throw std::runtime_error("managed configuration differs from its receiver-issued context");
+            config.ordinary_context=startup.context_;
+            detail::ordinary_before_open(config.path,config.ordinary_context);
+            if(config.is_in_memory()||config.read_only||config.is_sync_enabled()||config.is_ipc_enabled()||
+               config.audit_retention_seconds!=0||config.migration_block||config.row_migration_fn_||
+               !config.migration_schemas_.empty()||config.managed_product_credentials||config.target_schema_version<=0)
+                throw std::runtime_error("managed initial open requires a quiescent writable ordinary owner");
+            const auto catalog=swift_lattice::recovery_catalog(config,schemas);
+            const auto schema_identity=swift_lattice::managed_catalog_identity(catalog);
+            LatticeRefCacheKey key{config.path,config.sched,config.websocket_url,schema_identity,
+                config.target_schema_version,ipc_targets_fingerprint(config),sync_tuning_fingerprint(config),
+                config.recovery_source_expectation,config.ordinary_context,startup.admission_,
+                config.ordinary_policy,config.ordinary_model_profile};
+            auto validate=[&](const std::shared_ptr<swift_lattice>& owner){
+                detail::ordinary_require_creator(config.ordinary_context);
+                detail::ordinary_before_open(config.path,config.ordinary_context);
+                if(!owner||!owner->owns_creator_process()||owner->is_closed())throw std::runtime_error("managed cached owner retired");
+                if(owner->config().path!=config.path||
+                   swift_lattice::managed_catalog_identity(owner->recovery_declarations())!=schema_identity)
+                    throw std::runtime_error("managed cached catalog differs from actual declarations");
+                owner->validate_managed_ordinary();
+                detail::ordinary_before_open(config.path,config.ordinary_context);
+            };
+            std::shared_ptr<swift_lattice> existing;
+            std::size_t source_failure_slot=256;
+            std::promise<std::shared_ptr<swift_lattice>> promise;
+            std::shared_future<std::shared_ptr<swift_lattice>> waiting;
+            {
+                std::lock_guard<std::recursive_mutex> lock(mutex_);
+                for(auto it=key_cache_.begin();it!=key_cache_.end();++it)if(it->first==key){
+                    existing=it->second.lock();if(!existing)key_cache_.erase(it);break;
+                }
+                if(!existing){
+                    for(auto& entry:in_flight_)if(entry.first==key){waiting=entry.second;break;}
+                    if(!waiting.valid()){
+                        if(startup.admission_){
+                            auto& resources=cache_resources_.get();
+                            if(resources.failed_source_attempts>=resources.failed_sources.size())
+                                throw std::runtime_error("managed source opening ledger exhausted");
+                            source_failure_slot=resources.failed_source_attempts++;
+                        }
+                        in_flight_.emplace_back(key,promise.get_future().share());
+                    }
+                }
+            }
+            // No journal, physical, catalog or owned-writer validation runs in
+            // the cache leaf, including after another builder's future settles.
+            if(existing){validate(existing);return existing;}
+            if(waiting.valid()){auto owner=waiting.get();validate(owner);return owner;}
+            std::shared_ptr<swift_lattice> owner;bool claimed_opening=false;
+            try{
+                detail::ordinary_before_open(config.path,config.ordinary_context);
+                if(startup.admission_){swift_lattice::claim_managed_source_open(startup.admission_,config.path);claimed_opening=true;}
+                owner=swift_lattice::open_managed_ordinary(config,schemas,config.ordinary_context,startup.admission_);
+                if(!owner||!owner->owns_creator_process()||owner->is_closed()||
+                   owner->config().ordinary_context!=config.ordinary_context||owner->config().path!=config.path||
+                   owner->config().target_schema_version!=config.target_schema_version||
+                   swift_lattice::managed_catalog_identity(owner->recovery_declarations())!=schema_identity)
+                    throw std::runtime_error("checked managed opener did not return its exact retained owner");
+                if(startup.admission_)detail::ordinary_export_access::enroll_managed_history(*owner,startup.admission_);
+                validate(owner);
+                owner->publish_managed_ordinary();
+                validate(owner);
+                {
+                    std::lock_guard<std::recursive_mutex> lock(mutex_);
+                    bool inserted_key=false,inserted_pointer=false;
+                    try {
+                        key_cache_.emplace_back(key,owner);inserted_key=true;
+                        const auto inserted=ptr_cache_.emplace(owner.get(),owner);
+                        if(!inserted.second)throw std::runtime_error("managed cache reverse owner already registered");
+                        inserted_pointer=true;
+                        // Both maps and this actual builder future become visible
+                        // in one cache publication leaf. Later off-leaf validation
+                        // remains inside this builder's retained failure boundary.
+                        promise.set_value(owner);
+                        erase_in_flight(key);
+                    }catch(...){
+                        if(inserted_pointer)ptr_cache_.erase(owner.get());
+                        if(inserted_key)for(auto it=key_cache_.begin();it!=key_cache_.end();++it)
+                            if(it->first==key&&it->second.lock().get()==owner.get()){key_cache_.erase(it);break;}
+                        throw;
+                    }
+                }
+                // Late current/schema validation is still part of THIS
+                // builder's retained outcome, even after future publication.
+                validate(owner);
+            }catch(...){
+                const auto error=std::current_exception();
+                if(claimed_opening){
+                    remember_failed_source(source_failure_slot,owner,error);
+                    swift_lattice::remember_managed_open_failure(startup.admission_,config.path,error);
+                }
+                {std::lock_guard<std::recursive_mutex> lock(mutex_);erase_in_flight(key);}
+                try{promise.set_exception(error);}catch(...){}
+                std::rethrow_exception(error);
+            }
+            return owner;
+        }
+
+        // Only the unique winning builder writes its charged slot. Retain its
+        // SAME owner and first error before propagation; no diagnostic, mutex,
+        // native close or arbitrary target destruction occurs in this leaf.
+        void remember_failed_source(std::size_t slot,const std::shared_ptr<swift_lattice>& owner,
+            std::exception_ptr first) noexcept {
+            if(!cache_resources_.in_creator_process())return;
+            auto& resources=cache_resources_.get();
+            if(slot>=resources.failed_sources.size())return;
+            auto& retained=resources.failed_sources[slot];
+            if(!retained.first_error){retained.owner=owner;retained.first_error=std::move(first);}
+        }
+
+        // Fixed registry for named dormant preparations, including failed or
+        // unknown opens. Admission is charged before holder allocation. There
+        // is no refund/reset or second physical-opening attempt in this unit.
+        std::size_t reserve_group_receiver_preparation() {
+            require_creator_process();std::lock_guard<std::recursive_mutex> lock(mutex_);
+            auto& resources=cache_resources_.get();
+            if(resources.group_receiver_attempts>=resources.group_receivers.size())
+                throw std::runtime_error("dormant GROUP preparation registry exhausted");
+            return resources.group_receiver_attempts++;
+        }
+        void retain_group_receiver_preparation(std::size_t slot,
+            const std::shared_ptr<swift_managed_group_receiver::state>& actual) {
+            require_creator_process();std::lock_guard<std::recursive_mutex> lock(mutex_);
+            auto& resources=cache_resources_.get();
+            if(!actual||slot>=resources.group_receiver_attempts||resources.group_receivers[slot])
+                throw std::runtime_error("dormant GROUP original registry slot differs");
+            resources.group_receivers[slot]=actual;
+        }
+
         // Look up swift_lattice by raw pointer (reverse lookup from lattice_db*)
         std::shared_ptr<swift_lattice> get_by_pointer(swift_lattice* ptr) {
+            require_creator_process();
             std::lock_guard<std::recursive_mutex> lock(mutex_);
 
             auto it = ptr_cache_.find(ptr);
@@ -3519,6 +3855,7 @@ template <typename ConfigT>
         /// the subsequent ATTACH would mutate the parent's own connection.
         std::shared_ptr<swift_lattice> create_uncached(const swift_configuration& config,
                                                        const SchemaVector& schemas) {
+            require_creator_process();
             auto inst = std::make_shared<swift_lattice>(config, schemas);
             register_pointer(inst);
             return inst;
@@ -3530,6 +3867,7 @@ template <typename ConfigT>
         /// shared_for_lattice. NOT added to key_cache_: dynamic opens are not
         /// shared or deduped by config key.
         void register_pointer(const std::shared_ptr<swift_lattice>& inst) {
+            require_creator_process();
             if (!inst) return;
             std::lock_guard<std::recursive_mutex> lock(mutex_);
             ptr_cache_[inst.get()] = inst;
@@ -3538,6 +3876,7 @@ template <typename ConfigT>
         /// Remove a swift_lattice from both caches so subsequent get_or_create()
         /// for the same path creates a fresh instance.
         void evict(swift_lattice* ptr) {
+            require_creator_process();
             std::lock_guard<std::recursive_mutex> lock(mutex_);
             // Remove from key_cache_ so a subsequent open on the same path/schema
             // creates a fresh instance (match by shared_ptr identity).
@@ -3577,15 +3916,31 @@ template <typename ConfigT>
         // is already published in `ptr_cache_` (that's how `for_each_alive`
         // found it). The on-disk path builds OUTSIDE the lock (see in_flight_),
         // so for that path mutex_ is only held for short map operations.
-        std::recursive_mutex mutex_;
-        std::vector<std::pair<LatticeRefCacheKey, std::weak_ptr<swift_lattice>>> key_cache_;
-        std::unordered_map<swift_lattice*, std::weak_ptr<swift_lattice>> ptr_cache_;
+        std::recursive_mutex& mutex_ = cache_resources_.get().mutex_;
+        std::vector<std::pair<LatticeRefCacheKey, std::weak_ptr<swift_lattice>>>& key_cache_ = cache_resources_.get().key_cache_;
+        std::unordered_map<swift_lattice*, std::weak_ptr<swift_lattice>>& ptr_cache_ = cache_resources_.get().ptr_cache_;
         // On-disk construction-in-progress markers. A thread building a given key
         // publishes a shared_future here so concurrent callers for the same key
         // wait on the result instead of opening a duplicate connection.
         // Construction itself runs without holding mutex_. Not used for :memory:.
         std::vector<std::pair<LatticeRefCacheKey,
+                              std::shared_future<std::shared_ptr<swift_lattice>>>>& in_flight_ = cache_resources_.get().in_flight_;
+
+        struct owned_resources {
+            std::recursive_mutex mutex_;
+            struct failed_source {
+                std::shared_ptr<swift_lattice> owner;
+                std::exception_ptr first_error;
+            };
+            std::size_t failed_source_attempts=0;
+            std::array<failed_source,256> failed_sources{};
+            std::size_t group_receiver_attempts=0;
+            std::array<std::shared_ptr<swift_managed_group_receiver::state>,256> group_receivers{};
+            std::vector<std::pair<LatticeRefCacheKey, std::weak_ptr<swift_lattice>>> key_cache_;
+            std::unordered_map<swift_lattice*, std::weak_ptr<swift_lattice>> ptr_cache_;
+            std::vector<std::pair<LatticeRefCacheKey,
                               std::shared_future<std::shared_ptr<swift_lattice>>>> in_flight_;
+        };
     };
 } // namespace detail
 
@@ -3595,6 +3950,11 @@ inline void swift_lattice::close() {
 }
 inline lattice_close_result swift_lattice::close_checked() noexcept {
     lattice_close_result result;
+    if (!owns_creator_process()) {
+        try { throw std::runtime_error("inherited Swift lattice cleanup belongs to another process"); }
+        catch (...) { result.remember(std::current_exception()); }
+        return result;
+    }
     try{detail::LatticeCache::instance().evict(this);}catch(...){result.remember(std::current_exception());}
     result.merge(lattice_db::close_checked());return result;
 }
@@ -3623,6 +3983,85 @@ public:
         return ref;
     }
 #endif
+
+    // Empty/default/copy-only configuration cannot issue this authority. The
+    // retained receiver handle is checked before the cache singleton or schema.
+    static LATTICE_SLREF_RET create_managed(const swift_configuration& config,const SchemaVector& schemas,
+        const swift_ordinary_open_context& startup) SWIFT_NAME(createManaged(swiftConfig:schemas:startup:)) LATTICE_SLREF_UNRETAINED {
+        return sealed([&]{
+            if(!startup.context_)throw std::runtime_error("receiver-issued managed open context required");
+            detail::ordinary_require_creator(startup.context_);
+            detail::ordinary_before_open(config.path,startup.context_);
+            return _make(detail::LatticeCache::instance().get_or_create_managed(config,schemas,startup));
+        });
+    }
+    // Compatibility for an actual already-open quiescent receiver owner.
+    // Ordinary/source opening is NOT a receiver preparation substitute.
+    // Preserve under the inherited receive end; never refresh after open.
+    swift_owned_receiver_preservation preserve_managed_receiver(const swift_managed_history_startup& startup) const noexcept
+        SWIFT_NAME(preserveManagedReceiver(startup:)) {
+        return sealed([&]{
+            auto owner=impl_;
+            if(!owner||!owner->owns_creator_process()||!startup.valid()||
+               std::chrono::steady_clock::now()>=startup.receive_end_)
+                throw db_error("receiver preservation original startup unavailable");
+            detail::ordinary_require_creator(startup.opens_);
+            return swift_owned_receiver_preservation(detail::ordinary_export_access::preserve_managed_receiver(
+                owner,startup.admission_,startup.receive_end_));
+        });
+    }
+    bool enroll_managed_history(const swift_managed_history_startup& startup) const noexcept {
+        return sealed([&]{
+            auto owner=impl_;
+            if(!owner||!owner->owns_creator_process()||!startup.valid())
+                throw db_error("managed enrollment actual startup unavailable");
+            detail::ordinary_require_creator(startup.opens_);
+            return bool(detail::ordinary_export_access::enroll_managed_history(*owner,startup.admission_));
+        });
+    }
+
+    // Named storage-only receiver opening. Retain `held` BEFORE interpreting
+    // bool/error. It exposes no ordinary model ref and never activates a peer.
+    static bool prepare_managed_group_receiver(const swift_configuration&,const SchemaVector&,
+        const swift_managed_history_startup&,const swift_ordinary_open_context&,
+        swift_managed_group_receiver& held,cxx_error&) noexcept
+        SWIFT_NAME(prepareManagedGroupReceiver(swiftConfig:schemas:startup:context:retained:error:));
+
+    bool validate_managed_open_if_present() const noexcept SWIFT_NAME(validateManagedOpenIfPresent()) {
+        return sealed([&]{
+            auto owner=impl_;
+            if(!owner||!owner->owns_creator_process())throw std::runtime_error("native owner creator unavailable");
+            const auto context=owner->config().ordinary_context;
+            if(!context)return true;
+            detail::ordinary_require_creator(context);
+            detail::ordinary_before_open(owner->config().path,context);
+            // Model/observer resolution may already be in a user WRITE. This
+            // transports no authority and must not enter another owned turn.
+            // Context validation binds current anchored generation and its
+            // retained no-follow physical/catalog custody outside cache leaves.
+            if(owner->is_closed())throw std::runtime_error("managed reference retired");
+            return true;
+        });
+    }
+
+    // Trusted SPI opens a real existing server owner. Actual relay authorization
+    // is retained separately; this method issues no source, principal or cut.
+    static LATTICE_SLREF_RET create_checked_mounted_server(const swift_configuration& config,const SchemaVector& schemas)
+        SWIFT_NAME(createMountedServerExisting(swiftConfig:schemas:)) LATTICE_SLREF_UNRETAINED {
+        return sealed([&]{
+            // Allocate the FRT shell before any native opening. There is no
+            // throwing wrapper allocation after the private failure fence ends.
+#if LATTICE_HAS_FRT
+            std::unique_ptr<swift_lattice_ref> result(new swift_lattice_ref());
+            result->impl_=swift_lattice::open_checked_mounted_server(config,schemas);
+            return result.release();
+#else
+            swift_lattice_ref result;
+            result.impl_=swift_lattice::open_checked_mounted_server(config,schemas);
+            return result;
+#endif
+        });
+    }
 
     // Factory method - creates or reuses instance based on config path, with schemas
     static LATTICE_SLREF_RET create(const configuration& config, const SchemaVector& schemas) LATTICE_SLREF_UNRETAINED {
@@ -4140,7 +4579,65 @@ public:
     OptionalString last_attach_error() const { return impl().last_attach_error(); }
 
     // Sync data ingestion
+    // Exact held owner on both FRT and value paths. Empty/retired owners return
+    // an explicitly invalid result; neither path reads shared mutable error text.
+    ordinary_upload_ids_result receive_ordinary_upload(const ByteVector& data,const std::vector<std::string>& models)const noexcept
+        SWIFT_NAME(receiveOrdinaryUpload(data:models:)) {
+        try{auto owner=impl_;if(!owner||!owner->owns_creator_process()||owner->is_closed())return {};
+            return ordinary_upload_ids_result::receive(*owner,data,models);}
+        catch(...){return {};}
+    }
+    ordinary_upload_acknowledgment_result receive_ordinary_upload_with_acknowledgment(const ByteVector& data,const std::vector<std::string>& models)const noexcept
+        SWIFT_NAME(receiveOrdinaryUploadWithAcknowledgment(data:models:)) {
+        try{auto owner=impl_;if(!owner||!owner->owns_creator_process()||owner->is_closed())return {};
+            return ::lattice::receive_ordinary_source_upload_with_acknowledgment(*owner,data.data(),data.size(),models);}
+        catch(...){return {};}
+    }
+    ordinary_sync_observation_ref ordinary_sync_observation_tables(const std::vector<std::string>& models)const noexcept
+        SWIFT_NAME(ordinarySyncObservationTables(models:)) {
+        try{auto owner=impl_;if(!owner||!owner->owns_creator_process()||owner->is_closed())return {};
+            return ordinary_sync_observation_ref::select(*owner,models);}
+        catch(...){return {};}
+    }
+    // A nonnull, nonthrowing destroy callback transfers context on every outcome.
+    // Null destroy refuses before transfer and leaves context with its caller.
+    // Keep a local share through registration/removal: final context destruction
+    // cannot occur under Core's observer leaf even if registration throws.
+    uint64_t add_payload_free_table_observer(const std::string& table,void* context,
+        void (*callback)(void*),void (*destroy)(void*))const noexcept {
+        if(!destroy)return 0;
+        std::shared_ptr<void> owned;
+        std::shared_ptr<swift_lattice> owner;
+        uint64_t token=0;
+        try{
+            // shared_ptr invokes destroy(context) if its control-block allocation fails.
+            owned=std::shared_ptr<void>(context,destroy);
+            owner=impl_;
+            if(!callback||!owner||!owner->owns_creator_process()||owner->is_closed())return 0;
+            token=owner->lattice_db::add_table_observer(table,
+                [owned,callback](const std::vector<lattice_db::change_event>& batch){
+                    if(!batch.empty())callback(owned.get());
+                });
+            if(owner->is_closed()){owner->remove_table_observer(table,token);return 0;}
+            return token;
+        }catch(...){
+            if(token&&owner){try{owner->remove_table_observer(table,token);}catch(...){}}
+            return 0;
+        }
+    }
     std::vector<std::string> receive_sync_data(const ByteVector& data) const { return impl().receive_sync_data(data); }
+    ordinary_sync_export_ref capture_ordinary_export(const std::vector<std::string>& models)const noexcept
+        SWIFT_NAME(captureOrdinaryExport(models:)) {
+        try{if(!valid()||impl().is_closed())return {};return ordinary_sync_export_ref::capture(impl(),models);}catch(...){return {};}
+    }
+    ordinary_mounted_history_source_ref register_ordinary_mounted_history_source(const std::vector<std::string>& mounted)const noexcept
+        SWIFT_NAME(registerOrdinaryMountedHistorySource(models:)) {
+        try{if(!valid()||impl().is_closed())return {};return ordinary_mounted_history_source_ref::issue(impl_,mounted);}catch(...){return {};}
+    }
+    ordinary_history_export_ref capture_ordinary_history_export(const std::vector<std::string>& models)const noexcept
+        SWIFT_NAME(captureOrdinaryHistoryExport(models:)) {
+        try{if(!valid()||impl().is_closed())return {};return ordinary_history_export_ref::capture(impl(),models);}catch(...){return {};}
+    }
     OptionalString last_receive_error() const { return impl().last_receive_error(); }
 
     /// The sealed query surface's error slot (see error.hpp): nullopt if

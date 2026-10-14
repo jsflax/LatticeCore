@@ -3,9 +3,33 @@
 #include "recovery_export_adapter.hpp"
 #include <exception>
 #include <mutex>
+#include <array>
 
 namespace lattice::detail {
 class recovery_unknown_reconciliation;
+
+// One private nonblocking operation spans the exact owned transaction and its
+// publication/foreign handoff. It holds no mutex across SQL or callbacks.
+class recovery_reconciliation_operation final {
+    friend class recovery_unknown_reconciliation;
+    friend class recovery_export_adapter;
+    friend class recovery_export_route;
+    std::shared_ptr<recovery_unknown_reconciliation> worker_;
+    std::shared_ptr<const recovery_reconciliation_descriptor> descriptor_;
+    std::shared_ptr<const std::vector<int64_t>> before_;
+    std::shared_ptr<std::vector<int64_t>> candidate_;
+    uint64_t sequence_=0;
+    recovery_reconciliation_operation()=default;
+    void require_live()const;
+    void verify(database&,bool candidate=false)const;
+    void claimed(const recovery_obligation_export_ticket&);
+    void publish();
+    void require_settled(const recovery_install_result&)const;
+    void fail(std::exception_ptr)noexcept;
+public:
+    ~recovery_reconciliation_operation();
+    recovery_reconciliation_operation(const recovery_reconciliation_operation&)=delete;
+};
 
 // Issued only from the controller's current phase-4 descriptor. It names an
 // ordered window of retained originals, not pending/ACK bookkeeping or a caller
@@ -39,10 +63,19 @@ public:
 class recovery_unknown_reconciliation final : public std::enable_shared_from_this<recovery_unknown_reconciliation> {
     friend class ::lattice::synchronizer_base;
     friend class recovery_reconciliation_export;
+    friend class recovery_reconciliation_operation;
+    friend class recovery_export_route;
+    friend class recovery_receiver_controller;
     struct progress {size_t next=0;uint64_t active=0;};
     std::weak_ptr<const recovery_reconciliation_descriptor> descriptor_;
     std::mutex mutex_;
     std::vector<progress> contributions_;
+    // Existing immutable descriptor entries supply identities; only the exact
+    // first claims are retained here. Zero represents an actual NULL preimage.
+    std::array<size_t,17> claim_offsets_{};
+    size_t claim_capacity_=0;
+    std::shared_ptr<const std::vector<int64_t>> first_claims_;
+    uint64_t next_operation_=0,active_operation_=0;
     uint64_t next_reservation_=0;
     bool settling_=false, completed_=false, abandoned_=false;
     std::exception_ptr failure_;
@@ -51,6 +84,9 @@ class recovery_unknown_reconciliation final : public std::enable_shared_from_thi
         const std::shared_ptr<const recovery_reconciliation_descriptor>&);
     void require_live_locked()const;
     void fail(std::exception_ptr)noexcept;
+    std::shared_ptr<recovery_reconciliation_operation> begin_operation(bool claims);
+    std::shared_ptr<const std::vector<int64_t>> refreeze_claims();
+    size_t continuity_bytes(size_t)const noexcept;
     void release(size_t,uint64_t,size_t,size_t,bool,bool)noexcept;
     std::shared_ptr<recovery_reconciliation_export> reserve(
         const std::shared_ptr<const recovery_reconciliation_descriptor>&,

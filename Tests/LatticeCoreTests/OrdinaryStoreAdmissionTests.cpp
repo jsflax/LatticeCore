@@ -576,3 +576,124 @@ TEST(OrdinaryStoreAdmission, ProcessHelper) {
     if (!::testing::Test::HasFailure()) signal_file(directory.fd, "fork-joined.signal");
 }
 #endif
+
+// These cases exercise stored canonical facts and actual OS lease exclusion.
+// They do not invoke the private normal-origin issuer or issue an open context.
+TEST(OrdinaryStoreAdmission, NewAdmittedStateUsesOnlyExactNonceReservedArea) {
+    auto value=sample();value.revision=2;value.state=admission::stage::ordinary_admitted;value.normal_launch=id(10);
+    const auto bytes=admission::encode(value);
+    EXPECT_EQ(admission::decode(bytes),value);
+    for(std::size_t i=0;i!=value.normal_launch.size();++i)EXPECT_EQ(bytes[176+i],value.normal_launch[i]);
+    for(std::size_t i=192;i!=224;++i)EXPECT_EQ(bytes[i],0);
+    EXPECT_EQ(value.cutover,admission::identifier{});
+    // Independently packed from the original 256-byte v1 envelope and SHA256.
+    const std::string expected="4c415441444d31000100000000010000020000000000000003000000000000000100000000000000000000000000000002000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000004000000000000000500000000000000040000000000000006000000000000000400000000000000070000000000000004000000000000000800000000000000040000000000000009000000000000000a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008fb985d125851a2b1649643787a4f18cd24c18dff7e7fc4ca9dccf0e40915e1f";
+    EXPECT_EQ(picosha2::bytes_to_hex_string(bytes),expected);
+}
+
+TEST(OrdinaryStoreAdmission, OldStatesStillRejectEveryNonceReservedByte) {
+    for(const bool retired:{false,true}) {
+        auto value=sample();if(retired){value.state=admission::stage::retirement_requested;value.revision=2;value.cutover=id(10);}
+        const auto original=admission::encode(value);
+        for(std::size_t offset=176;offset!=224;++offset){auto bytes=original;bytes[offset]=1;rehash(bytes);EXPECT_THROW(admission::decode(bytes),admission::error);}
+        value.normal_launch=id(11);EXPECT_THROW(admission::encode(value),admission::error);
+    }
+}
+
+TEST(OrdinaryStoreAdmission, AdmittedStateRejectsZeroNonceCutoverOldRevisionAndOtherReservedBytes) {
+    auto value=sample();value.revision=2;value.state=admission::stage::ordinary_admitted;
+    EXPECT_THROW(admission::encode(value),admission::error);
+    value.normal_launch=id(10);value.cutover=id(11);EXPECT_THROW(admission::encode(value),admission::error);
+    value.cutover={};value.revision=1;EXPECT_THROW(admission::encode(value),admission::error);
+    value.revision=2;const auto original=admission::encode(value);
+    for(const auto offset:{9u,10u,11u,14u,15u,25u,31u,192u,223u}){auto bytes=original;bytes[offset]^=1;rehash(bytes);EXPECT_THROW(admission::decode(bytes),admission::error);}
+    auto cleared=original;std::fill(cleared.begin()+176,cleared.begin()+192,0);rehash(cleared);EXPECT_THROW(admission::decode(cleared),admission::error);
+}
+
+#if !defined(__EMSCRIPTEN__) && (defined(__APPLE__) || defined(__linux__))
+namespace {
+admission::record stored_normal_fact(const admission::record& original) {
+    auto value=original;value.revision=2;value.state=admission::stage::ordinary_admitted;value.normal_launch=id(30);return value;
+}
+admission::control_binding controls(const admission::record& original){return {original.control,original.entry,original.generation};}
+}
+
+TEST(OrdinaryStoreAdmission, StoredAdmittedFactsCannotGrantObservationalOrBootstrapHold) {
+    area owned;auto bootstrap=admission::journal::create_unadopted(owned.fd,binding());const auto original=bootstrap.read();
+    const auto fact=stored_normal_fact(original);overwrite(owned.fd,fact);
+    auto observational=admission::journal::open_existing(owned.fd,binding());
+    EXPECT_EQ(observational.read(),fact);
+    EXPECT_THROW(bootstrap.hold_ordinary(fact),admission::error);
+    EXPECT_THROW(observational.hold_ordinary(fact),admission::error);
+    EXPECT_THROW(observational.try_hold_generation(),admission::error);
+    EXPECT_FALSE(observational.generation_busy());
+    EXPECT_EQ(observational.read(),fact);EXPECT_FALSE(std::filesystem::exists(owned.path/"admission.pending"));
+}
+
+TEST(OrdinaryStoreAdmission, AnchoredStoredFactHoldRetainsActualGenerationAndExactExpectedRecord) {
+    area owned;auto bootstrap=admission::journal::create_unadopted(owned.fd,binding());const auto original=bootstrap.read();
+    const auto fact=stored_normal_fact(original);overwrite(owned.fd,fact);
+    auto anchored=admission::journal::open_existing(owned.fd,binding(),controls(original));
+    auto hold=anchored.hold_ordinary(fact);EXPECT_TRUE(static_cast<bool>(hold));EXPECT_TRUE(anchored.generation_busy());
+    descriptor generation(::openat(owned.fd,"generation.lock",O_RDWR|O_NOFOLLOW|O_CLOEXEC));ASSERT_GE(generation.fd,0);
+    EXPECT_EQ(::flock(generation.fd,LOCK_EX|LOCK_NB),-1);EXPECT_TRUE(errno==EWOULDBLOCK||errno==EAGAIN);
+    for(const unsigned change:{0u,1u,2u,3u}) {
+        auto stale=fact;if(change==0)++stale.revision;else if(change==1)stale.normal_launch=id(31);else if(change==2)stale.binding.main.inode+=1;else stale.generation.inode+=1;
+        EXPECT_THROW(anchored.hold_ordinary(stale),admission::error);EXPECT_EQ(anchored.read(),fact);
+    }
+    EXPECT_THROW(anchored.hold_ordinary(original),admission::error);
+    EXPECT_FALSE(std::filesystem::exists(owned.path/"admission.pending"));
+    hold={};EXPECT_FALSE(anchored.generation_busy());EXPECT_EQ(::flock(generation.fd,LOCK_EX|LOCK_NB),0);
+}
+
+TEST(OrdinaryStoreAdmission, RetirementFromStoredAdmittedFactPreservesOldCodecAndExistingRealHold) {
+    area owned;auto bootstrap=admission::journal::create_unadopted(owned.fd,binding());const auto original=bootstrap.read();
+    const auto fact=stored_normal_fact(original);overwrite(owned.fd,fact);
+    auto anchored=admission::journal::open_existing(owned.fd,binding(),controls(original));auto hold=anchored.hold_ordinary(fact);
+    const auto retired=anchored.begin_retirement(id(32));EXPECT_EQ(retired.state,admission::stage::retirement_requested);
+    EXPECT_EQ(retired.revision,3u);EXPECT_EQ(retired.cutover,id(32));EXPECT_EQ(retired.normal_launch,admission::identifier{});
+    const auto bytes=admission::encode(retired);for(std::size_t i=176;i!=224;++i)EXPECT_EQ(bytes[i],0);
+    EXPECT_EQ(admission::decode(bytes),retired);EXPECT_EQ(anchored.begin_retirement(id(32)),retired);
+    EXPECT_THROW(anchored.begin_retirement(id(33)),admission::error);
+    EXPECT_THROW(anchored.hold_ordinary(fact),admission::error);EXPECT_THROW(anchored.hold_ordinary(retired),admission::error);
+    EXPECT_THROW(anchored.try_hold_generation(),admission::error);EXPECT_TRUE(anchored.generation_busy());
+    hold={};EXPECT_FALSE(anchored.generation_busy());EXPECT_EQ(anchored.read(),retired);
+}
+
+TEST(OrdinaryStoreAdmission, AnchoredStoredFactHoldRefusesRealEntryContentionWithoutPublication) {
+    area owned;auto bootstrap=admission::journal::create_unadopted(owned.fd,binding());const auto original=bootstrap.read();
+    const auto fact=stored_normal_fact(original);overwrite(owned.fd,fact);
+    auto anchored=admission::journal::open_existing(owned.fd,binding(),controls(original));
+    descriptor entry(::openat(owned.fd,"entry.lock",O_RDWR|O_NOFOLLOW|O_CLOEXEC));ASSERT_GE(entry.fd,0);ASSERT_EQ(::flock(entry.fd,LOCK_EX|LOCK_NB),0);
+    EXPECT_THROW(anchored.hold_ordinary(fact),admission::error);EXPECT_FALSE(std::filesystem::exists(owned.path/"admission.pending"));
+    ASSERT_EQ(::close(entry.fd),0);entry.fd=-1;EXPECT_EQ(anchored.read(),fact);EXPECT_FALSE(anchored.generation_busy());
+}
+
+TEST(OrdinaryStoreAdmission, AnchoredStoredFactHoldCannotRelearnCoherentGenerationReplacement) {
+    area owned;auto bootstrap=admission::journal::create_unadopted(owned.fd,binding());const auto original=bootstrap.read();
+    const auto fact=stored_normal_fact(original);overwrite(owned.fd,fact);
+    auto anchored=admission::journal::open_existing(owned.fd,binding(),controls(original));auto retained=anchored.hold_ordinary(fact);
+    ASSERT_EQ(::renameat(owned.fd,"generation.lock",owned.fd,"old-normal-generation.lock"),0);
+    descriptor replacement(::openat(owned.fd,"generation.lock",O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW|O_CLOEXEC,0600));ASSERT_GE(replacement.fd,0);
+    struct stat current{};ASSERT_EQ(::fstat(replacement.fd,&current),0);auto changed=fact;
+    changed.generation={static_cast<std::uint64_t>(current.st_dev),static_cast<std::uint64_t>(current.st_ino)};overwrite(owned.fd,changed);
+    EXPECT_THROW(anchored.hold_ordinary(changed),admission::error);EXPECT_THROW(anchored.hold_ordinary(fact),admission::error);
+    EXPECT_THROW(admission::journal::open_existing(owned.fd,binding(),controls(original)),admission::error);
+    descriptor old_generation(::openat(owned.fd,"old-normal-generation.lock",O_RDWR|O_NOFOLLOW|O_CLOEXEC));ASSERT_GE(old_generation.fd,0);
+    EXPECT_EQ(::flock(old_generation.fd,LOCK_EX|LOCK_NB),-1);EXPECT_TRUE(errno==EWOULDBLOCK||errno==EAGAIN);
+    retained={};EXPECT_EQ(::flock(old_generation.fd,LOCK_EX|LOCK_NB),0);
+}
+
+TEST(OrdinaryStoreAdmission, PostRenameRetirementFailureNeverRestoresAdmittedHold) {
+    for(const auto point:{admission::test_hooks::boundary::after_rename,admission::test_hooks::boundary::after_directory_sync}) {
+        area owned;auto bootstrap=admission::journal::create_unadopted(owned.fd,binding());const auto original=bootstrap.read();
+        const auto fact=stored_normal_fact(original);overwrite(owned.fd,fact);
+        auto anchored=admission::journal::open_existing(owned.fd,binding(),controls(original));auto retained=anchored.hold_ordinary(fact);
+        {fault_scope fault(point);EXPECT_THROW(anchored.begin_retirement(id(34)),std::runtime_error);}
+        auto reopened=admission::journal::open_existing(owned.fd,binding(),controls(original));
+        const auto retired=reopened.begin_retirement(id(34));EXPECT_EQ(retired.revision,3u);EXPECT_EQ(retired.normal_launch,admission::identifier{});
+        EXPECT_THROW(reopened.hold_ordinary(fact),admission::error);EXPECT_TRUE(reopened.generation_busy());
+        retained={};EXPECT_FALSE(reopened.generation_busy());
+    }
+}
+#endif

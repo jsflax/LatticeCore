@@ -3,11 +3,15 @@
 #include "log.hpp"
 #include "types.hpp"
 #include "db.hpp"
+#include "ordinary_context.hpp"
+#include "ordinary_pointer_publication.hpp"
+#include "native_retirement_storage.hpp"
 #if defined(LATTICE_SYNC_COMMIT_PROBE)
 #include "sync_commit_probe.hpp"
 #endif
 #include "projection.hpp"
 #include "schema.hpp"
+#include "ordinary_schema_recipe.hpp"
 #include "recovery_schema.hpp"
 #include "derived_program.hpp"
 #include "managed.hpp"
@@ -45,6 +49,7 @@
 #include <unistd.h>
 
 namespace lattice {
+namespace detail {class ordinary_managed_profile;class ordinary_export_access;class ordinary_cohort_attachment_access;class ordinary_cohort_attachment_binding;class ordinary_child_origin;class ordinary_managed_receiver_preservation;class ordinary_receiver_wss_request;class ordinary_receiver_session;class ordinary_provisional_delivery;class ordinary_source_upload_delivery;class ordinary_managed_product_credentials;class ordinary_managed_ipc_access;class ordinary_receiver_wss_access;class ordinary_managed_owner_release;class ordinary_managed_start_capture_tail;struct configured_managed_handlers;class ordinary_history_child_connections;class database_open_ledger;struct ordinary_history_open_ledger_test_access;}
 
 // An owned close report. Pending/retired/disconnected are not ACK success;
 // cleanup always proceeds, preserving the first real error separately from a
@@ -146,11 +151,13 @@ public:
 
     void register_instance(const std::string& path, lattice_db* db,
                            std::shared_ptr<instance_guard> guard) {
+        require_creator_process();
         std::lock_guard<std::mutex> lock(mutex_);
         instances_[path].push_back({db, std::move(guard)});
     }
 
     void unregister_instance(const std::string& path, lattice_db* db) {
+        require_creator_process();
         // Move the notifier out under the lock, destroy it AFTER releasing —
         // the notifier destructor joins the inotify thread, which may be
         // waiting for mutex_ inside for_each_alive → get_entries.
@@ -181,6 +188,7 @@ public:
     /// notify_refcount before proceeding).
     template<typename Fn>
     void for_each_alive(const std::string& path, Fn&& fn) {
+        require_creator_process();
         auto entries = get_entries(path);
         for (auto& e : entries) {
             e.guard->notify_refcount.fetch_add(1, std::memory_order_seq_cst);
@@ -209,6 +217,27 @@ public:
         }
     }
 
+    // G03 setters alone use this same real registry snapshot/admitted guard.
+    // Foreign continuation cannot release holds or visit another inherited entry.
+    template<typename Fn> void for_each_alive_creator_bound(const std::string& path,Fn&& fn) {
+        require_creator_process();const auto native_creator=::getpid();
+        using entries_type=decltype(get_entries(path));
+        detail::native_retirement_storage<entries_type> held;
+        held.template get<0>()=get_entries(path);
+        for(auto& e:held.template get<0>()) {
+            if(native_creator!=::getpid())return;
+            e.guard->notify_refcount.fetch_add(1,std::memory_order_seq_cst);
+            if(!e.guard->alive.load(std::memory_order_seq_cst)) {e.guard->notify_refcount.fetch_sub(1,std::memory_order_seq_cst);continue;}
+            auto* g=e.guard.get();
+            struct hold_release {
+                instance_guard* g;pid_t creator;
+                ~hold_release(){if(creator!=::getpid())return;auto& depths=instance_guard::tls_depths();if(--depths[g]==0)depths.erase(g);g->notify_refcount.fetch_sub(1,std::memory_order_seq_cst);}
+            };
+            ++instance_guard::tls_depths()[g];hold_release release{g,native_creator};
+            fn(e.ptr);if(native_creator!=::getpid())return;
+        }
+    }
+
     /// Get or create a shared cross-process notifier for a path.
     /// Only ONE Darwin listener is registered per path per process,
     /// preventing N^2 notification amplification when multiple lattice_db
@@ -232,6 +261,7 @@ public:
     /// never erased (leaked with the singleton, like the registry itself);
     /// the shared_ptr keeps a gate valid for any late holder.
     std::shared_ptr<std::recursive_timed_mutex> write_gate(const std::string& path) {
+        require_creator_process();
         std::lock_guard<std::mutex> lock(mutex_);
         auto& gate = write_gates_[path];
         if (!gate) gate = std::make_shared<std::recursive_timed_mutex>();
@@ -249,10 +279,12 @@ public:
     /// (leaked with the singleton, like write_gates_): a reopened path keeps
     /// the last-set policy until the owner sets it again.
     void set_wal_eviction_threshold_for_path(const std::string& path, int64_t bytes) {
+        require_creator_process();
         std::lock_guard<std::mutex> lock(mutex_);
         wal_eviction_thresholds_[path] = bytes;
     }
     std::optional<int64_t> wal_eviction_threshold_for_path(const std::string& path) {
+        require_creator_process();
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = wal_eviction_thresholds_.find(path);
         if (it == wal_eviction_thresholds_.end()) return std::nullopt;
@@ -260,9 +292,14 @@ public:
     }
 
 private:
+    const pid_t creator_pid_=::getpid();
+    void require_creator_process() const {
+        if (creator_pid_ != ::getpid()) throw std::runtime_error("inherited instance_registry belongs to another process");
+    }
     instance_registry() = default;
 
     std::vector<entry> get_entries(const std::string& path) {
+        require_creator_process();
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = instances_.find(path);
         if (it != instances_.end()) {
@@ -503,6 +540,8 @@ class lattice_db;
 using migration_block_t = std::function<void(migration_context& context)>;
 
 struct configuration {
+    // Opaque native launch custody. Copying transports an already issued owner.
+    detail::ordinary_context ordinary_context;
     /// Database file path. Use ":memory:" for in-memory database.
     std::string path = ":memory:";
 
@@ -515,6 +554,9 @@ struct configuration {
 
     /// Authorization token for sync. Required if websocket_url is set.
     std::string authorization_token;
+    std::shared_ptr<detail::ordinary_managed_product_credentials> managed_product_credentials;
+    ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
+    std::string ordinary_model_profile; // Bounded selector; never model/source authority.
 
     // Explicit app expectation, not authority. The trusted SDK transport and
     // same physical describe exchange must independently authenticate it.
@@ -872,23 +914,113 @@ private:
 // Main database interface
 // ============================================================================
 
+// Native destruction ownership, independent of admission or store authority.
+// A forked child must not destroy inherited threads, futures, callbacks or
+// mutex-bearing resource graphs. Keep their actual ownership in one allocation;
+// the native creator PID is captured before allocation and cannot be supplied.
+namespace detail {
+template<typename T> class process_bound_resource_owner {
+    struct native_deleter {
+        pid_t creator_pid;
+        void operator()(T* value) const noexcept {
+            if (!value || creator_pid != ::getpid()) return;
+            // The real payload remains heap-owned throughout each arbitrary
+            // target destruction. This final fallback must not allocate or
+            // leave a nonempty automatic target bundle across a fork.
+            if constexpr (requires(T& fields, pid_t creator) {
+                fields.prepare_native_target_destruction(creator);
+            }) {
+                if (!value->prepare_native_target_destruction(creator_pid)) return;
+            }
+            if (creator_pid == ::getpid()) delete value;
+            // Foreign-process copy is deliberately abandoned without touching
+            // T or releasing inherited descriptor locks. OS exit reclaims it.
+        }
+    };
+    std::unique_ptr<T,native_deleter> value_;
+public:
+    template<typename... Args> explicit process_bound_resource_owner(Args&&... args)
+        : value_(nullptr,native_deleter{::getpid()}) {
+        value_.reset(new T(std::forward<Args>(args)...));
+    }
+    process_bound_resource_owner(const process_bound_resource_owner&)=delete;
+    process_bound_resource_owner& operator=(const process_bound_resource_owner&)=delete;
+    process_bound_resource_owner(process_bound_resource_owner&&)=delete;
+    process_bound_resource_owner& operator=(process_bound_resource_owner&&)=delete;
+    T& get() const noexcept { return *value_; }
+    bool in_creator_process() const noexcept {
+        return value_.get_deleter().creator_pid == ::getpid();
+    }
+};
+}
+
 class lattice_db {
+    struct owned_resources;
+    detail::process_bound_resource_owner<owned_resources> process_resources_;
     struct recovery_commit_batch;
     friend class detail::authenticated_relay_setup;
     // Never published or cached. Only the one-shot source administrator can construct it.
     lattice_db(const configuration& config, detail::recovery_owner_schema catalog, std::shared_ptr<database> writer)
-        : recovery_schemas_(std::move(catalog)), administrative_owner_(true), config_(config), db_(std::move(writer)) {
+        : process_resources_(config,std::move(catalog),std::move(writer)) {
         setup_administrative_transaction_hooks();
         alive_count().fetch_add(1,std::memory_order_relaxed);
+    }
+    struct checked_managed_existing_key {
+    private:
+        friend class swift_lattice;
+        friend class lattice_db;
+        checked_managed_existing_key() = default;
+    };
+    friend class swift_lattice;
+    lattice_db(const configuration& config,detail::recovery_owner_schema catalog,
+        std::shared_ptr<database> writer,checked_managed_existing_key)
+        :process_resources_(config,std::move(catalog),std::move(writer),checked_managed_existing_key{}) {
+        require_creator_process();
+        detail::ordinary_require_creator(config_.ordinary_context);
+        if(!config_.ordinary_context||!db_||config_.read_only||config_.is_in_memory()||
+           config_.is_sync_enabled()||config_.is_ipc_enabled()||config_.audit_retention_seconds!=0)
+            throw db_error("checked existing owner requires its quiescent native context");
+        setup_store_write_gate();
+        register_sql_functions();
+        note_tables_for_all_schemas();
+        // Last, nonthrowing Core construction step. Derived failure unwinds
+        // through the real destructor; earlier Core failure has no count.
+        alive_count().fetch_add(1,std::memory_order_relaxed);
+    }
+    struct checked_mounted_server_existing_key {
+    private:
+        friend class swift_lattice;
+        friend class lattice_db;
+        checked_mounted_server_existing_key() = default;
+    };
+    lattice_db(const configuration& config,detail::recovery_owner_schema catalog,
+        std::shared_ptr<database> writer,checked_mounted_server_existing_key)
+        :process_resources_(config,std::move(catalog),std::move(writer),checked_mounted_server_existing_key{}) {
+        require_creator_process();
+        if(config_.ordinary_context||!db_||config_.read_only||config_.is_in_memory()||
+           config_.is_sync_enabled()||config_.is_ipc_enabled()||config_.audit_retention_seconds!=0||
+           config_.managed_product_credentials||recovery_continuous_)
+            throw db_error("checked mounted server requires a quiescent no-context owner");
+        setup_store_write_gate();
+        register_sql_functions();
+        note_tables_for_all_schemas();
+        alive_count().fetch_add(1,std::memory_order_relaxed);
+    }
+    void publish_checked_existing_facilities() {
+        require_creator_process();
+        if(!checked_existing_unpublished_)throw db_error("checked existing owner already published");
+        // From this point an exception must run full original facility cleanup.
+        checked_existing_unpublished_=false;
+        setup_change_hook();
+        instance_registry::instance().register_instance(config_.path,this,guard_);
+        adopt_path_wal_eviction_threshold();
+        setup_cross_process_notifier();
     }
     void setup_administrative_transaction_hooks();
 public:
     // Construct with path (uses default scheduler, no sync)
     explicit lattice_db(const std::string& path)
-        : config_(path)
-        , db_(std::make_shared<database>(path, database::open_mode::read_write))
-        , read_db_(!configuration::path_is_memory(path) ? std::make_shared<database>(path, database::open_mode::read_only) : nullptr)
-        , scheduler_(std::make_shared<immediate_scheduler>()) {
+        : process_resources_(path) {
         setup_store_write_gate();
         ensure_tables();
         setup_change_hook();
@@ -899,10 +1031,7 @@ public:
 
     // Construct in-memory (uses default scheduler, no sync)
     lattice_db()
-        : config_()
-        , db_(std::make_shared<database>(":memory:", database::open_mode::read_write))
-        , read_db_(nullptr)  // In-memory DB can't have separate read connection
-        , scheduler_(std::make_shared<immediate_scheduler>()) {
+        : process_resources_() {
         setup_store_write_gate();
         ensure_tables();
         setup_change_hook();
@@ -922,7 +1051,7 @@ public:
 
     /// True once close() has been called. Reads/writes on the connections
     /// short-circuit to empty (the guard lives in the `database` wrapper).
-    bool is_closed() const { return closed_.load(std::memory_order_seq_cst); }
+    bool is_closed() const { return !owns_creator_process() || closed_.load(std::memory_order_seq_cst); }
 
     // When using :memory: with sync enabled, we need a shared cache URI so the
     // sync db (separate lattice_db instance) connects to the SAME in-memory database.
@@ -937,20 +1066,14 @@ public:
         : lattice_db(config,defer_sync,detail::recovery_owner_schema::capture_native()) {}
 
 protected:
+    bool owns_creator_process() const noexcept { return process_resources_.in_creator_process(); }
+    void require_creator_process() const {
+        if (!owns_creator_process()) throw std::runtime_error("inherited lattice owner belongs to another process");
+    }
     // Swift supplies complete immutable declarations before base-constructor
     // bootstrap. A virtual getter here would see only the base subobject.
-    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas, std::shared_ptr<detail::recovery_continuous_admission> continuous = {})
-        : recovery_continuous_(std::move(continuous))
-        , recovery_schemas_(std::move(recovery_schemas))
-        , config_(config)
-        , db_(recovery_continuous_ ? detail::open_continuous_writer(config,recovery_continuous_) : std::make_shared<database>(resolve_path(config),
-              config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
-              config.busy_timeout_ms))
-        , read_db_(config.read_only ? nullptr :
-                   (!config.is_in_memory() && !config.is_sync_enabled() ? std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr))
-        , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
-                         std::make_shared<database>(config.path, database::open_mode::read_only, config.busy_timeout_ms) : nullptr)
-        , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {
+    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas, std::shared_ptr<detail::recovery_continuous_admission> continuous = {}, std::shared_ptr<detail::database_open_ledger> connection_ledger = {})
+        : process_resources_(config,std::move(recovery_schemas),std::move(continuous),std::move(connection_ledger)) {
         // Update config_.path to the resolved path so instance_registry keys match
         // between the main db and sync db (both use "file::memory:?cache=shared").
         config_.path = resolve_path(config);
@@ -1521,8 +1644,10 @@ public:
 
     /// Flag indicating if this connection is the sync coordinator
     /// When true, audit logs are generated but not uploaded (they come from remote)
-    bool is_synchronizer() const { return is_synchronizer_; }
-    void set_is_synchronizer(bool value) { is_synchronizer_ = value; }
+    bool is_synchronizer() const {
+        require_creator_process(); return is_synchronizer_; }
+    void set_is_synchronizer(bool value) {
+        require_creator_process(); is_synchronizer_ = value; }
 
     /// True when other same-process instances registered under this path can
     /// read this instance's committed writes: file DBs and shared-cache memory
@@ -2172,7 +2297,8 @@ public:
     // ========================================================================
 
     /// Returns true if sync is configured and enabled
-    bool is_sync_enabled() const { return config_.is_sync_enabled(); }
+    bool is_sync_enabled() const {
+        require_creator_process(); return config_.is_sync_enabled(); }
 
     /// Returns true if currently connected to sync server
     bool is_sync_connected() const;
@@ -2181,6 +2307,7 @@ public:
     /// Used by Swift to decide whether to observe progress from the in-process
     /// synchronizer or fall back to AuditLog-based passive observation.
     bool is_sync_agent() const {
+        require_creator_process();
         if (configured_sync_present()) return true;
         if (sync_lock_fd_ >= 0) return true;
         for (const auto& ipc : ipc_synchronizers_) {
@@ -2238,6 +2365,7 @@ public:
     /// (e.g., sync daemon marked entries as synchronized). NOT dispatched through
     /// the scheduler — runs directly on the notification thread.
     void set_on_xproc_idle(std::function<void()> handler) {
+        require_creator_process();
         std::lock_guard<std::mutex> lock(xproc_idle_mutex_);
         on_xproc_idle_ = std::move(handler);
     }
@@ -2669,9 +2797,9 @@ private:
 
     /// LEAF lock — held only for registration bookkeeping, never across SQL
     /// or a callback (see the §2.3 contract above).
-    std::mutex invalidation_hooks_mutex_;
-    std::vector<std::pair<uint64_t, invalidation_hook_detailed_fn>> invalidation_hooks_;
-    uint64_t next_invalidation_hook_token_ = 1;
+    std::mutex& invalidation_hooks_mutex_ = process_resources_.get().invalidation_hooks_mutex_;
+    std::vector<std::pair<uint64_t, invalidation_hook_detailed_fn>>& invalidation_hooks_ = process_resources_.get().invalidation_hooks_;
+    uint64_t& next_invalidation_hook_token_ = process_resources_.get().next_invalidation_hook_token_;
 
 public:
     // ========================================================================
@@ -2718,6 +2846,9 @@ public:
     size_t projection_resources_outstanding() const;
 
     uint64_t acquire_read_generation() {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        detail::ordinary_before_open(config_.path,config_.ordinary_context);
+        note_history_uncaptured_connection(); // Before any keeper can leave the pool or begin an off-list native open.
 #ifdef __EMSCRIPTEN__
         return 0;
 #else
@@ -2748,11 +2879,13 @@ public:
             if (!conn) {
                 // Select the final 2,000-page keeper cache at construction.
                 // Ordinary readers retain their 50,000-page default.
-                conn = database::make_read_keeper(config_.path, config_.busy_timeout_ms);
+                conn = database::make_read_keeper(config_.path, config_.busy_timeout_ms, config_.ordinary_context,connection_ledger_);
             }
+            conn->validate_ordinary_current_();
             conn->execute("BEGIN");
             conn->query("SELECT 1 FROM sqlite_schema LIMIT 1");  // the pin/fence
         } catch (const db_error&) {
+            if(config_.ordinary_context)throw; // Managed refusal cannot enter tolerant fallback.
             return 0;  // unopenable/racing-close store — caller falls back
         }
         auto gen = std::make_shared<read_generation>();
@@ -2779,6 +2912,7 @@ public:
     /// batches). Returns false when the generation is already retired or
     /// retiring — the caller re-resolves.
     bool retain_read_generation(uint64_t generation_id) {
+        detail::ordinary_require_creator(config_.ordinary_context);
         std::lock_guard<std::mutex> lock(read_pool_mutex_);
         for (auto& gen : live_generations_) {
             if (gen->id == generation_id) {
@@ -2795,6 +2929,7 @@ public:
     /// Releasing an already-retired id is a no-op (TTL/threshold/lifecycle
     /// retirement can race a facade's release — that is expected).
     void release_read_generation(uint64_t generation_id) {
+        detail::ordinary_require_creator(config_.ordinary_context);
         std::shared_ptr<read_generation> to_retire;
         {
             std::lock_guard<std::mutex> lock(read_pool_mutex_);
@@ -2825,6 +2960,8 @@ public:
     std::optional<std::vector<database::row_t>> query_at_generation(
         uint64_t generation_id, const std::string& sql,
         const std::vector<column_value_t>& params = {}) {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        detail::ordinary_before_open(config_.path,config_.ordinary_context);
         std::shared_ptr<read_generation> gen;
         {
             std::lock_guard<std::mutex> lock(read_pool_mutex_);
@@ -2850,6 +2987,7 @@ public:
         } release{gen.get()};
         if (test_hook_generation_query_gap_) test_hook_generation_query_gap_();
         try {
+            gen->conn->validate_ordinary_current_();
             auto rows = gen->conn->query(sql, params);
             // TOCTOU re-check (item-A adversarial finding 1): a force-retire
             // that began AFTER the liveness check above sets `retiring`
@@ -2865,6 +3003,7 @@ public:
             if (gen->retiring.load(std::memory_order_acquire)) return std::nullopt;
             return rows;
         } catch (const db_error&) {
+            if(config_.ordinary_context)throw;
             // Interrupted by a force-retire, or the store went away.
             return std::nullopt;
         }
@@ -2872,6 +3011,7 @@ public:
 
     /// Live generations held by THIS instance.
     size_t local_read_generations_outstanding() {
+        detail::ordinary_require_creator(config_.ordinary_context);
         const size_t projections = projection_resources_outstanding();
         std::lock_guard<std::mutex> lock(read_pool_mutex_);
         return live_generations_.size() + projections;
@@ -2884,6 +3024,7 @@ public:
     /// normal (TSR resolves), so consulting any single instance would read
     /// 0 from the wrong one (adversarial-review finding #4).
     size_t read_generations_outstanding() {
+        detail::ordinary_require_creator(config_.ordinary_context);
         size_t total = 0;
         instance_registry::instance().for_each_alive(config_.path,
             [&total](lattice_db* inst) {
@@ -3036,7 +3177,7 @@ public:
     /// execution — lets tests widen the force-retire TOCTOU window
     /// deterministically. Assign only before spawning reader threads (the
     /// member is read unsynchronized); never set in production.
-    std::function<void()> test_hook_generation_query_gap_;
+    std::function<void()>& test_hook_generation_query_gap_ = process_resources_.get().test_hook_generation_query_gap_;
 
     // ========================================================================
     // Per-store write gate — Live Results item A, spec §4.1 mechanism 2
@@ -3157,7 +3298,8 @@ private:
             // generation can both reach here (retire is idempotent); pooling
             // one connection twice would hand two future generations the
             // same handle.
-            if (gen->in_flight.load(std::memory_order_acquire) == 0 &&
+            if (!closed_.load(std::memory_order_seq_cst) &&
+                gen->in_flight.load(std::memory_order_acquire) == 0 &&
                 idle_read_pool_.size() + live_generations_.size() < read_pool_capacity_ &&
                 std::find(idle_read_pool_.begin(), idle_read_pool_.end(), conn) ==
                     idle_read_pool_.end()) {
@@ -3258,22 +3400,22 @@ private:
     /// LEAF lock (spec §2.3 invariant): held for pool bookkeeping only,
     /// NEVER across a SQL statement — keeper BEGIN/pin/COMMIT and all
     /// generation reads run outside it.
-    std::mutex read_pool_mutex_;
-    std::vector<std::shared_ptr<read_generation>> live_generations_;
-    std::vector<std::shared_ptr<database>> idle_read_pool_;
-    size_t read_pool_capacity_ = 3;             // spec §1.7 keeperPoolSize default
-    uint64_t next_read_generation_id_ = 1;      // guarded by read_pool_mutex_
-    std::atomic<int64_t> read_generation_ttl_ms_{30'000};        // §1.7 generationTTLSeconds
-    std::atomic<int64_t> read_generation_max_age_ms_{300'000};   // §3.2(b) absolute cap
-    std::atomic<int64_t> wal_keeper_eviction_threshold_bytes_{16ll << 20};  // §1.7/§3.4
+    std::mutex& read_pool_mutex_ = process_resources_.get().read_pool_mutex_;
+    std::vector<std::shared_ptr<read_generation>>& live_generations_ = process_resources_.get().live_generations_;
+    std::vector<std::shared_ptr<database>>& idle_read_pool_ = process_resources_.get().idle_read_pool_;
+    size_t& read_pool_capacity_ = process_resources_.get().read_pool_capacity_;             // spec §1.7 keeperPoolSize default
+    uint64_t& next_read_generation_id_ = process_resources_.get().next_read_generation_id_;      // guarded by read_pool_mutex_
+    std::atomic<int64_t>& read_generation_ttl_ms_ = process_resources_.get().read_generation_ttl_ms_;        // §1.7 generationTTLSeconds
+    std::atomic<int64_t>& read_generation_max_age_ms_ = process_resources_.get().read_generation_max_age_ms_;   // §3.2(b) absolute cap
+    std::atomic<int64_t>& wal_keeper_eviction_threshold_bytes_ = process_resources_.get().wal_keeper_eviction_threshold_bytes_;  // §1.7/§3.4
     /// Set from the WAL hook's C frame (atomic store — hook-frame legal)
     /// when the log crosses the threshold; consumed by
     /// run_pending_wal_eviction_if_any() aggregating across the path.
-    std::atomic<bool> wal_eviction_pending_{false};
+    std::atomic<bool>& wal_eviction_pending_ = process_resources_.get().wal_eviction_pending_;
     /// Cached at setup_change_hook time — the WAL hook frame may not run SQL.
-    int64_t wal_page_size_ = 4096;
+    int64_t& wal_page_size_ = process_resources_.get().wal_page_size_;
     /// Per-path shared-cache write gate (null for file/isolated stores).
-    std::shared_ptr<std::recursive_timed_mutex> store_write_gate_;
+    std::shared_ptr<std::recursive_timed_mutex>& store_write_gate_ = process_resources_.get().store_write_gate_;
 
 public:
     // Find by primary key
@@ -3716,6 +3858,7 @@ public:
     /// cannot corrupt other synchronizers' filtered-set membership, so the
     /// full re-arm is safe on any topology, including multi-channel hubs.
     void reset_sync_state(const std::string& sync_id) {
+        require_creator_process();
         detail::reset_sync_channel_with_producer_fence(*this,sync_id,false);
         LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_state, sync_set, slot cursors)",
                  sync_id.c_str());
@@ -3730,6 +3873,7 @@ public:
     /// sync_state rows inflated the eager-collapse count — an entry could
     /// collapse to isSynchronized=1 before a still-live channel relayed it.
     void remove_sync_channel_state(const std::string& sync_id) {
+        require_creator_process();
         detail::reset_sync_channel_with_producer_fence(*this,sync_id,true);
         LOG_INFO("lattice_db", "remove_sync_channel_state(%s): channel retired (state, set, slot removed)",
                  sync_id.c_str());
@@ -3948,6 +4092,13 @@ private:
     std::vector<std::string> apply_remote_changes_impl_(
         const std::vector<audit_log_entry>&, const std::optional<std::string>&,
         detail::canonical_upstream_delivery*);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&, const std::optional<std::string>&,
+        detail::canonical_upstream_delivery*,detail::ordinary_provisional_delivery*);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&,const std::optional<std::string>&,
+        detail::canonical_upstream_delivery*,detail::ordinary_provisional_delivery*,
+        detail::ordinary_source_upload_delivery*);
 
     void publish_local_audit_id_(int64_t row_id);
 
@@ -4077,6 +4228,7 @@ public:
     // ---- retention maintenance thread (armed only when audit_retention_seconds > 0)
 
     void start_audit_maintenance() {
+        require_creator_process();
         if (config_.read_only || config_.audit_retention_seconds <= 0) return;
         if (audit_maint_thread_.joinable()) return;
         audit_maint_thread_ = std::thread([this] {
@@ -4098,6 +4250,7 @@ public:
     }
 
     void stop_audit_maintenance() {
+        require_creator_process();
         {
             std::lock_guard<std::mutex> lock(audit_maint_mutex_);
             audit_maint_stop_ = true;
@@ -4825,9 +4978,9 @@ public:
     /// Legacy raw connection access. The caller must keep this lattice alive
     /// and serialize the reference against close/reopen/maintenance. These raw
     /// signatures remain source-compatible; they are not owned reader leases.
-    database& db() { return *db_; }
-    database& read_db() { return *borrow_read_connection(); }
-    database& xproc_read_db() { return *borrow_xproc_read_connection(); }
+    database& db() { detail::ordinary_require_creator(config_.ordinary_context);return *db_; }
+    database& read_db() { detail::ordinary_require_creator(config_.ordinary_context);return *borrow_read_connection(); }
+    database& xproc_read_db() { detail::ordinary_require_creator(config_.ordinary_context);return *borrow_xproc_read_connection(); }
 
     /// Owned internal read access. Keep this lattice alive through the entire
     /// borrow, including its release: writer hooks refer back to the lattice.
@@ -4918,20 +5071,7 @@ public:
         if (!db_->table_exists(link_table_name)) {
             // Create link table with globalId for sync and PRIMARY KEY to prevent duplicates
             // Matches Lattice.swift's createLinkTable()
-            std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
-                "lhs TEXT NOT NULL, "
-                "rhs TEXT NOT NULL, "
-                "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
-                    "lower(hex(randomblob(4))) || '-' || "
-                    "lower(hex(randomblob(2))) || '-' || "
-                    "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
-                    "substr('89AB', 1 + (abs(random()) % 4), 1) || "
-                    "substr(lower(hex(randomblob(2))),2) || '-' || "
-                    "lower(hex(randomblob(6)))"
-                "), "
-                "PRIMARY KEY(lhs, rhs)"
-            ")";
-            db_->execute(sql);
+            db_->execute(detail::ordinary_schema_recipe::link_table(link_table_name));
         }
 
         // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
@@ -4945,21 +5085,7 @@ public:
 
         if (!db_->table_exists(link_table_name)) {
             // Virtual link table adds rhs_type column for type discrimination
-            std::string sql = "CREATE TABLE IF NOT EXISTS " + link_table_name + "("
-                "lhs TEXT NOT NULL, "
-                "rhs TEXT NOT NULL, "
-                "rhs_type TEXT NOT NULL, "
-                "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
-                    "lower(hex(randomblob(4))) || '-' || "
-                    "lower(hex(randomblob(2))) || '-' || "
-                    "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
-                    "substr('89AB', 1 + (abs(random()) % 4), 1) || "
-                    "substr(lower(hex(randomblob(2))),2) || '-' || "
-                    "lower(hex(randomblob(6)))"
-                "), "
-                "PRIMARY KEY(lhs, rhs_type, rhs)"
-            ")";
-            db_->execute(sql);
+            db_->execute(detail::ordinary_schema_recipe::virtual_link_table(link_table_name));
         }
 
         // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
@@ -5004,74 +5130,9 @@ public:
             db_->execute("ALTER TABLE " + union_table_name + " RENAME TO " + union_table_name + "_old");
         }
 
-        // Build column info from descriptor
-        std::vector<std::pair<std::string, column_type>> columns;
-        columns.push_back({"\"case\"", column_type::text});
-        std::map<std::string, std::vector<std::string>> case_to_cols;
-        std::vector<std::string> all_case_cols;
-
-        std::ostringstream sql;
-        sql << "CREATE TABLE " << union_table_name << "("
-            << "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
-            <<   "lower(hex(randomblob(4))) || '-' || "
-            <<   "lower(hex(randomblob(2))) || '-' || "
-            <<   "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
-            <<   "substr('89ab', 1 + (abs(random()) % 4), 1) || "
-            <<   "substr(lower(hex(randomblob(2))),2) || '-' || "
-            <<   "lower(hex(randomblob(6)))"
-            << "), "
-            << "\"case\" TEXT NOT NULL";
-
-        for (const auto& c : desc.cases) {
-            std::vector<std::string> cols;
-            if (c.values.empty()) {
-                case_to_cols[c.case_name] = {};
-                continue;
-            }
-            if (c.values.size() == 1 && c.values[0].param_name.empty()) {
-                std::string col = c.case_name;
-                sql << ", " << col << " " << sql_type_string(c.values[0].type);
-                columns.push_back({col, c.values[0].type});
-                cols.push_back(col);
-            } else {
-                for (const auto& val : c.values) {
-                    std::string col = c.case_name + "__" + val.param_name;
-                    sql << ", " << col << " " << sql_type_string(val.type);
-                    columns.push_back({col, val.type});
-                    cols.push_back(col);
-                }
-            }
-            case_to_cols[c.case_name] = cols;
-            all_case_cols.insert(all_case_cols.end(), cols.begin(), cols.end());
-        }
-
-        // CHECK constraint
-        if (!all_case_cols.empty()) {
-            sql << ", CHECK(";
-            bool first_case = true;
-            for (const auto& c : desc.cases) {
-                if (!first_case) sql << " OR ";
-                first_case = false;
-                sql << "(\"case\" = '" << c.case_name << "'";
-                auto my_cols_it = case_to_cols.find(c.case_name);
-                const auto& my_cols = (my_cols_it != case_to_cols.end())
-                    ? my_cols_it->second : std::vector<std::string>{};
-                for (const auto& col : my_cols) {
-                    sql << " AND " << col << " IS NOT NULL";
-                }
-                for (const auto& col : all_case_cols) {
-                    if (std::find(my_cols.begin(), my_cols.end(), col) == my_cols.end()) {
-                        sql << " AND " << col << " IS NULL";
-                    }
-                }
-                sql << ")";
-            }
-            sql << ")";
-        }
-
-        sql << ")";
-        db_->execute(sql.str());
+        auto generated=detail::ordinary_schema_recipe::union_table(union_table_name,desc);
+        const auto& columns=generated.columns;
+        db_->execute(generated.sql);
 
         // If rebuilding, copy old data and drop the old table
         if (!old_col_names.empty()) {
@@ -5119,15 +5180,7 @@ public:
     void create_union_cascade_trigger(const std::string& parent_table,
                                       const std::string& field_name,
                                       const std::string& union_table_name) {
-        std::string trigger_name = "_cascade_delete_" + parent_table + "_" + field_name + "_union";
-        std::string sql =
-            "CREATE TRIGGER IF NOT EXISTS " + trigger_name +
-            " BEFORE DELETE ON " + parent_table +
-            " WHEN OLD." + field_name + " IS NOT NULL AND OLD." + field_name + " != ''"
-            " BEGIN"
-            "   DELETE FROM " + union_table_name + " WHERE globalId = OLD." + field_name + ";"
-            " END";
-        db_->execute(sql);
+        db_->execute(detail::ordinary_schema_recipe::union_cascade(parent_table,field_name,union_table_name));
     }
 
     /// Get column types for a table (for sync schema lookup)
@@ -5170,7 +5223,7 @@ private:
     friend struct vec0_maintenance_test_access;
     // Install/clear only with all participating threads joined. The private
     // friend harness uses these phases for deterministic admission barriers.
-    std::function<void(const char*, const char*)> test_hook_vec0_maintenance_;
+    std::function<void(const char*, const char*)>& test_hook_vec0_maintenance_ = process_resources_.get().test_hook_vec0_maintenance_;
 
     struct vec0_maintenance_frame {
         sqlite3* connection;
@@ -5185,7 +5238,7 @@ private:
 
     // Shared-cache memory reuses its existing store write gate. Isolated
     // memory and DELETE-journal WASM need only this per-instance gate.
-    std::recursive_timed_mutex vec0_memory_maintenance_gate_;
+    std::recursive_timed_mutex& vec0_memory_maintenance_gate_ = process_resources_.get().vec0_memory_maintenance_gate_;
 
     struct vec0_sqlite_hold {
         sqlite3_mutex* mutex;
@@ -5378,13 +5431,7 @@ public:
         // Create R*Tree virtual table (if it doesn't exist)
         // Uses row id for joining back to main table
         if (!table_exists) {
-            std::ostringstream sql;
-            sql << "CREATE VIRTUAL TABLE " << rtree_table << " USING rtree("
-                << "id, "           // Matches main table id
-                << "minLat, maxLat, "
-                << "minLon, maxLon"
-                << ")";
-            db_->execute(sql.str());
+            db_->execute(detail::ordinary_schema_recipe::rtree_table(rtree_table));
         }
 
         // Column names in main table
@@ -5398,39 +5445,13 @@ public:
         // even when a TEMP UNION ALL view shadows the model table (from attach()).
         // Note: SQLite forbids qualified names inside trigger bodies.
         // INSERT trigger - add to R*Tree when row is inserted with non-null geo data
-        std::ostringstream insert_trigger;
-        insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_insert "
-                       << "AFTER INSERT ON main." << model_table << " "
-                       << "WHEN NEW." << minLat << " IS NOT NULL "
-                       << "BEGIN "
-                       << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
-                       << "VALUES (NEW.id, NEW." << minLat << ", NEW." << maxLat << ", "
-                       << "NEW." << minLon << ", NEW." << maxLon << "); "
-                       << "END";
-        db_->execute(insert_trigger.str());
+        db_->execute(detail::ordinary_schema_recipe::rtree_insert(model_table,column_name));
 
         // UPDATE trigger - update R*Tree when geo columns change
-        std::ostringstream update_trigger;
-        update_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_update "
-                       << "AFTER UPDATE OF " << minLat << ", " << maxLat << ", "
-                       << minLon << ", " << maxLon << " ON main." << model_table << " "
-                       << "BEGIN "
-                       << "DELETE FROM " << rtree_table << " WHERE id = OLD.id; "
-                       << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
-                       << "SELECT NEW.id, NEW." << minLat << ", NEW." << maxLat << ", "
-                       << "NEW." << minLon << ", NEW." << maxLon << " "
-                       << "WHERE NEW." << minLat << " IS NOT NULL; "
-                       << "END";
-        db_->execute(update_trigger.str());
+        db_->execute(detail::ordinary_schema_recipe::rtree_update(model_table,column_name));
 
         // DELETE trigger - remove from R*Tree when row is deleted
-        std::ostringstream delete_trigger;
-        delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_delete "
-                       << "AFTER DELETE ON main." << model_table << " "
-                       << "BEGIN "
-                       << "DELETE FROM " << rtree_table << " WHERE id = OLD.id; "
-                       << "END";
-        db_->execute(delete_trigger.str());
+        db_->execute(detail::ordinary_schema_recipe::rtree_delete(model_table,column_name));
 
         // Populate rtree from existing data (only on first creation)
         if (!table_exists) {
@@ -5452,12 +5473,7 @@ public:
         db_->execute("DELETE FROM " + rtree_table);
 
         // Repopulate from main table
-        std::ostringstream populate_sql;
-        populate_sql << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
-                     << "SELECT id, " << minLat << ", " << maxLat << ", " << minLon << ", " << maxLon << " "
-                     << "FROM " << model_table << " "
-                     << "WHERE " << minLat << " IS NOT NULL";
-        db_->execute(populate_sql.str());
+        db_->execute(detail::ordinary_schema_recipe::rtree_population(model_table,column_name));
     }
 
     /// Ensure all geo_bounds rtree tables exist for a set of model schemas.
@@ -5535,71 +5551,25 @@ public:
 
         // Create geo_bounds list table
         // Uses parent_id (globalId of parent) for relationship, like link tables
-        std::ostringstream sql;
-        sql << "CREATE TABLE IF NOT EXISTS " << list_table << "("
-            << "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            << "parent_id TEXT NOT NULL, "  // globalId of parent row
-            << "minLat REAL NOT NULL, "
-            << "maxLat REAL NOT NULL, "
-            << "minLon REAL NOT NULL, "
-            << "maxLon REAL NOT NULL, "
-            << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
-            << "lower(hex(randomblob(4))) || '-' || "
-            << "lower(hex(randomblob(2))) || '-' || "
-            << "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
-            << "substr('89AB', 1 + (abs(random()) % 4), 1) || "
-            << "substr(lower(hex(randomblob(2))),2) || '-' || "
-            << "lower(hex(randomblob(6)))"
-            << ")"
-            << ")";
-        db_->execute(sql.str());
+        db_->execute(detail::ordinary_schema_recipe::geo_list_table(list_table));
 
         // Create index for efficient parent lookups
-        std::string idx_sql = "CREATE INDEX IF NOT EXISTS idx_" +
-            list_table + "_parent ON " + list_table + "(parent_id)";
-        db_->execute(idx_sql);
+        db_->execute(detail::ordinary_schema_recipe::geo_list_parent_index(list_table));
 
         // Create R*Tree virtual table for spatial indexing (if it doesn't exist)
         if (!db_->table_exists(rtree_table)) {
-            std::ostringstream rtree_sql;
-            rtree_sql << "CREATE VIRTUAL TABLE " << rtree_table << " USING rtree("
-                      << "id, "  // Matches list table id
-                      << "minLat, maxLat, "
-                      << "minLon, maxLon"
-                      << ")";
-            db_->execute(rtree_sql.str());
+            db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_table(rtree_table));
         }
 
         // Create triggers to keep R*Tree in sync with list table
         // INSERT trigger
-        std::ostringstream insert_trigger;
-        insert_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_insert "
-                       << "AFTER INSERT ON " << list_table << " "
-                       << "BEGIN "
-                       << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
-                       << "VALUES (NEW.id, NEW.minLat, NEW.maxLat, NEW.minLon, NEW.maxLon); "
-                       << "END";
-        db_->execute(insert_trigger.str());
+        db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_insert(list_table));
 
         // UPDATE trigger
-        std::ostringstream update_trigger;
-        update_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_update "
-                       << "AFTER UPDATE OF minLat, maxLat, minLon, maxLon ON " << list_table << " "
-                       << "BEGIN "
-                       << "DELETE FROM " << rtree_table << " WHERE id = OLD.id; "
-                       << "INSERT INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
-                       << "VALUES (NEW.id, NEW.minLat, NEW.maxLat, NEW.minLon, NEW.maxLon); "
-                       << "END";
-        db_->execute(update_trigger.str());
+        db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_update(list_table));
 
         // DELETE trigger
-        std::ostringstream delete_trigger;
-        delete_trigger << "CREATE TRIGGER IF NOT EXISTS " << rtree_table << "_delete "
-                       << "AFTER DELETE ON " << list_table << " "
-                       << "BEGIN "
-                       << "DELETE FROM " << rtree_table << " WHERE id = OLD.id; "
-                       << "END";
-        db_->execute(delete_trigger.str());
+        db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_delete(list_table));
 
         // Create audit triggers for sync
         create_geo_bounds_list_triggers(list_table);
@@ -5607,45 +5577,7 @@ public:
 
     /// Create audit triggers for a geo_bounds list table (for sync/observation)
     void create_geo_bounds_list_triggers(const std::string& list_table) {
-        // INSERT trigger for AuditLog
-        std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + list_table + "Insert"
-            " AFTER INSERT ON " + list_table +
-            " WHEN NOT sync_disabled()"
-            " BEGIN"
-            "   INSERT INTO AuditLog(tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames)"
-            "   VALUES("
-            "       '" + list_table + "',"
-            "       'INSERT',"
-            "       NEW.id,"
-            "       NEW.globalId,"
-            "       json_object("
-            "           'parent_id', json_object('kind', 2, 'value', NEW.parent_id),"
-            "           'minLat', json_object('kind', 3, 'value', NEW.minLat),"
-            "           'maxLat', json_object('kind', 3, 'value', NEW.maxLat),"
-            "           'minLon', json_object('kind', 3, 'value', NEW.minLon),"
-            "           'maxLon', json_object('kind', 3, 'value', NEW.maxLon)"
-            "       ),"
-            "       json_array('parent_id', 'minLat', 'maxLat', 'minLon', 'maxLon')"
-            "   );"
-            " END";
-        db_->execute(insert_trigger);
-
-        // DELETE trigger for AuditLog
-        std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + list_table + "Delete"
-            " AFTER DELETE ON " + list_table +
-            " WHEN NOT sync_disabled()"
-            " BEGIN"
-            "   INSERT INTO AuditLog(tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames)"
-            "   VALUES("
-            "       '" + list_table + "',"
-            "       'DELETE',"
-            "       OLD.id,"
-            "       OLD.globalId,"
-            "       '{}',"
-            "       '[]'"
-            "   );"
-            " END";
-        db_->execute(delete_trigger);
+        for(const auto& sql:detail::ordinary_schema_recipe::geo_list_audit(list_table))db_->execute(sql);
     }
 
     /// Idempotent, atomic refresh of one vec0 index row (Aug 2026 UNIQUE/lock
@@ -6187,26 +6119,46 @@ public:
 
 protected:
     // Attached database aliases (set by attach()) for cross-DB knn/fts queries
-    std::vector<std::string> attached_aliases_;
+    std::vector<std::string>& attached_aliases_ = process_resources_.get().attached_aliases_;
 
     // attach/detach bookkeeping — all guarded by attach_mutex_:
     // (alias, path) pairs for idempotence checks, and the names of every
     // TEMP view attach created so regeneration can drop exactly what it
     // owns (view names are the bare table names; the set is identical on
     // every view-bearing handle).
-    mutable std::mutex attach_mutex_;
-    std::vector<std::pair<std::string, std::string>> attached_dbs_;
-    std::unordered_map<std::string, int64_t> attached_route_tokens_;
-    std::unordered_map<int64_t, std::shared_ptr<const void>> attached_route_metadata_;
-    int64_t next_attachment_token_ = 1;
-    std::set<std::string> attached_view_names_;
-    std::map<std::string, std::string> attached_view_sql_;
-    std::map<std::string, std::shared_ptr<const physical_store_identity>> attached_projection_identities_;
-    bool attachment_topology_valid_ = true;
+    std::mutex& attach_mutex_ = process_resources_.get().attach_mutex_;
+    std::vector<std::pair<std::string, std::string>>& attached_dbs_ = process_resources_.get().attached_dbs_;
+    std::unordered_map<std::string, int64_t>& attached_route_tokens_ = process_resources_.get().attached_route_tokens_;
+    std::unordered_map<int64_t, std::shared_ptr<const void>>& attached_route_metadata_ = process_resources_.get().attached_route_metadata_;
+    int64_t& next_attachment_token_ = process_resources_.get().next_attachment_token_;
+    std::set<std::string>& attached_view_names_ = process_resources_.get().attached_view_names_;
+    std::map<std::string, std::string>& attached_view_sql_ = process_resources_.get().attached_view_sql_;
+    std::map<std::string, std::shared_ptr<const physical_store_identity>>& attached_projection_identities_ = process_resources_.get().attached_projection_identities_;
+    bool& attachment_topology_valid_ = process_resources_.get().attachment_topology_valid_;
+    std::map<std::string,std::shared_ptr<const detail::ordinary_cohort_attachment_binding>>& attached_cohort_bindings_ = process_resources_.get().attached_cohort_bindings_;
 
     // Scalar admission reads this view only while holding its writer mutex.
     // Topology changes publish under attach_mutex_; invalidation is allocation
     // free and precedes the first DETACH side effect, including failed DETACH.
+    friend class detail::ordinary_cohort_attachment_access;
+    friend class detail::ordinary_export_access;
+    // Exact retained exporter/profile owner slots from the finite D8 header.
+    // Only the actual bootstrap COMMIT and private exporter/receiver paths set them.
+    bool& ordinary_schema_initialized_here_ = process_resources_.get().ordinary_schema_initialized_here_;
+    std::shared_ptr<const detail::ordinary_child_origin>& ordinary_child_origin_ = process_resources_.get().ordinary_child_origin_;
+    // Private fixed-connection custody, installed before the history child rendezvous.
+    // The marker is a refusal boundary, never a source or completion grant.
+    std::atomic<bool>& ordinary_connection_construction_seen_ = process_resources_.get().ordinary_connection_construction_seen_;
+    detail::ordinary_shared_publication<detail::ordinary_history_child_connections>& ordinary_history_child_connections_ = process_resources_.get().ordinary_history_child_connections_;
+    void note_history_uncaptured_connection();
+    friend struct detail::ordinary_history_open_ledger_test_access;
+    std::shared_ptr<detail::database_open_ledger>& connection_ledger_ = process_resources_.get().connection_ledger_;
+    detail::ordinary_shared_publication<const detail::ordinary_managed_profile>& ordinary_managed_profile_ = process_resources_.get().ordinary_managed_profile_;
+    detail::ordinary_weak_publication<const detail::ordinary_managed_receiver_preservation>& ordinary_receiver_preservation_ = process_resources_.get().ordinary_receiver_preservation_;
+    // Only the actual validated restart publisher associates a receive request.
+    detail::ordinary_weak_publication<const detail::ordinary_receiver_wss_request>& ordinary_receiver_wss_ = process_resources_.get().ordinary_receiver_wss_;
+    std::atomic<bool>& ordinary_export_enrolled_here_ = process_resources_.get().ordinary_export_enrolled_here_;
+    std::atomic<bool>& ordinary_receive_enrolled_here_ = process_resources_.get().ordinary_receive_enrolled_here_;
     friend class detail::managed_route_scope;
     friend class model_base;
     friend struct detail::recovery_writer_access;
@@ -6214,7 +6166,23 @@ protected:
     friend class detail::canonical_writer_adapter;
     friend class detail::recovery_local_producer_adapter;
     friend class detail::recovery_continuous_producer;
-    std::shared_ptr<detail::recovery_continuous_admission> recovery_continuous_;
+    std::shared_ptr<detail::recovery_continuous_admission>& recovery_continuous_ = process_resources_.get().recovery_continuous_;
+    friend class detail::ordinary_managed_ipc_access;
+    friend class detail::ordinary_receiver_wss_access;
+    friend class detail::ordinary_receiver_session;
+    friend class detail::ordinary_managed_start_capture_tail;
+    std::mutex& managed_wss_mutex_ = process_resources_.get().managed_wss_mutex_;
+    bool& managed_wss_starting_ = process_resources_.get().managed_wss_starting_;
+    std::shared_ptr<detail::configured_managed_handlers>& managed_wss_handlers_ = process_resources_.get().managed_wss_handlers_;
+    std::shared_ptr<detail::configured_recovery_connection>& managed_wss_connection_ = process_resources_.get().managed_wss_connection_;
+    std::shared_ptr<const detail::ordinary_managed_owner_release>& managed_wss_start_release_ = process_resources_.get().managed_wss_start_release_;
+    std::shared_ptr<detail::configured_managed_handlers> configured_listener_cell();
+    bool remember_configured_state(const synchronizer::on_state_change_handler&);
+    bool remember_configured_error(const synchronizer::on_error_handler&);
+    bool remember_configured_progress(const synchronizer::on_progress_handler&);
+    void begin_configured_listener_retirement();
+    bool retire_configured_listener_targets();
+    bool finish_configured_listener_retirement();
     std::shared_ptr<detail::configured_recovery_connection> configured_connection() const noexcept;
     bool configured_sync_present() const noexcept;
     bool configured_sync_connected() const;
@@ -6227,9 +6195,10 @@ protected:
     void configured_sync_progress(synchronizer::on_progress_handler);
     synchronizer::sync_progress configured_sync_progress() const;
     lattice_close_result configured_sync_close(std::chrono::steady_clock::time_point) noexcept;
-    const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
-    bool recovery_producer_bootstrapped_=false;
-    bool administrative_owner_=false;
+    const detail::recovery_owner_schema& recovery_schemas_ = process_resources_.get().recovery_schemas_;
+    bool& recovery_producer_bootstrapped_ = process_resources_.get().recovery_producer_bootstrapped_;
+    bool& administrative_owner_ = process_resources_.get().administrative_owner_;
+    bool& checked_existing_unpublished_ = process_resources_.get().checked_existing_unpublished_;
     friend struct managed_attachment_test_access;
     friend struct topology_admission_test_access;
     struct managed_attachment_binding {
@@ -6241,10 +6210,10 @@ protected:
             : alias(std::move(a)), filename(std::move(f)), token(t), writer(std::move(w)) {}
     };
     using managed_attachment_view = std::vector<std::shared_ptr<const managed_attachment_binding>>;
-    std::shared_ptr<const managed_attachment_view> managed_attachment_view_;
+    std::shared_ptr<const managed_attachment_view>& managed_attachment_view_ = process_resources_.get().managed_attachment_view_;
     // Covers admitted SQL and its deferred tail. Writer maintenance refuses
     // publication while nonzero; it never waits for callbacks under a mutex.
-    std::atomic<size_t> active_managed_attachment_operations_{0};
+    std::atomic<size_t>& active_managed_attachment_operations_ = process_resources_.get().active_managed_attachment_operations_;
     void publish_managed_attachment(const std::string& alias, const std::string& path,
                                     int64_t token, const std::shared_ptr<database>& writer);
     std::shared_ptr<const managed_attachment_view> managed_view_for_writer(
@@ -6312,12 +6281,12 @@ private:
     void shutdown_projection_reads();
     void pause_projection_reads();
     void resume_projection_reads();
-    mutable std::mutex projection_service_mutex_;
-    std::shared_ptr<projection_service> projection_service_;
+    std::mutex& projection_service_mutex_ = process_resources_.get().projection_service_mutex_;
+    std::shared_ptr<projection_service>& projection_service_ = process_resources_.get().projection_service_;
     // Retained across service replacement/maintenance so native batches from a
     // prior service still count against this parent's aggregate capture quota.
-    std::shared_ptr<projection_capture_account> projection_capture_account_;
-    bool projection_admission_paused_ = false; // protected by service mutex
+    std::shared_ptr<projection_capture_account>& projection_capture_account_ = process_resources_.get().projection_capture_account_;
+    bool& projection_admission_paused_ = process_resources_.get().projection_admission_paused_; // protected by service mutex
 
     using projection_pressure_map = std::map<std::string, std::shared_ptr<projection_pressure_source>, std::less<>>;
     struct projection_pressure_map_deleter {
@@ -6337,33 +6306,33 @@ private:
     // recheck the current slot, and release before callbacks/SQL. Publishers
     // switch slots then drain only old readers, outside SQLite/registry locks.
     // All protocol atomics are seq_cst. At most two immutable maps exist.
-    mutable std::atomic<unsigned> projection_pressure_slot_{0};
-    mutable std::atomic<uint64_t> projection_pressure_readers_[2]{};
-    std::atomic<const projection_pressure_map*> projection_pressure_maps_[2]{};
-    std::unique_ptr<const projection_pressure_map, projection_pressure_map_deleter> projection_pressure_owners_[2];
+    std::atomic<unsigned>& projection_pressure_slot_ = process_resources_.get().projection_pressure_slot_;
+    std::atomic<uint64_t> (&projection_pressure_readers_)[2] = process_resources_.get().projection_pressure_readers_;
+    std::atomic<const projection_pressure_map*> (&projection_pressure_maps_)[2] = process_resources_.get().projection_pressure_maps_;
+    std::unique_ptr<const projection_pressure_map, projection_pressure_map_deleter> (&projection_pressure_owners_)[2] = process_resources_.get().projection_pressure_owners_;
 
-    configuration config_;
+    configuration& config_ = process_resources_.get().config_;
     // Publication only: never hold this mutex across SQLite, callbacks, or
     // destruction. attach -> publication is the only nested lock direction.
-    std::mutex connection_ownership_mutex_;
-    uint64_t connection_revision_ = 0;
-    std::shared_ptr<database> db_;       // Write connection / fallback owner
-    std::shared_ptr<database> read_db_;
-    std::shared_ptr<detail::recovery_refresh_state> recovery_refresh_;
+    std::mutex& connection_ownership_mutex_ = process_resources_.get().connection_ownership_mutex_;
+    uint64_t& connection_revision_ = process_resources_.get().connection_revision_;
+    std::shared_ptr<database>& db_ = process_resources_.get().db_;       // Write connection / fallback owner
+    std::shared_ptr<database>& read_db_ = process_resources_.get().read_db_;
+    std::shared_ptr<detail::recovery_refresh_state>& recovery_refresh_ = process_resources_.get().recovery_refresh_;
     void recovery_subscriptions_changed();
     // Thread that opened the current explicit transaction (see read_db()).
-    std::atomic<std::thread::id> txn_owner_thread_{};  // Read-only connection for concurrent reads
-    std::shared_ptr<database> xproc_read_db_;  // Dedicated read connection for xproc handler
+    std::atomic<std::thread::id>& txn_owner_thread_ = process_resources_.get().txn_owner_thread_;  // Read-only connection for concurrent reads
+    std::shared_ptr<database>& xproc_read_db_ = process_resources_.get().xproc_read_db_;  // Dedicated read connection for xproc handler
                                                // (avoids SQLite lock contention with read_db_
                                                // when observer callbacks query on MainActor)
     // Set by close() for is_closed(). Published and borrowed owners retain the
     // wrapper; database::close() provides the logical read/write guard.
-    std::atomic<bool> closed_{false};
-    std::shared_ptr<scheduler> scheduler_;
-    std::unique_ptr<synchronizer> synchronizer_;
+    std::atomic<bool>& closed_ = process_resources_.get().closed_;
+    std::shared_ptr<scheduler>& scheduler_ = process_resources_.get().scheduler_;
+    std::unique_ptr<synchronizer>& synchronizer_ = process_resources_.get().synchronizer_;
     // Payload-free immutable policy shared by pending, active and dormant
     // same-path/URL owners. Its registry lock never spans owner work.
-    std::shared_ptr<const detail::sync_policy_reservation> sync_policy_;
+    std::shared_ptr<const detail::sync_policy_reservation>& sync_policy_ = process_resources_.get().sync_policy_;
 
     // IPC sync
     struct ipc_sync_state {
@@ -6371,30 +6340,30 @@ private:
         std::unique_ptr<synchronizer> sync;
         int lock_fd = -1;  // flock on <channel>.ipc.lock — mirrors sync_lock_fd_ for WSS
     };
-    std::vector<ipc_sync_state> ipc_synchronizers_;
+    std::vector<ipc_sync_state>& ipc_synchronizers_ = process_resources_.get().ipc_synchronizers_;
 
     // Sync callbacks — stored for retroactive application to lazily-created synchronizers.
     // Protected by ipc_callbacks_mutex_ to avoid races between the accept thread
     // (which creates IPC synchronizers) and the main thread (which sets callbacks).
-    std::mutex ipc_callbacks_mutex_;
-    std::function<void(bool)> on_sync_state_change_;
-    std::function<void(const std::string&)> on_sync_error_;
-    synchronizer::on_progress_handler on_sync_progress_;
+    std::mutex& ipc_callbacks_mutex_ = process_resources_.get().ipc_callbacks_mutex_;
+    std::function<void(bool)>& on_sync_state_change_ = process_resources_.get().on_sync_state_change_;
+    std::function<void(const std::string&)>& on_sync_error_ = process_resources_.get().on_sync_error_;
+    synchronizer::on_progress_handler& on_sync_progress_ = process_resources_.get().on_sync_progress_;
 
     // Cross-process idle hint — fires on the xproc background thread (NOT the
     // scheduler) when a Darwin notification arrives but no new AuditLog entries
     // exist. Used by passive sync progress observers to re-check pending counts
     // without going through the general observer system / MainActor scheduler.
-    std::mutex xproc_idle_mutex_;
-    std::function<void()> on_xproc_idle_;
+    std::mutex& xproc_idle_mutex_ = process_resources_.get().xproc_idle_mutex_;
+    std::function<void()>& on_xproc_idle_ = process_resources_.get().on_xproc_idle_;
 
     // Synchronizer flag - true if this connection handles remote changes
-    bool is_synchronizer_ = false;
+    bool& is_synchronizer_ = process_resources_.get().is_synchronizer_;
 
     // Cross-process flock for WSS sync ownership.
     // >= 0 means this process holds the lock and owns the WSS synchronizer.
     // -1 means lock not held (another process owns it, or sync not configured).
-    int sync_lock_fd_ = -1;
+    int& sync_lock_fd_ = process_resources_.get().sync_lock_fd_;
 
     struct recovery_commit_batch {
         std::vector<change_event> events;
@@ -6406,25 +6375,25 @@ private:
     // Guarded by change_buffer_mutex_. A generic flush cannot steal the
     // admitted recovery transaction's rows, including a preexisting drain
     // that already cleared txn_dirty_ before this frame acquired SQLite.
-    bool recovery_change_buffer_reserved_ = false;
+    bool& recovery_change_buffer_reserved_ = process_resources_.get().recovery_change_buffer_reserved_;
     // Only off-lock topology delivery holds this depth. Callback writes keep
     // their existing bounded outer drain instead of recursively delivering.
-    size_t topology_delivery_depth_ = 0; // guarded by change_buffer_mutex_
+    size_t& topology_delivery_depth_ = process_resources_.get().topology_delivery_depth_; // guarded by change_buffer_mutex_
     // Physical-writer publication also refuses same-thread recursive SQLite
     // callbacks during an admitted private install; whole-owner close may fence
     // new admission without replacing the retained writer.
-    std::atomic<size_t> active_recovery_install_operations_{0};
+    std::atomic<size_t>& active_recovery_install_operations_ = process_resources_.get().active_recovery_install_operations_;
 
     // Change buffering - accumulates changes until WAL hook fires
-    std::mutex change_buffer_mutex_;
-    std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> change_buffer_;  // (table, op, rowId, globalId, mainSchema)
-    bool is_flushing_ = false;
+    std::mutex& change_buffer_mutex_ = process_resources_.get().change_buffer_mutex_;
+    std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>>& change_buffer_ = process_resources_.get().change_buffer_;  // (table, op, rowId, globalId, mainSchema)
+    bool& is_flushing_ = process_resources_.get().is_flushing_;
 
 public:
     /// Set by apply_remote_changes to signal that flush_changes should look up
     /// changedFieldsNames from AuditLog and pass them to object observers.
     /// Local Swift setter changes don't need this (the setter handles observation).
-    std::atomic<bool> applying_remote_changes_{false};
+    std::atomic<bool>& applying_remote_changes_ = process_resources_.get().applying_remote_changes_;
 
     /// Set by the upsert/bulk-insert paths so flush_changes() populates changed_fields
     /// for the resulting local UPDATE — lets live object instances backing the conflicted
@@ -6467,17 +6436,17 @@ private:
     void trigger_sync_upload();
 
     // Table-level observer storage (for Results observation)
-    std::mutex observers_mutex_;
+    std::mutex& observers_mutex_ = process_resources_.get().observers_mutex_;
     // Table and object registrations hold different registry mutexes. Token
     // allocation is shared; registry publication stays under each own mutex.
-    std::atomic<observer_id> next_observer_id_{1};
-    std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>> table_observers_;
+    std::atomic<observer_id>& next_observer_id_ = process_resources_.get().next_observer_id_;
+    std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>>& table_observers_ = process_resources_.get().table_observers_;
 
     // Per-object observer storage (for individual model observation)
     // Maps: tableName -> rowId -> [observer callbacks]
-    detail::managed_observation_state managed_observers_;
-    std::mutex object_observers_mutex_;
-    std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void(const std::string&)>>>>> object_observers_;
+    detail::managed_observation_state& managed_observers_ = process_resources_.get().managed_observers_;
+    std::mutex& object_observers_mutex_ = process_resources_.get().object_observers_mutex_;
+    std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void(const std::string&)>>>>>& object_observers_ = process_resources_.get().object_observers_;
 
     // Setup hooks for change notifications
     // Update hook buffers changes, WAL hook flushes on commit (matches Swift's pattern)
@@ -6489,22 +6458,22 @@ private:
 
     // Cross-process observation — notifier is owned by instance_registry
     // (one per path per process). This is a non-owning pointer for post_notification.
-    cross_process_notifier* shared_xproc_notifier_ = nullptr;
-    std::atomic<int64_t> last_seen_audit_id_{0};
+    cross_process_notifier*& shared_xproc_notifier_ = process_resources_.get().shared_xproc_notifier_;
+    std::atomic<int64_t>& last_seen_audit_id_ = process_resources_.get().last_seen_audit_id_;
 
     // Audit-retention maintenance thread (see start_audit_maintenance()).
-    std::thread audit_maint_thread_;
-    std::atomic<bool> history_generation_active_{false};
-    std::mutex audit_maint_mutex_;
-    std::condition_variable audit_maint_cv_;
-    bool audit_maint_stop_ = false;
+    std::thread& audit_maint_thread_ = process_resources_.get().audit_maint_thread_;
+    std::atomic<bool>& history_generation_active_ = process_resources_.get().history_generation_active_;
+    std::mutex& audit_maint_mutex_ = process_resources_.get().audit_maint_mutex_;
+    std::condition_variable& audit_maint_cv_ = process_resources_.get().audit_maint_cv_;
+    bool& audit_maint_stop_ = process_resources_.get().audit_maint_stop_;
     // Shared mutex captured by the xproc callback lambda so it outlives this
     // object.  The destructor locks it while unregistering, preventing the
     // callback from accessing a partially-destroyed lattice_db.
-    std::shared_ptr<std::mutex> xproc_callback_mutex_ = std::make_shared<std::mutex>();
+    std::shared_ptr<std::mutex>& xproc_callback_mutex_ = process_resources_.get().xproc_callback_mutex_;
     /// Heap-allocated guard for safe cross-instance notification.
     /// Set alive=false before teardown; spin on refcount before destroying members.
-    std::shared_ptr<instance_guard> guard_ = std::make_shared<instance_guard>();
+    std::shared_ptr<instance_guard>& guard_ = process_resources_.get().guard_;
 
     // Cascade walker side indexes — populated by the `ensure_*` registration
     // sites at startup, read by `remove(...)` and `delete_where(...)` to
@@ -6519,19 +6488,19 @@ private:
     // only needs to clean junction rows whose `rhs` references T, so the
     // walker iterates `link_tables_by_rhs_target_[T]` — typically a small
     // set, often empty for leaf types like LatticeHistoricalSignal.
-    std::unordered_map<std::string, std::unordered_set<std::string>> link_tables_by_rhs_target_;
+    std::unordered_map<std::string, std::unordered_set<std::string>>& link_tables_by_rhs_target_ = process_resources_.get().link_tables_by_rhs_target_;
     // Defensive bucket for regular link tables registered without a known
     // target (e.g. the idempotent `ensure_link_table(name)` re-call from
     // `managed<T*>::set_link`). After `ensure_link_tables()` has run during
     // init, every link table is also recorded under its rhs target, so this
     // set is normally empty — but the walker still iterates it for safety.
-    std::unordered_set<std::string> link_tables_unknown_target_;
+    std::unordered_set<std::string>& link_tables_unknown_target_ = process_resources_.get().link_tables_unknown_target_;
     // Virtual link tables — rhs is polymorphic, but `rhs_type` scopes per
     // row, so the walker can issue `WHERE rhs = ? AND rhs_type = ?` to
     // target precisely without per-target indexing.
-    std::unordered_set<std::string> virtual_link_tables_;
+    std::unordered_set<std::string>& virtual_link_tables_ = process_resources_.get().virtual_link_tables_;
     // parent_table -> list tables to clean via `parent_id = ?`.
-    std::unordered_map<std::string, std::vector<std::string>> list_tables_by_parent_;
+    std::unordered_map<std::string, std::vector<std::string>>& list_tables_by_parent_ = process_resources_.get().list_tables_by_parent_;
 
     // True if `link_table_name` is already recorded under a known rhs target.
     // Used so a later bare `ensure_link_table(name)` call doesn't pollute the
@@ -6660,6 +6629,7 @@ private:
 
         store_fingerprint_marker(fp_key);
         txn.commit();
+        ordinary_schema_initialized_here_=!receive_legacy_origin;
     }
 
     /// Detect schema changes for a table without applying them.
@@ -6722,55 +6692,8 @@ private:
     }
 
     void create_model_table(const model_schema& schema) {
-        // Create table with SQL-generated UUID default for globalId
-        // This matches Lattice.swift's table creation
-        std::ostringstream sql;
-        sql << "CREATE TABLE IF NOT EXISTS " << schema.table_name << "(";
-        sql << "id INTEGER PRIMARY KEY AUTOINCREMENT, ";
-        sql << "globalId TEXT UNIQUE COLLATE NOCASE DEFAULT ("
-               "lower(hex(randomblob(4))) || '-' || "
-               "lower(hex(randomblob(2))) || '-' || "
-               "'4' || substr(lower(hex(randomblob(2))),2) || '-' || "
-               "substr('89AB', 1 + (abs(random()) % 4), 1) || "
-               "substr(lower(hex(randomblob(2))),2) || '-' || "
-               "lower(hex(randomblob(6)))"
-               ")";
-
-        // Collect column names and types for triggers
-        std::vector<std::pair<std::string, column_type>> columns;
-
-        for (const auto& prop : schema.properties) {
-            // Skip list properties - they use separate tables (link_list, geo_bounds_list)
-            if (prop.kind == property_kind::list) {
-                continue;
-            }
-            if (prop.is_geo_bounds) {
-                // geo_bounds expands to 4 REAL columns
-                sql << ", " << prop.name << "_minLat REAL";
-                sql << ", " << prop.name << "_maxLat REAL";
-                sql << ", " << prop.name << "_minLon REAL";
-                sql << ", " << prop.name << "_maxLon REAL";
-                // Add all 4 columns to trigger list
-                columns.push_back({prop.name + "_minLat", column_type::real});
-                columns.push_back({prop.name + "_maxLat", column_type::real});
-                columns.push_back({prop.name + "_minLon", column_type::real});
-                columns.push_back({prop.name + "_maxLon", column_type::real});
-            } else {
-                sql << ", " << prop.name << " ";
-                switch (prop.type) {
-                    case column_type::integer: sql << "INTEGER"; break;
-                    case column_type::real: sql << "REAL"; break;
-                    case column_type::text: sql << "TEXT"; break;
-                    case column_type::blob: sql << "BLOB"; break;
-                }
-                if (!prop.nullable) {
-                    sql << " NOT NULL";
-                }
-                columns.push_back({prop.name, prop.type});
-            }
-        }
-        sql << ")";
-        db_->execute(sql.str());
+        std::vector<std::pair<std::string,column_type>> columns;
+        db_->execute(detail::ordinary_schema_recipe::model_table(schema,columns));
 
         // Create audit triggers for sync/observation — with the schema's
         // no_history set, and the marker ensure_audit_triggers compares on
@@ -6843,11 +6766,8 @@ public:
             if (prop.kind != property_kind::primitive || prop.is_geo_bounds) {
                 continue;  // no single base-table column to index; ordinal reserved
             }
-            const std::string idx_name =
-                "unique_" + schema.table_name + "_" + std::to_string(i);
             const std::string sql =
-                "CREATE UNIQUE INDEX IF NOT EXISTS " + idx_name +
-                " ON " + schema.table_name + "(" + prop.name + ")";
+                detail::ordinary_schema_recipe::core_unique_index(schema.table_name,i,prop.name);
             try {
                 db_->execute(sql);
             } catch (...) {
@@ -7319,29 +7239,7 @@ private:
 
     void ensure_audit_log_table() {
         // Create AuditLog table matching Lattice.swift's schema
-        std::string sql = R"(
-            CREATE TABLE IF NOT EXISTS AuditLog(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                globalId TEXT UNIQUE COLLATE NOCASE DEFAULT (
-                    lower(hex(randomblob(4)))   || '-' ||
-                    lower(hex(randomblob(2)))   || '-' ||
-                    '4' || substr(lower(hex(randomblob(2))),2) || '-' ||
-                    substr('89AB', 1 + (abs(random()) % 4), 1) ||
-                      substr(lower(hex(randomblob(2))),2)     || '-' ||
-                    lower(hex(randomblob(6)))
-                ),
-                tableName TEXT,
-                operation TEXT,
-                rowId INTEGER,
-                globalRowId TEXT,
-                changedFields TEXT,
-                changedFieldsNames TEXT,
-                isFromRemote INTEGER DEFAULT 0,
-                isSynchronized INTEGER DEFAULT 0,
-                timestamp REAL DEFAULT (unixepoch('subsec')),
-                synthesized INTEGER DEFAULT 0
-            )
-        )";
+        std::string sql = detail::ordinary_schema_recipe::audit_table();
         db_->execute(sql);
 
         // A5 provenance column for pre-existing databases. Guarded ALTER —
@@ -7355,11 +7253,7 @@ private:
 
         // Partial index for sync queries — only indexes unsynchronized entries,
         // which are the ones query_audit_log_for_sync needs to scan.
-        db_->execute(R"(
-            CREATE INDEX IF NOT EXISTS idx_audit_log_pending_sync
-                ON AuditLog(isSynchronized)
-                WHERE isSynchronized = 0
-        )");
+        db_->execute(detail::ordinary_schema_recipe::audit_pending_index());
 
         // Covering index for flush_changes' change→audit-entry lookups
         // (pass 2: tableName+rowId+operation; pass 3 uses the tableName
@@ -7367,21 +7261,13 @@ private:
         // on large AuditLogs during bulk applies. Existing DBs gain it via
         // the kLatticeSchemaFormatEpoch bump (fingerprint slow path re-runs
         // this guarded DDL).
-        db_->execute(R"(
-            CREATE INDEX IF NOT EXISTS idx_audit_log_change_lookup
-                ON AuditLog(tableName, rowId, operation)
-        )");
+        db_->execute(detail::ordinary_schema_recipe::audit_lookup_index());
     }
 
     void ensure_sync_control_table() {
         // Create _SyncControl table for temporarily disabling sync
-        db_->execute(R"(
-            CREATE TABLE IF NOT EXISTS _SyncControl (
-                id INTEGER PRIMARY KEY CHECK(id=1),
-                disabled INTEGER NOT NULL DEFAULT 0
-            )
-        )");
-        db_->execute("INSERT OR IGNORE INTO _SyncControl(id, disabled) VALUES(1, 0)");
+        db_->execute(detail::ordinary_schema_recipe::sync_control_table());
+        db_->execute(detail::ordinary_schema_recipe::sync_control_initial());
 
         // Create _lattice_sync_set table for tracking filtered sync membership,
         // scoped PER SYNCHRONIZER (sync_id). Two channels with different
@@ -7390,44 +7276,19 @@ private:
         // set and synthesized real DELETEs for them (`!matches && in_set`),
         // and reconcile Phase 1 emitted filter-removal DELETEs for the other
         // channel's rows — cross-channel mirror wipes.
-        db_->execute(R"(
-            CREATE TABLE IF NOT EXISTS _lattice_sync_set (
-                sync_id TEXT NOT NULL,
-                table_name TEXT NOT NULL,
-                global_row_id TEXT NOT NULL,
-                PRIMARY KEY (sync_id, table_name, global_row_id)
-            )
-        )");
+        db_->execute(detail::ordinary_schema_recipe::sync_set());
 
         // Create _lattice_sync_state table for per-synchronizer sync tracking.
         // Each row tracks whether a specific synchronizer has synced a given AuditLog entry.
         // Absence of a row = pending for that sync_id.
-        db_->execute(R"(
-            CREATE TABLE IF NOT EXISTS _lattice_sync_state (
-                audit_entry_id INTEGER NOT NULL,
-                sync_id TEXT NOT NULL,
-                is_synchronized INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (audit_entry_id, sync_id)
-            )
-        )");
+        db_->execute(detail::ordinary_schema_recipe::sync_state());
         // Partial index for efficient pending-entry queries per sync_id
-        db_->execute(R"(
-            CREATE INDEX IF NOT EXISTS idx_sync_state_pending
-                ON _lattice_sync_state(sync_id, is_synchronized)
-                WHERE is_synchronized = 0
-        )");
+        db_->execute(detail::ordinary_schema_recipe::sync_state_pending());
 
         // Create _lattice_replication_slots table for slot-aware compaction.
         // Each synchronizer registers a slot; compaction only deletes entries
         // below the minimum confirmed_audit_id across all active slots.
-        db_->execute(R"(
-            CREATE TABLE IF NOT EXISTS _lattice_replication_slots (
-                sync_id TEXT PRIMARY KEY,
-                confirmed_audit_id INTEGER NOT NULL DEFAULT 0,
-                last_received_event_id TEXT,
-                last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        )");
+        db_->execute(detail::ordinary_schema_recipe::replication_slots());
 
         // upload_floor: per-slot SCAN BOUND for query_audit_log_for_sync —
         // invariant: no entry pending for this sync_id has id <= upload_floor.
@@ -7440,7 +7301,7 @@ private:
         // fast path requires the kLatticeSchemaFormatEpoch bump below.
         try {
             db_->execute(
-                "ALTER TABLE _lattice_replication_slots ADD COLUMN upload_floor INTEGER NOT NULL DEFAULT 0");
+                detail::ordinary_schema_recipe::replication_upload_floor());
         } catch (const std::exception&) {
             // Column already exists.
         }
@@ -7551,14 +7412,9 @@ protected:
     // ========================================================================
 
     void ensure_lattice_meta_table() {
-        db_->execute(R"(
-            CREATE TABLE IF NOT EXISTS _lattice_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        )");
+        db_->execute(detail::ordinary_schema_recipe::metadata_table());
         // Initialize schema version to 1 if not set
-        db_->execute("INSERT OR IGNORE INTO _lattice_meta(key, value) VALUES('schema_version', '1')");
+        db_->execute(detail::ordinary_schema_recipe::metadata_initial_version());
     }
 
     // ========================================================================
@@ -8011,41 +7867,7 @@ protected:
     }
 
     void create_virtual_link_table_triggers(const std::string& link_table_name) {
-        // INSERT trigger for virtual link table (includes rhs_type)
-        std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
-            " AFTER INSERT ON " + link_table_name +
-            " WHEN (sync_disabled() = 0)"
-            " BEGIN"
-            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
-            "   VALUES ("
-            "       '" + link_table_name + "',"
-            "       'INSERT',"
-            "       0,"
-            "       NEW.globalId,"
-            "       json_object('lhs', NEW.lhs, 'rhs', NEW.rhs, 'rhs_type', NEW.rhs_type),"
-            "       json_array('lhs', 'rhs', 'rhs_type'),"
-            "       unixepoch('subsec')"
-            "   );"
-            " END";
-        db_->execute(insert_trigger);
-
-        // DELETE trigger for virtual link table
-        std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
-            " AFTER DELETE ON " + link_table_name +
-            " WHEN (sync_disabled() = 0)"
-            " BEGIN"
-            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
-            "   VALUES ("
-            "       '" + link_table_name + "',"
-            "       'DELETE',"
-            "       0,"
-            "       OLD.globalId,"
-            "       json_object('lhs', OLD.lhs, 'rhs', OLD.rhs, 'rhs_type', OLD.rhs_type),"
-            "       json_array('lhs', 'rhs', 'rhs_type'),"
-            "       unixepoch('subsec')"
-            "   );"
-            " END";
-        db_->execute(delete_trigger);
+        for(const auto& sql:detail::ordinary_schema_recipe::virtual_link_audit(link_table_name))db_->execute(sql);
     }
 
     std::string generate_global_id() {
@@ -8180,7 +8002,176 @@ protected:
 
         return obj;
     }
+
+private:
+    // Original declarations and ordering are preserved inside the actual
+    // owning allocation, so creator-process automatic teardown is unchanged.
+    // The wrapper retains only non-owning references plus the native holder.
+    struct owned_resources {
+        std::mutex invalidation_hooks_mutex_;
+        std::vector<std::pair<uint64_t, invalidation_hook_detailed_fn>> invalidation_hooks_;
+        uint64_t next_invalidation_hook_token_ = 1;
+        std::function<void()> test_hook_generation_query_gap_;
+        std::mutex read_pool_mutex_;
+        std::vector<std::shared_ptr<read_generation>> live_generations_;
+        std::vector<std::shared_ptr<database>> idle_read_pool_;
+        size_t read_pool_capacity_ = 3;
+        uint64_t next_read_generation_id_ = 1;
+        std::atomic<int64_t> read_generation_ttl_ms_{30'000};
+        std::atomic<int64_t> read_generation_max_age_ms_{300'000};
+        std::atomic<int64_t> wal_keeper_eviction_threshold_bytes_{16ll << 20};
+        std::atomic<bool> wal_eviction_pending_{false};
+        int64_t wal_page_size_ = 4096;
+        std::shared_ptr<std::recursive_timed_mutex> store_write_gate_;
+        std::function<void(const char*, const char*)> test_hook_vec0_maintenance_;
+        std::recursive_timed_mutex vec0_memory_maintenance_gate_;
+        std::vector<std::string> attached_aliases_;
+        mutable std::mutex attach_mutex_;
+        std::vector<std::pair<std::string, std::string>> attached_dbs_;
+        std::unordered_map<std::string, int64_t> attached_route_tokens_;
+        std::unordered_map<int64_t, std::shared_ptr<const void>> attached_route_metadata_;
+        int64_t next_attachment_token_ = 1;
+        std::set<std::string> attached_view_names_;
+        std::map<std::string, std::string> attached_view_sql_;
+        std::map<std::string, std::shared_ptr<const physical_store_identity>> attached_projection_identities_;
+        bool attachment_topology_valid_ = true;
+        std::map<std::string,std::shared_ptr<const detail::ordinary_cohort_attachment_binding>> attached_cohort_bindings_;
+        bool ordinary_schema_initialized_here_=false;
+        std::shared_ptr<const detail::ordinary_child_origin> ordinary_child_origin_;
+        std::shared_ptr<detail::database_open_ledger> connection_ledger_; // Installed before every constructor-owned native open.
+        std::atomic<bool> ordinary_connection_construction_seen_{false};
+        detail::ordinary_shared_publication<detail::ordinary_history_child_connections> ordinary_history_child_connections_;
+        detail::ordinary_shared_publication<const detail::ordinary_managed_profile> ordinary_managed_profile_;
+        detail::ordinary_weak_publication<const detail::ordinary_managed_receiver_preservation> ordinary_receiver_preservation_;
+        detail::ordinary_weak_publication<const detail::ordinary_receiver_wss_request> ordinary_receiver_wss_;
+        std::atomic<bool> ordinary_export_enrolled_here_{false};
+        std::atomic<bool> ordinary_receive_enrolled_here_{false};
+        std::shared_ptr<detail::recovery_continuous_admission> recovery_continuous_;
+        mutable std::mutex managed_wss_mutex_;
+        bool managed_wss_starting_=false;
+        std::shared_ptr<detail::configured_managed_handlers> managed_wss_handlers_;
+        std::shared_ptr<detail::configured_recovery_connection> managed_wss_connection_;
+        // Actual first-local start destruction only, never admission/source authority.
+        std::shared_ptr<const detail::ordinary_managed_owner_release> managed_wss_start_release_;
+        const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
+        bool recovery_producer_bootstrapped_=false;
+        bool administrative_owner_=false;
+        bool checked_existing_unpublished_=false;
+        std::shared_ptr<const managed_attachment_view> managed_attachment_view_;
+        std::atomic<size_t> active_managed_attachment_operations_{0};
+        mutable std::mutex projection_service_mutex_;
+        std::shared_ptr<projection_service> projection_service_;
+        std::shared_ptr<projection_capture_account> projection_capture_account_;
+        bool projection_admission_paused_ = false;
+        mutable std::atomic<unsigned> projection_pressure_slot_{0};
+        mutable std::atomic<uint64_t> projection_pressure_readers_[2]{};
+        std::atomic<const projection_pressure_map*> projection_pressure_maps_[2]{};
+        std::unique_ptr<const projection_pressure_map, projection_pressure_map_deleter> projection_pressure_owners_[2];
+        configuration config_;
+        std::mutex connection_ownership_mutex_;
+        uint64_t connection_revision_ = 0;
+        std::shared_ptr<database> db_;
+        std::shared_ptr<database> read_db_;
+        std::shared_ptr<detail::recovery_refresh_state> recovery_refresh_;
+        std::atomic<std::thread::id> txn_owner_thread_{};
+        std::shared_ptr<database> xproc_read_db_;
+        std::atomic<bool> closed_{false};
+        std::shared_ptr<scheduler> scheduler_;
+        std::unique_ptr<synchronizer> synchronizer_;
+        std::shared_ptr<const detail::sync_policy_reservation> sync_policy_;
+        std::vector<ipc_sync_state> ipc_synchronizers_;
+        std::mutex ipc_callbacks_mutex_;
+        std::function<void(bool)> on_sync_state_change_;
+        std::function<void(const std::string&)> on_sync_error_;
+        synchronizer::on_progress_handler on_sync_progress_;
+        std::mutex xproc_idle_mutex_;
+        std::function<void()> on_xproc_idle_;
+        bool is_synchronizer_ = false;
+        int sync_lock_fd_ = -1;
+        bool recovery_change_buffer_reserved_ = false;
+        size_t topology_delivery_depth_ = 0;
+        std::atomic<size_t> active_recovery_install_operations_{0};
+        std::mutex change_buffer_mutex_;
+        std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> change_buffer_;
+        bool is_flushing_ = false;
+        std::atomic<bool> applying_remote_changes_{false};
+        std::mutex observers_mutex_;
+        std::atomic<observer_id> next_observer_id_{1};
+        std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>> table_observers_;
+        detail::managed_observation_state managed_observers_;
+        std::mutex object_observers_mutex_;
+        std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void(const std::string&)>>>>> object_observers_;
+        cross_process_notifier* shared_xproc_notifier_ = nullptr;
+        std::atomic<int64_t> last_seen_audit_id_{0};
+        std::thread audit_maint_thread_;
+        std::atomic<bool> history_generation_active_{false};
+        std::mutex audit_maint_mutex_;
+        std::condition_variable audit_maint_cv_;
+        bool audit_maint_stop_ = false;
+        std::shared_ptr<std::mutex> xproc_callback_mutex_ = std::make_shared<std::mutex>();
+        std::shared_ptr<instance_guard> guard_ = std::make_shared<instance_guard>();
+        std::unordered_map<std::string, std::unordered_set<std::string>> link_tables_by_rhs_target_;
+        std::unordered_set<std::string> link_tables_unknown_target_;
+        std::unordered_set<std::string> virtual_link_tables_;
+        std::unordered_map<std::string, std::vector<std::string>> list_tables_by_parent_;
+
+        // Final automatic-destruction fallback only, after actual app
+        // destructor/close phases. Preserve ordinary listener persistence.
+        // Empty std::function assignment destroys its target in this full
+        // expression without allocating; no target-owning local survives it.
+        bool prepare_native_target_destruction(pid_t creator) noexcept {
+            if (creator != ::getpid()) return false;
+            on_sync_progress_ = nullptr;
+            if (creator != ::getpid()) return false;
+            on_sync_error_ = nullptr;
+            if (creator != ::getpid()) return false;
+            on_sync_state_change_ = nullptr;
+            if (creator != ::getpid()) return false;
+            return true;
+        }
+
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<database>,checked_managed_existing_key);
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<database>,checked_mounted_server_existing_key);
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<database>);
+        explicit owned_resources(const std::string&);
+        owned_resources();
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<detail::recovery_continuous_admission>,std::shared_ptr<detail::database_open_ledger> = {});
+    };
 };
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
+    std::shared_ptr<database> writer,checked_managed_existing_key)
+    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(config),db_(std::move(writer)),
+     scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
+    std::shared_ptr<database> writer,checked_mounted_server_existing_key)
+    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(config),db_(std::move(writer)),
+     scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,std::shared_ptr<database> writer)
+    : recovery_schemas_(std::move(catalog)), administrative_owner_(true), config_(config), db_(std::move(writer)) {}
+inline lattice_db::owned_resources::owned_resources(const std::string& path)
+        : config_(path)
+        , db_(std::make_shared<database>(path, database::open_mode::read_write))
+        , read_db_(!configuration::path_is_memory(path) ? std::make_shared<database>(path, database::open_mode::read_only) : nullptr)
+        , scheduler_(std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources()
+        : config_()
+        , db_(std::make_shared<database>(":memory:", database::open_mode::read_write))
+        , read_db_(nullptr)  // In-memory DB can't have separate read connection
+        , scheduler_(std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema recovery_schemas,std::shared_ptr<detail::recovery_continuous_admission> continuous,std::shared_ptr<detail::database_open_ledger> connection_ledger)
+        : recovery_continuous_(std::move(continuous))
+        , recovery_schemas_(std::move(recovery_schemas))
+        , config_(config)
+        , connection_ledger_(std::move(connection_ledger))
+        , db_(recovery_continuous_ ? detail::open_continuous_writer(config,recovery_continuous_) : database::make_owned_connection(resolve_path(config),
+              config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
+              config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_))
+        , read_db_(config.read_only ? nullptr :
+                   (!config.is_in_memory() && !config.is_sync_enabled() ? database::make_owned_connection(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_) : nullptr))
+        , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
+                         database::make_owned_connection(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_) : nullptr)
+        , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {}
+
 
 // ============================================================================
 // Query template implementations
@@ -8997,6 +8988,11 @@ inline void lattice_db::teardown_sync(bool fire_handoff) {
 }
 inline lattice_close_result lattice_db::teardown_sync_checked(bool fire_handoff) noexcept {
     lattice_close_result result;
+    if (!owns_creator_process()) {
+        try { throw std::runtime_error("inherited lattice cleanup belongs to another process"); }
+        catch (...) { result.remember(std::current_exception()); }
+        return result;
+    }
     const auto attempt=[&](auto&& operation) noexcept {
         try {operation();}catch(...) {result.remember(std::current_exception());}
     };
@@ -9047,15 +9043,24 @@ inline void lattice_db::close() {
 }
 inline lattice_close_result lattice_db::close_checked() noexcept {
     lattice_close_result result;
+    if (!owns_creator_process()) {
+        try { throw std::runtime_error("inherited lattice cleanup belongs to another process"); }
+        catch (...) { result.remember(std::current_exception()); }
+        return result;
+    }
     const auto attempt=[&](auto&& operation) noexcept {
         try {operation();}catch(...) {result.remember(std::current_exception());}
     };
-    std::shared_ptr<database> writer,reader,xproc;
+    std::unique_ptr<detail::native_retirement_storage<std::shared_ptr<database>,std::shared_ptr<database>,std::shared_ptr<database>>> retained;
+    try{retained=std::make_unique<detail::native_retirement_storage<std::shared_ptr<database>,std::shared_ptr<database>,std::shared_ptr<database>>>();}
+    catch(...){result.remember(std::current_exception());return result;}
+    auto& writer=retained->get<0>();auto& reader=retained->get<1>();auto& xproc=retained->get<2>();
     attempt([&]{
         std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
         closed_.store(true,std::memory_order_seq_cst);guard_->alive.store(false,std::memory_order_seq_cst);++connection_revision_;
         writer=db_;reader=read_db_;xproc=xproc_read_db_;
     });
+    attempt([&]{begin_configured_listener_retirement();});
     attempt([&]{managed_observers_.retire();});
     attempt([&]{shutdown_projection_reads();});
     guard_->alive.store(false,std::memory_order_seq_cst);
@@ -9064,14 +9069,26 @@ inline lattice_close_result lattice_db::close_checked() noexcept {
     attempt([&]{stop_audit_maintenance();});
     result.merge(teardown_sync_checked());sync_policy_.reset();
     attempt([&]{if(scheduler_)scheduler_->shutdown();});
+    attempt([&]{if(!finish_configured_listener_retirement()){
+        result.cleanup_complete=false;
+        if(result.sync!=sync_drain_state::failed)result.sync=sync_drain_state::deadline_pending;
+    }});
+    if(!owns_creator_process()){result.cleanup_complete=false;return result;}
     attempt([&]{instance_registry::instance().unregister_instance(config_.path,this);});
     shared_xproc_notifier_=nullptr;
     attempt([&]{retire_all_read_generations();});
+    std::vector<std::shared_ptr<database>> retired_idle;
     attempt([&]{
         std::lock_guard<std::mutex> lock(read_pool_mutex_);
-        for(auto& conn:idle_read_pool_)attempt([&]{conn->close();});
-        idle_read_pool_.clear();
+        retired_idle.swap(idle_read_pool_);
     });
+    for(auto& conn:retired_idle){
+        if(!owns_creator_process())return result;
+        attempt([&]{conn->close();});
+        if(!owns_creator_process())return result;
+        conn.reset(); // Last native/custody destruction occurs OFF the pool leaf.
+        if(!owns_creator_process())return result;
+    }
     attempt([&]{deactivate_projection_pressure();});
     if(writer)attempt([&]{writer->close();});
     if(reader)attempt([&]{reader->close();});
@@ -9079,9 +9096,15 @@ inline lattice_close_result lattice_db::close_checked() noexcept {
     return result;
 }
 inline lattice_db::~lattice_db() {
-    if(administrative_owner_) {
+    // All automatic resource ownership is in process_resources_. References
+    // below have no destruction work; its native deleter abandons the entire
+    // inherited payload before any member destructor, mutex or thread join.
+    if (!owns_creator_process()) return;
+    if(administrative_owner_||checked_existing_unpublished_) {
         closed_.store(true,std::memory_order_seq_cst);
         guard_->alive.store(false,std::memory_order_seq_cst);
+        try{begin_configured_listener_retirement();(void)retire_configured_listener_targets();}catch(...){}
+        if(!owns_creator_process())return;
         alive_count().fetch_sub(1,std::memory_order_relaxed);
         return; // Only connection-local settlement hooks exist; no public facilities were published.
     }
@@ -9091,6 +9114,7 @@ inline lattice_db::~lattice_db() {
     const auto attempt=[](auto&& operation) noexcept {try{operation();}catch(...){}};
     closed_.store(true, std::memory_order_seq_cst);
     guard_->alive.store(false, std::memory_order_seq_cst);
+    attempt([&]{begin_configured_listener_retirement();});
     attempt([&]{managed_observers_.retire();});
     attempt([&]{deactivate_projection_pressure();});
     attempt([&]{shutdown_projection_reads();});
@@ -9130,6 +9154,8 @@ inline lattice_db::~lattice_db() {
     // 4. Drain scheduler.
     LOG_INFO("lattice_db", "~dtor: shutting down scheduler");
     attempt([&]{if (scheduler_) scheduler_->shutdown();});
+    attempt([&]{(void)finish_configured_listener_retirement();});
+    if(!owns_creator_process())return;
     LOG_INFO("lattice_db", "~dtor: scheduler shutdown done");
     // 5. Unregister. Do NOT hold xproc_callback_mutex_ during unregister —
     //    unregister_instance takes registry mutex_, and may destroy the notifier
@@ -9143,11 +9169,13 @@ inline lattice_db::~lattice_db() {
 }
 
 inline bool lattice_db::is_sync_connected() const {
+    require_creator_process();
     if(configured_sync_present())return configured_sync_connected();
     return synchronizer_ && synchronizer_->is_connected();
 }
 
 inline void lattice_db::sync_now() {
+    require_creator_process();
     if(configured_sync_present()){configured_sync_now();return;}
     if (synchronizer_) {
         synchronizer_->sync_now();
@@ -9155,6 +9183,7 @@ inline void lattice_db::sync_now() {
 }
 
 inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
+    require_creator_process();
     if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     LOG_INFO("lattice_db", "update_sync_filter: %zu entries, wss=%d, ipc_syncs=%zu (db=%s)",
              filter.size(), synchronizer_ ? 1 : 0, ipc_synchronizers_.size(), config_.path.c_str());
@@ -9175,6 +9204,7 @@ inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter
 
 inline void lattice_db::update_sync_filter(const std::string& channel,
                                            std::vector<sync_filter_entry> filter) {
+    require_creator_process();
     if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     if (channel.empty()) {
         LOG_INFO("lattice_db", "update_sync_filter(wss): %zu entries (db=%s)",
@@ -9202,6 +9232,7 @@ inline void lattice_db::update_sync_filter(const std::string& channel,
 }
 
 inline void lattice_db::clear_sync_filter() {
+    require_creator_process();
     if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     if (synchronizer_) {
         synchronizer_->clear_sync_filter();
@@ -9214,6 +9245,7 @@ inline void lattice_db::clear_sync_filter() {
 }
 
 inline void lattice_db::clear_sync_filter(const std::string& channel) {
+    require_creator_process();
     if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
     if (channel.empty()) {
         config_.sync_filter = std::nullopt;
@@ -9233,6 +9265,7 @@ inline void lattice_db::clear_sync_filter(const std::string& channel) {
 }
 
 inline void lattice_db::trigger_sync_upload() {
+    require_creator_process();
     if(configured_sync_present()){configured_sync_upload();return;}
     // Dispatch via scheduler instead of calling sync_now() synchronously.
     // This method is called from the WAL hook; a synchronous sync_now()
@@ -9259,6 +9292,7 @@ inline void lattice_db::trigger_sync_upload() {
 }
 
 inline void lattice_db::connect_sync() {
+    require_creator_process();
     if(configured_sync_present()){configured_sync_connect();return;}
     if (synchronizer_) {
         synchronizer_->connect();
@@ -9269,6 +9303,7 @@ inline void lattice_db::connect_sync() {
 }
 
 inline void lattice_db::disconnect_sync() {
+    require_creator_process();
     if(configured_sync_present()){configured_sync_disconnect();return;}
     if (synchronizer_) {
         synchronizer_->disconnect();
@@ -9276,22 +9311,39 @@ inline void lattice_db::disconnect_sync() {
 }
 
 inline void lattice_db::set_on_sync_state_change(std::function<void(bool connected)> handler) {
-    if(configured_sync_present()){configured_sync_state(std::move(handler));return;}
-    on_sync_state_change_ = std::move(handler);
-    if (synchronizer_) {
-        synchronizer_->set_on_state_change(on_sync_state_change_);
+    require_creator_process();
+    detail::native_retirement_storage<synchronizer::on_state_change_handler,synchronizer::on_state_change_handler> held;
+    held.get<0>().swap(handler);
+    if(is_closed())throw db_error("application listener registration is retired");
+    if(!remember_configured_state(held.get<0>())||!owns_creator_process())return;
+    if(configured_sync_present()){configured_sync_state(std::move(held.get<0>()));return;}
+    held.get<1>()=held.get<0>(); // Actual copy off the application leaf.
+    if(!owns_creator_process())return;
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);
+        if(is_closed())return;on_sync_state_change_.swap(held.get<0>());
     }
+    if(!held.release<0>())return; // Actual displaced target, before next owner access.
+    if(synchronizer_)synchronizer_->set_on_state_change(std::move(held.get<1>()));
 }
 
 inline void lattice_db::set_on_sync_error(std::function<void(const std::string& error)> handler) {
-    if(configured_sync_present()){configured_sync_error(std::move(handler));return;}
-    on_sync_error_ = std::move(handler);
-    if (synchronizer_) {
-        synchronizer_->set_on_error(on_sync_error_);
+    require_creator_process();
+    detail::native_retirement_storage<synchronizer::on_error_handler,synchronizer::on_error_handler> held;
+    held.get<0>().swap(handler);
+    if(is_closed())throw db_error("application listener registration is retired");
+    if(!remember_configured_error(held.get<0>())||!owns_creator_process())return;
+    if(configured_sync_present()){configured_sync_error(std::move(held.get<0>()));return;}
+    held.get<1>()=held.get<0>(); // Actual copy off the application leaf.
+    if(!owns_creator_process())return;
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);
+        if(is_closed())return;on_sync_error_.swap(held.get<0>());
     }
+    if(!held.release<0>())return; // Actual displaced target, before next owner access.
+    if(synchronizer_)synchronizer_->set_on_error(std::move(held.get<1>()));
 }
 
 inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
+    require_creator_process();
     // Walk all instances on the same path — the synchronizer may live on a sibling.
     synchronizer::sync_progress agg;
     instance_registry::instance().for_each_alive(config_.path,
@@ -9321,32 +9373,54 @@ inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
 }
 
 inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler handler) {
+    require_creator_process();
+    detail::native_retirement_storage<synchronizer::on_progress_handler> requested;
+    requested.get<0>().swap(handler);
+    if(is_closed())throw db_error("application listener registration is retired");
     LOG_INFO("lattice_db", "set_on_sync_progress called (this=%p, path=%s, handler=%s)",
-             (void*)this, config_.path.c_str(), handler ? "SET" : "NULL");
+             (void*)this, config_.path.c_str(), requested.get<0>() ? "SET" : "NULL");
     // Walk all instances on the same path — the synchronizer may live on a sibling.
     // Lock ipc_callbacks_mutex_ on each sibling to synchronize with the IPC accept
     // callback, which creates synchronizers on the accept thread.
-    instance_registry::instance().for_each_alive(config_.path,
-        [&handler](lattice_db* sibling) {
+    instance_registry::instance().for_each_alive_creator_bound(config_.path,
+        [&requested](lattice_db* sibling) {
+            sibling->require_creator_process();
+            if(!sibling->remember_configured_progress(requested.get<0>())||!sibling->owns_creator_process())return;
             if(sibling->configured_sync_present()){
-                sibling->configured_sync_progress(handler);
+                detail::native_retirement_storage<synchronizer::on_progress_handler> forwarding;
+                forwarding.get<0>()=requested.get<0>();
+                if(!sibling->owns_creator_process())return;
+                sibling->configured_sync_progress(std::move(forwarding.get<0>()));
                 return; // Continuous configuration excludes IPC targets.
             }
-            std::lock_guard<std::mutex> lock(sibling->ipc_callbacks_mutex_);
-            sibling->on_sync_progress_ = handler;
+            detail::native_retirement_storage<synchronizer::on_progress_handler,synchronizer::on_progress_handler> local;
+            auto& replacement=local.get<0>();replacement=requested.get<0>();
+            if(!sibling->owns_creator_process())return;
+            {std::lock_guard<std::mutex> lock(sibling->managed_wss_mutex_);
+                if(sibling->is_closed())return;
+                sibling->on_sync_progress_.swap(replacement);
+            }
+            if(!local.release<0>())return;
+            detail::native_retirement_leaf_lock lock(sibling->ipc_callbacks_mutex_);
             LOG_INFO("lattice_db", "  visiting sibling=%p, sync=%p, ipc_count=%zu",
                      (void*)sibling,
                      sibling->synchronizer_ ? (void*)sibling->synchronizer_.get() : nullptr,
                      sibling->ipc_synchronizers_.size());
             if (sibling->synchronizer_) {
-                sibling->synchronizer_->set_on_progress(handler);
+                local.get<1>()=requested.get<0>();
+                if(!sibling->owns_creator_process())return;
+                sibling->synchronizer_->set_on_progress(std::move(local.get<1>()));
+                if(!sibling->owns_creator_process())return;
             }
             for (size_t i = 0; i < sibling->ipc_synchronizers_.size(); ++i) {
                 auto& ipc = sibling->ipc_synchronizers_[i];
                 LOG_INFO("lattice_db", "  ipc[%zu].sync=%p", i,
                          ipc.sync ? (void*)ipc.sync.get() : nullptr);
                 if (ipc.sync) {
-                    ipc.sync->set_on_progress(handler);
+                    local.get<1>()=requested.get<0>();
+                    if(!sibling->owns_creator_process())return;
+                    ipc.sync->set_on_progress(std::move(local.get<1>()));
+                    if(!sibling->owns_creator_process())return;
                 }
             }
         });

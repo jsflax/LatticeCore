@@ -417,7 +417,9 @@ struct authenticated_relay_setup::source_file_administration {
 };
 std::unique_ptr<authenticated_relay_setup::source_file_administration>
 authenticated_relay_setup::open_administrative_file(const std::string& path,recovery_owner_schema catalog,
-    int64_t schema_version,int busy_timeout_ms) {
+    int64_t schema_version,int busy_timeout_ms,ordinary_context context) {
+    ordinary_require_creator(context);
+    ordinary_before_open(path,context);
 #if defined(__APPLE__) || defined(__linux__)
     if(path.empty()||path.size()>4096||path.find('\0')!=std::string::npos||path.starts_with("file:")||
        !std::filesystem::path(path).is_absolute()||schema_version<1||schema_version>INT32_MAX||
@@ -447,7 +449,7 @@ authenticated_relay_setup::open_administrative_file(const std::string& path,reco
     const auto observation=admin_before_open_test_hook_?*admin_before_open_test_hook_:std::function<void()>{};
     if(observation)observation();
     s.writer=std::make_shared<database>(s.expected->filename,database::open_mode::read_write,busy_timeout_ms,
-        std::shared_ptr<database_read_control>{},database::initialization_key(s.expected));
+        std::shared_ptr<database_read_control>{},database::initialization_key(s.expected),context);
     s.verify_writer();
     const auto& writer=s.writer;
     // Lattice's declared version is the existing metadata row. SQLite's
@@ -476,7 +478,8 @@ authenticated_relay_setup::open_administrative_file(const std::string& path,reco
     if(version.size()!=1||!std::holds_alternative<std::string>(version[0].at("version"))||
        std::get<std::string>(version[0].at("version"))!=std::to_string(schema_version))
         reject("receipt administration declared schema version differs; no migration");
-    configuration config(s.expected->filename);config.busy_timeout_ms=busy_timeout_ms;config.target_schema_version=static_cast<int32_t>(schema_version);
+    configuration config(s.expected->filename);config.ordinary_context=context;
+    config.busy_timeout_ms=busy_timeout_ms;config.target_schema_version=static_cast<int32_t>(schema_version);
     s.owner=std::shared_ptr<lattice_db>(new lattice_db(config,std::move(catalog),s.writer));
     s.verify();return session;
 #else

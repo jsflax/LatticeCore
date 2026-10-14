@@ -20,6 +20,7 @@ struct sync_upload_tracking {
     // Passive per-send identity, retained after handoff until the matching ACK,
     // timeout or lifecycle clear. An original ID may be sent again later.
     std::unordered_map<std::string,uint64_t> delivery_tokens;
+    std::unordered_map<std::string,std::string> ordinary_versions;
     std::atomic<int64_t> pending{0};
     uint64_t generation=1,next_token=0;
     // Caller holds mutex. Token zero is the legacy, unregistered delivery path
@@ -33,9 +34,9 @@ struct sync_upload_tracking {
     }
     bool erase_locked(const std::string& id,uint64_t physical,uint64_t token,bool handed_off)noexcept {
         if(!matches_locked(id,physical,token,handed_off))return false;
-        ids.erase(id);delivery_tokens.erase(id);pre_handoff.erase(id);return true;
+        ids.erase(id);delivery_tokens.erase(id);pre_handoff.erase(id);ordinary_versions.erase(id);return true;
     }
-    void clear_ids_locked()noexcept {ids.clear();pre_handoff.clear();delivery_tokens.clear();}
+    void clear_ids_locked()noexcept {ids.clear();pre_handoff.clear();delivery_tokens.clear();ordinary_versions.clear();}
 };
 class sync_upload_exclusion {
     std::shared_ptr<sync_upload_tracking> state_;

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@ using deadline = std::chrono::steady_clock::time_point;
 using frame = std::vector<std::uint8_t>;
 inline constexpr std::size_t maximum_frame_bytes = 128 * 1024;
 inline constexpr std::size_t maximum_inherited_directories = 128;
+inline constexpr std::size_t maximum_inherited_channels = 2;
 
 enum class error_code { unavailable, invalid_specification, inherited_use, wrong_thread,
     io, timed_out, canceled, malformed_frame, launch_failed, identity_unproved,
@@ -32,6 +34,8 @@ struct process_identity {
     bool operator==(const process_identity&) const = default;
 };
 process_identity current_process();
+// Repeated native birth/parent observation; no installation/open authority.
+process_identity current_parent_process();
 
 // The launching authority must own approved executable/invocation validation.
 // This lower-level primitive performs no approval by inspecting these strings.
@@ -44,6 +48,9 @@ struct launch_specification {
     std::vector<std::string> environment;
     int input = 0, output = 1, diagnostic = 2;
     std::vector<int> inherited_directories;
+    // Explicit transport endpoints follow directories. They grant no managed
+    // role or store authority; only the fixed paired controller supplies them.
+    std::vector<int> inherited_channels;
 };
 
 class inherited_channel {
@@ -94,6 +101,9 @@ public:
     // child. The caller must separately retain every actual store-owning role
     // and descendant; this primitive never promotes a group census to proof.
     terminal_observation stop_and_join(deadline);
+    // Creating supervisor thread only. Live returns empty without stopping
+    // admission/I/O or signalling. Terminal status requires actual owned reap.
+    std::optional<terminal_observation> observe_terminal(deadline);
     // A failed teardown remains process-retained. Wrapper destruction cannot
     // turn unknown cleanup into a successful observation or release its PID.
     static std::size_t unresolved_lifetimes();

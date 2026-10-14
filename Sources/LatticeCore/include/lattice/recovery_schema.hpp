@@ -5,6 +5,12 @@
 #include <memory>
 
 namespace lattice::detail {
+// Retained declaration inputs for the same unique-index/link-shadow generators
+// used by ordinary Swift setup. A digest alone cannot reconstruct those rules.
+struct recovery_constraint {
+    std::vector<std::string> columns;
+    bool allows_upsert = false;
+};
 // Engine-owned declaration snapshot, not a caller's recovery grant. An ordinary
 // store with declarations outside these bounds may still open; only recovery
 // admission refuses its unavailable catalog. The owner retains an immutable
@@ -19,7 +25,10 @@ public:
     static constexpr size_t max_models=256, max_properties=8192, max_bytes=1048576;
     std::map<std::string,model_schema> models;
     std::set<std::string> swift_models;
+    std::vector<std::string> swift_order; // Actual producing SchemaVector order, not a selector grant.
+    std::map<std::string,std::vector<recovery_constraint>> swift_constraints;
     std::string swift_digest, swift_fingerprint;
+    std::string swift_snapshot; // Actual normal serializer retained on SAME owner catalog.
 
     static recovery_owner_schema capture_native();
     bool valid()const noexcept{return valid_;}

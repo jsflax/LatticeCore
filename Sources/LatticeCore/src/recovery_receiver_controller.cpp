@@ -98,6 +98,10 @@ void members(const json& value,std::initializer_list<const char*> required,std::
     for(const auto* key:optional)allowed.insert(key);
     for(const auto& item:value.items())require(allowed.count(item.key()),"controller unknown control member");
 }
+bool repeated_description(const json& value) {
+    return value.is_object()&&value.contains("kind")&&value.at("kind")=="recoveryReady"&&
+        value.contains("operation")&&value.at("operation")=="describe";
+}
 void settlement_shape(const json& value) {
     members(value,{"state","unexpectedCommitObserved","primaryError","cleanupError","postcommitError","notificationError"});
     require(value.at("state").is_string(),"controller settlement state type");const auto state=value.at("state").get<std::string>();
@@ -723,6 +727,10 @@ void recovery_receiver_controller::turn() {
                 try {
                     const auto description=parse(route->state_->source->recovery_description(front->late_view),65536);
                     const auto late=parse(front->bytes,recovery_request_store::frame_bytes);
+                    // This inbox owns an already-described physical view. Keep
+                    // the original verifier's refusal and exact-view revocation
+                    // when a second describe is intercepted by this lane.
+                    require(!repeated_description(late),"receiver source unsolicited, repeated or expired recovery frame");
                     if(terminal_profile(description)) {
                         if(late.value("operation",std::string{})=="predecessor")late_predecessor_shape(late,description);
                         else late_lifecycle_shape(late,description);
@@ -974,6 +982,16 @@ void recovery_receiver_controller::turn() {
             const auto description=parse(route->state_->source->recovery_description(pending->view),65536);
             const auto channel=description.at("channel").get<std::string>();
             const auto response_value=parse(response,recovery_request_store::frame_bytes);
+            if(repeated_description(response_value)) {
+                // Pending control/range requests must not turn a repeated
+                // describe into a generic parse failure with live authority.
+                // invalidate compares the actual retained record under its
+                // leaf; a replaced view cannot revoke the successor.
+                if(route->state_->source->recovery_live(pending->view)&&route->state_->source->invalidate(pending->view.value))
+                    refuse("receiver source unsolicited, repeated or expired recovery frame");
+                {std::lock_guard lock(runtime.mutex);if(runtime.outstanding==pending)runtime.outstanding.reset();}
+                settle.keep_admission_wait=true;return;
+            }
             bool original_discard_admitted;
             {std::lock_guard lock(runtime.mutex);original_discard_admitted=route->state_->issued_discard_view.lock()==pending->view.value;}
             if((terminal_profile(description)||(original_discard_admitted&&response_value.value("operation",std::string{})=="discard"))&&
@@ -1678,6 +1696,9 @@ recovery_reconciliation_result recovery_receiver_controller::controller_reconcil
         runtime.running=true;runtime.reconciliation_reservation=reservation.get();reservation->active=true;}
     result.descriptor_=descriptor;result.step_=step;result.reservation_=reservation;
     const bool cancel=step==recovery_reconciliation_step::cancelled;
+    const auto continuity=cancel?std::shared_ptr<recovery_unknown_reconciliation>{}:recovery_unknown_reconciliation::acquire(descriptor);
+    require(cancel||continuity,"controller reconciliation first-claim worker unavailable");
+    const auto first_claims=continuity?continuity->refreeze_claims():std::shared_ptr<const std::vector<int64_t>>{};
     require(descriptor->phase_==(cancel?2:4),"controller reconciliation step/phase differs");
     require(!cancel||(descriptor->barrier_<INT64_MAX&&descriptor->attempt_<INT64_MAX),"controller reconciliation sequence exhausted");
     result.next_barrier_=descriptor->barrier_+(cancel?1:0);result.next_attempt_=descriptor->attempt_+(cancel?1:0);
@@ -1701,14 +1722,16 @@ recovery_reconciliation_result recovery_receiver_controller::controller_reconcil
         recovery_obligation_store journal(owner,runtime.caps.obligations,runtime.caps.install.installations);
         receive_install_store receiver(owner,runtime.caps.install.installations);receiver.audit();journal.audit();
         std::vector<recovery_obligation_snapshot> journals;std::vector<receive_install_snapshot> receivers;
-        for(const auto& c:descriptor->contributions_) {
+        for(size_t contribution=0;contribution<descriptor->contributions_.size();++contribution) {
+            const auto& c=descriptor->contributions_[contribution];
             require(requests.read(c.framing.journal.channel)==std::optional<recovery_request_row>{c.framing},"controller reconciliation frozen Q/M changed");
             const auto scope=journal.read(c.framing.journal.channel);const auto installed=receiver.read(c.framing.journal.channel);
             require(scope&&installed&&scope->profile==c.journal.scope.profile&&scope->address==c.journal.scope.address,"controller reconciliation journal address changed");
             auto snapshot=cancel?journal.snapshot_for_install(scope->address,descriptor->attempt_):journal.snapshot_for_reconciliation(scope->address);
             require(snapshot.entries.size()==c.journal.entries.size(),"controller reconciliation pending inventory changed");
             for(size_t n=0;n<snapshot.entries.size();++n){auto current=snapshot.entries[n],original=c.journal.entries[n];
-                if(!cancel&&!original.first_export_claim)original.first_export_claim=current.first_export_claim;
+                if(!cancel){const auto first=first_claims->at(continuity->claim_offsets_[contribution]+n);
+                    original.first_export_claim=first?std::optional<int64_t>{first}:std::nullopt;}
                 require(current==original,"controller reconciliation original, order, receipt or first claim changed");}
             if(cancel)require(snapshot.scope==c.journal.scope,"controller frozen reconciliation scope changed");
             else require(scope->mode==recovery_obligation_mode::recording&&scope->last_attempt==c.framing.sequence&&scope->revision>=c.journal.scope.revision,

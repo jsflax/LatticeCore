@@ -106,7 +106,7 @@ void recovery_continuous_producer::require_no_continuous_route(lattice_db& owner
 std::shared_ptr<database> recovery_continuous_producer::open_writer(const configuration& config,const std::shared_ptr<recovery_continuous_admission>& admission) {
     if(!admission||!admission->state||admission->state->path!=config.path)refuse("continuous writer lacks exact container custody");
     auto writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
-        std::shared_ptr<database_read_control>{},database::initialization_key(admission));
+        std::shared_ptr<database_read_control>{},database::initialization_key(admission),config.ordinary_context);
     writer->suppress_destructor_optimize_=true; // Immutable profile: refusal/close must not run optional ANALYZE.
     auto& state=*admission->state;
     const auto identity=writer->physical_identity("main",{},true);
@@ -341,7 +341,8 @@ std::shared_ptr<recovery_continuous_work> recovery_continuous_producer::admit_re
     return work;
 }
 recovery_install_result recovery_continuous_producer::reconciliation_export_owned(std::shared_ptr<lattice_db> owner,
-    const std::shared_ptr<recovery_continuous_work>& work,const std::vector<std::string>& originals,const std::function<void(database&)>& body,bool* admission_busy,bool automatic) {
+    const std::shared_ptr<recovery_continuous_work>& work,const std::vector<std::string>& originals,const std::function<void(database&)>& body,bool* admission_busy,bool automatic,
+    const std::function<void()>& after_committed_unlock) {
     // Only initial admission before any owned body or SQL can report BUSY.
     return recovery_writer_access::install_impl(owner,[&](database& db){
         if(!work||!work->reconciliation_||work->owner_!=owner||!owner->recovery_continuous_||work->state_!=owner->recovery_continuous_->state)
@@ -352,7 +353,7 @@ recovery_install_result recovery_continuous_producer::reconciliation_export_owne
             if(integer(row,"phase")!=4||integer(row,"incarnation")!=work->incarnation_||integer(row,"barrier")!=work->reconciliation_->barrier()||
                 integer(row,"attempt")!=work->reconciliation_->attempt())refuse("restricted export durable generation changed");};
         verify();continuous_frame claim(*state,db,2);body(db);verify();
-    },{},{},automatic?nullptr:admission_busy,automatic);
+    },after_committed_unlock,{},automatic?nullptr:admission_busy,automatic);
 }
 recovery_install_result recovery_continuous_producer::export_owned(std::shared_ptr<lattice_db> owner,const std::shared_ptr<recovery_continuous_work>& work,const std::function<void(database&)>& body,bool* initial_admission_busy,bool automatic) {
     return recovery_writer_access::install_impl(owner,[&](database& db){

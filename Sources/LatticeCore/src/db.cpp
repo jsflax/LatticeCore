@@ -1,11 +1,13 @@
 #include "recovery_producer_continuity.hpp"
 #include "lattice/db.hpp"
+#include "ordinary_cohort_attachment.hpp"
 #include "lattice/projection.hpp"
 #include "lattice/log.hpp"
 #include "checkpoint_test_probe.hpp"
 #include "recovery_admission_test_probe.hpp"
 #include "database_open_test_probe.hpp"
 #include "database_retirement.hpp"
+#include "database_open_ledger.hpp"
 #include <sqlite-vec.h>
 #include <sstream>
 #include <iostream>
@@ -16,6 +18,7 @@
 #include <sys/stat.h>
 #include <exception>
 #include <utility>
+#include <limits>
 
 namespace lattice {
 
@@ -34,6 +37,60 @@ uint64_t database::thread_statement_count() {
 }
 
 
+uint64_t detail::database_native_process() noexcept {
+#if defined(__APPLE__) || defined(__linux__)
+    return static_cast<uint64_t>(::getpid());
+#else
+    return 0;
+#endif
+}
+bool database::creator_current_() const noexcept {
+    if(target_staging_)return target_staging_creator_current_();
+    if(!ordinary_context_&&!ordinary_guarded_&&!checked_existing_connection_)return true;
+    return retirement_&&retirement_->ordinary_history_creator_pid_==detail::database_native_process()&&
+        detail::ordinary_creator_current(ordinary_context_);
+}
+void database::require_creator_() const {
+    if(target_staging_)throw db_error("unpublished target has no ordinary database access");
+    if(!creator_current_())throw std::runtime_error("managed database creator process required");
+}
+void database::validate_ordinary_current_() const {
+    require_creator_();
+    if(ordinary_context_){
+        detail::ordinary_before_open(path_,ordinary_context_);
+        const auto actual=physical_identity("main",{},true);
+        if(!actual)throw std::runtime_error("managed database physical owner unavailable");
+        ordinary_context_->validate_physical(actual->device,actual->inode);
+    }
+}
+void database::finish_checked_preparation_read_control_(std::chrono::steady_clock::time_point end) {
+    // Check creator before any inherited SQLite/control mutex. This function is
+    // called only after the same unpublished owner recorded its clean archive
+    // COMMIT; it does not issue cleanup/retirement or a fresh operation deadline.
+    require_creator_();
+    if(!checked_existing_connection_||!ordinary_context_||!db_||closed_.load(std::memory_order_acquire)||
+       !read_control_||read_control_->creator_process!=detail::database_native_process()||
+       read_control_->deadline!=end||read_control_->stopped())
+        throw db_error("checked preparation original deadline control unavailable");
+    auto* mutex=sqlite3_db_mutex(db_);
+    if(!mutex||sqlite3_mutex_try(mutex)!=SQLITE_OK)
+        throw db_error("checked preparation connection is still in use");
+    struct leave {sqlite3_mutex* mutex;~leave(){sqlite3_mutex_leave(mutex);}} held{mutex};
+    if(sqlite3_get_autocommit(db_)!=1||engine_reads_||read_control_->stopped())
+        throw db_error("checked preparation native operation is unsettled or expired");
+    for(auto* statement=sqlite3_next_stmt(db_,nullptr);statement;statement=sqlite3_next_stmt(db_,statement)) {
+        if(read_control_->stopped()||sqlite3_stmt_busy(statement))
+            throw db_error("checked preparation retains an active statement or expired control");
+    }
+    // Native callbacks no longer borrow this control before its last strong
+    // reference is dropped. A failed reset keeps the original owner/control and
+    // is propagated through its existing first-failure registry, never retried.
+    sqlite3_progress_handler(db_,0,nullptr,nullptr);
+    if(sqlite3_busy_timeout(db_,busy_timeout_ms_)!=SQLITE_OK)
+        throw db_error("checked preparation busy policy restoration failed");
+    read_control_->unpublish(db_);
+    read_control_.reset();
+}
 bool database_read_control::stopped() noexcept {
     if (stop_code.load(std::memory_order_acquire) != 0) return true;
     if (std::chrono::steady_clock::now() < deadline) return false;
@@ -42,17 +99,23 @@ bool database_read_control::stopped() noexcept {
     return true;
 }
 void database_read_control::stop(int32_t reason) noexcept {
+    if(!detail::ordinary_creator_current({}) ||
+       (detail::ordinary_requires_attachment_guard()&&creator_process!=detail::database_native_process()))return;
     int32_t expected = 0;
     stop_code.compare_exchange_strong(expected, reason, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(target_mutex);
     if (target) sqlite3_interrupt(target);
 }
 void database_read_control::publish(sqlite3* handle) noexcept {
+    if(!detail::ordinary_creator_current({}) ||
+       (detail::ordinary_requires_attachment_guard()&&creator_process!=detail::database_native_process()))return;
     std::lock_guard<std::mutex> lock(target_mutex);
     target = handle;
     if (stopped()) sqlite3_interrupt(target);
 }
 void database_read_control::unpublish(sqlite3* handle) noexcept {
+    if(!detail::ordinary_creator_current({}) ||
+       (detail::ordinary_requires_attachment_guard()&&creator_process!=detail::database_native_process()))return;
     std::lock_guard<std::mutex> lock(target_mutex);
     if (target == handle) target = nullptr;
 }
@@ -71,6 +134,7 @@ std::shared_ptr<const physical_store_identity> database::physical_identity(
 std::shared_ptr<const physical_store_identity> database::physical_identity_observed(
     const std::string& schema, const std::shared_ptr<database_read_control>& control,
     bool validate_current, const char*& failure, physical_identity_details* details) const {
+    require_creator_();
     failure = nullptr;
     if (details) *details = {};
     const auto failed = [&](const char* label) -> std::shared_ptr<const physical_store_identity> {
@@ -177,6 +241,7 @@ std::shared_ptr<const physical_store_identity> database::physical_identity_locke
 
 
 database::physical_identity_attempt database::try_current_physical_identity(const std::string& schema) const {
+    require_creator_();
     physical_identity_attempt result;
 #if defined(__EMSCRIPTEN__) || (!defined(__APPLE__) && !defined(__linux__))
     result.failure = "unsupported_platform";
@@ -223,6 +288,7 @@ std::unique_lock<std::mutex> database::attachment_operation::lock(std::mutex& mu
 thread_local database::attachment_sql_scope* database::attachment_sql_scope::current_ = nullptr;
 database::attachment_sql_scope::attachment_sql_scope(database& owner, attachment_operation& operation)
     : owner_(owner), operation_(operation) {
+    owner_.require_creator_();
     operation_.check();
     if (!owner_.db_ || owner_.closed_.load(std::memory_order_acquire))
         throw db_error("topology admission: database closed");
@@ -247,6 +313,7 @@ database::attachment_sql_scope::attachment_sql_scope(database& owner, attachment
     current_ = this;
 }
 database::attachment_sql_scope::~attachment_sql_scope() {
+    if(!owner_.creator_current_()){if(current_==this)current_=previous_;return;}
     current_ = previous_;
     if (mutex_) sqlite3_mutex_leave(mutex_);
 }
@@ -337,13 +404,11 @@ void database::execute_attachment_sql(const std::string& sql, attachment_operati
         if (channel_reset_unsettled_.load(std::memory_order_acquire))
             throw db_error("channel reset unsettled; explicit rollback required");
         record_statement();
-        char* message = nullptr;
-        rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &message);
-        const std::unique_ptr<char, decltype(&sqlite3_free)> free_message(message, &sqlite3_free);
+        rc = execute_observed_sql_(sql.c_str());
         if (rc != SQLITE_OK) {
             extended_code = sqlite3_extended_errcode(db_);
             system_errno = sqlite3_system_errno(db_);
-            error = message ? message : "Unknown error";
+            const auto* message=sqlite3_errmsg(db_);error = message ? message : "Unknown error";
         }
         // This tail uses the mutex already admitted above. If retaining the
         // tail fails, keep the original SQL failure as well as that failure.
@@ -504,23 +569,87 @@ std::vector<std::string> database::query_attachment_text_metadata(
 }
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
-                   std::shared_ptr<database_read_control> read_control)
-    : database(path, mode, busy_timeout_ms, std::move(read_control), initialization_key(false)) {}
+                   std::shared_ptr<database_read_control> read_control, detail::ordinary_context context)
+    : database(path, mode, busy_timeout_ms, std::move(read_control), initialization_key(false), std::move(context)) {}
 
 std::shared_ptr<database> database::make_read_keeper(const std::string& path,
-                                                   int busy_timeout_ms) {
+                                                   int busy_timeout_ms, detail::ordinary_context context,
+                                                   std::shared_ptr<detail::database_open_ledger> ledger) {
+    if(ledger)return make_owned_connection(path,open_mode::read_only,busy_timeout_ms,{},std::move(context),std::move(ledger),true);
     return std::make_shared<database>(path, open_mode::read_only, busy_timeout_ms,
-                                     std::shared_ptr<database_read_control>{}, initialization_key(true));
+                                     std::shared_ptr<database_read_control>{}, initialization_key(true), std::move(context));
+}
+
+
+namespace {
+struct database_open_builder_tail {
+    std::shared_ptr<detail::database_open_ledger> ledger;
+    size_t slot; uint64_t serial; bool object_created=false;
+    ~database_open_builder_tail(){
+        if(!ledger->in_creator_process())return;
+        if(!object_created)ledger->object_returned(slot,serial);
+        ledger->builder_returned(slot,serial);
+    }
+};
+}
+void database::owned_connection_deleter::operator()(database* value) const noexcept {
+    if(!ledger){delete value;return;}
+    if(!ledger->in_creator_process())return; // Quarantine before inherited destructor/leaf.
+    delete value; // Entire actual wrapper/native/callback/member destruction returned.
+    if(!ledger->in_creator_process())return; // Arbitrary destruction may have forked.
+    ledger->object_returned(slot,serial);
+}
+std::shared_ptr<database> database::make_owned_connection(const std::string& path,open_mode mode,int busy,
+    std::shared_ptr<database_read_control> control,detail::ordinary_context context,
+    std::shared_ptr<detail::database_open_ledger> ledger,bool keeper) {
+    if(!ledger)return std::make_shared<database>(path,mode,busy,std::move(control),initialization_key(keeper),std::move(context));
+    const auto admitted=ledger->reserve_open();
+    database_open_builder_tail tail{ledger,admitted.slot,admitted.serial};
+    auto fact=std::make_shared<detail::database_retirement_state>();
+    ledger->bind_retirement(admitted.slot,admitted.serial,fact);
+    initialization_key key(keeper,fact,ledger,admitted.slot,admitted.serial);
+    auto* actual=new database(path,mode,busy,std::move(control),key,std::move(context));
+    tail.object_created=true;
+    // Control-block failure calls this exact deleter; builder tail settles once.
+    return std::shared_ptr<database>(actual,owned_connection_deleter{ledger,admitted.slot,admitted.serial});
+}
+database::private_connection database::make_private_connection(const std::string& path,open_mode mode,int busy,
+    std::shared_ptr<database_read_control> control,detail::ordinary_context context,
+    std::shared_ptr<detail::database_open_ledger> ledger) {
+    if(!ledger)return private_connection(new database(path,mode,busy,std::move(control),std::move(context)),owned_connection_deleter{});
+    const auto admitted=ledger->reserve_open();
+    database_open_builder_tail tail{ledger,admitted.slot,admitted.serial};
+    auto fact=std::make_shared<detail::database_retirement_state>();
+    ledger->bind_retirement(admitted.slot,admitted.serial,fact);
+    initialization_key key(false,fact,ledger,admitted.slot,admitted.serial);
+    auto* actual=new database(path,mode,busy,std::move(control),key,std::move(context));
+    tail.object_created=true;
+    return private_connection(actual,owned_connection_deleter{ledger,admitted.slot,admitted.serial});
 }
 
 database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
-                   std::shared_ptr<database_read_control> read_control, initialization_key key)
-    : administrative_connection_(key.administrative_), retirement_(std::make_shared<detail::database_retirement_state>()),
-      path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
-    suppress_destructor_optimize_=key.administrative_;
+                   std::shared_ptr<database_read_control> read_control, initialization_key key, detail::ordinary_context context)
+    : administrative_connection_(key.administrative_), checked_existing_connection_(key.checked_existing_),
+      retirement_(key.checked_retirement_?key.checked_retirement_:std::make_shared<detail::database_retirement_state>()),
+      ordinary_context_(std::move(context)), path_(path), mode_(mode), busy_timeout_ms_(busy_timeout_ms), read_control_(std::move(read_control)) {
+    detail::ordinary_require_creator(ordinary_context_);
+    detail::ordinary_before_open(path,ordinary_context_);
+    ordinary_guarded_=detail::ordinary_requires_attachment_guard();
+    suppress_destructor_optimize_=key.administrative_||key.checked_existing_;
+    if(key.checked_existing_&&((key.checked_mounted_server_?
+       static_cast<bool>(ordinary_context_):(!ordinary_context_||ordinary_context_!=key.checked_context_))||
+       !key.checked_identity_||!retirement_||mode_!=open_mode::read_write))
+        throw db_error("checked existing open requires its actual retained native owner");
     if(mode==open_mode::read_write && !key.continuous_)detail::require_continuous_path_unowned(path);
     // Determine SQLite open flags based on mode
     int flags = SQLITE_OPEN_FULLMUTEX;  // Always use serialized threading mode
+    if(ordinary_context_){
+#ifdef SQLITE_OPEN_NOFOLLOW
+        flags |= SQLITE_OPEN_NOFOLLOW;
+#else
+        throw std::runtime_error("managed physical open requires SQLite no-follow support");
+#endif
+    }
     int rc;
 
     if (mode == open_mode::read_only) {
@@ -542,18 +671,22 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         if(!key.administrative_&&!key.continuous_&&!key.keeper_cache_&&!read_control_)
             observed_vfs=detail::database_open_test_hooks::consume(path.c_str(),flags);
 #endif
+        if(key.open_ledger_)key.open_ledger_->native_open_entered(key.open_slot_,key.open_serial_);
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, observed_vfs);
     } else {
         flags |= SQLITE_OPEN_READWRITE;
-        if(key.administrative_) {
+        if(key.administrative_||key.checked_existing_) {
 #ifdef SQLITE_OPEN_NOFOLLOW
             flags |= SQLITE_OPEN_NOFOLLOW;
 #else
             throw db_error("receipt administration requires no-follow SQLite open");
 #endif
-        } else flags |= SQLITE_OPEN_CREATE | SQLITE_OPEN_URI; // ordinary open unchanged
+        } else if(ordinary_context_) flags |= SQLITE_OPEN_URI; // enrolled existing file, never CREATE
+        else flags |= SQLITE_OPEN_CREATE | SQLITE_OPEN_URI; // ordinary open unchanged
+        if(key.open_ledger_)key.open_ledger_->native_open_entered(key.open_slot_,key.open_serial_);
         rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     }
+    if(key.open_ledger_&&!db_)retirement_->record_close(SQLITE_OK,detail::database_retirement_state::not_attempted); // Actual open returned no native handle.
     if (rc != SQLITE_OK) {
         try {
             std::string error = sqlite3_errmsg(db_);
@@ -568,9 +701,12 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
     }
 
     try {
+    validate_ordinary_current_();
+    if(ordinary_guarded_&&detail::restore_ordinary_attachment_guard(db_)!=SQLITE_OK)
+        throw std::runtime_error("managed attachment gate installation failed");
     if (const auto* probe = detail::database_retirement_test_hooks::current; probe && probe->after_open)
         probe->after_open(*this, db_);
-    if(key.administrative_) {
+    if(key.administrative_||key.checked_existing_) {
 #ifdef SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
         if(sqlite3_db_config(db_,SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,1,nullptr)!=SQLITE_OK ||
            sqlite3_wal_autocheckpoint(db_,0)!=SQLITE_OK)
@@ -579,8 +715,8 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         throw db_error("receipt administration requires no-checkpoint-on-close support");
 #endif
         const auto actual=physical_identity("main",{},true);
-        if(!key.administrative_identity_ || !actual || *actual!=*key.administrative_identity_ ||
-           actual->filename!=key.administrative_identity_->filename)
+        const auto& expected=key.checked_existing_?key.checked_identity_:key.administrative_identity_;
+        if(!expected || !actual || *actual!=*expected || actual->filename!=expected->filename)
             throw db_error("receipt administration file changed before SQLite admission");
     }
     // Statement-level busy timeout MUST be installed before ANY statement runs.
@@ -616,10 +752,10 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
         throw db_error("Failed to initialize sqlite-vec extension");
     }
 
-    if(mode==open_mode::read_write)
+    if(mode==open_mode::read_write && !key.checked_existing_)
         detail::recovery_continuous_producer::classify_open(*this,static_cast<bool>(key.continuous_),true);
 
-    if(key.administrative_) {
+    if(key.administrative_||key.checked_existing_) {
         const auto mode=query("PRAGMA main.journal_mode");
         if(mode.size()!=1 || mode[0].size()!=1 || !std::holds_alternative<std::string>(mode[0].begin()->second) ||
            std::get<std::string>(mode[0].begin()->second)!="wal")
@@ -695,6 +831,10 @@ database::database(const std::string& path, open_mode mode, int busy_timeout_ms,
 }
 
 database::~database() {
+    if(target_staging_){retire_target_staging_();return;}
+    if(!creator_current_()){retire_connection_(false);return;}
+    bool optional_current=true;
+    if(ordinary_context_){try{validate_ordinary_current_();}catch(...){optional_current=false;}}
     if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
     if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
     if (read_control_) read_control_->unpublish(db_);
@@ -712,13 +852,13 @@ database::~database() {
             // missing or stale. Never throw from a destructor.
             // An unresolved/failed producer bootstrap preserves its refused
             // schema. Hook detachment, passive checkpoint and close still run.
-            if (!suppress_destructor_optimize_ && !administrative_connection_) {
+            if (optional_current && !suppress_destructor_optimize_ && !administrative_connection_) {
                 int orc = sqlite3_exec(db_, "PRAGMA optimize", nullptr, nullptr, nullptr);
                 if (orc != SQLITE_OK) {
                     LOG_DEBUG("db", "~database optimize skipped: rc=%d, path=%s", orc, path_.c_str());
                 }
             }
-            if(!administrative_connection_) {
+            if(optional_current && !administrative_connection_ && !checked_existing_connection_) {
                 int nLog = 0, nCkpt = 0;
                 int rc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
                 LOG_DEBUG("db", "~database checkpoint: rc=%d, nLog=%d, nCkpt=%d, path=%s", rc, nLog, nCkpt, path_.c_str());
@@ -729,7 +869,16 @@ database::~database() {
 }
 
 void database::retire_connection_(bool detach_callbacks) noexcept {
+    if(target_staging_){retire_target_staging_();return;}
     if (!db_) return;
+    if(!creator_current_()){
+        // No inherited SQLite, read-control mutex or callback teardown. The
+        // genuine process slot retains the lease; no physical close is proved.
+        db_=nullptr;
+        if(retirement_)retirement_->record_close(detail::database_retirement_state::not_attempted,
+                                               detail::database_retirement_state::not_attempted);
+        return;
+    }
     if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
     if (canonical_write_allowed_) canonical_write_allowed_->store(false, std::memory_order_release);
     if (read_control_) read_control_->unpublish(db_);
@@ -764,6 +913,7 @@ void database::retire_connection_(bool detach_callbacks) noexcept {
 }
 
 void database::close() {
+    require_creator_();
     if (auto allowed = std::atomic_load(&local_producer_write_allowed_)) allowed->store(false, std::memory_order_release);
     // Logical close: ops short-circuit after this. The sqlite3* itself is freed in
     // ~database (single-threaded), so a concurrent reader holding this wrapper can
@@ -776,6 +926,8 @@ void database::close() {
 }
 
 sqlite3* database::handle() const {
+    require_creator_();
+    detail::ordinary_require_no_raw_escape(ordinary_context_);
     // The connection stays allocated through logical close. As with every raw
     // access, callers must keep the database wrapper alive and not move it.
     if (!db_) return nullptr;
@@ -802,6 +954,7 @@ sqlite3* database::handle() const {
 }
 
 void database::set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back) {
+    require_creator_();
     if (!db_) throw db_error("transaction hooks require a physical connection");
     // Even std::function moves/swaps can copy or destroy inline targets. Finish
     // all callable construction before locking; replacement owns the displaced
@@ -822,6 +975,7 @@ void database::set_txn_hooks(std::function<void()> settled, std::function<void()
 
 void database::set_txn_hooks_owned_(std::function<void()> settled, std::function<void()> rolled_back,
         std::function<std::function<void()>(database&, bool)> capture_owned) {
+    require_creator_();
     auto replacement = std::make_shared<txn_hook_callbacks>(
         std::move(settled), std::move(rolled_back), std::move(capture_owned));
     {
@@ -833,6 +987,7 @@ void database::set_txn_hooks_owned_(std::function<void()> settled, std::function
 }
 
 void database::rebind_txn_hooks_owned_() noexcept {
+    if(!creator_current_())return;
     // Rollback hook: fires inside SQLite's C frames, so the trampoline only
     // clears a flag and (via rolled_back) a C++ vector — no SQLite calls,
     // nothing that can throw. Applies to every storage kind: without it a
@@ -851,6 +1006,7 @@ void database::rebind_txn_hooks_owned_() noexcept {
 }
 
 void database::drain_if_settled() {
+    require_creator_();
     if (auto* operation = attachment_sql_scope::operation_for(this)) {
         operation->capture_settlement_locked(*this, false);
         return;
@@ -865,6 +1021,9 @@ void database::drain_if_settled() {
     // Attached scalar wrappers release their writer (and optional vector
     // store gate) before delivering the outer successful statement's tail.
     if (detail::managed_route_scope::active_for(this)) return;
+    // A compound read may retain the connection mutex and a real main cursor
+    // across several queries. Its explicit tail drains after both are released.
+    if (engine_query_scope::defers_delivery_for(*this)) return;
     // Post-statement drain point (docs/design-deferred-memory-delivery.md):
     // after a successful statement, autocommit != 0 means the top-level
     // transaction just closed (implicit, or the explicit COMMIT that funnels
@@ -890,6 +1049,7 @@ void database::drain_if_settled() {
 }
 
 void database::discard_if_rolled_back() {
+    require_creator_();
     if (auto* operation = attachment_sql_scope::operation_for(this)) {
         operation->capture_settlement_locked(*this, true);
         return;
@@ -912,15 +1072,24 @@ void database::discard_if_rolled_back() {
     if (hooks && hooks->rolled_back) hooks->rolled_back();
 }
 
+sqlite3* database::note_owning_wrapper_move_(database& other) noexcept {
+    // Pointer factories never move actual database objects. A public move
+    // leaves their external owning-deleter envelope, so retain honest debt.
+    if(other.retirement_)other.retirement_->owning_wrapper_moved_.store(true,std::memory_order_release);
+    return other.db_;
+}
 database::database(database&& other) noexcept
-    : db_(other.db_), retirement_(std::move(other.retirement_)), path_(std::move(other.path_)), mode_(other.mode_),
+    : target_staging_(std::move(other.target_staging_)),
+      db_(note_owning_wrapper_move_(other)), retirement_(std::move(other.retirement_)), ordinary_context_(std::move(other.ordinary_context_)),
+      ordinary_guarded_(other.ordinary_guarded_), path_(std::move(other.path_)), mode_(other.mode_),
       busy_timeout_ms_(other.busy_timeout_ms_), read_control_(std::move(other.read_control_)),
-      main_physical_identity_(std::atomic_load(&other.main_physical_identity_)) {
+      main_physical_identity_(creator_current_()?std::atomic_load(&other.main_physical_identity_):nullptr) {
     canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
     canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
     canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
     suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
     administrative_connection_ = std::exchange(other.administrative_connection_, false);
+    checked_existing_connection_ = std::exchange(other.checked_existing_connection_, false);
     continuous_file_.store(other.continuous_file_.exchange(continuous_classification::unknown));
     txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
     local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
@@ -941,19 +1110,24 @@ database& database::operator=(database&& other) noexcept {
         // Retire displaced user captures after the complete move/rebind, with
         // no SQLite mutex held. Bare wrappers' public bundles move as well.
         auto retired_hooks = std::move(txn_hooks_);
+        auto retired_target = std::move(target_staging_);
+        target_staging_ = std::move(other.target_staging_);
         canonical_trigger_only_ = std::exchange(other.canonical_trigger_only_, false);
         canonical_callback_custody_ = std::move(other.canonical_callback_custody_);
         canonical_write_allowed_ = std::move(other.canonical_write_allowed_);
         suppress_destructor_optimize_ = std::exchange(other.suppress_destructor_optimize_, false);
         administrative_connection_ = std::exchange(other.administrative_connection_, false);
+        checked_existing_connection_ = std::exchange(other.checked_existing_connection_, false);
         continuous_file_.store(other.continuous_file_.exchange(continuous_classification::unknown));
         txn_hooks_external_ = std::exchange(other.txn_hooks_external_,false);
         local_producer_callback_custody_ = std::move(other.local_producer_callback_custody_);
         local_producer_write_allowed_ = std::move(other.local_producer_write_allowed_);
         channel_reset_unsettled_.store(other.channel_reset_unsettled_.exchange(false));
         lattice_update_hook_context_ = std::move(other.lattice_update_hook_context_);
-        db_ = other.db_;
+        db_ = note_owning_wrapper_move_(other);
         retirement_ = std::move(other.retirement_);
+        ordinary_context_ = std::move(other.ordinary_context_);
+        ordinary_guarded_ = other.ordinary_guarded_;
         txn_dirty_.store(other.txn_dirty_.exchange(false));
         txn_hooks_ = std::move(other.txn_hooks_);
         // The SQLite update/WAL userdata address has not changed. The rollback
@@ -964,7 +1138,7 @@ database& database::operator=(database&& other) noexcept {
         mode_ = other.mode_;
         busy_timeout_ms_ = other.busy_timeout_ms_;
         read_control_ = std::move(other.read_control_);
-        std::atomic_store(&main_physical_identity_, std::atomic_load(&other.main_physical_identity_));
+        if(creator_current_())std::atomic_store(&main_physical_identity_, std::atomic_load(&other.main_physical_identity_));
         path_ = std::move(other.path_);
         other.db_ = nullptr;
     }
@@ -972,27 +1146,73 @@ database& database::operator=(database&& other) noexcept {
 }
 
 int64_t database::changes() const {
+    require_creator_();
     if (closed_.load(std::memory_order_acquire) || !db_) return 0;
     return sqlite3_changes64(db_);
 }
 
+void database::note_history_mutation_(sqlite3_stmt* statement) const noexcept {
+    // Called under this exact connection's SQLite mutex, immediately before
+    // an actual step. SQLite's own program classification, not SQL text or a
+    // caller flag, determines whether this program may write. The field moves
+    // with retirement_ and cannot be reset through any public/native DTO API.
+    if(!retirement_)return;
+    auto& sequence=retirement_->ordinary_history_mutation_epoch_;
+    if(!statement||sqlite3_db_handle(statement)!=db_){sequence.store(std::numeric_limits<uint64_t>::max(),std::memory_order_release);return;}
+    if(sqlite3_stmt_readonly(statement))return;
+    auto prior=sequence.load(std::memory_order_relaxed);
+    while(prior!=std::numeric_limits<uint64_t>::max()&&!sequence.compare_exchange_weak(prior,prior+1,std::memory_order_release,std::memory_order_relaxed)){}
+}
+int database::execute_observed_sql_(const char* sql) {
+    // The no-callback branch of execute/attachment SQL already retains the
+    // physical SQLite mutex. Follow SQLite's own exec prepare/tail/step/
+    // finalize shape once; never double-prepare an authorizer/fault action.
+    // Readonly transaction statements remain unchanged. An unknown failed
+    // mutating step still advances the private sequence and forces auditing.
+    // Preserve native exec's initial error-state/API validity reset without
+    // preparing or stepping any program (and thus without fault callbacks).
+    int rc=sqlite3_exec(db_,"",nullptr,nullptr,nullptr);
+    const char* at=sql?sql:"";
+    while(rc==SQLITE_OK&&*at){
+        sqlite3_stmt* statement=nullptr;const char* tail=nullptr;
+        rc=sqlite3_prepare_v2(db_,at,-1,&statement,&tail);
+        if(rc!=SQLITE_OK){sqlite3_finalize(statement);break;}
+        if(!statement){at=tail;continue;} // whitespace/comment, no actual step
+        do {note_history_mutation_(statement);rc=sqlite3_step(statement);}while(rc==SQLITE_ROW);
+        // Like native exec, finalize supplies the terminal result including
+        // a failed virtual-table/commit settlement. No result callback/copy.
+        rc=sqlite3_finalize(statement);at=tail;
+        // Match sqlite3_exec's ASCII tail advancement after an actual
+        // finalized program. Do not prepare an over-limit whitespace tail
+        // after a committed statement, or invent locale-sensitive spacing.
+        while(static_cast<unsigned char>(*at)==0x20 ||
+              (static_cast<unsigned char>(*at)>=0x09 &&
+               static_cast<unsigned char>(*at)<=0x0d))++at;
+    }
+    return rc;
+}
+
 int database::step_statement_(sqlite3_stmt* statement) const {
+    require_creator_();
     auto* mutex=sqlite3_db_mutex(db_);sqlite3_mutex_enter(mutex);
     struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
     // Transactions such as COMMIT are SQLite-readonly but have no result
     // columns. Only actual read diagnostics may step while fenced.
     const bool refused=channel_reset_unsettled_.load(std::memory_order_acquire) &&
         (!sqlite3_stmt_readonly(statement)||sqlite3_column_count(statement)==0);
-    return refused?SQLITE_ABORT:sqlite3_step(statement);
+    if(refused)return SQLITE_ABORT;
+    note_history_mutation_(statement);
+    return sqlite3_step(statement);
 }
 
 void database::execute(const std::string& sql, const std::vector<column_value_t>& params) {
+    require_creator_();
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
     if (params.empty()) {
         // Fast path for parameterless queries
-        char* errmsg = nullptr;
+        std::string errmsg;
         int rc, failure_extended_code, failure_system_errno;
         {
             auto* mutex=sqlite3_db_mutex(db_);sqlite3_mutex_enter(mutex);
@@ -1000,18 +1220,18 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
             const bool explicit_rollback=sql=="ROLLBACK";
             if(channel_reset_unsettled_.load(std::memory_order_acquire)&&!explicit_rollback)
                 throw db_error("channel reset unsettled; explicit rollback required");
-            rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errmsg);
+            rc = execute_observed_sql_(sql.c_str());
             if(rc!=SQLITE_OK) {
                 // Preserve this failure while the existing connection mutex
                 // still owns it, before cleanup or any metadata lookup.
                 failure_extended_code=sqlite3_extended_errcode(db_);
                 failure_system_errno=sqlite3_system_errno(db_);
+                const auto* message=sqlite3_errmsg(db_);errmsg=message?message:"Unknown error";
             } else if(explicit_rollback&&sqlite3_get_autocommit(db_)!=0)
                 channel_reset_unsettled_.store(false,std::memory_order_release);
         }
         if (rc != SQLITE_OK) {
-            std::string error = errmsg ? errmsg : "Unknown error";
-            sqlite3_free(errmsg);
+            std::string error = errmsg;
             LOG_ERROR("db", "SQL execution failed: %s (SQL: %s) [rc=%d extended_code=%d system_errno=%d sqlite_version=%s sqlite_source_id=%s]",
                 error.c_str(), sql.c_str(), rc, failure_extended_code, failure_system_errno, sqlite3_libversion(), sqlite3_sourceid());
             discard_if_rolled_back();
@@ -1057,6 +1277,7 @@ void database::execute(const std::string& sql, const std::vector<column_value_t>
 }
 
 bool database::table_exists(const std::string& name) const {
+    require_creator_();
     const char* sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
     sqlite3_stmt* stmt = nullptr;
 
@@ -1074,6 +1295,7 @@ bool database::table_exists(const std::string& name) const {
 }
 
 std::unordered_map<std::string, std::string> database::get_table_info(const std::string& table) const {
+    require_creator_();
     std::unordered_map<std::string, std::string> columns;
 
     std::string sql = "PRAGMA table_info(" + table + ")";
@@ -1155,6 +1377,7 @@ void database::ensure_table(const table_schema& schema) {
 }
 
 void database::bind_value(sqlite3_stmt* stmt, int index, const column_value_t& value) {
+    require_creator_();
     std::visit([&](auto&& v) {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, std::nullptr_t>) {
@@ -1180,6 +1403,7 @@ void database::bind_value(sqlite3_stmt* stmt, int index, const column_value_t& v
 }
 
 column_value_t database::extract_column(sqlite3_stmt* stmt, int index) {
+    require_creator_();
     int type = sqlite3_column_type(stmt, index);
     switch (type) {
         case SQLITE_INTEGER:
@@ -1207,6 +1431,7 @@ column_value_t database::extract_column(sqlite3_stmt* stmt, int index) {
 primary_key_t database::insert(const std::string& table,
                                const std::vector<std::pair<std::string, column_value_t>>& values,
                                const std::vector<std::string>& conflict_columns) {
+    require_creator_();
     if (closed_.load(std::memory_order_acquire)) return {};
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
@@ -1323,6 +1548,7 @@ primary_key_t database::insert(const std::string& table,
 void database::update(const std::string& table,
                        primary_key_t id,
                        const std::vector<std::pair<std::string, column_value_t>>& values) {
+    require_creator_();
     if (closed_.load(std::memory_order_acquire)) return;
     if (values.empty()) return;
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
@@ -1367,6 +1593,7 @@ void database::update(const std::string& table,
 }
 
 void database::remove(const std::string& table, primary_key_t id) {
+    require_creator_();
     if (closed_.load(std::memory_order_acquire)) return;
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
@@ -1391,8 +1618,8 @@ void database::remove(const std::string& table, primary_key_t id) {
     drain_if_settled();
 }
 
-database::engine_query_scope::engine_query_scope(database& db)
-    : owner(db), previous(current) { current = this; }
+database::engine_query_scope::engine_query_scope(database& db, bool defer_delivery)
+    : owner(db), previous(current), defers_delivery(defer_delivery) { owner.require_creator_();current = this; }
 
 database::engine_query_scope::~engine_query_scope() noexcept { reset(); }
 
@@ -1402,8 +1629,15 @@ bool database::engine_query_scope::active_for(const database& db) noexcept {
     return false;
 }
 
+bool database::engine_query_scope::defers_delivery_for(const database& db) noexcept {
+    for (auto* scope = current; scope; scope = scope->previous)
+        if (&scope->owner == &db && scope->defers_delivery) return true;
+    return false;
+}
+
 void database::engine_query_scope::adopt(sqlite3_stmt* value) noexcept {
     statement = value;
+    if(!owner.creator_current_())return;
     auto* mutex = sqlite3_db_mutex(owner.db_);
     sqlite3_mutex_enter(mutex);
     if (statement && sqlite3_stmt_readonly(statement) && sqlite3_column_count(statement) > 0) {
@@ -1416,6 +1650,7 @@ void database::engine_query_scope::adopt(sqlite3_stmt* value) noexcept {
 
 void database::engine_query_scope::reset() noexcept {
     if (!active) return;
+    if(!owner.creator_current_()){statement=nullptr;registered=false;current=previous;active=false;return;}
     auto* mutex = sqlite3_db_mutex(owner.db_);
     sqlite3_mutex_enter(mutex);
     if (registered) {
@@ -1433,6 +1668,7 @@ void database::engine_query_scope::reset() noexcept {
 
 std::vector<database::row_t> database::query(const std::string& sql,
                                              const std::vector<column_value_t>& params) {
+    require_creator_();
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return {};
@@ -1499,6 +1735,7 @@ std::vector<database::row_t> database::query(const std::string& sql,
 
 std::optional<column_value_t> database::query_managed_cell(
     const std::string& sql, const std::string& column, primary_key_t row_id) {
+    require_creator_();
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
     if (closed_.load(std::memory_order_acquire)) return std::nullopt;
@@ -1551,16 +1788,19 @@ std::optional<column_value_t> database::query_managed_cell(
 }
 
 void database::refresh_wal_snapshot() {
+    require_creator_();
     // A no-op SELECT forces SQLite to release the old WAL read snapshot
     // and acquire a fresh one on the next query.
     sqlite3_exec(db_, "SELECT 1", nullptr, nullptr, nullptr);
 }
 
 void database::interrupt() {
+    require_creator_();
     if (db_) sqlite3_interrupt(db_);
 }
 
 database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_budget_ms) {
+    require_creator_();
     checkpoint_result result;
 #ifdef __EMSCRIPTEN__
     // DELETE journal mode — there is no WAL to checkpoint.
@@ -1630,6 +1870,7 @@ database::checkpoint_result database::wal_checkpoint(bool truncate, int busy_bud
 }
 
 bool database::maintenance_scope::idle(database& db) noexcept {
+    if(!db.creator_current_())return false;
     if (!db.db_ || db.closed_.load(std::memory_order_acquire) ||
         sqlite3_get_autocommit(db.db_) == 0 ||
         sqlite3_txn_state(db.db_, nullptr) != SQLITE_TXN_NONE ||
@@ -1642,6 +1883,7 @@ bool database::maintenance_scope::idle(database& db) noexcept {
 }
 
 void database::maintenance_scope::probe_before_store_gate(database& db) {
+    db.require_creator_();
     detail::recovery_admission_test_hooks::route_maintenance_entered();
     if (!try_probe_before_store_gate(db)) {
         detail::recovery_admission_test_hooks::route_maintenance(
@@ -1653,6 +1895,7 @@ void database::maintenance_scope::probe_before_store_gate(database& db) {
 }
 
 bool database::maintenance_scope::try_probe_before_store_gate(database& db) {
+    db.require_creator_();
     auto* mutex = db.db_ ? sqlite3_db_mutex(db.db_) : nullptr;
 #ifndef __EMSCRIPTEN__
     if (!mutex) throw db_error("audit maintenance requires a serialized connection");
@@ -1669,6 +1912,7 @@ bool database::maintenance_scope::try_probe_before_store_gate(database& db) {
 }
 
 database::maintenance_scope::admission database::maintenance_scope::controller_classify_locked(database& db) {
+    db.require_creator_();
     if (engine_query_scope::active_for(db) || active_for(db.db_) || update_hook_scope::active_for(db.db_))
         throw db_error("controller maintenance cannot reenter a connection callback");
     if (idle(db)) return admission::ready;
@@ -1693,6 +1937,7 @@ database::maintenance_scope::admission database::maintenance_scope::controller_c
 }
 
 database::maintenance_scope::admission database::maintenance_scope::controller_probe(database& db) {
+    db.require_creator_();
     if (engine_query_scope::active_for(db) || active_for(db.db_) || update_hook_scope::active_for(db.db_))
         throw db_error("controller maintenance cannot reenter a connection callback");
     auto* mutex = db.db_ ? sqlite3_db_mutex(db.db_) : nullptr;
@@ -1711,7 +1956,7 @@ database::maintenance_scope::maintenance_scope(database& db)
     : maintenance_scope(db, nullptr) {}
 
 database::maintenance_scope::maintenance_scope(database& db, admission* controller_admission)
-    : owner(db), mutex(db.db_ ? sqlite3_db_mutex(db.db_) : nullptr) {
+    : owner(db), mutex((db.require_creator_(), db.db_ ? sqlite3_db_mutex(db.db_) : nullptr)) {
 #ifndef __EMSCRIPTEN__
     if (!mutex) throw db_error("audit maintenance requires a serialized connection");
 #endif
@@ -1738,12 +1983,14 @@ database::maintenance_scope::maintenance_scope(database& db, admission* controll
 }
 
 database::maintenance_scope::~maintenance_scope() noexcept {
+    if(!owner.creator_current_()){if(current==this)current=previous;return;}
     if (!entered) return;
     current = previous;
     sqlite3_mutex_leave(mutex);
 }
 
 void database::begin_transaction(bool exclusive) {
+    require_creator_();
     if(channel_reset_unsettled_.load(std::memory_order_acquire))throw db_error("channel reset unsettled; explicit rollback required");
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
     // IMMEDIATE: acquires write lock, readers still allowed (WAL mode).
@@ -1765,6 +2012,55 @@ void database::begin_transaction(bool exclusive) {
     // interactive process that opened with busy_timeout_ms=2000 must not
     // discover its explicit BEGINs still park for 30s (Aug 2026 hook-wedge
     // incident — two such waits ate a 60s harness deadline whole).
+    // The actual unpublished checked preparation privately owns this whole
+    // archive turn. Do not replace its original busy control with a renewed
+    // ordinary timeout; the BEGIN budget may only shorten the original end.
+    if(checked_existing_connection_&&read_control_) {
+        const int budget_ms=busy_timeout_ms_>0?busy_timeout_ms_:kDefaultBusyTimeoutMs;
+        const auto deadline=std::min(read_control_->deadline,
+            std::chrono::steady_clock::now()+std::chrono::milliseconds(budget_ms));
+        struct busy_context {database_read_control* control;std::chrono::steady_clock::time_point end;};
+        busy_context context{read_control_.get(),deadline};
+        struct restore_busy {
+            sqlite3* handle;std::shared_ptr<database_read_control> control;
+            ~restore_busy() noexcept {
+                // Creator-fenced before inherited native/control locks. The
+                // private original keeps this live handle; no public close or
+                // other operation is admitted while this stack context exists.
+                if(control->creator_process!=detail::database_native_process()||
+                   !detail::ordinary_creator_current({}))return;
+                sqlite3_busy_handler(handle,[](void* p,int)->int {
+                    auto* c=static_cast<database_read_control*>(p);
+                    if(c->stopped())return 0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    return c->stopped()?0:1;
+                },control.get());
+            }
+        } restore{db_,read_control_};
+        if(sqlite3_busy_handler(db_,[](void* p,int)->int {
+            auto& c=*static_cast<busy_context*>(p);
+            if(c.control->stopped()||std::chrono::steady_clock::now()>=c.end)return 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return c.control->stopped()||std::chrono::steady_clock::now()>=c.end?0:1;
+        },&context)!=SQLITE_OK)throw db_error("checked preparation BEGIN busy control unavailable");
+        int rc;
+        for(;;) {
+            if(read_control_->stopped()||std::chrono::steady_clock::now()>=deadline){rc=SQLITE_BUSY;break;}
+            rc=sqlite3_exec(db_,sql,nullptr,nullptr,nullptr);
+            // Return successful BEGIN unchanged. Its real owning caller must
+            // record active before any later original-end refusal/rollback.
+            if(rc==SQLITE_OK)return;
+            const bool expired=read_control_->stopped()||std::chrono::steady_clock::now()>=deadline;
+            if((rc==SQLITE_BUSY||rc==SQLITE_LOCKED)&&!expired)continue;
+            if(rc==SQLITE_ERROR&&is_in_transaction()&&!expired){
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));continue;
+            }
+            break;
+        }
+        auto error=std::string(sqlite3_errmsg(db_));
+        throw db_error("Failed to begin checked preparation transaction: "+error);
+    }
+
     const int budget_ms = busy_timeout_ms_ > 0 ? busy_timeout_ms_ : kDefaultBusyTimeoutMs;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
     int rc;
@@ -1807,6 +2103,7 @@ void database::begin_transaction(bool exclusive) {
 }
 
 bool database::try_begin_immediate(int /*timeout_ms*/) {
+    require_creator_();
     if(channel_reset_unsettled_.load(std::memory_order_acquire))return false;
     if (closed_.load(std::memory_order_acquire)) return false;
     // Non-blocking: temporarily set busy timeout to 0, try BEGIN IMMEDIATE once,
@@ -1826,6 +2123,7 @@ void database::rollback() {
 }
 
 bool database::is_in_transaction() const {
+    require_creator_();
     // sqlite3_get_autocommit returns 0 if a transaction is active, non-zero otherwise
     return sqlite3_get_autocommit(db_) == 0;
 }
@@ -1856,3 +2154,6 @@ void transaction::rollback() {
 }
 
 } // namespace lattice
+
+// Closed target-only construction; no ordinary constructor body is replaced.
+#include "ordinary_target_staging_database.inc"

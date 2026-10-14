@@ -23,8 +23,10 @@ void validate(const record& value) {
         empty(value.binding.epoch) || !value.binding.main.inode || !value.binding.parent.inode ||
         !value.control.inode || !value.entry.inode || !value.generation.inode ||
         value.entry == value.generation ||
-        (value.state != stage::unadopted && value.state != stage::retirement_requested) ||
-        (value.state == stage::unadopted ? !empty(value.cutover) : empty(value.cutover)))
+        (value.state != stage::unadopted && value.state != stage::retirement_requested && value.state != stage::ordinary_admitted) ||
+        (value.state == stage::ordinary_admitted ?
+            (value.revision < 2 || !empty(value.cutover) || empty(value.normal_launch)) :
+            (!empty(value.normal_launch) || (value.state == stage::unadopted ? !empty(value.cutover) : empty(value.cutover)))))
         fail(error_code::invalid_record, "ordinary admission record invalid");
 }
 void put64(encoded_record& bytes, std::size_t& at, std::uint64_t value) {
@@ -54,6 +56,10 @@ encoded_record encode(const record& value) {
     for (const auto* identity : {&value.binding.main, &value.binding.parent, &value.control, &value.entry, &value.generation}) {
         put64(bytes, at, identity->device); put64(bytes, at, identity->inode);
     }
+    // Only the new admitted state may occupy original reserved bytes176..191.
+    // Original unadopted/retirement records still encode every reserved zero.
+    if (value.state == stage::ordinary_admitted)
+        std::copy(value.normal_launch.begin(), value.normal_launch.end(), bytes.begin() + 176);
     picosha2::hash256(bytes.begin(), bytes.begin() + 224, bytes.begin() + 224, bytes.end());
     return bytes;
 }
@@ -70,6 +76,7 @@ record decode(const encoded_record& bytes) {
     for (auto* identity : {&value.binding.main, &value.binding.parent, &value.control, &value.entry, &value.generation}) {
         identity->device = get64(bytes, at); identity->inode = get64(bytes, at);
     }
+    std::copy_n(bytes.begin() + 176, value.normal_launch.size(), value.normal_launch.begin());
     // Re-encoding also verifies magic/version/size, reserved zeros, enum/ID
     // invariants, and the complete checksum. No permissive version fallback.
     if (encode(value) != bytes) fail(error_code::invalid_record, "ordinary admission bytes invalid");
@@ -130,6 +137,9 @@ struct journal::implementation {
     file_identity control;
     file_identity accepted_entry{}, accepted_generation{};
     bool locks_bound = false;
+    // Native immutable opening provenance, never a caller-ready argument.
+    // Set only after exact externally anchored three-argument reopen succeeds.
+    bool normal_admission_anchored = false;
     explicit implementation(int fd, const store_binding& binding)
         : directory(::fcntl(fd, F_DUPFD_CLOEXEC, 0)), binding(binding) {
         if (directory.fd < 0) fail(error_code::unavailable, "ordinary admission control directory unavailable");
@@ -268,6 +278,7 @@ journal journal::open_existing(int directory_fd, const store_binding& expected,
     anchored.generation = expected_controls.generation;
     state->bind_locks(anchored);
     auto entry = state->entry(); (void)state->load(entry.fd);
+    state->normal_admission_anchored = true;
     return journal(std::move(state));
 }
 record journal::read() const {
@@ -282,6 +293,60 @@ generation_hold journal::try_hold_generation() const {
     impl_->check_named("generation.lock", lease.fd, value.generation);
     lock(lease.fd, LOCK_SH); return generation_hold(lease.release());
 }
+record journal::admit_ordinary(const record& expected, const identifier& launch) {
+    if (!impl_) fail(error_code::unavailable, "ordinary admission moved journal");
+    // entry() checks actual creator PID before any inherited lock/native use.
+    auto entry = impl_->entry();
+    if (!impl_->normal_admission_anchored)
+        fail(error_code::identity_changed, "ordinary normal origin requires independently anchored controls");
+    (void)encode(expected);
+    if (expected.state != stage::unadopted || empty(launch))
+        fail(error_code::invalid_record, "ordinary normal origin expected unadopted record and exact launch");
+    if (expected.revision == std::numeric_limits<std::uint64_t>::max())
+        fail(error_code::revision_exhausted, "ordinary admission revision exhausted");
+    auto desired = expected;
+    ++desired.revision; desired.state = stage::ordinary_admitted; desired.normal_launch = launch;
+    (void)encode(desired);
+    const auto current = impl_->load(entry.fd);
+    // load() re-establishes named-snapshot/directory durability before exact
+    // retry may report success. A real receiver may already retain its hold;
+    // idempotence never takes an exclusive lock against that actual lease.
+    if (current == desired) return current;
+    if (current != expected)
+        fail(error_code::conflicting_normal_launch, "ordinary normal origin record or launch conflicts");
+    auto generation = file(impl_->directory.fd, "generation.lock");
+    impl_->check_named("generation.lock", generation.fd, expected.generation);
+    // Initial publication excludes an actual pre-existing observational hold.
+    // Quiet contention is insufficient authority: only the real private seeded
+    // issuer reached this method after its approved retained exchange.
+    lock(generation.fd, LOCK_EX);
+    impl_->check_named("generation.lock", generation.fd, expected.generation);
+    if (impl_->load(entry.fd) != expected)
+        fail(error_code::conflicting_normal_launch, "ordinary normal origin changed before publication");
+    impl_->save(desired);
+    impl_->check_named("generation.lock", generation.fd, expected.generation);
+    return desired;
+}
+generation_hold journal::hold_ordinary(const record& expected) const {
+    if (!impl_) fail(error_code::unavailable, "ordinary admission moved journal");
+    auto entry = impl_->entry();
+    if (!impl_->normal_admission_anchored)
+        fail(error_code::identity_changed, "ordinary normal hold requires independently anchored controls");
+    (void)encode(expected);
+    if (expected.state != stage::ordinary_admitted)
+        fail(error_code::invalid_record, "ordinary normal hold requires exact admitted record");
+    if (impl_->load(entry.fd) != expected)
+        fail(error_code::conflicting_normal_launch, "ordinary normal hold record or launch changed");
+    auto lease = file(impl_->directory.fd, "generation.lock");
+    impl_->check_named("generation.lock", lease.fd, expected.generation);
+    lock(lease.fd, LOCK_SH);
+    impl_->check_named("generation.lock", lease.fd, expected.generation);
+    // Entry exclusion survives until the acquired lease and exact fresh record
+    // have both been checked. Retirement cannot slip between check and hold.
+    if (impl_->load(entry.fd) != expected)
+        fail(error_code::conflicting_normal_launch, "ordinary normal hold changed during acquisition");
+    return generation_hold(lease.release());
+}
 record journal::begin_retirement(const identifier& cutover) {
     if (!impl_) fail(error_code::unavailable, "ordinary admission moved journal");
     if (empty(cutover)) fail(error_code::invalid_record, "ordinary admission cutover is empty");
@@ -293,6 +358,9 @@ record journal::begin_retirement(const identifier& cutover) {
     if (value.revision == std::numeric_limits<std::uint64_t>::max())
         fail(error_code::revision_exhausted, "ordinary admission revision exhausted");
     ++value.revision; value.state = stage::retirement_requested; value.cutover = cutover;
+    // Retirement always returns to the original state2 encoding. The process
+    // slot/actual existing generation hold remains retained independently.
+    value.normal_launch = {};
     impl_->save(value); return value;
 }
 bool journal::generation_busy() const {
@@ -316,6 +384,8 @@ journal journal::open_existing(int, const store_binding&) { unsupported(); }
 journal journal::open_existing(int, const store_binding&, const control_binding&) { unsupported(); }
 record journal::read() const { unsupported(); }
 generation_hold journal::try_hold_generation() const { unsupported(); }
+record journal::admit_ordinary(const record&, const identifier&) { unsupported(); }
+generation_hold journal::hold_ordinary(const record&) const { unsupported(); }
 record journal::begin_retirement(const identifier&) { unsupported(); }
 bool journal::generation_busy() const { unsupported(); }
 generation_hold::~generation_hold() = default;

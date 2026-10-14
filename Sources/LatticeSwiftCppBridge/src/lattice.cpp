@@ -1,4 +1,12 @@
 #include <lattice.hpp>
+#include <filesystem>
+#include <array>
+#include <atomic>
+#include <mutex>
+#include "../../LatticeCore/src/database_retirement.hpp"
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/stat.h>
+#endif
 #include <list.hpp>
 #include <unmanaged_object.hpp>
 #include <dynamic_object.hpp>
@@ -88,8 +96,13 @@ std::shared_ptr<lattice::swift_lattice> lattice::managed<lattice::swift_dynamic_
     return lattice::swift_lattice_ref::shared_for_lattice(this->lattice_);
 }
 
+// Native cache owner process is bound before any function-local cache
+// initialization guard may be inherited. It conveys no store admission.
+static const pid_t native_lattice_cache_creator_pid=::getpid();
 lattice::detail::LatticeCache& lattice::detail::LatticeCache::instance() {
+   if(native_lattice_cache_creator_pid != ::getpid()) throw std::runtime_error("inherited native LatticeCache belongs to another process");
    static LatticeCache inst;
+   inst.require_creator_process();
    return inst;
 }
 
@@ -167,10 +180,346 @@ void dynamic_object::manage(managed<swift_dynamic_object> o) {
     lattice = o.lattice_shared();
 }
 
+namespace {
+#if defined(__APPLE__) || defined(__linux__)
+// One bounded opening/failure fence, not a second export quota or an issuer.
+// A failed close's actual physical/retirement evidence survives exception-to-
+// string conversion. Only process restart can clear an unproved native opening.
+struct mounted_server_open_fact {
+    const uint64_t creator=static_cast<uint64_t>(::getpid());
+    const physical_store_identity physical;
+    const std::shared_ptr<detail::database_retirement_state> retirement;
+    bool native_attempted=false, published=false, owner_cleanup_unproved=false;
+    mounted_server_open_fact(const physical_store_identity& value,
+        std::shared_ptr<detail::database_retirement_state> close):physical(value),retirement(std::move(close)){}
+};
+struct mounted_server_open_registry {
+    std::mutex leaf;
+    std::array<mounted_server_open_fact*,4> slots{};
+};
+mounted_server_open_registry& mounted_server_open_registry_for_creator() {
+    static std::atomic<uint64_t> creator{0};
+    const auto current=static_cast<uint64_t>(::getpid());uint64_t empty=0;
+    creator.compare_exchange_strong(empty,current,std::memory_order_acq_rel);
+    if(creator.load(std::memory_order_acquire)!=current)
+        throw db_error("mounted server opening registry inherited across fork");
+    // Native PID refusal precedes a potentially inherited initialization guard.
+    // Intentionally retained process storage includes poisoned failure records.
+    static auto* value=new mounted_server_open_registry();return *value;
+}
+class mounted_server_open_attempt {
+    mounted_server_open_registry* registry_=nullptr;
+    mounted_server_open_fact* fact_=nullptr;
+    size_t slot_=0;
+public:
+    mounted_server_open_attempt(const physical_store_identity& physical,
+        const std::shared_ptr<detail::database_retirement_state>& retirement) {
+        auto& registry=mounted_server_open_registry_for_creator();
+        auto fact=std::make_unique<mounted_server_open_fact>(physical,retirement);
+        bool conflict=false;size_t free=registry.slots.size();
+        {std::lock_guard lock(registry.leaf);
+            for(size_t n=0;n<registry.slots.size();++n){const auto* prior=registry.slots[n];
+                if(!prior){if(free==registry.slots.size())free=n;continue;}
+                if(prior->physical.filename==physical.filename||
+                   (prior->physical.device==physical.device&&prior->physical.inode==physical.inode))conflict=true;
+            }
+            if(!conflict&&free<registry.slots.size())registry.slots[free]=fact.get();
+        }
+        if(conflict||free==registry.slots.size())
+            throw db_error("mounted server opening or failed native close retains physical custody");
+        registry_=&registry;slot_=free;fact_=fact.release();
+    }
+    mounted_server_open_attempt(const mounted_server_open_attempt&)=delete;
+    ~mounted_server_open_attempt() noexcept {
+        if(!fact_)return;
+        // Quarantine inherited storage BEFORE its mutex or automatic referents.
+        if(fact_->creator!=static_cast<uint64_t>(::getpid()))return;
+        const bool unproved=fact_->native_attempted&&!fact_->published&&
+            (fact_->owner_cleanup_unproved||fact_->retirement->state()!=detail::database_retirement_state::phase::closed||
+             fact_->retirement->raw_handle_escaped());
+        if(unproved)return; // exact record remains in its original bounded slot
+        auto* released=fact_;
+        {std::lock_guard lock(registry_->leaf);registry_->slots[slot_]=nullptr;}
+        delete released; // all referent destruction off the registry leaf
+    }
+    void will_open_native() noexcept {fact_->native_attempted=true;}
+    void published() noexcept {fact_->published=true;}
+    void observed_owner_cleanup_unproved() noexcept {fact_->owner_cleanup_unproved=true;}
+};
+#endif
+}
+
 // MARK: Swift Lattice
 // Construct with swift_configuration (includes row migration callback)
+swift_lattice::swift_lattice(const swift_configuration& config,const SchemaVector& schemas,
+    detail::recovery_owner_schema catalog,std::shared_ptr<database> writer,lattice_db::checked_managed_existing_key key)
+    :lattice_db(config,std::move(catalog),std::move(writer),key),swift_resources_(config) {
+    // Mirror the genuine READ fast path; no ensure/heal/migration/background work.
+    populate_swift_in_memory_state(schemas);
+}
+
+std::shared_ptr<swift_lattice> swift_lattice::open_managed_ordinary(const swift_configuration& config,
+    const SchemaVector& schemas,const detail::ordinary_context& context,
+    const std::shared_ptr<const detail::ordinary_managed_child_admission>& admission,
+    const detail::ordinary_launch::deadline* dormant_end,bool* dormant_claimed) {
+    detail::ordinary_require_creator(context);
+    if(!context||config.ordinary_context!=context)throw db_error("checked open requires exact receiver context");
+    if(!dormant_end)detail::ordinary_before_open(config.path,context);
+    if(config.is_in_memory()||config.read_only||config.is_sync_enabled()||config.is_ipc_enabled()||
+       config.audit_retention_seconds!=0||config.migration_block||config.row_migration_fn_||
+       !config.migration_schemas_.empty()||config.managed_product_credentials||config.target_schema_version<=0||
+       config.ordinary_policy!=ordinary_sync_policy::legacy_provisional||!config.ordinary_model_profile.empty()||
+       config.busy_timeout_ms<0||config.busy_timeout_ms>30000)
+        throw db_error("checked open requires quiescent existing configuration");
+    detail::ordinary_export_access::validate_checked_open_admission(context,admission,config.path);
+    auto catalog=recovery_catalog(config,schemas);
+    if(!catalog.valid()||catalog.models.empty()||catalog.swift_fingerprint.empty())
+        throw db_error("checked open full native and Swift declarations required");
+#if defined(__APPLE__) || defined(__linux__)
+    if(config.path.empty()||config.path.size()>4096||config.path.find('\0')!=std::string::npos||
+       config.path.starts_with("file:")||!std::filesystem::path(config.path).is_absolute())
+        throw db_error("checked open bounded existing file required");
+    // Actual no-follow main metadata plus the issued context. This is selection
+    // of a retained existing file, never a seeded birth or a new source issuer.
+    const auto requested=std::filesystem::path(config.path);
+    const auto name=requested.filename().string();
+    if(name.empty()||name=="."||name=="..")throw db_error("checked open regular main required");
+    std::error_code error;const auto parent=std::filesystem::canonical(requested.parent_path(),error);
+    if(error)throw db_error("checked open existing parent unavailable");
+    const auto physical_path=parent/name;struct stat physical{};
+    if(::lstat(physical_path.c_str(),&physical)!=0||!S_ISREG(physical.st_mode)||physical.st_nlink!=1)
+        throw db_error("checked open no-follow existing regular main required");
+    auto expected=std::make_shared<physical_store_identity>();
+    expected->device=physical.st_dev;expected->inode=physical.st_ino;expected->filename=physical_path.string();
+    if(dormant_end){
+        if(!dormant_claimed||*dormant_claimed)throw db_error("dormant GROUP opening identity already consumed");
+        detail::ordinary_export_access::claim_managed_group_open(context,admission,config.path,
+            expected->device,expected->inode,catalog,*dormant_end);
+        *dormant_claimed=true; // Nonthrowing first fact immediately after the actual shared CAS.
+    }
+    else context->validate_physical(expected->device,expected->inode);
+    auto retirement=std::make_shared<detail::database_retirement_state>();
+    std::shared_ptr<database> writer;std::shared_ptr<swift_lattice> owner;
+    try {
+        // The unpublished dormant owner has no concurrent public query/sync
+        // route. Keep one original control across open, schema and archive SQL;
+        // do not leave an expired control on a successful later request owner.
+        std::shared_ptr<database_read_control> preparation_control;
+        if(dormant_end){preparation_control=std::make_shared<database_read_control>();preparation_control->deadline=*dormant_end;}
+        writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
+            preparation_control,database::initialization_key(expected,context,retirement),context);
+        if(dormant_end)detail::ordinary_export_access::validate_managed_group_open(context,admission,config.path,
+            expected->device,expected->inode,*dormant_end);
+        else detail::ordinary_before_open(config.path,context);
+        owner=std::shared_ptr<swift_lattice>(new swift_lattice(config,schemas,std::move(catalog),writer,
+            lattice_db::checked_managed_existing_key{}));
+        detail::ordinary_export_access::validate_checked_managed_schema(*owner,
+            detail::ordinary_export_access::checked_reference_phase::before_enrollment,
+            dormant_end?admission:std::shared_ptr<const detail::ordinary_managed_child_admission>{},
+            dormant_end?*dormant_end:detail::ordinary_launch::deadline{});
+        if(dormant_end)detail::ordinary_export_access::validate_managed_group_open(context,admission,config.path,
+            expected->device,expected->inode,*dormant_end);
+        else detail::ordinary_before_open(config.path,context);
+        return owner; // Still unpublished; real enrollment and revalidation follow in cache.
+    }catch(...){
+        const auto primary=std::current_exception();std::exception_ptr cleanup;
+        // All wrapper/target/scheduler destruction is outside SQLite/cache leaves.
+        owner.reset();
+        if(writer){
+            try{writer->close();}catch(...){cleanup=std::current_exception();}
+            writer->retire_connection_();
+        }
+        if(!cleanup&&retirement->state()==detail::database_retirement_state::phase::close_unproved)
+            cleanup=std::make_exception_ptr(db_error("checked existing native close unproved"));
+        // This error retains the actual context and recorded close evidence.
+        // It cannot manufacture a normal/history/source capability.
+        throw detail::ordinary_checked_open_error(primary,cleanup,context,retirement);
+    }
+#else
+    (void)admission;throw db_error("checked existing managed open platform unsupported");
+#endif
+}
+
+swift_lattice::swift_lattice(const swift_configuration& config,const SchemaVector& schemas,
+    detail::recovery_owner_schema catalog,std::shared_ptr<database> writer,lattice_db::checked_mounted_server_existing_key key)
+    :lattice_db(config,std::move(catalog),std::move(writer),key),swift_resources_(config) {
+    populate_swift_in_memory_state(schemas);
+}
+
+
+void swift_lattice::open_managed_group_receiver(const swift_configuration& supplied,const SchemaVector& schemas,
+    const detail::ordinary_context& context,const std::shared_ptr<const detail::ordinary_managed_child_admission>& admission,
+    detail::ordinary_launch::deadline end,std::shared_ptr<swift_lattice>& retained,bool& opening_claimed) {
+    detail::ordinary_require_creator(context);
+    if(retained||opening_claimed||!context||!admission||std::chrono::steady_clock::now()>=end)
+        throw db_error("dormant GROUP requires its fresh original preparation");
+    auto config=supplied;
+    if(config.ordinary_context&&config.ordinary_context!=context)throw db_error("dormant GROUP configuration context differs");
+    config.ordinary_context=context;
+    retained=open_managed_ordinary(config,schemas,context,admission,&end,&opening_claimed);
+    // Real owner retention precedes any hook installation or later preservation
+    // failure. No normal update buffering, observer registration, notifier,
+    // background maintenance or source enrollment is published here.
+    detail::ordinary_export_access::validate_checked_managed_schema(*retained,
+        detail::ordinary_export_access::checked_reference_phase::before_enrollment,admission,end);
+    retained->setup_administrative_transaction_hooks();
+}
+
+void swift_lattice::finish_managed_group_preparation_control(detail::ordinary_launch::deadline end) {
+    require_creator_process();
+    std::shared_ptr<database> writer;
+    {std::lock_guard lock(connection_ownership_mutex_);
+        if(closed_.load()||!db_)throw db_error("dormant GROUP original owner unavailable after archive");
+        writer=db_;}
+    writer->finish_checked_preparation_read_control_(end);
+}
+
+struct swift_managed_group_receiver::state {
+    struct resources {
+        const detail::ordinary_context context;
+        const std::shared_ptr<const detail::ordinary_managed_child_admission> admission;
+        const detail::ordinary_launch::deadline end;
+        const std::thread::id thread=std::this_thread::get_id();
+        std::shared_ptr<swift_lattice> owner;
+        std::shared_ptr<const detail::ordinary_managed_receiver_preservation> archive;
+        std::exception_ptr first_failure;
+        bool opening_claimed=false;
+        bool complete=false;
+        resources(detail::ordinary_context c,std::shared_ptr<const detail::ordinary_managed_child_admission> a,
+            detail::ordinary_launch::deadline e):context(std::move(c)),admission(std::move(a)),end(e){}
+    };
+    detail::process_bound_resource_owner<resources> custody;
+    state(detail::ordinary_context c,std::shared_ptr<const detail::ordinary_managed_child_admission> a,
+        detail::ordinary_launch::deadline e):custody(std::move(c),std::move(a),e){}
+};
+namespace {
+void group_receiver_error(cxx_error& error,std::exception_ptr first) noexcept {
+    // Diagnostics are fallible DATA. The bool and original exception custody
+    // remain authoritative for success/failure even if text cannot allocate.
+    error.name.clear();error.msg.clear();
+    try{if(first)std::rethrow_exception(first);throw db_error("dormant GROUP operation failed");}
+    catch(const std::exception& e){try{error.name=typeid(e).name();error.msg=e.what();}catch(...){error.name.clear();error.msg.clear();}}
+    catch(...){try{error.name="native";error.msg="unknown dormant GROUP failure";}catch(...){error.name.clear();error.msg.clear();}}
+}
+}
+bool swift_lattice_ref::prepare_managed_group_receiver(const swift_configuration& config,const SchemaVector& schemas,
+    const swift_managed_history_startup& startup,const swift_ordinary_open_context& registered,
+    swift_managed_group_receiver& held,cxx_error& error) noexcept {
+    error.name.clear();error.msg.clear();bool registered_holder=false;
+    const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+    try {
+        if(held.value_)throw db_error("dormant GROUP preparation cannot be replaced or retried");
+        if(!startup.opens_||!startup.admission_||!registered.context_||registered.admission_!=startup.admission_)
+            throw db_error("dormant GROUP requires its actual startup and registered context");
+        detail::ordinary_require_creator(registered.context_);
+        detail::ordinary_export_access::validate_checked_open_admission(registered.context_,startup.admission_,config.path);
+        auto& cache=detail::LatticeCache::instance();
+        const auto slot=cache.reserve_group_receiver_preparation();
+        held.value_=std::make_shared<swift_managed_group_receiver::state>(registered.context_,startup.admission_,end);
+        cache.retain_group_receiver_preparation(slot,held.value_);registered_holder=true;
+        auto& original=held.value_->custody.get();
+        swift_lattice::open_managed_group_receiver(config,schemas,original.context,original.admission,original.end,original.owner,original.opening_claimed);
+        original.archive=detail::ordinary_export_access::preserve_managed_receiver(original.owner,original.admission,original.end);
+        original.owner->finish_managed_group_preparation_control(original.end);
+        if(std::chrono::steady_clock::now()>=original.end)throw db_error("dormant GROUP original publication deadline expired");
+        original.complete=true;return true;
+    }catch(...){
+        const auto first=std::current_exception();
+        if(registered_holder&&held.value_->custody.in_creator_process()){
+            auto& original=held.value_->custody.get();if(!original.first_failure)original.first_failure=first;
+            // This original cannot mint another archive/source if metadata later
+            // disappears. Hold the real native open/transaction/cleanup error.
+            if(original.opening_claimed)detail::ordinary_export_access::remember_managed_open_failure(
+                original.admission,config.path,original.first_failure);
+        }
+        group_receiver_error(error,first);return false;
+    }
+}
+bool swift_managed_group_receiver::preservation(swift_owned_receiver_preservation& held,cxx_error& error) const noexcept {
+    error.name.clear();error.msg.clear();
+    try{
+        if(!value_||!value_->custody.in_creator_process())throw db_error("dormant GROUP creator custody unavailable");
+        const auto& original=value_->custody.get();
+        if(original.thread!=std::this_thread::get_id()||original.first_failure||!original.complete||!original.archive||
+           !original.owner||original.owner->is_closed()||std::chrono::steady_clock::now()>=original.end)
+            throw db_error("dormant GROUP original preservation unavailable");
+        // The existing native archive validator still owns current/directory
+        // admission. This is a SAME strong capability copy, never a DATA factory.
+        held=swift_owned_receiver_preservation(original.archive);return true;
+    }catch(...){group_receiver_error(error,std::current_exception());return false;}
+}
+
+std::shared_ptr<swift_lattice> swift_lattice::open_checked_mounted_server(
+    const swift_configuration& config,const SchemaVector& schemas) {
+#if defined(__APPLE__) || defined(__linux__)
+    (void)mounted_server_open_registry_for_creator();
+    // This is a distinct no-context owner, never a receiver/admin fallback.
+    if(config.ordinary_context||config.managed_product_credentials||config.is_in_memory()||config.read_only||
+       config.is_sync_enabled()||config.is_ipc_enabled()||config.audit_retention_seconds!=0||
+       config.migration_block||config.row_migration_fn_||!config.migration_schemas_.empty()||
+       config.ordinary_policy!=ordinary_sync_policy::legacy_provisional||!config.ordinary_model_profile.empty()||
+       !config.recovery_source_expectation.empty()||config.target_schema_version<=0||
+       config.busy_timeout_ms<0||config.busy_timeout_ms>30000)
+        throw db_error("checked mounted server quiescent existing configuration required");
+    if(config.path.empty()||config.path.size()>4096||config.path.find('\0')!=std::string::npos||
+       config.path.starts_with("file:")||!std::filesystem::path(config.path).is_absolute())
+        throw db_error("checked mounted server bounded existing file required");
+    const auto requested=std::filesystem::path(config.path);const auto name=requested.filename().string();
+    if(name.empty()||name=="."||name=="..")throw db_error("checked mounted server regular main required");
+    std::error_code error;const auto parent=std::filesystem::canonical(requested.parent_path(),error);
+    if(error)throw db_error("checked mounted server existing parent unavailable");
+    const auto physical_path=parent/name;struct stat physical{};
+    if(::lstat(physical_path.c_str(),&physical)!=0||!S_ISREG(physical.st_mode)||physical.st_nlink!=1)
+        throw db_error("checked mounted server no-follow existing regular main required");
+    auto expected=std::make_shared<physical_store_identity>();
+    expected->device=physical.st_dev;expected->inode=physical.st_ino;expected->filename=physical_path.string();
+    auto retirement=std::make_shared<detail::database_retirement_state>();
+    mounted_server_open_attempt attempt(*expected,retirement);
+    auto catalog=recovery_catalog(config,schemas);
+    if(!catalog.valid()||catalog.models.empty()||catalog.swift_models.empty()||catalog.swift_fingerprint.empty())
+        throw db_error("checked mounted server full native and Swift declarations required");
+    // Catalog identity validates every real descriptor/constraint before opening.
+    (void)managed_catalog_identity(catalog);
+    std::shared_ptr<database> writer;std::shared_ptr<swift_lattice> owner;
+    try {
+        attempt.will_open_native();
+        writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
+            std::shared_ptr<database_read_control>{},database::initialization_key(expected,retirement,
+                database::initialization_key::mounted_server_key{}),detail::ordinary_context{});
+        owner=std::shared_ptr<swift_lattice>(new swift_lattice(config,schemas,std::move(catalog),writer,
+            lattice_db::checked_mounted_server_existing_key{}));
+        detail::ordinary_export_access::validate_checked_mounted_server_schema(*owner,*expected);
+        owner->publish_checked_existing_facilities();
+        detail::ordinary_export_access::validate_checked_mounted_server_schema(*owner,*expected);
+        // Pointer resolution only; no reuse of a generic cached/bootstrap owner.
+        detail::LatticeCache::instance().register_pointer(owner);
+        attempt.published();
+        return owner; // shared_ptr move is nonthrowing; FRT shell already allocated
+    }catch(...){
+        const auto primary=std::current_exception();std::exception_ptr cleanup;
+        if(owner){
+            const auto closed=owner->close_checked();
+            cleanup=closed.cleanup_error?closed.cleanup_error:closed.error;
+            if(!closed.cleanup_complete||closed.cleanup_error)attempt.observed_owner_cleanup_unproved();
+        }
+        owner.reset();
+        if(writer){
+            try{writer->close();}catch(...){if(!cleanup)cleanup=std::current_exception();}
+            writer->retire_connection_();
+        }
+        if(!cleanup&&retirement->state()!=detail::database_retirement_state::phase::closed)
+            cleanup=std::make_exception_ptr(db_error("checked mounted server native close unproved"));
+        // Failure fence disposition occurs AFTER all actual native retire attempts.
+        // A poisoned physical record survives this error's sealed string boundary.
+        throw detail::ordinary_checked_open_error(primary,cleanup,{},retirement);
+    }
+#else
+    (void)config;(void)schemas;throw db_error("checked mounted server open platform unsupported");
+#endif
+}
+
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
-    : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_config_(config) {
+    : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_resources_(config) {
     LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
     if (!config.read_only) {
         LOG_DEBUG("swift_lattice", "ensure_swift_tables");
@@ -190,7 +539,7 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
 }
 
 swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& schemas)
-    : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_config_(std::move(config)) {
+    : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_resources_(std::move(config)) {
     if (!swift_config_.read_only) {
         ensure_swift_tables(schemas);
         lattice_db::setup_sync_if_configured();
@@ -208,7 +557,7 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
 // occur in the common retained-owner factory after this constructor returns.
 swift_lattice::swift_lattice(const swift_configuration& config,const SchemaVector& schemas,
     const std::shared_ptr<detail::recovery_continuous_admission>& admission)
-    :lattice_db(config,true,recovery_catalog(config,schemas),admission),swift_config_(config) {
+    :lattice_db(config,true,recovery_catalog(config,schemas),admission),swift_resources_(config) {
     ensure_swift_tables(schemas,false);
 }
 
@@ -579,20 +928,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish
         constraints_[entry.table_name] = entry.constraints;
 
         // Convert SwiftSchema to model_schema for table operations
-        model_schema schema;
-        schema.table_name = entry.table_name;
-        for (const auto& [name, desc] : entry.properties) {
-            if (desc.kind == property_kind::union_type) {
-                // Union FK column: TEXT storing the union row's globalId
-                auto col_desc = desc;
-                col_desc.type = column_type::text;
-                col_desc.nullable = true;
-                schema.properties.push_back(col_desc);
-            } else if (desc.kind == property_kind::primitive ||
-                       (desc.kind == property_kind::list && desc.is_geo_bounds)) {
-                schema.properties.push_back(desc);
-            }
-        }
+        model_schema schema=detail::ordinary_schema_recipe::swift_physical_model(entry.table_name,entry.properties);
         all_schemas.push_back(std::move(schema));
 
         if (!db().table_exists(entry.table_name)) {
@@ -1054,8 +1390,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish
                     auto cols_map = db().get_table_info(entry.table_name);
                     const bool shadow_added = cols_map.find(shadow_col) == cols_map.end();
                     if (shadow_added) {
-                        db().execute("ALTER TABLE " + entry.table_name +
-                                     " ADD COLUMN " + shadow_col + " TEXT");
+                        db().execute(detail::ordinary_schema_recipe::shadow_column(entry.table_name,shadow_col));
                     }
 
                     // 2) Shadow-maintenance triggers on the link table.
@@ -1065,28 +1400,13 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish
                     //    what syncs; peers recompute their own shadow).
                     const std::string ins_trig =
                         "LinkShadow_" + link_table + "_Insert_" + shadow_col;
-                    db().execute(
-                        "CREATE TRIGGER IF NOT EXISTS " + ins_trig +
-                        " AFTER INSERT ON " + link_table +
-                        " BEGIN"
-                        "   UPDATE " + entry.table_name +
-                        "   SET " + shadow_col + " = NEW.rhs"
-                        "   WHERE globalId = NEW.lhs;"
-                        " END");
+                    db().execute(detail::ordinary_schema_recipe::shadow_insert(entry.table_name,link_table,shadow_col,ins_trig));
 
                     const std::string del_trig =
                         "LinkShadow_" + link_table + "_Delete_" + shadow_col;
                     // Guard with `shadow = OLD.rhs` so a stale delete doesn't
                     // clobber a freshly re-assigned link.
-                    db().execute(
-                        "CREATE TRIGGER IF NOT EXISTS " + del_trig +
-                        " AFTER DELETE ON " + link_table +
-                        " BEGIN"
-                        "   UPDATE " + entry.table_name +
-                        "   SET " + shadow_col + " = NULL"
-                        "   WHERE globalId = OLD.lhs"
-                        "     AND " + shadow_col + " = OLD.rhs;"
-                        " END");
+                    db().execute(detail::ordinary_schema_recipe::shadow_delete(entry.table_name,link_table,shadow_col,del_trig));
 
                     // 3) Backfill from the current link-table state so rows
                     //    inserted before the constraint was added participate
@@ -1095,12 +1415,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish
                     //    have been maintaining it, and this UPDATE scans the
                     //    whole parent table.
                     if (shadow_added) {
-                        db().execute(
-                            "UPDATE " + entry.table_name +
-                            " SET " + shadow_col + " ="
-                            " (SELECT rhs FROM " + link_table +
-                            " WHERE lhs = " + entry.table_name + ".globalId LIMIT 1)"
-                            " WHERE " + shadow_col + " IS NULL");
+                        db().execute(detail::ordinary_schema_recipe::shadow_backfill(entry.table_name,link_table,shadow_col));
                     }
 
                     resolved_cols.push_back(shadow_col);
@@ -1109,21 +1424,10 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish
                 }
             }
 
-            std::ostringstream idx_name;
-            idx_name << "unique_" << entry.table_name << "_" << i;
-
-            std::ostringstream cols_ss;
-            for (size_t j = 0; j < resolved_cols.size(); ++j) {
-                if (j > 0) cols_ss << ", ";
-                cols_ss << resolved_cols[j];
-            }
-            std::string col_list = cols_ss.str();
-
-            std::ostringstream sql;
-            sql << "CREATE UNIQUE INDEX IF NOT EXISTS " << idx_name.str()
-                << " ON " << entry.table_name << "(" << col_list << ")";
+            std::string col_list=detail::ordinary_schema_recipe::column_list(resolved_cols);
+            const auto sql=detail::ordinary_schema_recipe::unique_index(entry.table_name,i,col_list);
             try {
-                db().execute(sql.str());
+                db().execute(sql);
             } catch (...) {
                 // Duplicate data exists — deduplicate (keep newest row per group).
                 LOG_WARN("swift_lattice", "Deduplicating %s for unique constraint on (%s)",
@@ -1132,7 +1436,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish
                     "DELETE FROM " + entry.table_name + " WHERE id NOT IN ("
                     "SELECT MAX(id) FROM " + entry.table_name + " GROUP BY " + col_list + ")");
                 // Retry index creation
-                db().execute(sql.str());
+                db().execute(sql);
             }
         }
     }
@@ -1141,10 +1445,7 @@ void swift_lattice::ensure_swift_tables(const SchemaVector &schemas,bool publish
     for (const auto& schema : all_schemas) {
         for (const auto& prop : schema.properties) {
             if (!prop.is_indexed) continue;
-            std::ostringstream sql;
-            sql << "CREATE INDEX IF NOT EXISTS idx_" << schema.table_name << "_" << prop.name
-                << " ON " << schema.table_name << "(" << prop.name << ")";
-            db().execute(sql.str());
+            db().execute(detail::ordinary_schema_recipe::nonunique_index(schema,prop));
         }
     }
 
@@ -1365,6 +1666,35 @@ property_descriptor descriptor_from_json(const std::string& name, const nlohmann
 
 } // anonymous namespace
 
+namespace {
+nlohmann::json ordinary_swift_schema_snapshot(int32_t version,const SchemaVector& schemas) {
+    nlohmann::json root;
+    root["format"] = 1;
+    root["version"] = version;
+    nlohmann::json tables = nlohmann::json::array();
+    for (const auto& entry : schemas) {
+        nlohmann::json t;
+        t["name"] = entry.table_name;
+        nlohmann::json props = nlohmann::json::object();
+        for (const auto& [name, desc] : entry.properties) {
+            props[name] = descriptor_to_json(desc);
+        }
+        t["properties"] = std::move(props);
+        nlohmann::json constraints = nlohmann::json::array();
+        for (const auto& c : entry.constraints) {
+            nlohmann::json cj;
+            cj["columns"] = c.columns;
+            cj["allows_upsert"] = c.allows_upsert;
+            constraints.push_back(std::move(cj));
+        }
+        t["constraints"] = std::move(constraints);
+        tables.push_back(std::move(t));
+    }
+    root["tables"] = std::move(tables);
+    return root;
+}
+}
+
 detail::recovery_owner_schema swift_lattice::recovery_catalog(const swift_configuration& config,const SchemaVector& schemas) {
     auto result=detail::recovery_owner_schema::capture_native();
     if(!result.valid()||schemas.size()>detail::recovery_owner_schema::max_models-result.models.size()) {
@@ -1386,9 +1716,17 @@ detail::recovery_owner_schema swift_lattice::recovery_catalog(const swift_config
             if(!result.admit_count(constraint.columns.size(),64,16))return result;
             for(const auto& name:constraint.columns)if(!result.admit_field(name))return result;
         }
+        if(!result.admit_count(1,detail::recovery_owner_schema::max_models,sizeof(std::string))||
+           !result.admit_field(entry.table_name)) {result.refuse();return result;}
+        result.swift_order.push_back(entry.table_name); // Retain actual original order before later generation.
         model_schema model;model.table_name=entry.table_name;model.properties.reserve(entry.properties.size());
         for(const auto& [name,p]:entry.properties)model.properties.push_back(p);
         result.models.emplace(entry.table_name,std::move(model));result.swift_models.insert(entry.table_name);
+        // Complete bounded preflight above precedes every constraint copy,
+        // including an explicit empty vector for each declared Swift table.
+        auto& constraints=result.swift_constraints[entry.table_name];constraints.reserve(entry.constraints.size());
+        for(const auto& constraint:entry.constraints)
+            constraints.push_back({std::vector<std::string>(constraint.columns.begin(),constraint.columns.end()),constraint.allows_upsert});
     }
     // Stable complete declaration digest includes constraints, unsupported
     // property flags, relationships and the target version. A schema cookie or
@@ -1408,37 +1746,18 @@ detail::recovery_owner_schema swift_lattice::recovery_catalog(const swift_config
     root["tables"]=std::move(tables);
     result.swift_digest=picosha2::hash256_hex_string(root.dump());
     result.swift_fingerprint=compute_swift_fingerprint_key_for(config.target_schema_version,schemas);
+    auto snapshot=ordinary_swift_schema_snapshot(config.target_schema_version,schemas).dump();
+    if(!result.admit_count(snapshot.size(),detail::recovery_owner_schema::max_bytes,1)) {result.refuse();return result;}
+    result.swift_snapshot=std::move(snapshot); // Actual normal producer bytes, no current/SQL grant.
     return result;
 }
 
 void swift_lattice::store_swift_schema_snapshot(const SchemaVector& schemas) {
-    nlohmann::json root;
-    root["format"] = 1;
-    root["version"] = swift_config_.target_schema_version;
-    nlohmann::json tables = nlohmann::json::array();
-    for (const auto& entry : schemas) {
-        nlohmann::json t;
-        t["name"] = entry.table_name;
-        nlohmann::json props = nlohmann::json::object();
-        for (const auto& [name, desc] : entry.properties) {
-            props[name] = descriptor_to_json(desc);
-        }
-        t["properties"] = std::move(props);
-        nlohmann::json constraints = nlohmann::json::array();
-        for (const auto& c : entry.constraints) {
-            nlohmann::json cj;
-            cj["columns"] = c.columns;
-            cj["allows_upsert"] = c.allows_upsert;
-            constraints.push_back(std::move(cj));
-        }
-        t["constraints"] = std::move(constraints);
-        tables.push_back(std::move(t));
-    }
-    root["tables"] = std::move(tables);
+    const auto snapshot=ordinary_swift_schema_snapshot(swift_config_.target_schema_version,schemas);
     try {
         db().execute(
             "INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES('lattice_swift_schema', ?)",
-            { root.dump() });
+            { snapshot.dump() });
     } catch (const std::exception& e) {
         LOG_WARN("swift_lattice", "store_swift_schema_snapshot failed: %s", e.what());
     }

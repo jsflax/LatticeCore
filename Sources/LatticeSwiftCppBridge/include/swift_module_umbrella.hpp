@@ -29,6 +29,7 @@
 #include <lattice.hpp>
 #include <list.hpp>
 #include <managed_object.hpp>
+#include <ordinary_sync_export.hpp>
 #include <projection.hpp>
 #include <recovery_continuity.hpp>
 #include <recovery_export.hpp>

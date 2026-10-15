@@ -208,6 +208,14 @@ struct checkpoint_outcome {
     int64_t checkpointed = -1;   // frames folded back (< log_frames = partial)
 };
 
+/// One checked maintenance observation, never an admission or cleanup grant.
+/// The conservative default cannot turn a refused Swift call into success.
+struct read_pool_maintenance_result {
+    bool completed = false;
+    bool pressure_pending = true;
+    std::string error;
+};
+
 /// One audit row's HEADER — the columns that precede `changedFields` in the
 /// row, so reading them never walks the payload's overflow chain. What
 /// `Lattice.changeHeaders` yields per delivered change.
@@ -2004,6 +2012,24 @@ public:
         }
     }
 
+private:
+    /// Checked public maintenance path. Keep the legacy timer's void/catch
+    /// behavior unchanged; this distinct path lets its real error reach the
+    /// outer Swift boundary. No pressure flag or epoch is reset here.
+    read_pool_maintenance_result run_read_pool_maintenance_checked() {
+        require_creator_process();
+        detail::ordinary_require_creator(config().ordinary_context);
+        if (is_closed()) throw db_error("read-pool maintenance requires its live original owner");
+        lattice_db::run_read_pool_maintenance();
+        const bool pending = lattice_db::wal_eviction_pending();
+        if (is_closed()) throw db_error("read-pool maintenance owner closed during its tick");
+        read_pool_maintenance_result result;
+        result.completed = true;
+        result.pressure_pending = pending;
+        return result;
+    }
+
+public:
     // ---- Pool tunables (§1.7 ResultsTuning; forwarded per-Lattice from
     //      Swift in Commit 5). Plain atomic stores — nothrow by
     //      construction. ----
@@ -4956,6 +4982,25 @@ public:
     size_t read_generations_outstanding() const { return sealed([&] { return impl().read_generations_outstanding(); }); }
     size_t local_read_generations_outstanding() const { return sealed([&] { return impl().local_read_generations_outstanding(); }); }
     void run_read_pool_maintenance() const { sealed([&] { impl().run_read_pool_maintenance(); }); }
+
+    read_pool_maintenance_result run_read_pool_maintenance_checked() const
+        SWIFT_NAME(runReadPoolMaintenanceChecked()) {
+        auto result = sealed([&] {
+            // Keep exactly this creator owner alive through the complete tick
+            // and its same-owner pending observation, even if a public alias
+            // is dropped. The ordinary callback guard latches any reentry.
+            auto retained = impl_;
+            if (!retained) throw db_error("read-pool maintenance original owner unavailable");
+            retained->require_catalog_callback_absent();
+            return retained->run_read_pool_maintenance_checked();
+        });
+        if (!last_bridge_error().empty()) {
+            result.completed = false;
+            result.pressure_pending = true;
+            try { result.error = last_bridge_error(); } catch (...) {}
+        }
+        return result;
+    }
 
     void set_read_generation_ttl_ms(int64_t ms) const { sealed([&] { impl().set_read_generation_ttl_ms(ms); }); }
     void set_read_generation_max_age_ms(int64_t ms) const { sealed([&] { impl().set_read_generation_max_age_ms(ms); }); }

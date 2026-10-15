@@ -64,6 +64,7 @@ namespace lattice {
 // Owned, sealed close outcome; no member borrows the retired implementation.
 class swift_close_result {
     friend class swift_lattice_ref;
+    friend class swift_managed_wss_owner;
     int32_t sync_=0;
     bool cleanup_complete_=false,failed_=false,cleanup_failed_=false,message_unavailable_=false;
     std::string message_;
@@ -84,6 +85,13 @@ public:
     bool message_unavailable()const noexcept SWIFT_NAME(messageUnavailable()){return message_unavailable_;}
     std::string take_message()noexcept SWIFT_NAME(takeMessage()){return std::move(message_);}
 };
+
+inline swift_close_result swift_managed_wss_owner::close()const noexcept{
+#ifndef __EMSCRIPTEN__
+    if(value_)return swift_close_result(value_->close(std::chrono::steady_clock::now()+std::chrono::seconds(2)));
+#endif
+    return {};
+}
 
 // ============================================================================
 // swift_dynamic_object - A type-erased model for Swift interop

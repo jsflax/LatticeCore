@@ -673,6 +673,13 @@ struct configuration {
     };
     std::vector<ipc_target> ipc_targets;
 
+    /// Explicit requested WAL-file extent admission, in bytes. Unset preserves
+    /// legacy opens; no quota is guessed from journal_size_limit. This first
+    /// route supports a canonical native MAIN path, with no ATTACH/URI/VFS
+    /// override. All writers must enroll the same policy before a store-wide
+    /// bound is claimed. MAIN, SHM and physical allocation are not included.
+    std::optional<sqlite3_int64> wal_extent_limit_bytes;
+
     /// Returns true if WSS sync is configured (websocket_url is not empty)
     bool is_sync_enabled() const {
         return !websocket_url.empty() && !authorization_token.empty();
@@ -701,6 +708,17 @@ struct configuration {
     /// Returns true if this is an in-memory database (either :memory: or shared cache URI)
     bool is_in_memory() const { return path_is_memory(path); }
 };
+
+namespace detail {
+inline configuration ordinary_wal_configuration(configuration config) {
+    // The owner must retain the actual policy its writer receives, even when
+    // a native caller bypasses the Swift cache. Memory/readonly gain no route.
+    if(!config.read_only&&!config.is_in_memory())
+        config.wal_extent_limit_bytes=ordinary_select_wal_extent_limit(config.path,
+            config.ordinary_context,config.wal_extent_limit_bytes);
+    return config;
+}
+}
 
 // Backwards compatibility alias
 using db_config = configuration;
@@ -4893,43 +4911,38 @@ public:
     void begin_transaction() {
         acquire_store_write_gate();
         try {
-            db_->begin_transaction();
+            db_->begin_transaction_owned_(txn_owner_thread_);
         } catch (...) {
             release_store_write_gate();
             throw;
         }
-        // Record the owning thread: read_db()'s in-transaction routing must
-        // apply ONLY to this thread — other threads' reads keep reader
-        // isolation and never observe the open transaction.
-        txn_owner_thread_.store(std::this_thread::get_id(), std::memory_order_release);
+        // The successful physical BEGIN published this existing stamp before
+        // releasing its SQLite mutex. Other threads can defer without ever
+        // borrowing this transaction or seeing an unpublished Core WRITE.
     }
     void commit() {
         try {
-            db_->commit();
+            db_->end_transaction_owned_(false, txn_owner_thread_);
         } catch (...) {
             // COMMIT can fail with the transaction still open (BUSY) — keep
             // the gate; the caller retries or rolls back. If the txn is
             // already gone (auto-rollback), release now.
             if (!db_->is_in_transaction()) {
-                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
                 release_store_write_gate();
             }
             throw;
         }
-        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
         release_store_write_gate();
     }
     void rollback() {
         try {
-            db_->rollback();
+            db_->end_transaction_owned_(true, txn_owner_thread_);
         } catch (...) {
             if (!db_->is_in_transaction()) {
-                txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
                 release_store_write_gate();
             }
             throw;
         }
-        txn_owner_thread_.store(std::thread::id{}, std::memory_order_release);
         release_store_write_gate();
     }
 
@@ -8140,14 +8153,14 @@ private:
 };
 inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
     std::shared_ptr<database> writer,checked_managed_existing_key)
-    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(config),db_(std::move(writer)),
+    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(detail::ordinary_wal_configuration(config)),db_(std::move(writer)),
      scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
 inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
     std::shared_ptr<database> writer,checked_mounted_server_existing_key)
-    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(config),db_(std::move(writer)),
+    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(detail::ordinary_wal_configuration(config)),db_(std::move(writer)),
      scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
 inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,std::shared_ptr<database> writer)
-    : recovery_schemas_(std::move(catalog)), administrative_owner_(true), config_(config), db_(std::move(writer)) {}
+    : recovery_schemas_(std::move(catalog)), administrative_owner_(true), config_(detail::ordinary_wal_configuration(config)), db_(std::move(writer)) {}
 inline lattice_db::owned_resources::owned_resources(const std::string& path)
         : config_(path)
         , db_(std::make_shared<database>(path, database::open_mode::read_write))
@@ -8161,11 +8174,11 @@ inline lattice_db::owned_resources::owned_resources()
 inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema recovery_schemas,std::shared_ptr<detail::recovery_continuous_admission> continuous,std::shared_ptr<detail::database_open_ledger> connection_ledger)
         : recovery_continuous_(std::move(continuous))
         , recovery_schemas_(std::move(recovery_schemas))
-        , config_(config)
+        , config_(detail::ordinary_wal_configuration(config))
         , connection_ledger_(std::move(connection_ledger))
-        , db_(recovery_continuous_ ? detail::open_continuous_writer(config,recovery_continuous_) : database::make_owned_connection(resolve_path(config),
-              config.read_only ? database::open_mode::read_only : database::open_mode::read_write,
-              config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_))
+        , db_(recovery_continuous_ ? detail::open_continuous_writer(config_,recovery_continuous_) : database::make_owned_connection(resolve_path(config_),
+              config_.read_only ? database::open_mode::read_only : database::open_mode::read_write,
+              config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_,false,config_.wal_extent_limit_bytes))
         , read_db_(config.read_only ? nullptr :
                    (!config.is_in_memory() && !config.is_sync_enabled() ? database::make_owned_connection(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_) : nullptr))
         , xproc_read_db_(!config.is_in_memory() && !config.read_only ?

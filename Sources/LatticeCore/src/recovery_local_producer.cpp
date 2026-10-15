@@ -816,8 +816,9 @@ std::optional<bool> recovery_local_producer_adapter::export_protection_impl(std:
     if(automatic&&!owned_write) {
         // A busy SELECT without a main read transaction still needs provenance;
         // so does same-thread query/callback reentry even when main is idle.
-        if(database::maintenance_scope::controller_classify_locked(*writer)==
-                database::maintenance_scope::admission::engine_read_busy) {
+        const auto admission=database::maintenance_scope::controller_classify_locked(*writer, &owner->txn_owner_thread_);
+        if(admission==database::maintenance_scope::admission::engine_read_busy ||
+           admission==database::maintenance_scope::admission::core_write_busy) {
             validate_deferred_owner();return std::nullopt;
         }
     }else if(!idle&&!owned_write)

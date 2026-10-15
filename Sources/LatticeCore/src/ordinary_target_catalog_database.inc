@@ -5,6 +5,7 @@
 namespace lattice {
 struct database::target_staging_state::catalog_native {
     using program=detail::ordinary_group_target_schema_original::catalog_program;
+    terminal_native_static_tail terminal_static; // FIRST: real member tail follows payload/scope destruction.
     database* const shell;
     const std::weak_ptr<detail::ordinary_group_target_schema_original> original;
     const std::shared_ptr<program> generated;
@@ -35,11 +36,12 @@ struct database::target_staging_state::catalog_native {
     std::exception_ptr first_failure;
     catalog_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_schema_original>& source,
         std::shared_ptr<program> input)
-        :shell(&actual),original(source),generated(std::move(input)),commit_index(generated->operations.size()+1),
+        :terminal_static(actual,this,source.get(),0),shell(&actual),original(source),generated(std::move(input)),commit_index(generated->operations.size()+1),
          rollback_index(commit_index+1),probe_index(commit_index+2),udf_first_index(commit_index+3) {
         if(generated->operations.empty()||generated->operations.size()>program::maximum_operations||
            udf_first_index+maximum_udf_queries>maximum_statements)
             throw db_error("target catalog fixed native capacity unavailable");
+        terminal_static.constructor_returned();
     }
     void require(database& actual,bool unwind=false)const {
         const auto state=actual.target_staging_;
@@ -216,7 +218,7 @@ void database::target_staging_state::invoke_catalog_control(sync_control_userdat
 bool database::target_catalog_native_ending_()const noexcept {
     try {
         const auto state=target_staging_;const auto actual=state?state->catalog:nullptr;
-        if(!state||!state->current_creator()||!actual||actual->shell!=this||!actual->scope||actual->ending||
+        if(!state||!state->current_creator()||state->terminal_native_statics_attempted||!actual||actual->shell!=this||!actual->scope||actual->ending||
            actual->first_failure||!actual->module_entered||!actual->module_returned||actual->first_module_rc!=SQLITE_OK||
            !actual->cookie_observed||actual->first_cookie<0||actual->cookie_text.empty()||
            actual->completed_operations!=actual->generated->operations.size()||!actual->udf_queries)

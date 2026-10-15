@@ -52,6 +52,24 @@ struct database::target_staging_state {
     bool terminal_scope_ending_attempted=false,terminal_scope_ending_returned=false;
     detail::ordinary_target_staging_connection::terminal_scope_retirement_result terminal_scope_result=
         detail::ordinary_target_staging_connection::terminal_scope_retirement_result::retained_debt;
+    struct terminal_native_static_record;
+    struct terminal_native_static_tail;
+    struct terminal_native_static_ending;
+    bool terminal_native_statics_attempted=false,terminal_native_statics_allocation_returned=false,terminal_native_statics_allocation_exception_returned=false;
+    std::exception_ptr terminal_native_statics_first_failure;
+    std::shared_ptr<terminal_native_static_ending> terminal_native_statics_original;
+    struct terminal_native_page_record;
+    struct terminal_native_page_tail;
+    struct terminal_native_page_ending;
+    bool terminal_native_pages_attempted=false,terminal_native_pages_allocation_returned=false,terminal_native_pages_allocation_exception_returned=false;
+    std::exception_ptr terminal_native_pages_first_failure;
+    std::shared_ptr<terminal_native_page_ending> terminal_native_pages_original;
+    struct terminal_native_outer_record;
+    struct terminal_native_outer_tail;
+    struct terminal_native_outer_ending;
+    bool terminal_native_outer_attempted=false,terminal_native_outer_allocation_returned=false,terminal_native_outer_allocation_exception_returned=false;
+    std::exception_ptr terminal_native_outer_first_failure;
+    std::shared_ptr<terminal_native_outer_ending> terminal_native_outer_original;
     struct terminal_native_phase_record;
     struct terminal_native_phase_tail;
     struct terminal_native_phase_ending;
@@ -642,15 +660,18 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
 }
 } // namespace lattice
 
+#include "ordinary_target_terminal_static_tail_database.inc"
 #include "ordinary_target_catalog_database.inc"
 
 #include "ordinary_target_history_header_database.inc"
 
+#include "ordinary_target_terminal_page_tail_database.inc"
 #include "ordinary_target_history_page_database.inc"
 
 #include "ordinary_target_history_projection_database.inc"
 
 #include "ordinary_target_terminal_phase_tail_database.inc"
+#include "ordinary_target_terminal_outer_tail_database.inc"
 #include "ordinary_target_history_chain_database.inc"
 #include "ordinary_target_import_suspension_database.inc"
 #include "ordinary_target_history_row_import_database.inc"
@@ -658,3 +679,9 @@ void database::bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary
 #include "ordinary_target_abandonment_database.inc"
 #include "ordinary_target_terminal_decoder_database.inc"
 #include "ordinary_target_terminal_phase_database.inc"
+#include "ordinary_target_terminal_outer_database.inc"
+#include "ordinary_target_terminal_page_database.inc"
+#include "ordinary_target_terminal_static_database.inc"
+#include "ordinary_target_terminal_programme_database.inc"
+
+#include "ordinary_target_terminal_scope_roots_database.inc"

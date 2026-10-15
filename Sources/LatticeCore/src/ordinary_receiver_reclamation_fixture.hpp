@@ -7,6 +7,12 @@
 #error "This receiving-owner qualification requires the genuine macOS installed image harness"
 #endif
 #include "ordinary_target_staging_connection.hpp"
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+#include "ordinary_target_lifetime_observation.hpp"
+#endif
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_PAIR_FAILURE) && !defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+#error "Injected page-pair failure requires its separate positive-history fixture process"
+#endif
 #include <cstdint>
 #include <memory>
 namespace lattice::detail {
@@ -28,6 +34,13 @@ class ordinary_receiver_reclamation_fixture final {
     static disposition observe_disposition(ordinary_group_target_receiving_owner&,disposition)noexcept;
     static void observe_ordinary_fallback(ordinary_group_target_receiving_owner&)noexcept;
 public:
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+    // Read-only worker publication and same-owner close only. The selector
+    // requests one explicit negative test throw; it never sets an ending fact.
+    static void observe_history_worker(ordinary_group_target_receiving_owner&)noexcept;
+    static bool history_page2_failure_requested(const ordinary_group_target_receiving_owner&)noexcept;
+    static std::size_t close_history_json(void*,std::size_t)noexcept;
+#endif
     enum bit : std::uint64_t {
         captured=1ull<<0,checkpoint_reached=1ull<<1,disposition_joined=1ull<<2,no_fallback=1ull<<3,
         first_sqlite_close_ok=1ull<<4,first_unlink_ok=1ull<<5,held_zero_links=1ull<<6,name_absent=1ull<<7,

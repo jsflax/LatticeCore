@@ -279,6 +279,8 @@ target_link_libraries(gtest_main PUBLIC gtest)
 # LatticeTests - GoogleTest-based test suite
 # =============================================================================
 add_executable(LatticeCoreTests
+    Tests/LatticeCoreTests/WalExtentBudgetTests.cpp
+    Tests/LatticeCoreTests/HistoricalWalCheckpointTests.cpp
     Tests/LatticeCoreTests/Vec0Tests.cpp
     Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp
     Tests/LatticeCoreTests/ExactVectorRowsTests.cpp
@@ -479,6 +481,13 @@ if(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
         target_compile_definitions(LatticeInstallationLauncher PRIVATE
             LATTICE_ENGRAM_${stamp}_HEADER="${LATTICE_RECLAMATION_${stamp}_HEADER}")
     endforeach()
+endif()
+option(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE "Continue the genuine debug owner through real receiving history (never release)" OFF)
+if(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+    if(NOT LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+        message(FATAL_ERROR "Positive history qualification requires the genuine debug owner build")
+    endif()
+    target_compile_definitions(LatticeCore PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
 endif()
 if(LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
     if(NOT APPLE OR NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")

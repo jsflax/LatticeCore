@@ -1528,6 +1528,34 @@ TEST(BridgeTuning, DifferentTuningDoesNotShareInstance) {
     EXPECT_EQ(ib.get(), ic.get());
 }
 
+// A selected WAL bound must survive both cached and derived owner openings.
+TEST(BridgeWalPolicy, CachedUnboundedOwnerCannotSatisfyBoundedRequest) {
+    const auto path=std::filesystem::temp_directory_path()/
+        ("bridge_wal_policy_"+lattice::uuid_t::generate().to_string()+".sqlite");
+    lattice::swift_configuration legacy(path.string());
+    auto& cache=lattice::detail::LatticeCache::instance();
+    auto unbounded=cache.get_or_create(legacy,lattice::SchemaVector{});
+    auto bounded=legacy;bounded.wal_extent_limit_bytes=1024*1024;
+    auto first=cache.get_or_create(bounded,lattice::SchemaVector{});
+    ASSERT_NE(first.get(),unbounded.get());
+    EXPECT_EQ(first->config().wal_extent_limit_bytes,bounded.wal_extent_limit_bytes);
+    auto same=cache.get_or_create(bounded,lattice::SchemaVector{});
+    EXPECT_EQ(same.get(),first.get());
+    auto tighter=bounded;tighter.wal_extent_limit_bytes=512*1024;
+    auto second=cache.get_or_create(tighter,lattice::SchemaVector{});
+    EXPECT_NE(second.get(),first.get());
+    EXPECT_EQ(second->config().wal_extent_limit_bytes,tighter.wal_extent_limit_bytes);
+    auto read_only=bounded;read_only.read_only=true;
+    EXPECT_THROW(cache.get_or_create(read_only,lattice::SchemaVector{}),std::runtime_error);
+    auto invalid=bounded;invalid.wal_extent_limit_bytes=0;
+    EXPECT_THROW(cache.get_or_create(invalid,lattice::SchemaVector{}),std::runtime_error);
+    second->close();first->close();unbounded->close();
+    second.reset();same.reset();first.reset();unbounded.reset();
+    std::filesystem::remove(path);
+    std::filesystem::remove(path.string()+"-wal");
+    std::filesystem::remove(path.string()+"-shm");
+}
+
 TEST(BridgeTuning, InvalidTuningValuesAreIgnored) {
     lattice::swift_configuration cfg(":memory:");
     cfg.set_sync_chunk_size(0);

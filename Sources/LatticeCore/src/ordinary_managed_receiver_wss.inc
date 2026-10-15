@@ -49,6 +49,19 @@ struct ordinary_receiver_reclamation_fixture::state {
     std::uint64_t observation=0;
     std::shared_ptr<const ordinary_receiver_wss_request> request;
     std::shared_ptr<ordinary_group_target_receiving_owner> owner;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+    std::condition_variable history_changed;
+    const ordinary_group_target_receiving_owner* history_owner_original=nullptr;
+    const void* history_state_original=nullptr;
+    ordinary_target_lifetime_observation history_latest{},history_ready_original{};
+    ordinary_target_raw_object_observation history_raw_latest{},history_raw_ready_original{};
+    ordinary_target_programme_observation history_programme_latest{},history_programme_ready_original{};
+    ordinary_target_schema_root_observation history_schema_latest{},history_schema_ready_original{};
+    ordinary_target_scope_root_observation history_scope_latest{},history_scope_ready_original{};
+    bool history_observed=false,history_ready=false,history_stopped=false,history_owner_failure=false;
+    bool history_close_entered=false,history_close_returned=false;
+    std::exception_ptr history_bridge_first_failure;
+#endif
 };
 ordinary_receiver_reclamation_fixture::state& ordinary_receiver_reclamation_fixture::original() {
     // Exactly one actual authenticated owner per qualification process. Debt
@@ -149,12 +162,16 @@ std::uint64_t ordinary_receiver_reclamation_fixture::close_and_observe()noexcept
 extern "C" std::uint64_t lattice_receiver_reclamation_fixture_close_v1()noexcept {
     return ordinary_receiver_reclamation_fixture::close_and_observe();
 }
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+#include "ordinary_receiver_history_lifecycle_fixture.inc"
+#endif
 #endif
 
 // No catalog copy or target SQL grant is produced here. Strong actual owner
 // custody keeps the immutable full declarations alive; request custody is
 // weak so request -> schema original -> request cannot form a cycle.
 struct ordinary_group_target_schema_original::state {
+    ordinary_target_schema_root_tail terminal_schema_root_{this,1}; // First: all actual payload members end before this tail.
     const std::uint64_t process=creator();
     const clock::time_point end;
     const std::weak_ptr<const ordinary_receiver_wss_request> request;
@@ -167,6 +184,10 @@ struct ordinary_group_target_schema_original::state {
     const recovery_owner_schema* const declarations;
     const std::int32_t version;
     std::exception_ptr first_failure;
+    struct terminal_programmes_ending;
+    bool programmes_attempted=false,programmes_allocation_returned=false,programmes_allocation_exception_returned=false;
+    std::shared_ptr<terminal_programmes_ending> programmes_original;
+    std::exception_ptr programmes_first_failure;
     bool catalog_preparation_attempted=false;
     std::shared_ptr<catalog_program> catalog;
     bool row_import_attempted=false;
@@ -180,14 +201,14 @@ struct ordinary_group_target_schema_original::state {
         std::int32_t schema_version)
         :end(value->deadline),request(original),application(value->application),archive(value->archive),
          target(value->unpublished_target),io(value->staging_io),connection(value->staging_connection),
-         expectation(value->expectation),declarations(catalog),version(schema_version) {}
+         expectation(value->expectation),declarations(catalog),version(schema_version) {terminal_schema_root_.construction_returned_=true;}
     static void dispose(state* value)noexcept {
         if(value&&value->process==creator())delete value;
         // Foreign implicit teardown has no original retirement/cleanup grant.
     }
 };
 ordinary_group_target_schema_original::ordinary_group_target_schema_original(std::shared_ptr<state> value)
-    :state_(std::move(value)) {}
+    :terminal_schema_root_(this,0),state_(std::move(value)) {terminal_schema_root_.construction_returned_=true;}
 ordinary_group_target_schema_original::~ordinary_group_target_schema_original()=default;
 void ordinary_export_access::prepare_receiver_group_target_schema(
     const std::shared_ptr<const ordinary_receiver_wss_request>& request,
@@ -224,6 +245,7 @@ void ordinary_export_access::prepare_receiver_group_target_schema(
 void ordinary_group_target_schema_original::require_connection(
     const ordinary_target_staging_connection& connection,ordinary_launch::deadline end)const {
     if(!state_||state_->process!=creator())throw std::runtime_error("GROUP schema original creator unavailable");
+    if(state_->programmes_attempted)throw std::runtime_error("GROUP schema programme ending already selected");
     ordinary_export_access::validate_receiver_group_target_schema(*this,connection,end);
 }
 void ordinary_export_access::validate_receiver_group_target_schema(
@@ -231,6 +253,7 @@ void ordinary_export_access::validate_receiver_group_target_schema(
     ordinary_launch::deadline end) {
     creator_check();const auto& held=original.state_;
     require(held&&held->process==creator(),"GROUP schema original creator differs");
+    require(!held->programmes_attempted,"GROUP schema programme ending already selected");
     const auto request=held->request.lock();
     require(request&&request->state_&&request->state_->process==creator(),"GROUP schema original request unavailable");
     const auto& value=request->state_;
@@ -284,6 +307,8 @@ void ordinary_export_access::bootstrap_receiver_group_target_metadata(
 #include "ordinary_group_target_projection_program.inc"
 #include "ordinary_group_target_import_suspension_program.inc"
 #include "ordinary_group_target_row_import_program.inc"
+#include "ordinary_target_terminal_programmes.inc"
+#include "ordinary_target_terminal_schema_roots.inc"
 
 ordinary_receiver_wss_request::ordinary_receiver_wss_request(std::shared_ptr<ordinary_receiver_wss_state> state):state_(std::move(state)){}
 ordinary_receiver_wss_request::~ordinary_receiver_wss_request()=default;
@@ -460,7 +485,7 @@ void ordinary_receiver_wss_access::prepare_group_on_receiving_worker(const std::
     receiver->require_worker_current();
     ordinary_export_access::prepare_receiver_group_target_connection(state->unpublished_target,state->staging_io,state->staging_connection,end);
     receiver->require_worker_current();
-#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE) && !defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
     // The same real authenticated request has returned its actual fixed
     // constructor. Qualification closes this owner before ANY schema work.
     ordinary_receiver_reclamation_fixture::checkpoint(request,*receiver);
@@ -539,6 +564,7 @@ std::shared_ptr<ordinary_managed_wss_handle> ordinary_receiver_wss_access::start
         control=configured_recovery_connection::create_impl(application,config,factory,typed,[application,request,end]{
             require(request->current()&&clock::now()<end&&!application->is_closed(),"receiver same-file child admission expired");
             configuration child_config(application->config_.path,std::make_shared<std_thread_scheduler>());child_config.ordinary_context=application->config_.ordinary_context;
+            child_config.wal_extent_limit_bytes=application->config_.wal_extent_limit_bytes;
             child_config.busy_timeout_ms=application->config_.busy_timeout_ms;child_config.audit_retention_seconds=0;
             child_config.target_schema_version=application->config_.target_schema_version;child_config.migration_block=application->config_.migration_block;
             auto child=std::shared_ptr<lattice_db>(ordinary_export_access::child(*application,child_config));

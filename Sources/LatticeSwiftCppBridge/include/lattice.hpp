@@ -3518,6 +3518,7 @@ template <typename ConfigT>
         ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
         std::string ordinary_model_profile;
         bool read_only = false; // Actual native access mode is part of owner identity.
+        std::optional<sqlite3_int64> wal_extent_limit_bytes;
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if(managed_admission!=other.managed_admission)return managed_admission.owner_before(other.managed_admission);
@@ -3532,6 +3533,7 @@ template <typename ConfigT>
             if (ordinary_policy != other.ordinary_policy) return ordinary_policy < other.ordinary_policy;
             if (ordinary_model_profile != other.ordinary_model_profile) return ordinary_model_profile < other.ordinary_model_profile;
             if (read_only != other.read_only) return read_only < other.read_only;
+            if (wal_extent_limit_bytes != other.wal_extent_limit_bytes) return wal_extent_limit_bytes < other.wal_extent_limit_bytes;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -3553,6 +3555,7 @@ template <typename ConfigT>
             if (ordinary_policy != other.ordinary_policy) return false;
             if (ordinary_model_profile != other.ordinary_model_profile) return false;
             if (read_only != other.read_only) return false;
+            if (wal_extent_limit_bytes != other.wal_extent_limit_bytes) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -3576,6 +3579,9 @@ template <typename ConfigT>
             require_creator_process();
             detail::ordinary_before_open(config.path,config.ordinary_context);
             if(config.ordinary_context)throw std::runtime_error("managed opens require their receiver-issued cache entry");
+            // A cache hit must not bypass the selected native opening policy.
+            if(config.wal_extent_limit_bytes&&(*config.wal_extent_limit_bytes<=0||config.read_only||config.is_in_memory()))
+                throw std::runtime_error("bounded WAL cache open requires positive writable file policy");
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
 
             // Build schema hash from table names and properties (sorted for
@@ -3614,7 +3620,7 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, {}, {}, config.ordinary_policy, config.ordinary_model_profile, config.read_only};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, {}, {}, config.ordinary_policy, config.ordinary_model_profile, config.read_only,config.wal_extent_limit_bytes};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,
@@ -3719,6 +3725,8 @@ template <typename ConfigT>
                 throw std::runtime_error("managed configuration differs from its receiver-issued context");
             config.ordinary_context=startup.context_;
             detail::ordinary_before_open(config.path,config.ordinary_context);
+            config.wal_extent_limit_bytes=detail::ordinary_select_wal_extent_limit(config.path,
+                config.ordinary_context,config.wal_extent_limit_bytes);
             if(config.is_in_memory()||config.read_only||config.is_sync_enabled()||config.is_ipc_enabled()||
                config.audit_retention_seconds!=0||config.migration_block||config.row_migration_fn_||
                !config.migration_schemas_.empty()||config.managed_product_credentials||config.target_schema_version<=0)
@@ -3728,12 +3736,12 @@ template <typename ConfigT>
             LatticeRefCacheKey key{config.path,config.sched,config.websocket_url,schema_identity,
                 config.target_schema_version,ipc_targets_fingerprint(config),sync_tuning_fingerprint(config),
                 config.recovery_source_expectation,config.ordinary_context,startup.admission_,
-                config.ordinary_policy,config.ordinary_model_profile,config.read_only};
+                config.ordinary_policy,config.ordinary_model_profile,config.read_only,config.wal_extent_limit_bytes};
             auto validate=[&](const std::shared_ptr<swift_lattice>& owner){
                 detail::ordinary_require_creator(config.ordinary_context);
                 detail::ordinary_before_open(config.path,config.ordinary_context);
                 if(!owner||!owner->owns_creator_process()||owner->is_closed())throw std::runtime_error("managed cached owner retired");
-                if(owner->config().path!=config.path||
+                if(owner->config().path!=config.path||owner->config().wal_extent_limit_bytes!=config.wal_extent_limit_bytes||
                    swift_lattice::managed_catalog_identity(owner->recovery_declarations())!=schema_identity)
                     throw std::runtime_error("managed cached catalog differs from actual declarations");
                 owner->validate_managed_ordinary();
@@ -3773,6 +3781,7 @@ template <typename ConfigT>
                 if(!owner||!owner->owns_creator_process()||owner->is_closed()||
                    owner->config().ordinary_context!=config.ordinary_context||owner->config().path!=config.path||
                    owner->config().target_schema_version!=config.target_schema_version||
+                   owner->config().wal_extent_limit_bytes!=config.wal_extent_limit_bytes||
                    swift_lattice::managed_catalog_identity(owner->recovery_declarations())!=schema_identity)
                     throw std::runtime_error("checked managed opener did not return its exact retained owner");
                 if(startup.admission_)detail::ordinary_export_access::enroll_managed_history(*owner,startup.admission_);

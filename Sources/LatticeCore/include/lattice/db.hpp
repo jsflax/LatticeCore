@@ -16,6 +16,7 @@
 #include <thread>
 #include <exception>
 #include <vector>
+#include <optional>
 
 namespace lattice {
 
@@ -24,7 +25,7 @@ namespace lattice {
 /// configuration::busy_timeout_ms so a stuck writer can't hang the UI thread.
 inline constexpr int kDefaultBusyTimeoutMs = 30000;
 
-namespace detail { uint64_t database_native_process() noexcept; }
+namespace detail { class wal_extent_vfs;struct wal_extent_test_access;uint64_t database_native_process() noexcept; struct ordinary_target_scope_native_fact; struct ordinary_target_scope_root_observation; }
 
 class db_error : public std::runtime_error {
 public:
@@ -79,6 +80,9 @@ struct recovery_continuous_admission;
 class database_retirement_state;
 class database_open_ledger;
 class ordinary_target_staging_connection;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+struct ordinary_target_lifetime_observation;
+#endif
 class ordinary_target_history_page_reader;
 struct ordinary_target_history_read_span;
 class ordinary_target_staging_io;
@@ -208,6 +212,25 @@ private:
         engine_query_scope& operator=(const engine_query_scope&) = delete;
     };
     engine_query_scope* engine_reads_ = nullptr;
+    // Physical Core BEGIN provenance, guarded by this connection's SQLite
+    // mutex. A parent routing stamp alone cannot identify a raw successor.
+    mutable std::thread::id core_transaction_thread_{};
+    // A reusable native thread id is not a lifetime. Only a genuine Core
+    // BEGIN may issue this private original; it captures no parent or writer.
+    struct core_thread_lifetime { std::atomic<bool> alive{true}; };
+    static thread_local bool core_thread_lifetime_ended_;
+    struct core_thread_holder {
+        std::shared_ptr<core_thread_lifetime> original;
+        ~core_thread_holder() noexcept {
+            core_thread_lifetime_ended_=true;
+            if(original)original->alive.store(false,std::memory_order_release);
+        }
+    };
+    static core_thread_holder& core_thread_lifetime_() noexcept;
+    mutable std::weak_ptr<const core_thread_lifetime> core_transaction_lifetime_;
+    bool core_transaction_origin_live_locked_() const noexcept;
+    bool core_transaction_origin_current_locked_() const noexcept;
+    void note_core_transaction_end_locked_() const noexcept;
     friend class detail::managed_route_scope;
     // Only the database and named closed engine factories construct this key.
     // The keyed overload stays accessible to make_shared for one allocation.
@@ -269,7 +292,8 @@ private:
     using private_connection=std::unique_ptr<database,owned_connection_deleter>;
     static std::shared_ptr<database> make_owned_connection(const std::string&,open_mode,int,
         std::shared_ptr<database_read_control>,detail::ordinary_context,
-        std::shared_ptr<detail::database_open_ledger>,bool keeper=false);
+        std::shared_ptr<detail::database_open_ledger>,bool keeper=false,
+        std::optional<sqlite3_int64> wal_extent_limit = {});
     static private_connection make_private_connection(const std::string&,open_mode,int,
         std::shared_ptr<database_read_control>,detail::ordinary_context,
         std::shared_ptr<detail::database_open_ledger>);
@@ -284,7 +308,58 @@ private:
         const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)noexcept;
     bool target_terminal_native_phases_ended_(
         const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+    enum class terminal_native_outer_result {not_held,roots_ended,retained_debt};
+    terminal_native_outer_result retire_target_terminal_native_outer_roots_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)noexcept;
+    bool target_terminal_native_outer_roots_ended_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+    bool target_terminal_phase_history_after_outer_known_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+    detail::ordinary_target_lifetime_observation qualification_target_lifetime_observation_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+#endif
+    enum class terminal_native_statics_result {not_held,objects_ended,retained_debt};
+    terminal_native_statics_result retire_target_terminal_native_statics_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)noexcept;
+    bool target_terminal_native_static_history_known_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+    bool target_terminal_native_statics_ended_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+    detail::ordinary_target_scope_root_observation qualification_target_scope_root_observation_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&)const noexcept;
+#endif
+    bool retire_target_terminal_scope_roots_(detail::ordinary_target_staging_connection&,detail::ordinary_group_target_receiving_owner&)noexcept;
+    bool target_terminal_scope_root_context_snapshot_(const detail::ordinary_target_staging_connection&,
+        detail::ordinary_target_scope_native_fact&)const noexcept;
+    bool target_terminal_scope_root_context_matches_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_target_scope_native_fact&)const noexcept;
+    bool target_terminal_programme_originals_known_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const detail::ordinary_group_target_schema_original&,
+        const std::array<const void*,4>&,const std::array<std::exception_ptr,4>&)const noexcept;
+    bool target_terminal_programme_history_known_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const void*,
+        const std::array<const void*,4>&,const std::array<std::exception_ptr,4>&)const noexcept;
+    enum class terminal_native_pages_result {not_held,pages_ended,retained_debt};
+    terminal_native_pages_result retire_target_terminal_native_pages_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)noexcept;
+    bool target_terminal_native_pages_ended_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+    bool target_terminal_native_page_history_known_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+    bool target_terminal_outer_history_before_pages_known_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
     struct target_staging_state;
+    static void wake_target_terminal_native_static_(const std::weak_ptr<target_staging_state>&,
+        const std::weak_ptr<detail::ordinary_group_target_receiving_owner>&,
+        const detail::ordinary_target_staging_connection*)noexcept;
+    static void wake_target_terminal_native_page_(const std::weak_ptr<target_staging_state>&,
+        const std::weak_ptr<detail::ordinary_group_target_receiving_owner>&,
+        const detail::ordinary_target_staging_connection*)noexcept;
+    static void wake_target_terminal_native_outer_(const std::weak_ptr<target_staging_state>&,
+        const std::weak_ptr<detail::ordinary_group_target_receiving_owner>&,
+        const detail::ordinary_target_staging_connection*)noexcept;
     static void wake_target_terminal_native_phase_(const std::weak_ptr<target_staging_state>&,
         const std::weak_ptr<detail::ordinary_group_target_receiving_owner>&,
         const detail::ordinary_target_staging_connection*)noexcept;
@@ -445,11 +520,17 @@ private:
         maintenance_scope* previous = nullptr;
         static inline thread_local maintenance_scope* current = nullptr;
         bool entered = false;
-        enum class admission { ready, mutex_busy, engine_read_busy };
+        enum class admission { ready, mutex_busy, engine_read_busy, core_write_busy };
         static bool idle(database& db) noexcept;
-        static admission controller_probe(database& db);
-        static admission controller_classify_locked(database& db);
-        maintenance_scope(database& db, admission* controller_admission);
+        // The optional stamp comes only from the retained actual Core owner.
+        // It permits no SQL/transaction borrowing: a genuine other-thread
+        // Core WRITE is a no-effect busy result for bounded automatic work.
+        static admission controller_probe(database& db,
+            const std::atomic<std::thread::id>* core_transaction = nullptr);
+        static admission controller_classify_locked(database& db,
+            const std::atomic<std::thread::id>* core_transaction = nullptr);
+        maintenance_scope(database& db, admission* controller_admission,
+            const std::atomic<std::thread::id>* core_transaction = nullptr);
         static void probe_before_store_gate(database& db);
         // False is only the initial no-effect SQLite mutex contention probe.
         static bool try_probe_before_store_gate(database& db);
@@ -479,7 +560,7 @@ public:
     // Private construction capability; no caller can manufacture the key.
     database(const std::string& path, open_mode mode, int busy_timeout_ms,
              std::shared_ptr<database_read_control> read_control, initialization_key key,
-             detail::ordinary_context context = {});
+             detail::ordinary_context context = {}, std::optional<sqlite3_int64> wal_extent_limit = {});
     ~database();
 
     /// No SQL statements. Best-effort for legacy callers; nullptr means an
@@ -631,6 +712,13 @@ public:
 
 private:
     // Trusted Core/bridge callers only; never return this pointer to a client.
+    // Only lattice_db supplies its existing transaction stamp. Publication
+    // occurs inside the successful BEGIN call's same SQLite mutex custody.
+    void begin_transaction_owned_(std::atomic<std::thread::id>& owner_thread);
+    void begin_transaction_impl_(bool exclusive, std::atomic<std::thread::id>* owner_thread);
+    void end_transaction_owned_(bool rollback, std::atomic<std::thread::id>& owner_thread);
+    void execute_impl_(const std::string& sql, const std::vector<column_value_t>& params,
+        std::atomic<std::thread::id>* owner_thread);
     sqlite3* internal_handle() const noexcept { return !target_staging_ && creator_current_() ? db_ : nullptr; }
     bool creator_current_() const noexcept;
     void require_creator_() const;
@@ -653,6 +741,8 @@ private:
     std::atomic<bool> closed_{false};
     int busy_timeout_ms_ = kDefaultBusyTimeoutMs;
     std::shared_ptr<database_read_control> read_control_;
+    friend struct detail::wal_extent_test_access;
+    std::shared_ptr<detail::wal_extent_vfs> wal_extent_vfs_;
     mutable std::shared_ptr<const physical_store_identity> main_physical_identity_;
     // Deferred delivery (docs/design-deferred-memory-delivery.md): set by the
     // update hook via mark_txn_dirty(); consumed by drain_if_settled() at the

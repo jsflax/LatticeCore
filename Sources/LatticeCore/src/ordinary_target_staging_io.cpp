@@ -40,6 +40,7 @@ managed_fixed_file_ceiling target_layout() {
 }
 #if defined(__APPLE__) || defined(__linux__)
 struct ordinary_target_staging_io::environmental_phase {
+    ordinary_target_scope_root_tail terminal_scope_root_{this,4}; // First: real scalar Native environment bank member ending.
     const pid_t creator=::getpid();
     const std::thread::id thread=std::this_thread::get_id();
     const ordinary_target_staging_connection* const connection;
@@ -53,7 +54,7 @@ struct ordinary_target_staging_io::environmental_phase {
         std::uint64_t cleanup_generation=0;
     } terminal_ending; // Separate fixed first receipt; ordinary settlement stays historical.
     environmental_phase(const ordinary_target_staging_connection& original,std::uint64_t phase)
-        :connection(&original),generation(phase) {}
+        :connection(&original),generation(phase) {terminal_scope_root_.construction_returned_=true;}
     bool creator_current()const noexcept {return creator==::getpid()&&thread==std::this_thread::get_id();}
 };
 struct ordinary_target_staging_io::state {
@@ -860,9 +861,16 @@ nlohmann::json ordinary_target_reclamation_fixture::registration_ending(const or
         {"uncertain",guard->uncertain.load(std::memory_order_acquire)}};
 }
 #endif
+#include "ordinary_target_scope_environment_history.inc"
 #else
 struct ordinary_target_staging_io::state {};
 struct ordinary_target_staging_io::environmental_phase {};
+bool ordinary_target_staging_io::prepare_terminal_scope_environment_history(const ordinary_target_staging_connection&,
+    const std::shared_ptr<environmental_phase>&,const std::shared_ptr<ordinary_resource_reservation<true>>&,
+    std::shared_ptr<ordinary_target_scope_environment_record>&)const noexcept{return false;}
+bool ordinary_target_staging_io::bind_terminal_scope_environment_history(const ordinary_target_staging_connection&,
+    const std::shared_ptr<environmental_phase>&,const std::shared_ptr<ordinary_target_scope_environment_record>&)noexcept{return false;}
+
 ordinary_target_staging_io::ordinary_target_staging_io(std::shared_ptr<state> held):state_(std::move(held)) {}
 ordinary_target_staging_io::~ordinary_target_staging_io() = default;
 void ordinary_target_staging_io::require_bound_original(const std::shared_ptr<const ordinary_unpublished_group_target>&,ordinary_launch::deadline) {

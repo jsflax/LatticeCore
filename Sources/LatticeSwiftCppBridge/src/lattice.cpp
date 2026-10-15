@@ -279,6 +279,9 @@ std::shared_ptr<swift_lattice> swift_lattice::open_managed_ordinary(const swift_
     detail::ordinary_require_creator(context);
     if(!context||config.ordinary_context!=context)throw db_error("checked open requires exact receiver context");
     if(!dormant_end)detail::ordinary_before_open(config.path,context);
+    const auto issued_wal_limit=context->wal_extent_limit_bytes(config.path);
+    if(!config.wal_extent_limit_bytes||*config.wal_extent_limit_bytes!=issued_wal_limit)
+        throw db_error("checked open requires its normalized receiver WAL policy");
     if(config.is_in_memory()||config.read_only||config.is_sync_enabled()||config.is_ipc_enabled()||
        config.audit_retention_seconds!=0||config.migration_block||config.row_migration_fn_||
        !config.migration_schemas_.empty()||config.managed_product_credentials||config.target_schema_version<=0||
@@ -321,7 +324,7 @@ std::shared_ptr<swift_lattice> swift_lattice::open_managed_ordinary(const swift_
         std::shared_ptr<database_read_control> preparation_control;
         if(dormant_end){preparation_control=std::make_shared<database_read_control>();preparation_control->deadline=*dormant_end;}
         writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
-            preparation_control,database::initialization_key(expected,context,retirement),context);
+            preparation_control,database::initialization_key(expected,context,retirement),context,config.wal_extent_limit_bytes);
         if(dormant_end)detail::ordinary_export_access::validate_managed_group_open(context,admission,config.path,
             expected->device,expected->inode,*dormant_end);
         else detail::ordinary_before_open(config.path,context);
@@ -370,6 +373,7 @@ void swift_lattice::open_managed_group_receiver(const swift_configuration& suppl
     auto config=supplied;
     if(config.ordinary_context&&config.ordinary_context!=context)throw db_error("dormant GROUP configuration context differs");
     config.ordinary_context=context;
+    config.wal_extent_limit_bytes=detail::ordinary_select_wal_extent_limit(config.path,context,config.wal_extent_limit_bytes);
     retained=open_managed_ordinary(config,schemas,context,admission,&end,&opening_claimed);
     // Real owner retention precedes any hook installation or later preservation
     // failure. No normal update buffering, observer registration, notifier,
@@ -499,7 +503,7 @@ std::shared_ptr<swift_lattice> swift_lattice::open_checked_mounted_server(
         attempt.will_open_native();
         writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
             std::shared_ptr<database_read_control>{},database::initialization_key(expected,retirement,
-                database::initialization_key::mounted_server_key{}),detail::ordinary_context{});
+                database::initialization_key::mounted_server_key{}),detail::ordinary_context{},config.wal_extent_limit_bytes);
         owner=std::shared_ptr<swift_lattice>(new swift_lattice(config,schemas,std::move(catalog),writer,
             lattice_db::checked_mounted_server_existing_key{}));
         detail::ordinary_export_access::validate_checked_mounted_server_schema(*owner,*expected);

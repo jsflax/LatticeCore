@@ -78,11 +78,12 @@ def verify_dependency_config(root, seal):
         raise RuntimeError("Only the exact generated owned-fork mirror DATA is eligible")
     return pinned
 
-def qualification_work(requested):
+def qualification_work(requested, hosted_work_base=None):
     # A fresh direct child keeps configured Darwin scratch/socket paths short.
     # The installed SDK has sun_path[104]; reserve a slash, 48-byte leaf and NUL.
     root = Path(requested).absolute()
-    if (root.parent != Path("/Users/jason/localdev")
+    base = Path("/Users/jason/localdev") if hosted_work_base is None else hosted_work_base
+    if (root.parent != base
             or not re.fullmatch("lq[0-9a-f]{8}", root.name)
             or root.resolve() != root):
         raise RuntimeError("Fresh exact /Users/jason/localdev/lq<8-hex> root without aliases required")
@@ -93,7 +94,7 @@ def qualification_work(requested):
     return root, work
 
 
-def main():
+def main(argv=None, hosted_commands=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--ephemeral-ci-vm", action="store_true", required=True)
     parser.add_argument("--graph", type=Path, required=True)
@@ -116,13 +117,13 @@ def main():
     parser.add_argument("--qualified-legacy-profile-sha256", required=True)
     parser.add_argument("--provider", required=True)
     parser.add_argument("--provider-private-credentials", type=Path, required=True)
-    parser.add_argument("--case", choices=["joined", "extra-entry-debt"], required=True)
-    args = parser.parse_args()
+    parser.add_argument("--case", choices=["joined", "extra-entry-debt", "history-lifecycle", "history-page-pair-failure"], required=True)
+    args = parser.parse_args(argv)
     if not args.ephemeral_ci_vm or sys.platform != "darwin" or os.geteuid() != 0:
         raise RuntimeError("Only the explicit disposable macOS VM/root account-creation lane is eligible")
     source = local(args.graph.resolve(strict=True))
-    root, work = qualification_work(args.root)
-    if (not root.is_relative_to(Path("/Users/jason/localdev"))
+    root, work = qualification_work(args.root, None if hosted_commands is None else hosted_commands.work_base)
+    if (root.parent != (Path("/Users/jason/localdev") if hosted_commands is None else hosted_commands.work_base)
             or root.exists() or root.is_symlink() or (source / ".git").exists()):
         raise RuntimeError("Fresh assembly root and sealed plain source graph required; no reuse or reset")
     dependency_cache = local(args.dependency_cache.resolve(strict=True))
@@ -193,6 +194,10 @@ def main():
             or credential_stat.st_size > 16384):
         raise RuntimeError("Actual disposable provider credential file must be private and regular")
     credential_bytes = args.provider_private_credentials.read_bytes()
+    if hosted_commands is not None:
+        # Actual reviewed hosted entry retains OS/command custody before effects.
+        # Source/legacy/config validation above is unchanged and precedes it.
+        hosted_commands.start_verified_inputs(args, source)
 
     # Same reviewed OS-account observations; a distinct name prevents reuse
     # of the direct-constructor account and makes the installed caller refuse
@@ -202,12 +207,16 @@ def main():
     scratch = work / "scratch"
     mkdir(scratch, 0, 0)
     def run(argv, user=None, cwd=None, timeout=600):
+        if hosted_commands is not None:
+            return hosted_commands.run(argv, user=user, cwd=work if cwd is None else cwd,
+                                       timeout=timeout, scratch=scratch)
         return helpers.run(argv, user=user, cwd=work if cwd is None else cwd,
                            timeout=timeout, scratch=scratch)
     name = "lattice-owner-" + uuid.uuid4().hex[:8]
     occupied = {int(line.split()[-1]) for line in run(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"], timeout=10).splitlines()
                 if line.split() and line.split()[-1].isdigit()}
-    uid = next(value for value in range(600, 4096) if value not in occupied)
+    eligible_uids = range(600, 4096) if hosted_commands is None else range(60000, 80000)
+    uid = next(value for value in eligible_uids if value not in occupied)
     gid = grp.getgrnam("staff").gr_gid
     home = Path("/Users") / name
     if home.exists() or home.is_symlink():
@@ -241,8 +250,13 @@ def main():
                   item.st_mode & 0o010 if item.st_gid == gid else item.st_mode & 0o001)
         if not search:
             raise RuntimeError("Actual fresh account cannot search work parent; no permission rewrite")
-    account = canonical(dict(account=name, uid=uid, actualHome=observed.pw_dir, actualWorkRoot=str(work), homeOverride=False,
-                             caseData=args.case, disposition="PRESERVE_ACCOUNT_AND_FIRST_FAILURES"))
+    account_data = dict(account=name, uid=uid, actualHome=observed.pw_dir, actualWorkRoot=str(work), homeOverride=False,
+                        caseData=args.case, disposition="PRESERVE_ACCOUNT_AND_FIRST_FAILURES")
+    if hosted_commands is not None:
+        hosted_commands.bind_created_account(name, uid, gid, home, work)
+        account_data.update(hostedRunnerUID=hosted_commands.runner_uid,
+                            hostedWorkBase=str(hosted_commands.work_base))
+    account = canonical(account_data)
     write(work / "ACCOUNT.json", account, uid, gid); write(root / "ACCOUNT.json", account, 0, 0)
     graph = work / "graph"
     shutil.copytree(source, graph, symlinks=False)
@@ -304,6 +318,8 @@ def main():
     for path in [configuration, *configuration.rglob("*")]:
         os.chown(path, uid, gid)
     verify_dependency_config(configuration, config_seal)
+    if hosted_commands is not None:
+        hosted_commands.capture_build_source(graph)
     run(["/usr/bin/git", "init"], user=name, cwd=graph, timeout=10)
     run(["/usr/bin/git", "add", "."], user=name, cwd=graph, timeout=60)
     run(["/usr/bin/git", "-c", "user.name=Lattice Fixture", "-c", "user.email=fixture@localhost", "commit", "-m", "Frozen authenticated owner fixture source"], user=name, cwd=graph, timeout=60)
@@ -316,6 +332,10 @@ def main():
     macros = ["LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE"]
     if args.case == "extra-entry-debt":
         macros.append("LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_EXTRA_ENTRY")
+    if args.case in ("history-lifecycle", "history-page-pair-failure"):
+        macros.append("LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE")
+    if args.case == "history-page-pair-failure":
+        macros.append("LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_PAIR_FAILURE")
     swift_command = ["/usr/bin/env", "LATTICE_RECLAMATION_COMPOSED_ENGRAM_SOURCE=" + str(graph / "Engram"),
         swift, "build", "--package-path", graph / "OwnerImages", "--scratch-path", work / "owner-swift-build",
         "--cache-path", cache, "--config-path", configuration, "--configuration", "debug",
@@ -327,14 +347,16 @@ def main():
                       "-Xcxx", "-fmodules-cache-path=" + str(module_cache)]
     for macro in macros:
         swift_command += ["-Xswiftc", "-D" + macro, "-Xcxx", "-D" + macro]
-    run(swift_command, user=name, cwd=work)
+    run(swift_command, user=name, cwd=work, timeout=600 if hosted_commands is None else 5400)
     binary_path = run([*swift_command, "--show-bin-path"], user=name, cwd=work, timeout=30).strip()
     binary_directory = Path(binary_path).resolve(strict=True)
     if not binary_directory.is_relative_to(work):
         raise RuntimeError("Actual Swift build output must remain in the exact Jason-localdev account work")
-    built_memory, built_daemon = [binary_directory / leaf for leaf in ["memory", "memory-sync"]]
+    built_memory, built_daemon = [binary_directory / leaf for leaf in ["lattice-reclamation-paired-image", "memory-sync"]]
     for image in [built_memory, built_daemon]:
         run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", image], user=name, cwd=work, timeout=30)
+    if hosted_commands is not None:
+        hosted_commands.verify_build_source(graph, "after-owner-images")
     memory_hash, daemon_hash = [helpers.digest(image) for image in [built_memory, built_daemon]]
     if memory_hash == daemon_hash:
         raise RuntimeError("Distinct actual normal paired/SDK owner images required; no native direct runtime substitute")
@@ -357,20 +379,31 @@ def main():
     run([cmake, "-S", graph / "Core", "-B", build, "-DCMAKE_BUILD_TYPE=Debug",
          "-DLATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE=OFF",
          "-DLATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE=ON",
+         "-DLATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE=" + ("ON" if args.case in ("history-lifecycle", "history-page-pair-failure") else "OFF"),
          "-DCMAKE_CXX_FLAGS=" + " ".join("-D" + m for m in macros) +
          " -fmodules-cache-path=" + shlex.quote(str(module_cache)),
          "-DLATTICE_RECLAMATION_BUILD_STAMP_HEADER=" + str(generated / "build.hpp"),
          "-DLATTICE_RECLAMATION_MANAGED_PAIR_STAMP_HEADER=" + str(generated / "pair.hpp"),
          "-DLATTICE_RECLAMATION_LEGACY_PROFILE_HEADER=" + str(generated / "legacy.hpp")], user=name, cwd=work)
-    run([cmake, "--build", build, "--target", "LatticeInstallationLauncher", "--parallel", "2"], user=name, cwd=work)
+    run([cmake, "--build", build, "--target", "LatticeInstallationLauncher", "--parallel", "2"], user=name, cwd=work,
+        timeout=600 if hosted_commands is None else 5400)
     launcher = build / "LatticeInstallationLauncher"
     run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", launcher], user=name, cwd=work, timeout=30)
 
+    if hosted_commands is not None:
+        hosted_commands.verify_build_source(graph, "before-provider")
     credential = work / "provider-credentials.json"
     write(credential, credential_bytes, uid, gid)
     qualification = work / "owner-qualification"
-    run([sys.executable, graph / "FixtureScripts/provider_setup.py", "--endpoint", args.provider,
-         "--private-credentials", credential, "--output", qualification], user=name, cwd=work, timeout=90)
+    provider_arguments = [sys.executable, graph / "FixtureScripts/provider_setup.py", "--endpoint", args.provider,
+         "--private-credentials", credential, "--output", qualification]
+    if args.case in ("history-lifecycle", "history-page-pair-failure"):
+        provider_arguments.append("--history-lifecycle")
+    if hosted_commands is not None:
+        # Irreversible BEFORE actual provider login/group/row effects or any
+        # product image. Later build/tool labels cannot restore preproduct scope.
+        hosted_commands.begin_product()
+    run(provider_arguments, user=name, cwd=work, timeout=90)
     metadata = json.loads((qualification / "PROVIDER.json").read_text())
     group = str(uuid.UUID(metadata["group"]))
     if (metadata["legacy_group_leaf"] != "group-" + group + ".sqlite"
@@ -433,17 +466,21 @@ def main():
         sync(path)
     # This assembly receipt is DATA; no READY, admission, already-closed/native
     # success field exists. A separate ONE normal controller run is required.
+    future_command = [sys.executable, str(graph / "FixtureScripts/launch_installed_owner.py"), "--ephemeral-ci-vm",
+                      "--work-root", str(work), "--expect", args.case]
+    if hosted_commands is not None:
+        future_command += ["--hosted-runner-uid", str(hosted_commands.runner_uid)]
     receipt = canonical(dict(format="owner-image-account-assembly-v1", account=name, uid=uid,
         sourceRevision=revision, actualWorkRoot=str(work), sourceGraphSealSHA256=args.graph_pins_sha256,
         dependencyCacheSealSHA256=args.dependency_cache_pins_sha256, ownerResolvedSHA256=args.owner_package_resolved_sha256,
         qualificationCaseData=args.case, memorySHA256=memory_hash, daemonSHA256=daemon_hash,
         controllerSHA256=helpers.digest(launcher), legacyProfileSHA256=sha(profile),
         actualProviderGroup=group, launchPerformed=False, ownerQualified=False, wholeCohortRetirementQualified=False,
-        futureNormalCommand=[sys.executable, str(graph / "FixtureScripts/launch_installed_owner.py"), "--ephemeral-ci-vm",
-                             "--work-root", str(work), "--expect", args.case],
+        futureNormalCommand=future_command,
         disposition="RETAIN_ACCOUNT_IMAGES_STORES_AND_FIRST_FAILURES"))
     write(work / "OWNER-ASSEMBLY.json", receipt, uid, gid); write(root / "OWNER-ASSEMBLY.json", receipt, 0, 0)
     print(str(work / "OWNER-ASSEMBLY.json"))
+    return work / "OWNER-ASSEMBLY.json"
 
 
 if __name__ == "__main__":

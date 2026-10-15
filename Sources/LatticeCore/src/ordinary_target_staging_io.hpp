@@ -1,5 +1,6 @@
 #pragma once
 #include "ordinary_managed_history.hpp"
+#include "ordinary_target_scope_root_tail.hpp"
 #include <memory>
 namespace lattice::detail {
 class ordinary_export_access;
@@ -34,6 +35,11 @@ class ordinary_target_staging_io final {
     void settle_descriptor_phase(const ordinary_target_staging_connection&,const std::shared_ptr<environmental_phase>&);
     void settle_descriptor_callback(const ordinary_target_staging_connection&);
     bool callbacks_joined(const ordinary_target_staging_connection&)const noexcept;
+    bool prepare_terminal_scope_environment_history(const ordinary_target_staging_connection&,
+        const std::shared_ptr<environmental_phase>&,const std::shared_ptr<ordinary_resource_reservation<true>>&,
+        std::shared_ptr<ordinary_target_scope_environment_record>&)const noexcept;
+    bool bind_terminal_scope_environment_history(const ordinary_target_staging_connection&,
+        const std::shared_ptr<environmental_phase>&,const std::shared_ptr<ordinary_target_scope_environment_record>&)noexcept;
     bool terminal_environment_known(const ordinary_target_staging_connection&,const std::shared_ptr<environmental_phase>&)const noexcept;
     bool end_terminal_environment(const ordinary_target_staging_connection&,const std::shared_ptr<environmental_phase>&)noexcept;
     bool terminal_environment_ended(const ordinary_target_staging_connection&,const std::shared_ptr<environmental_phase>&)const noexcept;

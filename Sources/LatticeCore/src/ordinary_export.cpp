@@ -1726,7 +1726,8 @@ recovery_owner_schema ordinary_export_access::managed_clone_catalog(lattice_db& 
     if(parent.is_closed() || !parent.recovery_schemas_.valid() || !config.ordinary_context ||
         config.ordinary_context!=parent.config_.ordinary_context || config.path!=parent.config_.path ||
         config.is_sync_enabled() || config.is_ipc_enabled() || config.is_in_memory() ||
-        config.read_only!=parent.config_.read_only || config.audit_retention_seconds!=0)
+        config.read_only!=parent.config_.read_only || config.audit_retention_seconds!=0||
+        config.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes)
         refuse("managed attachment clone requires its actual parent configuration");
     const auto settled=recovery_writer_access::ordinary_owned_write(parent,[&](database& writer){
         const auto profile=parent.ordinary_managed_profile_.load(std::memory_order_acquire);
@@ -1769,6 +1770,7 @@ void ordinary_export_access::admit_managed_clone(lattice_db& parent,lattice_db& 
     if(&parent==&child || parent.is_closed() || child.is_closed() ||
         child.config_.ordinary_context!=parent.config_.ordinary_context ||
         child.config_.path!=parent.config_.path || child.config_.is_sync_enabled() || child.config_.is_ipc_enabled() ||
+        child.config_.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes ||
         child.ordinary_managed_profile_.load(std::memory_order_acquire))
         refuse("managed attachment clone publication refused");
     std::shared_ptr<const ordinary_managed_profile> retained;
@@ -1799,6 +1801,9 @@ bool ordinary_export_access::fresh_origin(const lattice_db& owner,const physical
 std::unique_ptr<lattice_db> ordinary_export_access::child(lattice_db& parent,const configuration& config,
     std::shared_ptr<ordinary_history_child_connections>* history_custody) {
     if(parent.is_closed()||!parent.recovery_schemas_.valid())refuse("ordinary child parent/catalog unavailable");
+    if((parent.config_.ordinary_context||parent.config_.wal_extent_limit_bytes)&&
+       config.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes)
+        refuse("ordinary child WAL extent policy differs from its retained parent");
     // The immutable catalog is the actual parent's declaration snapshot. The
     // unexposed child does not synthesize Swift declarations from physical SQL.
     std::unique_ptr<lattice_db> child;

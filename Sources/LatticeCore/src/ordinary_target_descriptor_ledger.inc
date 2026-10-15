@@ -644,7 +644,7 @@ int ordinary_target_staging_connection::descriptor_write(std::uint64_t id,sqlite
         native->require_role(true);native->inspect(file,index,false);
         const auto extent=offset+bytes;
         if(!native->io->charge_descriptor(*this,file.journal,extent))return SQLITE_FULL;
-        auto& high=file.journal?native->journal_high:native->main_high;high=std::max(high,extent);
+        auto& high=file.journal?native->journal_high:native->main_high;high=std::max(high,std::int64_t(extent));
         file.write_pending=true;int done=0;
         while(done<bytes) {
             native->require_role(true);auto& call=native->reserve(state::action::write,index,file.fd,offset+done);

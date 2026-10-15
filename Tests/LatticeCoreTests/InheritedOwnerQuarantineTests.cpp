@@ -330,7 +330,8 @@ TEST(InheritedOwnerQuarantine, ActualDeferredIpcSetupRefusesBeforeEndpointAndPar
     const auto status=bounded_child_status(child);
     ASSERT_NE(status,-1);ASSERT_TRUE(WIFEXITED(status));ASSERT_EQ(WEXITSTATUS(status),0);
     EXPECT_EQ(output.available(),"D");
-    EXPECT_NO_THROW(owner->disconnect_sync());EXPECT_NO_THROW(owner->sync_now());
+    EXPECT_NO_THROW(owner->disconnect_sync());
+    EXPECT_NO_THROW(owner->sync_now());
     owner->add(TestPerson{"deferred-ipc-parent",12,std::nullopt});
     const auto rows=owner->db().query("SELECT COUNT(*) AS n FROM TestPerson");
     ASSERT_EQ(std::get<int64_t>(rows.at(0).at("n")),1);

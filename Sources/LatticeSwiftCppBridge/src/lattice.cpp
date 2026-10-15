@@ -532,6 +532,28 @@ std::shared_ptr<swift_lattice> swift_lattice::open_checked_mounted_server(
 #endif
 }
 
+namespace {
+// Schema-bearing read-only opens must enforce the same upper version bound
+// without entering ensure_swift_tables, migration, DDL or background repair.
+void require_read_only_swift_version(database& connection,int target_version) {
+    const auto rows=connection.query("SELECT value FROM _lattice_meta WHERE key = 'schema_version'");
+    int current_version=1; // Same explicit legacy missing-key default as get_schema_version().
+    if(!rows.empty()) {
+        if(rows.size()!=1)throw db_error("read-only schema version metadata is not singular");
+        const auto& value=std::get<std::string>(rows.front().at("value"));
+        if(value.empty()||value.find_first_not_of("0123456789")!=std::string::npos)
+            throw db_error("read-only schema version metadata is invalid");
+        // Query/type/range failures propagate; none become a permissive default.
+        current_version=std::stoi(value);
+        if(current_version<=0)throw db_error("read-only schema version metadata is invalid");
+    }
+    if(current_version>target_version)
+        throw std::runtime_error("Database schema version ("+std::to_string(current_version)+
+            ") is newer than this binary supports ("+std::to_string(target_version)+
+            "). Update the application.");
+}
+}
+
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
     : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_resources_(config) {
     LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
@@ -543,6 +565,7 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
         lattice_db::setup_sync_if_configured();
         lattice_db::setup_ipc_if_configured();
     } else {
+        if(!schemas.empty())require_read_only_swift_version(db(),swift_config_.target_schema_version);
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
             schemas_[entry.table_name] = entry.properties;
@@ -559,6 +582,7 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
         lattice_db::setup_sync_if_configured();
         lattice_db::setup_ipc_if_configured();
     } else {
+        if(!schemas.empty())require_read_only_swift_version(db(),swift_config_.target_schema_version);
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
             schemas_[entry.table_name] = entry.properties;

@@ -830,6 +830,46 @@ TEST(Bridge, CacheConcurrentSamePathDedup) {
     for (auto* r : refs) delete r;
 }
 
+TEST(BridgeCacheReadOnlyPolicy, WritableFirstKeepsReadOnlyOwnerSeparate) {
+    TempDB file{"bridge-cache-writable-first"};
+    const lattice::SchemaVector schemas={make_schema("ReadOnlyCacheRow",{{"name",text_prop("name")}})};
+    lattice::swift_configuration write_config(file.str());
+    auto& cache=lattice::detail::LatticeCache::instance();
+    auto writer=cache.get_or_create(write_config,schemas);
+    writer->db().execute("INSERT INTO ReadOnlyCacheRow(globalId,name) VALUES('00000000-0000-4000-8000-000000000001','original')");
+    auto read_config=write_config;read_config.read_only=true;
+    auto reader=cache.get_or_create(read_config,schemas);
+    ASSERT_NE(reader.get(),writer.get());
+    EXPECT_EQ(sqlite3_db_readonly(reader->db().handle(),"main"),1);
+    EXPECT_EQ(sqlite3_db_readonly(writer->db().handle(),"main"),0);
+    EXPECT_EQ(cache.get_or_create(read_config,schemas),reader);
+    EXPECT_EQ(cache.get_or_create(write_config,schemas),writer);
+    EXPECT_THROW(reader->db().execute("UPDATE ReadOnlyCacheRow SET name='forbidden'"),lattice::db_error);
+    writer->db().execute("UPDATE ReadOnlyCacheRow SET name='committed'");
+    EXPECT_EQ(std::get<std::string>(reader->db().query("SELECT name FROM ReadOnlyCacheRow").at(0).at("name")),"committed");
+}
+
+TEST(BridgeCacheReadOnlyPolicy, ReadOnlyFirstDoesNotReplaceRequestedWritableOwner) {
+    TempDB file{"bridge-cache-readonly-first"};
+    const lattice::SchemaVector schemas={make_schema("ReadOnlyCacheRow",{{"name",text_prop("name")}})};
+    lattice::swift_configuration write_config(file.str());
+    {
+        lattice::swift_lattice seed(write_config,schemas);
+        seed.db().execute("INSERT INTO ReadOnlyCacheRow(globalId,name) VALUES('00000000-0000-4000-8000-000000000002','original')");
+    }
+    auto read_config=write_config;read_config.read_only=true;
+    auto& cache=lattice::detail::LatticeCache::instance();
+    auto reader=cache.get_or_create(read_config,schemas);
+    auto writer=cache.get_or_create(write_config,schemas);
+    ASSERT_NE(reader.get(),writer.get());
+    EXPECT_EQ(sqlite3_db_readonly(reader->db().handle(),"main"),1);
+    EXPECT_EQ(sqlite3_db_readonly(writer->db().handle(),"main"),0);
+    EXPECT_EQ(cache.get_or_create(read_config,schemas),reader);
+    EXPECT_EQ(cache.get_or_create(write_config,schemas),writer);
+    EXPECT_NO_THROW(writer->db().execute("UPDATE ReadOnlyCacheRow SET name='writable'"));
+    EXPECT_EQ(std::get<std::string>(reader->db().query("SELECT name FROM ReadOnlyCacheRow").at(0).at("name")),"writable");
+}
+
 TEST(Bridge, CacheConcurrentCreateResolveStress) {
     // TSan target: hammer get_or_create's cache-hit path and get_by_pointer
     // (the per-object hot path) concurrently. A seed ref keeps the cached
@@ -2141,4 +2181,99 @@ TEST(Bridge, ManagedRowFactoryKeepsAttachedEqualIDsOnTheirPhysicalRoute) {
     EXPECT_EQ(std::get<int64_t>(local_values[0].at("age")), 10);
     EXPECT_EQ(std::get<int64_t>(arm_values[0].at("age")), 44);
 }
+
+
+namespace {
+lattice::SchemaVector readonly_version_schemas() {
+    return {make_schema("ReadOnlyVersionRow",{{"name",text_prop("name")}})};
+}
+void make_readonly_version_file(const std::string& path) {
+    lattice::swift_configuration config(path);config.target_schema_version=40;
+    lattice::swift_lattice writer(config,readonly_version_schemas());
+    writer.db().execute("INSERT INTO ReadOnlyVersionRow(globalId,name) VALUES('readonly-version-row','original')");
+}
+struct readonly_version_snapshot {
+    std::vector<lattice::database::row_t> meta,schema,rows,cookie;
+};
+readonly_version_snapshot read_version_snapshot(lattice::database& reader) {
+    return {reader.query("SELECT key,value FROM _lattice_meta ORDER BY key"),
+        reader.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"),
+        reader.query("SELECT globalId,name FROM ReadOnlyVersionRow ORDER BY id"),
+        reader.query("PRAGMA schema_version")};
+}
+void expect_same_version_snapshot(const readonly_version_snapshot& a,const readonly_version_snapshot& b) {
+    EXPECT_EQ(a.meta,b.meta);EXPECT_EQ(a.schema,b.schema);EXPECT_EQ(a.rows,b.rows);EXPECT_EQ(a.cookie,b.cookie);
+}
+void count_readonly_migration(const char*,void* raw) {++*static_cast<int*>(raw);}
+}
+
+TEST(BridgeReadOnlySchemaVersion, ConstAndRvalueTypedOpensRefuseNewerRealFileWithoutMutation) {
+    TempDB file{"readonly-version-newer"};make_readonly_version_file(file.str());
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);
+    const auto before=read_version_snapshot(observer);int callbacks=0;
+    const auto schemas=readonly_version_schemas();
+    lattice::swift_configuration old(file.str());old.read_only=true;old.target_schema_version=36;
+    old.setRowMigrationCallback(&callbacks,count_readonly_migration);
+    const auto& const_config=old;
+    try {lattice::swift_lattice refused(const_config,schemas);FAIL()<<"newer schema was admitted";}
+    catch(const std::runtime_error& e){EXPECT_NE(std::string(e.what()).find("(40) is newer than this binary supports (36)"),std::string::npos);}
+    old.target_schema_version=37;
+    try {lattice::swift_lattice refused(std::move(old),schemas);FAIL()<<"newer schema was admitted";}
+    catch(const std::runtime_error& e){EXPECT_NE(std::string(e.what()).find("(40) is newer than this binary supports (37)"),std::string::npos);}
+    EXPECT_EQ(callbacks,0);expect_same_version_snapshot(before,read_version_snapshot(observer));
+}
+
+TEST(BridgeReadOnlySchemaVersion, SupportedTypedVersionsReadWithoutMigrationOrSchemaWrites) {
+    TempDB file{"readonly-version-supported"};make_readonly_version_file(file.str());
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);
+    const auto before=read_version_snapshot(observer);int callbacks=0;
+    const auto schemas=readonly_version_schemas();
+    lattice::swift_configuration exact(file.str());exact.read_only=true;exact.target_schema_version=40;
+    exact.setRowMigrationCallback(&callbacks,count_readonly_migration);
+    {
+        const auto& const_config=exact;lattice::swift_lattice reader(const_config,schemas);
+        EXPECT_EQ(std::get<std::string>(reader.db().query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+        EXPECT_EQ(sqlite3_db_readonly(reader.db().handle(),"main"),1);
+    }
+    exact.target_schema_version=41; // Read-only admission never requests migration to the larger supported bound.
+    {
+        lattice::swift_lattice reader(std::move(exact),schemas);
+        EXPECT_EQ(std::get<std::string>(reader.db().query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+    }
+    EXPECT_EQ(callbacks,0);expect_same_version_snapshot(before,read_version_snapshot(observer));
+}
+
+TEST(BridgeReadOnlySchemaVersion, MalformedAndUnreadableMetadataRefuseWithoutDefaultingToZero) {
+    TempDB file{"readonly-version-malformed"};make_readonly_version_file(file.str());
+    const auto schemas=readonly_version_schemas();
+    for(const auto& value:{std::string("not-a-version"),std::string("40trailing"),std::string("999999999999999999999999")}) {
+        {lattice::database writer(file.str());writer.execute("UPDATE _lattice_meta SET value=? WHERE key='schema_version'",{value});}
+        lattice::database observer(file.str(),lattice::database::open_mode::read_only);const auto before=read_version_snapshot(observer);
+        lattice::swift_configuration config(file.str());config.read_only=true;config.target_schema_version=36;
+        const auto& const_config=config;EXPECT_THROW({lattice::swift_lattice refused(const_config,schemas);},std::exception);
+        EXPECT_THROW({lattice::swift_lattice refused(std::move(config),schemas);},std::exception);
+        expect_same_version_snapshot(before,read_version_snapshot(observer));
+    }
+    {lattice::database writer(file.str());writer.execute("DROP TABLE _lattice_meta");}
+    lattice::swift_configuration unreadable(file.str());unreadable.read_only=true;unreadable.target_schema_version=36;
+    const auto& const_config=unreadable;EXPECT_THROW({lattice::swift_lattice refused(const_config,schemas);},std::exception);
+    EXPECT_THROW({lattice::swift_lattice refused(std::move(unreadable),schemas);},std::exception);
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);
+    EXPECT_FALSE(observer.table_exists("_lattice_meta"));
+    EXPECT_EQ(std::get<std::string>(observer.query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+}
+
+TEST(BridgeReadOnlySchemaVersion, NoSchemaDynamicAndEmptySchemaOpensKeepTheirUnversionedContract) {
+    TempDB file{"readonly-version-dynamic"};make_readonly_version_file(file.str());
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);const auto before=read_version_snapshot(observer);
+    lattice::swift_configuration config(file.str());config.read_only=true; // Default target1 is not a typed schema claim.
+    {
+        auto copy=config;lattice::swift_lattice dynamic(std::move(copy));dynamic.open_dynamic();
+        EXPECT_EQ(std::get<std::string>(dynamic.db().query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+    }
+    {const auto& const_config=config;lattice::swift_lattice empty(const_config,{});}
+    {lattice::swift_lattice empty(std::move(config),{});}
+    expect_same_version_snapshot(before,read_version_snapshot(observer));
+}
+
 #endif // !__linux__

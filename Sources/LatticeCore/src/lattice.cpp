@@ -2037,7 +2037,7 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
     // remaining aliases happens after the DETACH).
     for (const auto& handle : handles) {
         for (const auto& view : attached_view_names_) {
-            handle->execute_attachment_sql("DROP VIEW IF EXISTS \"" + view + "\"", operation);
+            handle->execute_attachment_sql("DROP VIEW IF EXISTS temp.\"" + view + "\"", operation);
         }
     }
     attached_view_names_.clear();
@@ -2087,7 +2087,7 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
     std::map<std::string, std::string> rebuilt_sql;
     for (const auto& handle : handles) {
         for (const auto& view : attached_view_names_) {
-            handle->execute_attachment_sql("DROP VIEW IF EXISTS \"" + view + "\"", operation);
+            handle->execute_attachment_sql("DROP VIEW IF EXISTS temp.\"" + view + "\"", operation);
         }
     }
     attached_view_names_.clear();

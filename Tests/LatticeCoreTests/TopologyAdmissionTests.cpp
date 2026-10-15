@@ -250,6 +250,51 @@ TEST(TopologyAdmission, DetachRefusalKeepsPhysicalBindingButRetiresItsRoute) {
     EXPECT_TRUE(topology_access::valid(fixture.parent));
 }
 
+TEST(TopologyAdmission, PartialViewDropRefusalRetriesOnlyActualTemporaryViews) {
+    terminal_watchdog watchdog;
+    pair_fixture fixture;
+    fixture.parent.attach(fixture.arm);
+    auto writer = topology_access::writer(fixture.parent);
+    auto reader = topology_access::reader(fixture.parent);
+    ASSERT_NE(writer, nullptr);
+    ASSERT_NE(reader, nullptr);
+    const auto temp_views = [](database& db) {
+        return std::get<int64_t>(db.query(
+            "SELECT count(*) AS n FROM sqlite_temp_master WHERE type='view' AND name='Fixture'").at(0).at("n"));
+    };
+    ASSERT_EQ(temp_views(*writer), 1);
+    ASSERT_EQ(temp_views(*reader), 1);
+    held_connection held(reader);
+    ASSERT_TRUE(held.await_ready());
+    const auto error = refusal([&] { fixture.parent.detach(fixture.arm); });
+    const bool forced = held.forced_release();
+    held.release();
+    expect_deadline(error);
+    EXPECT_FALSE(forced);
+    EXPECT_EQ(held.after_release_rc, SQLITE_OK);
+    // The first real handle completed its DROP before the same operation
+    // refused on the reader. Its main table remains the original real table.
+    ASSERT_EQ(temp_views(*writer), 0);
+    ASSERT_EQ(temp_views(*reader), 1);
+    EXPECT_EQ(std::get<int64_t>(writer->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_EQ(std::get<int64_t>(reader->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_TRUE(physically_attached(*writer));
+    EXPECT_TRUE(physically_attached(*reader));
+    EXPECT_EQ(topology_access::tokens(fixture.parent), 0u);
+    EXPECT_FALSE(topology_access::valid(fixture.parent));
+    // This is a genuine later public cleanup episode after the actual holder
+    // returned; no first refusal, route token, or original deadline is reset.
+    ASSERT_NO_THROW(fixture.parent.detach(fixture.arm));
+    EXPECT_FALSE(physically_attached(*writer));
+    EXPECT_FALSE(physically_attached(*reader));
+    EXPECT_EQ(temp_views(*writer), 0);
+    EXPECT_EQ(temp_views(*reader), 0);
+    EXPECT_EQ(std::get<int64_t>(writer->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_EQ(std::get<int64_t>(reader->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_EQ(topology_access::tokens(fixture.parent), 0u);
+    EXPECT_TRUE(topology_access::valid(fixture.parent));
+}
+
 TEST(TopologyAdmission, EarlierActualSQLTimeIsChargedBeforeLaterReaderAdmission) {
     terminal_watchdog watchdog;
     pair_fixture fixture;

@@ -3517,6 +3517,7 @@ template <typename ConfigT>
         // Append policy selectors after actual managed custody; neither selector issues a grant.
         ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
         std::string ordinary_model_profile;
+        bool read_only = false; // Actual native access mode is part of owner identity.
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if(managed_admission!=other.managed_admission)return managed_admission.owner_before(other.managed_admission);
@@ -3530,6 +3531,7 @@ template <typename ConfigT>
             if (recovery_expectation != other.recovery_expectation) return recovery_expectation < other.recovery_expectation;
             if (ordinary_policy != other.ordinary_policy) return ordinary_policy < other.ordinary_policy;
             if (ordinary_model_profile != other.ordinary_model_profile) return ordinary_model_profile < other.ordinary_model_profile;
+            if (read_only != other.read_only) return read_only < other.read_only;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -3550,6 +3552,7 @@ template <typename ConfigT>
             if (recovery_expectation != other.recovery_expectation) return false;
             if (ordinary_policy != other.ordinary_policy) return false;
             if (ordinary_model_profile != other.ordinary_model_profile) return false;
+            if (read_only != other.read_only) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -3611,7 +3614,7 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, {}, {}, config.ordinary_policy, config.ordinary_model_profile};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, {}, {}, config.ordinary_policy, config.ordinary_model_profile, config.read_only};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,
@@ -3725,7 +3728,7 @@ template <typename ConfigT>
             LatticeRefCacheKey key{config.path,config.sched,config.websocket_url,schema_identity,
                 config.target_schema_version,ipc_targets_fingerprint(config),sync_tuning_fingerprint(config),
                 config.recovery_source_expectation,config.ordinary_context,startup.admission_,
-                config.ordinary_policy,config.ordinary_model_profile};
+                config.ordinary_policy,config.ordinary_model_profile,config.read_only};
             auto validate=[&](const std::shared_ptr<swift_lattice>& owner){
                 detail::ordinary_require_creator(config.ordinary_context);
                 detail::ordinary_before_open(config.path,config.ordinary_context);

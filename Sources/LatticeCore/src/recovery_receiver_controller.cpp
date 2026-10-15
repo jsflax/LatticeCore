@@ -1670,12 +1670,28 @@ void recovery_receiver_controller::verify_reconciliation_route(
     auto controller=descriptor->controller_.lock();require(controller!=nullptr,"restricted export controller retired");
     {std::lock_guard lock(controller->state_->mutex);require(controller->state_->reconciliation==descriptor&&controller->state_->revision==descriptor->controller_revision_,"restricted export descriptor replaced");}
     const recovery_reconciliation_descriptor::contribution* matched=nullptr;
-    for(const auto& c:descriptor->contributions_)if(auto route=c.route.lock())if(route->state_->continuous==continuous&&route->state_->owner.lock()==owner&&
-        !route->state_->retired.load()&&c.source==route->state_->source&&c.source->recovery_live(c.view)&&c.source->recovery_lifecycle(c.view)==physical){
+    // Record the first actual failed predicate for each contribution while
+    // performing the SAME short-circuit checks. Do not re-read source/lifetime
+    // state after refusal and mistake that later observation for its cause.
+    std::array<size_t,7> missed{};
+    for(const auto& c:descriptor->contributions_){
+        const auto route=c.route.lock();
+        if(!route){++missed[0];continue;}
+        if(route->state_->continuous!=continuous){++missed[1];continue;}
+        if(route->state_->owner.lock()!=owner){++missed[2];continue;}
+        if(route->state_->retired.load()){++missed[3];continue;}
+        if(c.source!=route->state_->source){++missed[4];continue;}
+        if(!c.source->recovery_live(c.view)){++missed[5];continue;}
+        if(c.source->recovery_lifecycle(c.view)!=physical){++missed[6];continue;}
         require(!matched,"restricted export ambiguous actual route");
         require(compatible_context(c.framing,parse(c.source->recovery_description(c.view),65536),c.compatibility,route,c.view,
-            descriptor->controller_revision_,descriptor->physical_incarnation_,descriptor->phase_,descriptor->barrier_,descriptor->attempt_,descriptor->limits_.codec),"restricted export source compatibility changed");matched=&c;}
-    require(matched!=nullptr,"restricted export physical authenticated source differs");
+            descriptor->controller_revision_,descriptor->physical_incarnation_,descriptor->phase_,descriptor->barrier_,descriptor->attempt_,descriptor->limits_.codec),"restricted export source compatibility changed");matched=&c;
+    }
+    if(!matched)throw db_error("restricted export physical authenticated source differs"
+        " [first-failed predicates: routeExpired="+std::to_string(missed[0])+
+        ", continuous="+std::to_string(missed[1])+", owner="+std::to_string(missed[2])+
+        ", retired="+std::to_string(missed[3])+", source="+std::to_string(missed[4])+
+        ", viewLive="+std::to_string(missed[5])+", lifecycle="+std::to_string(missed[6])+"]");
     if(originals){require(!originals->empty()&&originals->size()<=8192,"restricted export original window capacity");
         size_t next=0;for(const auto& allowed:matched->unknown_originals)if(next<originals->size()&&allowed==(*originals)[next])++next;
         require(next==originals->size(),"restricted export window outside exact ordered retained-Q candidates");}

@@ -106,7 +106,7 @@ void recovery_continuous_producer::require_no_continuous_route(lattice_db& owner
 std::shared_ptr<database> recovery_continuous_producer::open_writer(const configuration& config,const std::shared_ptr<recovery_continuous_admission>& admission) {
     if(!admission||!admission->state||admission->state->path!=config.path)refuse("continuous writer lacks exact container custody");
     auto writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
-        std::shared_ptr<database_read_control>{},database::initialization_key(admission),config.ordinary_context);
+        std::shared_ptr<database_read_control>{},database::initialization_key(admission),config.ordinary_context,config.wal_extent_limit_bytes);
     writer->suppress_destructor_optimize_=true; // Immutable profile: refusal/close must not run optional ANALYZE.
     auto& state=*admission->state;
     const auto identity=writer->physical_identity("main",{},true);
@@ -517,10 +517,12 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
         try{
             const auto path=owner.config_.path;const auto busy_timeout=owner.config_.busy_timeout_ms;
             const auto schema_version=owner.config_.target_schema_version;const auto recipe=admission->recipe;
+            const auto wal_extent_limit_bytes=owner.config_.wal_extent_limit_bytes;
             const auto policy=state->policy;
-            configured=configured_recovery_connection::create(actual_owner,config,factory,typed,[path,busy_timeout,schema_version,recipe,policy]{
+            configured=configured_recovery_connection::create(actual_owner,config,factory,typed,[path,busy_timeout,schema_version,recipe,policy,wal_extent_limit_bytes]{
                 configuration child(path,std::make_shared<std_thread_scheduler>());
                 child.busy_timeout_ms=busy_timeout;child.target_schema_version=schema_version;
+                child.wal_extent_limit_bytes=wal_extent_limit_bytes;
                 auto opened=open_owned(child,policy,recipe);
                 if(!opened.owner||opened.settlement.state!=recovery_install_state::committed||opened.settlement.postcommit_error){
                     if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);
@@ -544,6 +546,7 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     // never acquire an automatic replacement grant or a new registry charge.
     configuration child(owner.config_.path,std::make_shared<std_thread_scheduler>());
     child.busy_timeout_ms=owner.config_.busy_timeout_ms;child.target_schema_version=owner.config_.target_schema_version;
+    child.wal_extent_limit_bytes=owner.config_.wal_extent_limit_bytes;
     auto opened=open_owned(child,state->policy,owner.recovery_continuous_->recipe);
     if(!opened.owner||opened.settlement.state!=recovery_install_state::committed){if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);refuse("continuous dedicated facade open failed");}
     // This private facade was just given a dedicated scheduler. Public shared

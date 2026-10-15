@@ -338,6 +338,7 @@ void lattice_db::note_history_uncaptured_connection() {
 }
 std::shared_ptr<database> lattice_db::borrow_read_connection() {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     if(config_.ordinary_context)
         detail::ordinary_before_open(config_.path,config_.ordinary_context);
     std::shared_ptr<database> writer, reader;
@@ -368,6 +369,7 @@ std::shared_ptr<database> lattice_db::borrow_read_connection() {
 
 std::shared_ptr<database> lattice_db::borrow_xproc_read_connection() {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     if(config_.ordinary_context)
         detail::ordinary_before_open(config_.path,config_.ordinary_context);
     std::shared_ptr<database> writer, reader, xproc;
@@ -413,6 +415,7 @@ std::vector<database::row_t> lattice_db::query_xproc(
 
 void lattice_db::close_read_db() {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     note_history_uncaptured_connection(); // A removed initial handle may already be retiring off-list.
     std::shared_ptr<database> reader, xproc;
     {
@@ -427,6 +430,7 @@ void lattice_db::close_read_db() {
 
 void lattice_db::close_write_db() {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     note_history_uncaptured_connection(); // A removed initial handle may already be retiring off-list.
     if (active_recovery_install_operations_.load(std::memory_order_acquire) != 0)
         throw db_error("writer close refused during owned recovery install");
@@ -477,11 +481,12 @@ void lattice_db::restore_attached_views(database& connection) {
     // Caller holds attachment admission; this connection is not published.
     if (!attachment_topology_valid_)
         throw db_error("cannot reopen an incomplete attachment topology");
+    const bool typed=config_.ordinary_context||config_.wal_extent_limit_bytes.has_value();
     database::attachment_operation managed_operation(config_.busy_timeout_ms);
-    if(config_.ordinary_context&&(connection.txn_hooks_||connection.txn_hooks_external_))
+    if(typed&&(connection.txn_hooks_||connection.txn_hooks_external_))
         throw db_error("managed topology restoration requires unpublished callback-free handle");
     for (const auto& [alias, path] : attached_dbs_) {
-        if(config_.ordinary_context){
+        if(typed){
             const auto at=attached_cohort_bindings_.find(alias);
             if(at==attached_cohort_bindings_.end())throw db_error("managed restoration lost cohort binding");
             detail::ordinary_cohort_attachment_access::attach(connection,at->second,managed_operation);continue;
@@ -498,14 +503,15 @@ void lattice_db::restore_attached_views(database& connection) {
         }
     }
     for (const auto& [_, sql] : attached_view_sql_) {
-        if(config_.ordinary_context)connection.execute_attachment_sql(sql,managed_operation);
+        if(typed)connection.execute_attachment_sql(sql,managed_operation);
         else connection.execute(sql);
     }
-    if(config_.ordinary_context)managed_operation.finish({});
+    if(typed)managed_operation.finish({});
 }
 
 void lattice_db::reopen_write_db() {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     note_history_uncaptured_connection(); // A staged or displaced connection is not a fixed-field snapshot.
     detail::ordinary_before_open(config_.path,config_.ordinary_context);
     if(recovery_continuous_)throw db_error("continuous writer replacement requires a new admitted facade");
@@ -526,7 +532,7 @@ void lattice_db::reopen_write_db() {
         previous_writer = db_;
     }
     auto staged = database::make_owned_connection(config_.path,
-        database::open_mode::read_write, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_);
+        database::open_mode::read_write, config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_,false,config_.wal_extent_limit_bytes);
     register_sql_functions(*staged);
     {
         // Never wait behind topology while a caller may own the writer mutex.
@@ -579,6 +585,7 @@ void lattice_db::reopen_write_db() {
 
 void lattice_db::reopen_read_db() {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     note_history_uncaptured_connection(); // A staged or displaced connection is not a fixed-field snapshot.
     detail::ordinary_before_open(config_.path,config_.ordinary_context);
     if (config_.is_in_memory()) return;
@@ -1459,6 +1466,7 @@ void lattice_db::setup_sync_if_configured() {
     sync_db_config.target_schema_version = config_.target_schema_version;
     sync_db_config.migration_block = config_.migration_block;
     sync_db_config.ordinary_context = config_.ordinary_context;
+    sync_db_config.wal_extent_limit_bytes = config_.wal_extent_limit_bytes;
     auto sync_db = (config_.ordinary_policy==ordinary_sync_policy::ordered_required||config_.ordinary_policy==ordinary_sync_policy::ordered_history_required)
         ?detail::ordinary_export_access::child(*this,sync_db_config)
         :std::make_unique<lattice_db>(sync_db_config);
@@ -1610,6 +1618,7 @@ void lattice_db::setup_ipc_if_configured() {
                 ipc_db_config.target_schema_version = config_.target_schema_version;
                 ipc_db_config.migration_block = config_.migration_block;
                 ipc_db_config.ordinary_context = config_.ordinary_context;
+    ipc_db_config.wal_extent_limit_bytes = config_.wal_extent_limit_bytes;
                 auto ipc_db = std::make_unique<lattice_db>(ipc_db_config);
 
                 LOG_INFO("ipc_sync", "[%s] Creating synchronizer (replacing old=%p)",
@@ -1723,6 +1732,8 @@ void lattice_db::attach(lattice_db &lattice) {
 void lattice_db::attach_with_metadata(lattice_db& lattice, std::shared_ptr<const void> metadata) {
     detail::ordinary_require_creator(config_.ordinary_context);
     detail::ordinary_require_creator(lattice.config_.ordinary_context);
+    require_catalog_callback_absent();
+    lattice.require_catalog_callback_absent();
     database::attachment_operation operation(config_.busy_timeout_ms, lattice.config_.busy_timeout_ms);
     std::exception_ptr primary;
     try {
@@ -1800,10 +1811,10 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
             if (existing_path == lattice.config_.path) {
                 if (!attached_route_tokens_.count(alias))
                     throw std::runtime_error("attach: incomplete prior topology change; detach before retry");
-                if(config_.ordinary_context){
+                if(config_.ordinary_context||config_.wal_extent_limit_bytes||lattice.config_.wal_extent_limit_bytes){
                     const auto at=attached_cohort_bindings_.find(alias);
                     if(at==attached_cohort_bindings_.end())throw db_error("managed retained binding missing");
-                    detail::ordinary_cohort_attachment_access::validate_target(at->second,source_identity,operation.deadline);
+                    detail::ordinary_cohort_attachment_access::validate_target(at->second,source_identity,lattice.config_.wal_extent_limit_bytes,operation.deadline);
                     validate_source();auto lock=operation.lock(connection_ownership_mutex_);validate_recipient_locked();operation.check();
                 }
                 return;
@@ -1869,7 +1880,8 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
     if (next_attachment_token_ == std::numeric_limits<int64_t>::max())
         throw std::runtime_error("attach: attachment generation exhausted");
     const int64_t token = next_attachment_token_++;
-    const auto recipient_identity=(config_.ordinary_context||lattice.config_.ordinary_context)?
+    const auto recipient_identity=(config_.ordinary_context||lattice.config_.ordinary_context||
+        config_.wal_extent_limit_bytes||lattice.config_.wal_extent_limit_bytes)?
         writer->attachment_physical_identity(operation):std::shared_ptr<const physical_store_identity>{};
     auto cohort=detail::ordinary_cohort_attachment_access::bind(*this,lattice,alias,token,source_identity,recipient_identity,operation);
     if(cohort){
@@ -1934,6 +1946,7 @@ void lattice_db::attach_with_metadata_impl(lattice_db& lattice, std::shared_ptr<
 
 void lattice_db::detach(lattice_db &lattice) {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     database::attachment_operation operation(config_.busy_timeout_ms);
     std::exception_ptr primary;
     try {
@@ -1966,6 +1979,7 @@ void lattice_db::detach(lattice_db &lattice) {
 
 void lattice_db::detach_alias(const std::string& alias) {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     database::attachment_operation operation(config_.busy_timeout_ms);
     std::exception_ptr primary;
     try {
@@ -1993,6 +2007,7 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
                                         std::optional<int64_t> expected_token,
                                         database::attachment_operation& operation) {
     detail::ordinary_require_creator(config_.ordinary_context);
+    require_catalog_callback_absent();
     if (detail::managed_route_scope::active_for(this))
         throw db_error("detach: topology mutation during managed scalar access");
     std::vector<std::shared_ptr<database>> handles;
@@ -2037,7 +2052,7 @@ void lattice_db::detach_alias_if_current(const std::string& alias,
     // remaining aliases happens after the DETACH).
     for (const auto& handle : handles) {
         for (const auto& view : attached_view_names_) {
-            handle->execute_attachment_sql("DROP VIEW IF EXISTS \"" + view + "\"", operation);
+            handle->execute_attachment_sql("DROP VIEW IF EXISTS temp.\"" + view + "\"", operation);
         }
     }
     attached_view_names_.clear();
@@ -2087,7 +2102,7 @@ void lattice_db::rebuild_attached_views(const std::vector<std::shared_ptr<databa
     std::map<std::string, std::string> rebuilt_sql;
     for (const auto& handle : handles) {
         for (const auto& view : attached_view_names_) {
-            handle->execute_attachment_sql("DROP VIEW IF EXISTS \"" + view + "\"", operation);
+            handle->execute_attachment_sql("DROP VIEW IF EXISTS temp.\"" + view + "\"", operation);
         }
     }
     attached_view_names_.clear();

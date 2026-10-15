@@ -866,3 +866,52 @@ TEST_F(RecoveryCancelPreservation, SuccessfulCancellationPreservesSettledAndOthe
         EXPECT_EQ(installs().read(profile.binding.channel)->last_installed,prior);EXPECT_EQ(installs().read(profile.binding.channel)->last_sequence,2);
     });
 }
+
+
+TEST_F(RecoveryObligationStore, AddressedFindUsesFourReadsAndPreservesCanonicalPresentAndMissingResults) {
+    const auto e=add(1201);auto s=storage();
+    committed([&](auto& db){
+        const auto before=db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original");
+        const auto usage=s.usage();
+        auto count=lattice::database::thread_statement_count();
+        const auto found=s.find(address,lower(e.record.original_id));
+        const auto present_reads=lattice::database::thread_statement_count()-count;
+        ASSERT_TRUE(found);EXPECT_EQ(*found,e);EXPECT_EQ(present_reads,4u);
+        count=lattice::database::thread_statement_count();
+        const auto missing=s.find(address,gid(1202));
+        const auto missing_reads=lattice::database::thread_statement_count()-count;
+        EXPECT_FALSE(missing);EXPECT_EQ(missing_reads,3u);
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original"),before);
+        EXPECT_EQ(s.usage(),usage);s.audit();
+    });
+}
+TEST_F(RecoveryObligationStore, AddressedFindStillRefusesCounterCoverageAndCorruptReceiptWithoutRepair) {
+    const auto e=add(1203);auto s=storage();
+    committed([&](auto& db){
+        s.claim_export(address,{e.record.original_id});
+        const auto found=s.find(address,e.record.original_id);ASSERT_TRUE(found);ASSERT_TRUE(found->first_export_claim);
+        const auto before=db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original");
+        const auto counters=db.query("SELECT * FROM _lattice_obligation_store");
+        db.execute("SAVEPOINT find_export_counter");
+        db.execute("UPDATE _lattice_obligation_store SET export_sequence=0");
+        const auto lowered=db.query("SELECT * FROM _lattice_obligation_store");
+        expect(error::corrupt_state,[&]{s.find(address,e.record.original_id);});
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_store"),lowered);
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original"),before);
+        db.execute("ROLLBACK TO find_export_counter");db.execute("RELEASE find_export_counter");
+        db.execute("SAVEPOINT find_record_counter");
+        db.execute("UPDATE _lattice_obligation_store SET records=0");
+        expect(error::corrupt_state,[&]{s.find(address,e.record.original_id);});
+        db.execute("ROLLBACK TO find_record_counter");db.execute("RELEASE find_record_counter");
+        db.execute("SAVEPOINT find_receipt");
+        db.execute("UPDATE _lattice_obligation_entry SET ack_position=1 WHERE channel=? AND original=?",
+            {encoded(address.channel),encoded(e.canonical_original_id)});
+        const auto corrupt=db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original");
+        expect(error::corrupt_state,[&]{s.find(address,e.record.original_id);});
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original"),corrupt);
+        db.execute("ROLLBACK TO find_receipt");db.execute("RELEASE find_receipt");
+        EXPECT_EQ(s.find(address,e.record.original_id),found);
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_store"),counters);
+        EXPECT_EQ(db.query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original"),before);s.audit();
+    });
+}

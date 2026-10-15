@@ -1,6 +1,7 @@
 #include <lattice.hpp>
 #include <filesystem>
 #include <array>
+#include <cstdint>
 #include <atomic>
 #include <mutex>
 #include "../../LatticeCore/src/database_retirement.hpp"
@@ -15,6 +16,170 @@
 #include <LatticeBridge.hpp>
 #include <nlohmann/json.hpp>  // bundled in ../LatticeCore/include (header search path)
 #include "../../LatticeCore/src/vendor/picosha2/picosha2.h"
+
+namespace lattice {
+namespace {
+// Fixed scratch and finite traversal; no SQL, owner calls or error-bank writes.
+class ordinary_error_diagnostic {
+    static constexpr std::size_t limit = 2048;
+    static constexpr unsigned depth_limit = 4, node_limit = 16;
+    std::array<char, limit + 1> text_{};
+    std::array<const std::exception*, depth_limit> active_{};
+    std::array<const char*, depth_limit + 1> labels_{};
+    std::size_t size_ = 0;
+    unsigned nodes_ = 0;
+    bool truncated_ = false;
+
+    void append(const char* value) noexcept {
+        if (!value) value = "[message-unknown]";
+        while (*value) {
+            if (size_ == limit) { truncated_ = true; return; }
+            text_[size_++] = *value++;
+        }
+    }
+    bool full() const noexcept { return size_ == limit; }
+    void presence(const char* label, const std::exception_ptr& error) noexcept {
+        append(","); append(label); append(error ? "=present" : "=absent");
+    }
+    void number(int value) noexcept {
+        const auto signed_value = static_cast<std::int64_t>(value);
+        auto magnitude = signed_value < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(signed_value)
+                                          : static_cast<std::uint64_t>(signed_value);
+        std::array<char, 24> digits{};
+        std::size_t count = 0;
+        do { digits[count++] = static_cast<char>('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
+        if (signed_value < 0) append("-");
+        while (count) { const char digit[]{digits[--count], '\0'}; append(digit); }
+    }
+    static const char* phase(detail::recovery_install_state value) noexcept {
+        switch (value) {
+            case detail::recovery_install_state::refused: return "refused";
+            case detail::recovery_install_state::rolled_back: return "rolled_back";
+            case detail::recovery_install_state::committed: return "committed";
+            case detail::recovery_install_state::unsettled: return "unsettled";
+            case detail::recovery_install_state::ownership_lost: return "ownership_lost";
+        }
+        return "[phase-unknown]";
+    }
+    static const char* deferred(detail::recovery_install_deferred value) noexcept {
+        switch (value) {
+            case detail::recovery_install_deferred::none: return "none";
+            case detail::recovery_install_deferred::connection_mutex: return "connection_mutex";
+            case detail::recovery_install_deferred::engine_read: return "engine_read";
+            case detail::recovery_install_deferred::store_gate: return "store_gate";
+            case detail::recovery_install_deferred::core_write: return "core_write";
+        }
+        return "[deferred-unknown]";
+    }
+    void path(unsigned depth) noexcept {
+        if (!depth) { append("root"); return; }
+        for (unsigned at = 1; at <= depth; ++at) {
+            if (at != 1) append(".");
+            append(labels_[at]);
+        }
+    }
+    void marker(const char* value, unsigned depth, bool messages) noexcept {
+        if (messages) { append(";"); path(depth); append(":"); }
+        append(value);
+    }
+    void nested(const char* label, const std::exception_ptr& error, unsigned depth, bool messages) noexcept {
+        if (!error) return;
+        if (full()) { truncated_ = true; return; }
+        labels_[depth] = label; // depth is at most depth_limit, before refusal below.
+        if (!messages) { append(";"); append(label); append(":"); }
+        if (depth >= depth_limit) { marker("[depth-limit;further-errors-unknown]", depth, messages); return; }
+        if (nodes_ >= node_limit) { marker("[node-limit;further-errors-unknown]", depth, messages); return; }
+        try { std::rethrow_exception(error); }
+        catch (const std::exception& value) { describe(value, depth, messages); }
+        catch (...) { ++nodes_; marker("[non-std-exception;message-unknown]", depth, messages); }
+    }
+    void describe(const std::exception& error, unsigned depth, bool messages) noexcept {
+        if (full()) { truncated_ = true; return; }
+        if (nodes_ >= node_limit) { marker("[node-limit;further-errors-unknown]", depth, messages); return; }
+        for (unsigned at = 0; at < depth; ++at)
+            if (active_[at] == &error) { marker("[cycle;further-errors-unknown]", depth, messages); return; }
+        ++nodes_;
+        active_[depth] = &error;
+        if (const auto* owned = dynamic_cast<const detail::ordinary_order_write_error*>(&error)) {
+            const auto& value = owned->settlement;
+            if (!messages) {
+                append("ordinary-owned-error{phase="); append(phase(value.state));
+                append(",deferred="); append(deferred(value.deferred));
+                append(value.unexpected_commit_observed ? ",unexpected_commit=true" : ",unexpected_commit=false");
+                presence("primary", value.primary_error); presence("cleanup", value.cleanup_error);
+                presence("postcommit", value.postcommit_error); presence("notification", value.notification_error);
+                append("}");
+            }
+            nested("primary", value.primary_error, depth + 1, messages);
+            nested("cleanup", value.cleanup_error, depth + 1, messages);
+            nested("postcommit", value.postcommit_error, depth + 1, messages);
+            nested("notification", value.notification_error, depth + 1, messages);
+        } else if (const auto* checked = dynamic_cast<const detail::ordinary_checked_open_error*>(&error)) {
+            if (!messages) {
+                append("ordinary-checked-open-error{retirement="); append(checked->retirement ? "retained" : "absent");
+                append(",context="); append(checked->retained_context ? "retained" : "absent");
+                if (checked->retirement) {
+                    const auto observed = checked->retirement->state();
+                    append(",retirement_phase_observed=");
+                    using retirement_phase = detail::database_retirement_state::phase;
+                    append(observed == retirement_phase::closed ? "closed" :
+                           observed == retirement_phase::close_unproved ? "close_unproved" :
+                           observed == retirement_phase::live ? "live" : "[phase-unknown]");
+                    append(",checked_close="); number(checked->retirement->checked_close_result());
+                    append(",fallback_close="); number(checked->retirement->fallback_close_result());
+                    append(checked->retirement->raw_handle_escaped() ? ",raw_escape=true" : ",raw_escape=false");
+                    append(checked->retirement->owning_wrapper_moved() ? ",wrapper_moved=true" : ",wrapper_moved=false");
+                }
+                presence("primary", checked->primary_error); presence("cleanup", checked->cleanup_error); append("}");
+            }
+            nested("primary", checked->primary_error, depth + 1, messages);
+            nested("cleanup", checked->cleanup_error, depth + 1, messages);
+        } else if (messages) {
+            append(";"); path(depth); append(":");
+            const auto* what = error.what();
+            append(what && *what ? what : "[empty-exception-message]");
+        } else {
+            append("std-exception");
+        }
+        active_[depth] = nullptr;
+    }
+public:
+    void format(const std::exception& error) noexcept {
+        if (!dynamic_cast<const detail::ordinary_order_write_error*>(&error) &&
+            !dynamic_cast<const detail::ordinary_checked_open_error*>(&error)) {
+            append(error.what()); // A valid empty unrelated what() remains exactly empty.
+        } else {
+            describe(error, 0, false); // All bounded structured facts precede cause text.
+            append(";causes"); nodes_ = 0; active_.fill(nullptr);
+            describe(error, 0, true);
+        }
+        if (truncated_) {
+            constexpr char suffix[] = "[truncated]";
+            for (std::size_t at = 0; at < sizeof(suffix) - 1; ++at)
+                text_[limit - (sizeof(suffix) - 1) + at] = suffix[at];
+        }
+        text_[size_] = '\0';
+    }
+    const char* data() const noexcept { return text_.data(); }
+    std::size_t size() const noexcept { return size_; }
+};
+}
+void assign_ordinary_bridge_exception(std::string& destination, const std::exception& error) noexcept {
+    try {
+        ordinary_error_diagnostic diagnostic; diagnostic.format(error);
+        destination.assign(diagnostic.data(), diagnostic.size());
+    } catch (...) {
+        try { destination = "[diagnostic-unavailable]"; } catch (...) {}
+    }
+}
+bool record_ordinary_bridge_exception(const std::exception& error) noexcept {
+    if (!dynamic_cast<const detail::ordinary_order_write_error*>(&error) &&
+        !dynamic_cast<const detail::ordinary_checked_open_error*>(&error)) return false;
+    try { assign_ordinary_bridge_exception(last_bridge_error(), error); }
+    catch (...) {} // Preserve sealing even if the thread-local destination cannot initialize.
+    return true; // Recognized failure, independently of diagnostic allocation.
+}
+} // namespace lattice
 
 // Thread-local state for migration lookup functions
 static thread_local lattice::swift_lattice* g_migration_lattice = nullptr;
@@ -279,6 +444,9 @@ std::shared_ptr<swift_lattice> swift_lattice::open_managed_ordinary(const swift_
     detail::ordinary_require_creator(context);
     if(!context||config.ordinary_context!=context)throw db_error("checked open requires exact receiver context");
     if(!dormant_end)detail::ordinary_before_open(config.path,context);
+    const auto issued_wal_limit=context->wal_extent_limit_bytes(config.path);
+    if(!config.wal_extent_limit_bytes||*config.wal_extent_limit_bytes!=issued_wal_limit)
+        throw db_error("checked open requires its normalized receiver WAL policy");
     if(config.is_in_memory()||config.read_only||config.is_sync_enabled()||config.is_ipc_enabled()||
        config.audit_retention_seconds!=0||config.migration_block||config.row_migration_fn_||
        !config.migration_schemas_.empty()||config.managed_product_credentials||config.target_schema_version<=0||
@@ -321,7 +489,7 @@ std::shared_ptr<swift_lattice> swift_lattice::open_managed_ordinary(const swift_
         std::shared_ptr<database_read_control> preparation_control;
         if(dormant_end){preparation_control=std::make_shared<database_read_control>();preparation_control->deadline=*dormant_end;}
         writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
-            preparation_control,database::initialization_key(expected,context,retirement),context);
+            preparation_control,database::initialization_key(expected,context,retirement),context,config.wal_extent_limit_bytes);
         if(dormant_end)detail::ordinary_export_access::validate_managed_group_open(context,admission,config.path,
             expected->device,expected->inode,*dormant_end);
         else detail::ordinary_before_open(config.path,context);
@@ -370,6 +538,7 @@ void swift_lattice::open_managed_group_receiver(const swift_configuration& suppl
     auto config=supplied;
     if(config.ordinary_context&&config.ordinary_context!=context)throw db_error("dormant GROUP configuration context differs");
     config.ordinary_context=context;
+    config.wal_extent_limit_bytes=detail::ordinary_select_wal_extent_limit(config.path,context,config.wal_extent_limit_bytes);
     retained=open_managed_ordinary(config,schemas,context,admission,&end,&opening_claimed);
     // Real owner retention precedes any hook installation or later preservation
     // failure. No normal update buffering, observer registration, notifier,
@@ -499,7 +668,7 @@ std::shared_ptr<swift_lattice> swift_lattice::open_checked_mounted_server(
         attempt.will_open_native();
         writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
             std::shared_ptr<database_read_control>{},database::initialization_key(expected,retirement,
-                database::initialization_key::mounted_server_key{}),detail::ordinary_context{});
+                database::initialization_key::mounted_server_key{}),detail::ordinary_context{},config.wal_extent_limit_bytes);
         owner=std::shared_ptr<swift_lattice>(new swift_lattice(config,schemas,std::move(catalog),writer,
             lattice_db::checked_mounted_server_existing_key{}));
         detail::ordinary_export_access::validate_checked_mounted_server_schema(*owner,*expected);
@@ -532,6 +701,28 @@ std::shared_ptr<swift_lattice> swift_lattice::open_checked_mounted_server(
 #endif
 }
 
+namespace {
+// Schema-bearing read-only opens must enforce the same upper version bound
+// without entering ensure_swift_tables, migration, DDL or background repair.
+void require_read_only_swift_version(database& connection,int target_version) {
+    const auto rows=connection.query("SELECT value FROM _lattice_meta WHERE key = 'schema_version'");
+    int current_version=1; // Same explicit legacy missing-key default as get_schema_version().
+    if(!rows.empty()) {
+        if(rows.size()!=1)throw db_error("read-only schema version metadata is not singular");
+        const auto& value=std::get<std::string>(rows.front().at("value"));
+        if(value.empty()||value.find_first_not_of("0123456789")!=std::string::npos)
+            throw db_error("read-only schema version metadata is invalid");
+        // Query/type/range failures propagate; none become a permissive default.
+        current_version=std::stoi(value);
+        if(current_version<=0)throw db_error("read-only schema version metadata is invalid");
+    }
+    if(current_version>target_version)
+        throw std::runtime_error("Database schema version ("+std::to_string(current_version)+
+            ") is newer than this binary supports ("+std::to_string(target_version)+
+            "). Update the application.");
+}
+}
+
 swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVector& schemas)
     : lattice_db(config, /*defer_sync=*/true,recovery_catalog(config,schemas)), swift_resources_(config) {
     LOG_DEBUG("swift_lattice", "ctor start path=%s schemas=%zu read_only=%d", config.path.c_str(), schemas.size(), config.read_only);
@@ -543,6 +734,7 @@ swift_lattice::swift_lattice(const swift_configuration& config, const SchemaVect
         lattice_db::setup_sync_if_configured();
         lattice_db::setup_ipc_if_configured();
     } else {
+        if(!schemas.empty())require_read_only_swift_version(db(),swift_config_.target_schema_version);
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
             schemas_[entry.table_name] = entry.properties;
@@ -559,6 +751,7 @@ swift_lattice::swift_lattice(swift_configuration&& config, const SchemaVector& s
         lattice_db::setup_sync_if_configured();
         lattice_db::setup_ipc_if_configured();
     } else {
+        if(!schemas.empty())require_read_only_swift_version(db(),swift_config_.target_schema_version);
         // In read-only mode, just store schemas without creating tables
         for (const auto& entry : schemas) {
             schemas_[entry.table_name] = entry.properties;

@@ -119,6 +119,7 @@ add_library(LatticeCore STATIC
     Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
     Sources/LatticeCore/src/projection.cpp
+    Sources/LatticeCore/src/owned_catalog.cpp
     Sources/LatticeCore/src/projection_memory.cpp
     Sources/LatticeCore/src/projection_capture_policy.cpp
     Sources/LatticeCore/src/cross_process_notifier_darwin.cpp
@@ -279,6 +280,8 @@ target_link_libraries(gtest_main PUBLIC gtest)
 # LatticeTests - GoogleTest-based test suite
 # =============================================================================
 add_executable(LatticeCoreTests
+    Tests/LatticeCoreTests/WalExtentBudgetTests.cpp
+    Tests/LatticeCoreTests/HistoricalWalCheckpointTests.cpp
     Tests/LatticeCoreTests/Vec0Tests.cpp
     Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp
     Tests/LatticeCoreTests/ExactVectorRowsTests.cpp
@@ -314,6 +317,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/RecoveryWitnessTests.cpp
     Tests/LatticeCoreTests/RecoveryRefreshWorkerTests.cpp
     Tests/LatticeCoreTests/RecoveryRefreshBridgeTests.cpp
+    Tests/LatticeCoreTests/OrdinaryErrorDiagnosticBridgeTests.cpp
     Tests/LatticeCoreTests/RecoveryRefreshAdmissionTests.cpp
     Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
     Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp
@@ -401,7 +405,9 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp
     Tests/LatticeCoreTests/BulkMutationTests.cpp
     Tests/LatticeCoreTests/ProjectionReadTests.cpp
+    Tests/LatticeCoreTests/OwnedCatalogStreamTests.cpp
     Tests/LatticeCoreTests/OrdinaryPagedHistoryTests.cpp
+    Tests/LatticeCoreTests/OrdinaryFingerprintTests.cpp
     Tests/LatticeCoreTests/TopologyAdmissionTests.cpp
     Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp
     Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp
@@ -479,6 +485,20 @@ if(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
         target_compile_definitions(LatticeInstallationLauncher PRIVATE
             LATTICE_ENGRAM_${stamp}_HEADER="${LATTICE_RECLAMATION_${stamp}_HEADER}")
     endforeach()
+endif()
+option(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE "Continue the genuine debug owner through real receiving history (never release)" OFF)
+if(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+    if(NOT LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+        message(FATAL_ERROR "Positive history qualification requires the genuine debug owner build")
+    endif()
+    target_compile_definitions(LatticeCore PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+endif()
+option(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_EXTRA_ALIAS "Hold one actual Conn alias through first refusal, then release for genuine collection (debug qualification only)" OFF)
+if(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_EXTRA_ALIAS)
+    if(NOT LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+        message(FATAL_ERROR "Extra Conn alias requires the genuine debug history owner build")
+    endif()
+    target_compile_definitions(LatticeCore PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_EXTRA_ALIAS)
 endif()
 if(LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
     if(NOT APPLE OR NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")

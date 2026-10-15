@@ -8,7 +8,7 @@ namespace lattice::detail {
 enum class recovery_install_state { refused, rolled_back, committed, unsettled, ownership_lost };
 // Internal controller/automatic-export no-effect outcome. Never a transaction
 // settlement and is never set after notification reservation or BEGIN.
-enum class recovery_install_deferred { none, connection_mutex, engine_read, store_gate };
+enum class recovery_install_deferred { none, connection_mutex, engine_read, store_gate, core_write };
 struct recovery_install_result {
     recovery_install_deferred deferred = recovery_install_deferred::none;
     recovery_install_state state = recovery_install_state::refused;

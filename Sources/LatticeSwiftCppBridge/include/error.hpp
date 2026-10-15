@@ -40,6 +40,12 @@ inline void record_bridge_error(const char* message) noexcept {
     catch (...) {} // Keep any diagnostic already present if recording fails.
 }
 
+// The ordinary adapter reads retained first-error banks without changing them.
+// It writes at most 2048 bytes; failure/validity never comes from this text.
+void assign_ordinary_bridge_exception(std::string&, const std::exception&) noexcept;
+// False leaves unrelated exceptions on the unchanged generic sealed path.
+bool record_ordinary_bridge_exception(const std::exception&) noexcept;
+
 /// Run a Swift-facing bridge body under the sealed contract: clear the
 /// error slot, catch any C++ exception, stash its message, and return a
 /// default-constructed value ({} / 0 / "" / empty vector) in its place.
@@ -49,12 +55,14 @@ decltype(auto) sealed(F&& f) {
     using R = decltype(f());
     if constexpr (std::is_void_v<R>) {
         try { f(); }
-        catch (const std::exception& e) { record_bridge_error(e.what()); }
+        catch (const std::exception& e) {
+            if (!record_ordinary_bridge_exception(e)) record_bridge_error(e.what());
+        }
         catch (...) { record_bridge_error("Unknown C++ bridge exception"); }
     } else {
         try { return f(); }
         catch (const std::exception& e) {
-            record_bridge_error(e.what());
+            if (!record_ordinary_bridge_exception(e)) record_bridge_error(e.what());
             return R{};
         }
         catch (...) {

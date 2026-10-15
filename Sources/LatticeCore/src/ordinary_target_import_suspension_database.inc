@@ -6,6 +6,7 @@ namespace lattice {
 struct database::target_staging_state::import_suspension_native {
     using program_type=detail::ordinary_group_target_schema_original::import_suspension_program;
     using purpose=program_type::purpose;
+    terminal_native_static_tail terminal_static; // FIRST: actual Native member tail, no shared-owner ending grant.
     database* const shell;
     const std::weak_ptr<detail::ordinary_group_target_receiving_owner> owner;
     const std::weak_ptr<detail::ordinary_group_target_schema_original> schema;
@@ -34,7 +35,7 @@ struct database::target_staging_state::import_suspension_native {
     std::exception_ptr first_failure;
     import_suspension_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
         const std::shared_ptr<detail::ordinary_group_target_schema_original>& original,const std::shared_ptr<program_type>& input)
-        :shell(&actual),owner(receiving),schema(original),program(input),commit(input->operations.size()+1),rollback(commit+1) {
+        :terminal_static(actual,this,original.get(),3,receiving),shell(&actual),owner(receiving),schema(original),program(input),commit(input->operations.size()+1),rollback(commit+1) {
         const auto state=actual.target_staging_;
         if(!state||!state->history_chain||!state->history_chain->active||!program||
            program->operations.size()>program_type::maximum_operations)
@@ -54,6 +55,7 @@ struct database::target_staging_state::import_suspension_native {
             if(operation.kind==purpose::require_absent)statement.binding=&operation.name;
         }
         // Every VM/call/rollback slot is charged and retained before BEGIN.
+        terminal_static.constructor_returned();
     }
     void add(std::size_t n) {
         if(n>ordinary_history_limits::stage_scratch_bytes-logical_bytes)
@@ -220,10 +222,10 @@ struct database::target_staging_state::import_suspension_native {
 };
 bool database::target_import_suspension_native_ending_()const noexcept {
     const auto state=target_staging_;const auto original=state?state->import_suspension:nullptr;
-    return state&&state->current_creator()&&original&&original->shell==this&&original->native_ending_known();
+    return state&&state->current_creator()&&!state->terminal_native_statics_attempted&&original&&original->shell==this&&original->native_ending_known();
 }
 bool database::target_import_suspension_cleanup_ending_()const noexcept {
-    const auto state=target_staging_;if(!state||!state->current_creator())return false;
+    const auto state=target_staging_;if(!state||!state->current_creator()||state->terminal_native_statics_attempted)return false;
     return !state->import_suspension||state->import_suspension->cleanup_known();
 }
 void database::require_target_import_suspension_issued_(const detail::ordinary_target_staging_connection& connection,

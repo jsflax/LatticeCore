@@ -72,11 +72,25 @@ database* recovery_writer_access::active_writer(lattice_db& owner) {
     }
     // Refuse another thread before any SQLite call: the admitted maintenance
     // frame may hold that connection while waiting for this caller to finish.
-    if (owner.is_closed() || owner.txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
-        !owner.owns_write_transaction()) return nullptr;
+    if (owner.is_closed() || owner.txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id())
+        return nullptr;
     auto& writer = owner.db();
     auto* h = writer.internal_handle();
-    if (writer.is_closed() || writer.channel_reset_unsettled_.load(std::memory_order_acquire) || sqlite3_get_autocommit(h) != 0 ||
+    if (!h || writer.is_closed()) return nullptr;
+    auto* mutex = sqlite3_db_mutex(h);
+#ifndef __EMSCRIPTEN__
+    if (!mutex) return nullptr;
+#endif
+    if (sqlite3_mutex_try(mutex) != SQLITE_OK) return nullptr;
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    // The old routing stamp is only a necessary check. Actual database
+    // settlement retires physical Core origin; a raw successor cannot inherit
+    // it. A recycled thread id must also match this live TLS original. Public
+    // native escape prevents proving any later external settlement sequence.
+    if (writer.is_closed() || writer.raw_handle_escaped_.load(std::memory_order_acquire) ||
+        writer.core_transaction_thread_ != std::this_thread::get_id() ||
+        !writer.core_transaction_origin_current_locked_() || !owner.owns_write_transaction() ||
+        writer.channel_reset_unsettled_.load(std::memory_order_acquire) || sqlite3_get_autocommit(h) != 0 ||
         sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE) return nullptr;
     return &writer;
 }
@@ -512,11 +526,12 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
         };
         using admission = database::maintenance_scope::admission;
         const auto deferred_reason = [](admission value) {
-            return value == admission::mutex_busy ? recovery_install_deferred::connection_mutex
-                                                  : recovery_install_deferred::engine_read;
+            if (value == admission::mutex_busy) return recovery_install_deferred::connection_mutex;
+            if (value == admission::core_write_busy) return recovery_install_deferred::core_write;
+            return recovery_install_deferred::engine_read;
         };
         if (controller_try) {
-            const auto initial = database::maintenance_scope::controller_probe(*writer);
+            const auto initial = database::maintenance_scope::controller_probe(*writer, &owner->txn_owner_thread_);
             if (initial != admission::ready) { defer(deferred_reason(initial)); return result; }
             if (recovery_admission_test_hooks::after_initial_probe) recovery_admission_test_hooks::after_initial_probe();
         } else if (initial_admission_busy) {
@@ -545,7 +560,8 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                 } else memory_gate = std::unique_lock<std::recursive_timed_mutex>(owner->vec0_memory_maintenance_gate_);
             }
             admission admitted = admission::ready;
-            database::maintenance_scope maintenance(*writer, controller_try ? &admitted : nullptr);
+            database::maintenance_scope maintenance(*writer, controller_try ? &admitted : nullptr,
+                controller_try ? &owner->txn_owner_thread_ : nullptr);
             if (admitted != admission::ready) { defer(deferred_reason(admitted)); return result; }
             auto* context = writer->lattice_update_hook_context_.get();
             {

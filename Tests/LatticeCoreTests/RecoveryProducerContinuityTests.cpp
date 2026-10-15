@@ -759,9 +759,20 @@ TEST_F(RecoveryProducerContinuity, ReadOnlyClassificationFailuresNeverCacheAbsen
     EXPECT_EQ(snapshot(),before);
 }
 TEST_F(RecoveryProducerContinuity, ReadOnlyCopiedAndAliasedProtectedFilesStillRefuseRawAndLegacyExport) {
-    open();owner->add(ContinuousSharedRow{"copied"});owner->close();owner.reset();
+    open();owner->add(ContinuousSharedRow{"copied"});
+    // Retain a complete, closed WAL cohort for the physical-copy fixture.
+    // A MAIN-only WAL database cannot be opened read-only on every SQLite VFS.
+    int persist_wal=1;
+    ASSERT_EQ(sqlite3_file_control(canonical_writer_custody_test_access::fault_handle(owner->db()),
+                                  "main",SQLITE_FCNTL_PERSIST_WAL,&persist_wal),SQLITE_OK);
+    owner->close();owner.reset();
     TempDB copied{"continuous_readonly_copy"};
-    std::filesystem::copy_file(config().path,copied.str(),std::filesystem::copy_options::overwrite_existing);
+    for(const char* suffix:{"","-wal","-shm"}) {
+        const auto original=config().path+suffix,destination=copied.str()+suffix;
+        ASSERT_TRUE(std::filesystem::is_regular_file(original));
+        ASSERT_TRUE(std::filesystem::copy_file(original,destination,std::filesystem::copy_options::overwrite_existing));
+        ASSERT_EQ(std::filesystem::file_size(destination),std::filesystem::file_size(original));
+    }
     {
         database copy=diagnostic_readonly_open(copied.str(),"copied-main",config().path);
         EXPECT_EQ(number(copy,"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
@@ -798,25 +809,72 @@ struct negotiated_phase_trace {
     enum phase {begin,claim_precommit,claim_committed,handoff,publication,worker_entered,worker_expired,worker_finished,window_observed,ack_requested,permits_released,cleanup_released};
     struct sample {uint64_t micros=0;unsigned stage=0;size_t first=0,second=0;};
     std::mutex mutex;std::array<sample,64> samples{};size_t count=0,omitted=0;
+    // Fixed first-expiry DATA survives a saturated chronological prefix.
+    sample first_expiry{},last_progress{},progress_at_first_expiry{};
+    bool first_expiry_observed=false,last_progress_observed=false,progress_at_first_expiry_observed=false;
     const std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
     void record(phase stage,size_t first=0,size_t second=0)noexcept {
         const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-started).count();
         std::lock_guard lock(mutex);
+        const sample actual{elapsed>0?static_cast<uint64_t>(elapsed):0,static_cast<unsigned>(stage),first,second};
+        if(stage==worker_expired&&!first_expiry_observed){
+            first_expiry=actual;first_expiry_observed=true;
+            progress_at_first_expiry=last_progress;progress_at_first_expiry_observed=last_progress_observed;
+        }
+        if(stage!=worker_entered&&stage!=worker_expired&&stage!=worker_finished){
+            last_progress=actual;last_progress_observed=true;
+        }
         if(count==samples.size()){if(omitted!=std::numeric_limits<size_t>::max())++omitted;return;}
-        samples[count++]={elapsed>0?static_cast<uint64_t>(elapsed):0,static_cast<unsigned>(stage),first,second};
+        samples[count++]=actual;
     }
 };
 struct negotiated_failure_phases {
+    const char* const case_label;
+    explicit negotiated_failure_phases(const char* actual_case="twoThousandWindow"):case_label(actual_case){}
     std::shared_ptr<negotiated_phase_trace> trace=std::make_shared<negotiated_phase_trace>();
     ~negotiated_failure_phases(){
         if(!::testing::Test::HasFailure())return;
         std::array<negotiated_phase_trace::sample,64> samples;size_t count,omitted;
-        {std::lock_guard lock(trace->mutex);samples=trace->samples;count=trace->count;omitted=trace->omitted;}
-        std::fprintf(stderr,"LATTICE_UPLOAD_PHASE {\"version\":1,\"case\":\"twoThousandWindow\",\"omitted\":%zu,\"samples\":[",omitted);
+        negotiated_phase_trace::sample first_expiry,progress_at_first_expiry;
+        bool first_expiry_observed,progress_at_first_expiry_observed;
+        {std::lock_guard lock(trace->mutex);samples=trace->samples;count=trace->count;omitted=trace->omitted;
+            first_expiry=trace->first_expiry;first_expiry_observed=trace->first_expiry_observed;
+            progress_at_first_expiry=trace->progress_at_first_expiry;progress_at_first_expiry_observed=trace->progress_at_first_expiry_observed;}
+        std::fprintf(stderr,"LATTICE_UPLOAD_PHASE {\"version\":1,\"case\":\"%s\",\"omitted\":%zu,\"samples\":[",case_label,omitted);
         for(size_t i=0;i<count;++i)std::fprintf(stderr,"%s[%llu,%u,%zu,%zu]",i?",":"",static_cast<unsigned long long>(samples[i].micros),samples[i].stage,samples[i].first,samples[i].second);
-        std::fprintf(stderr,"]}\n");
+        std::fprintf(stderr,"],\"firstExpiry\":");
+        if(first_expiry_observed)std::fprintf(stderr,"[%llu,%u,%zu,%zu]",static_cast<unsigned long long>(first_expiry.micros),first_expiry.stage,first_expiry.first,first_expiry.second);
+        else std::fprintf(stderr,"null");
+        std::fprintf(stderr,",\"progressAtFirstExpiry\":");
+        if(progress_at_first_expiry_observed)std::fprintf(stderr,"[%llu,%u,%zu,%zu]",static_cast<unsigned long long>(progress_at_first_expiry.micros),progress_at_first_expiry.stage,progress_at_first_expiry.first,progress_at_first_expiry.second);
+        else std::fprintf(stderr,"null");
+        std::fprintf(stderr,"}\n");
     }
 };
+// Pure recorder regression; this does not run or synthesize an actual ACK timer.
+TEST(RecoveryNegotiatedPhaseObservation, FirstExpirySurvivesSaturatedPrefixAndLaterEvents) {
+    negotiated_phase_trace actual;
+    for(size_t at=0;at<64;++at)actual.record(negotiated_phase_trace::claim_committed,at,at+1);
+    const auto prefix=actual.samples;
+    actual.record(negotiated_phase_trace::window_observed,8000,32);
+    const auto progress=actual.last_progress;
+    actual.record(negotiated_phase_trace::worker_expired,17,16);
+    const auto first=actual.first_expiry;
+    actual.record(negotiated_phase_trace::worker_expired,18,100);
+    actual.record(negotiated_phase_trace::ack_requested,99,256);
+    EXPECT_EQ(actual.count,64u);EXPECT_EQ(actual.omitted,4u);
+    ASSERT_TRUE(actual.first_expiry_observed);ASSERT_TRUE(actual.progress_at_first_expiry_observed);
+    EXPECT_EQ(actual.first_expiry.stage,negotiated_phase_trace::worker_expired);
+    EXPECT_EQ(actual.first_expiry.first,17u);EXPECT_EQ(actual.first_expiry.second,16u);
+    EXPECT_EQ(actual.first_expiry.micros,first.micros);
+    EXPECT_EQ(actual.progress_at_first_expiry.stage,negotiated_phase_trace::window_observed);
+    EXPECT_EQ(actual.progress_at_first_expiry.first,8000u);EXPECT_EQ(actual.progress_at_first_expiry.second,32u);
+    EXPECT_EQ(actual.progress_at_first_expiry.micros,progress.micros);
+    for(size_t at=0;at<64;++at){
+        EXPECT_EQ(actual.samples[at].micros,prefix[at].micros);EXPECT_EQ(actual.samples[at].stage,prefix[at].stage);
+        EXPECT_EQ(actual.samples[at].first,prefix[at].first);EXPECT_EQ(actual.samples[at].second,prefix[at].second);
+    }
+}
 // New negotiated fixture: one permit follows each actual ACK commit, so
 // already ACKed retry workers do not remain held during later page selection.
 // The original fixture and its 30-second/5-second deadlines remain unchanged.
@@ -1119,7 +1177,8 @@ TEST_F(RecoveryNegotiatedExport, ActualConfiguredOwnerForwardsExpectationToRetai
     EXPECT_EQ(factory->wires[0]->audit_batches(),batches);EXPECT_EQ(number(owner->db(),"SELECT COUNT(*) AS n FROM ContinuousSharedRow"),1);
 }
 TEST_F(RecoveryNegotiatedExport, ActualEightThousandTwoKiBOriginalsMakeOrderedBoundedProgressAcrossCoWritersAndChannels) {
-    negotiated_ack_pause pause(senders,factory);constexpr size_t count=8000;
+    negotiated_failure_phases diagnostic("eightThousandTwoKiB");
+    negotiated_ack_pause pause(senders,factory,diagnostic.trace);constexpr size_t count=8000;
     policy.limits.obligations.records=2*(count+1);policy.limits.obligations.encoded_bytes=64*1024*1024;
     policy.limits.producers.stamps=2*(count+1);policy.limits.producers.encoded_bytes=64*1024*1024;
     policy.frozen_entries=2*(count+1);policy.frozen_bytes=64*1024*1024;
@@ -1128,16 +1187,20 @@ TEST_F(RecoveryNegotiatedExport, ActualEightThousandTwoKiBOriginalsMakeOrderedBo
     owner->add_bulk(std::move(first));co->add_bulk(std::move(second));
     const auto before=owner->db().query("SELECT * FROM AuditLog ORDER BY id");ASSERT_EQ(before.size(),count);
     start();EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(claimed(),0);EXPECT_THROW(senders[0]->sync_now(),db_error);
-    accept(caps());std::vector<std::string> emitted;size_t cursor=0;
+    negotiated_phase_hooks phases(diagnostic.trace);
+    negotiated_publication_scope publications(platform->attempts[0],[trace=diagnostic.trace,ordinal=std::make_shared<std::atomic<size_t>>(0)]{trace->record(negotiated_phase_trace::publication,ordinal->fetch_add(1)+1);});
+    diagnostic.trace->record(negotiated_phase_trace::begin);accept(caps());std::vector<std::string> emitted;size_t cursor=0;
     for(size_t group=0;group<40&&emitted.size()<count;++group){
         ASSERT_TRUE(pump_until_batch(cursor+1));queue->drain();
         const auto batches=factory->wires[0]->audit_batches();const auto raws=audit_wire();
+        diagnostic.trace->record(negotiated_phase_trace::window_observed,emitted.size(),batches.size());
         ASSERT_LE(batches.size(),40u);ASSERT_EQ(raws.size(),batches.size());pause.await_started(batches.size());
         std::vector<std::string> acked;
         for(;cursor<batches.size();++cursor){
             ASSERT_LE(batches[cursor].size(),256u);ASSERT_FALSE(batches[cursor].empty());
             const auto metrics=wire_metrics(raws[cursor]);EXPECT_LE(metrics.bytes,1048576u);EXPECT_LE(metrics.scalar,65536u);EXPECT_LE(metrics.nodes,32768u);EXPECT_LE(metrics.depth,16u);
             for(const auto& id:batches[cursor]){ASSERT_LT(emitted.size(),before.size());EXPECT_EQ(id,std::get<std::string>(before[emitted.size()].at("globalId")));emitted.push_back(id);acked.push_back(id);}
+            diagnostic.trace->record(negotiated_phase_trace::ack_requested,cursor,batches[cursor].size());
             factory->wires[0]->ack(batches[cursor]);
         }
         ASSERT_TRUE(pump_until_ids_retired(acked));pause.acknowledged_prefix(cursor);queue->drain();
@@ -1384,16 +1447,80 @@ TEST_F(RecoveryNegotiatedExport, MutationStageBusyTextIsAnErrorAndNeverReplayedA
     accept(caps());queue->drain();EXPECT_EQ(bodies,1u);EXPECT_EQ(errors.size(),1u);EXPECT_TRUE(audit_wire().empty());
     EXPECT_EQ(snapshot(),before);EXPECT_EQ(claimed(),0);EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
 }
+namespace {
+// Passive copies of the actual existing queue owner; defined beside the
+// existing friend below. This seam cannot change time or queue admission.
+struct negotiated_deferral_snapshot {
+    uintptr_t work=0;
+    unsigned attempts=0;
+    std::chrono::steady_clock::time_point deadline{};
+    bool failed=false;
+};
+negotiated_deferral_snapshot negotiated_read_deferral(synchronizer_base&);
+}
 TEST_F(RecoveryNegotiatedExport, HandoffContentionExhaustionKeepsClaimsAndReportsWithoutAckWorker) {
     negotiated_worker_observation workers;open();owner->add(ContinuousSharedRow{"bounded-busy"});start();
     auto* physical=canonical_writer_custody_test_access::fault_handle(owner->db());std::unique_ptr<negotiated_writer_hold> held;
     decltype(snapshot()) committed;size_t commits=0;
     negotiated_hook_scope hold([&]{++commits;committed=snapshot();held=std::make_unique<negotiated_writer_hold>(physical);});
+    negotiated_failure_phases observation("handoffContentionExhaustion");
+    negotiated_phase_hooks phases(observation.trace);
     accept(caps());ASSERT_TRUE(held);
-    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-    while(errors.empty()&&std::chrono::steady_clock::now()<deadline){if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+    const auto admitted=negotiated_read_deferral(*senders[0]);
+    ASSERT_NE(admitted.work,0u);ASSERT_GE(admitted.attempts,1u);ASSERT_FALSE(admitted.failed);
+    // The real retry fence is five seconds from the first BUSY settlement.
+    // Error delivery is a separate queued callback, so it cannot be required
+    // to have run before the very deadline that makes it eligible.
+    ASSERT_LE(admitted.deadline-std::chrono::steady_clock::now(),std::chrono::seconds(5));
+    while(errors.empty()&&std::chrono::steady_clock::now()<admitted.deadline){
+        if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto eligible=negotiated_read_deferral(*senders[0]);
+    EXPECT_EQ(eligible.work,admitted.work);EXPECT_EQ(eligible.deadline,admitted.deadline);
+    EXPECT_LE(eligible.attempts,32u);
+    ASSERT_TRUE(eligible.failed||std::chrono::steady_clock::now()>=admitted.deadline);
+    // Join only the original accepted queue's terminal callback, without a new
+    // sync request, lifecycle, retry deadline, writer release or ACK worker.
+    const auto callback_end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(errors.empty()&&std::chrono::steady_clock::now()<callback_end){
+        if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto terminal=negotiated_read_deferral(*senders[0]);
+    EXPECT_TRUE(terminal.failed);EXPECT_EQ(terminal.work,admitted.work);
+    EXPECT_EQ(terminal.deadline,admitted.deadline);EXPECT_LE(terminal.attempts,32u);
     ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors[0].find("deferral exhausted"),std::string::npos);
     EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(commits,1u);EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    held.reset();EXPECT_EQ(snapshot(),committed);EXPECT_EQ(claimed(),2);
+    senders.clear();const auto q=freeze();ASSERT_TRUE(q.unsent);EXPECT_TRUE(q.unsent->canonical_originals().empty());
+}
+
+TEST_F(RecoveryNegotiatedExport, HandoffDeadlineExpiresBeforeQueuedTerminalCallbackRuns) {
+    negotiated_worker_observation workers;open();owner->add(ContinuousSharedRow{"busy-queued-expiry"});start();
+    auto* physical=canonical_writer_custody_test_access::fault_handle(owner->db());
+    std::unique_ptr<negotiated_writer_hold> held;decltype(snapshot()) committed;size_t commits=0;
+    negotiated_hook_scope hold([&]{++commits;committed=snapshot();held=std::make_unique<negotiated_writer_hold>(physical);});
+    negotiated_failure_phases observation("handoffQueuedDeadline");negotiated_phase_hooks phases(observation.trace);
+    accept(caps());ASSERT_TRUE(held);
+    const auto admitted=negotiated_read_deferral(*senders[0]);
+    ASSERT_NE(admitted.work,0u);ASSERT_GE(admitted.attempts,1u);ASSERT_LT(admitted.attempts,32u);ASSERT_FALSE(admitted.failed);
+    ASSERT_LE(admitted.deadline-std::chrono::steady_clock::now(),std::chrono::seconds(5));
+    // Deliberately leave the actual application queue unpumped. A real retry
+    // may already be queued, but no fixture can run it or move its deadline.
+    std::this_thread::sleep_until(admitted.deadline);
+    const auto parked=negotiated_read_deferral(*senders[0]);
+    ASSERT_EQ(parked.work,admitted.work);ASSERT_EQ(parked.deadline,admitted.deadline);
+    EXPECT_EQ(parked.attempts,admitted.attempts);EXPECT_TRUE(errors.empty());
+    EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    const auto callback_end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(errors.empty()&&std::chrono::steady_clock::now()<callback_end){
+        if(!queue->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto terminal=negotiated_read_deferral(*senders[0]);
+    EXPECT_TRUE(terminal.failed);EXPECT_EQ(terminal.work,admitted.work);
+    EXPECT_EQ(terminal.deadline,admitted.deadline);EXPECT_EQ(terminal.attempts,admitted.attempts);
+    ASSERT_EQ(errors.size(),1u);EXPECT_NE(errors[0].find("deferral exhausted"),std::string::npos);
+    EXPECT_TRUE(audit_wire().empty());EXPECT_EQ(commits,1u);
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
     held.reset();EXPECT_EQ(snapshot(),committed);EXPECT_EQ(claimed(),2);
     senders.clear();const auto q=freeze();ASSERT_TRUE(q.unsent);EXPECT_TRUE(q.unsent->canonical_originals().empty());
 }
@@ -1841,6 +1968,9 @@ struct automatic_export_admission_test_access {
         bool failed=false,has_completion=false,active=false;
         std::map<std::string,std::pair<int64_t,uint64_t>> registrations;
     };
+    static std::optional<bool> automatic_protection(synchronizer_base& sync) {
+        return sync.try_has_automatic_export_protection();
+    }
     static state read(synchronizer_base& sync) {
         state result;const auto queue=sync.discovery_deferral_;
         {std::lock_guard lock(queue->mutex_);result.count=queue->count_;result.bytes=queue->bytes_;result.failed=queue->failed_;result.active=queue->active_;
@@ -1854,6 +1984,10 @@ struct automatic_export_admission_test_access {
 }
 namespace {
 using automatic_read_access=lattice::detail::automatic_export_admission_test_access;
+negotiated_deferral_snapshot negotiated_read_deferral(synchronizer_base& sync){
+    const auto actual=automatic_read_access::read(sync);
+    return {actual.work,actual.attempts,actual.deadline,actual.failed};
+}
 bool negotiated_ids_retired(synchronizer& sync,const std::vector<std::string>& ids){
     const auto actual=automatic_read_access::read(sync);
     return std::none_of(ids.begin(),ids.end(),[&](const auto& id){return actual.registrations.count(id)!=0;});
@@ -1930,6 +2064,194 @@ protected:
         EXPECT_EQ(factory->wires[0]->audit_batches(),batches);EXPECT_TRUE(errors.empty());
     }
 };
+}
+namespace {
+// A genuine public Core transaction on another native thread, held between
+// SQL calls. No raw handle, ownership setter or synthetic receipt is used.
+struct automatic_core_write {
+    std::shared_ptr<lattice_db> owner;
+    std::mutex mutex;std::condition_variable changed;
+    bool ready=false,released=false,timed_out=false;
+    std::exception_ptr error,expected_commit_failure;unsigned commit_denials=0;
+    std::thread worker;
+    explicit automatic_core_write(std::shared_ptr<lattice_db> value,bool core=true,bool fail_commit=false):owner(std::move(value)) {
+        worker=std::thread([this,core,fail_commit] {
+            bool began=false;
+            const auto rollback=[&]{if(core)owner->rollback();else owner->db().rollback();};
+            try {
+                if(core)owner->begin_transaction();else owner->db().begin_transaction();
+                began=true;
+                if(fail_commit) {
+                    static thread_local unsigned denials=0;denials=0;
+                    {
+                        continuity_fault fault(owner.get(),[](int action,const char* one,const char*,const char*)noexcept {
+                            if(action==SQLITE_TRANSACTION&&one&&std::strcmp(one,"COMMIT")==0){++denials;return SQLITE_DENY;}
+                            return SQLITE_OK;
+                        });
+                        try{owner->commit();}catch(...){expected_commit_failure=std::current_exception();}
+                    }
+                    commit_denials=denials;
+                    if(!expected_commit_failure||denials!=1||!owner->db().is_in_transaction())
+                        throw db_error("automatic fixture did not retain its actual denied Core COMMIT");
+                }
+                {
+                    std::unique_lock lock(mutex);ready=true;changed.notify_all();
+                    // A fixture guard only. Automatic work retains its original
+                    // five-second operation deadline and bounded attempt count.
+                    if(!changed.wait_for(lock,std::chrono::seconds(12),[&]{return released;}))timed_out=true;
+                }
+                rollback();began=false;
+            }catch(...) {
+                const auto first=std::current_exception();
+                if(began)try{rollback();}catch(...){}
+                std::lock_guard lock(mutex);error=first;ready=true;changed.notify_all();
+            }
+        });
+        std::unique_lock lock(mutex);
+        if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return ready;})||error) {
+            released=true;changed.notify_all();lock.unlock();worker.join();
+            if(error)std::rethrow_exception(error);
+            throw db_error("automatic Core transaction fixture admission timeout");
+        }
+    }
+    void finish(){ {std::lock_guard lock(mutex);released=true;changed.notify_all();}if(worker.joinable())worker.join();}
+    ~automatic_core_write(){finish();}
+};
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, OtherThreadCoreWriteDefersBeforeProtectionWithoutClaims) {
+    negotiated_ack_pause pause(senders,factory);seed();const auto before=snapshot();
+    automatic_core_write transaction(owner);
+    // Foreground/strict discovery still cannot borrow this foreign turn.
+    EXPECT_THROW(recovery_export_adapter::protected_store(owner),db_error);
+    EXPECT_THROW(recovery_export_adapter::try_protected_store(owner),db_error);
+    accept(caps());const auto first=observed();ASSERT_NE(first.work,0u);ASSERT_GE(first.attempts,1u);
+    EXPECT_EQ(claimed(),0);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    ASSERT_TRUE(until([&]{return observed().attempts>=first.attempts+1;}));same_episode(first,observed());
+    EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    transaction.finish();EXPECT_FALSE(transaction.error);EXPECT_FALSE(transaction.timed_out);
+    ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(claimed(),2);ack_only_batch(pause);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, OtherThreadCoreWriteStartingAfterProbeDefersBeforeInstall) {
+    negotiated_ack_pause pause(senders,factory);seed();const auto before=snapshot();
+    std::unique_ptr<automatic_core_write> transaction;size_t probes=0;
+    {automatic_after_probe probe([&]{++probes;if(!transaction)transaction=std::make_unique<automatic_core_write>(owner);});
+        accept(caps());}
+    ASSERT_TRUE(transaction);EXPECT_EQ(probes,1u);
+    const auto first=observed();ASSERT_NE(first.work,0u);ASSERT_GE(first.attempts,1u);
+    EXPECT_EQ(claimed(),0);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    ASSERT_TRUE(until([&]{return observed().attempts>=first.attempts+1;}));same_episode(first,observed());
+    EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    transaction->finish();EXPECT_FALSE(transaction->error);EXPECT_FALSE(transaction->timed_out);
+    ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(claimed(),2);ack_only_batch(pause);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, OtherThreadDatabaseWriteWithoutCoreProvenanceRemainsFatal) {
+    negotiated_worker_observation workers;seed();const auto before=snapshot();
+    automatic_core_write transaction(owner,false);
+    accept(caps());EXPECT_EQ(observed().work,0u);EXPECT_EQ(errors.size(),1u);
+    EXPECT_EQ(claimed(),0);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());
+    EXPECT_EQ(workers.started->load(),0u);EXPECT_EQ(workers.finished->load(),0u);
+    transaction.finish();EXPECT_FALSE(transaction.error);EXPECT_FALSE(transaction.timed_out);
+    queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, FailedStillLiveCoreCommitRetainsStampAndOriginalDeferral) {
+    negotiated_ack_pause pause(senders,factory);seed();const auto before=snapshot();
+    automatic_core_write transaction(owner,true,true);
+    ASSERT_TRUE(transaction.expected_commit_failure);EXPECT_EQ(transaction.commit_denials,1u);
+    accept(caps());const auto first=observed();ASSERT_NE(first.work,0u);ASSERT_GE(first.attempts,1u);
+    EXPECT_EQ(claimed(),0);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    ASSERT_TRUE(until([&]{return observed().attempts>=first.attempts+1;}));same_episode(first,observed());
+    transaction.finish();EXPECT_FALSE(transaction.error);EXPECT_FALSE(transaction.timed_out);
+    ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(claimed(),2);ack_only_batch(pause);
+}
+namespace {
+struct automatic_core_end_pause {
+    std::shared_ptr<lattice_db> owner;
+    std::mutex mutex;std::condition_variable changed;
+    bool entered=false,returned=false,released=false,timed_out=false;
+    std::exception_ptr error;std::thread worker;
+    static inline thread_local automatic_core_end_pause* current=nullptr;
+    explicit automatic_core_end_pause(std::shared_ptr<lattice_db> value,bool rollback,bool database_end=false):owner(std::move(value)) {
+        worker=std::thread([this,rollback,database_end] {
+            const auto prior=recovery_admission_test_hooks::after_core_transaction_end;
+            auto* previous=current;current=this;
+            recovery_admission_test_hooks::after_core_transaction_end=[] {
+                auto& self=*current;std::unique_lock lock(self.mutex);self.entered=true;self.changed.notify_all();
+                if(!self.changed.wait_for(lock,std::chrono::seconds(12),[&]{return self.released;}))self.timed_out=true;
+            };
+            try{owner->begin_transaction();if(database_end)owner->db().commit();else if(rollback)owner->rollback();else owner->commit();}
+            catch(...){std::lock_guard lock(mutex);error=std::current_exception();}
+            recovery_admission_test_hooks::after_core_transaction_end=prior;current=previous;
+            {std::lock_guard lock(mutex);returned=true;changed.notify_all();}
+        });
+        std::unique_lock lock(mutex);
+        if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return entered||returned;})||!entered) {
+            released=true;changed.notify_all();lock.unlock();worker.join();
+            if(error)std::rethrow_exception(error);
+            throw db_error("automatic Core ending fixture admission timeout");
+        }
+    }
+    void finish(){ {std::lock_guard lock(mutex);released=true;changed.notify_all();}if(worker.joinable())worker.join();}
+    ~automatic_core_end_pause(){finish();}
+};
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualCoreCommitCannotLendStampToRawSuccessorBeforePublicReturn) {
+    seed();const auto before=snapshot();automatic_core_end_pause ending(owner,false);
+    automatic_core_write raw(owner,false);accept(caps());
+    EXPECT_EQ(observed().work,0u);EXPECT_EQ(errors.size(),1u);EXPECT_EQ(claimed(),0);EXPECT_TRUE(audit_wire().empty());
+    // Let the actual public Core COMMIT return while the genuine raw WRITE
+    // remains open; the outer Core return must not clear or adopt a successor.
+    ending.finish();EXPECT_FALSE(ending.error);EXPECT_FALSE(ending.timed_out);
+    raw.finish();EXPECT_FALSE(raw.error);EXPECT_FALSE(raw.timed_out);
+    queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualCoreRollbackCannotLendStampToRawSuccessorBeforePublicReturn) {
+    seed();const auto before=snapshot();automatic_core_end_pause ending(owner,true);
+    automatic_core_write raw(owner,false);accept(caps());
+    EXPECT_EQ(observed().work,0u);EXPECT_EQ(errors.size(),1u);EXPECT_EQ(claimed(),0);EXPECT_TRUE(audit_wire().empty());
+    ending.finish();EXPECT_FALSE(ending.error);EXPECT_FALSE(ending.timed_out);
+    raw.finish();EXPECT_FALSE(raw.error);EXPECT_FALSE(raw.timed_out);
+    queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, EarlierCoreReturnCannotEraseActualCoreSuccessorStamp) {
+    negotiated_ack_pause pause(senders,factory);seed();const auto before=snapshot();
+    automatic_core_end_pause ending(owner,false);automatic_core_write successor(owner);
+    accept(caps());const auto first=observed();ASSERT_NE(first.work,0u);ASSERT_GE(first.attempts,1u);
+    EXPECT_EQ(claimed(),0);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    ending.finish();EXPECT_FALSE(ending.error);EXPECT_FALSE(ending.timed_out);
+    ASSERT_TRUE(until([&]{return observed().attempts>=first.attempts+1;}));same_episode(first,observed());
+    EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());EXPECT_TRUE(errors.empty());
+    successor.finish();EXPECT_FALSE(successor.error);EXPECT_FALSE(successor.timed_out);
+    ASSERT_TRUE(pump_until_batch(1));EXPECT_EQ(claimed(),2);ack_only_batch(pause);
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualDatabaseCommitOfCoreTurnCannotLendOriginToRawSuccessor) {
+    seed();const auto before=snapshot();automatic_core_end_pause ending(owner,false,true);
+    // This real database ending bypasses Core's wrapper stamp clear. Its
+    // actual physical origin must still retire before the raw successor.
+    automatic_core_write raw(owner,false);accept(caps());
+    EXPECT_EQ(observed().work,0u);EXPECT_EQ(errors.size(),1u);EXPECT_EQ(claimed(),0);EXPECT_TRUE(audit_wire().empty());
+    ending.finish();EXPECT_FALSE(ending.error);EXPECT_FALSE(ending.timed_out);
+    raw.finish();EXPECT_FALSE(raw.error);EXPECT_FALSE(raw.timed_out);
+    queue->drain();EXPECT_EQ(errors.size(),1u);EXPECT_EQ(snapshot(),before);EXPECT_TRUE(audit_wire().empty());
+}
+TEST_F(RecoveryAutomaticExportReadAdmission, ActualNativeEscapeCannotOfferCoreWriteProvenanceAfterRawSuccessor) {
+    // A genuine ordinary store permits raw escape. Continuous stores already
+    // refuse that public handle before publishing it; no flag is forged here.
+    TempDB raw_file{"automatic-native-escape"};
+    configuration raw_config(raw_file.str(),std::make_shared<immediate_scheduler>());
+    raw_config.busy_timeout_ms=100;
+    auto ordinary=std::make_shared<lattice_db>(raw_config);
+    sync_config actual_config;actual_config.sync_id="native-escape";
+    actual_config.websocket_url="wss://continuous.invalid/native-escape";
+    actual_config.checkpoint_passive_interval_ms=0;actual_config.upload_coalesce_ms=0;
+    auto actual=std::make_unique<synchronizer>(ordinary,actual_config);
+    auto* handle=ordinary->db().handle();ASSERT_NE(handle,nullptr);
+    automatic_core_write transaction(ordinary);
+    ASSERT_EQ(sqlite3_exec(handle,"COMMIT; BEGIN IMMEDIATE",nullptr,nullptr,nullptr),SQLITE_OK);
+    // Native SQL bypassed wrapper ending observation and the original worker
+    // has not returned. Escape itself must forbid a provenance-based BUSY.
+    EXPECT_THROW(automatic_read_access::automatic_protection(*actual),db_error);
+    transaction.finish();EXPECT_FALSE(transaction.error);EXPECT_FALSE(transaction.timed_out);
+    actual.reset();ordinary->close();
 }
 TEST_F(RecoveryAutomaticExportReadAdmission, OtherThreadEngineReadDefersSelectionWithoutClaims) {
     selection_read("SELECT value FROM ContinuousSharedRow");

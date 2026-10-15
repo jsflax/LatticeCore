@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "ExceptionObservation.hpp"
 #include <lattice/ordinary_history.hpp>
 #include "../../Sources/LatticeCore/src/ordinary_source_upload.hpp"
 #include "../../Sources/LatticeCore/src/ordinary_wire_test_hooks.hpp"
@@ -25,20 +26,59 @@ int64_t history_usage(lattice_db& owner){const auto rows=owner.db().query("SELEC
 }
 
 TEST(OrdinaryPagedHistory, NineThousandTwoKiBRowsAndOriginalsUseBoundedDurablePages) {
+    const char* phase="construct-source";int seed_row=-1;uint64_t observed_page=0;bool page_observed=false;
+    try {
     TempDB path{"ordinary_history_9000"};lattice_db source{history_config(path)};
-    source.begin_transaction();for(int n=0;n<9000;++n)source.add(TestPerson{std::string(2048,'x'),n,std::nullopt});source.commit();
-    const auto flags=source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog");
-    EXPECT_THROW((void)capture_ordinary_sync_export(source,{"TestPerson"}),db_error); // strict-v2 limit unchanged
-    const auto issued=capture_ordinary_history_export(source,{"TestPerson"});const auto header=decoded(issued,0);
+    phase="seed-begin";source.begin_transaction();
+    phase="seed-add";for(int n=0;n<9000;++n){seed_row=n;source.add(TestPerson{std::string(2048,'x'),n,std::nullopt});}
+    phase="seed-commit";source.commit();
+    phase="seed-flags";const auto flags=source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog");
+    phase="strict-refusal";EXPECT_THROW((void)capture_ordinary_sync_export(source,{"TestPerson"}),db_error); // strict-v2 limit unchanged
+    phase="history-capture";const auto issued=capture_ordinary_history_export(source,{"TestPerson"});phase="history-header";const auto header=decoded(issued,0);
     EXPECT_EQ(header["profile"],"paged-history-v1");EXPECT_EQ(header["rows"],"9000");EXPECT_EQ(header["knownOriginals"],"9000");EXPECT_EQ(header["unknownOriginals"],"0");
     const auto columns=header["tables"][0]["columns"];const auto name_column=std::find(columns.begin(),columns.end(),"name")-columns.begin();ASSERT_LT(size_t(name_column),columns.size());
     size_t rows=0,originals=0;std::string previous;
-    for(uint64_t n=1;n<issued.frame_count();++n){auto lease=issued.page(n);const auto bytes=lease.bytes();EXPECT_LE(bytes.size(),ordinary_history_limits{}.page_bytes);
-        const auto page=json::parse(bytes.begin(),bytes.end())["latticeOrdinarySync"];EXPECT_EQ(page["previousDigest"],previous);EXPECT_EQ(page["index"],std::to_string(n-1));EXPECT_LE(page["records"].size(),64u);
+    for(uint64_t n=1;n<issued.frame_count();++n){page_observed=true;observed_page=n;phase="history-page";auto lease=issued.page(n);const auto bytes=lease.bytes();EXPECT_LE(bytes.size(),ordinary_history_limits{}.page_bytes);
+        phase="history-page-decode";const auto page=json::parse(bytes.begin(),bytes.end())["latticeOrdinarySync"];EXPECT_EQ(page["previousDigest"],previous);EXPECT_EQ(page["index"],std::to_string(n-1));EXPECT_LE(page["records"].size(),64u);
         for(const auto& record:page["records"]){if(record.contains("row")){++rows;EXPECT_EQ(record["row"]["values"][size_t(name_column)][1].get<std::string>().size(),2048u);}else if(record.contains("original"))++originals;else ADD_FAILURE()<<"unexpected unknown record";}
         previous=picosha2::hash256_hex_string(bytes.begin(),bytes.end());}
-    EXPECT_EQ(rows,9000u);EXPECT_EQ(originals,9000u);EXPECT_EQ(header["contentDigest"],complete_hash(issued));EXPECT_EQ(source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog"),flags);
-    EXPECT_LT(issued.durable_bytes(),ordinary_history_limits{}.durable_stage_bytes);
+    EXPECT_EQ(rows,9000u);EXPECT_EQ(originals,9000u);phase="content-digest";EXPECT_EQ(header["contentDigest"],complete_hash(issued));phase="final-audit";EXPECT_EQ(source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog"),flags);
+    phase="durable-extent";EXPECT_LT(issued.durable_bytes(),ordinary_history_limits{}.durable_stage_bytes);
+    } catch (...) {
+        const auto original=std::current_exception();
+        const auto text=lattice_test::actual_exception_text(original);
+        try {
+            ::testing::Test::RecordProperty("historyFailurePhase",phase);
+            ::testing::Test::RecordProperty("historyFailureSeedRow",std::to_string(seed_row));
+            ::testing::Test::RecordProperty("historyFailurePageObserved",page_observed?"true":"false");
+            ::testing::Test::RecordProperty("historyFailurePage",std::to_string(observed_page));
+            ::testing::Test::RecordProperty("historyFirstError",text);
+        } catch (...) {
+            std::fprintf(stderr,"LATTICE_HISTORY_ERROR_PROPERTY_UNAVAILABLE phase=%s seed_row=%d page_observed=%d page=%llu first_error=%s\n",
+                phase,seed_row,page_observed?1:0,static_cast<unsigned long long>(observed_page),text.c_str());
+        }
+        throw; // The exact original type/settlement/first errors still reach GoogleTest.
+    }
+}
+TEST(OrdinaryPagedHistory, MultiPageCaptureKeepsInstalledGuardAcrossLiveSourceRowCursor) {
+    TempDB path{"ordinary_history_live_cursor_guard"};lattice_db source{history_config(path)};
+    source.begin_transaction();
+    for(int n=0;n<65;++n)source.add(TestPerson{std::string(2048,'p'),n,std::nullopt});
+    source.commit();
+    const auto before=source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog");
+    const auto issued=capture_ordinary_history_export(source,{"TestPerson"});
+    const auto header=decoded(issued,0);
+    EXPECT_EQ(header["rows"],"65");EXPECT_EQ(header["knownOriginals"],"65");
+    ASSERT_GT(issued.frame_count(),2u); // A page must flush before its live source cursor finishes.
+    size_t rows=0,originals=0;
+    for(uint64_t n=1;n<issued.frame_count();++n){
+        const auto page=decoded(issued,n);EXPECT_LE(page["records"].size(),64u);
+        for(const auto& record:page["records"]){if(record.contains("row"))++rows;else if(record.contains("original"))++originals;else ADD_FAILURE()<<"unexpected unknown record";}
+    }
+    EXPECT_EQ(rows,65u);EXPECT_EQ(originals,65u);
+    EXPECT_EQ(header["contentDigest"],complete_hash(issued));
+    EXPECT_EQ(source.db().query("SELECT COUNT(*) AS n,SUM(isSynchronized) AS synced FROM AuditLog"),before);
+    EXPECT_EQ(source.db().query("SELECT id FROM TestPerson").size(),65u);
 }
 TEST(OrdinaryPagedHistory, UnknownLegacyRemoteAndMalformedAgeNeverBecomeKnownOriginals) {
     TempDB up{"ordinary_history_unknown_up"},path{"ordinary_history_unknown_source"};lattice_db uploader{history_config(up)},source{history_config(path)};

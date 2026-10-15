@@ -2304,4 +2304,72 @@ TEST(BridgeReadOnlySchemaVersion, NoSchemaDynamicAndEmptySchemaOpensKeepTheirUnv
     expect_same_version_snapshot(before,read_version_snapshot(observer));
 }
 
+
+// Regression for the real Swift factory lifetime: logical close alone does
+// not run the database destructor. Every wrapper and linked object must end
+// before checking the persisted fingerprint cookie and reopening.
+TEST(Bridge, ClosedCreatorFinalReleasePreservesCheckedMountedFingerprint) {
+    TempDB file{"closed_creator_fingerprint"};
+    auto value=text_prop("value");value.nullable=false;
+    auto child=make_schema("ClosedCreatorFpChild",{{"value",value}});
+    auto link=int_prop("child");link.kind=lattice::property_kind::link;
+    link.target_table=child.table_name;link.link_table="ClosedCreatorFpParent";link.nullable=true;
+    auto parent=make_schema("ClosedCreatorFpParent",{{"value",value},{"child",link}});
+    lattice::SchemaVector schemas{parent,child};
+    lattice::swift_configuration config(file.str());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+    int64_t original_cookie=-1;
+    std::vector<lattice::database::row_t> original_markers;
+    std::weak_ptr<lattice::swift_lattice> actual_creator;
+    const auto marker_sql="SELECT key,value FROM main._lattice_meta WHERE key LIKE 'schema_fingerprint:%' ORDER BY key";
+    const auto stat_sql="SELECT count(*) AS n FROM main.sqlite_schema WHERE type='table' AND name='sqlite_stat1'";
+    {
+#if LATTICE_HAS_FRT
+        std::unique_ptr<lattice::swift_lattice_ref> creator(lattice::swift_lattice_ref::create(config,schemas));
+        auto* view=creator.get();
+#else
+        auto creator=lattice::swift_lattice_ref::create(config,schemas);auto* view=&creator;
+#endif
+        ASSERT_TRUE(view);auto* owner=view->get();ASSERT_TRUE(owner);
+        actual_creator=lattice::detail::LatticeCache::instance().get_by_pointer(owner);
+        ASSERT_FALSE(actual_creator.expired());
+        auto child_row=make_sdo(child.table_name,child.properties);child_row.values["value"]=std::string("preserved-child");
+        auto managed_child=std::make_shared<lattice::dynamic_object>(child_row);owner->add(*managed_child);
+        auto parent_row=make_sdo(parent.table_name,parent.properties);parent_row.values["value"]=std::string("preserved-parent");
+        parent_row.link_values["child"]=managed_child;lattice::dynamic_object managed_parent(parent_row);owner->add(managed_parent);
+        original_cookie=std::get<int64_t>(owner->db().query("PRAGMA main.schema_version").at(0).at("schema_version"));
+        original_markers=owner->db().query(marker_sql);ASSERT_GE(original_markers.size(),2u);
+        for(const auto& marker:original_markers)EXPECT_EQ(std::get<std::string>(marker.at("value")),std::to_string(original_cookie));
+        ASSERT_EQ(std::get<int64_t>(owner->db().query(stat_sql).at(0).at("n")),0);
+        const auto closed=owner->close_checked();EXPECT_FALSE(closed.error);EXPECT_FALSE(closed.cleanup_error);EXPECT_TRUE(closed.cleanup_complete);
+    }
+    ASSERT_TRUE(actual_creator.expired()); // Real final owner release, not a logical-close proxy.
+    {
+        lattice::database observed(file.str(),lattice::database::open_mode::read_only,100);
+        EXPECT_EQ(std::get<int64_t>(observed.query("PRAGMA main.schema_version").at(0).at("schema_version")),original_cookie);
+        EXPECT_EQ(observed.query(marker_sql),original_markers);
+        EXPECT_EQ(std::get<int64_t>(observed.query(stat_sql).at(0).at("n")),0);
+    }
+    for(int attempt=0;attempt<2;++attempt) {
+#if LATTICE_HAS_FRT
+        std::unique_ptr<lattice::swift_lattice_ref> checked(lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas));
+        auto* view=checked.get();
+#else
+        auto checked=lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas);auto* view=&checked;
+#endif
+        ASSERT_TRUE(view);auto* owner=view->get();ASSERT_TRUE(owner)<<lattice::last_bridge_error();
+        EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT count(*) AS n FROM ClosedCreatorFpParent").at(0).at("n")),1);
+        EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT count(*) AS n FROM ClosedCreatorFpChild").at(0).at("n")),1);
+        const auto closed=owner->close_checked();EXPECT_FALSE(closed.error);EXPECT_FALSE(closed.cleanup_error);EXPECT_TRUE(closed.cleanup_complete);
+    }
+    // Genuine unrelated DDL must still invalidate the strict checked cookie.
+    {lattice::database changed(file.str());changed.execute("CREATE TABLE ClosedCreatorExternalDDL(x INTEGER)");changed.close();}
+#if LATTICE_HAS_FRT
+    std::unique_ptr<lattice::swift_lattice_ref> refused(lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas));
+    EXPECT_TRUE(!refused||!refused->get());
+#else
+    auto refused=lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas);EXPECT_FALSE(refused.get());
+#endif
+    EXPECT_NE(lattice::last_bridge_error().find("fingerprint/cookie differs"),std::string::npos);
+}
+
 #endif // !__linux__

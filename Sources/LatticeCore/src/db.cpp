@@ -1048,7 +1048,13 @@ database::~database() {
             // missing or stale. Never throw from a destructor.
             // An unresolved/failed producer bootstrap preserves its refused
             // schema. Hook detachment, passive checkpoint and close still run.
-            if (optional_current && !suppress_destructor_optimize_ && !administrative_connection_) {
+            // Logical close ends optional SQL maintenance as well as public
+            // operations. Final destruction can happen later, after a checked
+            // close returned; optimize may create sqlite_stat1 and invalidate
+            // the already-published schema cookie. Physical retirement and its
+            // original passive checkpoint below remain independent.
+            if (optional_current && !closed_.load(std::memory_order_acquire) &&
+                !suppress_destructor_optimize_ && !administrative_connection_) {
                 int orc = sqlite3_exec(db_, "PRAGMA optimize", nullptr, nullptr, nullptr);
                 if (orc != SQLITE_OK) {
                     LOG_DEBUG("db", "~database optimize skipped: rc=%d, path=%s", orc, path_.c_str());

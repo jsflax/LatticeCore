@@ -655,7 +655,8 @@ TEST(OrdinaryStoreAdmission, RetirementFromStoredAdmittedFactPreservesOldCodecAn
     const auto bytes=admission::encode(retired);for(std::size_t i=176;i!=224;++i)EXPECT_EQ(bytes[i],0);
     EXPECT_EQ(admission::decode(bytes),retired);EXPECT_EQ(anchored.begin_retirement(id(32)),retired);
     EXPECT_THROW(anchored.begin_retirement(id(33)),admission::error);
-    EXPECT_THROW(anchored.hold_ordinary(fact),admission::error);EXPECT_THROW(anchored.hold_ordinary(retired),admission::error);
+    EXPECT_THROW(anchored.hold_ordinary(fact),admission::error);
+    EXPECT_THROW(anchored.hold_ordinary(retired),admission::error);
     EXPECT_THROW(anchored.try_hold_generation(),admission::error);EXPECT_TRUE(anchored.generation_busy());
     hold={};EXPECT_FALSE(anchored.generation_busy());EXPECT_EQ(anchored.read(),retired);
 }
@@ -677,7 +678,8 @@ TEST(OrdinaryStoreAdmission, AnchoredStoredFactHoldCannotRelearnCoherentGenerati
     descriptor replacement(::openat(owned.fd,"generation.lock",O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW|O_CLOEXEC,0600));ASSERT_GE(replacement.fd,0);
     struct stat current{};ASSERT_EQ(::fstat(replacement.fd,&current),0);auto changed=fact;
     changed.generation={static_cast<std::uint64_t>(current.st_dev),static_cast<std::uint64_t>(current.st_ino)};overwrite(owned.fd,changed);
-    EXPECT_THROW(anchored.hold_ordinary(changed),admission::error);EXPECT_THROW(anchored.hold_ordinary(fact),admission::error);
+    EXPECT_THROW(anchored.hold_ordinary(changed),admission::error);
+    EXPECT_THROW(anchored.hold_ordinary(fact),admission::error);
     EXPECT_THROW(admission::journal::open_existing(owned.fd,binding(),controls(original)),admission::error);
     descriptor old_generation(::openat(owned.fd,"old-normal-generation.lock",O_RDWR|O_NOFOLLOW|O_CLOEXEC));ASSERT_GE(old_generation.fd,0);
     EXPECT_EQ(::flock(old_generation.fd,LOCK_EX|LOCK_NB),-1);EXPECT_TRUE(errno==EWOULDBLOCK||errno==EAGAIN);

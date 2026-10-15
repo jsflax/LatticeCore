@@ -148,8 +148,12 @@ public:
     bool available()const noexcept SWIFT_NAME(isAvailable()){return role_!=role::unavailable;}
     bool personal()const noexcept SWIFT_NAME(isPersonal()){return role_==role::personal;}
     bool group()const noexcept SWIFT_NAME(isGroup()){return role_==role::group;}
-    const std::string& group_identifier()const noexcept SWIFT_NAME(groupIdentifier()){return group_;}
-    const std::string& admission_nonce()const noexcept SWIFT_NAME(admissionNonce()){return nonce_;}
+    std::string group_identifier()const noexcept SWIFT_NAME(groupIdentifier()){
+        try{return group_;}catch(...){return {};}
+    }
+    std::string admission_nonce()const noexcept SWIFT_NAME(admissionNonce()){
+        try{return nonce_;}catch(...){return {};}
+    }
 };
 // Opaque closed restart receiver handoff, never a path/profile/receipt DTO.
 class swift_managed_receiver_request final {
@@ -209,7 +213,8 @@ class swift_owned_receiver_preservation final {
 public:
     swift_owned_receiver_preservation()=default;
     bool valid()const noexcept{return bool(value_);}
-    swift_managed_receiver_request begin(const swift_managed_product_credentials& credentials)const noexcept{
+    swift_managed_receiver_request begin_receiver_request(const swift_managed_product_credentials& credentials)const noexcept
+        SWIFT_NAME(beginReceiverRequest(credentials:)){
 #ifndef __EMSCRIPTEN__
         try{return swift_managed_receiver_request(detail::ordinary_receiver_wss_access::begin(value_,credentials.value_));}catch(...){}
 #endif

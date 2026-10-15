@@ -3995,6 +3995,18 @@ public:
             return _make(detail::LatticeCache::instance().get_or_create_managed(config,schemas,startup));
         });
     }
+    swift_managed_peer_owner start_managed_engram_peer() const noexcept SWIFT_NAME(startManagedEngramPeer()) {
+        try{return swift_managed_peer_owner(detail::ordinary_managed_ipc_access::start_peer_endpoint(
+            impl_,std::chrono::steady_clock::now()+std::chrono::seconds(10)));}
+        catch(...){return {};}
+    }
+    swift_managed_product_request begin_managed_engram_route(const swift_lattice_ref& target,
+        const swift_managed_product_credentials& credentials,uint8_t direction,const std::string& group) const noexcept
+        SWIFT_NAME(beginManagedEngramRoute(target:credentials:direction:group:)) {
+        try{return swift_managed_product_request(detail::ordinary_managed_ipc_access::begin(
+            impl_,target.impl_,credentials.value_,direction,group));}
+        catch(...){return {};}
+    }
     // Compatibility for an actual already-open quiescent receiver owner.
     // Ordinary/source opening is NOT a receiver preparation substitute.
     // Preserve under the inherited receive end; never refresh after open.

@@ -250,6 +250,20 @@ public:
 }
 
 // MARK: Swift Lattice
+// Actual managed parent is retained by the bridge factory throughout this
+// unpublished construction. Reuse immutable declarations and in-memory Swift
+// descriptors, without applying caller-provided migrations or schema edits.
+swift_lattice::swift_lattice(const swift_configuration& config,swift_lattice& parent)
+    :lattice_db(config,true,detail::ordinary_export_access::managed_clone_catalog(parent,config)),swift_resources_(config) {
+    SchemaVector declarations;declarations.reserve(parent.schemas_.size());
+    for(const auto& [name,properties]:parent.schemas_){
+        const auto constraints=parent.constraints_.find(name);
+        if(constraints==parent.constraints_.end())throw std::runtime_error("managed clone parent constraints unavailable");
+        declarations.emplace_back(name,properties,constraints->second);
+    }
+    populate_swift_in_memory_state(declarations);
+}
+
 // Construct with swift_configuration (includes row migration callback)
 swift_lattice::swift_lattice(const swift_configuration& config,const SchemaVector& schemas,
     detail::recovery_owner_schema catalog,std::shared_ptr<database> writer,lattice_db::checked_managed_existing_key key)

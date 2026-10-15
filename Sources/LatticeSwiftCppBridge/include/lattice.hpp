@@ -26,6 +26,7 @@
 #include "../../LatticeCore/src/ordinary_normal_startup.hpp"
 #include "../../LatticeCore/src/ordinary_managed_history.hpp"
 #include "../../LatticeCore/src/ordinary_export.hpp"
+#include "../../LatticeCore/src/ordinary_cohort_attachment_qualification.hpp"
 #include <lattice/platform_retirement.hpp>
 #include <lattice/configured_platform.hpp>
 #include <list.hpp>
@@ -817,6 +818,7 @@ private:
         detail::ordinary_export_access::validate_checked_managed_schema(*this,
             detail::ordinary_export_access::checked_reference_phase::enrolled);
     }
+    swift_lattice(const swift_configuration&,swift_lattice& managed_parent);
     swift_lattice(const swift_configuration&,const SchemaVector&,
         const std::shared_ptr<detail::recovery_continuous_admission>&);
     /// Best-effort schema reconstruction for databases written before the
@@ -4056,6 +4058,26 @@ public:
         });
     }
 
+    bool validate_managed_reference() const
+        SWIFT_NAME(validateManagedReference()) {
+        return sealed([&]{
+            auto retained=impl_;
+            if(!retained)throw std::runtime_error("managed reference owner released");
+            detail::ordinary_export_access::validate_managed_reference(*retained);
+            return true;
+        });
+    }
+#if defined(LATTICE_MANAGED_ATTACHMENT_QUALIFICATION)
+    detail::ordinary_cohort_attachment_qualification_result qualify_managed_attachment(
+        const swift_lattice_ref& target) const SWIFT_NAME(qualifyManagedAttachment(target:)) {
+        return sealed([&]{
+            auto parent=impl_,other=target.impl_;
+            if(!parent||!other)throw std::runtime_error("qualification retained owners missing");
+            return detail::qualify_managed_cohort_attachment(*parent,*other);
+        });
+    }
+#endif
+
     // Trusted SPI opens a real existing server owner. Actual relay authorization
     // is retained separately; this method issues no source, principal or cut.
     static LATTICE_SLREF_RET create_checked_mounted_server(const swift_configuration& config,const SchemaVector& schemas)
@@ -4175,6 +4197,23 @@ public:
     SWIFT_NAME(createUncached(swiftConfig:schemas:)) LATTICE_SLREF_UNRETAINED {
         auto impl = detail::LatticeCache::instance().create_uncached(config, schemas);
         return _make(impl);
+    }
+
+    static LATTICE_SLREF_RET create_managed_attachment_clone(const swift_lattice_ref& parent,
+        const swift_configuration& config,cxx_error& error)
+    SWIFT_NAME(createManagedAttachmentClone(parent:swiftConfig:error:)) LATTICE_SLREF_UNRETAINED {
+        return sealed([&]() -> LATTICE_SLREF_RET {
+            try {
+                auto retained=parent.impl_;
+                if(!retained)throw std::runtime_error("managed attachment parent unavailable");
+                auto child=std::shared_ptr<swift_lattice>(new swift_lattice(config,*retained));
+                detail::ordinary_export_access::admit_managed_clone(*retained,*child);
+                detail::LatticeCache::instance().register_pointer(child);
+                return _make(std::move(child));
+            } catch(const std::exception& value) { error=value; }
+            catch(...) { error=std::runtime_error("managed attachment clone failed"); }
+            return _make({});
+        });
     }
 
     static LATTICE_SLREF_RET create(const swift_configuration& config,

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <random>
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -50,7 +51,14 @@ private:
 class LatticeTestEnv : public ::testing::Environment {
 public:
     void SetUp() override {
-        log_file_ = fopen("/tmp/lattice_debug.log", "w");
+        // Qualification runs can place every artifact beside their receipts.
+        // Otherwise follow the platform temp directory (including TMPDIR),
+        // rather than bypassing that configuration with a hard-coded /tmp.
+        const auto* requested_log = std::getenv("LATTICE_TEST_LOG_PATH");
+        const auto log_path = requested_log && *requested_log
+            ? std::filesystem::path(requested_log)
+            : std::filesystem::temp_directory_path() / "lattice_debug.log";
+        log_file_ = fopen(log_path.string().c_str(), "w");
         if (log_file_) {
             lattice::set_log_file(log_file_);
             lattice::set_log_level(lattice::log_level::debug);

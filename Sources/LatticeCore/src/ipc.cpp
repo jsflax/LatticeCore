@@ -57,8 +57,23 @@ static void suppress_sigpipe(int fd) {
     int on = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 #else
-    // Linux: handled via MSG_NOSIGPIPE on each send, or signal(SIGPIPE, SIG_IGN)
+    // Linux: handled per send by write_frame_bytes(), without changing the
+    // process-wide signal disposition.
     (void)fd;
+#endif
+}
+
+static ssize_t write_frame_bytes(int fd, const void* bytes, size_t length) {
+#ifdef __linux__
+    const ssize_t result = ::send(fd, bytes, length, MSG_NOSIGNAL);
+    // The public framing helper also accepts non-socket descriptors. Preserve
+    // their existing write behavior, including their existing signal policy.
+    // Never retry a socket error through write(), which would revive SIGPIPE.
+    if (result < 0 && errno == ENOTSOCK) return ::write(fd, bytes, length);
+    return result;
+#else
+    // Darwin sockets retain the SO_NOSIGPIPE initialization above.
+    return ::write(fd, bytes, length);
 #endif
 }
 
@@ -72,7 +87,7 @@ bool write_length_prefixed(int fd, const void* data, uint32_t length) {
     const uint8_t* hdr = reinterpret_cast<const uint8_t*>(&net_len);
     size_t written = 0;
     while (written < 4) {
-        ssize_t n = ::write(fd, hdr + written, 4 - written);
+        ssize_t n = write_frame_bytes(fd, hdr + written, 4 - written);
         if (n <= 0) return false;
         written += static_cast<size_t>(n);
     }
@@ -80,7 +95,7 @@ bool write_length_prefixed(int fd, const void* data, uint32_t length) {
     const uint8_t* payload = static_cast<const uint8_t*>(data);
     written = 0;
     while (written < length) {
-        ssize_t n = ::write(fd, payload + written, length - written);
+        ssize_t n = write_frame_bytes(fd, payload + written, length - written);
         if (n <= 0) return false;
         written += static_cast<size_t>(n);
     }

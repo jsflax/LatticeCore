@@ -21,11 +21,23 @@
 #include <unordered_set>
 #include <set>
 #include <mutex>
+#include <exception>
 
 namespace lattice {
 
+// Checked flush disposition is not a remote receipt/install guarantee.
+enum class sync_drain_state { not_attempted,drained,disconnected,retired,deadline_pending,reentrant_pending,failed };
+struct sync_drain_result {
+    sync_drain_state state=sync_drain_state::not_attempted;
+    std::exception_ptr error;
+    bool discovery_pending=false;
+};
 // Forward declaration
 class lattice_db;
+namespace detail {
+struct ordinary_upload_ack;class ordinary_source_upload_delivery;class recovery_continuous_producer;class recovery_receiver_route;class recovery_continuous_route;class sync_callback_lifetime;class recovery_export_route;class committed_export_frame;struct recovery_export_test_access;struct recovery_receiver_cohort_test_access;struct recovery_delivery_registration_test_access;struct sync_pacer_state;class sync_discovery_deferral;struct sync_discovery_operation;struct sync_upload_continuation;struct sync_upload_tracking;enum class sync_discovery_kind;struct sync_discovery_test_access;struct automatic_export_admission_test_access;}
+namespace detail {class ordinary_managed_product_credentials;class configured_recovery_connection;struct configured_attempt;class ordinary_receiver_session;}
+enum class ordinary_sync_policy : uint8_t { legacy_provisional=0, ordered_required=1, ordered_history_required=2 };
 
 // ============================================================================
 // AnyProperty - matches Swift's AnyProperty enum
@@ -92,6 +104,22 @@ using changed_fields_map = std::unordered_map<std::string, any_property>;
 // AuditLog Entry - matches Lattice.swift's AuditLog model
 // ============================================================================
 
+// Passive wire facts. Only the registered-producer ingress recomputation can
+// establish original identity; these fields confer no receipt authority.
+struct audit_original_identity {
+    int64_t version = 1;
+    std::vector<std::string> changed_fields_names;
+    std::string digest;
+    bool operator==(const audit_original_identity&) const = default;
+};
+// Passive uploader observation taken before no_history late binding. This
+// contains no source, epoch, cut, producer registration or acceptance grant.
+// The paired ordinary-v2 ABI must be rebuilt when this field is introduced.
+struct ordinary_upload_original final {
+    std::vector<std::string> fields;
+    std::vector<std::string> names;
+};
+
 struct audit_log_entry {
     int64_t id = 0;
     std::string global_id;
@@ -116,6 +144,12 @@ struct audit_log_entry {
     /// Serialized as an optional "synthesized" JSON key; old receivers
     /// ignore it (legacy upsert behavior — acceptable, they predate groups).
     bool synthesized = false;
+    std::optional<audit_original_identity> original_identity;
+    // Ordinary-v2 only; legacy serialization intentionally ignores it.
+    std::shared_ptr<const ordinary_upload_original> upload_original;
+    // Passive exact-delivery correlation; never source or projected-value authority.
+    // Legacy JSON/binary-original codecs intentionally do not serialize it.
+    std::optional<std::string> ordinary_delivery_version;
 
     // Generate SQL instruction from this audit entry
     // Returns {sql, params} for executing the change
@@ -144,6 +178,35 @@ struct audit_log_entry {
 
 // Type alias for Swift interop (can't specialize templates from Swift)
 using AuditLogEntryVector = std::vector<audit_log_entry>;
+
+namespace detail { struct ordinary_export_batch; class ordinary_export_access; class ordinary_child_origin; }
+/// Immutable local server-helper result. An engine-issued complete cut may
+/// establish one source for its receiving scope/channel. Unowned, historical or
+/// unsupported legacy exports remain provisional. Neither audit entries nor
+/// JSON can manufacture the retained cut. Copying this value to std::vector
+/// deliberately drops its ordered guarantee; rebuild C++ callers with this ABI.
+class server_export_batch final {
+    std::shared_ptr<const detail::ordinary_export_batch> value_;
+    explicit server_export_batch(std::shared_ptr<const detail::ordinary_export_batch>);
+    friend class detail::ordinary_export_access;
+public:
+    server_export_batch(const server_export_batch&) = default;
+    server_export_batch(server_export_batch&&) noexcept = default;
+    server_export_batch& operator=(const server_export_batch&) = default;
+    server_export_batch& operator=(server_export_batch&&) noexcept = default;
+    bool ordered() const;
+    const std::vector<audit_log_entry>& entries() const;
+    size_t size() const { return entries().size(); }
+    bool empty() const { return entries().empty(); }
+    const audit_log_entry& front() const { return entries().front(); }
+    const audit_log_entry& back() const { return entries().back(); }
+    const audit_log_entry& at(size_t n) const { return entries().at(n); }
+    const audit_log_entry& operator[](size_t n) const { return entries()[n]; }
+    auto begin() const { return entries().begin(); }
+    auto end() const { return entries().end(); }
+    operator std::vector<audit_log_entry>() const { return entries(); }
+};
+
 
 // ============================================================================
 // ServerSentEvent - matches Lattice.swift's ServerSentEvent enum
@@ -192,8 +255,12 @@ struct sync_filter_entry {
 };
 
 struct sync_config {
+    std::shared_ptr<detail::ordinary_managed_product_credentials> managed_product_credentials;
+    ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
+    std::string ordinary_model_profile; // Distinct from history effect/profile.
     std::string websocket_url;
     std::string authorization_token;
+    std::string recovery_source_expectation; // explicit app expectation only
     int max_reconnect_attempts = 0;  // 0 = unlimited
     double base_delay_seconds = 1.0;
     double max_delay_seconds = 60.0;
@@ -289,6 +356,10 @@ struct sync_config {
 // ============================================================================
 
 class synchronizer_base {
+    friend class lattice_db;
+    // Retained by close across reset; destructor cleanup failures cannot be
+    // recovered from a destroyed synchronizer or substituted for a drain error.
+    std::shared_ptr<std::exception_ptr> cleanup_error_=std::make_shared<std::exception_ptr>();
 public:
     using on_sync_complete_handler = std::function<void(const std::vector<std::string>& synced_ids)>;
     using on_error_handler = std::function<void(const std::string& error)>;
@@ -315,7 +386,7 @@ public:
     virtual ~synchronizer_base();
 
 protected:
-    synchronizer_base() = default;
+    synchronizer_base();
 
 public:
     // Non-copyable, non-moveable
@@ -350,6 +421,7 @@ public:
     /// of scope, and the A→B handoff all rely on this.
     /// Never blocks past `deadline`; returns immediately when disconnected.
     void drain(std::chrono::steady_clock::time_point deadline);
+    sync_drain_result drain_checked(std::chrono::steady_clock::time_point deadline) noexcept;
 
     std::shared_ptr<ack_retry_guard> ack_guard_ = std::make_shared<ack_retry_guard>();
 
@@ -380,16 +452,44 @@ protected:
     /// Owned database (native only). Stored in the base class so it outlives
     /// ~synchronizer_base() — base members are destroyed after the base
     /// destructor body, avoiding use-after-free on db_ptr_.
-    std::unique_ptr<lattice_db> owned_db_;
+    std::shared_ptr<lattice_db> owned_db_;
 
     /// Common init — call from subclass constructors after db is set up.
     void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched);
+    void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
+                   std::shared_ptr<detail::configured_attempt> configured);
+    void begin_configured_retirement();
+    friend class detail::configured_recovery_connection;
     void init_sync(const sync_config& config, std::shared_ptr<scheduler> sched,
                    std::unique_ptr<sync_transport> transport);
 
     sync_config config_;
     std::shared_ptr<scheduler> scheduler_;
-    std::unique_ptr<sync_transport> ws_client_;
+    std::shared_ptr<sync_transport> ws_client_;
+    std::shared_ptr<detail::sync_callback_lifetime> callback_lifetime_;
+    std::shared_ptr<detail::sync_pacer_state> pacer_state_;
+    std::shared_ptr<detail::sync_discovery_deferral> discovery_deferral_;
+    std::shared_ptr<detail::recovery_export_route> recovery_export_route_;
+    std::shared_ptr<detail::recovery_continuous_route> continuous_route_;
+    std::shared_ptr<detail::receiver_source_binding> receiver_source_;
+    std::shared_ptr<detail::ordinary_receiver_session> ordinary_receiver_;
+    // Passive scan incompleteness, never payload/debt or source authority.
+    // Scheduler turns publish it; admitted checked-drain readers may be foreign.
+    std::atomic<bool> ordinary_scan_incomplete_{false};
+    std::shared_ptr<detail::recovery_receiver_route> receiver_controller_;
+    // Shutdown authority is independent of retaining the database. Publish it
+    // before init can fail; borrowed owner/sibling schedulers must stay live.
+    bool owns_scheduler_shutdown_=false;
+    bool owns_inline_scheduler_adapter_=false;
+    // The completed base is destroyed even when a subclass constructor
+    // refuses a route before init_sync reaches the instance counter.
+    bool counted_instance_=false;
+    friend struct detail::recovery_export_test_access;
+    friend struct detail::recovery_receiver_cohort_test_access;
+    friend struct detail::recovery_delivery_registration_test_access;
+    friend struct detail::sync_discovery_test_access;
+    friend struct detail::automatic_export_admission_test_access;
+    friend struct sync_discovery_admission_test_access;
 
     /// Log-line identity: config_.log_label when set, else sync_id. Cached
     /// so LOG_ macros can take a stable c_str(). Set by init_sync.
@@ -401,7 +501,17 @@ protected:
 
     std::atomic<bool> is_connected_{false};
     std::atomic<bool> is_destroyed_{false};  // Set in destructor; guards scheduled lambdas
-    std::atomic<bool> should_reconnect_{true};  // Set false on explicit disconnect
+    // Explicit connect/disconnect publish a new generation. The low bit carries
+    // retry permission in the SAME atomic value, so an overlapping old call
+    // cannot pair its permission with a newer lifecycle's generation. A retry
+    // only borrows its captured token; it never enables reconnect itself.
+    std::atomic<uint64_t> reconnect_lifecycle_{1};
+    // One plus the latest stopped generation (lifecycle >> 1), or zero. Old
+    // refusal cannot stop a newer explicit connect; concurrent old refusals
+    // cannot erase a newer stop. This is not a durable source/lifetime token.
+    std::atomic<uint64_t> receive_stop_generation_{0};
+    bool receive_lifecycle_stopped(uint64_t lifecycle) const noexcept;
+
     std::atomic<int> reconnect_attempts_{0};
     // steady_clock ms of the last successful open. Backoff resets only after a
     // connection proved STABLE (open ≥ config_.stable_connection_ms before
@@ -420,7 +530,15 @@ protected:
     /// sync_now). Leading edge dispatches inline; in-window requests are
     /// absorbed by the pacer thread's single trailing-edge tick. Thread-safe;
     /// no-op after destruction begins.
-    void request_upload();
+    void request_upload(bool background=false);
+    void dispatch_upload(bool background,bool consume_request);
+    void background_upload() noexcept;
+    std::shared_ptr<detail::sync_discovery_operation> make_upload_successor(uint64_t generation);
+    void enqueue_discovery(detail::sync_discovery_kind kind,const char* stage,size_t charge,
+                           std::function<bool(detail::sync_discovery_operation&)> work);
+    void pump_discovery(std::shared_ptr<detail::sync_discovery_operation> initial = {});
+    void background_operation(const char* stage,const std::function<void()>& work) noexcept;
+    void schedule_background(const char* stage,std::function<void()> work);
 
     /// Consecutive ack-timeout failures (no ACK before the resend deadline).
     /// Grows the resend deadline (10s, 20s, 40s… capped) so a stalled server
@@ -442,14 +560,10 @@ protected:
 
 #ifndef __EMSCRIPTEN__
     // Pacer thread: owns trailing-edge coalescing and periodic WAL
-    // maintenance. Started by init_sync when upload_coalesce_ms > 0; joined
-    // in the destructor BEFORE scheduler shutdown (it only ever enqueues to
-    // the scheduler, never blocks on it).
+    // maintenance. Its waiting state is retained independently, and every
+    // owner access uses callback admission. Protected retirement transfers
+    // the existing thread into its reserved off-callback cleanup slot.
     std::thread pacer_thread_;
-    std::mutex pacer_mutex_;
-    std::condition_variable pacer_cv_;
-    bool pacer_stop_ = false;
-    std::chrono::steady_clock::time_point next_allowed_tick_{};
     std::chrono::steady_clock::time_point last_passive_ckpt_{};
     std::chrono::steady_clock::time_point last_truncate_ckpt_{};
     void start_pacer();
@@ -459,16 +573,24 @@ protected:
     /// TRUNCATE only when idle (in-flight empty — pending mirrors it).
     void maybe_checkpoint();
 #endif
-    std::atomic<bool> upload_requested_{false};  // Coalesces observer-triggered uploads
+    // Protected retirement moves its existing pacer into the already reserved
+    // transport slot before the first cleanup publication, including error,
+    // close and explicit disconnect. No per-close executor is created.
+    bool retire_protected_transport() noexcept;
     std::atomic<uint64_t> filter_version_{0};     // Bumped on each update_sync_filter; reconcile checks before acting
+    // Actual policy mutations invalidate parked exact vectors independently of
+    // update request coalescing. Clear also changes this revision.
+    std::atomic<uint64_t> upload_policy_revision_{0};
+    void advance_upload_policy_revision();
 
     // In-flight tracking: entries sent but not yet ACK'd, mapping the entry's
     // global_id to its AuditLog id (0 for synthetic entries, which have no
     // audit row — they must never gate the upload floor).
     // Prevents upload_pending_changes from re-sending entries on each cycle.
     // Accessed from scheduler thread (upload) and WebSocket/IPC thread (ACK) — needs mutex.
-    std::mutex in_flight_mutex_;
-    std::unordered_map<std::string, int64_t> in_flight_ids_;
+    std::shared_ptr<detail::sync_upload_tracking> upload_tracking_;
+    std::mutex& in_flight_mutex_;
+    std::unordered_map<std::string, int64_t>& in_flight_ids_;
 
     // Upload-floor bookkeeping (guarded by in_flight_mutex_). open_audit_ids_
     // holds every real audit id enumerated but not yet resolved (ACKed or
@@ -508,7 +630,7 @@ protected:
     on_progress_handler on_progress_;
 
     // Progress tracking
-    std::atomic<int64_t> progress_pending_upload_{0};
+    std::atomic<int64_t>& progress_pending_upload_;
     std::atomic<int64_t> progress_total_upload_{0};
     std::atomic<int64_t> progress_acked_{0};
     std::atomic<int64_t> progress_received_{0};
@@ -530,21 +652,45 @@ protected:
 
     // Sync operations
     void upload_pending_changes();
+    bool upload_pending_changes_step(detail::sync_upload_continuation&,detail::sync_discovery_operation*);
     std::vector<std::string> apply_remote_changes(const std::vector<audit_log_entry>& entries);
     void mark_as_synced(const std::vector<std::string>& global_ids);
+    void mark_as_synced_after_discovery(const std::vector<std::string>&,bool protected_store);
 
     // upload_pending_changes decomposed phases
     struct classified_entries {
         std::vector<audit_log_entry> to_send;
         std::vector<int64_t> to_mark_synced;
     };
-    // Continuation is a result of this specific pass, never shared state.
-    std::vector<audit_log_entry> query_pending_entries(bool& enumeration_hit_limit);
+    // Result of this actual pass. Empty entries prove exhaustion only when
+    // state is completed; not_enumerated carries no horizon or floor proof.
+    struct pending_entries_scan {
+        enum class outcome { not_enumerated,completed };
+        outcome state=outcome::not_enumerated;
+        std::vector<audit_log_entry> entries;
+        bool enumeration_hit_limit=false;
+        int64_t horizon=0;
+    };
+    pending_entries_scan query_pending_entries();
     classified_entries classify_entries(std::vector<audit_log_entry>& entries);
     void classify_delete(audit_log_entry& entry, classified_entries& result);
     void classify_insert_or_update(audit_log_entry& entry, const std::string& filter_table, bool is_link_table, classified_entries& result);
     void mark_skipped_synced(const std::vector<int64_t>& to_mark_synced);
     void send_entries(std::vector<audit_log_entry>& entries);
+    void send_entries_after_discovery(std::vector<audit_log_entry>& entries);
+    bool send_committed_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy);
+    bool upload_protected_entries(detail::sync_upload_continuation&,detail::sync_discovery_operation*,bool* discovery_busy=nullptr);
+    std::optional<bool> try_has_export_protection();
+    bool has_export_protection();
+private:
+    // Automatic admission is reachable only from this engine's queued work.
+    std::optional<bool> try_has_automatic_export_protection();
+    void mark_as_synced_after_discovery_impl(const std::vector<std::string>&,bool,bool*);
+    void mark_ordinary_as_synced(const std::vector<detail::ordinary_upload_ack>&);
+protected:
+    void schedule_ack_retry(const std::vector<audit_log_entry>&);
+    std::function<void()> prepare_ack_retry(const std::vector<audit_log_entry>&,bool after_handoff=false,uint64_t delivery_token=0,
+        std::function<void()> delivery_retry={});
 
     // Sync filter helpers
     // Returns nullopt if table not in filter; otherwise returns the where_clause (which may itself be nullopt for "all rows")
@@ -562,6 +708,9 @@ protected:
     void reconcile_sync_filter();
 
     // Reconnection
+    uint64_t advance_reconnect_lifecycle(bool enabled);
+    void connect_for_lifecycle(uint64_t lifecycle);
+    bool connect_step_for_lifecycle(uint64_t lifecycle);
     void schedule_reconnect();
 
     // Get last received event ID for checkpoint
@@ -585,9 +734,16 @@ public:
 
 #else
 
-/// Native: owns a dedicated lattice_db (separate connection on its own thread).
+/// Native: shared owners lend their scheduler; unique child owners transfer
+/// dedicated scheduler shutdown responsibility to this synchronizer.
 class synchronizer : public synchronizer_base {
+    enum class scheduler_ownership { borrowed, owned };
+    synchronizer(std::shared_ptr<lattice_db>,const sync_config&,scheduler_ownership);
+    synchronizer(std::shared_ptr<lattice_db>,const sync_config&,std::shared_ptr<detail::configured_attempt>);
+    friend class detail::recovery_continuous_producer;
+    friend class detail::configured_recovery_connection;
 public:
+    synchronizer(std::shared_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config);
     synchronizer(std::unique_ptr<lattice_db> db, const sync_config& config,
                  std::unique_ptr<sync_transport> transport);
@@ -633,8 +789,15 @@ void mark_audit_entries_synced_for(lattice_db& db,
                                    const std::string& sync_id,
                                    const std::vector<std::string>& all_active_sync_ids);
 
-// Get events after a checkpoint (for server-side sync)
-std::vector<audit_log_entry> events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
+// Get a retained local server batch after a checkpoint. The entry view keeps
+// legacy checkpoint spelling/unknown-checkpoint behavior; an ordered batch's
+// complete materialization cut covers its full bound scope, not just that view.
+// A borrowed database/owner must outlive the entire synchronous call, including
+// committed observer delivery. Issuance requires the actual owner's own WRITE.
+server_export_batch events_after(database& db, const std::optional<std::string>& checkpoint_global_id);
+// Explicit legacy vector endpoint. C/Swift JSON callers gain no source authority.
+std::vector<audit_log_entry> events_after_provisional(database& db,
+    const std::optional<std::string>& checkpoint_global_id);
 
 /// no_history late-binding (1.5.0). A column flagged `no_history` records
 /// THAT it changed in its UPDATE audit rows, never its value (see
@@ -670,6 +833,11 @@ extern std::function<void(size_t chunk_start)> apply_chunk_begin;
 // Disables sync triggers, executes model SQL, inserts AuditLog records, re-enables triggers.
 // Returns global IDs of successfully applied entries (entries that failed SQL execution are excluded).
 std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<audit_log_entry>& entries);
+/// Retains the actual private issuer envelope, including its complete cut.
+/// Copying entries into a vector invokes only the original provisional endpoint.
+/// Full helper provisional/upload/ACK/prune integration remains a required
+/// owning-source prerequisite; these declarations alone do not supply it.
+std::vector<std::string> apply_remote_changes(lattice_db& db, const server_export_batch& entries);
 
 /// Apply remote audit log entries and mark them as synced for the receiving sync_id.
 /// Unlike apply_remote_changes, this uses per-synchronizer sync state so that OTHER
@@ -678,6 +846,9 @@ std::vector<std::string> apply_remote_changes(lattice_db& db, const std::vector<
 /// Returns global IDs of successfully applied entries.
 std::vector<std::string> apply_remote_changes_for(lattice_db& db,
                               const std::vector<audit_log_entry>& entries,
+                              const std::string& sync_id);
+std::vector<std::string> apply_remote_changes_for(lattice_db& db,
+                              const server_export_batch& entries,
                               const std::string& sync_id);
 
 // Replication slot management for sync-safe compaction.

@@ -1,6 +1,10 @@
 #include "TestHelpers.hpp"
 #include <lattice.hpp>          // swift_lattice, swift_lattice_ref (schemas with per-property flags)
 #include <lattice/sync.hpp>
+#include <lattice/ordinary_sync.hpp>
+#include "../../Sources/LatticeCore/src/ordinary_source_upload.hpp"
+#include "../../Sources/LatticeCore/src/ordinary_v2_original.hpp"
+#include <cstring>
 
 // ============================================================================
 // property_descriptor::no_history (1.5.0) — "record that it changed, not what
@@ -196,4 +200,60 @@ TEST(NoHistory, ReceiverNeverBindsANullForANoHistoryColumn) {
     ASSERT_EQ(row.size(), 1u);
     EXPECT_EQ(std::get<std::string>(row[0].at("title")), "T2");
     EXPECT_EQ(std::get<std::string>(row[0].at("body")), "kept") << "the null must not overwrite the value";
+}
+
+
+TEST(NoHistory, PassiveUploadAndDeliveryFactsDoNotEnterLegacyJSONOrOriginalEnvelope) {
+    lattice::audit_log_entry entry;entry.id=3;entry.global_id=fake_uuid(7301);entry.table_name="NhDoc";
+    entry.operation="UPDATE";entry.row_id=7;entry.global_row_id=fake_uuid(7302);entry.timestamp="123.25";
+    entry.changed_fields.emplace("title",lattice::any_property(std::string("T")));entry.changed_fields_names={"title"};
+    entry.original_identity=lattice::audit_original_identity{1,{"title"},std::string(64,'a')};
+    const auto json=entry.to_json();size_t charged=0;
+    const auto charge=[&](size_t n){charged+=n;};
+    const auto encoded=lattice::detail::encode_ordinary_v2_original(entry,charge);
+    const auto retained=lattice::detail::encode_ordinary_v2_retained_entry(entry,charge);
+    auto original=std::make_shared<lattice::ordinary_upload_original>();original->fields={"body","title"};original->names={"title","body"};
+    entry.upload_original=original;entry.ordinary_delivery_version=std::string(64,'b');
+    EXPECT_EQ(entry.to_json(),json);
+    EXPECT_EQ(lattice::detail::encode_ordinary_v2_original(entry,charge),encoded);
+    EXPECT_EQ(lattice::detail::encode_ordinary_v2_retained_entry(entry,charge),retained);
+    const auto decoded=lattice::audit_log_entry::from_json(entry.to_json());ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->original_identity,entry.original_identity);EXPECT_FALSE(decoded->upload_original);EXPECT_FALSE(decoded->ordinary_delivery_version);
+    auto copied=entry;EXPECT_EQ(copied.upload_original.get(),original.get());EXPECT_EQ(copied.ordinary_delivery_version,entry.ordinary_delivery_version);
+    EXPECT_GT(charged,0u);
+}
+
+TEST(NoHistory, OrdinaryQueryKeepsActualRawMembershipAfterTargetDeletion) {
+    TempDB tmp{"ordinary_current_raw_membership"};auto schemas=doc_schema(true);
+    auto* ref=lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()),schemas);auto& owner=*ref->get();
+    owner.db().execute("INSERT INTO NhDoc(globalId,title,body) VALUES('d1','T','v1')");
+    owner.db().execute("UPDATE NhDoc SET body='v2' WHERE globalId='d1'");
+    owner.db().execute("DELETE FROM NhDoc WHERE globalId='d1'");
+    const auto before=owner.db().query("SELECT * FROM AuditLog ORDER BY id");
+    const auto input=lattice::detail::query_ordinary_upload_entries(owner.db(),"ordinary-current-observation",std::nullopt,0,64);
+    ASSERT_EQ(input.size(),3u);const auto update=std::find_if(input.begin(),input.end(),[](const auto& e){return e.operation=="UPDATE";});ASSERT_NE(update,input.end());
+    EXPECT_TRUE(update->changed_fields.empty());EXPECT_TRUE(update->changed_fields_names.empty());ASSERT_TRUE(update->upload_original);
+    EXPECT_EQ(update->upload_original->fields,(std::vector<std::string>{"body"}));EXPECT_EQ(update->upload_original->names,(std::vector<std::string>{"body"}));
+    EXPECT_EQ(update->ordinary_delivery_version,(std::optional<std::string>{"0"}));
+    EXPECT_EQ(owner.db().query("SELECT * FROM AuditLog ORDER BY id"),before);
+    const auto legacy=lattice::query_audit_log_for_sync(owner.db(),"ordinary-current-observation",std::nullopt,0,64);
+    ASSERT_EQ(legacy.size(),3u);const auto old_update=std::find_if(legacy.begin(),legacy.end(),[](const auto& e){return e.operation=="UPDATE";});ASSERT_NE(old_update,legacy.end());
+    EXPECT_TRUE(old_update->changed_fields.empty());EXPECT_TRUE(old_update->changed_fields_names.empty());EXPECT_FALSE(old_update->upload_original);EXPECT_FALSE(old_update->ordinary_delivery_version);
+}
+
+TEST(NoHistory, OrdinaryQueryRefusesUnboundedAndActualNativeReadFailureWithoutMutation) {
+    TempDB tmp{"ordinary_current_read_refusal"};auto schemas=doc_schema(true);
+    auto* ref=lattice::swift_lattice_ref::create(lattice::swift_configuration(tmp.str()),schemas);auto& owner=*ref->get();
+    owner.db().execute("INSERT INTO NhDoc(globalId,title,body) VALUES('d1','T','v1')");
+    const auto before=owner.db().query("SELECT * FROM AuditLog ORDER BY id");
+    EXPECT_THROW((void)lattice::detail::query_ordinary_upload_entries(owner.db(),"ordinary-current-refusal",std::nullopt,0,0),lattice::db_error);
+    EXPECT_THROW((void)lattice::detail::query_ordinary_upload_entries(owner.db(),"ordinary-current-refusal",std::nullopt,0,lattice::ordinary_sync_limits::originals+1),lattice::db_error);
+    auto* handle=owner.db().handle();struct clear_authorizer {sqlite3* handle;~clear_authorizer(){sqlite3_set_authorizer(handle,nullptr,nullptr);}} clear{handle};int denied=0;
+    ASSERT_EQ(sqlite3_set_authorizer(handle,[](void* state,int action,const char* table,const char*,const char*,const char*)noexcept {
+        if(action==SQLITE_READ&&table&&std::strcmp(table,"AuditLog")==0){++*static_cast<int*>(state);return SQLITE_DENY;}return SQLITE_OK;
+    },&denied),SQLITE_OK);
+    EXPECT_THROW((void)lattice::detail::query_ordinary_upload_entries(owner.db(),"ordinary-current-refusal",std::nullopt,0,64),lattice::db_error);
+    ASSERT_EQ(sqlite3_set_authorizer(handle,nullptr,nullptr),SQLITE_OK);EXPECT_GT(denied,0);
+    EXPECT_EQ(owner.db().query("SELECT * FROM AuditLog ORDER BY id"),before);
+    EXPECT_FALSE(owner.db().is_in_transaction());
 }

@@ -7,6 +7,8 @@
 #include <bridging.hpp>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <unmanaged_object.hpp>
 #include <LatticeCore.hpp>
 
@@ -24,19 +26,19 @@ class swift_lattice;
 template <> \
 const managed<type> get_managed_field(const std::string& name) const { \
 managed<type> m; \
-m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_); \
+m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_); \
 return m; \
 } \
 template <> \
 const managed<std::optional<type>> get_managed_field(const std::string& name) const { \
 managed<std::optional<type>> m; \
-m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_); \
+m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_); \
 return m; \
 } \
 template <> \
 const managed<std::vector<type>> get_managed_field(const std::string& name) const { \
 managed<std::vector<type>> m; \
-m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_); \
+m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_); \
 return m; \
 }
 
@@ -50,6 +52,14 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     swift_dynamic_object source;
     std::unordered_map<std::string, property_descriptor> properties_;
     std::unordered_map<std::string, managed_base> fields;  // Managed property wrappers for read/write
+
+    // The exact SQL row returned by a collection query, retained only long
+    // enough to extract query-position metadata (e.g. a keyset anchor).
+    // Separate from source.values / unmanaged_values_: neither live field
+    // reads nor writes, inserts, or row-cache refreshes consult this image.
+    // Copies share an immutable image; consumers release it before publishing
+    // live models so large payloads do not stay resident with those models.
+    std::shared_ptr<const database::row_t> query_row_image_;
     
     managed() = default;
     managed(managed&&) = default;
@@ -178,7 +188,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     template <>
     const managed<std::vector<uint8_t>> get_managed_field(const std::string& name) const {
         managed<std::vector<uint8_t>> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
         // Check if this is a vector column for similarity search
         auto it = properties_.find(name);
         if (it != properties_.end() && it->second.is_vector) {
@@ -189,7 +199,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     template <>
     const managed<std::optional<std::vector<uint8_t>>> get_managed_field(const std::string& name) const {
         managed<std::optional<std::vector<uint8_t>>> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
         // Check if this is a vector column for similarity search
         auto it = properties_.find(name);
         if (it != properties_.end() && it->second.is_vector) {
@@ -202,7 +212,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     template <>
     const managed<swift_dynamic_object*> get_managed_field(const std::string& name) const {
         managed<swift_dynamic_object*> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
         const property_descriptor& property = properties_.at(name);
         auto base = static_cast<model_base>(*this);
         m.bind_to_parent(&base, property);
@@ -212,7 +222,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     template <>
     const managed<swift_dynamic_object> get_managed_field(const std::string& name) const {
         managed<swift_dynamic_object*> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
         auto base = static_cast<model_base>(*this);
         const property_descriptor& property = properties_.at(name);
         m.bind_to_parent(&base, property);
@@ -223,7 +233,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     template <>
     const managed<std::vector<int>> get_managed_field(const std::string& name) const {
         managed<std::vector<int>> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
         return m;
     }
     
@@ -231,7 +241,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     template <>
     const managed<std::vector<swift_dynamic_object*>> get_managed_field(const std::string& name) const {
         managed<std::vector<swift_dynamic_object*>> m;
-        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_);
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_, this->attachment_token_, this->attachment_writer_);
         auto base = static_cast<model_base>(*this);
         const property_descriptor& property = properties_.at(name);
         m.bind_to_parent(&base, property);
@@ -242,24 +252,18 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
     template <>
     const managed<geo_bounds> get_managed_field(const std::string& name) const {
         managed<geo_bounds> m;
-        m.db = this->db_;
-        m.lattice = this->lattice_;
-        m.table_name = this->table_name_;
-        m.column_name = name;
-        m.row_id = this->id_;
-        m.rtree_table_ = "_" + this->table_name_ + "_" + name + "_rtree";
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_,
+                 this->attachment_token_, this->attachment_writer_);
+        m.rtree_table_ = managed_sidecar_sql(this->table_name_, name + "_rtree");
         return m;
     }
 
     template <>
     const managed<std::optional<geo_bounds>> get_managed_field(const std::string& name) const {
         managed<std::optional<geo_bounds>> m;
-        m.db = this->db_;
-        m.lattice = this->lattice_;
-        m.table_name = this->table_name_;
-        m.column_name = name;
-        m.row_id = this->id_;
-        m.rtree_table_ = "_" + this->table_name_ + "_" + name + "_rtree";
+        m.assign(this->db_, this->lattice_, this->table_name_, name, this->id_,
+                 this->attachment_token_, this->attachment_writer_);
+        m.rtree_table_ = managed_sidecar_sql(this->table_name_, name + "_rtree");
         return m;
     }
 
@@ -272,8 +276,8 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         m.table_name = this->table_name_;
         m.column_name = name;
         m.row_id = this->id_;
-        m.list_table_ = "_" + this->table_name_ + "_" + name;
-        m.rtree_table_ = m.list_table_ + "_rtree";
+        m.list_table_ = managed_sidecar_sql(this->table_name_, name);
+        m.rtree_table_ = managed_sidecar_sql(this->table_name_, name + "_rtree");
         m.parent_global_id_ = this->global_id_;
         return m;
     }
@@ -296,7 +300,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         managed.assign(this->db_,
                        this->lattice_,
                        this->table_name_,
-                       name, this->id_);
+                       name, this->id_, this->attachment_token_, this->attachment_writer_);
         return managed.detach();
     }
     
@@ -305,7 +309,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         managed.assign(this->db_,
                        this->lattice_,
                        this->table_name_,
-                       name, this->id_);
+                       name, this->id_, this->attachment_token_, this->attachment_writer_);
         return managed.detach();
     }
     
@@ -314,7 +318,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         managed.assign(this->db_,
                        this->lattice_,
                        this->table_name_,
-                       name, this->id_);
+                       name, this->id_, this->attachment_token_, this->attachment_writer_);
         return managed.detach();
     }
     
@@ -323,7 +327,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         managed.assign(this->db_,
                        this->lattice_,
                        this->table_name_,
-                       name, this->id_);
+                       name, this->id_, this->attachment_token_, this->attachment_writer_);
         return managed.detach();
     }
 
@@ -385,7 +389,7 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
         managed->assign(this->db_,
                         this->lattice_,
                         this->table_name_,
-                        name, this->id_);
+                        name, this->id_, this->attachment_token_, this->attachment_writer_);
     }
     
     // Shared handle to the owning db wrapper (nullptr when not attached).
@@ -394,6 +398,29 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<swift_dynamic_object> : model_base {
 
     friend struct dynamic_object;
     friend struct link_list;
+
+private:
+    // Dynamic scalar reads need a value, not a separately bound field wrapper.
+    // Keep the column snapshot: an authorizer can mutate its caller's name
+    // string during prepare, before query_managed_cell matches result names.
+    template <typename T>
+    T read_live_scalar(const std::string& name) const {
+        static_assert(std::is_same_v<T, int64_t> || std::is_same_v<T, double> ||
+                      std::is_same_v<T, std::string>);
+        const std::string column = name;
+        if (this->db_ && this->id_ != 0) {
+            detail::managed_route_scope route_guard(this->db_, this->lattice_, this->table_name_,
+                this->attachment_token_, this->attachment_writer_);
+            auto cell = this->db_->query_managed_cell(
+                detail::managed_scalar_select_sql(this->table_name_, column),
+                column, this->id_);
+            if (cell && std::holds_alternative<T>(*cell)) {
+                return std::get<T>(std::move(*cell));
+            }
+        }
+        // The old get_managed_field<T> path default-constructed its wrapper.
+        return T{};
+    }
 };
 }
 

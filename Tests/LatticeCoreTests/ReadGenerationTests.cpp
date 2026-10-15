@@ -268,6 +268,7 @@ TEST(InvalidationHook, LeafLockABBAWatchdog) {
 // Read-generation pool (§2.2/§2.5)
 // ----------------------------------------------------------------------------
 
+
 // The core guarantee: a held generation reads one MVCC snapshot — a reader
 // at generation N sees pre-commit state after the writer commits; a fresh
 // generation sees post-commit state.

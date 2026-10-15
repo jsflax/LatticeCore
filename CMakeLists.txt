@@ -4,6 +4,7 @@ project(LatticeCore VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+option(LATTICE_SYNC_COMMIT_PROBE "Opt-in tagged WAL probe and qualification tests" OFF)
 
 # For Android, we need to bundle SQLite3
 if(ANDROID)
@@ -63,14 +64,84 @@ target_link_libraries(SqliteVec PRIVATE SQLite::SQLite3)
 # =============================================================================
 add_library(LatticeCore STATIC
     Sources/LatticeCore/src/db.cpp
+    Sources/LatticeCore/src/ordinary_export.cpp
+    Sources/LatticeCore/src/ordinary_target_staging_io.cpp
+    Sources/LatticeCore/src/ordinary_target_staging_connection.cpp
+    Sources/LatticeCore/src/ordinary_schema_validation.cpp
+    Sources/LatticeCore/src/ordinary_internal_schema.cpp
+    Sources/LatticeCore/src/ordinary_wire.cpp
+    Sources/LatticeCore/src/ordinary_receiver_session.cpp
+    Sources/LatticeCore/src/ordinary_v2_original.cpp
+    Sources/LatticeCore/src/ordinary_source_upload.cpp
+    Sources/LatticeCore/src/ordinary_v2_audit_json.cpp
+    Sources/LatticeCore/src/ordinary_vector_integrity.cpp
+    Sources/LatticeCore/src/ordinary_store_admission.cpp
+    Sources/LatticeCore/src/ordinary_owned_launch.cpp
+    Sources/LatticeCore/src/managed_observation.cpp
+    Sources/LatticeCore/src/scheduler.cpp
     Sources/LatticeCore/src/schema.cpp
+    Sources/LatticeCore/src/derived_profile.cpp
     Sources/LatticeCore/src/sync.cpp
+    Sources/LatticeCore/src/sync_commit_probe.cpp
+    Sources/LatticeCore/src/recovery_export_adapter.cpp
+    Sources/LatticeCore/src/recovery_server_export.cpp
+    Sources/LatticeCore/src/sync_callback_lifetime.cpp
+    Sources/LatticeCore/src/configured_retirement.cpp
+    Sources/LatticeCore/src/configured_attempt_custody.cpp
+    Sources/LatticeCore/src/configured_platform.cpp
+    Sources/LatticeCore/src/configured_recovery_connection.cpp
+    Sources/LatticeCore/src/scoped_recovery_install.cpp
+    Sources/LatticeCore/src/recovery_witness.cpp
+    Sources/LatticeCore/src/recovery_refresh.cpp
+    Sources/LatticeCore/src/receive_install_state.cpp
+    Sources/LatticeCore/src/recovery_obligation_store.cpp
+    Sources/LatticeCore/src/recovery_local_producer.cpp
+    Sources/LatticeCore/src/receive_ledger.cpp
+    Sources/LatticeCore/src/receive_delivery_guard.cpp
+    Sources/LatticeCore/src/recovery_staging.cpp
+    Sources/LatticeCore/src/recovery_install_transaction.cpp
+    Sources/LatticeCore/src/canonical_change_store.cpp
+    Sources/LatticeCore/src/recovery_receipt_coverage.cpp
+    Sources/LatticeCore/src/canonical_receipt_coverage.cpp
+    Sources/LatticeCore/src/canonical_writer_adapter.cpp
+    Sources/LatticeCore/src/recovery_authenticated_session.cpp
+    Sources/LatticeCore/src/recovery_receiver_source.cpp
+    Sources/LatticeCore/src/recovery_receiver_controller.cpp
+    Sources/LatticeCore/src/recovery_unknown_reconciliation.cpp
+    Sources/LatticeCore/src/recovery_request_store.cpp
+    Sources/LatticeCore/src/sync_recovery_protocol.cpp
+    Sources/LatticeCore/src/sync_canonical_range.cpp
+    Sources/LatticeCore/src/canonical_range_staging.cpp
+    Sources/LatticeCore/src/sync_recovery_values.cpp
+    Sources/LatticeCore/src/sync_recovery_outbox.cpp
+    Sources/LatticeCore/src/sync_snapshot_source.cpp
     Sources/LatticeCore/src/network.cpp
     Sources/LatticeCore/src/ipc.cpp
     Sources/LatticeCore/src/lattice.cpp
+    Sources/LatticeCore/src/projection.cpp
+    Sources/LatticeCore/src/projection_memory.cpp
+    Sources/LatticeCore/src/projection_capture_policy.cpp
     Sources/LatticeCore/src/cross_process_notifier_darwin.cpp
     Sources/LatticeCore/src/cross_process_notifier_linux.cpp
     Sources/LatticeCore/src/cross_process_notifier_noop.cpp
+    Sources/LatticeCore/src/ordinary_cohort_attachment.cpp
+    Sources/LatticeCore/src/ordinary_cohort_attachment_qualification.cpp
+    Sources/LatticeCore/src/ordinary_installation_cohort.cpp
+    Sources/LatticeCore/src/ordinary_installation_files.cpp
+    Sources/LatticeCore/src/ordinary_installation_manifest.cpp
+    Sources/LatticeCore/src/ordinary_installation_seed.cpp
+    Sources/LatticeCore/src/ordinary_ipc_frame_io.cpp
+    Sources/LatticeCore/src/ordinary_managed_ipc_attempt.cpp
+    Sources/LatticeCore/src/ordinary_managed_ipc_connection.cpp
+    Sources/LatticeCore/src/ordinary_managed_ipc_endpoint.cpp
+    Sources/LatticeCore/src/ordinary_managed_ipc_route.cpp
+    Sources/LatticeCore/src/ordinary_managed_ipc_worker_owner.cpp
+    Sources/LatticeCore/src/ordinary_managed_ipc_workers.cpp
+    Sources/LatticeCore/src/ordinary_managed_product_route.cpp
+    Sources/LatticeCore/src/ordinary_managed_wss_binding.cpp
+    Sources/LatticeCore/src/ordinary_namespace_retirement.cpp
+    Sources/LatticeCore/src/ordinary_normal_startup.cpp
+    Sources/LatticeCore/src/ordinary_observed_process.cpp
 )
 target_include_directories(LatticeCore PUBLIC
     Sources/LatticeCore/include
@@ -80,6 +151,9 @@ target_include_directories(LatticeCore PUBLIC
 # and every sqlite3_* call expands to the undefined sqlite3_api thunk table
 # (bites on Linux, where libsqlite3-dev ships sqlite3ext.h).
 target_compile_definitions(LatticeCore PRIVATE SQLITE_CORE)
+if(LATTICE_SYNC_COMMIT_PROBE)
+    target_compile_definitions(LatticeCore PUBLIC LATTICE_SYNC_COMMIT_PROBE)
+endif()
 target_link_libraries(LatticeCore PUBLIC
     SqliteVec
     SQLite::SQLite3
@@ -90,6 +164,11 @@ target_link_libraries(LatticeCore PUBLIC
 # =============================================================================
 add_library(LatticeSwiftCppBridge STATIC
     Sources/LatticeSwiftCppBridge/src/lattice.cpp
+    Sources/LatticeSwiftCppBridge/src/bulk_mutation.cpp
+    Sources/LatticeSwiftCppBridge/src/projection.cpp
+    Sources/LatticeSwiftCppBridge/src/recovery_continuity.cpp
+    Sources/LatticeSwiftCppBridge/src/recovery_export.cpp
+    Sources/LatticeSwiftCppBridge/src/recovery_relay.cpp
     Sources/LatticeSwiftCppBridge/src/dynamic_object.cpp
     Sources/LatticeSwiftCppBridge/src/managed_object.cpp
     Sources/LatticeSwiftCppBridge/src/unmanaged_object.cpp
@@ -174,6 +253,20 @@ install(FILES Sources/LatticeCAPI/include/lattice.h
 # =============================================================================
 enable_testing()
 
+# Genuine retained installation issuer and fixed C seed receiver. The ordinary
+# build stamp remains unavailable; registration still fails closed.
+find_package(Threads REQUIRED)
+add_executable(LatticeInstallationLauncher
+    Tools/LatticeInstallationLauncher/main.cpp
+    Tools/LatticeInstallationLauncher/engram_product_installer.cpp
+    Tools/LatticeInstallationLauncher/engram_restart_preparation.cpp
+    Tools/LatticeInstallationLauncher/engram_upgrade_session.cpp
+)
+target_link_libraries(LatticeInstallationLauncher PRIVATE LatticeCore Threads::Threads)
+add_library(LatticeInstallationChannel STATIC Sources/LatticeInstallationChannel/src/channel.cpp)
+target_include_directories(LatticeInstallationChannel PUBLIC Sources/LatticeInstallationChannel/include)
+target_link_libraries(LatticeInstallationChannel PRIVATE LatticeCore)
+
 add_library(gtest STATIC Sources/GoogleTest/src/gtest-all.cc)
 target_include_directories(gtest PUBLIC Sources/GoogleTest/include)
 target_include_directories(gtest PRIVATE Sources/GoogleTest)
@@ -187,24 +280,138 @@ target_link_libraries(gtest_main PUBLIC gtest)
 # =============================================================================
 add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0Tests.cpp
+    Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp
+    Tests/LatticeCoreTests/ExactVectorRowsTests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/SyncPartialConstructionTests.cpp
+    Tests/LatticeCoreTests/RecoveryReceiverSourceTests.cpp
+    Tests/LatticeCoreTests/RecoveryReceiverControllerTests.cpp
+    Tests/LatticeCoreTests/RecoveryOriginalIdentityTests.cpp
+    Tests/LatticeCoreTests/CanonicalReceiptCoverageRangeTests.cpp
+    Tests/LatticeCoreTests/RecoveryReceiptCoverageControllerTests.cpp
+    Tests/LatticeCoreTests/SyncCommitProbeTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
+    Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp
+    Tests/LatticeCoreTests/StartupSyncHealingTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp
+    Tests/LatticeCoreTests/SyncCanonicalRangeTests.cpp
+    Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp
+    Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp
+    Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp
+    Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp
+    Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp
+    Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp
+    Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp
+    Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp
+    Tests/LatticeCoreTests/AuthenticatedRelaySessionTests.cpp
+    Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp
+    Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp
+    Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp
+    Tests/LatticeCoreTests/OrdinaryOwnedTransactionTests.cpp
+    Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp
+    Tests/LatticeCoreTests/RecoveryWitnessTests.cpp
+    Tests/LatticeCoreTests/RecoveryRefreshWorkerTests.cpp
+    Tests/LatticeCoreTests/RecoveryRefreshBridgeTests.cpp
+    Tests/LatticeCoreTests/RecoveryRefreshAdmissionTests.cpp
+    Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp
+    Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp
+    Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp
+    Tests/LatticeCoreTests/ScopedRecoveryDeltaTests.cpp
+    Tests/LatticeCoreTests/CanonicalScopedInstallTests.cpp
+    Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp
+    Tests/LatticeCoreTests/RecoveryObligationStoreTests.cpp
+    Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp
+    Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp
+    Tests/LatticeCoreTests/ReceiveDeliveryGuardTests.cpp
+    Tests/LatticeCoreTests/ReceiveResetAdmissionTests.cpp
+    Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp
+    Tests/LatticeCoreTests/SyncCallbackLifetimeTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp
+    Tests/LatticeCoreTests/SyncDiscoveryDeferralTests.cpp
+    Tests/LatticeCoreTests/SyncDiscoveryAdmissionTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp
+    Tests/LatticeCoreTests/RecoveryUploadJsonTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp
+    Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp
+    Tests/LatticeCoreTests/RecoveryServerExportTests.cpp
+    Tests/LatticeCoreTests/RecoveryOwnerSchemaTests.cpp
+    Tests/LatticeCoreTests/OrdinarySchemaRecipeTests.cpp
+    Tests/LatticeCoreTests/RecoverySwiftContinuityTests.cpp
+    Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp
+    Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp
+    Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp
+    Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp
+    Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp
+    Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp
+    Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp
+    Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp
+    Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp
+    Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp
+    Tests/LatticeCoreTests/VectorClearTests.cpp
+    Tests/LatticeCoreTests/DerivedFtsProgramTests.cpp
+    Tests/LatticeCoreTests/DerivedProfileTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
+    Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
-    Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
+    Tests/LatticeCoreTests/DatabaseRetirementTests.cpp
+    Tests/LatticeCoreTests/ConfiguredRetirementTests.cpp
+    Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp
+    Tests/LatticeCoreTests/OrdinaryStoreAdmissionTests.cpp
+    Tests/LatticeCoreTests/OrdinaryOwnedLaunchTests.cpp
+    Tests/LatticeCoreTests/OrdinaryOwnedExportTests.cpp
+    Tests/LatticeCoreTests/OrdinaryOwnedHelperTests.cpp
+    Tests/LatticeCoreTests/OrdinaryHelperUploadIntegrityTests.cpp
+    Tests/LatticeCoreTests/OrdinaryOwnedExportRestartTests.cpp
+    Tests/LatticeCoreTests/OrdinaryCurrentManagedConsumerTests.cpp
+    Tests/LatticeCoreTests/OrdinaryOwnedTransactionTests.cpp
+    Tests/LatticeCoreTests/InheritedOwnerQuarantineTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
+    Tests/LatticeCoreTests/ManagedObservationTests.cpp
     Tests/LatticeCoreTests/ObservationTests.cpp
     Tests/LatticeCoreTests/LinuxNotifierTests.cpp
     Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp
     Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp
     Tests/LatticeCoreTests/ReaderLifetimeTests.cpp
+    Tests/LatticeCoreTests/ReadGenerationTests.cpp
     Tests/LatticeCoreTests/InstanceLifecycleTests.cpp
+    Tests/LatticeCoreTests/AttachTests.cpp
+    Tests/LatticeCoreTests/DeferredDeliveryTests.cpp
+    Tests/LatticeCoreTests/FilterRemovalGateTests.cpp
+    Tests/LatticeCoreTests/HistoryAndReclaimTests.cpp
+    Tests/LatticeCoreTests/LogTests.cpp
+    Tests/LatticeCoreTests/MultiChannelSyncSetTests.cpp
+    Tests/LatticeCoreTests/NamedMemoryTests.cpp
+    Tests/LatticeCoreTests/NoHistoryTests.cpp
+    Tests/LatticeCoreTests/SkewToleranceTests.cpp
+    Tests/LatticeCoreTests/SyncIntegerWidthTests.cpp
+    Tests/LatticeCoreTests/SynthesisNoClobberTests.cpp
+    Tests/LatticeCoreTests/IPCFramingRegressionTests.cpp
     Tests/LatticeCoreTests/BridgeTests.cpp
+    Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp
+    Tests/LatticeCoreTests/BulkMutationTests.cpp
+    Tests/LatticeCoreTests/ProjectionReadTests.cpp
+    Tests/LatticeCoreTests/OrdinaryPagedHistoryTests.cpp
+    Tests/LatticeCoreTests/TopologyAdmissionTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp
+    Tests/LatticeCoreTests/ProjectionMemoryServiceTests.cpp
+    Tests/LatticeCoreTests/SpatialShapeBridgeTests.cpp
+    Tests/LatticeCoreTests/ManagedPhysicalRouteTests.cpp
+    Tests/LatticeCoreTests/VirtualUnionRouteTests.cpp
+    Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
+    Tests/LatticeCoreTests/UnmanagedConstructionTests.cpp
+    Tests/LatticeCoreTests/LiveScalarReadTests.cpp
     Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp
     Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp
     Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp
@@ -212,6 +419,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/AuditHygieneTests.cpp
     Tests/LatticeCoreTests/AuditRetentionTests.cpp
     Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp
+    Tests/LatticeCoreTests/InheritedOwnerQuarantineTests.cpp
     Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp
     Tests/LatticeCoreTests/SyncPerfBench.cpp
     Tests/LatticeCoreTests/CAPISurfaceTests.cpp
@@ -242,3 +450,55 @@ target_include_directories(LatticeCAPITests PRIVATE
     # never string-compared (key order is unspecified).
     Sources/LatticeCore/include)
 gtest_discover_tests(LatticeCAPITests)
+
+# Dedicated native constructor qualification only. The actual installed-image,
+# account, namespace, retirement and paired admission checks remain mandatory.
+option(LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE "Build private admitted-target constructor fixture (never release)" OFF)
+# Normal-entry authenticated-owner qualification has no constructor phases5-7.
+option(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE "Build private authenticated-owner qualification (never release)" OFF)
+if(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+    if(LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
+        message(FATAL_ERROR "Owner and direct constructor qualification are separate builds")
+    endif()
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        message(FATAL_ERROR "Genuine receiving-owner qualification requires macOS")
+    endif()
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        message(FATAL_ERROR "Private owner qualification cannot be enabled in a release build")
+    endif()
+    target_compile_definitions(LatticeCore PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+    foreach(stamp BUILD_STAMP MANAGED_PAIR_STAMP LEGACY_PROFILE)
+        if(NOT DEFINED LATTICE_RECLAMATION_${stamp}_HEADER)
+            message(FATAL_ERROR "Owner qualification requires each actual controller stamp/profile header")
+        endif()
+        if(NOT IS_ABSOLUTE "${LATTICE_RECLAMATION_${stamp}_HEADER}" OR
+           NOT EXISTS "${LATTICE_RECLAMATION_${stamp}_HEADER}" OR
+           IS_DIRECTORY "${LATTICE_RECLAMATION_${stamp}_HEADER}")
+            message(FATAL_ERROR "Owner controller stamp/profile must be an actual absolute file")
+        endif()
+        target_compile_definitions(LatticeInstallationLauncher PRIVATE
+            LATTICE_ENGRAM_${stamp}_HEADER="${LATTICE_RECLAMATION_${stamp}_HEADER}")
+    endforeach()
+endif()
+if(LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        message(FATAL_ERROR "Genuine managed history admission is currently macOS-only")
+    endif()
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        message(FATAL_ERROR "Private reclamation fixture cannot be enabled in a release build")
+    endif()
+    target_compile_definitions(LatticeCore PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
+    target_compile_definitions(LatticeInstallationLauncher PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
+    add_executable(LatticeManagedTargetReclamationRuntime Tools/LatticeManagedTargetReclamationFixture/runtime.cpp)
+    target_compile_definitions(LatticeManagedTargetReclamationRuntime PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
+    target_link_libraries(LatticeManagedTargetReclamationRuntime PRIVATE LatticeCore Threads::Threads)
+    add_executable(LatticeManagedTargetReclamationTests Tests/LatticeCoreTests/ManagedTargetReclamationFixtureTests.cpp)
+    target_compile_definitions(LatticeManagedTargetReclamationTests PRIVATE LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE)
+    target_link_libraries(LatticeManagedTargetReclamationTests PRIVATE LatticeCore gtest_main Threads::Threads)
+    foreach(stamp BUILD_STAMP MANAGED_PAIR_STAMP LEGACY_PROFILE)
+        if(DEFINED LATTICE_RECLAMATION_${stamp}_HEADER)
+            target_compile_definitions(LatticeInstallationLauncher PRIVATE
+                LATTICE_ENGRAM_${stamp}_HEADER="${LATTICE_RECLAMATION_${stamp}_HEADER}")
+        endif()
+    endforeach()
+endif()

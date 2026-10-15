@@ -3,11 +3,19 @@
 #ifdef __cplusplus
 
 #include "types.hpp"
+#include "ordinary_context.hpp"
 #include <sqlite3.h>
 #include <stdexcept>
 #include <unordered_map>
 #include <atomic>
 #include <functional>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <algorithm>
+#include <thread>
+#include <exception>
+#include <vector>
 
 namespace lattice {
 
@@ -16,24 +24,346 @@ namespace lattice {
 /// configuration::busy_timeout_ms so a stuck writer can't hang the UI thread.
 inline constexpr int kDefaultBusyTimeoutMs = 30000;
 
+namespace detail { uint64_t database_native_process() noexcept; }
+
 class db_error : public std::runtime_error {
 public:
     explicit db_error(const std::string& msg) : std::runtime_error(msg) {}
 };
 
+/// Only installed on a connection exclusively owned by one bounded operation.
+/// Dormant managed preparation privately spans its checked open and owned archive
+/// WRITE; only its known clean success may detach that exact deadline control.
+/// Target publication protects sqlite3_interrupt from late cancellation/UAF.
+struct database_read_control {
+    std::atomic<int32_t> stop_code{0};
+    std::chrono::steady_clock::time_point deadline;
+    std::mutex target_mutex;
+    sqlite3* target = nullptr;
+    // A managed inherited control cannot lock or interrupt its parent target.
+    const uint64_t creator_process = detail::database_native_process();
+    bool stopped() noexcept;
+    void stop(int32_t reason) noexcept;
+    void publish(sqlite3* handle) noexcept;
+    void unpublish(sqlite3* handle) noexcept;
+};
+
+/// Native live-file identity. filename is SQLite's decoded absolute filename,
+/// canonicalized for diagnostics; matching uses device/inode, not spelling.
+/// Capture validates pathname stability with HAS_MOVED, not an atomic fstat of
+/// SQLite's descriptor. Concurrent external replacement during capture is
+/// unsupported; detected movement/replacement fails projected reads closed.
+struct physical_store_identity {
+    uint64_t device = 0, inode = 0;
+    std::string filename;
+    bool operator==(const physical_store_identity& other) const noexcept {
+        return device == other.device && inode == other.inode;
+    }
+};
+
+class lattice_db;
+class database;
+namespace detail {
+uint64_t database_native_process() noexcept;
+struct exact_vector_rows_access;
+struct recovery_writer_access;
+struct recovery_witness_access;
+struct recovery_refresh_access;
+struct receive_delivery_guard_access;
+class canonical_writer_adapter;
+class authenticated_relay_setup;
+struct canonical_writer_custody_test_access;
+class recovery_local_producer_adapter;
+class recovery_continuous_producer;
+struct recovery_continuous_admission;
+class database_retirement_state;
+class database_open_ledger;
+class ordinary_target_staging_connection;
+class ordinary_target_history_page_reader;
+struct ordinary_target_history_read_span;
+class ordinary_target_staging_io;
+class ordinary_target_history_page_append;
+class ordinary_group_target_schema_original;
+class ordinary_group_target_receiving_owner;
+struct ordinary_history_progress;
+class ordinary_export_access;
+class ordinary_cohort_attachment_access;
+struct database_retirement_access;
+void require_continuous_raw_handle_absent(database&);
+void require_continuous_legacy_export_absent(database&);
+class recovery_obligation_producer_store;
+void require_canonical_relation(database&, const std::string&);
+bool prepare_recovery_local_producer(lattice_db&, const std::shared_ptr<database>&);
+void publish_recovery_local_producer(lattice_db&, database&) noexcept;
+bool preserve_recovery_local_producer_relation(database&, const std::string&);
+void require_recovery_local_producer_maintenance_absent(database&);
+void reset_sync_channel_with_producer_fence(lattice_db&, const std::string&, bool retire);
+void initialize_receive_guard_schema(database&, bool legacy_origin);
+bool receive_guard_manages_cursor(database&);
+void require_receive_guard_history_unblocked(database&);
+
+// One ordinary attached-field operation. Main/manual database fields keep
+// their existing path. The implementation never acquires a topology mutex
+// beneath SQLite; it validates the published generation while holding SQLite.
+class managed_route_scope {
+    database* db_ = nullptr;
+    std::shared_ptr<database> writer_owner_;
+    lattice_db* owner_ = nullptr;
+    sqlite3_mutex* mutex_ = nullptr;
+    std::unique_lock<std::recursive_timed_mutex> vector_gate_;
+    managed_route_scope* previous_ = nullptr;
+    int exceptions_ = 0;
+    static thread_local managed_route_scope* current_;
+public:
+    managed_route_scope(database*, lattice_db*, const std::string& table,
+                        int64_t token, const std::weak_ptr<database>& writer,
+                        bool vector_write = false);
+    ~managed_route_scope() noexcept(false);
+    managed_route_scope(const managed_route_scope&) = delete;
+    managed_route_scope& operator=(const managed_route_scope&) = delete;
+    static bool active_for(const database*) noexcept;
+    static bool active_for(const lattice_db*) noexcept;
+};
+}
+
 class database {
+public:
+    enum class open_mode; // Declared before private factories use the public type.
+private:
     friend class lattice_db;
-    // Only database can create the key. The keyed overload is accessible to
-    // make_shared so a keeper retains its single allocation.
+    friend class detail::ordinary_target_staging_connection;
+    friend struct topology_admission_test_access;
+    friend struct detail::exact_vector_rows_access;
+    friend struct detail::recovery_writer_access;
+    friend struct detail::recovery_witness_access;
+    friend struct detail::recovery_refresh_access;
+    friend struct detail::receive_delivery_guard_access;
+    friend class detail::canonical_writer_adapter;
+    friend class detail::authenticated_relay_setup;
+    friend struct detail::canonical_writer_custody_test_access;
+    friend class detail::recovery_local_producer_adapter;
+    friend class detail::recovery_continuous_producer;
+    friend struct detail::database_retirement_access;
+    friend class detail::ordinary_export_access;
+    friend class detail::ordinary_cohort_attachment_access;
+    friend void detail::require_continuous_raw_handle_absent(database&);
+    friend void detail::require_continuous_legacy_export_absent(database&);
+    friend class detail::recovery_obligation_producer_store;
+    friend void detail::require_canonical_relation(database&, const std::string&);
+    friend bool detail::preserve_recovery_local_producer_relation(database&, const std::string&);
+    friend void detail::require_recovery_local_producer_maintenance_absent(database&);
+    // Private fixed-scope trigger qualification lacks upstream receipt settlement.
+    bool canonical_trigger_only_ = false;
+    std::shared_ptr<void> canonical_callback_custody_;
+    std::shared_ptr<std::atomic<bool>> canonical_write_allowed_;
+    // Physical policy custody, serialized by SQLite's connection mutex.
+    // Bootstrap closes the interval before the canonical context is published.
+    bool canonical_custody_bootstrap_ = false;
+    // Failed producer bootstrap must not let optional close-time ANALYZE
+    // mutate the schema it just refused. This policy follows the physical
+    // handle through moves, even before producer callback custody exists.
+    bool suppress_destructor_optimize_ = false;
+    bool administrative_connection_ = false;
+    bool checked_existing_connection_ = false; // Private one-shot open: no optional close maintenance.
+    // Writable constructors classify eagerly. Read-only internal/keeper paths
+    // defer until a guarded raw/legacy export boundary. Unknown never means
+    // absence; this denial-only state cannot grant producer/source authority.
+    enum class continuous_classification { unknown, ordinary, protected_file };
+    std::atomic<continuous_classification> continuous_file_{continuous_classification::unknown};
+    bool txn_hooks_external_ = false;
+    void set_txn_hooks_owned_(std::function<void()>, std::function<void()>,
+        std::function<std::function<void()>(database&, bool)> = {});
+    void rebind_txn_hooks_owned_() noexcept;
+    // Private receiver producer admission. Heap custody follows the physical
+    // connection across wrapper moves; no all-route capability is implied.
+    std::shared_ptr<void> local_producer_callback_custody_;
+    std::shared_ptr<std::atomic<bool>> local_producer_write_allowed_;
+    // A failed channel-reset cleanup cannot leave partial work committable.
+    // Only an explicit successful rollback clears this physical-writer fence.
+    std::atomic<bool> channel_reset_unsettled_{false};
+    int step_statement_(sqlite3_stmt*) const;
+    // Connection-owned observation only; never changes authorizer/trace/hooks.
+    void note_history_mutation_(sqlite3_stmt*) const noexcept;
+    int execute_observed_sql_(const char*);
+    // Only materializing engine queries can prove that an autocommit read
+    // cursor belongs to another thread and will be finalized by its caller.
+    // The connection mutex guards the intrusive list; TLS rejects reentry
+    // even from prepare/step callbacks before a cursor becomes busy.
+    struct engine_query_scope {
+        database& owner;
+        sqlite3_stmt* statement = nullptr;
+        engine_query_scope* previous;
+        engine_query_scope* next_read = nullptr;
+        const std::thread::id thread = std::this_thread::get_id();
+        bool registered = false, active = true;
+        const bool defers_delivery;
+        static inline thread_local engine_query_scope* current = nullptr;
+        explicit engine_query_scope(database&, bool defer_delivery = false);
+        ~engine_query_scope() noexcept;
+        void adopt(sqlite3_stmt*) noexcept;
+        void reset() noexcept;
+        static bool active_for(const database&) noexcept;
+        static bool defers_delivery_for(const database&) noexcept;
+        engine_query_scope(const engine_query_scope&) = delete;
+        engine_query_scope& operator=(const engine_query_scope&) = delete;
+    };
+    engine_query_scope* engine_reads_ = nullptr;
+    friend class detail::managed_route_scope;
+    // Only the database and named closed engine factories construct this key.
+    // The keyed overload stays accessible to make_shared for one allocation.
     class initialization_key {
         friend class database;
+        friend class detail::recovery_continuous_producer;
+        friend class detail::authenticated_relay_setup;
+        friend class swift_lattice;
+        friend class detail::ordinary_target_staging_connection;
         const bool keeper_cache_;
+        const bool administrative_ = false;
+        std::shared_ptr<const physical_store_identity> administrative_identity_;
+        const bool checked_existing_ = false;
+        const bool checked_mounted_server_ = false;
+        std::shared_ptr<const physical_store_identity> checked_identity_;
+        detail::ordinary_context checked_context_;
+        std::shared_ptr<detail::database_retirement_state> checked_retirement_;
+        std::shared_ptr<detail::database_open_ledger> open_ledger_;
+        size_t open_slot_=0; uint64_t open_serial_=0;
+        // Only the real target connection derives this unopened shell key.
+        std::weak_ptr<detail::ordinary_target_staging_connection> target_connection_;
+        std::shared_ptr<detail::ordinary_target_staging_io> target_io_;
+        initialization_key(const std::shared_ptr<detail::ordinary_target_staging_connection>& connection,
+            const std::shared_ptr<detail::ordinary_target_staging_io>& io,
+            std::shared_ptr<detail::database_retirement_state> retirement,
+            std::shared_ptr<detail::database_open_ledger> ledger,size_t slot,uint64_t serial)
+            :keeper_cache_(false),checked_retirement_(std::move(retirement)),open_ledger_(std::move(ledger)),
+             open_slot_(slot),open_serial_(serial),target_connection_(connection),target_io_(io) {}
+        initialization_key(bool keeper,std::shared_ptr<detail::database_retirement_state> retirement,
+            std::shared_ptr<detail::database_open_ledger> ledger,size_t slot,uint64_t serial)
+            :keeper_cache_(keeper),checked_retirement_(std::move(retirement)),open_ledger_(std::move(ledger)),open_slot_(slot),open_serial_(serial) {}
+        initialization_key(std::shared_ptr<const physical_store_identity> identity,
+            detail::ordinary_context context,std::shared_ptr<detail::database_retirement_state> retirement)
+            :keeper_cache_(false),checked_existing_(true),checked_identity_(std::move(identity)),
+             checked_context_(std::move(context)),checked_retirement_(std::move(retirement)) {}
+        struct mounted_server_key { private: friend class swift_lattice; mounted_server_key() = default; };
+        initialization_key(std::shared_ptr<const physical_store_identity> identity,
+            std::shared_ptr<detail::database_retirement_state> retirement,mounted_server_key)
+            :keeper_cache_(false),checked_existing_(true),checked_mounted_server_(true),
+             checked_identity_(std::move(identity)),checked_retirement_(std::move(retirement)) {}
+        explicit initialization_key(std::shared_ptr<const physical_store_identity> value)
+            : keeper_cache_(false), administrative_(true), administrative_identity_(std::move(value)) {}
+        std::shared_ptr<detail::recovery_continuous_admission> continuous_;
+        explicit initialization_key(std::shared_ptr<detail::recovery_continuous_admission> value) : keeper_cache_(false), continuous_(std::move(value)) {}
         explicit initialization_key(bool keeper_cache) : keeper_cache_(keeper_cache) {}
     public:
         initialization_key(const initialization_key&) = default;
     };
     static std::shared_ptr<database> make_read_keeper(const std::string& path,
-                                                    int busy_timeout_ms);
+                                                    int busy_timeout_ms,
+                                                    detail::ordinary_context context = {},
+                                                    std::shared_ptr<detail::database_open_ledger> ledger = {});
+    // Internal lifetime custody only. Empty ledger preserves ordinary factories.
+    struct owned_connection_deleter {
+        std::shared_ptr<detail::database_open_ledger> ledger;
+        size_t slot=0; uint64_t serial=0;
+        void operator()(database*) const noexcept;
+    };
+    using private_connection=std::unique_ptr<database,owned_connection_deleter>;
+    static std::shared_ptr<database> make_owned_connection(const std::string&,open_mode,int,
+        std::shared_ptr<database_read_control>,detail::ordinary_context,
+        std::shared_ptr<detail::database_open_ledger>,bool keeper=false);
+    static private_connection make_private_connection(const std::string&,open_mode,int,
+        std::shared_ptr<database_read_control>,detail::ordinary_context,
+        std::shared_ptr<detail::database_open_ledger>);
+    struct target_staging_deferred_t { private: friend class database; target_staging_deferred_t() = default; };
+    enum class terminal_decoder_payload_result {not_held,captures_ended,retained_debt};
+    terminal_decoder_payload_result retire_target_terminal_decoder_payloads_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)noexcept;
+    bool target_terminal_decoder_payloads_ended_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+    enum class terminal_native_phase_result {not_held,phases_ended,retained_debt};
+    terminal_native_phase_result retire_target_terminal_native_phases_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)noexcept;
+    bool target_terminal_native_phases_ended_(
+        const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const noexcept;
+    struct target_staging_state;
+    static void wake_target_terminal_native_phase_(const std::weak_ptr<target_staging_state>&,
+        const std::weak_ptr<detail::ordinary_group_target_receiving_owner>&,
+        const detail::ordinary_target_staging_connection*)noexcept;
+    static void wake_target_terminal_decoder_payload_(const std::weak_ptr<target_staging_state>&,
+        const std::weak_ptr<detail::ordinary_group_target_receiving_owner>&,
+        const detail::ordinary_target_staging_connection*)noexcept;
+    std::shared_ptr<target_staging_state> target_staging_;
+    database(initialization_key,target_staging_deferred_t);
+    static std::shared_ptr<database> make_target_staging_shell(
+        const std::shared_ptr<detail::ordinary_target_staging_connection>&);
+    void initialize_target_staging_();
+    void require_target_fixed_constructor_(const detail::ordinary_target_staging_connection&)const;
+    void bootstrap_target_metadata_(const std::shared_ptr<detail::ordinary_group_target_schema_original>&);
+    void require_target_metadata_ending_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_schema_original&)const;
+    void install_target_catalog_(const std::shared_ptr<detail::ordinary_group_target_schema_original>&);
+    bool target_catalog_native_ending_()const noexcept;
+    void require_target_catalog_ending_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_schema_original&)const;
+    void stage_target_history_header_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&);
+    void stage_target_raw_history_header_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&);
+    void stage_target_history_header_program_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&,bool);
+    bool target_history_raw_storage_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    bool target_history_header_native_ending_()const noexcept;
+    bool target_history_guard_destroyed_()const noexcept;
+    bool target_history_page_guard_destroyed_()const noexcept;
+    bool target_history_page_native_ending_()const noexcept;
+    void stage_target_history_page_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&);
+    void stage_target_raw_history_page_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&,
+        const std::shared_ptr<const detail::ordinary_target_history_page_append>&);
+    void stage_target_history_page_program_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&,
+        const std::shared_ptr<const detail::ordinary_target_history_page_append>&);
+    void require_target_raw_history_page_ending_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const detail::ordinary_target_history_page_append&)const;
+    void require_target_raw_history_page_observation_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const detail::ordinary_target_history_page_append&)const;
+    detail::ordinary_history_progress target_history_page_progress_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    uint64_t target_history_page_append_before_bytes_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&,detail::ordinary_history_progress&)const;
+    void require_target_history_header_ending_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&)const;
+    void import_target_history_rows_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&);
+    void require_target_row_import_issued_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    void require_target_row_import_ending_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    bool target_row_import_native_ending_()const noexcept;
+    bool target_row_import_cleanup_ending_()const noexcept;
+    void suspend_target_import_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&);
+    void require_target_import_suspension_issued_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    void require_target_import_suspension_ending_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    bool target_import_suspension_native_ending_()const noexcept;
+    bool target_import_suspension_cleanup_ending_()const noexcept;
+    void verify_target_history_chain_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&);
+    void require_target_history_chain_ending_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    void require_target_history_chain_issued_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    bool target_history_chain_native_ending_()const noexcept;
+    bool target_history_chain_cleanup_ending_()const noexcept;
+    detail::ordinary_target_history_read_span target_history_chain_raw_span_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const void*,const void*,const detail::ordinary_target_history_page_reader*)const;
+    detail::ordinary_target_history_read_span target_row_import_raw_span_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const void*,const void*,const detail::ordinary_target_history_page_reader*)const;
+    void require_target_history_chain_raw_retired_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const void*,const detail::ordinary_target_history_page_reader&)const;
+    void require_target_row_import_raw_retired_(const detail::ordinary_target_staging_connection&,
+        const detail::ordinary_group_target_receiving_owner&,const void*,const detail::ordinary_target_history_page_reader&)const;
+    void validate_target_history_projection_(const std::shared_ptr<detail::ordinary_group_target_receiving_owner>&);
+    void require_target_history_complete_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    bool target_history_projection_native_ending_()const noexcept;
+    bool target_history_projection_cleanup_ending_()const noexcept;
+    void require_target_history_projection_ending_(const detail::ordinary_target_staging_connection&,const detail::ordinary_group_target_receiving_owner&)const;
+    void retire_target_staging_() noexcept;
+    // Actual retained first failure, available only before first retirement.
+    std::exception_ptr target_staging_failure_original_(const detail::ordinary_target_staging_connection&)const noexcept;
+    bool target_staging_native_cleanup_known_(const detail::ordinary_target_staging_connection&)const noexcept;
+    bool target_staging_cleanup_joined_(const detail::ordinary_target_staging_connection&)const noexcept;
+    bool target_staging_creator_current_() const noexcept;
+    template<typename T, typename Enable> friend struct managed;
+    friend class swift_lattice;
+    friend class projection_service;
+    friend struct projection_operation_state;
+    friend struct database_projection_capture;
     // The update hook may query globalId through database::query(). That
     // nested query must not drain a prior row's dirty state while the outer
     // SQLite statement still owns its connection mutex. Track the actual
@@ -43,7 +373,9 @@ class database {
         update_hook_scope* previous;
         static inline thread_local update_hook_scope* current = nullptr;
         explicit update_hook_scope(database& db) noexcept
-            : connection(db.db_), previous(current) { current = this; }
+            : update_hook_scope(db.db_) {}
+        explicit update_hook_scope(sqlite3* handle) noexcept
+            : connection(handle), previous(current) { current = this; }
         ~update_hook_scope() noexcept { current = previous; }
         update_hook_scope(const update_hook_scope&) = delete;
         update_hook_scope& operator=(const update_hook_scope&) = delete;
@@ -55,6 +387,54 @@ class database {
         }
     };
 
+    // SQLite retains this address as update-hook userdata. Heap ownership
+    // keeps it stable when a database wrapper moves; physical identity does
+    // not depend on which writer the lattice currently publishes. The raw
+    // lattice owner must still outlive all uses of the connection.
+    struct sync_apply_chunk_state {
+        enum class phase { not_started, active, committed, rolled_back };
+        phase state = phase::not_started;
+        // A pre-commit callback is not proof of durable settlement. It only
+        // prevents an admitted reset from following COMMIT into a successor,
+        // including memory and no-write transactions with no WAL callback.
+        bool commit_attempted = false;
+        // Only self-owned private maintenance uses this restriction. Sync and
+        // caller-owned reset markers remain observational by default.
+        enum class commit_policy { observational, owner_body, owner_finalizing };
+        commit_policy policy = commit_policy::observational;
+        bool premature_commit = false;
+        // A rollback consumes this reservation before a successor can write.
+        // The operation's separate owner-lifetime hold lasts through unwind.
+        bool owns_recovery_reservation = false;
+    };
+    struct lattice_update_hook_context {
+        lattice_db* owner = nullptr;
+        sqlite3* connection = nullptr;
+        // Only touched while owning this physical connection's SQLite mutex.
+        // The added hook path uses POD, with no allocation/SQL/user callback.
+        sync_apply_chunk_state* sync_chunk = nullptr;
+        bool recovery_delivery_deferred = false;
+        bool entry_cursor_active = false;
+        bool entry_cursor_present = false;
+        int64_t entry_cursor_last = 0;
+        bool consume_recovery_reservation(sync_apply_chunk_state* settlement) noexcept {
+            if (!settlement || !settlement->owns_recovery_reservation) return false;
+            settlement->owns_recovery_reservation = false;
+            entry_cursor_active = false;
+            entry_cursor_present = false;
+            recovery_delivery_deferred = false;
+            return true;
+        }
+        void note_settled(bool committed) noexcept {
+            if (!sync_chunk) return;
+            sync_chunk->state = committed ? sync_apply_chunk_state::phase::committed
+                                          : sync_apply_chunk_state::phase::rolled_back;
+            // Consume before callbacks can open a successor transaction.
+            sync_chunk = nullptr;
+        }
+    };
+    std::unique_ptr<lattice_update_hook_context> lattice_update_hook_context_;
+
     // Private multi-statement maintenance ownership. FULLMUTEX alone only
     // serializes individual SQLite calls; another thread must not join this
     // owner's transaction between its safety reads and writes. The caller
@@ -64,8 +444,15 @@ class database {
         sqlite3_mutex* mutex;
         maintenance_scope* previous = nullptr;
         static inline thread_local maintenance_scope* current = nullptr;
+        bool entered = false;
+        enum class admission { ready, mutex_busy, engine_read_busy };
         static bool idle(database& db) noexcept;
+        static admission controller_probe(database& db);
+        static admission controller_classify_locked(database& db);
+        maintenance_scope(database& db, admission* controller_admission);
         static void probe_before_store_gate(database& db);
+        // False is only the initial no-effect SQLite mutex contention probe.
+        static bool try_probe_before_store_gate(database& db);
         explicit maintenance_scope(database& db);
         ~maintenance_scope() noexcept;
         maintenance_scope(const maintenance_scope&) = delete;
@@ -86,11 +473,24 @@ public:
     };
 
     explicit database(const std::string& path, open_mode mode = open_mode::read_write,
-                      int busy_timeout_ms = kDefaultBusyTimeoutMs);
-    // Private construction capability; callers cannot manufacture the key.
+                      int busy_timeout_ms = kDefaultBusyTimeoutMs,
+                      std::shared_ptr<database_read_control> read_control = {},
+                   detail::ordinary_context context = {});
+    // Private construction capability; no caller can manufacture the key.
     database(const std::string& path, open_mode mode, int busy_timeout_ms,
-             initialization_key key);
+             std::shared_ptr<database_read_control> read_control, initialization_key key,
+             detail::ordinary_context context = {});
     ~database();
+
+    /// No SQL statements. Best-effort for legacy callers; nullptr means an
+    /// unsupported/moved/nonfilesystem store or interrupted metadata wait.
+    /// The main identity is cached lazily; validation is required on a newly
+    /// opened private lease. Callers never hold a global registry lock here.
+    std::shared_ptr<const physical_store_identity> physical_identity(
+        const std::string& schema = "main",
+        const std::shared_ptr<database_read_control>& control = {},
+        bool validate_current = false) const;
+
 
     /// Logically close the connection: subsequent ops short-circuit to empty/no-op.
     /// The underlying sqlite3* is NOT freed here — it is released in ~database (which
@@ -164,10 +564,11 @@ public:
     /// before the keeper transaction can close (results spec §3.4).
     void interrupt();
 
-    /// Result of a wal_checkpoint() call. rc is the PRAGMA's SQLite result
+    /// Result of a wal_checkpoint() call. rc retains the PRAGMA-style result
     /// code; busy is 1 when the checkpoint could not complete because a
     /// reader/writer held the WAL; log_frames/checkpointed mirror the PRAGMA
-    /// row (-1 when unavailable).
+    /// row (-1 when unavailable). Native SQLITE_BUSY maps to rc=SQLITE_OK,
+    /// busy=1; other native errors retain rc=SQLITE_ERROR and unavailable frames.
     struct checkpoint_result {
         int rc = 0;
         int busy = 1;
@@ -195,6 +596,8 @@ public:
     /// issued from the calling thread. Exact budgets for single-threaded
     /// read paths, immune to parallel test suites in the same process.
     static uint64_t thread_statement_count();
+    /// Raw bounded read cursors use the same statement accounting funnel.
+    static void record_statement();
 
     /// Mark this connection dirty: buffered row changes await delivery once
     /// the enclosing transaction settles. Relaxed store — callable from inside
@@ -212,8 +615,13 @@ public:
     /// failed statements whose implicit transaction already rolled back.
     void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back);
 
-    // Raw access (use sparingly)
-    sqlite3* handle() const { return db_; }
+    /// Raw access retires canonical admission before pointer publication and
+    /// refuses during its bootstrap, transaction or active statement. Public
+    /// transaction-hook replacement likewise refuses attached policy custody.
+    /// Raw access permanently opts this connection out of strict borrowed
+    /// memory projection capture: external SQLite handlers cannot be restored
+    /// or proven read-only. Waits behind an active capture before exposing it.
+    sqlite3* handle() const;
 
     // Bind a value to a prepared statement (public for lattice_db bulk insert)
     void bind_value(sqlite3_stmt* stmt, int index, const column_value_t& value);
@@ -222,20 +630,163 @@ public:
     bool is_closed() const { return closed_.load(std::memory_order_acquire); }
 
 private:
+    // Trusted Core/bridge callers only; never return this pointer to a client.
+    sqlite3* internal_handle() const noexcept { return !target_staging_ && creator_current_() ? db_ : nullptr; }
+    bool creator_current_() const noexcept;
+    void require_creator_() const;
+    static sqlite3* note_owning_wrapper_move_(database&) noexcept;
+    void validate_ordinary_current_() const;
+    // Private to the unpublished checked owner; no rearm/reset after failure.
+    void finish_checked_preparation_read_control_(std::chrono::steady_clock::time_point);
+    detail::ordinary_context ordinary_context_;
+    bool ordinary_guarded_ = false;
     sqlite3* db_ = nullptr;
+    // Follows this exact SQLite connection through moves. A retained state
+    // outlives the wrapper; close_v2 success is never physical-close proof.
+    std::shared_ptr<detail::database_retirement_state> retirement_;
+    void retire_connection_(bool detach_callbacks = true) noexcept;
+    mutable std::atomic<bool> raw_handle_escaped_{false};
     std::string path_;
     open_mode mode_;
     // Set by close(); ops short-circuit when set. db_ stays valid until ~database,
     // so this is a logical-close flag, not a lifetime guard.
     std::atomic<bool> closed_{false};
     int busy_timeout_ms_ = kDefaultBusyTimeoutMs;
+    std::shared_ptr<database_read_control> read_control_;
+    mutable std::shared_ptr<const physical_store_identity> main_physical_identity_;
     // Deferred delivery (docs/design-deferred-memory-delivery.md): set by the
     // update hook via mark_txn_dirty(); consumed by drain_if_settled() at the
     // success tail of every statement wrapper; cleared by the rollback hook.
     std::atomic<bool> txn_dirty_{false};
-    std::function<void()> on_txn_settled_;
-    std::function<void()> on_txn_rolled_back_;
+    struct txn_hook_callbacks {
+        std::function<void()> settled, rolled_back;
+        // Engine-only state capture. It may inspect the already admitted exact
+        // writer, but returns all observer delivery for the off-lock tail.
+        // Public opaque hooks do not gain an in-lock callback through this API.
+        std::function<std::function<void()>(database&, bool)> capture_owned;
+        txn_hook_callbacks(std::function<void()>&& success, std::function<void()>&& rollback,
+                           std::function<std::function<void()>(database&, bool)>&& capture = {})
+            : settled(std::move(success)), rolled_back(std::move(rollback)),
+              capture_owned(std::move(capture)) {}
+    };
+    // One absolute admission/retry budget for a complete public topology call.
+    // This is not a timer for SQL, filesystem work, callbacks or destruction.
+    struct attachment_operation {
+        using clock = std::chrono::steady_clock;
+        static int budget_ms(int configured) noexcept {
+            return configured > 0 ? std::min(configured, 2000) : 2000;
+        }
+        const clock::time_point deadline;
+        explicit attachment_operation(int recipient_timeout_ms, int source_timeout_ms = 0)
+            : deadline(clock::now() + std::chrono::milliseconds(
+                std::min(budget_ms(recipient_timeout_ms), budget_ms(source_timeout_ms)))) {}
+        explicit attachment_operation(clock::time_point end) : deadline(end) {}
+        attachment_operation(const attachment_operation&) = delete;
+        attachment_operation& operator=(const attachment_operation&) = delete;
+        struct delivery {
+            std::shared_ptr<txn_hook_callbacks> hooks;
+            bool rollback = false, active = false;
+            std::function<void()> captured;
+        };
+        std::vector<delivery> deliveries;
+        database* capturing_owner = nullptr; // Internal read tails cannot settle recursively.
+        // Retain exact wrappers and retired extension captures through off-lock
+        // delivery; final releases must not occur beneath topology/SQLite locks.
+        std::vector<std::shared_ptr<database>> handles;
+        std::shared_ptr<const void> retired_metadata; // At most one invalidated alias per public call.
+        void check() const;
+        void wait(std::chrono::milliseconds interval = std::chrono::milliseconds(1)) const;
+        std::unique_lock<std::mutex> lock(std::mutex&) const;
+        void capture_settlement_locked(database&, bool failed);
+        void settle_locked(database&, bool failed, std::exception_ptr primary);
+        void finish(std::exception_ptr primary);
+    };
+    struct attachment_delivery_error : db_error {
+        std::exception_ptr primary, delivery;
+        size_t delivery_failures;
+        attachment_delivery_error(std::exception_ptr p, std::exception_ptr d, size_t count)
+            : db_error("topology operation and off-lock delivery both failed"),
+              primary(std::move(p)), delivery(std::move(d)), delivery_failures(count) {}
+    };
+    class attachment_sql_scope {
+        database& owner_;
+        attachment_operation& operation_;
+        sqlite3_mutex* mutex_ = nullptr;
+        attachment_sql_scope* previous_ = nullptr;
+        static thread_local attachment_sql_scope* current_;
+    public:
+        attachment_sql_scope(database&, attachment_operation&);
+        ~attachment_sql_scope();
+        attachment_sql_scope(const attachment_sql_scope&) = delete;
+        attachment_sql_scope& operator=(const attachment_sql_scope&) = delete;
+        static attachment_operation* operation_for(const database*) noexcept;
+    };
+    void execute_attachment_sql(const std::string&, attachment_operation&);
+    std::shared_ptr<const physical_store_identity> attachment_physical_identity(attachment_operation&);
+    // Construct/destroy callable targets outside SQLite. Under its mutex only
+    // shared_ptr ownership moves; std::function moves/swaps may run user code.
+    std::shared_ptr<txn_hook_callbacks> txn_hooks_;
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
+    // Internal live primitive getter path. Preserve query()'s first-row/name
+    // and stored-type conventions without building generic result containers.
+    // Empty optional means no matching first-row cell; a present nullptr is
+    // SQL NULL. The owning connection, fresh statement and settled tail remain.
+    std::optional<column_value_t> query_managed_cell(
+        const std::string& sql, const std::string& column, primary_key_t row_id);
+    // ATTACH-only internal operation. Capture metadata in the same SQLite
+    // execution scope, before a competing writer can win a second acquisition.
+    // This captures only internal metadata; deferred user delivery stays after it.
+    std::shared_ptr<const physical_store_identity> attach_and_capture_identity(
+        const std::string& attach_sql, const std::string& schema, attachment_operation&);
+    // Caller owns this handle's recursive SQLite mutex.
+    std::shared_ptr<const physical_store_identity> physical_identity_locked(
+        const std::string& schema,
+        const std::shared_ptr<database_read_control>& control) const;
+    // Same checks and wait policy; failure is a borrowed static label only.
+    // Private diagnostics cannot issue identity or weaken current-file custody.
+    struct physical_identity_details {
+        enum class stage { entry, cached_identity, connection_mutex, file_name, vfs,
+            first_move, canonical_path, initial_stat, second_move, final_stat,
+            identity_comparison, cache_comparison, complete };
+        enum class vfs_kind { unobserved, unavailable_or_other, unix_vfs, unix_excl };
+        struct move_result {
+            bool observed = false;
+            int rc = 0;
+            bool moved_valid = false;
+            int moved = 0;
+            void record(int result, int output) noexcept {
+                observed = true; rc = result; moved_valid = result == SQLITE_OK;
+                moved = moved_valid ? output : 0;
+            }
+        };
+        stage last_stage = stage::entry;
+        bool mutex_acquired = false;
+        vfs_kind vfs = vfs_kind::unobserved;
+        bool vfs_result_observed = false;
+        int vfs_rc = 0;
+        move_result first_move, second_move;
+    };
+    std::shared_ptr<const physical_store_identity> physical_identity_observed(
+        const std::string& schema,
+        const std::shared_ptr<database_read_control>& control,
+        bool validate_current, const char*& failure, physical_identity_details* details = nullptr) const;
+    std::shared_ptr<const physical_store_identity> physical_identity_locked_observed(
+        const std::string& schema,
+        const std::shared_ptr<database_read_control>& control,
+        const char*& failure, physical_identity_details* details = nullptr) const;
+    struct physical_identity_attempt {
+        enum class status { captured, mutex_busy, refused };
+        status state = status::refused;
+        std::shared_ptr<const physical_store_identity> identity;
+        const char* failure = nullptr;
+    };
+    // Automatic source setup only. One mutex try, no wait/cached fast path/SQL/retry;
+    // successful acquisition uses the same complete current-file checks.
+    physical_identity_attempt try_current_physical_identity(const std::string& schema) const;
+    // Attachment schema metadata only. Run the existing single read statement
+    // inside one SQLite execution scope; keep original SQLite types and names.
+    std::vector<std::string> query_attachment_text_metadata(
+        const std::string& sql, const std::string& column, attachment_operation&);
     void drain_if_settled();
     void discard_if_rolled_back();
 };

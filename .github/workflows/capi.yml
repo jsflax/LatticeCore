@@ -32,8 +32,8 @@ jobs:
     # (its stricter explicit-module handling is what surfaced the bug).
     container: swift:6.3-noble
     env:
-      CORE_SOURCE_SHA: ${{ github.sha }}
-      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
+      CORE_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
     steps:
       - name: Install dependencies
         run: apt-get update && apt-get install -y git libsqlite3-dev cmake
@@ -111,8 +111,8 @@ jobs:
   capi-macos:
     runs-on: macos-26
     env:
-      CORE_SOURCE_SHA: ${{ github.sha }}
-      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
+      CORE_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
     steps:
       - name: Fetch exact source into owned localdev directory
         shell: bash

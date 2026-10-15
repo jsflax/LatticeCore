@@ -299,9 +299,12 @@ geo_bounds_list::element_proxy& geo_bounds_list::element_proxy::operator=(const 
 
 #if LATTICE_HAS_FRT
 void geo_bounds_list::element_proxy::assign(geo_bounds_ref* ref) {
-    if (ref) {
-        *this = *ref->get();
-    }
+    sealed([&] {
+        if (ref) {
+            if (!list) throw std::runtime_error("invalid geographic list element proxy");
+            *this = *ref->get();
+        }
+    });
 }
 
 geo_bounds_ref* geo_bounds_list::element_proxy::getObjectRef() const {
@@ -309,9 +312,12 @@ geo_bounds_ref* geo_bounds_list::element_proxy::getObjectRef() const {
 }
 #else
 void geo_bounds_list::element_proxy::assign(const geo_bounds_ref& ref) {
-    if (ref.get()) {
-        *this = *ref.get();
-    }
+    sealed([&] {
+        if (ref.get()) {
+            if (!list) throw std::runtime_error("invalid geographic list element proxy");
+            *this = *ref.get();
+        }
+    });
 }
 
 geo_bounds_ref geo_bounds_list::element_proxy::getObjectRef() const {

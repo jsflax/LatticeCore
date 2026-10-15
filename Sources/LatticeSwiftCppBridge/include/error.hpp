@@ -33,6 +33,13 @@ inline std::string& last_bridge_error() {
     return err;
 }
 
+// Recording a failure is itself an allocation boundary. Never let a secondary
+// exception (or a non-std exception from the body) escape into Swift.
+inline void record_bridge_error(const char* message) noexcept {
+    try { last_bridge_error() = message; }
+    catch (...) {} // Keep any diagnostic already present if recording fails.
+}
+
 /// Run a Swift-facing bridge body under the sealed contract: clear the
 /// error slot, catch any C++ exception, stash its message, and return a
 /// default-constructed value ({} / 0 / "" / empty vector) in its place.
@@ -42,11 +49,16 @@ decltype(auto) sealed(F&& f) {
     using R = decltype(f());
     if constexpr (std::is_void_v<R>) {
         try { f(); }
-        catch (const std::exception& e) { last_bridge_error() = e.what(); }
+        catch (const std::exception& e) { record_bridge_error(e.what()); }
+        catch (...) { record_bridge_error("Unknown C++ bridge exception"); }
     } else {
         try { return f(); }
         catch (const std::exception& e) {
-            last_bridge_error() = e.what();
+            record_bridge_error(e.what());
+            return R{};
+        }
+        catch (...) {
+            record_bridge_error("Unknown C++ bridge exception");
             return R{};
         }
     }

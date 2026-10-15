@@ -1285,7 +1285,7 @@ protected:
         auto timeout_seen=std::make_shared<std::atomic<bool>>(false);
         // Installed before actual route publication; this is a restriction on
         // the real worker, not a factory for recovery authority.
-        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this,observation,timeout_pause,timeout_seen](const char* stage){
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),worker_observer(false,[this,observation,timeout_pause,timeout_seen](const char* stage){
             if(std::strcmp(stage,"install-committed")==0){
                 auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
                 hook->after_timeout_transition=[timeout_pause,timeout_seen]{if(!timeout_seen->exchange(true))timeout_pause->wait();};
@@ -1303,8 +1303,9 @@ protected:
                     detail::recovery_export_test_hooks::after_claim_commit=cohort_claimed;
                 }
             }
-        });
-        connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+        }));
+        connect();ASSERT_TRUE(until([&]{worker_trace->begin_predicate();return worker_trace->value(1,phase())==0&&worker_trace->value(0,scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1"))==1;}));
+        worker_trace.reset(); // End this passive scope at the original successful install.
         detail::recovery_receiver_cohort_test_access::next_ack_timeout(*synchronizers[0]);
         observation->armed.store(true);seed_local(1,600);const auto ids=originals();ASSERT_EQ(ids.size(),1u);
         ASSERT_TRUE(until([&]{return !held_originals().empty()&&timeout_pause->ready();}));
@@ -1349,12 +1350,13 @@ TEST_F(RecoveryReceiverCohort, ReplacedRequestWaitsForActualRetainedBusyFrameBef
 TEST_F(RecoveryReceiverCohort, RecreatedLastControllerSharesActualRetainedBusyFrameCustody) {retained_replacement(true);}
 TEST_F(RecoveryReceiverCohort, FailedActualCaptureReleasesPhysicalReservationForFreshRequest) {
     configure();insert(*source,controller_uuid(610),"canonical");auto first=std::make_shared<std::atomic<bool>>(true);
-    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[first](const char* stage){
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),worker_observer(false,[first](const char* stage){
         if(std::strcmp(stage,"cohort-reserved")==0&&first->exchange(false))throw db_error("fixture cohort capture interrupted");
-    });
+    }));
     connect();ASSERT_TRUE(until([&]{return has_error();}));ASSERT_EQ(phase(),2);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=0"),1);
-    request_recovery();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+    request_recovery();ASSERT_TRUE(until([&]{worker_trace->begin_predicate();return worker_trace->value(1,phase())==0&&worker_trace->value(0,scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1"))==1;}));
+    worker_trace.reset(); // Preserve all subsequent original assertions/hooks.
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
     {std::lock_guard lock(errors_mutex);ASSERT_FALSE(errors.empty());for(const auto& error:errors)EXPECT_NE(error.find("fixture cohort capture interrupted"),std::string::npos);}
 }

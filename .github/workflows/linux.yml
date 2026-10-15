@@ -1,6 +1,13 @@
 name: Linux
 
 on:
+  workflow_dispatch:
+    inputs:
+      receiver_cohort_observation:
+        description: 'Run only the three traced receiver cohort cases; not full-suite acceptance'
+        type: boolean
+        required: false
+        default: false
   workflow_call:
   push:
     branches: [main]
@@ -12,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.2-noble
     env:
+      COHORT_OBSERVATION: ${{ inputs.receiver_cohort_observation || false }}
       CORE_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       CORE_SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
     steps:
@@ -45,11 +53,20 @@ jobs:
 
       - name: Build and run C++ tests
         working-directory: ${{ env.CORE_JOB_ROOT }}/source
+        shell: bash
         run: |
+          set -euo pipefail
+          OBSERVATION_ARGUMENTS=()
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$COHORT_OBSERVATION" == true ]]; then
+            # Only this explicit diagnostic dispatch selects three unchanged
+            # owning cases. Normal PR/push/workflow-call runs retain all tests.
+            OBSERVATION_ARGUMENTS+=(--gtest_filter=RecoveryReceiverCohort.ReplacedRequestWaitsForActualRetainedBusyFrameBeforeRecapture:RecoveryReceiverCohort.RecreatedLastControllerSharesActualRetainedBusyFrameCustody:RecoveryReceiverCohort.FailedActualCaptureReleasesPhysicalReservationForFreshRequest)
+            OBSERVATION_ARGUMENTS+=(--gtest_output=xml:"$CORE_JOB_ROOT/test-logs/cohort-observation.xml")
+          fi
           swift run --package-path "$CORE_JOB_ROOT/source" \
             --scratch-path "$CORE_JOB_ROOT/swift-build" --cache-path "$CORE_JOB_ROOT/swift-cache" \
             --config-path "$CORE_JOB_ROOT/swift-config" --security-path "$CORE_JOB_ROOT/swift-security" \
-            LatticeCoreTests
+            LatticeCoreTests "${OBSERVATION_ARGUMENTS[@]}"
 
       - name: Preserve parent and fresh-process test logs
         if: always() && env.CORE_JOB_ROOT != ''
@@ -59,6 +76,7 @@ jobs:
           name: core-native-linux-logs-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.CORE_JOB_ROOT }}/test-logs/*.log
+            ${{ env.CORE_JOB_ROOT }}/test-logs/*.xml
             ${{ env.CORE_JOB_ROOT }}/tmp/**/*.log
           include-hidden-files: true
           if-no-files-found: error

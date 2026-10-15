@@ -221,6 +221,13 @@ const std::vector<std::string>& ordinary_upload_acknowledgment_result::ids()cons
     static const std::vector<std::string> empty;
     return value_?value_->ids:empty;
 }
+size_t ordinary_upload_acknowledgment_result::idCount()const noexcept {
+    return value_?value_->ids.size():0;
+}
+std::string ordinary_upload_acknowledgment_result::idAt(size_t index)const noexcept {
+    try {return value_&&index<value_->ids.size()?value_->ids[index]:std::string{};}
+    catch(...){return {};}
+}
 const std::vector<uint8_t>& ordinary_upload_acknowledgment_result::acknowledgment()const noexcept {
     static const std::vector<uint8_t> empty;
     return value_?value_->acknowledgment:empty;

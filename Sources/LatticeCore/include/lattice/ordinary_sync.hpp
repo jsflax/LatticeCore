@@ -123,6 +123,10 @@ public:
     bool isValid()const noexcept;
     ordinary_upload_acknowledgment_result merged(const ordinary_upload_acknowledgment_result&)const noexcept;
     const std::vector<std::string>& ids()const noexcept;
+    // Passive owned-ID access for Swift; the immutable issued payload and its
+    // reservation remain retained by this value. No interior reference escapes.
+    size_t idCount()const noexcept;
+    std::string idAt(size_t)const noexcept;
     const std::vector<uint8_t>& acknowledgment()const noexcept;
     size_t acknowledgmentByteCount()const noexcept;
     // Exact-sized, caller-owned destination. An invalid result never copies;

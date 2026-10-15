@@ -46,3 +46,12 @@ jobs:
         run: |
           python3 -m py_compile release-train/release_train.py
           python3 -m json.tool release-train/policy.json > /dev/null
+
+  native-linux:
+    uses: ./.github/workflows/linux.yml
+
+  native-macos:
+    uses: ./.github/workflows/macos.yml
+
+  native-c-abi:
+    uses: ./.github/workflows/capi.yml

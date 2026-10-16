@@ -1542,6 +1542,21 @@ TEST(BridgeWalPolicy, CachedUnboundedOwnerCannotSatisfyBoundedRequest) {
     auto same=cache.get_or_create(bounded,lattice::SchemaVector{});
     EXPECT_EQ(same.get(),first.get());
     auto tighter=bounded;tighter.wal_extent_limit_bytes=512*1024;
+    // Cache identity is tested on an actually eligible tighter WAL. Bootstrap
+    // traffic may already exceed512KiB; do not turn this into a cap exception.
+    const auto wal=path.string()+"-wal";
+    const auto prior_extent=std::filesystem::exists(wal)?std::filesystem::file_size(wal):0;
+    RecordProperty("pre_tighter_wal_bytes",std::to_string(prior_extent));
+    const auto checkpoint=first->db().wal_checkpoint(/*truncate=*/true,/*busy_budget_ms=*/250);
+    RecordProperty("tighter_checkpoint_rc",checkpoint.rc);
+    RecordProperty("tighter_checkpoint_busy",checkpoint.busy);
+    RecordProperty("tighter_checkpoint_log",std::to_string(checkpoint.log_frames));
+    RecordProperty("tighter_checkpoint_done",std::to_string(checkpoint.checkpointed));
+    ASSERT_EQ(checkpoint.rc,SQLITE_OK);ASSERT_EQ(checkpoint.busy,0);
+    ASSERT_EQ(checkpoint.log_frames,0);ASSERT_EQ(checkpoint.checkpointed,0);
+    const auto admitted_extent=std::filesystem::exists(wal)?std::filesystem::file_size(wal):0;
+    RecordProperty("admitted_tighter_wal_bytes",std::to_string(admitted_extent));
+    ASSERT_EQ(admitted_extent,0u);
     auto second=cache.get_or_create(tighter,lattice::SchemaVector{});
     EXPECT_NE(second.get(),first.get());
     EXPECT_EQ(second->config().wal_extent_limit_bytes,tighter.wal_extent_limit_bytes);

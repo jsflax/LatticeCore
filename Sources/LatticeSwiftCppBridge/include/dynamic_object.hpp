@@ -12,6 +12,7 @@
 #include <managed_object.hpp>
 #include <LatticeCore.hpp>
 #include <error.hpp>
+#include <owner_identity.hpp>
 
 
 namespace lattice {
@@ -477,6 +478,10 @@ private:
     // Materialized-read mode (see the row-cache contract above the accessors).
     bool row_cache_enabled_ = false;
 
+    // Complete ownership exchange only; no SQL, allocation, callback or final
+    // graph-capture destruction. The enclosing journal retains both states.
+    void swap_graph_state(dynamic_object&) noexcept;
+    void set_union_body(const std::string&, const union_value&);
     friend class swift_lattice;
     friend struct link_list;
     friend class dynamic_object_ref;
@@ -568,6 +573,9 @@ public:
     swift_lattice_ref getLattice() const SWIFT_COMPUTED_PROPERTY;
 #endif
 
+    // Pure identity access: no ref allocation, SQL, cache lookup or TLS clear.
+    bridge_owner_identity owner_identity() const noexcept SWIFT_NAME(ownerIdentity());
+
     // Access the underlying dynamic_object
     dynamic_object* get() { return impl_.get(); }
     const dynamic_object* get() const { return impl_.get(); }
@@ -590,9 +598,9 @@ public:
     // exception crossing into Swift is std::terminate → SIGTRAP (observed
     // live in Engram.app, Aug 2026). sealed() catches, stashes the message
     // in last_bridge_error() for Swift to bubble, and returns a default.
-    // NOT sealed (default-value semantics don't fit their return types;
-    // revisit if they ever appear in a crash): get_object, get_union/
-    // set_union, get_link_list, get_geo_bounds_list.
+    // Object/union mutations and union reads are sealed. Allocating object,
+    // list and owner factories still need a separate nullable-result/Swift
+    // integration; they are not repaired by this mutation boundary slice.
     bool has_value(const std::string& name) const SWIFT_NAME(hasValue(named:)) {
         return sealed([&] { return impl_->has_value(name); });
     }
@@ -649,9 +657,8 @@ public:
         sealed([&] { impl_->set_nil(name); });
     }
 
-    /// The sealed contract's error slot (see error.hpp): "" if the last
-    /// sealed bridge call on THIS THREAD succeeded, else its failure
-    /// message. Check immediately after a suspicious defaulted result.
+    /// Compatibility message copy only. An empty message can also be a failed
+    /// call; borrow_bridge_outcome() supplies authoritative immediate status.
     std::string last_query_error_message() const SWIFT_NAME(lastQueryErrorMessage()) {
         return last_bridge_error();
     }
@@ -666,7 +673,10 @@ public:
     }
 
     void set_object(const std::string& name, const dynamic_object_ref& value) const SWIFT_NAME(setObject(named:_:)) {
-        impl_->set_object(name, value);
+        sealed([&] {
+            if (!impl_ || !value.impl_) throw std::runtime_error("Object mutation requires valid refs");
+            impl_->set_object(name, value);
+        });
     }
 
 #if LATTICE_HAS_FRT
@@ -768,7 +778,7 @@ public:
     column_value_t query_row_value(const std::string& name) const
         SWIFT_NAME(queryRowValue(named:)) {
         if (impl_) return impl_->query_row_value(name);
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         return nullptr;
     }
 

@@ -6,6 +6,7 @@
 #include "ordinary_target_raw_history_storage_recipe.hpp"
 namespace lattice {
 struct database::target_staging_state::history_chain_native {
+    terminal_native_outer_tail terminal_outer; // First: follows ALL actual outer member destruction.
     using arguments=std::vector<column_value_t>;
     struct phase;
     database* const shell;
@@ -20,12 +21,13 @@ struct database::target_staging_state::history_chain_native {
     bool completed=false;
     std::exception_ptr first_failure;
     history_chain_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving)
-        :shell(&actual),owner(receiving),schema(receiving->require_header_schema(*actual.target_staging_->connection.lock())),
+        :terminal_outer(actual,receiving,this,0),shell(&actual),owner(receiving),schema(receiving->require_header_schema(*actual.target_staging_->connection.lock())),
          raw_storage(actual.target_history_raw_storage_(*actual.target_staging_->connection.lock(),*receiving)),
          final_stage(actual.target_staging_->history_page?actual.target_staging_->history_page->stage:actual.target_staging_->history_header->stage),
          final_meta(actual.target_staging_->history_page?actual.target_staging_->history_page->meta:actual.target_staging_->history_header->meta) {
         const auto connection=actual.target_staging_->connection.lock();
         const auto& header=receiving->require_header_original(*connection);bytes=header.header.size();
+        terminal_outer.constructor_returned(); // Actual final constructor operation.
     }
 };
 struct database::target_staging_state::history_chain_native::phase {

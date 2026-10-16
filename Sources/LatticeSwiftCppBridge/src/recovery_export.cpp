@@ -12,7 +12,7 @@ void export_failure(std::exception_ptr error)noexcept{
 }
 server_export_endpoint swift_lattice_ref::make_server_export_endpoint_for_qualification(
     void* context,int32_t(*enqueue)(void*,const uint8_t*,size_t,uint64_t),void(*destroy)(void*),const server_export_limits& limits)const noexcept {
-    last_bridge_error().clear();
+    clear_bridge_outcome();
     // Core rejects a missing destroy callback before ownership transfer.
     // Otherwise it consumes context on every outcome, including allocation
     // failure. The caller must retain context when destroy is null.
@@ -37,7 +37,7 @@ server_export_stop server_export_endpoint::stop_token()const noexcept{
     server_export_stop result;result.value_=stop_;return result;
 }
 server_export_page server_export_endpoint::prepare_history(int64_t after,int64_t count)const noexcept{
-    last_bridge_error().clear();server_export_page result;
+    clear_bridge_outcome();server_export_page result;
     try{
         if(!value_)return result;
         if(count<=0||count>1000){record_bridge_error("server export page count outside bound");result.failure_=9;return result;}
@@ -67,7 +67,7 @@ server_export_completion server_export_page::completion_token()const noexcept{
     server_export_completion result;result.value_=completion_;return result;
 }
 int32_t server_export_page::consume()const noexcept{
-    if(failure_||!value_)return status_code();last_bridge_error().clear();const auto result=value_->consume();export_failure(value_->failure());return static_cast<int32_t>(result);
+    if(failure_||!value_)return status_code();clear_bridge_outcome();const auto result=value_->consume();export_failure(value_->failure());return static_cast<int32_t>(result);
 }
 void server_export_page::close_on_io()const noexcept{if(value_)value_->close_on_io();}
 } // namespace lattice

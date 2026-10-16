@@ -295,6 +295,13 @@ private:
 
 class model_base {
 public:
+    model_base() = default;
+    model_base(const model_base&) = default;
+    model_base& operator=(const model_base&) = default;
+    // The virtual destructor suppresses implicit moves. Preserve copy APIs,
+    // and give the private graph journal a real nonallocating ownership move.
+    model_base(model_base&&) noexcept = default;
+    model_base& operator=(model_base&&) noexcept = default;
     virtual ~model_base() = default;
 
     bool is_managed() const { return db_ != nullptr && id_ != 0; }
@@ -1773,7 +1780,9 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<T*>, std::enable_if_t<is
     managed(Wrapped&& wrapped) {
         throw std::runtime_error("not supported");
     }
-    managed(managed&&) = default;
+    managed(managed&&) noexcept = default;
+    managed& operator=(const managed&) = default;
+    managed& operator=(managed&&) noexcept = default;
     
     // OptionalProtocol requirements - lists always "have value" (even if empty)
     bool hasValue() const SWIFT_NAME(hasValue()) { return true; }

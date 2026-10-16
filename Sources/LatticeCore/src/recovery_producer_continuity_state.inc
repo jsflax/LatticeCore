@@ -15,6 +15,17 @@ struct recovery_continuous_state {
     int64_t incarnation=0,barrier=0,attempt=0;
     std::set<std::string> generated_names;
     std::weak_ptr<recovery_receiver_controller> controller;
+#ifndef __EMSCRIPTEN__
+    // Actual candidate originals, reserved BEFORE construction/worker launch.
+    // Retain racing/unpublished candidates independently of controller weak refs.
+    std::array<std::shared_ptr<controller_worker_original>,64> controller_originals;
+    std::shared_ptr<controller_worker_original> first_failed_controller_original;
+    const uint64_t controller_creator=database_native_process();
+    size_t controller_publication_builders=0;
+    std::atomic<bool> controller_publication_unknown{false};
+    std::condition_variable controller_publications_returned;
+    bool controller_deletion_retiring=false;
+#endif
     // Physical custody survives controller/route turnover while old work still
     // owns a cohort. Never clear this slot on request/source replacement.
     std::weak_ptr<const recovery_reconciliation_cohort> reconciliation_cohort;

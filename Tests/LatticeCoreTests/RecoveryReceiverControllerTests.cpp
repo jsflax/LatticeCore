@@ -1,4 +1,9 @@
 #include "TestHelpers.hpp"
+#include "FixtureCheckedOwnerEnding.hpp"
+#include "StartupPredicateObservation.hpp"
+#include "ControllerFixtureWorkerEnding.hpp"
+#include "../../Sources/LatticeCore/src/recovery_cohort_progress_observation.hpp"
+#include "../../Sources/LatticeCore/src/recovery_topology_wait_observation.hpp"
 #include "CanonicalWriterTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/recovery_admission_test_probe.hpp"
 #include "../../Sources/LatticeCore/src/sync_discovery_deferral.hpp"
@@ -10,6 +15,7 @@
 #include <set>
 #include <lattice.hpp>
 #include "../../Sources/LatticeCore/src/recovery_receiver_controller.hpp"
+#include "../../Sources/LatticeCore/src/recovery_authenticated_session.hpp"
 #include "../../Sources/LatticeCore/src/recovery_local_producer.hpp"
 #include <nlohmann/json.hpp>
 #include <deque>
@@ -25,8 +31,10 @@ struct recovery_receiver_controller_test_access {
     using probe=recovery_receiver_controller::test_probe;
     std::shared_ptr<const probe> prior;
     recovery_receiver_controller_test_access(const lattice_db* owner,std::function<void(const char*)> observed,
-        std::function<std::shared_ptr<void>(const char*)> scope={}) {
-        auto value=std::make_shared<probe>();value->owner=owner;value->observed=std::move(observed);value->scope=std::move(scope);
+        std::function<std::shared_ptr<void>(const char*)> scope={},std::function<void(const char*)> admission_observed={},
+        std::function<void()> phase_committed={},std::function<void()> reconciliation_prepublication={},
+        std::function<void()> response_capacity_wait={}) {
+        auto value=std::make_shared<probe>();value->owner=owner;value->observed=std::move(observed);value->scope=std::move(scope);value->admission_observed=std::move(admission_observed);value->phase_committed=std::move(phase_committed);value->reconciliation_prepublication=std::move(reconciliation_prepublication);value->response_capacity_wait=std::move(response_capacity_wait);
         std::lock_guard lock(recovery_receiver_controller::test_mutex_);prior=std::move(recovery_receiver_controller::test_probe_);recovery_receiver_controller::test_probe_=std::move(value);
     }
     ~recovery_receiver_controller_test_access(){std::shared_ptr<const probe> old;{std::lock_guard lock(recovery_receiver_controller::test_mutex_);old=std::move(recovery_receiver_controller::test_probe_);recovery_receiver_controller::test_probe_=std::move(prior);}}
@@ -55,6 +63,108 @@ struct ControllerCommitFault {
 };
 thread_local ControllerCommitFault* ControllerCommitFault::active=nullptr;
 using json=nlohmann::json;
+// One immutable ACK/one-shot claim selection, published off producer leaves.
+// Read on actual callback entry AND actual known after-claim COMMIT. Selection
+// exists before the relevant action becomes possible, never by observer arrival.
+// No selected payload is destroyed while the DATA mutex is held.
+class ControllerRouteHookCell {
+public:
+    struct Selection {
+        std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> ack;
+        std::shared_ptr<const std::function<void()>> after_claim;
+    };
+private:
+    const uint64_t creator_=detail::database_native_process();
+    std::mutex mutex_;std::shared_ptr<const Selection> selected_;
+public:
+    void publish(std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> ack,
+                 std::function<void()> after_claim={}) {
+        if(creator_!=detail::database_native_process())throw db_error("inherited route hook publication");
+        auto next=std::make_shared<Selection>();next->ack=std::move(ack);
+        if(after_claim)next->after_claim=std::make_shared<const std::function<void()>>(std::move(after_claim));
+        std::shared_ptr<const Selection> retired;
+        {std::lock_guard lock(mutex_);retired=std::move(selected_);selected_=std::move(next);}
+    }
+    std::shared_ptr<const Selection> read(){
+        if(creator_!=detail::database_native_process())throw db_error("inherited route hook read");
+        std::lock_guard lock(mutex_);return selected_;
+    }
+};
+class ControllerRouteCallbackHookScope {
+    const uint64_t creator_=detail::database_native_process();
+    struct Fields {
+        const uint64_t creator=detail::database_native_process();
+        std::shared_ptr<ControllerRouteHookCell> cell;
+        std::shared_ptr<const ControllerRouteHookCell::Selection> selected;
+        std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> previous_ack;
+        void (*previous_claim)()=nullptr;
+        void (*chained_claim)()=nullptr;
+        Fields* previous_scope=nullptr;
+    };
+    static thread_local Fields* current_;
+    // All selected payload stays heap-owned across the actual callback. A
+    // child abandons this capsule before inherited TLS/control-block cleanup.
+    Fields* original_=nullptr;
+    static void claimed() {
+        auto* const actual=current_;
+        if(!actual||actual->creator!=detail::database_native_process())return;
+        // A job may have entered before phase4 publication. Refresh at the
+        // real known after-COMMIT hook, before actual ACK launcher capture.
+        actual->selected=actual->cell->read();
+        if(actual->selected){
+            detail::sync_background_test_hooks::ack=actual->selected->ack;
+            if(actual->selected->after_claim)(*actual->selected->after_claim)();
+        }
+        if(actual->creator!=detail::database_native_process())return;
+        // Preserve the real outer first-claim hook. Nested route scopes use
+        // the innermost actual policy and chain the non-route hook once.
+        if(actual->chained_claim)actual->chained_claim();
+    }
+public:
+    explicit ControllerRouteCallbackHookScope(const std::shared_ptr<ControllerRouteHookCell>& cell) {
+        if(!cell)return;
+        auto staged=std::make_unique<Fields>();
+        staged->selected=cell->read();staged->cell=cell;
+        staged->previous_claim=detail::recovery_export_test_hooks::after_claim_commit;
+        staged->previous_scope=current_;
+        staged->chained_claim=staged->previous_claim;
+        if(staged->previous_claim==claimed){
+            if(!current_||current_->creator!=creator_)throw db_error("route callback hook scope mismatch");
+            staged->chained_claim=current_->chained_claim;
+        }
+        // Required custody exists before any TLS publication. Even an empty
+        // cell gets the dispatcher: publication arrival never grants eligibility.
+        staged->previous_ack=std::move(detail::sync_background_test_hooks::ack);
+        if(staged->selected)detail::sync_background_test_hooks::ack=staged->selected->ack;
+        else detail::sync_background_test_hooks::ack=staged->previous_ack;
+        original_=staged.release();current_=original_;
+        detail::recovery_export_test_hooks::after_claim_commit=claimed;
+    }
+    ~ControllerRouteCallbackHookScope()noexcept {
+        if(creator_!=detail::database_native_process()){original_=nullptr;return;}
+        if(!original_)return;
+        detail::recovery_export_test_hooks::after_claim_commit=original_->previous_claim;
+        current_=original_->previous_scope;
+        detail::sync_background_test_hooks::ack=std::move(original_->previous_ack);
+        delete original_;original_=nullptr; // Off callback SQL/selection leaves.
+    }
+    ControllerRouteCallbackHookScope(const ControllerRouteCallbackHookScope&)=delete;
+    ControllerRouteCallbackHookScope& operator=(const ControllerRouteCallbackHookScope&)=delete;
+};
+thread_local ControllerRouteCallbackHookScope::Fields* ControllerRouteCallbackHookScope::current_=nullptr;
+// Same actual std_thread_scheduler worker, FIFO, thread identity and shutdown.
+// Only the callback body gets a scoped hook selection; no extra job/worker.
+class ControllerRouteThreadScheduler final : public std_thread_scheduler {
+    const std::shared_ptr<ControllerRouteHookCell> hooks_;
+public:
+    explicit ControllerRouteThreadScheduler(std::shared_ptr<ControllerRouteHookCell> hooks):hooks_(std::move(hooks)){}
+    void invoke(std::function<void()>&& job)override {
+        const auto hooks=hooks_;
+        std_thread_scheduler::invoke([hooks,job=std::move(job)]()mutable{
+            ControllerRouteCallbackHookScope scope(hooks);job();
+        });
+    }
+};
 // Pump-thread observations only. No live endpoint, source result, owner, or
 // callback is retained. Diagnostic overflow never changes fixture admission.
 struct ControllerBoundaryTrace {
@@ -67,6 +177,8 @@ struct ControllerBoundaryTrace {
         Event event=Event::ready;Operation operation=Operation::unknown;
         Flag publishable=Flag::unobserved,opened=Flag::unobserved,delivered=Flag::unobserved,completed=Flag::unobserved;
         bool status_observed=false,before_suppressed=false,prepare_dropped=false,terminal_empty=false;
+        bool capture_failure_observed=false;
+        detail::authenticated_ready_control_test_observation::capture_failure capture_failure_copy;
         int32_t status=0;
         Copy request_id,route,request_index,source,after;
         std::array<char,8192> bytes{};
@@ -193,6 +305,14 @@ struct ControllerBoundaryTrace {
                 field=value.find(key);if(field!=value.end())if(const auto n=quantity(*field))out[key]=*n;}
         }catch(...){out["parse"]="unknown";}return out;
     }
+    static std::array<char,1023> capture_message_hex(
+        const detail::authenticated_ready_control_test_observation::capture_failure& failure) noexcept {
+        std::array<char,1023> out{};constexpr char digits[]="0123456789abcdef";
+        const auto count=std::min<size_t>(failure.bytes,failure.message.size()-1);
+        for(size_t i=0;i<count;++i){const auto byte=static_cast<unsigned char>(failure.message[i]);
+            out[2*i]=digits[byte>>4];out[2*i+1]=digits[byte&15];}
+        return out;
+    }
     void report()const noexcept{
         try{json rows=json::array();size_t copied=0;
             for(size_t i=0;i<retained;++i){const auto& row=records[i];copied+=row.used;
@@ -203,6 +323,11 @@ struct ControllerBoundaryTrace {
                     {"beforeSuppressed",row.before_suppressed},{"prepareDropped",row.prepare_dropped},{"terminalEmpty",row.terminal_empty},
                     {"source",metadata(row,row.source)},{"after",metadata(row,row.after)}};
                 if(row.status_observed)item["status"]=row.status;
+                if(row.capture_failure_observed){const auto& failure=row.capture_failure_copy;
+                    const auto hex=capture_message_hex(failure);
+                    item["actualCaptureFailure"]={{"kind",static_cast<unsigned>(failure.kind)},
+                        {"messageHex",std::string(hex.data())},{"messageEncoding","hex"},
+                        {"bytes",failure.bytes},{"truncated",failure.truncated},{"nullMessage",failure.null_message}};}
                 item["requestIndexObserved"]=row.request_index.observed;item["requestIndexStored"]=row.request_index.stored;
                 if(row.request_index.stored){const json text=std::string(row.bytes.data()+row.request_index.offset,row.request_index.bytes);
                     if(const auto index=quantity(text))item["requestIndex"]=*index;}
@@ -313,7 +438,10 @@ protected:
     std::deque<ControllerWire::Frame> held_uploads;
     std::vector<std::pair<size_t,std::vector<std::string>>> observed_uploads;
     std::vector<std::shared_ptr<ControllerPause>> pauses;
+    const std::shared_ptr<ControllerRouteHookCell> callback_hooks=std::make_shared<ControllerRouteHookCell>();
     std::unique_ptr<detail::recovery_receiver_controller_test_access> probe;
+    const std::shared_ptr<detail::controller_fixture_worker_endings> worker_endings=std::make_shared<detail::controller_fixture_worker_endings>();
+    detail::controller_fixture_worker_selection worker_selection{worker_endings};
     bool hold_second=false,drop_prepare=false,hold_uploads=true;size_t dropped=0,handled=0;
     size_t upload_chunk=1000;
     virtual json source_policy(const std::string& ns) {
@@ -363,7 +491,7 @@ protected:
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[pause](const char* stage){if(std::strcmp(stage,"install-committed")==0)pause->wait();});return pause;}
     void open_receiver() {
         boundary_trace.add(ControllerBoundaryTrace::Event::open_receiver);
-        swift_configuration config((container/"store.sqlite").string(),std::make_shared<std_thread_scheduler>());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+        swift_configuration config((container/"store.sqlite").string(),std::make_shared<ControllerRouteThreadScheduler>(callback_hooks));config.audit_retention_seconds=0;config.busy_timeout_ms=100;
         continuous_result result;
 #if LATTICE_HAS_FRT
         receiver_ref.reset(swift_lattice_ref::create_continuous(config,{controller_schema()},policy,result));
@@ -440,12 +568,27 @@ protected:
         if(!peers.at(peer).physical.trigger_on_message(transport_message::from_string(server_sent_event::make_audit_log({}).to_json())))
             throw db_error("fixture current recovery request endpoint retired");
     }
-    void close_receiver(){boundary_trace.add(ControllerBoundaryTrace::Event::close_receiver);{std::lock_guard lock(errors_mutex);errors.clear();}held_uploads.clear();synchronizers.clear();if(receiver)receiver->close();receiver.reset();receiver_ref.reset();}
+    virtual void release_controller_worker_holds() {for(const auto& pause:pauses)pause->release();}
+    void close_receiver()noexcept {
+        try {
+        boundary_trace.add(ControllerBoundaryTrace::Event::close_receiver);
+        release_controller_worker_holds();
+        synchronizers.clear(); // Retires routes/callback admission; does NOT prove controller join.
+        worker_endings->join_originals(); // Actual reaper join, while Native owner/source/namespace still live.
+        {std::lock_guard lock(errors_mutex);errors.clear();}
+        held_uploads.clear();detail::end_fixture_owner_checked(receiver.get(),"controller-receiver");receiver.reset();receiver_ref.reset();
+        }catch(...){detail::controller_fixture_worker_endings::fail_ending("fixture-release-join-or-close-threw");}
+    }
+    struct ControllerLocalWorkerEnding {
+        RecoveryReceiverController* fixture;
+        ~ControllerLocalWorkerEnding()noexcept {fixture->close_receiver();}
+    };
+    [[nodiscard]] ControllerLocalWorkerEnding scoped_controller_worker_ending()noexcept{return {this};}
     void TearDown()override {
         for(const auto& pause:pauses)pause->release();
         close_receiver();for(const auto& pause:pauses)EXPECT_FALSE(pause->timedOut());probe.reset();for(auto& peer:peers){peer.live->store(false);peer.setup.close_on_io();peer.setup={};}peers.clear();
         {std::lock_guard lock(wire->mutex);wire->frames.clear();wire->dials.clear();wire->endpoints.clear();}
-        if(source)source->close();source.reset();source_ref.reset();set_network_factory(previous);std::error_code error;std::filesystem::remove_all(container,error);
+        detail::end_fixture_owner_checked(source.get(),"controller-source");source.reset();source_ref.reset();set_network_factory(previous);std::error_code error;std::filesystem::remove_all(container,error);
     }
     // Default hooks preserve the original authenticated fixture workload.
     // Successor fixtures may only delay/corrupt actual boundary traffic.
@@ -477,7 +620,17 @@ protected:
             ControllerBoundaryTrace::Scope trace_scope(boundary_trace,observation);
             if(before_ready(index,control)){if(observation)observation->before_suppressed=true;return true;}
             auto charge=peer.setup.stop_token().reserve_ready(frame->raw.size());if(!charge.valid())throw db_error("actual source finite request reservation failed");
-            auto result=peer.setup.ready(frame->raw,charge);const auto status=result.status_code();bool publishable=false;
+            detail::authenticated_ready_control_test_observation::observation actual_ready;
+            auto result=[&]{
+                namespace observed=detail::authenticated_ready_control_test_observation;
+                struct reset {observed::observation* previous;~reset(){observed::current=previous;}} restore{observed::current};
+                observed::current=&actual_ready;
+                return peer.setup.ready(frame->raw,charge); // same sole native call
+            }();
+            if(observation&&actual_ready.visits[static_cast<size_t>(detail::authenticated_ready_control_test_observation::point::prepare_returned)]){
+                observation->capture_failure_observed=true;observation->capture_failure_copy=actual_ready.capture_failure_copy;
+            }
+            const auto status=result.status_code();bool publishable=false;
             if(status==1)publishable=result.publishable();ControllerBoundaryTrace::result(observation,status,publishable);
             if(status!=1||!publishable)throw db_error("actual source READY result unavailable");++handled;
             if(drop_prepare&&control["operation"]=="prepare"&&dropped++==0){if(observation)observation->prepare_dropped=true;return true;}
@@ -616,6 +769,7 @@ TEST_F(RecoveryReceiverController, SameDomainDifferentSchemaRefusesAndRollsBackE
 TEST_F(RecoveryReceiverController, ActualInstallCommitDenialRollsBackEveryCohortAndReopenRetriesExactFraming) {
     configure(2);insert(*source,controller_uuid(150),"canonical");insert(*receiver,controller_uuid(151),"pending");
     std::atomic<unsigned> hits{0};std::mutex before_mutex;Snapshot before;
+    auto controller_local_worker_ending=scoped_controller_worker_ending();
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[&](const char* stage)->std::shared_ptr<void>{
         if(std::strcmp(stage,"install")!=0)return {};{std::lock_guard lock(before_mutex);before=snapshot();}
         return std::make_shared<ControllerCommitFault>(receiver.get(),hits);
@@ -641,9 +795,11 @@ TEST_F(RecoveryReceiverController, LostKnownInstallResultReopensInstalledPhaseAn
 }
 
 TEST_F(RecoveryReceiverController, PositiveOneNamespaceAndClaimedUnknownOtherRemainClosedWithOriginalsIntact) {
-    configure(2);std::atomic<bool> pending{false};const auto cancel_pause=std::make_shared<ControllerPause>();pauses.push_back(cancel_pause);
-    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[&](const char* stage){if(std::strcmp(stage,"reconciliation-pending")==0)pending=true;},
-        [cancel_pause](const char* stage)->std::shared_ptr<void>{if(std::strcmp(stage,"reconcile-cancel")==0)cancel_pause->wait();return {};});
+    // This fixture serves version1 without registered producer coverage. A
+    // receipt owned by A cannot become an UNKNOWN receipt for B. The actual
+    // source refusal must retain the frozen Q and all original local intent.
+    // The registered v3 reconciliation path has its own coverage fixture.
+    configure(2);
     connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==2;}));
     insert(*receiver,controller_uuid(170),"local-original");
     ASSERT_TRUE(until([&]{return held_uploads.size()>=2;}));
@@ -652,12 +808,23 @@ TEST_F(RecoveryReceiverController, PositiveOneNamespaceAndClaimedUnknownOtherRem
     const auto before=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");const auto entries=receiver->db().query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original");
     ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NOT NULL AND stage=0"),2);
     ASSERT_TRUE(peers[0].physical.trigger_on_message(transport_message::from_string(server_sent_event::make_audit_log({}).to_json())));
-    ASSERT_TRUE(until([&]{return pending.load()&&cancel_pause->ready();}));EXPECT_EQ(phase(),2);
+    ASSERT_TRUE(until([&]{return error_contains("controller source preparation refused; exact Q retained");}));EXPECT_EQ(phase(),2);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1"),2);
     EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),before);
     EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original"),entries);
-    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_attempt WHERE verified=1"),2);
+    // Only A published and verified the second attempt; B refused before a
+    // manifest existed. Initial installed staging was already released.
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_range_attempt WHERE verified=1"),1);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE sequence=2"),2);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE length(manifest_frame)>0"),1);
+    const auto framing=receiver->db().query("SELECT * FROM _lattice_recovery_request ORDER BY channel");
     EXPECT_THROW(insert(*receiver,controller_uuid(171),"gate must stay closed"),db_error);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+    close_receiver();open_receiver();EXPECT_EQ(phase(),2);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_recovery_request ORDER BY channel"),framing);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM AuditLog ORDER BY id"),before);
+    EXPECT_EQ(receiver->db().query("SELECT * FROM _lattice_obligation_entry ORDER BY channel,original"),entries);
+    EXPECT_THROW(insert(*receiver,controller_uuid(171),"reopened gate must stay closed"),db_error);
     EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
 }
 
@@ -742,6 +909,7 @@ TEST_F(RecoveryReceiverController, UnchangedUnknownRefreezesOnceWithoutAckAndDra
 }
 TEST_F(RecoveryReceiverController, LostKnownReconciliationCancelCommitReopensRestrictedPhaseWithOriginalClaims) {
     configure();std::atomic<bool> stop{false};
+    auto controller_local_worker_ending=scoped_controller_worker_ending();
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[&](const char* stage){
         if(stop&&std::strcmp(stage,"reconcile-cancel-committed")==0)throw db_error("fixture lost known cancellation result");});
     connect();ASSERT_TRUE(until([&]{return phase()==0;}));seed_local(3);const auto ids=originals();ASSERT_TRUE(until([&]{return held_originals()==ids;}));
@@ -761,6 +929,7 @@ TEST_F(RecoveryReceiverController, LostKnownReconciliationCancelCommitReopensRes
 }
 TEST_F(RecoveryReceiverController, ReconciliationCancelCommitDenialPreservesWholeFrozenCohortAndReopenRecovers) {
     configure();std::atomic<bool> deny{false};std::atomic<unsigned> hits{0};std::mutex before_mutex;Snapshot before;
+    auto controller_local_worker_ending=scoped_controller_worker_ending();
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[&](const char* stage)->std::shared_ptr<void>{
         if(!deny||std::strcmp(stage,"reconcile-cancel")!=0)return {};{std::lock_guard lock(before_mutex);before=snapshot();}
         return std::make_shared<ControllerCommitFault>(receiver.get(),hits);});
@@ -775,6 +944,7 @@ TEST_F(RecoveryReceiverController, ReconciliationCancelCommitDenialPreservesWhol
 }
 TEST_F(RecoveryReceiverController, RefreezeCommitDenialPreservesRestrictedPhaseAndReopenReplaysExactOriginals) {
     configure();std::atomic<bool> deny{false};std::atomic<unsigned> hits{0};std::mutex before_mutex;Snapshot before;
+    auto controller_local_worker_ending=scoped_controller_worker_ending();
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[&](const char* stage)->std::shared_ptr<void>{
         if(!deny||std::strcmp(stage,"reconcile-refreeze")!=0)return {};{std::lock_guard lock(before_mutex);before=snapshot();}
         return std::make_shared<ControllerCommitFault>(receiver.get(),hits);});
@@ -814,14 +984,18 @@ TEST_F(RecoveryReceiverController, FullTwoThousandSendWindowRefreezesWithoutWait
 class FirstClaimScheduler final : public scheduler {
     mutable std::mutex mutex_;std::deque<std::function<void()>> jobs_;bool stopped_=false;
     static thread_local const FirstClaimScheduler* current_;
+    const std::shared_ptr<ControllerRouteHookCell> hooks_;
 public:
+    explicit FirstClaimScheduler(std::shared_ptr<ControllerRouteHookCell> hooks={}):hooks_(std::move(hooks)){}
     void invoke(std::function<void()>&& job)override {std::lock_guard lock(mutex_);if(stopped_)return;
         if(jobs_.size()>=256)throw db_error("first-claim fixture scheduler capacity");jobs_.push_back(std::move(job));}
     bool is_on_thread()const noexcept override{return current_==this;}
     bool is_same_as(const scheduler* other)const noexcept override{return other==this;}
     bool can_invoke()const noexcept override{std::lock_guard lock(mutex_);return !stopped_;}
+    size_t queued_snapshot()const {std::lock_guard lock(mutex_);return jobs_.size();}
     bool run_one(){std::function<void()> job;{std::lock_guard lock(mutex_);if(jobs_.empty())return false;job=std::move(jobs_.front());jobs_.pop_front();}
-        struct Restore{const FirstClaimScheduler* old;~Restore(){current_=old;}} restore{current_};current_=this;job();return true;}
+        struct Restore{const FirstClaimScheduler* old;~Restore(){current_=old;}} restore{current_};current_=this;
+        ControllerRouteCallbackHookScope hook_scope(hooks_);job();return true;}
     void discard(){std::deque<std::function<void()>> old;{std::lock_guard lock(mutex_);old.swap(jobs_);}}
     void shutdown()override{std::deque<std::function<void()>> old;{std::lock_guard lock(mutex_);stopped_=true;old.swap(jobs_);}}
 };
@@ -849,9 +1023,24 @@ struct FirstClaimWriterHold {
 };
 thread_local std::function<void()> first_claim_committed_action;
 void first_claim_committed(){if(first_claim_committed_action)first_claim_committed_action();}
+// Install only around the real scheduler callback that executes the claim.
+// Construct replacement captures before touching the old TLS, and restore on
+// both normal return and exception after that callback's SQL has unwound.
+struct FirstClaimRouteHookScope {
+    void (*&slot)(); std::function<void()>& action;
+    void (*previous)(); std::function<void()> previous_action;
+    FirstClaimRouteHookScope(void (*&selected)(),std::function<void()>& selected_action,
+        void (*callback)(),std::function<void()> replacement)
+        :slot(selected),action(selected_action),previous(selected),previous_action(std::move(selected_action)) {
+        action=std::move(replacement);slot=callback;
+    }
+    ~FirstClaimRouteHookScope(){slot=previous;action=std::move(previous_action);}
+    FirstClaimRouteHookScope(const FirstClaimRouteHookScope&)=delete;
+    FirstClaimRouteHookScope& operator=(const FirstClaimRouteHookScope&)=delete;
+};
 class RecoveryRestrictedFirstClaim : public RecoveryReceiverController {
 protected:
-    std::shared_ptr<FirstClaimScheduler> manual=std::make_shared<FirstClaimScheduler>();
+    std::shared_ptr<FirstClaimScheduler> manual=std::make_shared<FirstClaimScheduler>(callback_hooks);
     std::vector<std::shared_ptr<FirstClaimAckGate>> ack_gates;
     std::shared_ptr<FirstClaimAckGate> restricted_ack;
     std::shared_ptr<const detail::sync_background_test_hooks::ack_schedule> previous_ack;
@@ -862,15 +1051,64 @@ protected:
     std::vector<std::vector<database::row_t>> committed_claims;
     std::vector<int64_t> committed_sequences;
     Snapshot phase4_snapshot,committed_snapshot;
-    size_t restricted_begin=0,phase4_publications=0;bool park_first=false;
+    size_t restricted_begin=0;std::atomic<size_t> phase4_publications{0};bool park_first=false;
+    const std::thread::id claim_route_thread=std::this_thread::get_id();
+    // Capture before descriptor visibility, never after a route can claim.
+    // The separate actual after-publication observer counts real notifications.
+    // One pending DATA snapshot is moved to main; it grants no SQL authority.
+    std::mutex phase4_observation_mutex;
+    std::unique_ptr<Snapshot> pending_phase4_snapshot;
+    bool phase4_snapshot_prepared=false;
+    bool first_claim_capture_enabled=false; // Main-only mode chosen before any actual route.
+    void publish_phase4_observation() {
+        auto actual=std::make_unique<Snapshot>(snapshot());
+        std::unique_ptr<Snapshot> displaced;
+        {std::lock_guard lock(phase4_observation_mutex);
+            displaced=std::move(pending_phase4_snapshot);pending_phase4_snapshot=std::move(actual);}
+        // Displaced DATA destruction never runs beneath the observation leaf.
+    }
+    void consume_phase4_observation() {
+        if(std::this_thread::get_id()!=claim_route_thread)
+            throw db_error("first-claim fixture route executor changed thread");
+        std::unique_ptr<Snapshot> actual;
+        {std::lock_guard lock(phase4_observation_mutex);actual=std::move(pending_phase4_snapshot);}
+        if(actual){phase4_snapshot.swap(*actual);phase4_snapshot_prepared=true;}
+    }
+    virtual void claim_committed_on_route() {
+        committed_claims.push_back(claims());committed_sequences.push_back(scalar(*receiver,"SELECT export_sequence AS n FROM _lattice_obligation_store"));
+        if(committed_claims.size()==1){committed_snapshot=snapshot();if(park_first)writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);}
+    }
+    virtual bool run_claim_queue_body(FirstClaimScheduler& queue){return queue.run_one();}
+    bool run_claim_queue(FirstClaimScheduler& queue) {
+        consume_phase4_observation();
+        // Install on EVERY real job, including one already queued before the
+        // descriptor was published. Eligibility is never notification arrival.
+        FirstClaimRouteHookScope hook(detail::recovery_export_test_hooks::after_claim_commit,
+            first_claim_committed_action,first_claim_committed,[this]{
+                if(!first_claim_capture_enabled)return;
+                consume_phase4_observation();
+                if(phase()==4){
+                    if(!phase4_snapshot_prepared)throw db_error("restricted claim lacks actual prepublication snapshot");
+                    claim_committed_on_route();
+                }
+            });
+        return run_claim_queue_body(queue);
+    }
     void SetUp()override{RecoveryReceiverController::SetUp();previous_ack=detail::sync_background_test_hooks::ack;
         previous_claim=detail::recovery_export_test_hooks::after_claim_commit;previous_claim_action=std::move(first_claim_committed_action);}
     std::shared_ptr<FirstClaimAckGate> install_ack_gate(){auto gate=std::make_shared<FirstClaimAckGate>();ack_gates.push_back(gate);
         auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();hook->before_expiry=[gate]{gate->wait();};
         hook->completed=[gate]{++gate->finished;};detail::sync_background_test_hooks::ack=std::move(hook);return gate;}
+    // A real claim may beat the later after-publication DATA observer. Keep
+    // that observer/count real, and finish the SAME original drive only when
+    // both its original predicate and this required observation are present.
+    bool claim_publication_observed()const noexcept {
+        return !first_claim_capture_enabled||committed_claims.empty()||
+            phase4_publications.load(std::memory_order_acquire)!=0;
+    }
     template<class F> bool drive(F predicate){const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;manual->run_one();if(predicate())return true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));}return predicate();}
+        while(std::chrono::steady_clock::now()<end){pump();if(predicate()&&claim_publication_observed())return true;run_claim_queue(*manual);if(predicate()&&claim_publication_observed())return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));}return predicate()&&claim_publication_observed();}
     template<class F> bool observe(F predicate){const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
         while(std::chrono::steady_clock::now()<end){if(predicate())return true;std::this_thread::sleep_for(std::chrono::milliseconds(1));}return predicate();}
     void open_manual_receiver(){swift_configuration config((container/"store.sqlite").string(),manual);config.audit_retention_seconds=0;config.busy_timeout_ms=100;
@@ -896,6 +1134,7 @@ protected:
             result[name]=receiver->db().query("SELECT * FROM \""+name+"\"");}
         result["sqlite_schema"]=receiver->db().query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");return result;}
     void prepare_mixed(){
+        first_claim_capture_enabled=true;
         configure(2,false);open_manual_receiver();const auto initial_ack=install_ack_gate();connect();
         ASSERT_TRUE(drive([&]{return phase()==0;}));seed_local(1,700);const auto claimed=originals();ASSERT_EQ(claimed.size(),1u);
         ASSERT_TRUE(drive([&]{return held_originals(0)==claimed&&held_originals(1)==claimed;}));
@@ -915,15 +1154,15 @@ protected:
         ASSERT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
         held_uploads.clear();restricted_begin=observed_uploads.size();restricted_ack=install_ack_gate();
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this](const char* stage){
-            if(std::strcmp(stage,"reconciliation-pending")!=0||phase()!=4)return;
-            ++phase4_publications;phase4_snapshot=snapshot();
-            first_claim_committed_action=[this]{
-                committed_claims.push_back(claims());committed_sequences.push_back(scalar(*receiver,"SELECT export_sequence AS n FROM _lattice_obligation_store"));
-                if(committed_claims.size()==1){committed_snapshot=snapshot();if(park_first)writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);}
-            };
-            detail::recovery_export_test_hooks::after_claim_commit=first_claim_committed;
-        });
+            if(std::strcmp(stage,"reconciliation-pending")==0&&phase()==4)++phase4_publications;
+        },nullptr, nullptr, nullptr,[this]{publish_phase4_observation();});
         connect();
+    }
+    void release_controller_worker_holds() override {
+        if(writer_hold)writer_hold->release();
+        for(const auto& gate:ack_gates)gate->release();
+        if(manual)manual->shutdown();
+        RecoveryReceiverController::release_controller_worker_holds();
     }
     void TearDown()override{
         if(writer_hold){writer_hold->release();EXPECT_FALSE(writer_hold->timed_out);writer_hold.reset();}
@@ -936,7 +1175,7 @@ protected:
 TEST_F(RecoveryRestrictedFirstClaim, EarlierActualRouteClaimSurvivesLaterSameDescriptorSharedOriginalHandoff) {
     ASSERT_NO_FATAL_FAILURE(prepare_mixed());
     ASSERT_TRUE(drive([&]{return observed_originals(0,restricted_begin)==mixed_ids&&observed_originals(1,restricted_begin)==mixed_ids;}));
-    ASSERT_EQ(phase4_publications,1u);ASSERT_EQ(committed_claims.size(),2u);ASSERT_EQ(committed_sequences.size(),2u);
+    ASSERT_EQ(phase4_publications.load(std::memory_order_acquire),1u);ASSERT_EQ(committed_claims.size(),2u);ASSERT_EQ(committed_sequences.size(),2u);
     ASSERT_EQ(observed_uploads.size()-restricted_begin,2u);
     EXPECT_NE(observed_uploads[restricted_begin].first,observed_uploads[restricted_begin+1].first);
     // Whichever actual route ran first is A. Its claim covers both matching
@@ -950,7 +1189,7 @@ TEST_F(RecoveryRestrictedFirstClaim, EarlierActualRouteClaimSurvivesLaterSameDes
 }
 TEST_F(RecoveryRestrictedFirstClaim, AuditValidMatchingContributionFirstClaimRewriteAfterCommitRefusesBusyHandoff) {
     park_first=true;ASSERT_NO_FATAL_FAILURE(prepare_mixed());
-    ASSERT_TRUE(drive([&]{return bool(writer_hold);}));ASSERT_EQ(phase4_publications,1u);ASSERT_EQ(committed_claims.size(),1u);
+    ASSERT_TRUE(drive([&]{return bool(writer_hold);}));ASSERT_EQ(phase4_publications.load(std::memory_order_acquire),1u);ASSERT_EQ(committed_claims.size(),1u);
     EXPECT_EQ(observed_uploads.size(),restricted_begin);EXPECT_EQ(restricted_ack->started.load(),0u);
     EXPECT_EQ(synchronizers[0]->get_progress().pending_upload+synchronizers[1]->get_progress().pending_upload,2);
     // The run_one that returned has actually parked the committed frame on
@@ -1017,20 +1256,45 @@ protected:
     void SetUp()override{RecoveryRestrictedFirstClaim::SetUp();prior_before=detail::recovery_export_test_hooks::before_claim_commit;
         prior_before_action=std::move(continuity_before_claim_action);}
     bool route_error(size_t n){std::lock_guard lock(errors_mutex);return !route_errors[n].empty();}
+    void claim_committed_on_route() override {
+        if(running_route<0)throw db_error("continuity fixture claim did not run on actual route queue");
+        if(first_route<0)first_route=running_route;
+        committed_claims.push_back(claims());committed_sequences.push_back(scalar(*receiver,"SELECT export_sequence AS n FROM _lattice_obligation_store"));
+        committed_snapshot=snapshot();
+        if(committed_claims.size()<=park_commits)writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);
+    }
+    bool run_claim_queue_body(FirstClaimScheduler& queue) override {
+        FirstClaimRouteHookScope hook(detail::recovery_export_test_hooks::before_claim_commit,
+            continuity_before_claim_action,continuity_before_claim,[this]{
+                if(!first_claim_capture_enabled)return;
+                consume_phase4_observation();
+                if(phase()==4){
+                    if(!phase4_snapshot_prepared)throw db_error("restricted pre-COMMIT lacks actual prepublication snapshot");
+                    if(before_claim)before_claim();
+                }
+            });
+        return queue.run_one();
+    }
     bool selected(const std::function<bool()>& predicate,std::optional<size_t> only={}){
         const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;manual->run_one();if(predicate())return true;
+        while(std::chrono::steady_clock::now()<end){pump();if(predicate()&&claim_publication_observed())return true;run_claim_queue(*manual);if(predicate()&&claim_publication_observed())return true;
             for(size_t n=0;n<2;++n)if(!only||*only==n){
                 struct Restore{int& slot;int prior;~Restore(){slot=prior;}} restore{running_route,running_route};running_route=static_cast<int>(n);
-                if(route_queues[n]->run_one())++executed[n];if(predicate())return true;
+                if(run_claim_queue(*route_queues[n]))++executed[n];if(predicate()&&claim_publication_observed())return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));}
-        return predicate();
+        return predicate()&&claim_publication_observed();
     }
     void start_mixed(){
-        configure(2,false);open_manual_receiver();const auto initial_ack=install_ack_gate();connect();
-        ASSERT_TRUE(drive([&]{return phase()==0;}));seed_local(1,700);const auto claimed=originals();ASSERT_EQ(claimed.size(),1u);
-        ASSERT_TRUE(drive([&]{return held_originals(0)==claimed&&held_originals(1)==claimed;}));
+        first_claim_capture_enabled=true;
+        configure(2,false);open_manual_receiver();const auto initial_ack=install_ack_gate();
+        const auto startup=std::make_shared<test_observation::StartupPredicateObservation>();
+        auto startup_probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+            [startup](const char* stage){startup->observe(stage);});
+        connect();
+        ASSERT_TRUE(startup->result(drive([&]{return phase()==0;}),"continuity-initial-phase0",*receiver));seed_local(1,700);const auto claimed=originals();ASSERT_EQ(claimed.size(),1u);
+        ASSERT_TRUE(startup->result(drive([&]{return held_originals(0)==claimed&&held_originals(1)==claimed;}),"continuity-initial-upload",*receiver));
+        startup_probe.reset();
         ASSERT_TRUE(observe([&]{return initial_ack->started.load()==2;}));
         auto retired=std::make_shared<std::atomic<bool>>(false);manual->invoke([this,retired]{synchronizers.clear();retired->store(true);});
         ASSERT_TRUE(drive([&]{return retired->load();}));ASSERT_TRUE(manual->can_invoke());manual->discard();
@@ -1039,19 +1303,19 @@ protected:
         ASSERT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE first_export IS NULL"),2);
         held_uploads.clear();restricted_begin=observed_uploads.size();restricted_ack=install_ack_gate();
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this](const char* stage){
-            if(std::strcmp(stage,"reconciliation-pending")!=0||phase()!=4)return;
-            ++phase4_publications;phase4_snapshot=snapshot();
-            continuity_before_claim_action=[this]{if(before_claim)before_claim();};
-            detail::recovery_export_test_hooks::before_claim_commit=continuity_before_claim;
-            first_claim_committed_action=[this]{
-                if(running_route<0)throw db_error("continuity fixture claim did not run on actual route queue");
-                if(first_route<0)first_route=running_route;
-                committed_claims.push_back(claims());committed_sequences.push_back(scalar(*receiver,"SELECT export_sequence AS n FROM _lattice_obligation_store"));
-                committed_snapshot=snapshot();
-                if(committed_claims.size()<=park_commits)writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);
-            };
-            detail::recovery_export_test_hooks::after_claim_commit=first_claim_committed;
-        },[this](const char* stage)->std::shared_ptr<void>{if(std::strcmp(stage,"reconcile-refreeze")==0&&before_refreeze)before_refreeze();return {};});
+            if(std::strcmp(stage,"reconciliation-pending")==0&&phase()==4)++phase4_publications;
+        },[this](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"reconcile-refreeze")==0){
+                // This scope is reached by actual route work->step, not by the
+                // private controller turn. Refuse any different executor before
+                // reading a body-local callback or its plain DATA captures.
+                if(std::this_thread::get_id()!=claim_route_thread||running_route<0||running_route>=2||
+                    !route_queues[static_cast<size_t>(running_route)]->is_on_thread())
+                    throw db_error("continuity refreeze did not run on its actual selected route");
+                if(before_refreeze)before_refreeze();
+            }
+            return {};
+        },nullptr, nullptr,[this]{publish_phase4_observation();});
         for(size_t n=0;n<2;++n){const auto& peer=peers[n];sync_config config;config.websocket_url=peer.endpoint;
             config.authorization_token="registered-token";config.sync_id=peer.channel;
             for(const auto& active:peers)config.all_active_sync_ids.push_back(active.channel);
@@ -1082,6 +1346,11 @@ protected:
         EXPECT_EQ(observed_uploads.size(),restricted_begin);EXPECT_EQ(restricted_ack->started.load(),0u);EXPECT_EQ(snapshot(),expected);
         EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
         EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),0);
+    }
+    void release_controller_worker_holds() override {
+        if(writer_hold)writer_hold->release();
+        routes.clear();for(const auto& queue:route_queues)queue->shutdown();
+        RecoveryRestrictedFirstClaim::release_controller_worker_holds();
     }
     void TearDown()override{
         before_claim={};before_refreeze={};
@@ -1122,25 +1391,53 @@ TEST_F(RecoveryFirstClaimContinuity, FailedRouteFencesAlreadyClaimedSiblingEvenA
 }
 TEST_F(RecoveryFirstClaimContinuity, DeniedOwnedClaimCommitNeverPublishesCandidateToQueuedSibling) {
     park_commits=0;std::atomic<unsigned> denied{0};std::unique_ptr<ControllerCommitFault> fault;
-    before_claim=[&]{if(!fault)fault=std::make_unique<ControllerCommitFault>(receiver.get(),denied);};
+    auto controller_local_worker_ending=scoped_controller_worker_ending();before_claim=[&]{if(!fault)fault=std::make_unique<ControllerCommitFault>(receiver.get(),denied);};
     ASSERT_NO_FATAL_FAILURE(start_mixed());hold_uploads=false;ASSERT_TRUE(selected([&]{return has_error();}));
     fault.reset();ASSERT_GT(denied.load(),0u);EXPECT_TRUE(committed_claims.empty());no_new_send(phase4_snapshot);
     ASSERT_TRUE(selected([&]{return route_error(0)&&route_error(1);}));no_new_send(phase4_snapshot);
 }
 TEST_F(RecoveryFirstClaimContinuity, ReentrantBodyCommitCannotPublishOrPermitSiblingSourceMutation) {
-    park_commits=0;unsigned attempted=0;before_claim=[&]{++attempted;receiver->db().execute("COMMIT");};
+    park_commits=0;unsigned attempted=0;auto controller_local_worker_ending=scoped_controller_worker_ending();before_claim=[&]{++attempted;receiver->db().execute("COMMIT");};
     ASSERT_NO_FATAL_FAILURE(start_mixed());hold_uploads=false;ASSERT_TRUE(selected([&]{return has_error();}));
     EXPECT_EQ(attempted,1u);EXPECT_TRUE(committed_claims.empty());EXPECT_FALSE(receiver->db().is_in_transaction());no_new_send(phase4_snapshot);
     ASSERT_TRUE(selected([&]{return route_error(0)&&route_error(1);}));no_new_send(phase4_snapshot);
 }
 TEST_F(RecoveryFirstClaimContinuity, RefreezeRejectsAuditValidRewriteAfterBothActualHandoffs) {
     park_commits=0;bool corrupted=false;Snapshot expected;
-    before_refreeze=[&]{if(corrupted)return;corrupted=true;
+    uint64_t before_refreeze_calls=0;bool startup_completed=false,selected_completed=false;
+    const auto report=[&]()noexcept {
+        if(selected_completed)return;
+        // This local guard runs only after an original fatal assertion or
+        // exception has finalized. It never evaluates the predicate again.
+        std::array<unsigned char,512> first_error{};size_t copied=0,total_bytes=0,error_count=0;
+        size_t errors_a=0,errors_b=0;bool error_copy_known=false;
+        try {std::lock_guard lock(errors_mutex);error_count=errors.size();errors_a=route_errors[0].size();errors_b=route_errors[1].size();
+            if(!errors.empty()){total_bytes=errors.front().size();copied=std::min(total_bytes,first_error.size());
+                if(copied)std::memcpy(first_error.data(),errors.front().data(),copied);}error_copy_known=true;
+        }catch(...){}
+        std::fprintf(stderr,"refreeze-predicate POST_ORIGINAL_FAILURE startupCompleted=%d selectedCompleted=%d exceptionUnwinding=%d corrupted=%d actualBeforeRefreezeCalls=%llu claimsCommitted=%zu sendsObserved=%zu restrictedBegin=%zu route0Executed=%zu route1Executed=%zu firstRoute=%d errorsKnown=%d errors=%zu route0Errors=%zu route1Errors=%zu firstErrorBytes=%zu firstErrorCopied=%zu firstErrorHex=",
+            int(startup_completed),int(selected_completed),int(std::uncaught_exceptions()!=0),int(corrupted),static_cast<unsigned long long>(before_refreeze_calls),
+            committed_claims.size(),observed_uploads.size(),restricted_begin,executed[0],executed[1],first_route,
+            int(error_copy_known),error_count,errors_a,errors_b,total_bytes,copied);
+        for(size_t i=0;i<copied;++i)std::fprintf(stderr,"%02x",static_cast<unsigned>(first_error[i]));std::fputc('\n',stderr);
+        try {const auto fresh_phase=phase();
+            const auto unclaimed=scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NULL");
+            const auto claimed=scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_obligation_entry WHERE stage=0 AND first_export IS NOT NULL");
+            const auto retained=scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request");
+            std::fprintf(stderr,"refreeze-predicate FRESH_POST_FAILURE phase=%lld openUnclaimed=%lld openClaimed=%lld retainedRequests=%lld\n",
+                static_cast<long long>(fresh_phase),static_cast<long long>(unclaimed),static_cast<long long>(claimed),static_cast<long long>(retained));
+        }catch(const std::exception& error){const char* text=error.what();std::fputs("refreeze-predicate post-read-errorHex=",stderr);
+            if(!text)std::fputs("[null-what]",stderr);else for(size_t i=0;i<512&&text[i];++i)std::fprintf(stderr,"%02x",static_cast<unsigned>(static_cast<unsigned char>(text[i])));std::fputc('\n',stderr);
+        }catch(...){std::fputs("refreeze-predicate post-read-error=[nonstd]\n",stderr);}
+    };
+    auto controller_local_worker_ending=scoped_controller_worker_ending();
+    struct ReportAfterOriginalFailure {const decltype(report)& action;~ReportAfterOriginalFailure()noexcept{action();}} observed{report};
+    before_refreeze=[&]{if(before_refreeze_calls!=UINT64_MAX)++before_refreeze_calls;if(corrupted)return;corrupted=true;
         for(size_t n=0;n<64&&observed_uploads.size()<restricted_begin+2&&pump();++n){}
         EXPECT_EQ(observed_uploads.size(),restricted_begin+2);
         const auto older=first_claim(peers[1].channel,mixed_ids[0]);EXPECT_LT(older,first_claim(peers[1].channel,mixed_ids[1]));
         rewrite(1,older);expected=snapshot();};
-    ASSERT_NO_FATAL_FAILURE(start_mixed());ASSERT_TRUE(selected([&]{return corrupted&&has_error();}));
+    ASSERT_NO_FATAL_FAILURE(start_mixed());startup_completed=true;ASSERT_TRUE(selected([&]{return corrupted&&has_error();}));selected_completed=true;
     EXPECT_EQ(committed_claims.size(),2u);EXPECT_EQ(observed_uploads.size(),restricted_begin+2);EXPECT_EQ(phase(),4);
     EXPECT_EQ(snapshot(),expected);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
     {std::lock_guard lock(errors_mutex);EXPECT_TRUE(std::any_of(errors.begin(),errors.end(),[](const auto& error){return error.find("first claim changed")!=std::string::npos;}));}
@@ -1242,6 +1539,9 @@ TEST_F(RecoveryReceiverController, RestrictedResendAckAfterRefreezePreservesExis
 
 namespace lattice::detail {
 struct recovery_receiver_cohort_test_access {
+    // DATA-only mailbox stimulus/dispatch on this genuinely constructed route.
+    static void post_notification_error(synchronizer_base& sync,std::exception_ptr actual){sync.receiver_controller_->post(recovery_receiver_route::notification::error,std::move(actual));}
+    static void drain_notification_data(synchronizer_base& sync){sync.receiver_controller_->drain_notifications();}
     static void next_ack_timeout(synchronizer_base& sync){sync.config_.ack_timeout_base_ms=0;}
     static std::weak_ptr<recovery_receiver_controller> controller(synchronizer_base& sync){return sync.receiver_controller_->controller_;}
     static std::shared_ptr<sync_discovery_operation> retained_busy(synchronizer_base& sync) {
@@ -1272,8 +1572,6 @@ struct CohortWriterHold {
     void release(){ {std::lock_guard lock(mutex);released=true;changed.notify_all();}if(worker.joinable())worker.join();}
     ~CohortWriterHold(){release();}
 };
-thread_local std::function<void()> cohort_after_claim;
-void cohort_claimed(){auto action=std::move(cohort_after_claim);detail::recovery_export_test_hooks::after_claim_commit=nullptr;if(action)action();}
 class RecoveryReceiverCohort : public RecoveryReceiverController {
 protected:
     void retained_replacement(bool recreate) {
@@ -1283,26 +1581,34 @@ protected:
         struct Release {std::shared_ptr<Observation> value;~Release(){std::shared_ptr<CohortWriterHold> held;{std::lock_guard lock(value->mutex);value->closing=true;held=value->writer;}if(held)held->release();}} release{observation};
         auto timeout_pause=std::make_shared<ControllerPause>();pauses.push_back(timeout_pause);
         auto timeout_seen=std::make_shared<std::atomic<bool>>(false);
+        const auto timeout_hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
+        const auto following_timeout=std::make_shared<ControllerPause>();pauses.push_back(following_timeout);
+        const auto timeout_workers=std::make_shared<std::atomic<unsigned>>(0);
+        // Admit the original first real timeout. Later actual workers stop
+        // before clearing their registration; permanent zero timeout must not
+        // turn this one-expiry custody control into an unbounded resend loop.
+        timeout_hook->before_expiry=[following_timeout,timeout_workers]{if(timeout_workers->fetch_add(1)!=0)following_timeout->wait();};
+        timeout_hook->after_timeout_transition=[timeout_pause,timeout_seen]{if(!timeout_seen->exchange(true))timeout_pause->wait();};
+        const auto claimed_once=std::make_shared<std::atomic<bool>>(false);
+        callback_hooks->publish(timeout_hook);
         // Installed before actual route publication; this is a restriction on
         // the real worker, not a factory for recovery authority.
-        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this,observation,timeout_pause,timeout_seen](const char* stage){
-            if(std::strcmp(stage,"install-committed")==0){
-                auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
-                hook->after_timeout_transition=[timeout_pause,timeout_seen]{if(!timeout_seen->exchange(true))timeout_pause->wait();};
-                detail::sync_background_test_hooks::ack=std::move(hook);
-            }
+        probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this,observation](const char* stage){
             if(std::strcmp(stage,"cohort-reserved")==0)++observation->captures;
             if(std::strcmp(stage,"cohort-retained")==0)++observation->waiting;
-            if(std::strcmp(stage,"reconciliation-pending")==0&&phase()==4){
-                ++observation->restricted;
-                if(observation->armed.load()&&!observation->hooked.exchange(true)){
-                    cohort_after_claim=[this,observation]{
-                        std::lock_guard lock(observation->mutex);if(observation->closing)return;
-                        observation->claimed=snapshot();observation->writer=std::make_shared<CohortWriterHold>(*receiver);
-                    };
-                    detail::recovery_export_test_hooks::after_claim_commit=cohort_claimed;
-                }
-            }
+            if(std::strcmp(stage,"reconciliation-pending")==0&&phase()==4)++observation->restricted;
+        },nullptr, nullptr, nullptr,[this,observation,timeout_hook,claimed_once]{
+            // Re-publication must not overwrite a still-unconsumed action.
+            // Every armed descriptor keeps this SAME one-shot until a real
+            // after-COMMIT hook consumes it; later calls cannot renew it.
+            if(observation->armed.load()){
+                observation->hooked.store(true);
+                callback_hooks->publish(timeout_hook,[this,observation,claimed_once]{
+                    if(claimed_once->exchange(true))return;
+                    std::lock_guard lock(observation->mutex);if(observation->closing)return;
+                    observation->claimed=snapshot();observation->writer=std::make_shared<CohortWriterHold>(*receiver);
+                });
+            }else callback_hooks->publish(timeout_hook);
         });
         connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
         detail::recovery_receiver_cohort_test_access::next_ack_timeout(*synchronizers[0]);
@@ -1311,7 +1617,7 @@ protected:
         ASSERT_EQ(synchronizers[0]->get_progress().pending_upload,0);
         request_recovery();timeout_pause->release();
         std::shared_ptr<detail::sync_discovery_operation> retained;
-        ASSERT_TRUE(until([&]{retained=detail::recovery_receiver_cohort_test_access::retained_busy(*synchronizers[0]);return bool(retained);}));
+        ASSERT_TRUE(until([&]{retained=detail::recovery_receiver_cohort_test_access::retained_busy(*synchronizers[0]);return bool(retained)&&observation->restricted.load()!=0;}));
         std::shared_ptr<CohortWriterHold> writer;Snapshot before;
         {std::lock_guard lock(observation->mutex);writer=observation->writer;before=observation->claimed;}
         ASSERT_TRUE(writer);ASSERT_FALSE(before.empty());ASSERT_EQ(observation->restricted.load(),1u);
@@ -1376,12 +1682,9 @@ namespace {
 TEST_F(RecoveryReceiverController, AckedOldWorkerCannotReleaseNewRestrictedHandoffOfSameOriginal) {
     configure();auto first_pause=std::make_shared<ControllerPause>();pauses.push_back(first_pause);
     auto started=std::make_shared<std::atomic<unsigned>>(0),completed=std::make_shared<std::atomic<unsigned>>(0);
-    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[first_pause,started,completed](const char* stage){
-        if(std::strcmp(stage,"install-committed")!=0)return;
-        auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
-        hook->before_expiry=[first_pause,started]{if(started->fetch_add(1)==0)first_pause->wait();};
-        hook->completed=[completed]{++*completed;};detail::sync_background_test_hooks::ack=std::move(hook);
-    });
+    auto hook=std::make_shared<detail::sync_background_test_hooks::ack_schedule>();
+    hook->before_expiry=[first_pause,started]{if(started->fetch_add(1)==0)first_pause->wait();};
+    hook->completed=[completed]{++*completed;};callback_hooks->publish(std::move(hook));
     connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
     ASSERT_TRUE(detail::recovery_delivery_registration_test_access::timeout(*synchronizers[0],0));
     seed_local(1,700);const auto ids=originals();ASSERT_EQ(ids.size(),1u);
@@ -1495,13 +1798,14 @@ protected:
         events->restricted->first_windows=static_cast<unsigned>(ordinary_windows);
         if(!default_timeout){events->restricted->first=gate();events->restricted->following=gate();}
         const auto captured=events;
+        callback_hooks->publish(captured->ordinary->hooks());
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[captured](const char* stage){
-            if(std::strcmp(stage,"install-committed")==0)detail::sync_background_test_hooks::ack=captured->ordinary->hooks();
-            if(std::strcmp(stage,"reconciliation-pending")==0){++captured->pending;detail::sync_background_test_hooks::ack=captured->restricted->hooks();}
+            if(std::strcmp(stage,"reconciliation-pending")==0)++captured->pending;
             if(std::strcmp(stage,"reconcile-refreeze-committed")==0)++captured->refrozen;
             if(std::strcmp(stage,"delivery-retry-admitted")==0){++captured->admitted;if(captured->admitted_gate)captured->admitted_gate->wait();}
             if(captured->observed)captured->observed(stage);
-        },[captured](const char* stage)->std::shared_ptr<void>{return captured->scope?captured->scope(stage):nullptr;});
+        },[captured](const char* stage)->std::shared_ptr<void>{return captured->scope?captured->scope(stage):nullptr;}, nullptr, nullptr,
+        [captured,hooks=callback_hooks]{hooks->publish(captured->restricted->hooks());});
         connect();ASSERT_TRUE(until([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
         if(!default_timeout)ASSERT_TRUE(detail::recovery_delivery_registration_test_access::timeout(*synchronizers[0],0));
         seed_local(count,800);sent_ids=originals();ASSERT_EQ(sent_ids.size(),count);
@@ -1550,6 +1854,10 @@ protected:
         EXPECT_EQ(state->installs.load(),1u);EXPECT_EQ(state->hits.load(),1u);EXPECT_EQ(phase(),2);EXPECT_EQ(snapshot(),before);
         EXPECT_EQ(held_uploads.size(),2u);EXPECT_EQ(scalar(*source,"SELECT COUNT(*) AS n FROM _lattice_canonical_receipt"),1);
         EXPECT_EQ(originals(),sent_ids);
+    }
+    void release_controller_worker_holds() override {
+        for(const auto& value:gates)value->release();
+        RecoveryReceiverController::release_controller_worker_holds();
     }
     void TearDown()override{
         for(const auto& value:gates)value->release();
@@ -1710,11 +2018,11 @@ protected:
         configure(1,false);open_manual_receiver();
         events->ordinary->first=gate();events->restricted->first=gate();events->restricted->following=gate();
         const auto captured=events;
+        callback_hooks->publish(captured->ordinary->hooks());
         probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[captured](const char* stage){
-            if(std::strcmp(stage,"install-committed")==0)detail::sync_background_test_hooks::ack=captured->ordinary->hooks();
-            if(std::strcmp(stage,"reconciliation-pending")==0){++captured->pending;detail::sync_background_test_hooks::ack=captured->restricted->hooks();}
+            if(std::strcmp(stage,"reconciliation-pending")==0)++captured->pending;
             if(std::strcmp(stage,"delivery-retry-admitted")==0)++captured->admitted;
-        });
+        },nullptr, nullptr, nullptr,[captured,hooks=callback_hooks]{hooks->publish(captured->restricted->hooks());});
         connect();ASSERT_TRUE(drive([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
         auto configured=std::make_shared<std::atomic<bool>>(false);
         manual->invoke([this,configured]{detail::recovery_receiver_cohort_test_access::next_ack_timeout(*synchronizers[0]);configured->store(true);});
@@ -1837,18 +2145,16 @@ TEST_F(RecoveryComposedDelivery, StaleParkedRestrictedFrameKeepsCohortUntilActua
     configure(1,false);open_manual_receiver();events->ordinary->first=gate();events->restricted->first=gate();
     auto captures=std::make_shared<std::atomic<unsigned>>(0),waiting=std::make_shared<std::atomic<unsigned>>(0),phase4=std::make_shared<std::atomic<unsigned>>(0);
     auto park=std::make_shared<std::atomic<bool>>(true);const auto captured=events;
-    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this,captured,captures,waiting,phase4,park](const char* stage){
-        if(std::strcmp(stage,"install-committed")==0)detail::sync_background_test_hooks::ack=captured->ordinary->hooks();
+    callback_hooks->publish(captured->ordinary->hooks());
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[this,captured,captures,waiting,phase4](const char* stage){
         if(std::strcmp(stage,"cohort-reserved")==0)++*captures;
         if(std::strcmp(stage,"cohort-retained")==0)++*waiting;
         if(std::strcmp(stage,"delivery-retry-admitted")==0)++captured->admitted;
-        if(std::strcmp(stage,"reconciliation-pending")==0){
-            detail::sync_background_test_hooks::ack=captured->restricted->hooks();
-            if(phase()==4){++*phase4;
-                first_claim_committed_action=[this,park]{if(park->exchange(false)){committed_snapshot=snapshot();writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);}};
-                detail::recovery_export_test_hooks::after_claim_commit=first_claim_committed;
-            }
-        }
+        if(std::strcmp(stage,"reconciliation-pending")==0&&phase()==4)++*phase4;
+    },nullptr, nullptr, nullptr,[this,captured,park]{
+        callback_hooks->publish(captured->restricted->hooks(),[this,park]{
+            if(park->exchange(false)){committed_snapshot=snapshot();writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);}
+        });
     });
     connect();ASSERT_TRUE(drive([&]{return phase()==0&&scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
     auto configured=std::make_shared<std::atomic<bool>>(false);
@@ -1856,7 +2162,7 @@ TEST_F(RecoveryComposedDelivery, StaleParkedRestrictedFrameKeepsCohortUntilActua
     ASSERT_TRUE(drive([&]{return configured->load();}));seed_local(1,830);ids=originals();ASSERT_EQ(ids.size(),1u);
     ASSERT_TRUE(drive([&]{return held_originals()==ids&&events->ordinary->started.load()==1;}));legacy_ack(0,ids);
     std::shared_ptr<detail::sync_discovery_operation> retained;
-    ASSERT_TRUE(drive([&]{retained=detail::recovery_receiver_cohort_test_access::retained_busy(*synchronizers[0]);return bool(retained);}));
+    ASSERT_TRUE(drive([&]{retained=detail::recovery_receiver_cohort_test_access::retained_busy(*synchronizers[0]);return bool(retained)&&phase4->load()!=0;}));
     ASSERT_TRUE(writer_hold);ASSERT_FALSE(committed_snapshot.empty());ASSERT_EQ(phase4->load(),1u);
     const auto count=captures->load();const auto token=detail::recovery_delivery_registration_test_access::token(*synchronizers[0],ids[0]);ASSERT_NE(token,0u);
     events->ordinary->first->release();ASSERT_TRUE(observe([&]{return events->ordinary->completed.load()==1;}));
@@ -2026,6 +2332,7 @@ namespace {
 TEST_F(TerminalReceiverController, CancellationCommitDenialRetainsWholeFrozenCohortForReopen) {
     configure(2);insert(*source,controller_uuid(9340),"canonical");seed_local(1,9341);reopen_after_terminal_prepare(1);ASSERT_FALSE(HasFatalFailure());
     std::atomic<unsigned> denied{0};Snapshot before;
+    auto controller_local_worker_ending=scoped_controller_worker_ending();
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,[&](const char* stage)->std::shared_ptr<void>{
         if(std::strcmp(stage,"terminal-cancel")!=0)return {};before=snapshot();return std::make_shared<ControllerCommitFault>(receiver.get(),denied);});
     connect();ASSERT_TRUE(until([&]{return has_error();}));EXPECT_GT(denied.load(),0u);ASSERT_FALSE(before.empty());EXPECT_EQ(phase(),2);EXPECT_EQ(snapshot(),before);
@@ -2539,9 +2846,27 @@ struct ControllerAdmissionRead {
     bool released=false;
     std::atomic<bool> armed{false};
     std::atomic<unsigned> deferrals{0},consumed{0};
+    bool observe_after_deferrals=false; // Set before the controller is created.
+    std::atomic<bool> sample_ready{false},sample_ok{false};
+    int64_t unconsumed_requests=-1,model_rows=-1; // Published by sample_ready.
     void hold(database& db) {
         if(armed.exchange(true))return;
-        auto value=std::make_shared<recovery_admission_test::held_read>(db,false,"SELECT name FROM sqlite_schema");
+        std::function<void(database&)> sample;
+        if(observe_after_deferrals)sample=[this](database& actual){
+            try {
+                const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+                while(deferrals.load(std::memory_order_acquire)<3&&std::chrono::steady_clock::now()<end)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if(deferrals.load(std::memory_order_acquire)<3)throw db_error("fixture held-read deferrals not observed");
+                // Same original state oracles, on the genuinely held reader's
+                // existing engine frame. A fresh main-thread read must wait.
+                unconsumed_requests=std::get<int64_t>(actual.query("SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE length(manifest_frame)=0").at(0).at("n"));
+                model_rows=std::get<int64_t>(actual.query("SELECT COUNT(*) AS n FROM ControllerRow").at(0).at("n"));
+                sample_ok.store(true,std::memory_order_release);
+                sample_ready.store(true,std::memory_order_release);
+            }catch(...){sample_ready.store(true,std::memory_order_release);throw;}
+        };
+        auto value=std::make_shared<recovery_admission_test::held_read>(db,false,"SELECT name FROM sqlite_schema",false,std::move(sample));
         bool finish=false;{std::lock_guard lock(mutex);read=value;finish=released;}
         if(finish)value->finish();
     }
@@ -2557,7 +2882,7 @@ struct ControllerAdmissionReadRelease {
 };
 TEST_F(RecoveryReceiverController, RealReadDeferralRetainsActualRangeFrameUntilOwnedConsumption) {
     configure();insert(*source,controller_uuid(9200),"source after read");
-    auto held=std::make_shared<ControllerAdmissionRead>();ControllerAdmissionReadRelease cleanup{held};
+    auto held=std::make_shared<ControllerAdmissionRead>();held->observe_after_deferrals=true;ControllerAdmissionReadRelease cleanup{held};
     auto installed=std::make_shared<ControllerPause>();pauses.push_back(installed);
     const auto owner=receiver;
     probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),[held,owner,installed](const char* stage){
@@ -2566,10 +2891,11 @@ TEST_F(RecoveryReceiverController, RealReadDeferralRetainsActualRangeFrameUntilO
         if(std::strcmp(stage,"response-consumed")==0&&held->armed.load())++held->consumed;
         if(std::strcmp(stage,"install-committed")==0)installed->wait();
     });
-    connect();ASSERT_TRUE(until([&]{return held->deferrals.load()>=3;}));
+    connect();ASSERT_TRUE(until([&]{return held->deferrals.load()>=3&&held->sample_ready.load(std::memory_order_acquire);}));
+    ASSERT_TRUE(held->sample_ok.load(std::memory_order_acquire));
     EXPECT_FALSE(has_error());EXPECT_EQ(held->consumed.load(),0u);
-    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_recovery_request WHERE length(manifest_frame)=0"),1);
-    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+    EXPECT_EQ(held->unconsumed_requests,1);
+    EXPECT_EQ(held->model_rows,0);
     const auto requests_before=handled;EXPECT_EQ(requests.size(),1u);
     held->finish();ASSERT_TRUE(until([&]{return installed->ready();}));
     EXPECT_GT(held->consumed.load(),0u);EXPECT_GT(handled,requests_before);EXPECT_EQ(requests.size(),1u);EXPECT_FALSE(has_error());
@@ -3093,7 +3419,7 @@ protected:
         second=swift_lattice_ref::shared_for_lattice(second_ref->get());ASSERT_TRUE(second);
         if(auto* n=instance_registry::instance().get_or_create_notifier(second_file.str()))n->stop_listening();
     }
-    void TearDown()override {PredecessorReceiverController::TearDown();if(second)second->close();second.reset();second_ref.reset();}
+    void TearDown()override {PredecessorReceiverController::TearDown();detail::end_fixture_owner_checked(second.get(),"controller-second-source");second.reset();second_ref.reset();}
     relay_recovery_setup serve(size_t index)override {
         if(index==0)return PredecessorReceiverController::serve(index);
         auto& peer=peers.at(index);auto p=RecoveryReceiverController::source_policy(peer.ns);
@@ -3439,6 +3765,15 @@ TEST_F(BinaryRecoveryReceiverController, ActualLostPrepareReopenResumesIdentical
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 TEST_F(RecoveryDeliveryTimeout, CompletedRestrictedPrefixesReleaseCustodyBeforeActualRefreezeCommit) {
     const auto refreeze=gate();auto first=std::make_shared<std::atomic<bool>>(true);
+    const auto frozen_attempt=std::make_shared<std::atomic<int64_t>>(0);
+    auto controller_local_worker_ending=scoped_controller_worker_ending();
+    // The private controller still owns this actual phase2 turn. Cancellation
+    // cannot take its reservation until the off-leaf observation returns.
+    events->observed=[this,frozen_attempt](const char* stage){
+        if(std::strcmp(stage,"reconciliation-pending")!=0||frozen_attempt->load()!=0)return;
+        const auto row=receiver->db().query("SELECT phase,attempt FROM _lattice_producer_continuity").at(0);
+        if(std::get<int64_t>(row.at("phase"))==2)frozen_attempt->store(std::get<int64_t>(row.at("attempt")),std::memory_order_release);
+    };
     events->scope=[refreeze,first](const char* stage)->std::shared_ptr<void>{
         if(std::strcmp(stage,"reconcile-refreeze")==0&&first->exchange(false))refreeze->wait();return {};};
     start(2,1);ASSERT_FALSE(HasFatalFailure());restricted();ASSERT_FALSE(HasFatalFailure());
@@ -3447,7 +3782,10 @@ TEST_F(RecoveryDeliveryTimeout, CompletedRestrictedPrefixesReleaseCustodyBeforeA
     EXPECT_EQ(held_originals(),(std::vector<std::string>{sent_ids[0],sent_ids[1],sent_ids[0],sent_ids[1]}));
     const auto raw=receiver->db().query("SELECT * FROM AuditLog ORDER BY id");
     const auto claims=receiver->db().query("SELECT original,first_export FROM _lattice_obligation_entry ORDER BY original");
-    const auto prior_attempt=scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity");
+    const auto prior_attempt=frozen_attempt->load(std::memory_order_acquire);ASSERT_GT(prior_attempt,0);
+    // Phase2->4 cancellation already created this exact successor. Refreeze
+    // 4->1 and the next freeze retain it; neither issues another attempt.
+    EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),prior_attempt+1);
     refreeze->release(); // No ACK, timer release, public request or reconnect.
     ASSERT_TRUE(until([&]{return events->refrozen.load()==1&&phase()==2&&error_contains("UNKNOWN persisted after one restricted pass");}));
     EXPECT_EQ(scalar(*receiver,"SELECT attempt AS n FROM _lattice_producer_continuity"),prior_attempt+1);
@@ -3710,4 +4048,1068 @@ TEST_F(ControlledGenerationReceiverController, ConstructorMutexRefusalObservatio
     connect();ASSERT_TRUE(until([&]{return installed();}));EXPECT_FALSE(has_error());
 }
 }
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+TEST(AuthenticatedReadyCaptureFailureObservation, CopiesActualFirstDbExceptionWithoutReplacingIt) {
+    namespace observed=lattice::detail::authenticated_ready_control_test_observation;
+    const auto original=std::make_exception_ptr(lattice::db_error("actual static capture refusal"));
+    const auto copy=observed::copy_capture_failure(original);
+    EXPECT_EQ(copy.kind,observed::capture_exception_kind::db_error);
+    EXPECT_EQ(std::string(copy.message.data(),copy.bytes),"actual static capture refusal");
+    EXPECT_FALSE(copy.truncated);EXPECT_FALSE(copy.null_message);
+    try{std::rethrow_exception(original);}catch(const lattice::db_error& error){EXPECT_STREQ(error.what(),"actual static capture refusal");}
+    EXPECT_EQ(observed::copy_capture_failure({}).kind,observed::capture_exception_kind::none);
+}
+TEST(AuthenticatedReadyCaptureFailureObservation, BoundedKnownStdAndNonStdCausesRemainDistinct) {
+    namespace observed=lattice::detail::authenticated_ready_control_test_observation;
+    const auto large=std::make_exception_ptr(std::runtime_error(std::string(4096,'x')));
+    const auto copy=observed::copy_capture_failure(large);
+    EXPECT_EQ(copy.kind,observed::capture_exception_kind::std_exception);
+    EXPECT_EQ(copy.bytes,511u);EXPECT_TRUE(copy.truncated);EXPECT_EQ(copy.message.back(),'\0');
+    const auto other=observed::copy_capture_failure(std::make_exception_ptr(7));
+    EXPECT_EQ(other.kind,observed::capture_exception_kind::non_std_exception);EXPECT_EQ(other.bytes,0u);
+    const auto empty=observed::copy_capture_failure(std::make_exception_ptr(std::runtime_error("")));
+    EXPECT_EQ(empty.kind,observed::capture_exception_kind::std_exception);EXPECT_EQ(empty.bytes,0u);EXPECT_FALSE(empty.null_message);
+    const auto binary=observed::copy_capture_failure(std::make_exception_ptr(std::runtime_error(std::string(600,static_cast<char>(0xff)))));
+    const auto hex=ControllerBoundaryTrace::capture_message_hex(binary);
+    EXPECT_EQ(std::string(hex.data()),std::string(1022,'f'));EXPECT_TRUE(binary.truncated);
+    const nlohmann::json wire={{"messageHex",std::string(hex.data())},{"messageEncoding","hex"}};
+    EXPECT_NO_THROW((void)wire.dump());
+    struct NullWhat final:std::exception {const char* what()const noexcept override{return nullptr;}};
+    const auto missing=observed::copy_capture_failure(std::make_exception_ptr(NullWhat{}));
+    EXPECT_EQ(missing.kind,observed::capture_exception_kind::std_exception);EXPECT_TRUE(missing.null_message);EXPECT_EQ(missing.bytes,0u);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+TEST(AuthenticatedReadyCaptureFailureObservation, DiscardCopiesRetainedPrimaryCleanupAndFlagsWithoutReplacingThem) {
+    namespace observed=lattice::detail::authenticated_ready_control_test_observation;
+    observed::observation out;EXPECT_FALSE(out.discard_observed);EXPECT_EQ(out.logical_sequence,-1);
+    lattice::detail::recovery_install_result actual;actual.state=lattice::detail::recovery_install_state::unsettled;
+    const auto primary=std::make_exception_ptr(lattice::db_error("actual retained discard primary"));
+    const auto cleanup=std::make_exception_ptr(std::runtime_error(std::string(600,static_cast<char>(0xff))));
+    actual.primary_error=primary;actual.cleanup_error=cleanup;actual.unexpected_commit_observed=true;
+    observed::copy_discard(out,actual);
+    EXPECT_TRUE(out.discard_observed);EXPECT_EQ(out.discard.state,static_cast<int32_t>(lattice::detail::recovery_install_state::unsettled));
+    EXPECT_EQ(out.discard.errors,3u);EXPECT_TRUE(out.discard.unexpected_commit);
+    EXPECT_EQ(out.discard_primary.kind,observed::capture_exception_kind::db_error);
+    EXPECT_EQ(std::string(out.discard_primary.message.data(),out.discard_primary.bytes),"actual retained discard primary");
+    EXPECT_EQ(out.discard_cleanup.bytes,511u);EXPECT_TRUE(out.discard_cleanup.truncated);
+    EXPECT_EQ(actual.primary_error,primary);EXPECT_EQ(actual.cleanup_error,cleanup);
+    observed::observation known;const lattice::detail::recovery_install_result no_errors;observed::copy_discard(known,no_errors);
+    EXPECT_EQ(known.discard_primary.kind,observed::capture_exception_kind::none);
+    EXPECT_EQ(known.discard_cleanup.kind,observed::capture_exception_kind::none);EXPECT_EQ(known.discard.errors,0u);
+}
+#endif
+
+
+// TEST-only causal control: real queued controller admission vs a fresh read.
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct ControllerTurnReadTrace {
+    sqlite3* native=nullptr;
+    std::atomic<bool> watch{false},real_commit{false},reader_entered{false},reader_before_commit{false};
+    std::mutex mutex;std::condition_variable changed;
+    static int observe(unsigned event,void* context,void* statement,void*)noexcept {
+        auto& self=*static_cast<ControllerTurnReadTrace*>(context);
+        if(!self.watch.load())return 0;
+        const char* sql=sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
+        if(!sql)return 0;
+        if(event==SQLITE_TRACE_PROFILE&&std::strcmp(sql,"COMMIT")==0&&sqlite3_get_autocommit(self.native)==1)
+            self.real_commit.store(true);
+        if(event==SQLITE_TRACE_STMT&&std::strcmp(sql,"SELECT 731 AS n")==0){
+            self.reader_before_commit.store(!self.real_commit.load());self.reader_entered.store(true);self.changed.notify_all();
+        }
+        return 0;
+    }
+};
+struct ControllerTurnProbeState {
+    std::shared_ptr<ControllerPause> paused=std::make_shared<ControllerPause>();
+    std::atomic<unsigned> install_calls{0},actual_mutex_deferrals{0};
+    std::atomic<bool> hold_published{false},pause_selected{false};
+    std::shared_ptr<detail::recovery_cohort_progress_observation::record> progress=
+        std::make_shared<detail::recovery_cohort_progress_observation::record>();
+    std::atomic<uint64_t> selected_scopes{0};std::array<std::atomic<uint64_t>,6> admissions{};
+};
+struct IntentProgressScope {
+    std::shared_ptr<ControllerTurnProbeState> custody;
+    detail::recovery_cohort_progress_observation::scope scoped;
+    explicit IntentProgressScope(std::shared_ptr<ControllerTurnProbeState> state)
+        :custody(std::move(state)),scoped(*custody->progress){++custody->selected_scopes;}
+};
+void report_intent_progress(const ControllerTurnProbeState& state,size_t queued,uint64_t entries,
+    uint64_t phase_returns,uint64_t revision_returns,int64_t phase,int64_t revision,
+    size_t error_count,const std::array<unsigned char,512>& error,size_t error_bytes)noexcept {
+    struct Copy {uint64_t calls,bodies,completed,returns;uint32_t outcome;};std::array<Copy,3> copy{};
+    const auto& record=*state.progress;const auto scopes=state.selected_scopes.load();const auto reservations=record.reservations.load();
+    for(size_t i=0;i<copy.size();++i){copy[i]={record.calls[i].load(),record.bodies[i].load(),record.completed[i].load(),record.results[i].returns.load(),record.results[i].outcome.load(std::memory_order_acquire)};}
+    std::array<uint64_t,6> admissions{};for(size_t i=0;i<admissions.size();++i)admissions[i]=state.admissions[i].load();
+    constexpr char digits[]="0123456789abcdef";std::array<char,1025> hex{};
+    for(size_t i=0;i<error_bytes;++i){hex[2*i]=digits[error[i]>>4];hex[2*i+1]=digits[error[i]&15];}
+    // Actual independent detached copies, after the original predicate ended.
+    // No SQL, Native query, additional predicate, clock or callback is invoked.
+    std::fprintf(stderr,"intent-final-drive afterPredicateFinalized=1 scopes=%llu reservations=%llu queuedJobs=%zu predicateEntries=%llu phaseReturns=%llu revisionReturns=%llu lastPhase=%lld lastRevision=%lld errorCount=%zu firstErrorBytes=%zu firstErrorHex=%s independentCounters=1\n",
+        static_cast<unsigned long long>(scopes),static_cast<unsigned long long>(reservations),queued,
+        static_cast<unsigned long long>(entries),static_cast<unsigned long long>(phase_returns),static_cast<unsigned long long>(revision_returns),static_cast<long long>(phase),static_cast<long long>(revision),error_count,error_bytes,hex.data());
+    const char* labels[]={"classification","install","resume"};
+    for(size_t i=0;i<copy.size();++i){const auto& c=copy[i];std::fprintf(stderr,"intent-final-drive stage=%s calls=%llu bodies=%llu completed=%llu returns=%llu resultObserved=%d state=%u deferred=%u flags=%u\n",labels[i],static_cast<unsigned long long>(c.calls),static_cast<unsigned long long>(c.bodies),static_cast<unsigned long long>(c.completed),static_cast<unsigned long long>(c.returns),int((c.outcome&0x80000000u)!=0),c.outcome&255u,(c.outcome>>8)&255u,(c.outcome>>16)&31u);}
+    const char* reasons[]={"connection-mutex","engine-read","store-gate","core-write","none-unexpected","unknown"};
+    for(size_t i=0;i<admissions.size();++i)std::fprintf(stderr,"intent-final-drive admission=%s count=%llu\n",reasons[i],static_cast<unsigned long long>(admissions[i]));
+}
+TEST_F(RecoveryRestrictedFirstClaim, PendingControllerOwnedTurnPrecedesFreshOrdinaryReadAfterActualDeferral) {
+    configure(1,false);open_manual_receiver();
+    // The real controller retains its probe beyond this TestBody. Callback
+    // captures own passive state until actual route/controller retirement;
+    // they never borrow a destroyed stack counter or pause shared_ptr.
+    const auto state=std::make_shared<ControllerTurnProbeState>();const auto paused=state->paused;
+    auto& install_calls=state->install_calls;auto& actual_mutex_deferrals=state->actual_mutex_deferrals;
+    auto& hold_published=state->hold_published;
+    std::atomic<bool> stop_pump{false},reader_started{false};
+    std::exception_ptr reader_error,pump_error;int64_t reader_value=0;
+    std::thread fresh_reader,pump_worker;
+    ControllerTurnReadTrace trace;
+    trace.native=detail::canonical_writer_custody_test_access::fault_handle(receiver->db());
+    int trace_removal=SQLITE_ERROR;bool cleanup_done=false;
+    const auto cleanup=[&]()noexcept {
+        if(cleanup_done)return;
+        paused->release();if(writer_hold)writer_hold->release();stop_pump.store(true);
+        if(pump_worker.joinable())pump_worker.join();if(fresh_reader.joinable())fresh_reader.join();
+        trace.watch.store(false);trace_removal=sqlite3_trace_v2(trace.native,0,nullptr,nullptr);cleanup_done=true;
+    };
+    struct AlwaysReleaseAndJoin {const decltype(cleanup)& action;~AlwaysReleaseAndJoin()noexcept{action();}} ending{cleanup};
+    ASSERT_EQ(sqlite3_trace_v2(trace.native,SQLITE_TRACE_STMT|SQLITE_TRACE_PROFILE,ControllerTurnReadTrace::observe,&trace),SQLITE_OK);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,
+        [this,state](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"install")==0&&state->install_calls.fetch_add(1)==0){
+                writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);state->hold_published.store(true);
+            }
+            if(std::strcmp(stage,"selected-controller-turn-through-settlement")==0){
+                auto retained=std::make_shared<IntentProgressScope>(state);
+                if(state->actual_mutex_deferrals.load()!=0&&!state->pause_selected.exchange(true))state->paused->wait();
+                return retained;
+            }
+            return {};
+        },[state](const char* actual){
+            if(state->hold_published.load()&&std::strcmp(actual,"admission-deferred-connection-mutex")==0)++state->actual_mutex_deferrals;
+            const char* labels[]={"admission-deferred-connection-mutex","admission-deferred-engine-read","admission-deferred-store-gate","admission-deferred-core-write","admission-deferred-none-unexpected","admission-deferred-unknown"};
+            for(size_t i=0;i<6;++i)if(std::strcmp(actual,labels[i])==0){++state->admissions[i];break;}
+        });
+    connect();ASSERT_TRUE(drive([&]{return hold_published.load()&&actual_mutex_deferrals.load()!=0;}));
+    ASSERT_TRUE(writer_hold);EXPECT_FALSE(writer_hold->timed_out);
+    // The real first install was refused before an owned transaction. No
+    // new callback SQL, transaction flag or permission is manufactured here.
+    trace.watch.store(true);
+    fresh_reader=std::thread([&]{reader_started.store(true);try{
+        const auto rows=receiver->db().query("SELECT 731 AS n");reader_value=std::get<int64_t>(rows.at(0).at("n"));
+    }catch(...){reader_error=std::current_exception();}});
+    ASSERT_TRUE(observe([&]{return reader_started.load();}));
+    writer_hold->release();EXPECT_FALSE(writer_hold->timed_out);
+    // Run the real original scheduler queue on one owned thread. Pausing the
+    // next selected turn stops it before any next-turn owned SQL can COMMIT.
+    pump_worker=std::thread([&]{try{while(!stop_pump.load()){
+        if(!manual->run_one())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }}catch(...){pump_error=std::current_exception();}});
+    ASSERT_TRUE(observe([&]{return paused->ready();}));EXPECT_FALSE(paused->timedOut());
+    bool entered_while_pending=false;
+    {std::unique_lock lock(trace.mutex);entered_while_pending=trace.changed.wait_for(lock,std::chrono::milliseconds(100),[&]{return trace.reader_entered.load();});}
+    // The baseline has no intent and permits the fresh read before the held
+    // controller turn. This assertion is intended to fail on that real product.
+    EXPECT_FALSE(entered_while_pending);
+    paused->release();ASSERT_TRUE(observe([&]{return trace.reader_entered.load();}));
+    // Join the completed reader and stop recording BEFORE testing the actual
+    // initial COMMIT/read ordering. Keep the one existing manual executor alive
+    // through final synchronous SQL; removing its trace waits until that worker
+    // is joined. No new executor or query-side scheduler reentry is introduced.
+    if(fresh_reader.joinable())fresh_reader.join();trace.watch.store(false);
+    EXPECT_FALSE(paused->timedOut());EXPECT_FALSE(writer_hold->timed_out);
+    EXPECT_FALSE(reader_error);EXPECT_EQ(reader_value,731);
+    EXPECT_TRUE(trace.real_commit.load());EXPECT_FALSE(trace.reader_before_commit.load());
+    const auto drive_with_owned_executor=[&](auto predicate){
+        const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(std::chrono::steady_clock::now()<end){pump();if(predicate())return true;
+            // The already-running worker alone calls manual->run_one(). Keep
+            // both original predicate boundaries; never stop it before SQL.
+            if(predicate())return true;std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+        return predicate();
+    };
+    uint64_t predicate_entries=0,phase_returns=0,revision_returns=0;int64_t last_phase=INT64_MIN,last_revision=INT64_MIN;
+    const bool finished=drive_with_owned_executor([&]{++predicate_entries;const auto actual_phase=phase();++phase_returns;last_phase=actual_phase;
+        if(actual_phase!=0)return false;
+        const auto actual_revision=scalar(*receiver,"SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1");++revision_returns;last_revision=actual_revision;return actual_revision==1;});
+    // This same unwind guard also handles exceptions/fatal setup assertions.
+    // Only after the final predicate ends stop/join its sole executor, then
+    // remove the actual native trace and inspect its worker exception safely.
+    cleanup();EXPECT_EQ(trace_removal,SQLITE_OK);EXPECT_FALSE(pump_error);
+    if(!finished){std::array<unsigned char,512> first{};size_t count=0,bytes=0;
+        {std::lock_guard lock(errors_mutex);count=errors.size();if(count){bytes=std::min(first.size(),errors.front().size());if(bytes)std::memcpy(first.data(),errors.front().data(),bytes);}}
+        const auto queued=manual->queued_snapshot(); // Only after the old predicate finalized; no work is run.
+        report_intent_progress(*state,queued,predicate_entries,phase_returns,revision_returns,last_phase,last_revision,count,first,bytes);
+    }
+    ASSERT_TRUE(finished);
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),0);EXPECT_FALSE(has_error());
+}
+} // namespace
+#endif
+
+// DATA discriminator, not a scheduler-independent controller progress claim.
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(RecoveryRestrictedFirstClaim, StoppedSoleManualPumpLeavesFreshPhaseReadBehindActualControllerIntent) {
+    configure(1,false);open_manual_receiver();
+    struct State {
+        std::atomic<unsigned> installs{0},deferrals{0},selected_turns{0};
+        std::atomic<bool> hold_published{false},private_turn_held{false};
+    };
+    const auto state=std::make_shared<State>();
+    const auto private_turn=std::make_shared<ControllerPause>();pauses.push_back(private_turn);
+    const auto release=[&]()noexcept{private_turn->release();if(writer_hold)writer_hold->release();};
+    struct AlwaysRelease {const decltype(release)& action;~AlwaysRelease()noexcept{action();}} ending{release};
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,
+        [this,state,private_turn](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"selected-controller-turn-through-settlement")==0){
+                ++state->selected_turns;
+                if(state->deferrals.load()!=0&&!state->private_turn_held.exchange(true))private_turn->wait();
+            }
+            if(std::strcmp(stage,"install")==0&&state->installs.fetch_add(1)==0){
+                writer_hold=std::make_unique<FirstClaimWriterHold>(*receiver);state->hold_published.store(true);
+            }
+            return {};
+        },[state](const char* actual){
+            if(state->hold_published.load()&&std::strcmp(actual,"admission-deferred-connection-mutex")==0)++state->deferrals;
+        });
+    connect();ASSERT_TRUE(drive([&]{return state->hold_published.load()&&state->deferrals.load()!=0;}));
+    ASSERT_TRUE(writer_hold);writer_hold->release();EXPECT_FALSE(writer_hold->timed_out);
+    // The manual route deque is no longer the controller executor. Hold the
+    // next genuine private turn at its existing off-leaf boundary, after its
+    // exact intent capture and before any intermediate SQL/install can run.
+    // Until query ending, no fixture scheduler executor or Native bypass runs.
+    ASSERT_TRUE(observe([&]{return private_turn->ready()&&manual->queued_snapshot()!=0;}));ASSERT_FALSE(has_error());
+    const auto selected_before=state->selected_turns.load();const auto queued_before=manual->queued_snapshot();
+    auto* const actual_writer=&receiver->db();
+    namespace observed=detail::recovery_topology_wait_observation;
+    observed::record actual{};std::exception_ptr query_error;int64_t actual_phase=INT64_MIN;
+    try {
+        observed::scope observation(actual);
+        actual_phase=scalar(*receiver,"SELECT phase AS n FROM _lattice_producer_continuity");
+    }catch(...){query_error=std::current_exception();}
+    const auto queued_after=manual->queued_snapshot();const auto selected_after=state->selected_turns.load();
+    // All copies are inspected only after the query returned/threw and its
+    // same-thread scope ended. No observer runs under Native/metadata leaves.
+    std::fprintf(stderr,"stopped-pump-intent queryEnded=1 queryError=%d calls=%llu selectedWaits=%llu priorSelectedOmitted=%llu selected=%d wrapper=%llu original=%llu slot=%zu token=%llu excluded=%d selectionNow=%lld deadline=%lld deadlineObserved=%d deadlineExit=%lld returned=%d sleeps=%llu queuedBefore=%zu queuedAfter=%zu selectedTurnsBefore=%u selectedTurnsAfter=%u actualPhase=%lld queueMembershipTyped=0\n",
+        int(bool(query_error)),static_cast<unsigned long long>(actual.calls),static_cast<unsigned long long>(actual.selected_waits),
+        static_cast<unsigned long long>(actual.selected_waits?actual.selected_waits-1:0),int(actual.selected),
+        static_cast<unsigned long long>(actual.wrapper),static_cast<unsigned long long>(actual.original),actual.slot,
+        static_cast<unsigned long long>(actual.token),int(actual.excluded),static_cast<long long>(actual.selection_now),
+        static_cast<long long>(actual.deadline),int(actual.deadline_observed),static_cast<long long>(actual.deadline_exit),
+        int(actual.returned),static_cast<unsigned long long>(actual.sleeps),queued_before,queued_after,selected_before,selected_after,
+        static_cast<long long>(actual_phase));
+    if(query_error)std::rethrow_exception(query_error); // Preserve the actual first query exception.
+    ASSERT_TRUE(actual.selected);ASSERT_GT(actual.selected_waits,0u);
+    EXPECT_EQ(actual.wrapper,reinterpret_cast<std::uintptr_t>(actual_writer));EXPECT_NE(actual.original,0u);
+    EXPECT_NE(actual.token,0u);EXPECT_NE(actual.token,UINT64_MAX);EXPECT_FALSE(actual.excluded);
+    EXPECT_GT(actual.deadline,actual.selection_now);EXPECT_TRUE(actual.deadline_observed);
+    EXPECT_GE(actual.deadline_exit,actual.deadline);EXPECT_TRUE(actual.returned);
+    EXPECT_GT(queued_before,0u);EXPECT_GT(queued_after,0u);EXPECT_EQ(selected_after,selected_before);
+    EXPECT_NE(actual_phase,0);EXPECT_FALSE(has_error());
+    // Only now release that genuine private turn and resume route pumping.
+    // Its original episode deadline actually elapsed; no clock is renewed.
+    private_turn->release();
+    ASSERT_TRUE(drive([&]{return has_error();}));
+    EXPECT_TRUE(error_contains("controller admission retry budget exhausted; gate remains closed"));
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),0);
+}
+}
+#endif
+
+
+#include "RecoveryControllerExecutorTestAccess.hpp"
+
+// TEST-only real-worker control. No manual executor or setup SQL polling.
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct SoleFifoAdmissionState {
+    std::weak_ptr<lattice_db> owner;
+    std::unique_ptr<FirstClaimWriterHold> holder; // published once before hold_published
+    std::atomic<bool> holder_release_started{false};
+    std::atomic<bool> query_selected{false},callback_on_private{false},lane_identity_changed{false};
+    std::mutex lane_mutex;detail::recovery_controller_executor_test_access::ticket lane;
+    std::shared_ptr<scheduler> queue;
+    std::atomic<unsigned> installs{0},deferrals{0},selected_turns{0};
+    std::atomic<bool> hold_published{false},enqueue_once{false},enqueued{false};
+    std::atomic<bool> callback_on_worker{false},query_on_worker{false},query_started{false},query_finished{false};
+    std::atomic<bool> install_active{false},install_commit{false},install_returned{false},read_entered{false};
+    std::atomic<bool> read_before_install_commit{false},read_before_install_returned{false};
+    sqlite3* native=nullptr;
+    // The worker alone writes these until it is joined. Test reads occur only
+    // after actual shutdown/drain, never concurrently with the passive POD.
+    detail::recovery_topology_wait_observation::record query_wait{};
+    std::exception_ptr enqueue_error,query_error;
+    int64_t query_value=INT64_MIN;
+    unsigned turns_before=0,turns_after=0;
+    static int trace(unsigned event,void* context,void* statement,void*)noexcept {
+        auto& state=*static_cast<SoleFifoAdmissionState*>(context);
+        const char* sql=sqlite3_sql(static_cast<sqlite3_stmt*>(statement));if(!sql)return 0;
+        if(event==SQLITE_TRACE_PROFILE&&state.install_active.load()&&std::strcmp(sql,"COMMIT")==0&&
+           sqlite3_get_autocommit(state.native)==1)state.install_commit.store(true);
+        if(event==SQLITE_TRACE_STMT&&std::strcmp(sql,"SELECT 731 AS n")==0){
+            state.read_before_install_commit.store(!state.install_commit.load());
+            state.read_before_install_returned.store(!state.install_returned.load());state.read_entered.store(true);
+        }
+        return 0;
+    }
+};
+struct SoleFifoInstallScope {
+    std::shared_ptr<SoleFifoAdmissionState> state;
+    explicit SoleFifoInstallScope(std::shared_ptr<SoleFifoAdmissionState> actual):state(std::move(actual)){
+        state->install_active.store(true);
+    }
+    ~SoleFifoInstallScope(){state->install_active.store(false);}
+};
+TEST_F(RecoveryRestrictedFirstClaim, PendingControllerIntentCannotBlockItsSoleRealFifoWorkerBeforeInstall) {
+    constexpr unsigned required_deferrals=1;
+    configure(); // The unchanged real factory supplies one std_thread_scheduler.
+    const auto state=std::make_shared<SoleFifoAdmissionState>();state->owner=receiver;
+    state->queue=receiver->get_scheduler();ASSERT_TRUE(state->queue);
+    ASSERT_NE(std::dynamic_pointer_cast<std_thread_scheduler>(state->queue),nullptr);
+    state->native=detail::canonical_writer_custody_test_access::fault_handle(receiver->db());
+    // Allocate failure-diagnostic custody before any controlled callback exists.
+    const std::string retained_store=receiver->config().path;
+    const auto ending_debt=[&](const char* stage)noexcept{
+        std::fprintf(stderr,"sole-fifo-intent ending-debt stage=%s process=%ld group=%ld retained_store=%s\n",
+            stage,static_cast<long>(::getpid()),static_cast<long>(::getpgrp()),retained_store.c_str());
+        std::fflush(stderr);::_exit(93); // no Native/fixture cleanup on unknown ending
+    };
+    std::exception_ptr ending_error;int trace_removal=SQLITE_ERROR;bool ending_done=false;
+    const auto ending=[&]()noexcept{
+        if(ending_done)return;
+        // Release the actual SQLite holder first. Then drain/join the SAME
+        // worker; no replacement executor runs its callbacks. The constant
+        // query's real intent wait retains its original fixed episode end.
+        try{if(state->hold_published.load())state->holder->release();}catch(...){if(!ending_error)ending_error=std::current_exception();ending_debt("holder-join");}
+        // Real route retirement precedes original-worker drain. No private
+        // controller capture may remain live when the trace context is removed.
+        synchronizers.clear();
+        try{state->queue->shutdown();}catch(...){if(!ending_error)ending_error=std::current_exception();ending_debt("worker-drain-join");}
+        // Worker ending also settles any first-scope construction that had
+        // not yet published a holder when cleanup started. Main alone joins it.
+        try{if(state->holder)state->holder->release();}catch(...){if(!ending_error)ending_error=std::current_exception();ending_debt("late-holder-join");}
+        detail::recovery_controller_executor_test_access::ticket lane;
+        {std::lock_guard lock(state->lane_mutex);lane=state->lane;}
+        if(!detail::recovery_controller_executor_test_access::joined(lane,std::chrono::seconds(3)))ending_debt("private-controller-actual-join");
+        trace_removal=sqlite3_trace_v2(state->native,0,nullptr,nullptr);
+        if(trace_removal!=SQLITE_OK)ending_debt("trace-removal");
+        ending_done=true;
+    };
+    struct AlwaysEnd {const decltype(ending)& action;~AlwaysEnd()noexcept{action();}} release{ending};
+    ASSERT_EQ(sqlite3_trace_v2(state->native,SQLITE_TRACE_STMT|SQLITE_TRACE_PROFILE,SoleFifoAdmissionState::trace,state.get()),SQLITE_OK);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+        [state](const char* stage){
+            // Existing controller1745 observation follows the successfully
+            // returned owned install; PROFILE/autocommit alone is not proof.
+            if(std::strcmp(stage,"install-committed")==0)state->install_returned.store(true);
+        },
+        [this,state](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"selected-controller-turn-through-settlement")==0){
+                ++state->selected_turns;auto actual=detail::recovery_controller_executor_test_access::current();
+                {std::lock_guard lock(state->lane_mutex);if(!state->lane)state->lane=std::move(actual);else if(state->lane!=actual)state->lane_identity_changed.store(true);}
+            }
+            if(std::strcmp(stage,"install")!=0)return {};
+            if(state->installs.fetch_add(1)==0){
+                state->holder=std::make_unique<FirstClaimWriterHold>(*receiver);state->hold_published.store(true);
+            }
+            return std::make_shared<SoleFifoInstallScope>(state);
+        },[this,state](const char* actual){
+            if(!state->hold_published.load()||std::strcmp(actual,"admission-deferred-connection-mutex")!=0)return;
+            ++state->deferrals;
+            if(state->enqueue_once.exchange(true))return;
+            state->callback_on_worker.store(state->queue->is_on_thread());
+            state->callback_on_private.store(bool(detail::recovery_controller_executor_test_access::current()));
+            try{
+                state->queue->invoke([state]{
+                    state->query_on_worker.store(state->queue->is_on_thread());state->query_started.store(true);
+                    state->turns_before=state->selected_turns.load();
+                    try{
+                        detail::recovery_topology_wait_observation::scope observed(state->query_wait,&state->query_selected);
+                        auto owner=state->owner.lock();if(!owner)throw db_error("sole FIFO control owner retired");
+                        const auto rows=owner->db().query("SELECT 731 AS n");
+                        state->query_value=std::get<int64_t>(rows.at(0).at("n"));
+                    }catch(...){state->query_error=std::current_exception();}
+                    state->turns_after=state->selected_turns.load();state->query_finished.store(true);
+                });
+                state->enqueued.store(true);
+            }catch(...){state->enqueue_error=std::current_exception();}
+            // The main test thread alone releases/joins the published holder.
+            // This callback performs no release/join and cannot race cleanup.
+        });
+    connect();
+    // Mechanical transport stays live; predicate has no SQL and never pumps
+    // another scheduler. This is the original five-second observation bound.
+    const bool finished_in_original_bound=until([&]{
+        if(state->enqueued.load()&&state->query_selected.load()&&state->deferrals.load()>=required_deferrals&&!state->holder_release_started.exchange(true))state->holder->release();
+        return state->query_finished.load();
+    });
+    ending(); // All worker-owned data and trace context are settled before reads.
+    const auto& actual=state->query_wait;
+    size_t controller_error_count=0,controller_first_bytes=0;bool controller_first_truncated=false;
+    std::array<unsigned char,512> controller_first{};
+    {std::lock_guard lock(errors_mutex);controller_error_count=errors.size();
+        if(controller_error_count){controller_first_bytes=std::min(controller_first.size(),errors.front().size());
+            controller_first_truncated=controller_first_bytes!=errors.front().size();
+            if(controller_first_bytes)std::memcpy(controller_first.data(),errors.front().data(),controller_first_bytes);}}
+    // Detached fixed byte copy only: no formatting/callback under the mutex,
+    // no SQL, extra predicate, Native lookup or delivery proof is synthesized.
+    constexpr char hex_digits[]="0123456789abcdef";std::array<char,1025> controller_first_hex{};
+    for(size_t n=0;n<controller_first_bytes;++n){controller_first_hex[2*n]=hex_digits[controller_first[n]>>4];controller_first_hex[2*n+1]=hex_digits[controller_first[n]&15];}
+    std::fprintf(stderr,"sole-fifo-intent originalPredicateFinalized=1 finishedInOriginalBound=%d enqueued=%d callbackOnWorker=%d queryOnWorker=%d queryStarted=%d queryFinished=%d installs=%u deferrals=%u selectedTurnsBefore=%u selectedTurnsAfter=%u selected=%d selectedWaits=%llu priorSelectedOmitted=%llu slot=%zu token=%llu excluded=%d selectionNow=%lld deadline=%lld deadlineObserved=%d deadlineExit=%lld returned=%d installCommit=%d installReturned=%d readEntered=%d readBeforeInstallCommit=%d readBeforeInstallReturned=%d enqueueError=%d queryError=%d endingError=%d traceRemoval=%d controllerErrorCount=%zu firstControllerErrorBytes=%zu firstControllerErrorTruncated=%d firstControllerErrorHex=%s independentCopies=1\n",
+        int(finished_in_original_bound),int(state->enqueued.load()),int(state->callback_on_worker.load()),int(state->query_on_worker.load()),
+        int(state->query_started.load()),int(state->query_finished.load()),state->installs.load(),state->deferrals.load(),
+        state->turns_before,state->turns_after,int(actual.selected),static_cast<unsigned long long>(actual.selected_waits),
+        static_cast<unsigned long long>(actual.selected_waits?actual.selected_waits-1:0),actual.slot,static_cast<unsigned long long>(actual.token),
+        int(actual.excluded),static_cast<long long>(actual.selection_now),static_cast<long long>(actual.deadline),int(actual.deadline_observed),
+        static_cast<long long>(actual.deadline_exit),int(actual.returned),int(state->install_commit.load()),int(state->install_returned.load()),int(state->read_entered.load()),
+        int(state->read_before_install_commit.load()),int(state->read_before_install_returned.load()),int(bool(state->enqueue_error)),int(bool(state->query_error)),int(bool(ending_error)),trace_removal,
+        controller_error_count,controller_first_bytes,int(controller_first_truncated),controller_first_hex.data());
+    EXPECT_EQ(trace_removal,SQLITE_OK);EXPECT_FALSE(ending_error);
+    if(state->enqueue_error)std::rethrow_exception(state->enqueue_error);
+    if(state->query_error)std::rethrow_exception(state->query_error);
+    ASSERT_TRUE(state->holder);EXPECT_FALSE(state->holder->timed_out);
+    ASSERT_GT(state->deferrals.load(),0u);ASSERT_TRUE(state->enqueued.load());
+    EXPECT_FALSE(state->callback_on_worker.load());EXPECT_TRUE(state->callback_on_private.load());EXPECT_TRUE(state->query_on_worker.load());
+    EXPECT_FALSE(state->lane_identity_changed.load());EXPECT_TRUE(state->query_selected.load());
+    EXPECT_GE(state->deferrals.load(),required_deferrals);EXPECT_GT(state->turns_after,state->turns_before);
+    EXPECT_TRUE(actual.selected);EXPECT_FALSE(actual.excluded);EXPECT_FALSE(actual.deadline_observed);
+    ASSERT_TRUE(state->query_started.load());ASSERT_TRUE(state->query_finished.load());EXPECT_EQ(state->query_value,731);
+    // This is a correctness oracle, not permission to skip the real intent.
+    // On a self-blocking baseline the selected query waits until that episode
+    // expires with no intervening controller turn, then enters before install.
+    EXPECT_TRUE(finished_in_original_bound);
+    EXPECT_TRUE(state->install_commit.load());EXPECT_TRUE(state->install_returned.load());EXPECT_TRUE(state->read_entered.load());
+    EXPECT_FALSE(state->read_before_install_commit.load());
+    // Post-return observer timing is printed independently. It is not an
+    // admission fence after the real Native COMMIT/mutex have been released.
+    EXPECT_EQ(controller_error_count,0u);
+}
+
+TEST_F(RecoveryRestrictedFirstClaim, PrivateTimedRetriesProgressWhileOriginalFifoWorkerWaitsForInstall) {
+    constexpr unsigned required_deferrals=3;
+    configure(); // The unchanged real factory supplies one std_thread_scheduler.
+    const auto state=std::make_shared<SoleFifoAdmissionState>();state->owner=receiver;
+    const auto pacer_pause=std::make_shared<ControllerPause>();
+    const auto prior_pacer=detail::sync_background_test_hooks::pacer_wait;
+    struct RestorePacer{std::shared_ptr<const detail::sync_background_test_hooks::pacer_wait_schedule> prior;
+        ~RestorePacer(){detail::sync_background_test_hooks::pacer_wait=std::move(prior);}} restore_pacer{prior_pacer};
+    auto pacer_hook=std::make_shared<detail::sync_background_test_hooks::pacer_wait_schedule>();
+    pacer_hook->before_receiver_discovery=[pacer_pause]{pacer_pause->wait();};detail::sync_background_test_hooks::pacer_wait=std::move(pacer_hook);
+    state->queue=receiver->get_scheduler();ASSERT_TRUE(state->queue);
+    ASSERT_NE(std::dynamic_pointer_cast<std_thread_scheduler>(state->queue),nullptr);
+    state->native=detail::canonical_writer_custody_test_access::fault_handle(receiver->db());
+    // Allocate failure-diagnostic custody before any controlled callback exists.
+    const std::string retained_store=receiver->config().path;
+    const auto ending_debt=[&](const char* stage)noexcept{
+        std::fprintf(stderr,"sole-fifo-intent ending-debt stage=%s process=%ld group=%ld retained_store=%s\n",
+            stage,static_cast<long>(::getpid()),static_cast<long>(::getpgrp()),retained_store.c_str());
+        std::fflush(stderr);::_exit(93); // no Native/fixture cleanup on unknown ending
+    };
+    std::exception_ptr ending_error;int trace_removal=SQLITE_ERROR;bool ending_done=false;
+    const auto ending=[&]()noexcept{
+        if(ending_done)return;
+        // Release the actual SQLite holder first. Then drain/join the SAME
+        // worker; no replacement executor runs its callbacks. The constant
+        // query's real intent wait retains its original fixed episode end.
+        try{if(state->hold_published.load())state->holder->release();}catch(...){if(!ending_error)ending_error=std::current_exception();ending_debt("holder-join");}
+        // Real route retirement precedes original-worker drain. No private
+        // controller capture may remain live when the trace context is removed.
+        pacer_pause->release();
+        synchronizers.clear();
+        try{state->queue->shutdown();}catch(...){if(!ending_error)ending_error=std::current_exception();ending_debt("worker-drain-join");}
+        // Worker ending also settles any first-scope construction that had
+        // not yet published a holder when cleanup started. Main alone joins it.
+        try{if(state->holder)state->holder->release();}catch(...){if(!ending_error)ending_error=std::current_exception();ending_debt("late-holder-join");}
+        detail::recovery_controller_executor_test_access::ticket lane;
+        {std::lock_guard lock(state->lane_mutex);lane=state->lane;}
+        if(!detail::recovery_controller_executor_test_access::joined(lane,std::chrono::seconds(3)))ending_debt("private-controller-actual-join");
+        trace_removal=sqlite3_trace_v2(state->native,0,nullptr,nullptr);
+        if(trace_removal!=SQLITE_OK)ending_debt("trace-removal");
+        ending_done=true;
+    };
+    struct AlwaysEnd {const decltype(ending)& action;~AlwaysEnd()noexcept{action();}} release{ending};
+    ASSERT_EQ(sqlite3_trace_v2(state->native,SQLITE_TRACE_STMT|SQLITE_TRACE_PROFILE,SoleFifoAdmissionState::trace,state.get()),SQLITE_OK);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+        [state](const char* stage){
+            // Existing controller1745 observation follows the successfully
+            // returned owned install; PROFILE/autocommit alone is not proof.
+            if(std::strcmp(stage,"install-committed")==0)state->install_returned.store(true);
+        },
+        [this,state](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"selected-controller-turn-through-settlement")==0){
+                ++state->selected_turns;auto actual=detail::recovery_controller_executor_test_access::current();
+                {std::lock_guard lock(state->lane_mutex);if(!state->lane)state->lane=std::move(actual);else if(state->lane!=actual)state->lane_identity_changed.store(true);}
+            }
+            if(std::strcmp(stage,"install")!=0)return {};
+            if(state->installs.fetch_add(1)==0){
+                state->holder=std::make_unique<FirstClaimWriterHold>(*receiver);state->hold_published.store(true);
+            }
+            return std::make_shared<SoleFifoInstallScope>(state);
+        },[this,state](const char* actual){
+            if(!state->hold_published.load()||std::strcmp(actual,"admission-deferred-connection-mutex")!=0)return;
+            ++state->deferrals;
+            if(state->enqueue_once.exchange(true))return;
+            state->callback_on_worker.store(state->queue->is_on_thread());
+            state->callback_on_private.store(bool(detail::recovery_controller_executor_test_access::current()));
+            try{
+                state->queue->invoke([state]{
+                    state->query_on_worker.store(state->queue->is_on_thread());state->query_started.store(true);
+                    state->turns_before=state->selected_turns.load();
+                    try{
+                        detail::recovery_topology_wait_observation::scope observed(state->query_wait,&state->query_selected);
+                        auto owner=state->owner.lock();if(!owner)throw db_error("sole FIFO control owner retired");
+                        const auto rows=owner->db().query("SELECT 731 AS n");
+                        state->query_value=std::get<int64_t>(rows.at(0).at("n"));
+                    }catch(...){state->query_error=std::current_exception();}
+                    state->turns_after=state->selected_turns.load();state->query_finished.store(true);
+                });
+                state->enqueued.store(true);
+            }catch(...){state->enqueue_error=std::current_exception();}
+            // The main test thread alone releases/joins the published holder.
+            // This callback performs no release/join and cannot race cleanup.
+        });
+    connect();
+    // Mechanical transport stays live; predicate has no SQL and never pumps
+    // another scheduler. This is the original five-second observation bound.
+    const bool finished_in_original_bound=until([&]{
+        if(state->enqueued.load()&&state->query_selected.load()&&state->deferrals.load()>=required_deferrals&&pacer_pause->ready()&&!pacer_pause->timedOut()&&!state->holder_release_started.exchange(true))state->holder->release();
+        return state->query_finished.load();
+    });
+    ending(); // All worker-owned data and trace context are settled before reads.
+    const auto& actual=state->query_wait;
+    size_t controller_error_count=0,controller_first_bytes=0;bool controller_first_truncated=false;
+    std::array<unsigned char,512> controller_first{};
+    {std::lock_guard lock(errors_mutex);controller_error_count=errors.size();
+        if(controller_error_count){controller_first_bytes=std::min(controller_first.size(),errors.front().size());
+            controller_first_truncated=controller_first_bytes!=errors.front().size();
+            if(controller_first_bytes)std::memcpy(controller_first.data(),errors.front().data(),controller_first_bytes);}}
+    // Detached fixed byte copy only: no formatting/callback under the mutex,
+    // no SQL, extra predicate, Native lookup or delivery proof is synthesized.
+    constexpr char hex_digits[]="0123456789abcdef";std::array<char,1025> controller_first_hex{};
+    for(size_t n=0;n<controller_first_bytes;++n){controller_first_hex[2*n]=hex_digits[controller_first[n]>>4];controller_first_hex[2*n+1]=hex_digits[controller_first[n]&15];}
+    std::fprintf(stderr,"sole-fifo-intent originalPredicateFinalized=1 finishedInOriginalBound=%d enqueued=%d callbackOnWorker=%d queryOnWorker=%d queryStarted=%d queryFinished=%d installs=%u deferrals=%u selectedTurnsBefore=%u selectedTurnsAfter=%u selected=%d selectedWaits=%llu priorSelectedOmitted=%llu slot=%zu token=%llu excluded=%d selectionNow=%lld deadline=%lld deadlineObserved=%d deadlineExit=%lld returned=%d installCommit=%d installReturned=%d readEntered=%d readBeforeInstallCommit=%d readBeforeInstallReturned=%d enqueueError=%d queryError=%d endingError=%d traceRemoval=%d controllerErrorCount=%zu firstControllerErrorBytes=%zu firstControllerErrorTruncated=%d firstControllerErrorHex=%s independentCopies=1\n",
+        int(finished_in_original_bound),int(state->enqueued.load()),int(state->callback_on_worker.load()),int(state->query_on_worker.load()),
+        int(state->query_started.load()),int(state->query_finished.load()),state->installs.load(),state->deferrals.load(),
+        state->turns_before,state->turns_after,int(actual.selected),static_cast<unsigned long long>(actual.selected_waits),
+        static_cast<unsigned long long>(actual.selected_waits?actual.selected_waits-1:0),actual.slot,static_cast<unsigned long long>(actual.token),
+        int(actual.excluded),static_cast<long long>(actual.selection_now),static_cast<long long>(actual.deadline),int(actual.deadline_observed),
+        static_cast<long long>(actual.deadline_exit),int(actual.returned),int(state->install_commit.load()),int(state->install_returned.load()),int(state->read_entered.load()),
+        int(state->read_before_install_commit.load()),int(state->read_before_install_returned.load()),int(bool(state->enqueue_error)),int(bool(state->query_error)),int(bool(ending_error)),trace_removal,
+        controller_error_count,controller_first_bytes,int(controller_first_truncated),controller_first_hex.data());
+    EXPECT_EQ(trace_removal,SQLITE_OK);EXPECT_FALSE(ending_error);
+    if(state->enqueue_error)std::rethrow_exception(state->enqueue_error);
+    if(state->query_error)std::rethrow_exception(state->query_error);
+    ASSERT_TRUE(state->holder);EXPECT_FALSE(state->holder->timed_out);
+    ASSERT_GT(state->deferrals.load(),0u);ASSERT_TRUE(state->enqueued.load());
+    EXPECT_FALSE(state->callback_on_worker.load());EXPECT_TRUE(state->callback_on_private.load());EXPECT_TRUE(state->query_on_worker.load());
+    EXPECT_FALSE(state->lane_identity_changed.load());EXPECT_TRUE(state->query_selected.load());
+    EXPECT_GE(state->deferrals.load(),required_deferrals);EXPECT_GT(state->turns_after,state->turns_before);
+    EXPECT_TRUE(actual.selected);EXPECT_FALSE(actual.excluded);EXPECT_FALSE(actual.deadline_observed);
+    ASSERT_TRUE(state->query_started.load());ASSERT_TRUE(state->query_finished.load());EXPECT_EQ(state->query_value,731);
+    // This is a correctness oracle, not permission to skip the real intent.
+    // On a self-blocking baseline the selected query waits until that episode
+    // expires with no intervening controller turn, then enters before install.
+    EXPECT_TRUE(finished_in_original_bound);
+    EXPECT_TRUE(state->install_commit.load());EXPECT_TRUE(state->install_returned.load());EXPECT_TRUE(state->read_entered.load());
+    EXPECT_FALSE(state->read_before_install_commit.load());
+    // Post-return observer timing is printed independently. It is not an
+    // admission fence after the real Native COMMIT/mutex have been released.
+    detail::recovery_controller_executor_test_access::ticket lane;
+    {std::lock_guard lock(state->lane_mutex);lane=state->lane;}
+    EXPECT_GE(detail::recovery_controller_executor_test_access::snapshot(lane).timed_wakes,2u);
+    EXPECT_TRUE(pacer_pause->ready());EXPECT_FALSE(pacer_pause->timedOut());
+    EXPECT_EQ(controller_error_count,0u);
+}
+
+TEST_F(RecoveryReceiverController, SecondActualRouteReusesControllerWithoutAnotherEndingReservation) {
+    configure(2);using Access=detail::recovery_controller_executor_test_access;
+    const auto reaper=detail::sync_retirement_lane::instance();const auto before=Access::order(reaper);
+    Access::ticket controller;bool ending_done=false;const std::string retained_store=receiver->config().path;
+    const auto ending=[&]()noexcept{
+        if(ending_done)return;synchronizers.clear();
+        if(controller&&!Access::joined(controller,std::chrono::seconds(3))){
+            std::fprintf(stderr,"second-route ending-debt process=%ld group=%ld retained_store=%s\n",long(::getpid()),long(::getpgrp()),retained_store.c_str());std::fflush(stderr);::_exit(93);}
+        ending_done=true;
+    };
+    struct AlwaysEnd{const decltype(ending)& work;~AlwaysEnd()noexcept{work();}} cleanup{ending};
+    for(size_t i=0;i<peers.size();++i){auto& peer=peers[i];sync_config config;config.websocket_url=peer.endpoint;config.authorization_token="registered-token";config.sync_id=peer.channel;
+        for(const auto& active:peers)config.all_active_sync_ids.push_back(active.channel);
+        config.recovery_source_expectation=peer.expectation.dump();config.checkpoint_passive_interval_ms=0;config.upload_coalesce_ms=0;config.chunk_size=upload_chunk;
+        auto route=std::make_unique<synchronizer>(std::static_pointer_cast<lattice_db>(receiver),config);
+        route->set_on_error([this](const std::string& e){std::lock_guard lock(errors_mutex);errors.push_back(e);});synchronizers.push_back(std::move(route));
+        if(i==0)controller=Access::controller_at(reaper,before+1);
+        ASSERT_TRUE(controller);
+        // Neither route has called public connect yet: the only reservation
+        // in this interval is the genuine controller's prelaunch ending slot.
+        EXPECT_EQ(Access::order(reaper),before+1);
+        EXPECT_EQ(Access::controller_at(reaper,before+1),controller);
+    }
+    for(const auto& route:synchronizers)route->connect();
+    ASSERT_TRUE(until([&]{return phase()==0;}));
+    const auto actual=Access::snapshot(controller);EXPECT_TRUE(actual.available);EXPECT_NE(actual.worker,std::thread::id{});
+    size_t errors_before_ending;{std::lock_guard lock(errors_mutex);errors_before_ending=errors.size();}
+    ending();EXPECT_EQ(errors_before_ending,0u);EXPECT_TRUE(Access::snapshot(controller).joined);
+}
+
+
+TEST_F(RecoveryReceiverController, PrivateControllerFailureNotifiesOnOriginalWorkerAndRetiresItsActualLane) {
+    configure();using Access=detail::recovery_controller_executor_test_access;
+    struct State {
+        std::mutex mutex;Access::ticket lane;std::array<unsigned char,512> first{};size_t first_bytes=0;
+        std::atomic<unsigned> faults{0},callbacks{0};std::atomic<bool> done{false},on_private{false},on_original{false};
+        std::exception_ptr callback_failure;int64_t value=INT64_MIN;
+    };const auto state=std::make_shared<State>();const auto queue=receiver->get_scheduler();
+    const std::string retained_store=receiver->config().path;bool ended=false;
+    const auto ending=[&]()noexcept{
+        if(ended)return;synchronizers.clear();
+        try{queue->shutdown();}catch(...){std::fprintf(stderr,"private-error caller-ending-debt group=%ld store=%s\n",long(::getpgrp()),retained_store.c_str());std::fflush(stderr);::_exit(93);}
+        Access::ticket actual;{std::lock_guard lock(state->mutex);actual=state->lane;}
+        if(!Access::joined(actual,std::chrono::seconds(3))){std::fprintf(stderr,"private-error controller-ending-debt group=%ld store=%s\n",long(::getpgrp()),retained_store.c_str());std::fflush(stderr);::_exit(93);}ended=true;
+    };
+    struct AlwaysEnd{const decltype(ending)& work;~AlwaysEnd()noexcept{work();}} cleanup{ending};
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),nullptr,
+        [state](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"selected-controller-turn-through-settlement")==0){auto actual=Access::current();std::lock_guard lock(state->mutex);if(!state->lane)state->lane=std::move(actual);}
+            if(std::strcmp(stage,"install")==0){++state->faults;throw db_error("private-controller-real-install-scope-refusal");}return {};
+        });
+    // The actual public error callback is registered before connect, so the
+    // first copied error cannot race a later replacement handler installation.
+    auto& peer=peers.at(0);sync_config config;config.websocket_url=peer.endpoint;config.authorization_token="registered-token";config.sync_id=peer.channel;
+    config.all_active_sync_ids.push_back(peer.channel);config.recovery_source_expectation=peer.expectation.dump();config.checkpoint_passive_interval_ms=0;config.upload_coalesce_ms=0;config.chunk_size=upload_chunk;
+    auto route=std::make_unique<synchronizer>(std::static_pointer_cast<lattice_db>(receiver),config);
+    route->set_on_error([this,state,queue](const std::string& actual){
+        ++state->callbacks;state->on_private.store(bool(Access::current()));state->on_original.store(queue->is_on_thread());
+        try{
+            // Real reentrant public Native read. It is never executed by the
+            // private lane and receives no controller exact-cell bypass.
+            const auto rows=receiver->db().query("SELECT 733 AS n");state->value=std::get<int64_t>(rows.at(0).at("n"));
+            const auto count=std::min(state->first.size(),actual.size());
+            {std::lock_guard lock(state->mutex);if(!state->first_bytes){state->first_bytes=count;if(count)std::memcpy(state->first.data(),actual.data(),count);}}
+        }catch(...){state->callback_failure=std::current_exception();}
+        state->done.store(true);
+    });synchronizers.push_back(std::move(route));synchronizers.back()->connect();
+    const bool completed=until([&]{return state->done.load();});ending();
+    EXPECT_TRUE(completed);EXPECT_EQ(state->faults.load(),1u);EXPECT_EQ(state->callbacks.load(),1u);
+    EXPECT_FALSE(state->on_private.load());EXPECT_TRUE(state->on_original.load());EXPECT_EQ(state->value,733);EXPECT_FALSE(state->callback_failure);
+    std::array<char,513> copied{};size_t bytes;{std::lock_guard lock(state->mutex);bytes=state->first_bytes;if(bytes)std::memcpy(copied.data(),state->first.data(),bytes);}
+    EXPECT_NE(std::string(copied.data(),bytes).find("private-controller-real-install-scope-refusal"),std::string::npos);
+}
+
+}
+#endif
+
+
+// TEST-only supported concurrent scheduler. Exactly two real workers and32
+// queue cells make the independent worker capacity observable while one real
+// public handler is held. This does not serialize any production scheduler.
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+class ControllerNotificationConcurrentScheduler final : public scheduler {
+    struct State {
+        std::mutex mutex;std::condition_variable ready,ended;
+        std::array<std::function<void()>,32> jobs{};size_t head=0,count=0,active=0,workers_ended=0;
+        bool stopping=false;uint64_t completed=0;std::exception_ptr first_error;
+    };
+    std::shared_ptr<State> state_=std::make_shared<State>();
+    std::array<std::thread,2> workers_;size_t started_=0;bool joined_=false;
+    inline static thread_local const State* current_=nullptr;
+    [[noreturn]] static void ending_debt(const char* stage)noexcept{
+        std::fprintf(stderr,"controller-notification scheduler-ending-debt stage=%s process=%ld group=%ld retained=1\n",stage,long(::getpid()),long(::getpgrp()));
+        std::fflush(stderr);::_exit(95);
+    }
+    static void loop(State* state)noexcept {
+        current_=state;
+        for(;;){std::function<void()> job;
+            {std::unique_lock lock(state->mutex);state->ready.wait(lock,[&]{return state->stopping||state->count;});
+                if(!state->count){current_=nullptr;++state->workers_ended;lock.unlock();state->ended.notify_all();return;}
+                job.swap(state->jobs[state->head]);state->head=(state->head+1)%state->jobs.size();--state->count;++state->active;}
+            try{job();}catch(...){std::lock_guard lock(state->mutex);if(!state->first_error)state->first_error=std::current_exception();}
+            job={}; // all actual work/captures end before completion DATA
+            {std::lock_guard lock(state->mutex);--state->active;++state->completed;}
+            state->ended.notify_all();
+        }
+    }
+public:
+    ControllerNotificationConcurrentScheduler(){
+        try{for(auto& worker:workers_){worker=std::thread([raw=state_.get()]{loop(raw);});++started_;}}
+        catch(...){const auto first=std::current_exception();shutdown();std::rethrow_exception(first);}
+    }
+    ~ControllerNotificationConcurrentScheduler()override{shutdown();}
+    void invoke(std::function<void()>&& job)override{
+        {std::lock_guard lock(state_->mutex);if(state_->stopping)return;
+            if(state_->count==state_->jobs.size())throw db_error("controller notification fixture queue capacity");
+            const auto tail=(state_->head+state_->count)%state_->jobs.size();state_->jobs[tail].swap(job);++state_->count;}
+        state_->ready.notify_one();
+    }
+    bool is_on_thread()const noexcept override{return current_==state_.get();}
+    bool is_same_as(const scheduler* other)const noexcept override{return other==this;}
+    bool can_invoke()const noexcept override{std::lock_guard lock(state_->mutex);return !state_->stopping;}
+    std::future<void> checkpoint(std::function<void()> observe={}){
+        auto done=std::make_shared<std::promise<void>>();auto future=done->get_future();
+        invoke([done,observe=std::move(observe)]{if(observe)observe();done->set_value();});return future;
+    }
+    std::exception_ptr first_error()const{std::lock_guard lock(state_->mutex);return state_->first_error;}
+    void shutdown()override{
+        if(joined_)return;if(is_on_thread())ending_debt("self-shutdown");
+        {std::lock_guard lock(state_->mutex);state_->stopping=true;}state_->ready.notify_all();
+        {std::unique_lock lock(state_->mutex);if(!state_->ended.wait_for(lock,std::chrono::seconds(3),[&]{return state_->workers_ended==started_;}))ending_debt("worker-ending-unobserved");}
+        for(auto& worker:workers_)if(worker.joinable())try{worker.join();}catch(...){ending_debt("actual-worker-join");}
+        joined_=true;
+    }
+};
+struct ControllerHeldNotificationHandler {
+    std::mutex mutex;std::condition_variable changed;
+    unsigned callbacks=0;bool first_arrived=false,released=false,timed_out=false,free_worker_while_held=false;
+    bool wrong_execution_context=false,message_overflow=false;
+    std::array<std::array<char,256>,2> messages{};std::array<size_t,2> message_bytes{};
+    void release()noexcept{std::lock_guard lock(mutex);released=true;changed.notify_all();}
+};
+TEST_F(RecoveryReceiverController, ConcurrentRouteHandoffRemainsOutstandingThroughActualPublicErrorHandler) {
+    configure(1,false);using Access=detail::recovery_controller_executor_test_access;
+    const auto queue=std::make_shared<ControllerNotificationConcurrentScheduler>();
+    const auto held=std::make_shared<ControllerHeldNotificationHandler>();
+    const auto reaper=detail::sync_retirement_lane::instance();Access::ticket actual_lane;
+    const std::string retained_store=(container/"store.sqlite").string();bool route_born=false,ended=false;
+    const auto ending_debt=[&](const char* stage)noexcept{
+        std::fprintf(stderr,"controller-notification ending-debt stage=%s process=%ld group=%ld retained_store=%s\n",stage,long(::getpid()),long(::getpgrp()),retained_store.c_str());
+        std::fflush(stderr);::_exit(95);
+    };
+    const auto ending=[&]()noexcept{
+        if(ended)return;held->release(); // release actual handler before owner retirement
+        synchronizers.clear(); // original synchronizer/lifetime/pacer ending
+        try{queue->shutdown();}catch(...){ending_debt("original-concurrent-scheduler");}
+        if(route_born&&!Access::joined(actual_lane,std::chrono::seconds(3)))ending_debt("private-controller-actual-join");
+        ended=true;
+    };
+    struct AlwaysEnd{const decltype(ending)& action;~AlwaysEnd()noexcept{action();}} cleanup{ending};
+    swift_configuration owner_config(retained_store,queue);owner_config.audit_retention_seconds=0;owner_config.busy_timeout_ms=100;
+    continuous_result owner_result;
+#if LATTICE_HAS_FRT
+    receiver_ref.reset(swift_lattice_ref::create_continuous(owner_config,{controller_schema()},policy,owner_result));
+#else
+    receiver_ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create_continuous(owner_config,{controller_schema()},policy,owner_result));
+#endif
+    ASSERT_EQ(owner_result.phase(),2);ASSERT_FALSE(owner_result.has_error());
+    receiver=swift_lattice_ref::shared_for_lattice(receiver_ref->get());ASSERT_TRUE(receiver);
+    if(auto* notifier=instance_registry::instance().get_or_create_notifier(receiver->config().path))notifier->stop_listening();
+    const auto& peer=peers.at(0);sync_config config;config.websocket_url=peer.endpoint;config.authorization_token="registered-token";config.sync_id=peer.channel;
+    config.all_active_sync_ids.push_back(peer.channel);config.recovery_source_expectation=peer.expectation.dump();config.checkpoint_passive_interval_ms=0;config.upload_coalesce_ms=0;
+    const auto reservation_before=Access::order(reaper);
+    auto route=std::make_unique<synchronizer>(std::static_pointer_cast<lattice_db>(receiver),config);
+    route_born=true;actual_lane=Access::controller_at(reaper,reservation_before+1);ASSERT_TRUE(actual_lane);
+    route->set_on_error([held,queue](const std::string& message){
+        const bool on_private=bool(Access::current());const bool on_original=queue->is_on_thread();
+        std::unique_lock lock(held->mutex);const auto ordinal=++held->callbacks;
+        if(on_private||!on_original)held->wrong_execution_context=true;
+        if(ordinal<=held->messages.size()){
+            const auto count=std::min(held->messages[ordinal-1].size(),message.size());held->message_bytes[ordinal-1]=count;
+            if(count)std::memcpy(held->messages[ordinal-1].data(),message.data(),count);
+            if(count!=message.size())held->message_overflow=true;
+        }else held->message_overflow=true;
+        if(ordinal==1){held->first_arrived=true;held->changed.notify_all();
+            if(!held->changed.wait_for(lock,std::chrono::seconds(5),[&]{return held->released;}))held->timed_out=true;}
+        held->changed.notify_all();
+    });synchronizers.push_back(std::move(route));
+    // The public constructor enrolled the real route/controller/owner. No
+    // connect or fabricated authenticated source/outcome is needed: the two
+    // existing-friend forwards inject only fixed test notification DATA.
+    auto& actual=*synchronizers.front();
+    detail::recovery_receiver_cohort_test_access::post_notification_error(actual,std::make_exception_ptr(db_error("first-injected-route-mailbox-error")));
+    detail::recovery_receiver_cohort_test_access::drain_notification_data(actual);
+    {std::unique_lock lock(held->mutex);ASSERT_TRUE(held->changed.wait_for(lock,std::chrono::seconds(2),[&]{return held->first_arrived;}));}
+    for(unsigned n=0;n<8;++n){
+        detail::recovery_receiver_cohort_test_access::post_notification_error(actual,std::make_exception_ptr(db_error(n?"later-coalesced-route-mailbox-error":"first-pending-route-mailbox-error")));
+        detail::recovery_receiver_cohort_test_access::drain_notification_data(actual);
+    }
+    // One worker is actually held in the public handler. The other worker
+    // must execute both fixed FIFO markers. Two markers also drain the old
+    // helper's one extra scheduled-error hop; neither is a sleep/yield guess.
+    auto first_checkpoint=queue->checkpoint([held]{std::lock_guard lock(held->mutex);held->free_worker_while_held=held->first_arrived&&!held->released&&!held->timed_out;});
+    ASSERT_EQ(first_checkpoint.wait_for(std::chrono::seconds(1)),std::future_status::ready);first_checkpoint.get();
+    auto second_checkpoint=queue->checkpoint();ASSERT_EQ(second_checkpoint.wait_for(std::chrono::seconds(1)),std::future_status::ready);second_checkpoint.get();
+    {std::lock_guard lock(held->mutex);EXPECT_TRUE(held->free_worker_while_held);EXPECT_FALSE(held->released);EXPECT_FALSE(held->timed_out);EXPECT_EQ(held->callbacks,1u);}
+    held->release();
+    // Demand retained during the held callback remains actual pending DATA.
+    // A later real pacer tick or this explicit ordinary drain can dispatch it.
+    detail::recovery_receiver_cohort_test_access::drain_notification_data(actual);
+    {std::unique_lock lock(held->mutex);EXPECT_TRUE(held->changed.wait_for(lock,std::chrono::seconds(2),[&]{return held->callbacks>=2;}));}
+    ending(); // all actual original/private jobs and retained captures ended
+    EXPECT_FALSE(queue->first_error());
+    {std::lock_guard lock(held->mutex);
+        EXPECT_EQ(held->callbacks,2u);EXPECT_FALSE(held->timed_out);EXPECT_FALSE(held->wrong_execution_context);EXPECT_FALSE(held->message_overflow);
+        const std::string first(held->messages[0].data(),held->message_bytes[0]);const std::string pending(held->messages[1].data(),held->message_bytes[1]);
+        EXPECT_NE(first.find("first-injected-route-mailbox-error"),std::string::npos);
+        EXPECT_NE(pending.find("first-pending-route-mailbox-error"),std::string::npos);
+    }
+    EXPECT_TRUE(Access::snapshot(actual_lane).joined);
+}
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+TEST_F(RecoveryRestrictedFirstClaim, DeferredInstallTargetSurvivesIntermediateOwnedCommitAndAnotherActualTurn) {
+    configure();
+    struct State : SoleFifoAdmissionState {
+        std::mutex holds_mutex;std::condition_variable holds_changed;
+        std::array<std::shared_ptr<FirstClaimWriterHold>,2> holds;
+        unsigned creating=0;bool ending=false;
+        std::atomic<bool> first_release_started{false},second_published{false},second_release_started{false};
+        std::atomic<bool> still_denied_after_intermediate_turn{false};
+        std::atomic<unsigned> intermediate_commits{0},intermediate_turn{0},second_deferrals{0},second_first_turn{0};
+    };
+    const auto state=std::make_shared<State>();state->owner=receiver;state->queue=receiver->get_scheduler();
+    ASSERT_NE(std::dynamic_pointer_cast<std_thread_scheduler>(state->queue),nullptr);
+    state->native=detail::canonical_writer_custody_test_access::fault_handle(receiver->db());
+    const std::string retained_store=receiver->config().path;
+    const auto debt=[&](const char* stage)noexcept{
+        std::fprintf(stderr,"install-target ending-debt stage=%s process=%ld group=%ld retained_store=%s\n",
+            stage,static_cast<long>(::getpid()),static_cast<long>(::getpgrp()),retained_store.c_str());
+        std::fflush(stderr);::_exit(93);
+    };
+    const auto release_hold=[state](size_t index){
+        std::shared_ptr<FirstClaimWriterHold> held;
+        {std::lock_guard lock(state->holds_mutex);held=state->holds[index];}
+        if(held)held->release(); // main alone joins, never under the fixture leaf
+    };
+    std::exception_ptr ending_error;bool ended=false;int trace_removal=SQLITE_ERROR;
+    const auto ending=[&]()noexcept{
+        if(ended)return;
+        {std::lock_guard lock(state->holds_mutex);state->ending=true;}
+        try{release_hold(0);release_hold(1);}catch(...){ending_error=std::current_exception();debt("holder-release");}
+        // A constructor already admitted before ending may still publish.
+        // Release known holders first so that constructor cannot wait on one.
+        {std::unique_lock lock(state->holds_mutex);
+            if(!state->holds_changed.wait_for(lock,std::chrono::seconds(5),[&]{return state->creating==0;}))debt("holder-publication");}
+        try{release_hold(0);release_hold(1);}catch(...){ending_error=std::current_exception();debt("late-holder-release");}
+        synchronizers.clear();
+        try{state->queue->shutdown();}catch(...){ending_error=std::current_exception();debt("original-worker-join");}
+        detail::recovery_controller_executor_test_access::ticket lane;
+        {std::lock_guard lock(state->lane_mutex);lane=state->lane;}
+        if(!detail::recovery_controller_executor_test_access::joined(lane,std::chrono::seconds(3)))debt("private-lane-join");
+        trace_removal=sqlite3_trace_v2(state->native,0,nullptr,nullptr);
+        if(trace_removal!=SQLITE_OK)debt("trace-removal");
+        ended=true;
+    };
+    struct AlwaysEnd{const decltype(ending)& action;~AlwaysEnd()noexcept{action();}} always_end{ending};
+    ASSERT_EQ(sqlite3_trace_v2(state->native,SQLITE_TRACE_STMT|SQLITE_TRACE_PROFILE,
+        SoleFifoAdmissionState::trace,static_cast<SoleFifoAdmissionState*>(state.get())),SQLITE_OK);
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+        [state](const char* stage){if(std::strcmp(stage,"install-committed")==0)state->install_returned.store(true);},
+        [this,state](const char* stage)->std::shared_ptr<void>{
+            if(std::strcmp(stage,"selected-controller-turn-through-settlement")==0){
+                ++state->selected_turns;auto lane=detail::recovery_controller_executor_test_access::current();
+                std::lock_guard lock(state->lane_mutex);
+                if(!state->lane)state->lane=std::move(lane);else if(state->lane!=lane)state->lane_identity_changed.store(true);
+            }
+            if(std::strcmp(stage,"install")!=0)return {};
+            const auto install=state->installs.fetch_add(1);
+            if(install<2){
+                {std::lock_guard lock(state->holds_mutex);if(state->ending)return {};++state->creating;}
+                std::shared_ptr<FirstClaimWriterHold> actual;
+                try{actual=std::make_shared<FirstClaimWriterHold>(*receiver);}
+                catch(...){std::lock_guard lock(state->holds_mutex);--state->creating;state->holds_changed.notify_all();throw;}
+                {std::lock_guard lock(state->holds_mutex);state->holds[install]=std::move(actual);--state->creating;
+                    if(install==0)state->hold_published.store(true);else state->second_published.store(true);}
+                state->holds_changed.notify_all();
+            }
+            return std::make_shared<SoleFifoInstallScope>(state);
+        },
+        [state](const char* reason){
+            if(!state->hold_published.load()||std::strcmp(reason,"admission-deferred-connection-mutex")!=0)return;
+            ++state->deferrals;
+            if(state->second_published.load()){
+                if(state->second_deferrals.fetch_add(1)==0)state->second_first_turn.store(state->selected_turns.load());
+            }
+            if(state->enqueue_once.exchange(true))return;
+            state->callback_on_private.store(bool(detail::recovery_controller_executor_test_access::current()));
+            state->callback_on_worker.store(state->queue->is_on_thread());
+            try{state->queue->invoke([state]{
+                state->query_on_worker.store(state->queue->is_on_thread());state->query_started.store(true);
+                state->turns_before=state->selected_turns.load();
+                try{detail::recovery_topology_wait_observation::scope selected(state->query_wait,&state->query_selected);
+                    const auto owner=state->owner.lock();if(!owner)throw db_error("install target control owner retired");
+                    const auto rows=owner->db().query("SELECT 731 AS n");state->query_value=std::get<int64_t>(rows.at(0).at("n"));
+                }catch(...){state->query_error=std::current_exception();}
+                state->turns_after=state->selected_turns.load();state->query_finished.store(true);
+            });state->enqueued.store(true);}catch(...){state->enqueue_error=std::current_exception();}
+        },
+        [state]{
+            if(state->first_release_started.load()&&!state->install_returned.load()){
+                ++state->intermediate_commits;state->intermediate_turn.store(state->selected_turns.load());
+            }
+        });
+    connect();
+    const bool finished=until([&]{
+        if(state->enqueued.load()&&state->query_selected.load()&&!state->first_release_started.exchange(true))release_hold(0);
+        if(state->second_published.load()&&state->second_deferrals.load()>=2&&state->intermediate_commits.load()!=0&&
+           state->selected_turns.load()>state->second_first_turn.load()&&!state->second_release_started.exchange(true)){
+            state->still_denied_after_intermediate_turn.store(!state->query_finished.load());release_hold(1);
+        }
+        return state->query_finished.load();
+    }); // unchanged five-second predicate, no SQL or alternate executor
+    ending();
+    std::fprintf(stderr,"install-target finished=%d installs=%u deferrals=%u intermediateCommits=%u intermediateTurn=%u secondDeferrals=%u secondFirstTurn=%u turnsBefore=%u turnsAfter=%u deniedAcrossTurn=%d selectedWaits=%llu token=%llu deadlineObserved=%d actualCommit=%d installReturned=%d readBeforeCommit=%d\n",
+        int(finished),state->installs.load(),state->deferrals.load(),state->intermediate_commits.load(),state->intermediate_turn.load(),
+        state->second_deferrals.load(),state->second_first_turn.load(),state->turns_before,state->turns_after,
+        int(state->still_denied_after_intermediate_turn.load()),static_cast<unsigned long long>(state->query_wait.selected_waits),
+        static_cast<unsigned long long>(state->query_wait.token),int(state->query_wait.deadline_observed),
+        int(state->install_commit.load()),int(state->install_returned.load()),int(state->read_before_install_commit.load()));
+    EXPECT_EQ(trace_removal,SQLITE_OK);EXPECT_FALSE(ending_error);
+    if(state->enqueue_error)std::rethrow_exception(state->enqueue_error);
+    if(state->query_error)std::rethrow_exception(state->query_error);
+    for(const auto& held:state->holds){ASSERT_TRUE(held);EXPECT_FALSE(held->timed_out);}
+    EXPECT_TRUE(finished);EXPECT_TRUE(state->second_release_started.load());
+    EXPECT_GT(state->intermediate_commits.load(),0u);EXPECT_GE(state->second_deferrals.load(),2u);
+    EXPECT_TRUE(state->still_denied_after_intermediate_turn.load());EXPECT_GT(state->turns_after,state->second_first_turn.load());
+    EXPECT_TRUE(state->callback_on_private.load());EXPECT_FALSE(state->callback_on_worker.load());EXPECT_TRUE(state->query_on_worker.load());
+    EXPECT_FALSE(state->lane_identity_changed.load());EXPECT_TRUE(state->query_wait.selected);EXPECT_FALSE(state->query_wait.excluded);
+    EXPECT_EQ(state->query_wait.selected_waits,1u);EXPECT_FALSE(state->query_wait.deadline_observed);
+    EXPECT_NE(state->query_wait.token,0u);EXPECT_TRUE(state->query_wait.returned);EXPECT_EQ(state->query_value,731);
+    EXPECT_TRUE(state->install_commit.load());EXPECT_TRUE(state->install_returned.load());EXPECT_TRUE(state->read_entered.load());
+    EXPECT_FALSE(state->read_before_install_commit.load());EXPECT_FALSE(has_error());
+}
+}
+#endif
+
+
+// Real charge-ending continuation. The supported original manual route queue
+// runs on ONE owned worker only until the held callback returns. After its join,
+// no original route job executes. The actual pacer is independently held at
+// its existing starting observation until after the next-request witness.
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+class RecoveryResponseCapacity : public RecoveryRestrictedFirstClaim {
+protected:
+    size_t actual_reads=0,ready_offered=0;
+    std::string first_read_index;
+    struct DeliveryOutcome {std::atomic<unsigned> delivered{0},refused{0};};
+    const std::shared_ptr<DeliveryOutcome> delivery_outcome=std::make_shared<DeliveryOutcome>();
+    struct QueuedReady {
+        const uint64_t creator;
+        platform_transport_callbacks endpoint;
+        transport_message message;
+        std::shared_ptr<DeliveryOutcome> outcome;
+        explicit QueuedReady(uint64_t issuer):creator(issuer){}
+        static void destroy(QueuedReady* value)noexcept {
+            if(!value||value->creator!=detail::database_native_process())return;
+            value->message={};if(value->creator!=detail::database_native_process())return;
+            value->endpoint={};if(value->creator!=detail::database_native_process())return;
+            value->outcome.reset();if(value->creator!=detail::database_native_process())return;
+            delete value;
+        }
+    };
+    void after_ready(size_t index,const json& control,const std::string& raw) override {
+        // trigger_on_message is synchronous on its caller. Queue that SAME
+        // actual endpoint/message onto the SAME supported manual scheduler;
+        // no base trace/member access occurs from the worker callback.
+        if(raw.size()>8388608||ready_offered==32)throw db_error("response-credit fixture READY envelope bound");
+        boundary_trace.delivery_bytes(raw);++ready_offered; // Main-only source pump DATA.
+        const auto issuer=detail::database_native_process(); // Before either allocation.
+        auto queued=std::shared_ptr<QueuedReady>(new QueuedReady(issuer),QueuedReady::destroy);
+        if(queued->creator!=detail::database_native_process())throw db_error("response-credit fixture changed process");
+        queued->endpoint=peers.at(index).physical;queued->outcome=delivery_outcome;
+        queued->message=transport_message::from_string(raw);
+        if(queued->creator!=detail::database_native_process())throw db_error("response-credit fixture changed process");
+        manual->invoke([queued]{
+            if(queued->creator!=detail::database_native_process())return;
+            const bool delivered=queued->endpoint.trigger_on_message(queued->message);
+            if(queued->creator!=detail::database_native_process())return;
+            if(delivered)++queued->outcome->delivered;
+            else {++queued->outcome->refused;throw db_error("response-credit actual READY endpoint refused");}
+        });
+        if(control.at("operation")=="read"){
+            if(!actual_reads)first_read_index=control.at("index").get<std::string>();
+            ++actual_reads;
+        }
+    }
+};
+TEST_F(RecoveryResponseCapacity, ActualCallbackCaptureEndingResumesPrivateControlWithoutOriginalSchedulerTick) {
+    configure(1,false);insert(*source,controller_uuid(966),"canonical");open_manual_receiver();
+    struct State {
+        std::atomic<bool> callback_selected{false},stop{false},worker_ended{false};
+        std::atomic<unsigned> capacity_waits{0},jobs{0};
+        std::exception_ptr worker_error;
+        std::mutex lane_mutex;detail::recovery_controller_executor_test_access::ticket lane;
+        std::shared_ptr<ControllerPause> callback=std::make_shared<ControllerPause>();
+        std::shared_ptr<ControllerPause> pacer=std::make_shared<ControllerPause>();
+    };
+    const auto state=std::make_shared<State>();pauses.push_back(state->callback);pauses.push_back(state->pacer);
+    std::thread route_worker;bool cleaned=false;
+    const auto prior_pacer=detail::sync_background_test_hooks::pacer_wait;
+    struct RestorePacer {std::shared_ptr<const detail::sync_background_test_hooks::pacer_wait_schedule> prior;
+        ~RestorePacer(){detail::sync_background_test_hooks::pacer_wait=std::move(prior);}} restore_pacer{prior_pacer};
+    auto pacer_hook=std::make_shared<detail::sync_background_test_hooks::pacer_wait_schedule>();
+    pacer_hook->starting=[state]{state->pacer->wait();};
+    detail::sync_background_test_hooks::pacer_wait=std::move(pacer_hook);
+    const auto cleanup=[&]()noexcept{
+        if(cleaned)return;
+        state->stop.store(true);state->callback->release();state->pacer->release();
+        if(route_worker.joinable()){
+            const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+            while(!state->worker_ended.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<end)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if(!state->worker_ended.load(std::memory_order_acquire))
+                detail::controller_fixture_worker_endings::fail_ending("response-credit-route-callback-not-ended");
+            route_worker.join();
+        }
+        close_receiver();cleaned=true; // Actual private worker joins before callback/local destruction.
+    };
+    struct Ending {const decltype(cleanup)& run;~Ending()noexcept{run();}} ending{cleanup};
+    probe=std::make_unique<detail::recovery_receiver_controller_test_access>(receiver.get(),
+        [state](const char* stage){
+            if(std::strcmp(stage,"physical-reply-wake-returned")==0&&!state->callback_selected.exchange(true))
+                state->callback->wait(); // Actual receive locals STILL retain pending/reply originals.
+        },nullptr,nullptr,nullptr,nullptr,[state]{
+            auto actual=detail::recovery_controller_executor_test_access::current();
+            {std::lock_guard lock(state->lane_mutex);if(!state->lane)state->lane=std::move(actual);}
+            ++state->capacity_waits;
+        });
+    connect();
+    route_worker=std::thread([this,state]{
+        try{while(!state->stop.load()){
+            if(manual->run_one())++state->jobs;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }}catch(...){state->worker_error=std::current_exception();}
+        state->worker_ended.store(true,std::memory_order_release);
+    });
+    // Original fixed5s helper pumps only real peer traffic, never manual jobs.
+    ASSERT_TRUE(until([&]{
+        if(!state->pacer->ready()||!state->callback->ready()||!state->capacity_waits.load())return false;
+        detail::recovery_controller_executor_test_access::ticket actual;
+        {std::lock_guard lock(state->lane_mutex);actual=state->lane;}
+        const auto copied=detail::recovery_controller_executor_test_access::snapshot(actual);
+        return copied.available&&!copied.active&&!copied.pending&&!copied.timed&&!copied.worker_error;
+    }));
+    // Genuine empty private pending/timer slots exclude a previously queued
+    // private turn providing an incidental retry after callback release.
+    EXPECT_EQ(actual_reads,0u);EXPECT_FALSE(state->callback->timedOut());EXPECT_FALSE(state->pacer->timedOut());
+    // Stop is published while that actual callback is held. The sole worker
+    // returns from it, destroys its real callback tail/charge, then exits; it
+    // cannot execute the already queued periodic/discovery jobs after release.
+    state->stop.store(true);state->callback->release();
+    ASSERT_TRUE(observe([&]{return state->worker_ended.load(std::memory_order_acquire);}));
+    route_worker.join();ASSERT_FALSE(state->worker_error);const auto jobs=state->jobs.load();
+    ASSERT_TRUE(until([&]{return actual_reads!=0;}));
+    ASSERT_GT(manual->queued_snapshot(),0u); // Real next read response remains queued, unexecuted.
+    EXPECT_EQ(state->jobs.load(),jobs);EXPECT_EQ(actual_reads,1u);EXPECT_EQ(first_read_index,"0");
+    EXPECT_FALSE(state->callback->timedOut());EXPECT_FALSE(state->pacer->timedOut());EXPECT_FALSE(has_error());
+    // The actual captured pacer starting hook still holds that independent
+    // fallback thread; stopping manual jobs alone would NOT exclude it.
+    state->pacer->release();
+    // Resume the SAME actual original queue only after the independent private
+    // next-request witness. All canonical rows/install/COMMIT semantics remain.
+    ASSERT_TRUE(drive([&]{return phase()==0&&scalar(*receiver,
+        "SELECT COUNT(*) AS n FROM _lattice_install_channel WHERE revision=1")==1;}));
+    EXPECT_EQ(scalar(*receiver,"SELECT COUNT(*) AS n FROM ControllerRow"),1);
+    EXPECT_EQ(delivery_outcome->refused.load(),0u);EXPECT_EQ(delivery_outcome->delivered.load(),ready_offered);
+    EXPECT_FALSE(has_error());cleanup();
+}
+} // namespace
 #endif

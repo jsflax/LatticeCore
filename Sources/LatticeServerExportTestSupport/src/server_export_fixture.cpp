@@ -25,7 +25,7 @@ void failure()noexcept{
 }
 }
 int32_t enroll(const swift_lattice_ref& ref,const std::string& model)noexcept{
-    last_bridge_error().clear();
+    clear_bridge_outcome();
     try{
         if(model.empty()||model.size()>64)throw db_error("server export fixture model outside bound");
         auto owner=actual_owner(ref);recovery_obligation_address address;
@@ -40,14 +40,14 @@ int32_t enroll(const swift_lattice_ref& ref,const std::string& model)noexcept{
     }catch(...){failure();return 1;}
 }
 int32_t freeze(const swift_lattice_ref& ref)noexcept{
-    last_bridge_error().clear();
+    clear_bridge_outcome();
     try{auto owner=actual_owner(ref);committed(recovery_writer_access::install(owner,[&](database&){
         recovery_obligation_store journal(owner,limits.obligations,limits.installations);const auto scope=journal.read(binding.channel);
         if(!scope)throw db_error("missing server export fixture contribution");journal.freeze(scope->address,1);
     }));return 0;}catch(...){failure();return 1;}
 }
 fixture_facts facts(const swift_lattice_ref& ref)noexcept{
-    last_bridge_error().clear();fixture_facts result;
+    clear_bridge_outcome();fixture_facts result;
     try{auto owner=actual_owner(ref);committed(recovery_writer_access::install(owner,[&](database& writer){
         recovery_obligation_store journal(owner,limits.obligations,limits.installations);journal.audit();
         const auto counts=writer.query("SELECT (SELECT COUNT(*) FROM AuditLog) AS originals,"

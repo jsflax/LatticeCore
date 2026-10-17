@@ -21,11 +21,16 @@ void recovery_local_producer_adapter::compile_continuous(lattice_db& owner,conte
         // Every contribution tail follows the SAME genuine AuditLog insert.
         // WITHOUT ROWID metadata preserves last_insert_rowid across tails.
         if(continuous_receiver_enabled(*admitted.continuous->state)) {
-            // Count actual distinct unresolved originals after every generated
-            // contribution has been inserted, in this same model transaction.
-            // The 8,193-row result is bounded; SQLite may scan the admitted
-            // journal's full finite raw-record cap (at most 100,000 records).
-            tail+=require("(SELECT COUNT(*) FROM (SELECT DISTINCT original FROM _lattice_obligation_entry WHERE stage<>2 ORDER BY original LIMIT 8193))<=8192");
+            // Every unresolved original owns at least one actual journal row.
+            // A small physical row count therefore proves this same hard cap
+            // without enumerating distinct originals. For larger journals use
+            // the exact original test, including settled/shared-row semantics.
+            // Both branches read this transaction's post-tail SQLite state;
+            // no cached counter, memory flag, metadata claim or extra write.
+            if(admitted.legacy_distinct_count_programs)
+                tail+=require("(SELECT COUNT(*) FROM (SELECT DISTINCT original FROM _lattice_obligation_entry WHERE stage<>2 ORDER BY original LIMIT 8193))<=8192");
+            else
+                tail+=require("CASE WHEN (SELECT COUNT(*) FROM _lattice_obligation_entry)<=8192 THEN 1 ELSE (SELECT COUNT(*) FROM (SELECT DISTINCT original FROM _lattice_obligation_entry WHERE stage<>2 ORDER BY original LIMIT 8193))<=8192 END");
         }
         std::vector<std::string> emitted;
         if(first.link)owner.create_link_table_triggers(name,tail,&emitted);
@@ -106,7 +111,7 @@ void recovery_continuous_producer::require_no_continuous_route(lattice_db& owner
 std::shared_ptr<database> recovery_continuous_producer::open_writer(const configuration& config,const std::shared_ptr<recovery_continuous_admission>& admission) {
     if(!admission||!admission->state||admission->state->path!=config.path)refuse("continuous writer lacks exact container custody");
     auto writer=std::make_shared<database>(config.path,database::open_mode::read_write,config.busy_timeout_ms,
-        std::shared_ptr<database_read_control>{},database::initialization_key(admission),config.ordinary_context);
+        std::shared_ptr<database_read_control>{},database::initialization_key(admission),config.ordinary_context,config.wal_extent_limit_bytes);
     writer->suppress_destructor_optimize_=true; // Immutable profile: refusal/close must not run optional ANALYZE.
     auto& state=*admission->state;
     const auto identity=writer->physical_identity("main",{},true);
@@ -242,6 +247,31 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
             recovery_obligation_store journal(owner,state->policy.limits.obligations,state->policy.limits.installations);
             receive_install_store receiver(owner,state->policy.limits.installations);journal.audit();receiver.audit();
             if(journal.usage().scopes!=static_cast<int64_t>(state->policy.contributions.size())||receiver.usage().channels!=static_cast<int64_t>(state->policy.contributions.size()))refuse("continuous extra or missing journal/receiver contribution");
+            // Capture marker currentness before the existing audited receiver
+            // migration can legitimately perform DDL, under this same WRITE.
+            // No foreign DDL can interleave with these owned validations.
+            std::string upgrade_prior_cookie;
+            std::set<std::string> upgrade_marker_keys;
+            const auto schema_cookie=[&]() {
+                const auto rows=db.query("PRAGMA main.schema_version");
+                if(rows.size()!=1)refuse("continuous upgrade schema cookie unavailable");
+                const auto value=integer(rows[0],"schema_version");
+                if(value<0||value>std::numeric_limits<int32_t>::max())refuse("continuous upgrade schema cookie invalid");
+                return std::to_string(value);
+            };
+            const auto marker=[&](const std::string& key) {
+                const auto rows=db.query("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=10 THEN value END AS value FROM main._lattice_meta WHERE key=? LIMIT 2",{key});
+                if(rows.size()!=1)refuse("continuous upgrade expected marker missing");
+                return text(rows[0],"value");
+            };
+            if(candidate->legacy_distinct_count_programs) {
+                if(!continuous_receiver_enabled(*state)||!candidate->matches_complete_programs(db))
+                    refuse("continuous historical bundle changed before upgrade");
+                upgrade_prior_cookie=schema_cookie();upgrade_marker_keys.insert(owner->compute_core_fingerprint_key());
+                if(!owner->recovery_schemas_.swift_fingerprint.empty())upgrade_marker_keys.insert(owner->recovery_schemas_.swift_fingerprint);
+                for(const auto& key:upgrade_marker_keys)if(marker(key)!=upgrade_prior_cookie)
+                    refuse("continuous upgrade expected marker stale or noncanonical");
+            }
             if(continuous_receiver_enabled(*state)) {
                 recovery_receiver_controller::validate_reopen_owned(owner,state->policy,phase,barrier,attempt);
             } else for(const auto& profile:candidate->profiles){
@@ -253,6 +283,41 @@ recovery_install_result recovery_continuous_producer::enroll(std::shared_ptr<lat
                    scope->mode!=(phase==2?recovery_obligation_mode::frozen:recovery_obligation_mode::recording)||
                    scope->last_attempt!=(phase==2?attempt:prior_attempt))
                     refuse("continuous lineage/journal/receiver restart state differs");
+            }
+            if(candidate->legacy_distinct_count_programs) {
+                // Bootstrap was read-only. This existing owned enrollment WRITE
+                // has now validated the full lineage, every journal/receiver and
+                // the current physical file before any optional program upgrade.
+                if(!continuous_receiver_enabled(*state)||!candidate->matches_complete_programs(db))
+                    refuse("continuous historical bundle changed before upgrade");
+                if(recovery_local_producer_test_hooks::before_count_program_upgrade)
+                    recovery_local_producer_test_hooks::before_count_program_upgrade(owner.get());
+                // Retain the admitted descriptor unchanged. The replacement
+                // context is pending: its producer DML guard stays closed until
+                // the existing known-COMMIT tail activates it. Failed endings
+                // keep this unpublished owner fenced and follow normal cleanup.
+                auto upgraded=std::make_shared<recovery_local_producer_adapter::context>();
+                upgraded->connection=candidate->connection;upgraded->owner=candidate->owner;
+                upgraded->lifetime=candidate->lifetime;upgraded->admitted_limits=candidate->admitted_limits;
+                upgraded->continuous=candidate->continuous;upgraded->profiles=candidate->profiles;upgraded->previous=candidate;
+                recovery_local_producer_adapter::compile_continuous(*owner,*upgraded);
+                std::set<std::string> changed;
+                for(size_t i=0;i<candidate->profiles.size();++i)for(const auto& [name,table]:candidate->profiles[i].schema.tables)if(changed.insert(name).second) {
+                    for(const auto& [key,sql]:table.enrolled)db.execute("DROP TRIGGER "+key);
+                    const auto& replacement=upgraded->profiles[i].schema.tables.at(name);
+                    for(const auto& [key,sql]:replacement.enrolled)db.execute(sql);
+                }
+                if(!upgraded->matches_complete_programs(db))refuse("continuous upgrade complete postimage differs");
+                const auto current_cookie=schema_cookie();
+                for(const auto& key:upgrade_marker_keys) {
+                    db.execute("UPDATE main._lattice_meta SET value=? WHERE key=? AND typeof(value)='text' AND value=? COLLATE BINARY",{current_cookie,key,upgrade_prior_cookie});
+                    if(integer(db.query("SELECT changes() AS n").at(0),"n")!=1||marker(key)!=current_cookie)
+                        refuse("continuous upgrade marker postimage differs");
+                }
+                // Existing setup-only registration may throw; that is still
+                // inside this same transaction and follows ordinary rollback.
+                candidate=std::move(upgraded);
+                recovery_local_producer_adapter::register_context(db,candidate);
             }
             if(!state->initialized)db.execute("UPDATE _lattice_producer_continuity SET incarnation=? WHERE id=1 AND incarnation=?",{new_incarnation,old});
         }
@@ -517,10 +582,12 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
         try{
             const auto path=owner.config_.path;const auto busy_timeout=owner.config_.busy_timeout_ms;
             const auto schema_version=owner.config_.target_schema_version;const auto recipe=admission->recipe;
+            const auto wal_extent_limit_bytes=owner.config_.wal_extent_limit_bytes;
             const auto policy=state->policy;
-            configured=configured_recovery_connection::create(actual_owner,config,factory,typed,[path,busy_timeout,schema_version,recipe,policy]{
+            configured=configured_recovery_connection::create(actual_owner,config,factory,typed,[path,busy_timeout,schema_version,recipe,policy,wal_extent_limit_bytes]{
                 configuration child(path,std::make_shared<std_thread_scheduler>());
                 child.busy_timeout_ms=busy_timeout;child.target_schema_version=schema_version;
+                child.wal_extent_limit_bytes=wal_extent_limit_bytes;
                 auto opened=open_owned(child,policy,recipe);
                 if(!opened.owner||opened.settlement.state!=recovery_install_state::committed||opened.settlement.postcommit_error){
                     if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);
@@ -544,6 +611,7 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
     // never acquire an automatic replacement grant or a new registry charge.
     configuration child(owner.config_.path,std::make_shared<std_thread_scheduler>());
     child.busy_timeout_ms=owner.config_.busy_timeout_ms;child.target_schema_version=owner.config_.target_schema_version;
+    child.wal_extent_limit_bytes=owner.config_.wal_extent_limit_bytes;
     auto opened=open_owned(child,state->policy,owner.recovery_continuous_->recipe);
     if(!opened.owner||opened.settlement.state!=recovery_install_state::committed){if(opened.settlement.primary_error)std::rethrow_exception(opened.settlement.primary_error);refuse("continuous dedicated facade open failed");}
     // This private facade was just given a dedicated scheduler. Public shared
@@ -558,21 +626,138 @@ void recovery_continuous_producer::setup_configured_route(lattice_db& owner) {
 #endif
 }
 
+#ifndef __EMSCRIPTEN__
+bool controller_publications_ended(const std::shared_ptr<recovery_continuous_state>& state,
+    std::chrono::steady_clock::time_point end) noexcept {
+    if(!state||state->controller_creator!=database_native_process())return false;
+    try {
+        std::unique_lock lock(state->mutex);
+        if(!state->controller_deletion_retiring)return false;
+        const bool observed=state->controller_publications_returned.wait_until(lock,end,[&]{
+            return state->controller_publication_builders==0||state->controller_publication_unknown.load(std::memory_order_acquire);
+        });
+        return observed&&state->controller_publication_builders==0&&
+            !state->controller_publication_unknown.load(std::memory_order_acquire);
+    }catch(...){return false;}
+}
+controller_store_ending recovery_continuous_producer::retire_controller_for_deletion(
+    const std::shared_ptr<lattice_db>& owner) {
+    if(!owner)refuse("controller deletion requires its actual Native owner");
+    owner->require_creator_process();
+    if(!owner->is_closed())refuse("controller deletion ending requires prior logical close");
+    controller_store_ending::owned_payload held(new controller_store_ending::payload); // before the producer leaf
+    native_retirement_storage<std::shared_ptr<recovery_continuous_state>,
+        std::shared_ptr<recovery_receiver_controller>> retiring; // admitted before effects
+    if(!retiring.in_creator_process())refuse("controller deletion changed process during ending admission");
+    owner->require_creator_process(); // allocation cannot authorize an inherited producer leaf
+    auto& state=retiring.get<0>();auto& controller=retiring.get<1>();
+    state=owner->recovery_continuous_?owner->recovery_continuous_->state:nullptr;
+    if(state){
+        if(state->controller_creator!=database_native_process())refuse("controller deletion producer belongs to another process");
+        {
+            std::lock_guard lock(state->mutex);
+            state->controller_deletion_retiring=true;
+            held->rows=state->controller_originals;
+            held->first_failed_original=state->first_failed_controller_original;
+            controller=state->controller.lock();
+        }
+        held->publication=state;
+        if(controller)controller->retire_for_deletion(); // no producer/Native/store leaf
+    }
+    owner->require_creator_process(); // final off-leaf proof/writer release may have forked
+    // Private successful freeze only. Empty is not inferred from weak expiry:
+    // all actual candidates reserved rows before launching, and builders are
+    // fenced/awaited separately, including unpublished/racing constructors.
+    return controller_store_ending(held.release());
+}
+#endif
 std::shared_ptr<recovery_receiver_route> recovery_continuous_producer::attach_receiver(
     const std::shared_ptr<recovery_continuous_route>& route,std::shared_ptr<lattice_db> owner,
     const std::shared_ptr<receiver_source_binding>& source,const std::shared_ptr<owned_platform_sync_transport>& transport,
     const std::shared_ptr<scheduler>& scheduler,const std::shared_ptr<sync_callback_lifetime>& lifetime) {
     if(!owner||!owner->recovery_continuous_)return {};
+    owner->require_creator_process();
     auto state=owner->recovery_continuous_->state;
     if(!continuous_receiver_enabled(*state))return {};
     if(!route||route->state_!=state||route->owner_.lock()!=owner||route->incarnation_!=state->incarnation||
        !source||!transport||!scheduler||!lifetime)refuse("continuous receiver requires its actual authenticated platform route");
-    // Construct outside the leaf: no destructor, allocator or platform callback
-    // runs while a producer registration lock is held.
-    auto candidate=std::shared_ptr<recovery_receiver_controller>(new recovery_receiver_controller(state->policy));
+#ifndef __EMSCRIPTEN__
+    if(state->controller_creator!=database_native_process())refuse("controller producer belongs to another process");
+    struct publication_tail {
+        const uint64_t creator=database_native_process();
+        std::shared_ptr<recovery_continuous_state>* held;
+        bool admitted=false;
+        explicit publication_tail(const std::shared_ptr<recovery_continuous_state>& actual)
+            :held(new std::shared_ptr<recovery_continuous_state>(actual)){}
+        publication_tail(const publication_tail&)=delete;
+        publication_tail& operator=(const publication_tail&)=delete;
+        ~publication_tail(){
+            if(creator!=database_native_process()){held=nullptr;return;}
+            if(admitted){
+                auto& state=**held;
+                try {std::lock_guard lock(state.mutex);--state.controller_publication_builders;}
+                catch(...) {state.controller_publication_unknown.store(true,std::memory_order_release);}
+                state.controller_publications_returned.notify_all();
+            }
+            delete held; // final producer/callback ownership release OFF its leaf
+        }
+    } publication(state); // allocation precedes the actual counted admission
+    {
+        std::lock_guard lock(state->mutex);
+        if(!state->controller_deletion_retiring&&state->controller_publication_builders!=SIZE_MAX){
+            ++state->controller_publication_builders;publication.admitted=true;
+        }
+    }
+    if(!publication.admitted)refuse("controller deletion retired publication admission");
+    // No destructor, allocator or platform callback runs under the producer
+    // leaf. Completed originals are observed first and retired outside it.
     std::shared_ptr<recovery_receiver_controller> controller;
-    {std::lock_guard<std::mutex> lock(state->mutex);controller=state->controller.lock();if(!controller){controller=candidate;state->controller=controller;}}
+    std::array<std::shared_ptr<controller_worker_original>,64> prior,retired;
+    {std::lock_guard lock(state->mutex);controller=state->controller.lock();prior=state->controller_originals;}
+    if(!controller){
+        auto candidate_original=std::make_shared<controller_worker_original>();
+        std::array<bool,64> joined{},failed{};
+        for(size_t at=0;at<prior.size();++at)if(prior[at]){
+            const auto observed=prior[at]->wait_until(std::chrono::steady_clock::now());
+            joined[at]=observed.constructor_complete&&observed.actual==recovery_controller_executor::ending::disposition::joined;
+            failed[at]=observed.constructor_failed;
+        }
+        size_t selected=prior.size();bool retiring=false;
+        {
+            std::lock_guard lock(state->mutex);
+            retiring=state->controller_deletion_retiring;
+            if(!retiring){
+                for(size_t at=0;at<prior.size();++at)if(joined[at]&&state->controller_originals[at]==prior[at]){
+                    if(failed[at]&&!state->first_failed_controller_original)
+                        state->first_failed_controller_original=prior[at];
+                    retired[at]=std::move(state->controller_originals[at]);
+                }
+                for(size_t at=0;at<prior.size();++at)if(!state->controller_originals[at]){
+                    selected=at;state->controller_originals[at]=candidate_original;break;
+                }
+            }
+        }
+        if(retiring)refuse("controller deletion retired candidate construction");
+        if(selected==prior.size())refuse("controller original ending custody capacity exhausted");
+        std::shared_ptr<recovery_receiver_controller> candidate;
+        try{candidate=std::shared_ptr<recovery_receiver_controller>(new recovery_receiver_controller(state->policy,candidate_original));}
+        catch(...){candidate_original->failed_constructor(std::current_exception());throw;}
+        if(state->controller_creator!=database_native_process())refuse("controller candidate belongs to another process");
+        candidate_original->succeeded_constructor(); // shared_ptr construction/assignment actually returned
+        {
+            std::lock_guard lock(state->mutex);
+            retiring=state->controller_deletion_retiring;
+            controller=state->controller.lock();
+            if(!retiring&&!controller){controller=candidate;state->controller=controller;}
+        }
+        if(retiring){candidate->retire_for_deletion();refuse("controller deletion refused late candidate publication");}
+        // A racing candidate's actual worker retires off the producer leaf;
+        // its independently reserved original remains until real reaper join.
+    }
     return controller->attach(std::move(owner),route,source,transport,scheduler,lifetime);
+#else
+    refuse("continuous browser controller ending unavailable");
+#endif
 }
 recovery_continuous_producer::cohort_admission recovery_continuous_producer::controller_cohort(
     const recovery_receiver_controller& controller,const std::shared_ptr<lattice_db>& owner,
@@ -598,8 +783,49 @@ bool recovery_continuous_producer::reconciliation_work_current(
        work->state_!=owner->recovery_continuous_->state)refuse("restricted export lost counted descriptor custody");
     return recovery_receiver_controller::reconciliation_route_current(work->reconciliation_,work->restricted_route_,owner,work->physical_);
 }
+namespace {
+// One scoped producer context, never a callback or a generic publication hook.
+// The common install retains the actual owner/writer throughout this frame.
+struct controller_resume_commit_frame {
+    static thread_local controller_resume_commit_frame* current;
+    controller_resume_commit_frame* previous;
+    const recovery_receiver_controller* controller;
+    const lattice_db* owner;
+    std::shared_ptr<recovery_continuous_admission> admission;
+    std::shared_ptr<recovery_continuous_state> state;
+    database* writer=nullptr;
+    int64_t incarnation=0,barrier=0,attempt=0;
+    uint64_t gate_revision=0;
+    bool armed=false,published=false;
+    controller_resume_commit_frame(const recovery_receiver_controller& c,const lattice_db* o)noexcept
+        :previous(current),controller(&c),owner(o){current=this;}
+    ~controller_resume_commit_frame(){current=previous;}
+    controller_resume_commit_frame(const controller_resume_commit_frame&)=delete;
+};
+thread_local controller_resume_commit_frame* controller_resume_commit_frame::current=nullptr;
+}
+void publish_controller_resume_after_owned_commit(lattice_db& owner,database& writer) {
+    auto* pending=controller_resume_commit_frame::current;
+    if(!pending||pending->owner!=&owner||!pending->armed||pending->published)return;
+    const auto& state=pending->state;
+    if(pending->writer!=&writer||!state||!pending->admission||
+       pending->admission->owner!=&owner||pending->admission->writer!=&writer||
+       pending->admission->state!=state||owner.is_closed())
+        refuse("controller committed resume lost exact owner/writer custody");
+    // Same Native -> state-mutex order as controller_resume_owned. No SQL,
+    // arbitrary callback, user payload or clock; successful publication does
+    // not allocate. Refusal uses the existing bounded exception path.
+    std::lock_guard lock(state->mutex);
+    if(!state->initialized||state->controller.lock().get()!=pending->controller||
+       state->incarnation!=pending->incarnation||state->barrier!=pending->barrier||
+       state->attempt!=pending->attempt||state->gate_revision!=pending->gate_revision||
+       state->operations||state->dml_open.load(std::memory_order_acquire))
+        refuse("controller committed resume generation was revoked");
+    state->dml_open.store(true,std::memory_order_release);pending->published=true;
+}
 recovery_install_result recovery_continuous_producer::controller_owned(const recovery_receiver_controller& controller,
     std::shared_ptr<lattice_db> owner,const std::function<void(database&)>& body,bool controller_try) {
+    controller_resume_commit_frame publication(controller,owner.get());
     return recovery_writer_access::install_impl(owner,[&](database& db){
         if(!owner->recovery_continuous_)refuse("controller lost actual continuous owner");
         auto state=owner->recovery_continuous_->state;
@@ -664,6 +890,18 @@ void recovery_continuous_producer::controller_resume_owned(const recovery_receiv
     writer->execute("UPDATE _lattice_producer_continuity SET phase=0 WHERE id=1 AND phase=3 AND barrier=? AND attempt=?",{barrier,attempt});
     const auto after=writer->query(continuous_query).at(0);
     if(integer(after,"phase")!=0||integer(after,"barrier")!=barrier||integer(after,"attempt")!=attempt)refuse("controller resume transition changed");
+    // Arm only after the actual resumed journals and exact phase-0 postimage.
+    // A body failure/rollback/failed COMMIT discards this frame without opening.
+    auto* publication=controller_resume_commit_frame::current;
+    if(!publication||publication->owner!=owner.get()||publication->controller!=&controller||publication->armed)
+        refuse("controller resume lacks exact scoped publication custody");
+    std::lock_guard lock(state->mutex);
+    if(state->controller.lock().get()!=&controller||state->operations||state->dml_open.load()||
+       state->barrier!=barrier||state->attempt!=attempt||!state->initialized)
+        refuse("controller resume publication generation changed");
+    publication->admission=owner->recovery_continuous_;publication->state=state;publication->writer=writer;
+    publication->incarnation=state->incarnation;publication->barrier=barrier;publication->attempt=attempt;
+    publication->gate_revision=state->gate_revision;publication->armed=true;
 }
 void recovery_continuous_producer::controller_restart_terminal_owned(const recovery_receiver_controller& controller,
     std::shared_ptr<lattice_db> owner,int64_t physical_incarnation,int64_t barrier,int64_t attempt) {
@@ -711,6 +949,9 @@ void recovery_continuous_producer::controller_publish_resume(const recovery_rece
     if(!owner||owner->is_closed()||!owner->recovery_continuous_)return;
     const auto state=owner->recovery_continuous_->state;
     std::lock_guard<std::mutex> lock(state->mutex);
-    if(state->controller.lock().get()==&controller&&state->barrier==barrier&&state->attempt==attempt&&!state->operations)
-        state->dml_open.store(true,std::memory_order_release);
+    // Offlock acknowledgement only. Opening authority was consumed at known
+    // COMMIT under Native admission; this old tail cannot reopen a new barrier.
+    if(state->controller.lock().get()==&controller&&state->barrier==barrier&&state->attempt==attempt&&
+       !state->operations&&!state->dml_open.load(std::memory_order_acquire))
+        refuse("controller resume was not published with known COMMIT");
 }

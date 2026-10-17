@@ -105,7 +105,13 @@ public:
     recovery_continuous_route(const recovery_continuous_route&)=delete;
     recovery_continuous_route& operator=(const recovery_continuous_route&)=delete;
 };
+class controller_store_ending;
+class store_deletion_operation;
 class recovery_continuous_producer {
+    friend class store_deletion_operation;
+#ifndef __EMSCRIPTEN__
+    static controller_store_ending retire_controller_for_deletion(const std::shared_ptr<lattice_db>&);
+#endif
     friend class ::lattice::swift_lattice_ref;
     friend struct recovery_continuous_admission;
     // Closed recipe: only native and Swift retained-owner factories construct it.

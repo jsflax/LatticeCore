@@ -1,0 +1,97 @@
+name: Actual Engram managed startup qualification
+
+# A new disposable hosted OS account is the fixed native installation namespace.
+# The existing release workflow/public package pins are not changed.
+on:
+  push:
+    branches: ['codex/engram-managed-startup-registration-004-20260930']
+  workflow_dispatch:
+    inputs:
+      managed_startup_gate:
+        description: 'Qualify the reviewed new-origin primary MCP path in an actual dedicated hosted account; no populated-store adoption'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  actual-product:
+    if: inputs.managed_startup_gate == true
+    name: Actual managed primary MCP (macos)
+    runs-on: macos-26
+    timeout-minutes: 235
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      ENGRAM_MANAGED_HOSTED_GATE: '1'
+      ENGRAM_WORKFLOW_SHA: ${{ github.workflow_sha }}
+    steps:
+      - name: Bootstrap exact reviewed source under localdev
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BOOTSTRAP_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_REPOSITORY" = jsflax/Engram
+          test "$RUNNER_OS" = macOS
+          test "$ENGRAM_WORKFLOW_SHA" = "$GITHUB_SHA"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          umask 077
+          MANAGED_ROOT="$HOME/localdev/managed-startup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$MANAGED_ROOT"
+          mkdir -p "$MANAGED_ROOT/bootstrap" "$MANAGED_ROOT/tmp"
+          export TMPDIR="$MANAGED_ROOT/tmp"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+          # The initial source checkout is workflow bootstrap, never product or
+          # compiler qualification. Its failure prevents the guardian starting.
+          git -c core.hooksPath=/dev/null init "$MANAGED_ROOT/engram" > "$MANAGED_ROOT/bootstrap/checkout.log" 2>&1
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$BOOTSTRAP_TOKEN" | base64 | tr -d '\n')"
+          git -c core.hooksPath=/dev/null -C "$MANAGED_ROOT/engram" fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA" >> "$MANAGED_ROOT/bootstrap/checkout.log" 2>&1
+          unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 BOOTSTRAP_TOKEN
+          git -c core.hooksPath=/dev/null -C "$MANAGED_ROOT/engram" checkout --detach "$GITHUB_SHA" >> "$MANAGED_ROOT/bootstrap/checkout.log" 2>&1
+          test "$(git -C "$MANAGED_ROOT/engram" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C "$MANAGED_ROOT/engram" status --porcelain)"
+          PYTHON_EXECUTABLE="$(command -v python3)"
+          test -x "$PYTHON_EXECUTABLE"
+          # The dedicated child must read only the fixed exec gate from this
+          # bootstrap checkout. Keep raw bootstrap logs/private temp mode0700.
+          chmod 0711 "$HOME/localdev" "$MANAGED_ROOT"
+          chmod 0755 "$MANAGED_ROOT/engram" "$MANAGED_ROOT/engram/scripts"
+          chmod 0644 "$MANAGED_ROOT/engram/scripts/managed_startup_exec_gate.py"
+          # The root guardian subsequently reads this exact fresh local Git
+          # source. Transfer ownership before use; no safe.directory bypass.
+          sudo -n chown -R -P 0 "$MANAGED_ROOT/engram"
+          printf 'MANAGED_ROOT=%s\nMANAGED_PYTHON=%s\nTMPDIR=%s\n' "$MANAGED_ROOT" "$PYTHON_EXECUTABLE" "$MANAGED_ROOT/tmp" >> "$GITHUB_ENV"
+
+      - name: Own actual account, compiler graph, final installer and thirteen cases
+        timeout-minutes: 215
+        shell: bash
+        env:
+          SWIFTLM_CLONE_TOKEN: ${{ secrets.SWIFTLM_CLONE_TOKEN }}
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          # No HOME override represents an installation account. The guardian
+          # creates and verifies an actual unused non-admin directory-service
+          # account, then sets real child credentials before its fixed exec.
+          sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_EVENT_NAME,GITHUB_RUN_ATTEMPT,GITHUB_REPOSITORY,GITHUB_SHA,ENGRAM_WORKFLOW_SHA,ENGRAM_MANAGED_HOSTED_GATE,SWIFTLM_CLONE_TOKEN,PATH,DEVELOPER_DIR,SDKROOT \
+            "$MANAGED_PYTHON" -I -S -B "$MANAGED_ROOT/engram/scripts/managed_startup_hosted.py" \
+            --source-root "$MANAGED_ROOT/engram" --control-root "$MANAGED_ROOT/control" --engram-commit "$GITHUB_SHA" \
+            > "$MANAGED_ROOT/bootstrap/guardian.log" 2>&1
+
+      - name: Retain only bounded reconstructed first observations
+        if: always() && env.MANAGED_ROOT != ''
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: engram-managed-startup-macos-attempt-${{ github.run_attempt }}
+          path: ${{ env.MANAGED_ROOT }}/control/public/*.json
+          if-no-files-found: error
+          retention-days: 14

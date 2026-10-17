@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cstddef>
+#include <thread>
 
 namespace lattice { class database; }
 namespace lattice::detail {
@@ -15,6 +16,27 @@ class ordinary_target_history_spool;
 class ordinary_target_history_page_reader;
 template<bool Receiving> class ordinary_resource_reservation;
 struct ordinary_history_decoded_page;
+struct ordinary_target_raw_object_record;
+// First-member post-member tail only. No Native/descriptor effects or grant.
+class ordinary_target_raw_object_tail final {
+    friend class ordinary_target_staging_connection;
+    friend class ordinary_target_history_spool;
+    friend class ordinary_target_history_page_append;
+    friend class ordinary_target_history_page_reader;
+    const ordinary_launch::process_identity process_=ordinary_launch::current_process();
+    const std::thread::id thread_=std::this_thread::get_id();
+    const void* const object_;
+    const void* const state_;
+    const unsigned kind_;
+    bool construction_returned_=false;
+    std::shared_ptr<ordinary_target_raw_object_record> first_;
+    ordinary_target_raw_object_tail(const void*,const void*,unsigned)noexcept;
+    bool bind(const std::shared_ptr<ordinary_target_raw_object_record>&)noexcept;
+public:
+    ~ordinary_target_raw_object_tail()noexcept;
+    ordinary_target_raw_object_tail(const ordinary_target_raw_object_tail&)=delete;
+    ordinary_target_raw_object_tail& operator=(const ordinary_target_raw_object_tail&)=delete;
+};
 
 // Coordinates extracted only from the SAME active Native phase's retained,
 // sealed row. This DATA object grants no read or descriptor operation.
@@ -26,6 +48,7 @@ class ordinary_target_history_page_reader final {
     friend class ordinary_target_staging_connection;
     friend class ::lattice::database;
     struct state;
+    ordinary_target_raw_object_tail terminal_raw_tail_; // First member: state and all members end before this tail.
     const std::shared_ptr<state> state_;
     explicit ordinary_target_history_page_reader(std::shared_ptr<state>);
     static std::size_t retained_bytes(std::uint64_t);
@@ -50,6 +73,7 @@ class ordinary_target_history_page_append final {
     friend class ordinary_target_staging_connection;
     friend class ::lattice::database;
     struct state;
+    ordinary_target_raw_object_tail terminal_raw_tail_; // First member: state and all members end before this tail.
     const std::shared_ptr<state> state_;
     explicit ordinary_target_history_page_append(std::shared_ptr<state>);
     std::pair<std::uint64_t,std::uint64_t> require_durable_span(
@@ -76,6 +100,7 @@ class ordinary_target_history_spool final {
     friend class ordinary_target_history_page_append;
     friend class ordinary_target_history_page_reader;
     struct state;
+    ordinary_target_raw_object_tail terminal_raw_tail_; // First member: state and all members end before this tail.
     std::shared_ptr<state> state_;
     explicit ordinary_target_history_spool(std::shared_ptr<state>);
     static void prepare(const std::shared_ptr<ordinary_target_staging_connection>&,

@@ -2,6 +2,7 @@
 // Private fixed phase banks. Actual call/resource originals are monotonic; no
 // importer/caller quota, replay, public native handle or recovery authority.
 struct ordinary_target_staging_connection::database_scope::scope_state {
+    ordinary_target_scope_root_tail terminal_scope_root_{this,1}; // First: actual scope payload members end before this tail.
     std::weak_ptr<state> original;
     ::lattice::database* shell=nullptr;
     std::shared_ptr<database_retirement_state> retirement;
@@ -18,6 +19,7 @@ struct ordinary_target_staging_connection::database_scope::scope_state {
     bool callback_credit_sealed=false;
     bool cleanup=false,schema=false,catalog=false,history_header=false,history_page=false,projection=false,history_chain=false,import_suspension=false,row_import=false,ending=false,published=false,left=false,failed=false;
     std::weak_ptr<ordinary_group_target_schema_original> schema_original;
+    const void* schema_identity=nullptr; // Actual original captured while its weak source is still live.
     bool schema_begin_observed=false,schema_commit_observed=false,schema_rollback_observed=false;
     int schema_begin_rc=SQLITE_MISUSE,schema_commit_rc=SQLITE_MISUSE,schema_rollback_rc=SQLITE_MISUSE;
     std::size_t schema_finalizations=0;
@@ -26,6 +28,7 @@ struct ordinary_target_staging_connection::database_scope::scope_state {
     bool open_observed=false,close_observed=false,native_files_joined=false,abandonment_environment_joined=false;
     sqlite3* native=nullptr;int open_rc=SQLITE_MISUSE,close_rc=SQLITE_MISUSE;
     std::array<int,20> configurations{};std::size_t configuration_count=0;
+    scope_state(){terminal_scope_root_.construction_returned_=true;}
     void require(const ::lattice::database& actual)const {
         const auto owner=original.lock();
         if(!owner||!owner->creator_current()||!published||left||shell!=&actual||
@@ -389,7 +392,7 @@ int ordinary_target_staging_connection::state::file_lock(resource& file,std::siz
     (void)file;(void)index;(void)command;(void)type;(void)start;(void)length;return SQLITE_IOERR_LOCK;
 #endif
 }
-ordinary_target_staging_connection::database_scope::database_scope(std::shared_ptr<scope_state> value):held_(std::move(value)){}
+ordinary_target_staging_connection::database_scope::database_scope(std::shared_ptr<scope_state> value):held_(std::move(value)){terminal_scope_root_.construction_returned_=true;}
 ordinary_target_staging_connection::database_scope::~database_scope(){if(held_&&held_->shell)(void)leave(*held_->shell);}
 void ordinary_target_staging_connection::database_scope::require_current(const ::lattice::database& actual)const {
     if(!held_)birth_fail("target database scope missing");
@@ -458,6 +461,90 @@ bool ordinary_target_staging_connection::end_terminal_environment(const ::lattic
     }catch(...){return false;}
 }
 
+// Read-only first history of this exact wrapper. No scope/ledger/environment
+// ownership is copied. A failed leave remains failed; no Native effect is issued.
+// Same bounded readonly scope history for exactly four other Native roles.
+ordinary_target_staging_connection::database_scope::terminal_static_scope_history
+ordinary_target_staging_connection::database_scope::terminal_static_detached_history(
+    const ::lattice::database& actual,const ordinary_target_staging_connection& connection,
+    const ordinary_group_target_receiving_owner& receiving,const void* cleanup,std::uint64_t generation,std::size_t selected)const noexcept {
+    terminal_static_scope_history result;auto& observed=result.common;
+    try {
+        const auto native=held_?held_->original.lock():nullptr;
+        if(!native||!native->creator_current()||native->facade.lock().get()!=&connection||
+           native->shell.get()!=&actual||!connection.terminal_receiver_input_history_matches(receiving,cleanup,generation)||
+           held_->shell!=&actual||!held_->retirement||held_->retirement!=actual.retirement_||
+           !held_->schema||held_->cleanup||held_->history_page||held_->history_chain||held_->row_import||selected>=4||
+           held_->catalog!=(selected==0)||held_->history_header!=(selected==1)||
+           held_->projection!=(selected==2)||held_->import_suspension!=(selected==3)||
+           native->last_scope==held_||native->scope_identity==held_.get()||native->active_scope.lock()==held_)return result;
+        if(held_->published) {
+            if(!held_->left||!held_->generation||held_->generation>=generation||!held_->ledger||
+               held_->ledger->issuer!=held_.get()||held_->ledger->count>held_->ledger->calls.size()||
+               held_->active_callback_slot!=held_->callback_originals.size()||held_->active_callback_generation||
+               held_->settling_callback_slot!=held_->callback_originals.size()||held_->settling_callback_generation)return result;
+            for(std::size_t at=0;at<held_->ledger->count;++at)
+                if(held_->ledger->calls[at].entered&&!held_->ledger->calls[at].returned)return result;
+        }else if(held_->generation||held_->ledger||held_->environment||held_->cleanup_predecessor||
+            held_->left||held_->leave_returned||held_->leave_joined)return result;
+        // Actual unpublished allocation failure has no role/native effects;
+        // actual published detachment may have a failed/non-returned leave.
+        observed.scope_original=held_.get();observed.retirement_original=held_->retirement.get();
+        observed.ledger_original=held_->ledger.get();observed.environment_original=held_->environment.get();
+        observed.generation=held_->generation;observed.call_count=held_->ledger?held_->ledger->count:0;
+        observed.published=held_->published;observed.left=held_->left;observed.failed=held_->failed;observed.ending=held_->ending;
+        observed.leave_returned=held_->leave_returned;observed.leave_joined=held_->leave_joined;
+        observed.callback_credit_sealed=held_->callback_credit_sealed;
+        observed.active_callback_slot=held_->active_callback_slot;observed.active_callback_generation=held_->active_callback_generation;
+        observed.settling_callback_slot=held_->settling_callback_slot;observed.settling_callback_generation=held_->settling_callback_generation;
+        observed.settling_callback_high_generation=held_->settling_callback_high_generation;
+        observed.schema_begin_observed=held_->schema_begin_observed;observed.schema_begin_rc=held_->schema_begin_rc;
+        observed.schema_commit_observed=held_->schema_commit_observed;observed.schema_commit_rc=held_->schema_commit_rc;
+        observed.schema_rollback_observed=held_->schema_rollback_observed;observed.schema_rollback_rc=held_->schema_rollback_rc;
+        observed.schema_finalizations=held_->schema_finalizations;observed.schema_finalization_failed=held_->schema_finalization_failed;
+        observed.detached_known=true;result.kind=selected;return result; // Last action, after exact original readonly checks.
+    }catch(...){return result;}
+}
+ordinary_target_staging_connection::database_scope::terminal_page_scope_history
+ordinary_target_staging_connection::database_scope::terminal_page_detached_history(
+    const ::lattice::database& actual,const ordinary_target_staging_connection& connection,
+    const ordinary_group_target_receiving_owner& receiving,const void* cleanup,std::uint64_t generation)const noexcept {
+    terminal_page_scope_history observed;
+    try {
+        const auto native=held_?held_->original.lock():nullptr;
+        if(!native||!native->creator_current()||native->facade.lock().get()!=&connection||
+           native->shell.get()!=&actual||!connection.terminal_receiver_input_history_matches(receiving,cleanup,generation)||
+           held_->shell!=&actual||!held_->retirement||held_->retirement!=actual.retirement_||
+           !held_->schema||!held_->history_page||held_->cleanup||held_->catalog||held_->history_header||
+           held_->projection||held_->history_chain||held_->import_suspension||held_->row_import||
+           native->last_scope==held_||native->scope_identity==held_.get()||native->active_scope.lock()==held_)return observed;
+        if(held_->published) {
+            if(!held_->left||!held_->generation||held_->generation>=generation||!held_->ledger||
+               held_->ledger->issuer!=held_.get()||held_->ledger->count>held_->ledger->calls.size()||
+               held_->active_callback_slot!=held_->callback_originals.size()||held_->active_callback_generation||
+               held_->settling_callback_slot!=held_->callback_originals.size()||held_->settling_callback_generation)return observed;
+            for(std::size_t at=0;at<held_->ledger->count;++at)
+                if(held_->ledger->calls[at].entered&&!held_->ledger->calls[at].returned)return observed;
+        }else if(held_->generation||held_->ledger||held_->environment||held_->cleanup_predecessor||
+            held_->left||held_->leave_returned||held_->leave_joined)return observed;
+        // Actual unpublished allocation failure has no role/native effects;
+        // actual published detachment may have a failed/non-returned leave.
+        observed.scope_original=held_.get();observed.retirement_original=held_->retirement.get();
+        observed.ledger_original=held_->ledger.get();observed.environment_original=held_->environment.get();
+        observed.generation=held_->generation;observed.call_count=held_->ledger?held_->ledger->count:0;
+        observed.published=held_->published;observed.left=held_->left;observed.failed=held_->failed;observed.ending=held_->ending;
+        observed.leave_returned=held_->leave_returned;observed.leave_joined=held_->leave_joined;
+        observed.callback_credit_sealed=held_->callback_credit_sealed;
+        observed.active_callback_slot=held_->active_callback_slot;observed.active_callback_generation=held_->active_callback_generation;
+        observed.settling_callback_slot=held_->settling_callback_slot;observed.settling_callback_generation=held_->settling_callback_generation;
+        observed.settling_callback_high_generation=held_->settling_callback_high_generation;
+        observed.schema_begin_observed=held_->schema_begin_observed;observed.schema_begin_rc=held_->schema_begin_rc;
+        observed.schema_commit_observed=held_->schema_commit_observed;observed.schema_commit_rc=held_->schema_commit_rc;
+        observed.schema_rollback_observed=held_->schema_rollback_observed;observed.schema_rollback_rc=held_->schema_rollback_rc;
+        observed.schema_finalizations=held_->schema_finalizations;observed.schema_finalization_failed=held_->schema_finalization_failed;
+        observed.detached_known=true;return observed; // Last action, after exact original readonly checks.
+    }catch(...){return observed;}
+}
 bool ordinary_target_staging_connection::database_scope::leave(const ::lattice::database& actual)noexcept {
     if(!held_)return false;
     if(held_->left){const auto original=held_->original.lock();
@@ -1091,7 +1178,7 @@ void ordinary_target_staging_connection::begin_database_schema(::lattice::databa
     native->schema_attempted=true; // Native ending capacity already resides in SAME fixed ledger.
     auto scope=std::make_shared<database_scope::scope_state>();
     scope->original=native;scope->shell=&actual;scope->retirement=actual.retirement_;
-    scope->schema=true;scope->schema_original=original;scope->native=actual.db_;
+    scope->schema=true;scope->schema_original=original;scope->schema_identity=original.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope)); // Before post-current/error conversion.
     native->publish_scope(scope);
     retained->require_current(actual);
@@ -1189,7 +1276,7 @@ void ordinary_target_staging_connection::begin_database_catalog(::lattice::datab
     original->require_catalog(*this,end);actual.require_target_metadata_ending_(*this,*original);
     native->catalog_attempted=true; // Distinct role; constructor/metadata histories are never reset.
     auto scope=std::make_shared<database_scope::scope_state>();scope->original=native;scope->shell=&actual;
-    scope->retirement=actual.retirement_;scope->schema=true;scope->catalog=true;scope->schema_original=original;scope->native=actual.db_;
+    scope->retirement=actual.retirement_;scope->schema=true;scope->catalog=true;scope->schema_original=original;scope->schema_identity=original.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope));
     native->publish_scope(scope);
     retained->require_current(actual);
@@ -1219,7 +1306,7 @@ void ordinary_target_staging_connection::begin_database_history_header(::lattice
     actual.require_target_catalog_ending_(*this,*schema);
     native->history_header_attempted=true; // No constructor/schema/catalog rearm or replacement.
     auto scope=std::make_shared<database_scope::scope_state>();scope->original=native;scope->shell=&actual;
-    scope->retirement=actual.retirement_;scope->schema=true;scope->history_header=true;scope->schema_original=schema;scope->native=actual.db_;
+    scope->retirement=actual.retirement_;scope->schema=true;scope->history_header=true;scope->schema_original=schema;scope->schema_identity=schema.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope));
     native->publish_scope(scope);
     retained->require_current(actual);
@@ -1239,7 +1326,7 @@ void ordinary_target_staging_connection::begin_database_history_page(::lattice::
     actual.require_target_history_header_ending_(*this,*receiving);
     ++native->history_page_scopes; // Actual newly issued page scope, no prior role reset or unknown replay.
     auto scope=std::make_shared<database_scope::scope_state>();scope->original=native;scope->shell=&actual;scope->retirement=actual.retirement_;
-    scope->schema=true;scope->history_page=true;scope->schema_original=schema;scope->native=actual.db_;
+    scope->schema=true;scope->history_page=true;scope->schema_original=schema;scope->schema_identity=schema.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope));
     native->publish_scope(scope);retained->require_current(actual);
 }
@@ -1259,7 +1346,7 @@ void ordinary_target_staging_connection::begin_database_projection(::lattice::da
     const auto schema=receiving->require_header_schema(*this);schema->require_projection(*this,end);
     native->projection_attempted=true; // No catalog/header/page/constructor rearming.
     auto scope=std::make_shared<database_scope::scope_state>();scope->original=native;scope->shell=&actual;
-    scope->retirement=actual.retirement_;scope->schema=true;scope->projection=true;scope->schema_original=schema;scope->native=actual.db_;
+    scope->retirement=actual.retirement_;scope->schema=true;scope->projection=true;scope->schema_original=schema;scope->schema_identity=schema.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope)); // Hold before post-current/diagnostics.
     native->publish_scope(scope);retained->require_current(actual);
 }
@@ -1281,7 +1368,7 @@ void ordinary_target_staging_connection::begin_database_history_chain(::lattice:
     const auto schema=receiving->require_header_schema(*this);schema->require_projection(*this,end);
     ++native->history_chain_scopes; // Genuine next phase only after previous actual ending, not a reset.
     auto scope=std::make_shared<database_scope::scope_state>();scope->original=native;scope->shell=&actual;
-    scope->retirement=actual.retirement_;scope->schema=true;scope->history_chain=true;scope->schema_original=schema;scope->native=actual.db_;
+    scope->retirement=actual.retirement_;scope->schema=true;scope->history_chain=true;scope->schema_original=schema;scope->schema_identity=schema.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope));
     native->publish_scope(scope);retained->require_current(actual);
 }
@@ -1302,7 +1389,7 @@ void ordinary_target_staging_connection::begin_database_import_suspension(::latt
     actual.require_target_import_suspension_issued_(*this,*receiving);
     const auto schema=receiving->require_header_schema(*this);schema->require_import_suspension(*this,end);
     auto scope=std::make_shared<database_scope::scope_state>();scope->original=native;scope->shell=&actual;
-    scope->retirement=actual.retirement_;scope->schema=true;scope->import_suspension=true;scope->schema_original=schema;scope->native=actual.db_;
+    scope->retirement=actual.retirement_;scope->schema=true;scope->import_suspension=true;scope->schema_original=schema;scope->schema_identity=schema.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope)); // Held before native effects and postchecks.
     native->publish_scope(scope);retained->require_current(actual);
 }
@@ -1324,7 +1411,7 @@ void ordinary_target_staging_connection::begin_database_row_import(::lattice::da
     const auto schema=receiving->require_header_schema(*this);schema->require_row_import(*this,end);
     ++native->row_import_scopes;
     auto scope=std::make_shared<database_scope::scope_state>();scope->original=native;scope->shell=&actual;
-    scope->retirement=actual.retirement_;scope->schema=true;scope->row_import=true;scope->schema_original=schema;scope->native=actual.db_;
+    scope->retirement=actual.retirement_;scope->schema=true;scope->row_import=true;scope->schema_original=schema;scope->schema_identity=schema.get();scope->native=actual.db_;
     retained=std::unique_ptr<database_scope>(new database_scope(scope));
     native->publish_scope(scope);retained->require_current(actual);
 }

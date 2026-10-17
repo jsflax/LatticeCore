@@ -6,7 +6,9 @@ bool database::target_staging_native_cleanup_known_(
     const detail::ordinary_target_staging_connection& connection)const noexcept {
     try {
         const auto state=target_staging_;
-        if(!state||!state->current_creator()||state->connection.lock().get()!=&connection||
+        // Once outer-root extraction is attempted, this LIVE/absence-tolerant
+        // observer is permanently unavailable. Use the distinct first history.
+        if(!state||state->terminal_native_outer_attempted||!state->current_creator()||state->connection.lock().get()!=&connection||
            !state->initialization_attempted||!state->native_open_attempted||!state->native_open_returned||
            !state->retirement_requested||!state->cleanup_attempted||!state->cleanup_admission_returned||
            !state->cleanup_admitted||!state->cleanup_scope||!state->close_returned||

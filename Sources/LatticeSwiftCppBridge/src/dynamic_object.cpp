@@ -39,6 +39,30 @@ overloaded(Ts...) -> overloaded<Ts...>;
 
 namespace lattice {
 
+void dynamic_object::swap_graph_state(dynamic_object& other) noexcept {
+    using Managed = managed<swift_dynamic_object>;
+    static_assert(std::is_nothrow_move_constructible_v<Managed>);
+    static_assert(std::is_nothrow_move_assignable_v<Managed>);
+    static_assert(std::is_nothrow_move_constructible_v<swift_dynamic_object>);
+    static_assert(std::is_nothrow_move_assignable_v<swift_dynamic_object>);
+    if (this == &other) return;
+    if (bool(lattice) == bool(other.lattice)) {
+        if (lattice) std::swap(managed_, other.managed_);
+        else std::swap(unmanaged_, other.unmanaged_);
+    } else {
+        auto& bound = lattice ? *this : other;
+        auto& unbound = lattice ? other : *this;
+        swift_dynamic_object saved(std::move(unbound.unmanaged_));
+        unbound.unmanaged_.~swift_dynamic_object();
+        new (&unbound.managed_) Managed(std::move(bound.managed_));
+        bound.managed_.~Managed();
+        new (&bound.unmanaged_) swift_dynamic_object(std::move(saved));
+    }
+    lattice.swap(other.lattice);
+    std::swap(deleted_, other.deleted_);
+    std::swap(row_cache_enabled_, other.row_cache_enabled_);
+}
+
 std::string dynamic_object::debug_description() const {
     auto is_managed = lattice != nullptr;
     std::string table_name;
@@ -160,26 +184,12 @@ dynamic_object& dynamic_object::operator=(const dynamic_object &o) {
     return *this;
 }
 
-void dynamic_object::set_object(const std::string &name, const dynamic_object_ref& value) {
-    // impl_-> gives non-const access to the pointee even through a const ref
-    // (shared_ptr::operator-> is const but yields a non-const T*), so a const
-    // ref suffices and avoids the Swift inout-& asymmetry between the FRT (class)
-    // and value-type imports.
-    if (lattice) {
-        // Use the pointer specialization which handles nil fields safely
-        managed<swift_dynamic_object *> field = managed_.get_managed_field<swift_dynamic_object *>(name);
-        if (value.impl_->lattice) {
-            // Child is already managed — assign the managed object pointer
-            field = &value.impl_->managed_;
-        } else {
-            // Child is unmanaged — assign unmanaged value (will be auto-managed)
-            field = value.impl_->unmanaged_;
-            value.impl_->manage(field.value());
-        }
-    } else {
-        unmanaged_.link_values[name] = value.impl_;
-    }
+void dynamic_object::set_object(const std::string& name, const dynamic_object_ref& value) {
+    if (!value.impl_) throw db_error("link mutation requires a live target");
+    if (lattice) lattice->mutate_link(*this, name, value.impl_);
+    else unmanaged_.link_values[name] = value.impl_;
 }
+
 
 
 dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_NAME(getObject(named:)) SWIFT_RETURNS_INDEPENDENT_VALUE {
@@ -225,11 +235,17 @@ dynamic_object dynamic_object::get_object(const std::string &name) const SWIFT_N
 // ============================================================================
 
 union_value dynamic_object_ref::get_union(const std::string& name) const {
-    return impl_->get_union(name);
+    return sealed([&] {
+        if (!impl_) throw std::runtime_error("Union read requires a valid ref");
+        return impl_->get_union(name);
+    });
 }
 
 void dynamic_object_ref::set_union(const std::string& name, const union_value& value) const {
-    impl_->set_union(name, value);
+    sealed([&] {
+        if (!impl_) throw std::runtime_error("Union mutation requires a valid ref");
+        impl_->set_union(name, value);
+    });
 }
 
 // ============================================================================
@@ -349,6 +365,11 @@ union_value dynamic_object::get_union(const std::string& name) const {
 }
 
 void dynamic_object::set_union(const std::string& name, const union_value& value) {
+    if (lattice) { lattice->mutate_union(*this, name, value); return; }
+    unmanaged_.union_values[name] = std::make_shared<union_value>(value);
+}
+
+void dynamic_object::set_union_body(const std::string& name, const union_value& value) {
     if (lattice) {
         // Managed: update or insert union row, then update parent FK
         auto prop_it = managed_.properties_.find(name);
@@ -609,7 +630,7 @@ lattice::link_list lattice::dynamic_object::list_backing(const std::string& name
         const property_descriptor& property = managed_.properties_.at(name);
         model_base* base = const_cast<model_base*>(static_cast<const model_base*>(&managed_));
         m.bind_to_parent(base, property);
-        return link_list(m);
+        return link_list(m, lattice);
     }
     // Unmanaged: a list that was never staged reads as empty (the raw
     // accessor would throw std::out_of_range on the absent key).
@@ -733,4 +754,9 @@ std::string lattice::dynamic_object::to_json(int64_t max_depth) const {
     std::set<std::string> visited;
     json_walk(*this, max_depth, visited, &out);
     return out.dump();
+}
+
+lattice::bridge_owner_identity lattice::dynamic_object_ref::owner_identity() const noexcept {
+    if (!impl_) return {};
+    return swift_lattice_ref::identity_for_owner(impl_->lattice);
 }

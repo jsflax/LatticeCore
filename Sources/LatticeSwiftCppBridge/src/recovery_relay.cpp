@@ -11,7 +11,7 @@ void relay_failure()noexcept {
 }
 relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup(const std::string& policy,const std::string& connection,
     void* context,int32_t(*current)(void*),void(*destroy)(void*))const noexcept {
-    last_bridge_error().clear();
+    clear_bridge_outcome();
     try{relay_recovery_setup result;
         result.value_=detail::authenticated_relay_setup::open(impl_,policy,connection,context,current,destroy);return result;
     }catch(...){relay_failure();return {};}
@@ -19,7 +19,7 @@ relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup(const std::str
 bool relay_recovery_setup::valid()const noexcept{return bool(value_);}
 relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup_automatic(const std::string& policy,const std::string& connection,
     void* context,int32_t(*current)(void*),int32_t(*admissible)(void*),void(*destroy)(void*))const noexcept {
-    last_bridge_error().clear();
+    clear_bridge_outcome();
     try {
         relay_recovery_setup result;
         result.value_=detail::authenticated_relay_setup::open_automatic(impl_,policy,connection,context,current,admissible,destroy,
@@ -29,7 +29,7 @@ relay_recovery_setup swift_lattice_ref::open_relay_recovery_setup_automatic(cons
 }
 int32_t swift_lattice_ref::migrate_relay_receipt_coverage_file(const std::string& path,const SchemaVector& schemas,
     int64_t schema_version,int32_t busy_timeout_ms,const std::string& prior,const std::string& next)noexcept {
-    last_bridge_error().clear();
+    clear_bridge_outcome();
     try {
         if(schema_version<1||schema_version>INT32_MAX)throw db_error("receipt administration declared schema version outside bounds");
         swift_configuration declared;declared.target_schema_version=static_cast<int>(schema_version);
@@ -91,19 +91,19 @@ relay_lifecycle_adoption_result swift_lattice_ref::adopt_relay_lifecycle_file(co
     return out;
 }
 int32_t swift_lattice_ref::migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept {
-    last_bridge_error().clear();
+    clear_bridge_outcome();
     try{return detail::authenticated_relay_setup::migrate_receipt_coverage(impl_,prior,next)?1:2;}
     catch(...){relay_failure();return 4;}
 }
 std::string relay_recovery_setup::descriptor()const noexcept {
-    last_bridge_error().clear();try{return value_?value_->descriptor():std::string{};}catch(...){relay_failure();return {};}
+    clear_bridge_outcome();try{return value_?value_->descriptor():std::string{};}catch(...){relay_failure();return {};}
 }
 relay_recovery_stop relay_recovery_setup::stop_token()const noexcept {relay_recovery_stop r;if(value_)r.value_=value_->stop_token();return r;}
 bool relay_recovery_setup::finish_authorization(const std::string& outcome)const noexcept {
-    last_bridge_error().clear();try{return value_&&value_->finish_authorization(outcome);}catch(...){relay_failure();return false;}
+    clear_bridge_outcome();try{return value_&&value_->finish_authorization(outcome);}catch(...){relay_failure();return false;}
 }
 relay_recovery_result relay_recovery_setup::receive(const std::string& frame)const noexcept {
-    last_bridge_error().clear();relay_recovery_result result;
+    clear_bridge_outcome();relay_recovery_result result;
     try{if(!value_)return result;auto actual=value_->receive(frame);result.status_=actual.status;
         result.ids_=std::move(actual.applied);result.operation_=std::move(actual.operation);return result;
     }catch(...){relay_failure();result.status_=4;return result;}
@@ -113,7 +113,7 @@ void relay_recovery_stop::stop()const noexcept{if(value_)value_->stop();}
 bool relay_recovery_stop::live()const noexcept{return value_&&value_->live();}
 bool relay_recovery_stop::drained()const noexcept{return !value_||value_->drained();}
 relay_ready_charge relay_recovery_stop::reserve_ready(uint64_t bytes)const noexcept {
-    last_bridge_error().clear();relay_ready_charge result;
+    clear_bridge_outcome();relay_ready_charge result;
     try{if(value_)result.value_=value_->reserve_ready(bytes);}catch(...){relay_failure();}return result;
 }
 int32_t relay_recovery_result::status_code()const noexcept{return status_;}
@@ -123,7 +123,7 @@ std::vector<std::string> relay_recovery_result::take_ids()noexcept {
 }
 bool relay_recovery_result::publishable()const noexcept{return operation_&&operation_->publishable();}
 relay_ready_result relay_recovery_setup::ready(const std::string& wire,const relay_ready_charge& charge)const noexcept {
-    last_bridge_error().clear();relay_ready_result result;
+    clear_bridge_outcome();relay_ready_result result;
     try{if(!value_)return result;auto actual=value_->ready(wire,charge.value_);result.status_=actual.status;
         result.wire_=std::move(actual.wire);result.request_id_=std::move(actual.request_id);result.operation_=std::move(actual.operation);return result;
     }catch(...){relay_failure();result.status_=4;return result;}

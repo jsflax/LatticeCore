@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.0.8] - 2026-10-17
+
+### Fixed
+- Skip startup sync-repair writer admission when no audit entry is acknowledged
+  by every currently registered replication slot. When repair is needed,
+  recheck eligibility under writer ownership and atomically update the audit
+  flags and remove collapsed per-channel state. Confirmations from removed
+  channels no longer substitute for missing live-channel acknowledgements;
+  best-effort repair preserves an existing caller transaction on failure.
+- Avoid waiting for foreign readers when foreground read-generation acquisition
+  attempts a pending WAL checkpoint. Keep unsuccessful truncation requests
+  pending for bounded maintenance retry, including when no later write occurs.
+- Use `poll` for Linux/Android database-change notifications so high-numbered
+  descriptors do not index beyond `fd_set`. Handle shutdown and failed watch
+  descriptors without spinning on persistent poll errors.
+
+### Compatibility
+- No persistent schema, sync wire format, or public API signature change is
+  intended. Rebuild Core and generated C++/Swift bridge consumers together.
+- Independent SQLite readers still constrain WAL truncation; maintenance keeps
+  its existing bounded wait policy.
 ## [2.0.7] - 2026-09-21
 
 ### Fixed

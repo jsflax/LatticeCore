@@ -3,10 +3,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -112,29 +114,45 @@ struct TraceGuard {
     ~TraceGuard() { sqlite3_trace_v2(db, 0, nullptr, nullptr); }
 };
 
-// Observe the actual constructor's new connections without a production seam.
-// Registration is scoped; tests run serially and only this thread is selected.
-struct OpeningTrace {
-    static inline thread_local OpeningTrace* current = nullptr;
-    std::string path;
-    Trace trace;
-    int connections = 0;
-    static int extension(sqlite3* db, char**, const sqlite3_api_routines*) noexcept {
-        if (!current) return SQLITE_OK;
-        const char* path = sqlite3_db_filename(db, "main");
-        if (!path || current->path != path) return SQLITE_OK;
-        ++current->connections;
-        return sqlite3_trace_v2(db, SQLITE_TRACE_STMT, Trace::callback, &current->trace);
+// The constructor does not expose its new SQLite handles. Use its existing
+// logger instead of process-global SQLite auto extensions (unsupported on
+// Apple). Under a retained foreign writer every attempted writer admission
+// fails visibly; the legitimate deferred fingerprint read remains allowed.
+struct ConstructorLog {
+    std::filesystem::path path;
+    FILE* file = nullptr;
+    FILE* previous_file = nullptr;
+    log_level previous_level;
+    explicit ConstructorLog(const OwnedFile& owned) : path(owned.path.string() + ".reopen.log") {
+        file = std::fopen(path.string().c_str(), "w+");
+        require(file != nullptr, "constructor log open");
+        std::lock_guard<std::mutex> hold(g_log_mutex());
+        previous_file = g_log_file.load(std::memory_order_acquire);
+        previous_level = get_log_level();
+        g_log_file.store(file, std::memory_order_release);
+        set_log_level(log_level::debug);
     }
-    explicit OpeningTrace(const OwnedFile& file) : path(file.path.string()) {
-        require(current == nullptr, "no nested opening trace");
-        require(sqlite3_auto_extension(reinterpret_cast<void(*)()>(extension)) == SQLITE_OK,
-                "opening trace registration");
-        current = this;
+    ~ConstructorLog() {
+        {
+            std::lock_guard<std::mutex> hold(g_log_mutex());
+            g_log_file.store(previous_file, std::memory_order_release);
+            set_log_level(previous_level);
+            std::fclose(file);
+        }
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
     }
-    ~OpeningTrace() {
-        current = nullptr;
-        sqlite3_cancel_auto_extension(reinterpret_cast<void(*)()>(extension));
+    std::string snapshot() const {
+        std::lock_guard<std::mutex> hold(g_log_mutex());
+        require(std::fflush(file) == 0 && std::fseek(file, 0, SEEK_END) == 0,
+                "constructor log flush");
+        const auto length = std::ftell(file);
+        require(length >= 0 && length <= 1024 * 1024, "bounded constructor log");
+        require(std::fseek(file, 0, SEEK_SET) == 0, "constructor log rewind");
+        std::string text(static_cast<size_t>(length), '\0');
+        require(std::fread(text.data(), 1, text.size(), file) == text.size(), "constructor log read");
+        require(std::fseek(file, 0, SEEK_END) == 0, "constructor log append position");
+        return text;
     }
 };
 
@@ -148,19 +166,33 @@ TEST(StartupSyncRepair, HealthyReopenDoesNotAdmitWriter) {
     database blocker(f.file.path.string(), database::open_mode::read_write, 100);
     blocker.begin_transaction();
     {
-        OpeningTrace opening(f.file);
-        {
-            lattice_db reopened{config(f.file)};
-            EXPECT_EQ(image(reopened.db()), before);
-            EXPECT_TRUE(blocker.is_in_transaction());
-            EXPECT_EQ(sqlite3_txn_state(blocker.handle(), "main"), SQLITE_TXN_WRITE);
-            EXPECT_FALSE(reopened.db().is_in_transaction());
-        }
-        opening.trace.checked();
-        EXPECT_GT(opening.connections, 0);
-        EXPECT_EQ(opening.trace.begins, 0);
-        EXPECT_EQ(opening.trace.commits, 0);
-        EXPECT_EQ(opening.trace.rollbacks, 0);
+        // Directly prove the repair's no-admission property on a supported
+        // per-connection trace. The old unconditional BEGIN fails this check.
+        Trace trace;
+        TraceGuard guard(f.owner.db().handle(), trace);
+        f.owner.heal_collapsed_sync_state();
+        trace.checked();
+        EXPECT_EQ(trace.begins, 0);
+        EXPECT_EQ(trace.commits, 0);
+        EXPECT_EQ(trace.rollbacks, 0);
+        EXPECT_EQ(image(f.owner.db()), before);
+    }
+    {
+        ConstructorLog log(f.file);
+        lattice_db reopened{config(f.file)};
+        EXPECT_EQ(image(reopened.db()), before);
+        EXPECT_TRUE(blocker.is_in_transaction());
+        EXPECT_EQ(sqlite3_txn_state(blocker.handle(), "main"), SQLITE_TXN_WRITE);
+        EXPECT_FALSE(reopened.db().is_in_transaction());
+        // Inspect only initialization, before reopened's destructor can run
+        // checkpoint/maintenance. Successful markers prove logging is active.
+        const auto startup = log.snapshot();
+        SCOPED_TRACE(startup);
+        EXPECT_NE(startup.find("ctor start path=" + f.file.path.string()), std::string::npos);
+        EXPECT_NE(startup.find("ensure_tables: fast path (fingerprint match)"), std::string::npos);
+        EXPECT_NE(startup.find("ctor done"), std::string::npos);
+        EXPECT_EQ(startup.find("Failed to begin transaction"), std::string::npos);
+        EXPECT_EQ(startup.find("heal_collapsed_sync_state failed"), std::string::npos);
     }
     blocker.rollback();
     EXPECT_EQ(image(f.owner.db()), before);

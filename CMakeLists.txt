@@ -195,6 +195,24 @@ if(NOT APPLE)
 endif()
 
 
+# The old CAPI target is intentionally not built in this two-helper image.
+# Preserve every visibility property on the three actual retained product targets.
+# Default-hidden visibility (docs/CAPI-STABILITY.md rule 8): only the
+# LATTICE_EXPORT-annotated C surface leaves the shared library. Applied to the
+# static libs it absorbs too — their default-visibility symbols would
+# otherwise re-export through the .so.
+set(_lattice_hidden_targets LatticeCore LatticeSwiftCppBridge SqliteVec)
+if(TARGET sqlite3_bundled)
+    list(APPEND _lattice_hidden_targets sqlite3_bundled)
+endif()
+foreach(tgt ${_lattice_hidden_targets})
+    set_target_properties(${tgt} PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+endforeach()
+
 add_library(gtest STATIC Sources/GoogleTest/src/gtest-all.cc)
 target_include_directories(gtest PUBLIC Sources/GoogleTest/include)
 target_include_directories(gtest PRIVATE Sources/GoogleTest)

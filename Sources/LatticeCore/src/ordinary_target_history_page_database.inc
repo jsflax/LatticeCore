@@ -2,9 +2,16 @@
 // Included after header channel. No supplied SQL/path/old-owner/cut factory.
 #include "ordinary_history_record_key_recipe.hpp"
 #include "ordinary_target_history_spool.hpp"
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+#if !defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+#error "Receiving history fault qualification requires the debug macOS owner fixture"
+#endif
+#include "ordinary_receiver_reclamation_fixture.hpp"
+#endif
 namespace lattice {
 struct database::target_staging_state::history_page_native {
     using arguments=std::vector<column_value_t>;
+    terminal_native_page_tail terminal_page; // FIRST: runs after every actual page member dies.
     database* const shell;
     // SAME IO original is retained before SQL scope/native registration. The
     // numeric pair is its checked DATA; it cannot substitute for this original.
@@ -99,7 +106,7 @@ struct database::target_staging_state::history_page_native {
         const arguments& before_stage,const arguments& before_meta,const detail::ordinary_history_progress& before_progress,
         const picosha2::hash256_one_by_one& before_content,
         std::shared_ptr<const detail::ordinary_target_history_page_append> append,std::pair<std::uint64_t,std::uint64_t> span)
-        :shell(&actual),raw_append(std::move(append)),raw_span(span),owner(receiving),schema(original),previous(prior),stage(before_stage),meta(before_meta),progress(before_progress),content(before_content) {
+        :terminal_page(actual,receiving,this,input.index),shell(&actual),raw_append(std::move(append)),raw_span(span),owner(receiving),schema(original),previous(prior),stage(before_stage),meta(before_meta),progress(before_progress),content(before_content) {
         const ordinary_history_limits limits;
         if(input.index!=progress.next_page||input.previous!=progress.previous||progress.complete||input.records.empty()||input.records.size()>64||
            input.raw.empty()||input.raw.size()>limits.page_bytes||std::get<std::int64_t>(stage.at(15))<0||
@@ -167,6 +174,7 @@ struct database::target_staging_state::history_page_native {
         const auto header_original=actual.target_staging_->history_header;
         if(!header_original)throw db_error("target page actual header program missing");charge(header_original->logical_bytes);
         if(previous)charge(previous->logical_bytes); // Fixed two-page overlap; no successive allocation after unknown ending.
+        terminal_page.constructor_returned(); // Final constructor action, never a partial-page receipt.
     }
     void require(database& actual,bool unwind=false)const {
         const auto state=actual.target_staging_;
@@ -305,14 +313,14 @@ struct database::target_staging_state::history_page_native {
 };
 bool database::target_history_page_guard_destroyed_()const noexcept {
     const auto state=target_staging_;const auto actual=state?state->history_page:nullptr;
-    if(!state||!state->current_creator())return false;if(!actual)return true;
+    if(!state||!state->current_creator()||state->terminal_native_pages_attempted)return false;if(!actual)return true;
     if(!actual->userdata)return !actual->guard_registration_entered;
     return actual->guard_destroy_entered&&actual->guard_destroy_returned;
 }
 bool database::target_history_page_native_ending_()const noexcept {
     try {
         const auto state=target_staging_;const auto actual=state?state->history_page:nullptr;
-        if(!state||!state->current_creator()||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
+        if(!state||!state->current_creator()||state->terminal_native_pages_attempted||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
            !actual->guard_registration_entered||!actual->guard_registration_returned||actual->first_guard_registration_rc!=SQLITE_OK||
            !actual->userdata||actual->guard_destroy_entered||actual->guard_destroy_returned||!actual->previous_destroy_joined||
            actual->completed_operations!=10+2*actual->keys.size()||actual->guard_invocations!=actual->keys.size()+3)return false;
@@ -466,6 +474,13 @@ void database::stage_target_history_page_program_(const std::shared_ptr<detail::
         next->execute(*this,native::begin,next->begin_sql);++next->completed_operations;
         next->verify(*this,native::stage_before,next->stage_read_sql,next->stage_key,before_stage);++next->completed_operations;
         next->verify(*this,native::meta_before,next->meta_read_sql,next->stage_key,before_meta);++next->completed_operations;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+        if(next->terminal_page.page_index==1&&next->previous) {
+            next->require(*this); // SAME actual page/owner/currentness; no new role or deadline.
+            if(detail::ordinary_receiver_reclamation_fixture::history_page2_failure_requested(*receiving))
+                throw db_error("injected receiving history page2 pre-predecessor-release failure");
+        }
+#endif
         // Prior static bindings and actual guard/callback/VM ending are joined; release the old program only now.
         next->previous.reset();
         for(std::size_t at=0;at<next->keys.size();++at) {

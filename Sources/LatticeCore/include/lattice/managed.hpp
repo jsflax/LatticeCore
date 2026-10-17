@@ -17,6 +17,8 @@
 #include <functional>
 #include <mutex>
 #include "schema.hpp"
+#include "detail/observer_delivery_target.hpp"
+#include "detail/observer_delivery_assignment.hpp"
 
 // ============================================================================
 // nlohmann::json ADL serialization for lattice types
@@ -208,13 +210,15 @@ struct managed_base {
     // Captured with the parent; never recover a generation from a reused alias.
     int64_t attachment_token = 0;
     std::weak_ptr<database> attachment_writer;
+    detail::observer_delivery_identity observer_delivery_identity_;
     bool is_vector_column = false;  // True if this column is a vector for similarity search
 
     bool is_bound() const { return db != nullptr && row_id != 0; }
 
     void assign(database* d, lattice_db* l, const std::string& table,
                 const std::string& col, primary_key_t id, int64_t token = 0,
-                std::weak_ptr<database> writer = {}) {
+                std::weak_ptr<database> writer = {},
+                const detail::observer_delivery_identity& delivery = {}) {
         db = d;
         lattice = l;
         table_name = table;
@@ -222,6 +226,14 @@ struct managed_base {
         row_id = id;
         attachment_token = token;
         attachment_writer = std::move(writer);
+        observer_delivery_identity_=delivery;
+    }
+    detail::observer_delivery_target observer_delivery_target_for_field()const {
+        if(!is_bound()||!observer_delivery_identity_.valid()||
+           observer_delivery_identity_.rowid()!=row_id||observer_delivery_identity_.table()!=table_name||
+           observer_delivery_identity_.attachment_generation()!=attachment_token)
+            throw db_error("delivery field no longer matches its actual binding");
+        return detail::observer_delivery_target(observer_delivery_identity_,column_name);
     }
 
     // Called by LATTICE_BIND_PROP macro - implementation below after model_base
@@ -295,6 +307,13 @@ private:
 
 class model_base {
 public:
+    model_base() = default;
+    model_base(const model_base&) = default;
+    model_base& operator=(const model_base&) = default;
+    // The virtual destructor suppresses implicit moves. Preserve copy APIs,
+    // and give the private graph journal a real nonallocating ownership move.
+    model_base(model_base&&) noexcept = default;
+    model_base& operator=(model_base&&) noexcept = default;
     virtual ~model_base() = default;
 
     bool is_managed() const { return db_ != nullptr && id_ != 0; }
@@ -302,6 +321,14 @@ public:
     primary_key_t id() const { return id_; }
     const global_id_t& global_id() const { return global_id_; }
     const std::string& table_name() const { return table_name_; }
+    detail::observer_delivery_target observer_delivery_target_for(std::string_view column)const {
+        if(!is_managed()||!observer_delivery_identity_.valid()||
+           observer_delivery_identity_.rowid()!=id_||observer_delivery_identity_.table()!=table_name_||
+           observer_delivery_identity_.global_id()!=global_id_||
+           observer_delivery_identity_.attachment_generation()!=attachment_token_)
+            throw db_error("delivery model no longer matches its actual binding");
+        return detail::observer_delivery_target(observer_delivery_identity_,column);
+    }
 
     // Type-erased property access (for Swift C++ interop)
     virtual column_value_t get_value(const std::string& name) const {
@@ -368,6 +395,7 @@ protected:
     std::string table_name_;
     primary_key_t id_ = 0;
     global_id_t global_id_;
+    detail::observer_delivery_identity observer_delivery_identity_;
     // Nonpersisted physical-route generation, captured by query SQL. Zero is
     // main; positive values identify one attachment lifetime; -1 is invalid.
     int64_t attachment_token_ = 0;
@@ -387,6 +415,7 @@ inline void managed_base::bind_to_parent(model_base* parent, const char* prop_na
     row_id = parent->id_;
     attachment_token = parent->attachment_token_;
     attachment_writer = parent->attachment_writer_;
+    observer_delivery_identity_=parent->observer_delivery_identity_;
 }
 
 // ============================================================================
@@ -405,6 +434,9 @@ struct CONFORMS_TO_MANAGED managed<int64_t> : managed_base {
     }
 
     managed& operator=(int64_t v) SWIFT_NAME(set(_:)) {
+        if(detail::observer_delivery_assignment::enabled(*this)) {
+            detail::observer_delivery_assignment::scalar(*this,v);return *this;
+        }
         if (is_bound()) {
             detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
@@ -443,6 +475,9 @@ struct CONFORMS_TO_MANAGED managed<int> : managed_base {
     managed(int v) : unmanaged_value(v) {}
 
     managed& operator=(int v) SWIFT_NAME(set(_:)) {
+        if(detail::observer_delivery_assignment::enabled(*this)) {
+            detail::observer_delivery_assignment::scalar(*this,v);return *this;
+        }
         if (is_bound()) {
             detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<int64_t>(v)}});
@@ -482,6 +517,9 @@ struct CONFORMS_TO_MANAGED managed<double> : managed_base {
     managed(double v) : unmanaged_value(v) {}
     
     managed& operator=(double v) SWIFT_NAME(set(_:)) {
+        if(detail::observer_delivery_assignment::enabled(*this)) {
+            detail::observer_delivery_assignment::scalar(*this,v);return *this;
+        }
         if (is_bound()) {
             detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
@@ -518,6 +556,9 @@ struct CONFORMS_TO_MANAGED managed<float> : managed_base {
     managed(float v) : unmanaged_value(v) {}
 
     managed& operator=(float v) SWIFT_NAME(set(_:)) {
+        if(detail::observer_delivery_assignment::enabled(*this)) {
+            detail::observer_delivery_assignment::scalar(*this,v);return *this;
+        }
         if (is_bound()) {
             detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<double>(v)}});
@@ -557,6 +598,9 @@ struct CONFORMS_TO_MANAGED managed<bool> : managed_base {
     managed(bool v) : unmanaged_value(v) {}
 
     managed& operator=(bool v) SWIFT_NAME(set(_:)) {
+        if(detail::observer_delivery_assignment::enabled(*this)) {
+            detail::observer_delivery_assignment::scalar(*this,v);return *this;
+        }
         if (is_bound()) {
             detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             db->update(managed_table_sql(table_name), row_id, {{column_name, static_cast<int64_t>(v ? 1 : 0)}});
@@ -613,13 +657,29 @@ struct CONFORMS_TO_MANAGED managed<std::string> : managed_base {
         return os << m.detach();
     }
     
-    managed& operator=(std::string v) SWIFT_NAME(set(_:)) {
+private:
+    managed& assign_legacy_owned(std::string& v) {
         if (is_bound()) {
             detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer);
             db->update(managed_table_sql(table_name), row_id, {{column_name, v}});
         }
         unmanaged_value = v;
         return *this;
+    }
+public:
+    managed& operator=(const std::string& v) SWIFT_NAME(set(_:)) {
+        if(detail::observer_delivery_assignment::enabled(*this)) {
+            detail::observer_delivery_assignment::string(*this,v);return *this;
+        }
+        std::string owned(v); // same legacy owning snapshot, before the old body
+        return assign_legacy_owned(owned);
+    }
+    managed& operator=(std::string&& v) {
+        if(detail::observer_delivery_assignment::enabled(*this)) {
+            detail::observer_delivery_assignment::string(*this,v,&v);return *this;
+        }
+        std::string owned(std::move(v)); // same legacy consume-before-body
+        return assign_legacy_owned(owned);
     }
     
     operator std::string() const SWIFT_NAME(get()) { return detach(); }
@@ -1773,7 +1833,9 @@ struct CONFORMS_TO_OPTIONAL_MANAGED managed<std::vector<T*>, std::enable_if_t<is
     managed(Wrapped&& wrapped) {
         throw std::runtime_error("not supported");
     }
-    managed(managed&&) = default;
+    managed(managed&&) noexcept = default;
+    managed& operator=(const managed&) = default;
+    managed& operator=(managed&&) noexcept = default;
     
     // OptionalProtocol requirements - lists always "have value" (even if empty)
     bool hasValue() const SWIFT_NAME(hasValue()) { return true; }

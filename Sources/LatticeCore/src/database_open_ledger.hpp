@@ -13,7 +13,8 @@ public:
 private:
     struct entry {
         uint64_t serial=0;
-        bool occupied=false,attempted=false,object_done=false,builder_done=false,draining=false;
+        bool occupied=false,attempted=false,object_done=false,builder_done=false,draining=false,drain_returned=false;
+        int first_checked_close=database_retirement_state::not_attempted;
         std::shared_ptr<const database_retirement_state> native;
     };
     const uint64_t creator_=database_native_process();
@@ -41,6 +42,7 @@ private:
                 // Terminal acquire precedes the move/refusal observation.
                 if(value.native->state()!=database_retirement_state::phase::closed||value.native->owning_wrapper_moved())return;
             }
+            value.first_checked_close=value.native?value.native->checked_close_result():database_retirement_state::not_attempted;
             value.draining=true;native=std::move(value.native);
         }
         native.reset(); // Witness targets release OFF the ledger leaf.
@@ -50,6 +52,7 @@ private:
             std::lock_guard lock(leaf_);
             auto& value=entries_[slot];
             if(!value.occupied||value.serial!=serial||!value.draining)return;
+            value.drain_returned=true; // Actual original native witness reset returned before this publication.
             value.occupied=false;value.draining=false;--occupied_;
             if(sealed_&&occupied_==0&&tail_){tail=tail_;finish=finish_;tail_=nullptr;finish_=nullptr;}
         }
@@ -67,7 +70,8 @@ public:
         if(sealed_||serial_==std::numeric_limits<uint64_t>::max())throw db_error("history child native admission closed");
         for(size_t n=0;n<maximum_opens;++n)if(!entries_[n].occupied){
             auto& value=entries_[n];value.serial=++serial_;value.occupied=true;value.attempted=false;
-            value.object_done=false;value.builder_done=false;value.draining=false;++occupied_;
+            value.object_done=false;value.builder_done=false;value.draining=false;value.drain_returned=false;
+            value.first_checked_close=database_retirement_state::not_attempted;++occupied_;
             return {n,value.serial};
         }
         throw db_error("history child native open capacity exhausted");
@@ -95,6 +99,13 @@ public:
         {std::lock_guard lock(leaf_);if(slot>=maximum_opens)return;auto& value=entries_[slot];
             if(!value.occupied||value.serial!=serial)return;value.builder_done=true;}
         drain(slot,serial);
+    }
+    bool fixed_scope_original_ended(size_t slot,uint64_t serial) noexcept {
+        if(!in_creator_process()||slot>=maximum_opens||!serial)return false;
+        std::lock_guard lock(leaf_);const auto& value=entries_[slot];
+        return sealed_&&value.serial==serial&&value.attempted&&value.object_done&&value.builder_done&&
+            value.drain_returned&&value.first_checked_close==SQLITE_OK&&!value.occupied&&!value.draining&&!value.native;
+        // Positive original object/builder/drain returns, never an empty-slot inference.
     }
     bool seal_fixed_scope() noexcept {
         if(!in_creator_process())return false;

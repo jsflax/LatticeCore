@@ -12,19 +12,64 @@ namespace authenticated_ready_maintenance_test_observation {
 // lifecycle facts, change time or bypass the actual owned transaction.
 struct probe {const lattice_db* owner=nullptr;std::function<void(const char*)> observed;};
 std::shared_ptr<const probe> exchange(std::shared_ptr<const probe>);
+// Passive copies only, including when no service has ever been launched.
+// Neither map absence nor these counters is physical-ending authority.
+struct retirement_observation {
+    bool available=false,worker_exited=false,caller_is_worker=false;
+    uint64_t launches=0,requested=0,settled=0,boundaries=0;
+    size_t active_removal_originals=0;
+    size_t matching_registrations=0;
+};
+retirement_observation retirement(const instance_guard*) noexcept;
 }
 namespace authenticated_ready_control_test_observation {
 enum class operation : int32_t { unobserved,describe,prepare,resume,read,discard,inspect,predecessor,unknown };
 enum class point { entered,control_parsed,deadline_reserved,expiration_returned,prepare_returned,resume_returned,lease_copied,finished,count };
+// Test-only bounded copies from the actual retained capture exception. No
+// exception/owner is retained and no diagnostic participates in admission.
+enum class capture_exception_kind : uint8_t { unobserved,none,db_error,std_exception,non_std_exception };
+struct capture_failure {
+    capture_exception_kind kind=capture_exception_kind::unobserved;
+    std::array<char,512> message{};
+    uint16_t bytes=0;
+    bool truncated=false,null_message=false;
+};
+inline capture_failure copy_capture_failure(const std::exception_ptr& original) noexcept {
+    capture_failure out;
+    if(!original){out.kind=capture_exception_kind::none;return out;}
+    const auto copy=[&](capture_exception_kind kind,const char* text) noexcept {
+        out.kind=kind;if(!text){out.null_message=true;return;}
+        size_t n=0;for(;n+1<out.message.size()&&text[n];++n)out.message[n]=text[n];
+        out.bytes=static_cast<uint16_t>(n);out.truncated=text[n]!=0;
+    };
+    try {std::rethrow_exception(original);}
+    catch(const db_error& error){copy(capture_exception_kind::db_error,error.what());}
+    catch(const std::exception& error){copy(capture_exception_kind::std_exception,error.what());}
+    catch(...){out.kind=capture_exception_kind::non_std_exception;}
+    return out;
+}
 struct observation : canonical_ready_control_observation::stages<static_cast<size_t>(point::count)> {
     operation op=operation::unobserved;
+    capture_failure capture_failure_copy;
     // Copied only after native UUID validation; no untrusted/arbitrary string.
     std::array<char,37> request_id{};
     // Authenticated epoch milliseconds, distinct from retention-session time.
     int64_t clock_ms=-1,deadline_ms=-1,duration_ms=-1;
     canonical_ready_control_observation::settlement expiration,preparation,publication;
     bool capture_error=false,requires_full_request=false,lease_available=false;
+    // Passive, fixed copies only after the actual non-lifecycle discard returns.
+    // No exception pointer, owner, wire data or admission is retained here.
+    bool discard_observed=false;
+    int64_t logical_sequence=-1;
+    canonical_ready_control_observation::settlement discard;
+    capture_failure discard_primary,discard_cleanup;
 };
+inline void copy_discard(observation& out,const recovery_install_result& result) noexcept {
+    out.discard=canonical_ready_control_observation::copy(result);
+    out.discard_primary=copy_capture_failure(result.primary_error);
+    out.discard_cleanup=copy_capture_failure(result.cleanup_error);
+    out.discard_observed=true;
+}
 inline thread_local observation* current=nullptr;
 inline void mark(point p) noexcept {if(auto* value=current)value->mark(static_cast<size_t>(p));}
 }

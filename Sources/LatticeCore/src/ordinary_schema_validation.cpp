@@ -44,6 +44,8 @@ tokens lex(const std::string& s){tokens out;for(size_t i=0;i<s.size();){const ch
         const char a=s[i++];if(a==q){if(i<s.size()&&s[i]==q){x+=q;++i;}else{closed=true;break;}}else x+=a;}
         need(closed,"ordinary SQL unterminated quote");if(q=='\'')out.push_back("'"+x+"'");else {identifier(x);out.push_back(fold(x));}continue;}
     if(word(c)){auto start=i++;while(i<s.size()&&(word(s[i])||(s[i]=='.'&&s[start]>='0'&&s[start]<='9')))++i;out.push_back(fold(s.substr(start,i-start)));continue;}
+    // Generated union cascades spell inequality exactly !=. A bare ! is not SQL.
+    if(c=='!'&&i+1<s.size()&&s[i+1]=='='){out.push_back("!=");i+=2;continue;}
     need(std::string("(),;.=+-*%|[]<>").find(c)!=std::string::npos,"ordinary SQL token refused");
     need(!(c=='-'&&i+1<s.size()&&s[i+1]=='-'),"ordinary SQL comment refused");
     if(c=='|'&&i+1<s.size()&&s[i+1]=='|'){out.push_back("||");i+=2;}else {out.emplace_back(1,c);++i;}}
@@ -54,6 +56,26 @@ void remove_if(tokens& v){if(v.size()<3||v[0]!="create")return;const size_t i=(v
 std::string object_name(const std::string& sql,const std::string& kind){auto t=lex(sql);remove_if(t);size_t at=1;if(at<t.size()&&t[at]=="unique")++at;
     need(t.size()>at+1&&t[0]=="create"&&t[at]==kind,"ordinary generated object prefix");return t[at+1];}
 bool same_program(const std::string& a,const std::string& b){auto x=lex(a),y=lex(b);remove_if(x);remove_if(y);return x==y;}
+// Recover ordering DATA only. Even a successful extraction must subsequently
+// reproduce one complete approved typed bundle through unchanged same_program.
+// Never interpret arbitrary SQL expressions or search column permutations.
+std::optional<std::vector<std::string>> audit_insert_order(const std::string& sql){
+    const auto t=lex(sql);std::optional<std::vector<std::string>> result;
+    for(size_t i=0;i+1<t.size();++i)if(t[i]=="json_array"&&t[i+1]=="("){
+        if(result)return {};std::vector<std::string> order;size_t at=i+2;
+        for(;;){
+            if(at>=t.size()||order.size()>=ordinary_sync_limits::columns_per_table)return {};
+            const auto& value=t[at++];
+            if(value.size()<3||value.front()!='\''||value.back()!='\'')return {};
+            order.push_back(value.substr(1,value.size()-2));
+            if(at>=t.size())return {};
+            if(t[at]==")")break;
+            if(t[at++]!=",")return {};
+        }
+        result=std::move(order);
+    }
+    return result;
+}
 struct table_ddl {std::map<std::string,tokens> columns;std::vector<std::string> order;std::vector<tokens> constraints;bool without_rowid=false;};
 table_ddl parse_table(const std::string& sql,const std::string& name){auto t=lex(sql);remove_if(t);size_t i=2;
     need(t.size()>4&&t[0]=="create"&&t[1]=="table","ordinary table declaration kind");if(i+2<t.size()&&t[i]=="main"&&t[i+1]==".")i+=2;
@@ -147,6 +169,51 @@ struct validator {
             const auto d=default_tokens(clause);need(bool(d)==bool(c.default_sql),"ordinary pragma/DDL default presence");if(d)need(unparenthesized(*d)==unparenthesized(lex(*c.default_sql)),"ordinary pragma/DDL default mismatch");}
         foreign_keys(table);keep(f);owned.insert(fold(table));indexes(table,actual,cols,index_sql,expose);result.tables.emplace(table,ordinary_table_metadata{table,std::move(cols)});
     }
+    std::optional<std::vector<std::string>> recovered_audits(const ordinary_projection_table& table,
+            const std::vector<std::string>& approved){
+        if((table.role!=ordinary_projection_role::model&&table.role!=ordinary_projection_role::union_value)||approved.size()!=3)return {};
+        const auto insert_name=fold("Audit"+table.name+"Insert");
+        const auto input=all.find(insert_name);
+        if(input==all.end()||input->second.type!="trigger"||fold(input->second.owner)!=fold(table.name))return {};
+        const std::string* template_insert=nullptr;size_t capacity=0;
+        for(const auto& sql:approved){
+            if(sql.size()>16*1024*1024-capacity)return {};capacity+=sql.size();
+            if(object_name(sql,"trigger")==insert_name){if(template_insert)return {};template_insert=&sql;}
+        }
+        if(!template_insert)return {};
+        const auto expected=audit_insert_order(*template_insert),actual=audit_insert_order(input->second.sql);
+        if(!expected||!actual||expected->size()!=actual->size())return {};
+        std::set<std::string> allowed(expected->begin(),expected->end()),seen(actual->begin(),actual->end());
+        if(allowed.size()!=expected->size()||seen.size()!=actual->size()||seen!=allowed)return {};
+        std::map<std::string,const ordinary_projection_column*> declared;
+        for(const auto& column:table.columns)
+            if(!declared.emplace(column.audit_name,&column).second)return {};
+        const auto columns=[&](const std::vector<std::string>& order){
+            std::vector<std::pair<std::string,column_type>> out;out.reserve(order.size());
+            for(const auto& name:order){const auto found=declared.find(name);if(found==declared.end())return decltype(out){};
+                out.emplace_back(name,found->second->type);}
+            return out;
+        };
+        const auto original=columns(*expected),ordered=columns(*actual);
+        if(original.size()!=expected->size()||ordered.size()!=actual->size())return {};
+        std::set<std::string> no_history;
+        for(const auto& name:allowed)if(declared.at(name)->no_history)no_history.insert(name);
+        // First prove this approved variant is the SAME protected generator,
+        // not a custom SQL template that could confer a different authority.
+        size_t index=0;bool exact=true;
+        ordinary_model_audit_programs(table.name,original,no_history,{},[&](const std::string& sql){
+            if(index>=approved.size()||!same_program(approved[index],sql))exact=false;++index;
+        });
+        if(!exact||index!=approved.size())return {};
+        // One transient three-program candidate; a permutation preserves the
+        // aggregate byte size of its already admitted approved generator.
+        std::vector<std::string> candidate;size_t bytes=0;
+        ordinary_model_audit_programs(table.name,ordered,no_history,{},[&](const std::string& sql){
+            need(candidate.size()<3&&sql.size()<=read.limits.sql_bytes&&sql.size()<=capacity-bytes,
+                "ordinary recovered audit recipe bound");bytes+=sql.size();candidate.push_back(sql);
+        });
+        if(candidate.size()!=3)return {};return candidate;
+    }
     void audits(const ordinary_projection_table& table){
         const auto matches=[&](const std::vector<std::string>& bundle){for(const auto& sql:bundle){auto name=object_name(sql,"trigger");auto i=all.find(name);
             if(i==all.end()||i->second.type!="trigger"||fold(i->second.owner)!=fold(table.name)||!same_program(i->second.sql,sql))return false;}
@@ -156,6 +223,13 @@ struct validator {
             return true;};
         const std::vector<std::string>* chosen=matches(table.audit_programs)?&table.audit_programs:nullptr;
         if(!chosen)for(const auto& alternate:table.alternate_audit_programs)if(matches(alternate)){chosen=&alternate;break;}
+        std::vector<std::string> recovered;
+        if(!chosen){
+            const auto try_order=[&](const std::vector<std::string>& approved){auto value=recovered_audits(table,approved);
+                if(value&&matches(*value)){recovered=std::move(*value);chosen=&recovered;}};
+            try_order(table.audit_programs);
+            if(!chosen)for(const auto& alternate:table.alternate_audit_programs){try_order(alternate);if(chosen)break;}
+        }
         need(chosen,"ordinary complete audit program bundle mismatch");for(const auto& sql:*chosen)trigger(sql,table.name);
     }
     void trigger(const std::string& sql,const std::string& owner){const auto name=object_name(sql,"trigger");const auto& f=fact(name,"trigger",owner);need(same_program(f.sql,sql),"ordinary generated trigger mismatch");keep(f);}

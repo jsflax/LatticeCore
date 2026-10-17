@@ -3,6 +3,8 @@
 #include "ordinary_managed_receiver_preservation.hpp"
 #include "ordinary_managed_receiver_wss.hpp"
 #include "ordinary_history_final_install.hpp"
+#include "ordinary_history_refund_observation.hpp"
+#include <lattice/owned_catalog.hpp>
 #include "ordinary_managed_baseline_paging.hpp"
 #include "ordinary_managed_wss_binding.hpp"
 #include "ordinary_managed_product_route.hpp"
@@ -141,6 +143,13 @@ struct ordinary_wire_original_test_access;
 
 struct ordinary_delivery_outcome {std::string gid,version;int64_t audit_id=0;bool settled=false;};
 class ordinary_export_access final {
+    friend struct ordinary_history_refund_test_access;
+    static ordinary_history_refund_observation observe_history_refund(const ordinary_history_export&);
+    static ordinary_history_refund_observation observe_history_refund(const ordinary_mounted_history_source&);
+    static bool history_has_refund_observation(const ordinary_history_export&)noexcept;
+    static lattice_close_result close_history_child_for_test(const ordinary_history_export&);
+    static std::shared_ptr<database> history_child_xproc_for_test(const ordinary_history_export&);
+    static catalog_stream_operation history_child_catalog_for_test(const ordinary_history_export&,const std::string&,int64_t);
     // Only the existing owning history wrappers may call their private implementation.
     friend class ::lattice::ordinary_history_export;
     friend auto ::lattice::capture_ordinary_history_export(lattice_db&,

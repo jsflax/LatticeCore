@@ -101,6 +101,12 @@ struct recovery_refresh_state {
     std::shared_ptr<const managed_observation_state::interest_callback> managed_hook;
     bool in_flight = false;
     bool requested = false, manual = false;
+    // Independent of the witness delivery ticket: a scheduler may keep that
+    // ticket queued indefinitely without starving storage maintenance.
+    bool automatic_enabled = false, automatic_enrolling = false, automatic_running = false;
+    size_t automatic_pauses = 0;
+    std::chrono::steady_clock::time_point automatic_next_poll{};
+    uint64_t automatic_attempts = 0, automatic_quiet = 0, automatic_deferred = 0, automatic_completed = 0;
     lattice_db* owner = nullptr; // guarded by the independent heap lifetime guard
     std::shared_ptr<instance_guard> guard;
     std::weak_ptr<scheduler> delivery_scheduler; // never keep a queued-work cycle alive
@@ -162,7 +168,8 @@ struct recovery_refresh_worker {
                     auto& shared = i->second;
                     std::lock_guard<std::mutex> state_lock(shared->mutex);
                     if (stopped || !shared->guard->alive.load() ||
-                        (!shared->in_flight && !shared->managed_registrations && !shared->interested())) {
+                        (!shared->automatic_enabled && !shared->automatic_enrolling &&
+                         !shared->in_flight && !shared->managed_registrations && !shared->interested())) {
                         retired.push_back(shared); i = signal->owners.erase(i);
                     } else { work.push_back(shared); ++i; }
                 }
@@ -187,6 +194,286 @@ struct recovery_refresh_worker {
     }
 };
 #endif
+
+
+namespace {
+struct enrollment_failure { bool armed = true; };
+thread_local std::weak_ptr<enrollment_failure> next_enrollment_failure;
+void increment(uint64_t& value) noexcept { if (value != UINT64_MAX) ++value; }
+}
+
+bool recovery_refresh_access::enable_automatic_maintenance(lattice_db& owner) {
+    ordinary_require_creator(owner.config_.ordinary_context);
+    owner.require_catalog_callback_absent();
+    if (owner.closed_.load(std::memory_order_seq_cst)) throw db_error("automatic maintenance owner closed");
+    if (owner.config_.is_in_memory() || owner.config_.read_only) return false;
+#ifdef __EMSCRIPTEN__
+    throw db_error("automatic maintenance requires a native process worker");
+#else
+    // Existing enabled originals must not allocate a discarded state or
+    // acquire a new startup failure on an idempotent cached-alias call.
+    auto shared = state(owner, false);
+    if (!shared) shared = state(owner, true); // state() rechecks under ownership.
+    if (!shared) throw db_error("automatic maintenance owner closed");
+    {
+        std::lock_guard<std::mutex> lock(shared->mutex);
+        if (shared->automatic_enabled) return true;
+        if (shared->manual || shared->automatic_enrolling)
+            throw db_error("automatic maintenance registration unavailable");
+        shared->automatic_enrolling = true; // Pins registry admission, no SQL interest yet.
+    }
+    try {
+        if (auto fault = next_enrollment_failure.lock(); fault && fault->armed) {
+            fault->armed = false;
+            throw std::bad_alloc();
+        }
+        // Construct/start the real worker and admit this state before success.
+        recovery_refresh_worker::instance().add(shared);
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            if (!shared->guard->alive.load(std::memory_order_seq_cst))
+                throw db_error("automatic maintenance owner closed during registration");
+            shared->automatic_enabled = true;
+            shared->automatic_enrolling = false;
+        }
+        signal(shared);
+        return true;
+    } catch (...) {
+        std::shared_ptr<recovery_refresh_signal> wake;
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            shared->automatic_enrolling = false;
+            wake = shared->wake.lock();
+        }
+        // Never remove/reset existing witness registrations, acknowledgements,
+        // or interest. A now-uninterested entry is pruned by the actual worker.
+        if (wake) wake->notify();
+        throw;
+    }
+#endif
+}
+
+void recovery_refresh_access::maintain(const std::shared_ptr<recovery_refresh_state>& shared) noexcept {
+#ifndef __EMSCRIPTEN__
+    try {
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            const auto now = std::chrono::steady_clock::now();
+            if (!shared->automatic_enabled || shared->automatic_running || shared->automatic_pauses ||
+                now < shared->automatic_next_poll) return;
+            shared->automatic_running = true;
+            shared->automatic_next_poll = now + std::chrono::seconds(1);
+            increment(shared->automatic_attempts);
+        }
+        struct turn {
+            std::shared_ptr<recovery_refresh_state> shared;
+            ~turn() {
+                std::lock_guard<std::mutex> lock(shared->mutex);
+                shared->automatic_running = false;
+            }
+        } ticket{shared};
+        owner_hold hold(shared->guard);
+        if (!hold.admitted) return;
+        auto outcome = maintenance_result::deferred;
+        try { outcome = maintain_owner(*shared->owner); } catch (...) { /* Retain all obligations. */ }
+        std::lock_guard<std::mutex> lock(shared->mutex);
+        if (outcome == maintenance_result::quiet) increment(shared->automatic_quiet);
+        else if (outcome == maintenance_result::completed) increment(shared->automatic_completed);
+        else increment(shared->automatic_deferred);
+    } catch (...) { /* No exception can terminate the one process worker. */ }
+#else
+    (void)shared;
+#endif
+}
+
+bool recovery_refresh_access::retire_due_generations(lattice_db& owner, bool pressure, bool& work) {
+    std::vector<std::shared_ptr<lattice_db::read_generation>> due;
+    {
+        std::unique_lock<std::mutex> lock(owner.read_pool_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        const auto now = std::chrono::steady_clock::now();
+        const auto now_ms = lattice_db::steady_ms_now();
+        const auto ttl = owner.read_generation_ttl_ms_.load(std::memory_order_relaxed);
+        const auto max_age = owner.read_generation_max_age_ms_.load(std::memory_order_relaxed);
+        for (const auto& gen : owner.live_generations_) {
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - gen->pinned_at).count();
+            const bool idle = gen->in_flight.load(std::memory_order_acquire) == 0;
+            const bool ttl_due = ttl > 0 && idle && now_ms - gen->last_read_steady_ms.load() >= ttl;
+            if (pressure || gen->retiring.load() || ttl_due || (max_age > 0 && age >= max_age)) {
+                due.push_back(gen); // Allocate BEFORE changing actual retirement state.
+            }
+        }
+        for (const auto& gen : due) gen->retiring.store(true, std::memory_order_release);
+    }
+    bool ended_all = true;
+    for (const auto& gen : due) {
+        work = true;
+        const auto conn = gen->conn;
+        if (!conn) { ended_all = false; continue; }
+        // Keep the generation charged and visible while its exact original
+        // remains in a transaction. A failed COMMIT is never a pool/refund.
+        if (gen->in_flight.load(std::memory_order_acquire)) conn->interrupt();
+        auto* h = conn->internal_handle();
+        if (!h) { ended_all = false; continue; }
+        statement_guard native(h);
+        if (!native.owned) { ended_all = false; continue; }
+        conn->require_creator_();
+        conn->require_catalog_clean_locked_();
+        if (conn->is_closed() || conn->channel_reset_unsettled_.load(std::memory_order_acquire) ||
+            sqlite3_txn_state(h, nullptr) == SQLITE_TXN_WRITE) { ended_all = false; continue; }
+        bool busy = false;
+        for (auto* stmt = sqlite3_next_stmt(h, nullptr); stmt; stmt = sqlite3_next_stmt(h, stmt))
+            if (sqlite3_stmt_busy(stmt)) { busy = true; break; }
+        if (busy) { ended_all = false; continue; }
+        if (sqlite3_get_autocommit(h) == 0) {
+            database::record_statement();
+            // Private read keeper only, under uninterrupted try-admitted
+            // SQLite custody. The existing observed native path preserves
+            // statement/finalize errors without a topology wait under Native.
+            const int rc = conn->execute_observed_sql_("COMMIT");
+            if (rc != SQLITE_OK || sqlite3_get_autocommit(h) == 0) { ended_all = false; continue; }
+        }
+        // The actual known ending precedes removal. A bookkeeping race keeps
+        // it conservatively counted for a later turn; never restart its txn.
+        std::unique_lock<std::mutex> lock(owner.read_pool_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) { ended_all = false; continue; }
+        const auto found = std::find(owner.live_generations_.begin(), owner.live_generations_.end(), gen);
+        if (found == owner.live_generations_.end()) continue; // Another genuine retire path owns its tail.
+        if (!owner.closed_.load() && gen->in_flight.load(std::memory_order_acquire) == 0 &&
+            owner.idle_read_pool_.size() + owner.live_generations_.size() - 1 < owner.read_pool_capacity_ &&
+            std::find(owner.idle_read_pool_.begin(), owner.idle_read_pool_.end(), conn) == owner.idle_read_pool_.end())
+            owner.idle_read_pool_.push_back(conn); // Allocation failure leaves it counted.
+        owner.live_generations_.erase(found);
+    }
+    return ended_all;
+}
+
+recovery_refresh_access::maintenance_result recovery_refresh_access::maintain_owner(lattice_db& owner) {
+    ordinary_require_creator(owner.config_.ordinary_context);
+    bool pending = false;
+    instance_registry::instance().for_each_alive(owner.config_.path, [&](lattice_db* inst) {
+        pending = pending || inst->wal_eviction_pending_.load(std::memory_order_acquire);
+    });
+    bool work = false, readers_ended = true;
+    if (!pending) {
+        // No SQL, writer-mutex inspection, connection mint or projection epoch
+        // change on the quiet path. Only an actually due keeper may do work.
+        readers_ended = retire_due_generations(owner, false, work);
+        if (!work) return readers_ended ? maintenance_result::quiet : maintenance_result::deferred;
+        return readers_ended ? maintenance_result::completed : maintenance_result::deferred;
+    }
+    std::vector<std::pair<std::shared_ptr<projection_pressure_source>, uint64_t>> pressure;
+    instance_registry::instance().for_each_alive(owner.config_.path, [&](lattice_db* inst) {
+        for (const auto& source : inst->projection_pressure_sources())
+            if (source->pending()) pressure.emplace_back(source, source->raised.load(std::memory_order_acquire));
+        if (!retire_due_generations(*inst, true, work)) readers_ended = false;
+    });
+    for (const auto& [source, _] : pressure) retire_projection_store(source->identity);
+    for (const auto& [source, _] : pressure)
+        if (projection_store_readers(source->identity) != 0) readers_ended = false;
+    instance_registry::instance().for_each_alive(owner.config_.path, [&](lattice_db* inst) {
+        std::unique_lock<std::mutex> lock(inst->read_pool_mutex_, std::try_to_lock);
+        if (!lock.owns_lock() || !inst->live_generations_.empty()) readers_ended = false;
+    });
+    if (!readers_ended) return maintenance_result::deferred;
+    std::shared_ptr<database> writer;
+    {
+        std::unique_lock<std::mutex> lock(owner.connection_ownership_mutex_, std::try_to_lock);
+        if (!lock.owns_lock() || owner.closed_.load() || owner.config_.read_only) return maintenance_result::deferred;
+        writer = owner.db_;
+    }
+    if (!writer) return maintenance_result::deferred;
+    // Unlike a preflight probe, this scope retains the successful Native try
+    // admission through policy mutation, checkpoint, and restoration. A busy
+    // user's Native mutex or transaction defers without blocking other owners.
+    database::maintenance_scope::admission admission;
+    database::maintenance_scope native(*writer, &admission);
+    if (admission != database::maintenance_scope::admission::ready) return maintenance_result::deferred;
+    const auto result = writer->wal_checkpoint(true, 250);
+    if (result.rc != SQLITE_OK || result.busy != 0) return maintenance_result::deferred;
+    for (const auto& [source, through] : pressure) source->acknowledge(through);
+    instance_registry::instance().for_each_alive(owner.config_.path, [](lattice_db* inst) {
+        inst->wal_eviction_pending_.store(false, std::memory_order_seq_cst);
+        for (const auto& source : inst->projection_pressure_sources())
+            if (source->pending()) inst->wal_eviction_pending_.store(true, std::memory_order_seq_cst);
+    });
+    return maintenance_result::completed;
+}
+
+std::shared_ptr<void> recovery_refresh_test_access::pause_automatic_maintenance(lattice_db& owner) {
+    owner.require_catalog_callback_absent();
+    auto shared = recovery_refresh_access::state(owner, false);
+    if (!shared) throw db_error("automatic pause requires enrolled live owner");
+    struct pause {
+        std::shared_ptr<recovery_refresh_state> shared;
+        bool admitted = false;
+        ~pause() {
+            if (!admitted) return;
+            std::shared_ptr<recovery_refresh_signal> wake;
+            { std::lock_guard<std::mutex> lock(shared->mutex); --shared->automatic_pauses; wake = shared->wake.lock(); }
+#ifndef __EMSCRIPTEN__
+            if (wake) wake->notify();
+#endif
+        }
+    };
+    auto token = std::make_shared<pause>(); token->shared = shared;
+    {
+        std::lock_guard<std::mutex> lock(shared->mutex);
+        if (!shared->guard->alive.load() || !shared->automatic_enabled || shared->automatic_enrolling)
+            throw db_error("automatic pause requires enrolled live owner");
+        if (shared->automatic_running) return {};
+        if (shared->automatic_pauses == SIZE_MAX) throw db_error("automatic pause count exhausted");
+        ++shared->automatic_pauses; token->admitted = true;
+    }
+    return token;
+}
+automatic_maintenance_snapshot recovery_refresh_test_access::automatic_snapshot(lattice_db& owner) {
+    owner.require_catalog_callback_absent();
+    auto shared = recovery_refresh_access::state(owner, false);
+    if (!shared) return {};
+    std::lock_guard<std::mutex> lock(shared->mutex);
+    return {shared->automatic_enabled, shared->automatic_running, shared->automatic_pauses,
+        shared->automatic_attempts, shared->automatic_quiet, shared->automatic_deferred, shared->automatic_completed};
+}
+std::shared_ptr<void> recovery_refresh_test_access::fail_next_automatic_enrollment() {
+    if (auto prior = next_enrollment_failure.lock(); prior && prior->armed)
+        throw db_error("automatic enrollment fault already armed");
+    auto token = std::make_shared<enrollment_failure>();
+    next_enrollment_failure = token;
+    return token;
+}
+std::shared_ptr<database> recovery_refresh_access::test_keeper(lattice_db& owner, uint64_t id) {
+    owner.require_catalog_callback_absent();
+    ordinary_require_creator(owner.config_.ordinary_context);
+    std::lock_guard<std::mutex> lock(owner.read_pool_mutex_);
+    for (const auto& gen : owner.live_generations_) if (gen->id == id) return gen->conn;
+    return {};
+}
+std::shared_ptr<database> recovery_refresh_test_access::actual_read_keeper(lattice_db& owner, uint64_t id) {
+    return recovery_refresh_access::test_keeper(owner, id);
+}
+
+registry_depth_failure_observation recovery_refresh_access::test_registry_depth_failure(lattice_db& owner, bool creator_bound) {
+    owner.require_catalog_callback_absent();
+    ordinary_require_creator(owner.config_.ordinary_context);
+    auto& registry = instance_registry::instance();
+    if (registry.test_fail_next_depth_publication_) throw db_error("registry exception mechanism already armed");
+    registry_depth_failure_observation result;
+    result.holds_before = owner.guard_->notify_refcount.load(std::memory_order_seq_cst);
+    struct disarm { bool& armed; ~disarm() { armed = false; } } reset{registry.test_fail_next_depth_publication_};
+    registry.test_fail_next_depth_publication_ = true;
+    try {
+        auto visit = [&](lattice_db*) { result.callback_entered = true; };
+        if (creator_bound) registry.for_each_alive_creator_bound(owner.config_.path, visit);
+        else registry.for_each_alive(owner.config_.path, visit);
+    } catch (const std::bad_alloc&) { result.caught_bad_alloc = true; }
+    result.depth_publication_reached = !registry.test_fail_next_depth_publication_;
+    result.holds_after = owner.guard_->notify_refcount.load(std::memory_order_seq_cst);
+    return result;
+}
+registry_depth_failure_observation recovery_refresh_test_access::registry_depth_failure(lattice_db& owner, bool creator_bound) {
+    return recovery_refresh_access::test_registry_depth_failure(owner, creator_bound);
+}
 
 std::shared_ptr<recovery_refresh_state> recovery_refresh_access::state(lattice_db& owner, bool create) {
     ordinary_require_creator(owner.config_.ordinary_context);
@@ -328,12 +615,14 @@ void recovery_refresh_test_access::use_manual_preparation(lattice_db& owner) {
     auto shared = recovery_refresh_access::state(owner, true);
     if (!shared) throw db_error("manual recovery preparation requires live owner");
     std::lock_guard<std::mutex> lock(shared->mutex);
-    if (shared->interested() || shared->managed_registrations || shared->in_flight || !shared->wake.expired())
+    if (shared->automatic_enabled || shared->automatic_enrolling || shared->interested() ||
+        shared->managed_registrations || shared->in_flight || !shared->wake.expired())
         throw db_error("configure manual preparation before recovery subscription");
     shared->manual = true;
 }
 void recovery_refresh_access::process(const std::shared_ptr<recovery_refresh_state>& shared) noexcept {
     if(!ordinary_creator_current({}))return;
+    maintain(shared); // Separate admission/clock, before witness in_flight checks.
 #ifndef __EMSCRIPTEN__
     try {
         {
@@ -556,5 +845,6 @@ uint64_t lattice_db::add_recovery_refresh_observer(std::function<void()> callbac
 }
 void lattice_db::remove_recovery_refresh_observer(uint64_t token) { detail::recovery_refresh_access::unsubscribe(*this, token); }
 void lattice_db::request_recovery_refresh() noexcept { detail::recovery_refresh_access::request(*this); }
+bool lattice_db::enable_automatic_read_pool_maintenance() { return detail::recovery_refresh_access::enable_automatic_maintenance(*this); }
 void lattice_db::recovery_subscriptions_changed() { detail::recovery_refresh_access::subscriptions_changed(*this); }
 } // namespace lattice

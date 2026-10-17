@@ -57,7 +57,11 @@ class ordinary_group_target_receiving_owner final {
     enum class terminal_input_retirement_result {not_held,captures_ended,retained_debt};
     terminal_input_retirement_result retire_terminal_inputs(const ordinary_target_staging_connection&)noexcept;
     bool terminal_inputs_ended(const ordinary_target_staging_connection&)const noexcept;
+    std::weak_ptr<ordinary_group_target_receiving_owner> terminal_retirement_wake_original(
+        const ordinary_target_staging_connection&)const noexcept;
     bool terminal_decoder_charge_identity_matches(const ordinary_target_staging_connection&,const void*)const noexcept;
+    std::shared_ptr<ordinary_resource_reservation<true>> terminal_scope_charge(const ordinary_target_staging_connection&)const noexcept;
+    bool terminal_scope_owner_matches(const ordinary_target_staging_connection&,const void*)const noexcept;
     void retire_on_worker()noexcept;
     void collect_on_worker()noexcept;
     void schedule_collection()noexcept;

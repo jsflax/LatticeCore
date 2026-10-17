@@ -3515,8 +3515,8 @@ public:
         return _make(get_or_create_shared(new_config, schemas));
     }
     
-    /// Uncached construction for query-only clone connections (Swift's
-    /// attaching()). The keyed cache would dedup a clone whose config matches
+    /// Uncached construction for independent connections and query-only
+    /// clones (Swift's attaching()). The keyed cache would dedup a clone whose config matches
     /// its parent (same path/scheduler/schema/no-sync) and return the PARENT
     /// instance — the subsequent ATTACH would then mutate the parent's own
     /// connection. A clone must always be a distinct instance.
@@ -3526,6 +3526,15 @@ public:
         auto impl = detail::LatticeCache::instance().create_uncached(config, schemas);
         return _make(impl);
     }
+
+    /// Checked independent construction. Keeps the same schema, migration,
+    /// configuration and pointer-registry behavior as create_uncached(), but
+    /// reports open failures through cxx_error rather than crossing Swift's
+    /// exception boundary. The returned ref is invalid when err is populated.
+    static LATTICE_SLREF_RET create_uncached(const swift_configuration& config,
+                                             const SchemaVector& schemas,
+                                             cxx_error& err)
+    SWIFT_NAME(createUncached(swiftConfig:schemas:error:)) LATTICE_SLREF_UNRETAINED;
 
     static LATTICE_SLREF_RET create(const swift_configuration& config,
                                      const SchemaVector& schemas)

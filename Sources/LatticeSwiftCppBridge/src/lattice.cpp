@@ -1,4 +1,5 @@
 #include <lattice.hpp>
+#include <stdexcept>
 #include <list.hpp>
 #include <unmanaged_object.hpp>
 #include <dynamic_object.hpp>
@@ -1939,6 +1940,48 @@ SWIFT_NAME(create(swiftConfig:schemas:error:)) {
         LOG_ERROR("swift_lattice", "%s", e.what());
         last_error_ = e;
         err = e;
+    }
+    return _make(impl);
+}
+#endif
+
+#if LATTICE_HAS_FRT
+lattice::swift_lattice_ref* lattice::swift_lattice_ref::create_uncached(
+    const swift_configuration& config, const SchemaVector& schemas, cxx_error& err)
+SWIFT_NAME(createUncached(swiftConfig:schemas:error:)) {
+    // Return a non-null empty wrapper on failure, matching checked create().
+    // Swift reads err before boxing or dereferencing its implementation.
+    auto ref = new swift_lattice_ref();
+    err.name.clear();
+    err.msg.clear();
+    try {
+        ref->impl_ = detail::LatticeCache::instance().create_uncached(config, schemas);
+    } catch (const std::exception& e) {
+        last_error_ = e;
+        err = e;
+    } catch (...) {
+        const std::runtime_error failure("Unknown exception opening independent Lattice");
+        last_error_ = failure;
+        err = failure;
+    }
+    return ref;
+}
+#else
+lattice::swift_lattice_ref lattice::swift_lattice_ref::create_uncached(
+    const swift_configuration& config, const SchemaVector& schemas, cxx_error& err)
+SWIFT_NAME(createUncached(swiftConfig:schemas:error:)) {
+    std::shared_ptr<swift_lattice> impl;
+    err.name.clear();
+    err.msg.clear();
+    try {
+        impl = detail::LatticeCache::instance().create_uncached(config, schemas);
+    } catch (const std::exception& e) {
+        last_error_ = e;
+        err = e;
+    } catch (...) {
+        const std::runtime_error failure("Unknown exception opening independent Lattice");
+        last_error_ = failure;
+        err = failure;
     }
     return _make(impl);
 }

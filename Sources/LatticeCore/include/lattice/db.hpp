@@ -23,6 +23,24 @@ public:
 
 class database {
     friend class lattice_db;
+    // Test-only friend seam: install on the query's calling thread and clear
+    // before that thread exits. No public setter, bridge API or instance field.
+    friend struct database_query_test_access;
+    static inline thread_local std::function<void(sqlite3_stmt*)> test_hook_query_row_;
+    // A complete statement owns SQLite until finalize and commit sealing.
+    // Delivery is a separate C++ tail, after every enclosing scope unlocks.
+    struct statement_scope {
+        database& owner;
+        sqlite3_mutex* mutex;
+        statement_scope* previous;
+        static inline thread_local statement_scope* current = nullptr;
+        sqlite3_stmt* statement = nullptr;
+        explicit statement_scope(database& db) noexcept;
+        ~statement_scope() noexcept;
+        statement_scope(const statement_scope&) = delete;
+        statement_scope& operator=(const statement_scope&) = delete;
+        static bool active_for(sqlite3* connection) noexcept;
+    };
     // Only database can create the key. The keyed overload is accessible to
     // make_shared so a keeper retains its single allocation.
     class initialization_key {
@@ -201,16 +219,21 @@ public:
     /// sqlite3_update_hook (C frame: no locks, nothing that can throw).
     void mark_txn_dirty() { txn_dirty_.store(true, std::memory_order_relaxed); }
 
-    /// Install the transaction-settled drain and rollback-discard callbacks
-    /// (docs/design-deferred-memory-delivery.md). `settled` runs after any
-    /// successful statement that leaves the connection in autocommit mode
-    /// with the dirty flag set — i.e. at the close of every top-level
-    /// transaction (including the explicit COMMIT, which funnels through
-    /// execute()), on the writing thread, outside all SQLite frames.
-    /// `rolled_back` is invoked from sqlite3_rollback_hook (C frame — it must
-    /// only clear state, never touch SQLite or throw) and defensively on
-    /// failed statements whose implicit transaction already rolled back.
+    /// Install post-commit notification and rollback callbacks. Notifications
+    /// run outside SQLite frames and enclosing statement/maintenance scopes;
+    /// committed work survives a later error or rollback before delivery.
+    /// `rolled_back` runs in SQLite's C frame and must not throw or call SQL.
+    /// This overload is suitable for notification-only consumers. Consumers
+    /// buffering transaction rows use the seal overload below.
     void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back);
+
+    /// `sealed` transfers the completed transaction's buffered rows to a
+    /// committed queue. It runs under the connection mutex after SQLite has
+    /// settled the write, before another statement can modify that buffer.
+    /// It MUST NOT throw, allocate, call SQL, or deliver observer callbacks.
+    /// Rollback clears only the current transaction, never sealed rows.
+    void set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back,
+                       std::function<void()> sealed);
 
     // Raw access (use sparingly)
     sqlite3* handle() const { return db_; }
@@ -229,15 +252,21 @@ private:
     // so this is a logical-close flag, not a lifetime guard.
     std::atomic<bool> closed_{false};
     int busy_timeout_ms_ = kDefaultBusyTimeoutMs;
-    // Deferred delivery (docs/design-deferred-memory-delivery.md): set by the
-    // update hook via mark_txn_dirty(); consumed by drain_if_settled() at the
-    // success tail of every statement wrapper; cleared by the rollback hook.
+    // Current transaction and committed-but-undelivered work are distinct.
+    // The connection mutex protects sealing; rollback never clears pending.
     std::atomic<bool> txn_dirty_{false};
+    std::atomic<bool> committed_pending_{false};
     std::function<void()> on_txn_settled_;
     std::function<void()> on_txn_rolled_back_;
+    std::function<void()> on_txn_sealed_;
     column_value_t extract_column(sqlite3_stmt* stmt, int index);
+    void seal_if_settled_locked() noexcept;
     void drain_if_settled();
     void discard_if_rolled_back();
+    primary_key_t execute_statement(const char* sql, const std::vector<column_value_t>& params,
+                                    const char** tail, bool returning_rowid = false,
+                                    const char* prepare_error = nullptr, const char* step_error = nullptr);
+
 };
 
 // RAII transaction guard

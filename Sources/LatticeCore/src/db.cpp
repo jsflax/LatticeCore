@@ -5,8 +5,31 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <exception>
 
 namespace lattice {
+
+database::statement_scope::statement_scope(database& db) noexcept
+    : owner(db), mutex(sqlite3_db_mutex(db.db_)), previous(current) {
+    sqlite3_mutex_enter(mutex);
+    current = this;
+}
+
+database::statement_scope::~statement_scope() noexcept {
+    sqlite3_finalize(statement);
+    // Finalize may commit an implicit RETURNING write during exception unwind.
+    // READ is allowed: an unrelated active SELECT does not uncommit that write.
+    owner.seal_if_settled_locked();
+    current = previous;
+    sqlite3_mutex_leave(mutex);
+}
+
+bool database::statement_scope::active_for(sqlite3* connection) noexcept {
+    for (auto* scope = current; scope; scope = scope->previous) {
+        if (scope->owner.db_ == connection) return true;
+    }
+    return false;
+}
 
 // Process-global statement counter (see db.hpp::total_statement_count).
 static std::atomic<uint64_t> g_statement_count{0};
@@ -183,60 +206,54 @@ void database::close() {
 }
 
 void database::set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back) {
+    set_txn_hooks(std::move(settled), std::move(rolled_back), {});
+}
+
+void database::set_txn_hooks(std::function<void()> settled, std::function<void()> rolled_back,
+                              std::function<void()> sealed) {
     on_txn_settled_ = std::move(settled);
     on_txn_rolled_back_ = std::move(rolled_back);
-    // Rollback hook: fires inside SQLite's C frames, so the trampoline only
-    // clears a flag and (via rolled_back) a C++ vector — no SQLite calls,
-    // nothing that can throw. Applies to every storage kind: without it a
-    // rolled-back transaction's buffered rows linger and the NEXT flush
-    // delivers them as phantoms (latent file-DB bug, see the design doc).
-    sqlite3_rollback_hook(db_,
-        [](void* self_ptr) {
-            auto* self = static_cast<database*>(self_ptr);
-            self->txn_dirty_.store(false, std::memory_order_relaxed);
-            if (self->on_txn_rolled_back_) self->on_txn_rolled_back_();
-        },
-        this);
+    on_txn_sealed_ = std::move(sealed);
+    sqlite3_rollback_hook(db_, [](void* self_ptr) {
+        auto* self = static_cast<database*>(self_ptr);
+        self->txn_dirty_.store(false, std::memory_order_relaxed);
+        // Committed rows may still await the outer query's unlock. Preserve
+        // them even when a subsequent transaction rolls back on this handle.
+        if (self->on_txn_rolled_back_) self->on_txn_rolled_back_();
+    }, this);
+}
+
+void database::seal_if_settled_locked() noexcept {
+    // Autocommit is also true during an unfinished INSERT ... RETURNING.
+    // SQLite reports WRITE until that statement finalizes; a held SELECT may
+    // instead keep READ after a separate writer has committed successfully.
+    if (update_hook_scope::active_for(db_) || !db_ ||
+        sqlite3_get_autocommit(db_) == 0 ||
+        sqlite3_txn_state(db_, nullptr) == SQLITE_TXN_WRITE) return;
+    if (!txn_dirty_.exchange(false, std::memory_order_relaxed)) return;
+    if (on_txn_sealed_) on_txn_sealed_();
+    committed_pending_.store(true, std::memory_order_relaxed);
 }
 
 void database::drain_if_settled() {
-    // A nested query from the update hook can finish before the outer
-    // implicit statement does. Autocommit alone does not identify that
-    // callback frame. Leave dirty state for the actual statement's tail.
-    if (update_hook_scope::active_for(db_)) return;
-    // The explicit maintenance tail delivers after releasing its outer
-    // SQLite mutex and store gate. Keep dirty state pending until then.
-    if (maintenance_scope::active_for(db_)) return;
-    // Post-statement drain point (docs/design-deferred-memory-delivery.md):
-    // after a successful statement, autocommit != 0 means the top-level
-    // transaction just closed (implicit, or the explicit COMMIT that funnels
-    // through execute()) and every lock is released — the exact post-commit
-    // point the WAL hook gives file DBs, but reached through plain C++
-    // frames, so observer exceptions propagate to the writer instead of
-    // unwinding through sqlite3_step. Clear the flag BEFORE draining so a
-    // callback's own writes re-arm it rather than re-entering.
-    if (!on_txn_settled_ || !db_ || !txn_dirty_.load(std::memory_order_relaxed)) return;
+    if (!db_) return;
     auto* mutex = sqlite3_db_mutex(db_);
     sqlite3_mutex_enter(mutex);
-    const bool deliver = sqlite3_get_autocommit(db_) != 0 &&
-        txn_dirty_.exchange(false, std::memory_order_relaxed);
+    seal_if_settled_locked();
+    const bool eligible = !statement_scope::active_for(db_) &&
+        !update_hook_scope::active_for(db_) && !maintenance_scope::active_for(db_) &&
+        sqlite3_get_autocommit(db_) != 0 && sqlite3_txn_state(db_, nullptr) != SQLITE_TXN_WRITE;
+    const bool deliver = eligible && on_txn_settled_ &&
+        committed_pending_.exchange(false, std::memory_order_relaxed);
     sqlite3_mutex_leave(mutex);
-    // Claim under SQLite, deliver after releasing it. Unrelated active read
-    // cursors do not defer an already committed writer's notifications.
     if (deliver) on_txn_settled_();
 }
 
 void database::discard_if_rolled_back() {
-    // Failed statement with autocommit restored: the implicit transaction
-    // (if any) already rolled back. SQLite's rollback hook covers most of
-    // these paths; clear defensively so a hook-buffered row from the failed
-    // statement can't surface as a phantom in the next flush. Inside an
-    // explicit transaction (autocommit == 0) nothing is cleared — the
-    // transaction may still commit.
-    if (sqlite3_get_autocommit(db_) != 0) {
-        txn_dirty_.store(false, std::memory_order_relaxed);
-        if (on_txn_rolled_back_) on_txn_rolled_back_();
-    }
+    // SQLite's rollback hook is the authority for discarding the current
+    // transaction. An error in a later read is not evidence that an earlier
+    // committed write rolled back. Preserve and deliver sealed work.
+    drain_if_settled();
 }
 
 database::database(database&& other) noexcept
@@ -261,58 +278,72 @@ int64_t database::changes() const {
     return sqlite3_changes64(db_);
 }
 
+primary_key_t database::execute_statement(const char* sql,
+        const std::vector<column_value_t>& params, const char** tail, bool returning_rowid,
+        const char* prepare_error, const char* step_error) {
+    primary_key_t rowid = 0;
+    bool prepare_failed = false;
+    std::string error;
+    int rc = SQLITE_OK;
+    try {
+        statement_scope scope(*this);
+        rc = sqlite3_prepare_v2(db_, sql, -1, &scope.statement, tail);
+        prepare_failed = rc != SQLITE_OK;
+        if (rc == SQLITE_OK && scope.statement) {
+            int index = 1;
+            for (const auto& value : params) bind_value(scope.statement, index++, value);
+            bool first_row = true;
+            while ((rc = sqlite3_step(scope.statement)) == SQLITE_ROW) {
+                if (returning_rowid && first_row) rowid = sqlite3_column_int64(scope.statement, 0);
+                first_row = false;
+            }
+            if (rc == SQLITE_DONE) {
+                if (!returning_rowid) rowid = sqlite3_last_insert_rowid(db_);
+            } else error = sqlite3_errmsg(db_);
+        } else if (rc != SQLITE_OK) error = sqlite3_errmsg(db_);
+    } catch (...) {
+        const auto failure = std::current_exception();
+        try { drain_if_settled(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+    if (rc != SQLITE_OK && rc != SQLITE_DONE) {
+        // A SQL error is primary even if delivery of earlier committed work
+        // also throws. Neither failure changes its durable commit outcome.
+        try { drain_if_settled(); } catch (...) {}
+        const char* prefix = prepare_failed ? prepare_error : step_error;
+        if (prefix) throw db_error(std::string(prefix) + error);
+        throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
+    }
+    drain_if_settled();
+    return rowid;
+}
+
 void database::execute(const std::string& sql, const std::vector<column_value_t>& params) {
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return;
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
-    if (params.empty()) {
-        // Fast path for parameterless queries
-        char* errmsg = nullptr;
-        int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errmsg);
-        if (rc != SQLITE_OK) {
-            std::string error = errmsg ? errmsg : "Unknown error";
-            sqlite3_free(errmsg);
-            LOG_ERROR("db", "SQL execution failed: %s (SQL: %s)", error.c_str(), sql.c_str());
-            discard_if_rolled_back();
-            throw db_error("SQL execution failed: " + error + " (SQL: " + sql + ")");
-        }
-        drain_if_settled();
-    } else {
-        // Prepared statement path for parameterized queries
-        sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
-        if (rc != SQLITE_OK) {
-            LOG_ERROR("db", "Failed to prepare statement: %s (SQL: %s)", sqlite3_errmsg(db_), sql.c_str());
-            throw db_error("Failed to prepare statement: " + std::string(sqlite3_errmsg(db_)));
-        }
-
-        int index = 1;
-        for (const auto& param : params) {
-            bind_value(stmt, index++, param);
-        }
-
-        // Step until SQLITE_DONE. Virtual tables (e.g. vec0) may return
-        // SQLITE_ROW for DML statements (DELETE returns the deleted row).
-        // Drain all rows before expecting SQLITE_DONE.
-        do {
-            rc = sqlite3_step(stmt);
-        } while (rc == SQLITE_ROW);
-
-        // Capture error message BEFORE finalize, which resets connection error state
-        std::string errmsg_str;
-        if (rc != SQLITE_DONE) {
-            errmsg_str = sqlite3_errmsg(db_) ? sqlite3_errmsg(db_) : "Unknown error";
-        }
-
-        sqlite3_finalize(stmt);
-
-        if (rc != SQLITE_DONE) {
-            LOG_ERROR("db", "Execution failed: %s (SQL: %s)", errmsg_str.c_str(), sql.c_str());
-            discard_if_rolled_back();
-            throw db_error("Execution failed: " + errmsg_str);
-        }
-        drain_if_settled();
+    if (!params.empty()) {
+        execute_statement(sql.c_str(), params, nullptr);
+        return;
     }
+    // Match sqlite3_exec's multi-statement behavior, but finalize and seal each
+    // successful statement before the next can fail or roll back a later txn.
+    // The outer scope keeps the complete batch owned and postpones delivery.
+    try {
+        statement_scope batch(*this);
+        const char* next = sql.c_str();
+        while (*next) {
+            const char* tail = nullptr;
+            execute_statement(next, {}, &tail);
+            if (!tail || tail == next) break;
+            next = tail;
+        }
+    } catch (...) {
+        const auto failure = std::current_exception();
+        try { drain_if_settled(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+    drain_if_settled();
 }
 
 bool database::table_exists(const std::string& name) const {
@@ -528,55 +559,11 @@ primary_key_t database::insert(const std::string& table,
         sql << " RETURNING rowid";
     }
 
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql.str().c_str(), -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        LOG_ERROR("db", "Failed to prepare insert: %s", sqlite3_errmsg(db_));
-        throw db_error("Failed to prepare insert: " + std::string(sqlite3_errmsg(db_)));
-    }
-
-    int index = 1;
-    for (const auto& [_, val] : values) {
-        bind_value(stmt, index++, val);
-    }
-
-    rc = sqlite3_step(stmt);
-
-    if (!conflict_columns.empty()) {
-        primary_key_t affected_rowid = 0;
-        if (rc == SQLITE_ROW) {
-            affected_rowid = sqlite3_column_int64(stmt, 0);
-            rc = sqlite3_step(stmt);  // drain RETURNING
-        }
-        sqlite3_finalize(stmt);
-        if (rc != SQLITE_DONE) {
-            int extended_rc = sqlite3_extended_errcode(db_);
-            auto err = std::string(sqlite3_errmsg(db_));
-            LOG_ERROR("db", "Upsert failed (rc=%d, ext=%d, db=%p, path=%s): %s",
-                      rc, extended_rc, (void*)db_, path_.c_str(), err.c_str());
-            discard_if_rolled_back();
-            throw db_error("Insert failed: " + err);
-        }
-        drain_if_settled();
-        return affected_rowid;
-    }
-
-    sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_DONE) {
-        int extended_rc = sqlite3_extended_errcode(db_);
-        auto err = std::string(sqlite3_errmsg(db_));
-        LOG_ERROR("db", "Insert failed (rc=%d, ext=%d, db=%p, path=%s): %s",
-                  rc, extended_rc, (void*)db_, path_.c_str(), err.c_str());
-        discard_if_rolled_back();
-        throw db_error("Insert failed: " + err);
-    }
-
-    // Capture the rowid BEFORE draining: the drain runs observer callbacks,
-    // whose own writes would clobber last_insert_rowid on this connection.
-    auto rowid = sqlite3_last_insert_rowid(db_);
-    drain_if_settled();
-    return rowid;
+    std::vector<column_value_t> params;
+    params.reserve(values.size());
+    for (const auto& entry : values) params.push_back(entry.second);
+    return execute_statement(sql.str().c_str(), params, nullptr, !conflict_columns.empty(),
+                             "Failed to prepare insert: ", "Insert failed: ");
 }
 
 void database::update(const std::string& table,
@@ -599,30 +586,12 @@ void database::update(const std::string& table,
 
     sql << " WHERE id = ?";
 
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql.str().c_str(), -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        auto error = std::string(sqlite3_errmsg(db_));
-        LOG_ERROR("db", "Failed to prepare update: %s", error.c_str());
-        throw db_error("Failed to prepare update: " + error);
-    }
-
-    int index = 1;
-    for (const auto& [_, val] : values) {
-        bind_value(stmt, index++, val);
-    }
-    sqlite3_bind_int64(stmt, index, id);
-
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_DONE) {
-        auto errmsg = sqlite3_errmsg(db_);
-        LOG_ERROR("db", "Update failed: %s", errmsg);
-        discard_if_rolled_back();
-        throw db_error("Update failed: " + std::string(errmsg));
-    }
-    drain_if_settled();
+    std::vector<column_value_t> params;
+    params.reserve(values.size() + 1);
+    for (const auto& entry : values) params.push_back(entry.second);
+    params.push_back(id);
+    execute_statement(sql.str().c_str(), params, nullptr, false,
+                      "Failed to prepare update: ", "Update failed: ");
 }
 
 void database::remove(const std::string& table, primary_key_t id) {
@@ -631,23 +600,8 @@ void database::remove(const std::string& table, primary_key_t id) {
     ++t_statement_count;
     std::string sql = "DELETE FROM " + table + " WHERE id = ?";
 
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        LOG_ERROR("db", "Failed to prepare delete: %s", sqlite3_errmsg(db_));
-        throw db_error("Failed to prepare delete: " + std::string(sqlite3_errmsg(db_)));
-    }
-
-    sqlite3_bind_int64(stmt, 1, id);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_DONE) {
-        LOG_ERROR("db", "Delete failed: %s", sqlite3_errmsg(db_));
-        discard_if_rolled_back();
-        throw db_error("Delete failed: " + std::string(sqlite3_errmsg(db_)));
-    }
-    drain_if_settled();
+    execute_statement(sql.c_str(), {id}, nullptr, false,
+                      "Failed to prepare delete: ", "Delete failed: ");
 }
 
 std::vector<database::row_t> database::query(const std::string& sql,
@@ -655,60 +609,81 @@ std::vector<database::row_t> database::query(const std::string& sql,
     g_statement_count.fetch_add(1, std::memory_order_relaxed);
     ++t_statement_count;
     if (closed_.load(std::memory_order_acquire) && !maintenance_scope::active_for(db_)) return {};
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        auto errmsg = sqlite3_errmsg(db_);
-        LOG_ERROR("db", "%s in %s", errmsg, sql.c_str());
-        std::cerr<<"db: "<<errmsg<<" "<<sql.c_str()<<std::endl;
-        throw db_error("Failed to prepare query: " + std::string(errmsg));
-    }
 
-    int index = 1;
-    for (const auto& param : params) {
-        bind_value(stmt, index++, param);
-    }
-
+    enum class failure { none, prepare, column_name, step } failed = failure::none;
+    std::string error;
     std::vector<row_t> results;
-    int col_count = sqlite3_column_count(stmt);
+    std::exception_ptr materialization_failure;
+    try {
+        statement_scope scope(*this);
+        int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &scope.statement, nullptr);
+        auto* stmt = scope.statement;
+        if (rc != SQLITE_OK) {
+            // Capture connection-local error state before finalize or unlock.
+            error = sqlite3_errmsg(db_);
+            failed = failure::prepare;
+        } else {
+            int index = 1;
+            for (const auto& param : params) bind_value(stmt, index++, param);
 
-    // Capture column names ONCE, before stepping. sqlite3_column_name
-    // materializes the name lazily on first access and returns NULL if that
-    // allocation fails — under system memory pressure (Apple's purgeable
-    // page cache purging mid-scan) this is a real, observed failure, and
-    // constructing the row-map key from NULL is a segfault. Names are stable
-    // for the life of the statement, so per-row capture was also wasted work.
-    std::vector<std::string> col_names;
-    col_names.reserve(static_cast<size_t>(col_count));
-    for (int i = 0; i < col_count; ++i) {
-        const char* name = sqlite3_column_name(stmt, i);
-        if (!name) {
-            sqlite3_finalize(stmt);
-            LOG_ERROR("db", "column_name OOM in %s", sql.c_str());
-            throw db_error("Query failed: out of memory reading column name");
+            const int col_count = sqlite3_column_count(stmt);
+            // Names are lazy SQLite allocations; copy once while this statement
+            // owns the connection, preserving the existing explicit OOM check.
+            std::vector<std::string> col_names;
+            col_names.reserve(static_cast<size_t>(col_count));
+            for (int i = 0; i < col_count; ++i) {
+                const char* name = sqlite3_column_name(stmt, i);
+                if (!name) {
+                    failed = failure::column_name;
+                    break;
+                }
+                col_names.emplace_back(name);
+            }
+            if (failed == failure::none) {
+                while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+                    if (test_hook_query_row_) test_hook_query_row_(stmt);
+                    row_t row;
+                    for (int i = 0; i < col_count; ++i) {
+                        row[col_names[static_cast<size_t>(i)]] = extract_column(stmt, i);
+                    }
+                    results.push_back(std::move(row));
+                }
+                if (rc != SQLITE_DONE) {
+                    error = sqlite3_errmsg(db_);
+                    failed = failure::step;
+                }
+            }
         }
-        col_names.emplace_back(name);
+        // scope finalizes on every exit, including C++ exceptions, then unlocks.
+    } catch (...) {
+        materialization_failure = std::current_exception();
     }
 
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        row_t row;
-        for (int i = 0; i < col_count; ++i) {
-            row[col_names[static_cast<size_t>(i)]] = extract_column(stmt, i);
+    if (materialization_failure) {
+        // A nested autocommit write, or RETURNING finalized during unwinding,
+        // may already have committed. Deliver its dirty state after unlock;
+        // an extraction failure is not evidence that those writes rolled back.
+        // An explicit transaction remains open for its owning caller to settle.
+        try {
+            drain_if_settled();
+        } catch (...) {
+            // Preserve the initiating C++ exception even if delivery/logging
+            // also fails. Dirty-state consumption keeps the existing policy.
+            try { LOG_ERROR("db", "Settled delivery also failed after query materialization failure"); }
+            catch (...) {}
         }
-        results.push_back(std::move(row));
+        std::rethrow_exception(materialization_failure);
     }
 
-    sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_DONE) {
-        auto error = std::string(sqlite3_errmsg(db_));
-        LOG_ERROR("db", "Query failed: %s", error.c_str());
-        discard_if_rolled_back();
+    // Preserve committed nested work on every SQL failure. Rollback hooks
+    // already discarded only the uncommitted transaction's buffer.
+    if (failed != failure::none) {
+        try { drain_if_settled(); } catch (...) {}
+        if (failed == failure::prepare) throw db_error("Failed to prepare query: " + error);
+        if (failed == failure::column_name) throw db_error("Query failed: out of memory reading column name");
         throw db_error("Query failed: " + error);
     }
 
-    // A plain SELECT can't close a transaction, but DML-via-RETURNING issued
-    // through query() can — one relaxed load of insurance (see design doc).
     drain_if_settled();
     return results;
 }

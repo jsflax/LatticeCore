@@ -1,0 +1,148 @@
+#ifdef __APPLE__
+
+#include "lattice/cross_process_notifier.hpp"
+#include "lattice/log.hpp"
+
+#include <notify.h>
+#include <dispatch/dispatch.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <climits>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+#include <functional>
+
+namespace lattice {
+
+/// Derives a Darwin notification key from the database path.
+/// Uses SHA-256 of the resolved absolute path to avoid key collisions.
+static std::string derive_notification_key(const std::string& db_path) {
+    // Resolve symlinks and relative components
+    char resolved[PATH_MAX];
+    const char* real = realpath(db_path.c_str(), resolved);
+    const std::string canonical = real ? std::string(real) : db_path;
+
+    // SHA-256 hash
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(canonical.data(), static_cast<CC_LONG>(canonical.size()), hash);
+
+    // Convert to hex string
+    char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) {
+        snprintf(hex + i * 2, 3, "%02x", hash[i]);
+    }
+
+    return "com.lattice.db." + std::string(hex, CC_SHA256_DIGEST_LENGTH * 2);
+}
+
+/// Static registry for Darwin notification callbacks, keyed by token.
+/// The GCD block receives the token as a parameter and looks up the callback here,
+/// so it captures no C++ objects and is safe after the notifier is destroyed.
+// Intentionally leaked: prevents use-after-destroy when GCD callbacks
+// fire during process teardown (after atexit handlers run).
+static std::mutex& callback_registry_mutex() {
+    static auto* m = new std::mutex();
+    return *m;
+}
+static std::unordered_map<int, std::function<void()>>& callback_registry() {
+    static auto* r = new std::unordered_map<int, std::function<void()>>();
+    return *r;
+}
+
+class darwin_cross_process_notifier final : public cross_process_notifier {
+public:
+    explicit darwin_cross_process_notifier(const std::string& db_path)
+        : key_(derive_notification_key(db_path)) {
+        LOG_DEBUG("xproc", "Darwin notifier created with key: %s", key_.c_str());
+    }
+
+    ~darwin_cross_process_notifier() override {
+        stop_listening();
+    }
+
+    void post_notification() override {
+        LOG_DEBUG("xproc", "Posting Darwin notification: %s", key_.c_str());
+        notify_post(key_.c_str());
+    }
+
+    void start_listening(std::function<void()> callback) override {
+        if (listening_) return;
+
+        // Serial queue: only one notification processes at a time, preventing
+        // GCD from spawning dozens of worker threads that all block on
+        // sqlite3LockAndPrepare when notifications arrive faster than the
+        // SQLite queries in handle_cross_process_notification complete.
+        queue_ = dispatch_queue_create("com.lattice.xproc-notify", DISPATCH_QUEUE_SERIAL);
+
+        uint32_t status = notify_register_dispatch(
+            key_.c_str(),
+            &token_,
+            queue_,
+            ^(int token) {
+                // Look up callback from static registry — no C++ captures in this block.
+                std::function<void()> cb;
+                {
+                    std::lock_guard<std::mutex> lock(callback_registry_mutex());
+                    auto it = callback_registry().find(token);
+                    if (it == callback_registry().end()) return;
+                    cb = it->second;
+                }
+                cb();
+            }
+        );
+
+        if (status == NOTIFY_STATUS_OK) {
+            {
+                std::lock_guard<std::mutex> lock(callback_registry_mutex());
+                callback_registry()[token_] = std::move(callback);
+            }
+            listening_ = true;
+            LOG_DEBUG("xproc", "Darwin listener registered for: %s (serial queue)", key_.c_str());
+        } else {
+            LOG_ERROR("xproc", "Failed to register Darwin notification (status=%u)", status);
+            dispatch_release(queue_);
+            queue_ = nullptr;
+        }
+    }
+
+    void stop_listening() override {
+        if (!listening_) return;
+        // Remove from registry BEFORE cancelling, so any in-flight block
+        // that hasn't read the registry yet will find nothing.
+        {
+            std::lock_guard<std::mutex> lock(callback_registry_mutex());
+            callback_registry().erase(token_);
+        }
+        notify_cancel(token_);
+        if (queue_) {
+            dispatch_release(queue_);
+            queue_ = nullptr;
+        }
+        listening_ = false;
+        LOG_DEBUG("xproc", "Darwin listener cancelled for: %s", key_.c_str());
+    }
+
+    [[nodiscard]] bool is_listening() const noexcept override {
+        return listening_;
+    }
+
+private:
+    std::string key_;
+    int token_ = 0;
+    bool listening_ = false;
+    dispatch_queue_t queue_ = nullptr;
+};
+
+std::unique_ptr<cross_process_notifier> make_cross_process_notifier(const std::string& db_path) {
+    // No cross-process notifications for in-memory databases
+    if (db_path.empty() || db_path == ":memory:" ||
+        db_path.find(":memory:") != std::string::npos ||
+        db_path.find("mode=memory") != std::string::npos) {  // named/shared-cache memory URIs are process-local
+        return nullptr;
+    }
+    return std::make_unique<darwin_cross_process_notifier>(db_path);
+}
+
+} // namespace lattice
+
+#endif // __APPLE__

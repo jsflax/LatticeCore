@@ -1,0 +1,9602 @@
+#pragma once
+
+#include "log.hpp"
+#include "types.hpp"
+#include "db.hpp"
+#include "ordinary_context.hpp"
+#include "ordinary_pointer_publication.hpp"
+#include "native_retirement_storage.hpp"
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+#include "sync_commit_probe.hpp"
+#endif
+#include "projection.hpp"
+#include "owned_catalog.hpp"
+#include "schema.hpp"
+#include "ordinary_schema_recipe.hpp"
+#include "recovery_schema.hpp"
+#include "derived_program.hpp"
+#include "managed.hpp"
+#include "scheduler.hpp"
+#include "observation.hpp"
+#include "cross_process_notifier.hpp"
+#include "sync.hpp"  // for sync_filter_entry (used by configuration)
+#include "ipc.hpp"   // for ipc_endpoint (used by setup_ipc)
+#include <vector>
+#include <memory>
+#include <functional>
+#include <type_traits>
+#include <utility>
+#include <random>
+#include <sstream>
+#include <atomic>
+#include <limits>
+#include <exception>
+#include <iomanip>
+#include <mutex>
+#include <map>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+#include <array>
+#include <algorithm>
+#include <chrono>
+#include <optional>
+#include <thread>
+#include <stdio.h>
+#include <iostream>
+#include <concepts>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace lattice {
+namespace detail {class ordinary_managed_profile;class ordinary_export_access;class ordinary_cohort_attachment_access;class ordinary_cohort_attachment_binding;class ordinary_child_origin;class ordinary_managed_receiver_preservation;class ordinary_receiver_wss_request;class ordinary_receiver_session;class ordinary_provisional_delivery;class ordinary_source_upload_delivery;class ordinary_managed_product_credentials;class ordinary_managed_ipc_access;class ordinary_receiver_wss_access;class ordinary_managed_owner_release;class ordinary_managed_start_capture_tail;struct configured_managed_handlers;class ordinary_history_child_connections;class database_open_ledger;struct ordinary_history_open_ledger_test_access;}
+
+// An owned close report. Pending/retired/disconnected are not ACK success;
+// cleanup always proceeds, preserving the first real error separately from a
+// later cleanup error. Exception ownership survives connection/owner reset.
+struct lattice_close_result {
+    sync_drain_state sync=sync_drain_state::not_attempted;
+    std::exception_ptr error,cleanup_error;
+    bool cleanup_complete=true;
+    void remember(std::exception_ptr value,bool cleanup=true) noexcept {
+        if(!value)return;
+        if(!error)error=value;
+        if(cleanup){cleanup_complete=false;if(!cleanup_error)cleanup_error=std::move(value);}
+    }
+    void merge(const lattice_close_result& value) noexcept {
+        remember(value.error,false);if(value.cleanup_error)remember(value.cleanup_error);
+        cleanup_complete=cleanup_complete&&value.cleanup_complete;
+        if(static_cast<int>(value.sync)>static_cast<int>(sync))sync=value.sync;
+    }
+};
+
+// Forward declarations
+template<typename T> class query;
+template<typename T> class results;
+class lattice_db;
+class synchronizer_base;
+class synchronizer;
+struct configuration;
+namespace detail { struct recovery_writer_access; class canonical_writer_adapter; class recovery_local_producer_adapter;
+class recovery_continuous_producer;
+struct recovery_continuous_admission;
+std::shared_ptr<database> open_continuous_writer(const configuration&,const std::shared_ptr<recovery_continuous_admission>&); struct recovery_refresh_state; struct recovery_refresh_access; class canonical_upstream_delivery; }
+namespace detail { struct sync_policy_reservation; }
+
+// Type trait to detect if T has a 'source' member (for swift_dynamic_object)
+template<typename T, typename = void>
+struct has_source_member : std::false_type {};
+
+template<typename T>
+struct has_source_member<T, std::void_t<decltype(std::declval<T>().source.values)>> : std::true_type {};
+
+// A general template to help detect the validity of an expression
+template <typename T, typename = void>
+struct has_instance_schema : std::false_type {};
+
+// Specialization will only compile if the expression inside decltype is valid
+template <typename T>
+struct has_instance_schema<T, std::void_t<decltype(std::declval<T>().instance_schema())>> : std::true_type {};
+
+// Type trait to detect if T has collect_geo_bounds_lists method (for geo_bounds list persistence)
+template<typename T, typename = void>
+struct has_geo_bounds_lists : std::false_type {};
+
+template<typename T>
+struct has_geo_bounds_lists<T, std::void_t<decltype(std::declval<T>().collect_geo_bounds_lists())>> : std::true_type {};
+
+// ============================================================================
+// Multi-instance registry - allows multiple lattice_db instances to share a DB
+// Similar to Swift's latticeIsolationRegistrar
+// ============================================================================
+
+/// Guard token allocated on the heap so it outlives the lattice_db instance.
+/// flush_changes() copies these from the registry and can safely check the
+/// alive flag even after the lattice_db is destroyed.
+struct instance_guard {
+    std::atomic<bool> alive{true};
+    /// Number of in-flight notify_change() calls on this instance.
+    /// The destructor spins until this reaches 0 before proceeding.
+    std::atomic<int> notify_refcount{0};
+
+    /// Per-thread nesting depth of notify callbacks for THIS guard on the
+    /// calling thread. Lets close()/~lattice_db exclude the current thread's
+    /// own holds from the drain wait: when an observer callback releases the
+    /// LAST reference to the lattice, the destructor runs ON the callback
+    /// thread while notify_refcount still counts that very callback —
+    /// waiting for it is waiting for yourself (observed live as a 97%-CPU
+    /// yield spin in ~lattice_db during the test suite). A callback that
+    /// triggers destruction must not touch the lattice afterwards — which is
+    /// inherently true for deinit-triggered teardown.
+    static std::unordered_map<const instance_guard*, int>& tls_depths() {
+        thread_local std::unordered_map<const instance_guard*, int> depths;
+        return depths;
+    }
+    static int tls_depth(const instance_guard* g) {
+        auto& m = tls_depths();
+        auto it = m.find(g);
+        return it == m.end() ? 0 : it->second;
+    }
+};
+
+class instance_registry {
+public:
+    struct entry {
+        lattice_db* ptr;
+        std::shared_ptr<instance_guard> guard;
+    };
+
+    // Singleton accessor - defined in lattice.cpp to avoid ODR violations
+    static instance_registry& instance();
+
+    void register_instance(const std::string& path, lattice_db* db,
+                           std::shared_ptr<instance_guard> guard) {
+        require_creator_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        instances_[path].push_back({db, std::move(guard)});
+    }
+
+    void unregister_instance(const std::string& path, lattice_db* db) {
+        require_creator_process();
+        // Move the notifier out under the lock, destroy it AFTER releasing —
+        // the notifier destructor joins the inotify thread, which may be
+        // waiting for mutex_ inside for_each_alive → get_entries.
+        std::unique_ptr<cross_process_notifier> notifier_to_destroy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = instances_.find(path);
+            if (it != instances_.end()) {
+                auto& vec = it->second;
+                vec.erase(std::remove_if(vec.begin(), vec.end(),
+                    [db](const entry& e) { return e.ptr == db; }), vec.end());
+                if (vec.empty()) {
+                    instances_.erase(it);
+                    auto nit = shared_notifiers_.find(path);
+                    if (nit != shared_notifiers_.end()) {
+                        notifier_to_destroy = std::move(nit->second);
+                        shared_notifiers_.erase(nit);
+                    }
+                }
+            }
+        }
+        // Notifier destroyed here, outside the lock — safe to join its thread.
+    }
+
+    /// Iterate alive instances for a path with guard protection.
+    /// The callback receives a raw pointer guaranteed to remain valid for
+    /// the duration of the call (the instance's destructor spins on
+    /// notify_refcount before proceeding).
+    template<typename Fn>
+    void for_each_alive(const std::string& path, Fn&& fn) {
+        require_creator_process();
+        auto entries = get_entries(path);
+        for (auto& e : entries) {
+            e.guard->notify_refcount.fetch_add(1, std::memory_order_seq_cst);
+            if (!e.guard->alive.load(std::memory_order_seq_cst)) {
+                e.guard->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
+                continue;
+            }
+            // Track this thread's hold so a callback that ends up running
+            // close()/~lattice_db (released the last reference) can exclude
+            // itself from the drain wait instead of self-spinning forever.
+            // RAII: an observer exception now legally unwinds through here to
+            // the writer (docs/design-deferred-memory-delivery.md) — a leaked
+            // refcount would wedge the instance's destructor drain-wait.
+            auto* g = e.guard.get();
+            struct hold_release {
+                instance_guard* g;
+                bool depth_tracked = false;
+                ~hold_release() {
+                    if (depth_tracked) {
+                        auto& depths = instance_guard::tls_depths();
+                        const auto found = depths.find(g);
+                        if (found != depths.end() && --found->second == 0) depths.erase(found);
+                    }
+                    g->notify_refcount.fetch_sub(1, std::memory_order_seq_cst);
+                }
+            } release{g}; // Custody BEFORE potentially allocating TLS insertion.
+            if (test_fail_next_depth_publication_) {
+                test_fail_next_depth_publication_ = false;
+                throw std::bad_alloc(); // Inert private exception-unwind mechanism.
+            }
+            ++instance_guard::tls_depths()[g];
+            release.depth_tracked = true;
+            fn(e.ptr);
+        }
+    }
+
+    // G03 setters alone use this same real registry snapshot/admitted guard.
+    // Foreign continuation cannot release holds or visit another inherited entry.
+    template<typename Fn> void for_each_alive_creator_bound(const std::string& path,Fn&& fn) {
+        require_creator_process();const auto native_creator=::getpid();
+        using entries_type=decltype(get_entries(path));
+        detail::native_retirement_storage<entries_type> held;
+        held.template get<0>()=get_entries(path);
+        for(auto& e:held.template get<0>()) {
+            if(native_creator!=::getpid())return;
+            e.guard->notify_refcount.fetch_add(1,std::memory_order_seq_cst);
+            if(!e.guard->alive.load(std::memory_order_seq_cst)) {e.guard->notify_refcount.fetch_sub(1,std::memory_order_seq_cst);continue;}
+            auto* g=e.guard.get();
+            struct hold_release {
+                instance_guard* g;pid_t creator;bool depth_tracked=false;
+                ~hold_release(){
+                    if(creator!=::getpid())return;
+                    if(depth_tracked){auto& depths=instance_guard::tls_depths();const auto found=depths.find(g);if(found!=depths.end()&&--found->second==0)depths.erase(found);}
+                    g->notify_refcount.fetch_sub(1,std::memory_order_seq_cst);
+                }
+            } release{g,native_creator};
+            if(test_fail_next_depth_publication_){test_fail_next_depth_publication_=false;throw std::bad_alloc();}
+            ++instance_guard::tls_depths()[g];release.depth_tracked=true;
+            fn(e.ptr);if(native_creator!=::getpid())return;
+        }
+    }
+
+    /// Get or create a shared cross-process notifier for a path.
+    /// Only ONE Darwin listener is registered per path per process,
+    /// preventing N^2 notification amplification when multiple lattice_db
+    /// instances share the same path. The listener distributes to all
+    /// instances via for_each_alive.
+    /// Returns a raw pointer (owned by the registry) for post_notification,
+    /// or nullptr for in-memory DBs.
+    cross_process_notifier* get_or_create_notifier(const std::string& path);
+
+    /// Per-path write gate for SHARED-CACHE stores (Live Results item A spec,
+    /// §4.1 mechanism 2). Shared-cache table locks fail the loser immediately
+    /// with SQLITE_LOCKED (the busy timeout does not apply), so generation
+    /// captures/hydrations and cross-connection write transactions on the
+    /// same named-memory store must never overlap. Writers hold the gate for
+    /// the duration of a lattice-level write transaction; capture batches
+    /// (bridged in Commit 4) hold it around their capture transaction.
+    /// Recursive: with the immediate scheduler, observer callbacks — which
+    /// may themselves write or capture — run on the writer's thread while
+    /// the gate is held. The gate is never taken inside a hook frame (§2.3
+    /// leaf-lock rule) and never held across a scheduler hop. Entries are
+    /// never erased (leaked with the singleton, like the registry itself);
+    /// the shared_ptr keeps a gate valid for any late holder.
+    std::shared_ptr<std::recursive_timed_mutex> write_gate(const std::string& path) {
+        require_creator_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& gate = write_gates_[path];
+        if (!gate) gate = std::make_shared<std::recursive_timed_mutex>();
+        return gate;
+    }
+
+    /// Per-path WAL keeper-eviction threshold (results spec §3.4; item-A
+    /// adversarial finding 2). The threshold is read by each instance's OWN
+    /// WAL hook — and the synchronizer/IPC agents own their OWN lattice_db
+    /// per path — so a per-instance setter alone would leave the instances
+    /// that apply sync chunks at the default forever.
+    /// lattice_db::set_wal_keeper_eviction_threshold_bytes fans out to every
+    /// alive same-path instance AND records the value here so instances
+    /// opened LATER adopt it at registration. Entries are never erased
+    /// (leaked with the singleton, like write_gates_): a reopened path keeps
+    /// the last-set policy until the owner sets it again.
+    void set_wal_eviction_threshold_for_path(const std::string& path, int64_t bytes) {
+        require_creator_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        wal_eviction_thresholds_[path] = bytes;
+    }
+    std::optional<int64_t> wal_eviction_threshold_for_path(const std::string& path) {
+        require_creator_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = wal_eviction_thresholds_.find(path);
+        if (it == wal_eviction_thresholds_.end()) return std::nullopt;
+        return it->second;
+    }
+
+private:
+    friend struct detail::recovery_refresh_access;
+    // Only the private real-registry exception-unwind fixture arms this TLS
+    // point. It grants nothing and never resets an outstanding original hold.
+    static inline thread_local bool test_fail_next_depth_publication_ = false;
+    const pid_t creator_pid_=::getpid();
+    void require_creator_process() const {
+        if (creator_pid_ != ::getpid()) throw std::runtime_error("inherited instance_registry belongs to another process");
+    }
+    instance_registry() = default;
+
+    std::vector<entry> get_entries(const std::string& path) {
+        require_creator_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = instances_.find(path);
+        if (it != instances_.end()) {
+            return it->second;
+        }
+        return {};
+    }
+
+    std::mutex mutex_;
+    std::map<std::string, std::vector<entry>> instances_;
+    /// One Darwin listener per unique DB path — prevents N^2 notification
+    /// amplification when multiple lattice_db instances share the same path.
+    std::map<std::string, std::unique_ptr<cross_process_notifier>> shared_notifiers_;
+    /// Per-path shared-cache write gates (see write_gate above).
+    std::map<std::string, std::shared_ptr<std::recursive_timed_mutex>> write_gates_;
+    /// Per-path WAL eviction thresholds (see the accessors above).
+    std::map<std::string, int64_t> wal_eviction_thresholds_;
+};
+
+// ============================================================================
+// Observation token - see observation.hpp for notification_token
+// Backward compatibility alias
+// ============================================================================
+
+using observation_token = notification_token;
+
+// ============================================================================
+// Query builder for type-safe queries
+// ============================================================================
+
+template<typename T>
+class query {
+public:
+    explicit query(lattice_db& db) : db_(db) {}
+
+    query& where(const std::string& predicate) {
+        where_clause_ = predicate;
+        return *this;
+    }
+
+    query& order_by(const std::string& column, bool ascending = true) {
+        order_clause_ = column + (ascending ? " ASC" : " DESC");
+        return *this;
+    }
+
+    query& limit(size_t count) {
+        limit_ = count;
+        return *this;
+    }
+
+    query& offset(size_t count) {
+        offset_ = count;
+        return *this;
+    }
+
+    /// Filter by geo_bounds property within a bounding box using R*Tree index.
+    /// This is the fast spatial query path.
+    query& within_bbox(const std::string& geo_column,
+                       double minLat, double maxLat,
+                       double minLon, double maxLon) {
+        geo_column_ = geo_column;
+        geo_bbox_ = geo_bounds(minLat, maxLat, minLon, maxLon);
+        return *this;
+    }
+
+    /// Filter by geo_bounds property within a bounding box.
+    query& within_bbox(const std::string& geo_column, const geo_bounds& bbox) {
+        geo_column_ = geo_column;
+        geo_bbox_ = bbox;
+        return *this;
+    }
+
+    std::vector<managed<T>> execute();
+    size_t count();
+    std::optional<managed<T>> first();
+
+private:
+    lattice_db& db_;
+    std::string where_clause_;
+    std::string order_clause_;
+    size_t limit_ = 0;
+    size_t offset_ = 0;
+    std::string geo_column_;                    // For R*Tree spatial queries
+    std::optional<geo_bounds> geo_bbox_;        // Bounding box for spatial filter
+};
+
+// ============================================================================
+// Results container with observation support (matches realm-cpp pattern)
+// ============================================================================
+
+template<typename T>
+class results {
+public:
+    using value_type = managed<T>;
+
+    // Legacy callback type (receives full snapshot)
+    using observer_t = std::function<void(const std::vector<managed<T>>&)>;
+
+    // ========================================================================
+    // results_change - Describes changes to this collection (realm-cpp style)
+    // ========================================================================
+    struct results_change {
+        /// Pointer to the results collection that changed
+        results<T>* collection;
+
+        /// Indices of objects that were deleted
+        std::vector<uint64_t> deletions;
+
+        /// Indices of objects that were inserted
+        std::vector<uint64_t> insertions;
+
+        /// Indices of objects that were modified
+        std::vector<uint64_t> modifications;
+
+        /// True if the collection root was deleted
+        bool collection_root_was_deleted = false;
+
+        /// Returns true if no changes occurred
+        [[nodiscard]] bool empty() const noexcept {
+            return deletions.empty() && insertions.empty() && modifications.empty() &&
+                   !collection_root_was_deleted;
+        }
+    };
+
+    // New callback type (receives change info like realm-cpp)
+    using change_observer_t = std::function<void(results_change)>;
+
+    /// Construct from pre-fetched items (legacy)
+    explicit results(std::vector<managed<T>> items, lattice_db* db = nullptr)
+        : items_(std::move(items)), db_(db), table_name_(managed<T>::schema().table_name) {}
+
+    /// Construct with query state (for chained queries)
+    results(lattice_db* db, std::string table_name,
+            std::string where_clause = "", std::string order_clause = "",
+            size_t limit = 0, size_t offset = 0)
+        : db_(db), table_name_(std::move(table_name)),
+          where_clause_(std::move(where_clause)), order_clause_(std::move(order_clause)),
+          limit_(limit), offset_(offset) {
+        execute_query();
+    }
+
+    auto begin() { return items_.begin(); }
+    auto end() { return items_.end(); }
+    auto begin() const { return items_.begin(); }
+    auto end() const { return items_.end(); }
+
+    size_t size() const { return items_.size(); }
+    bool empty() const { return items_.empty(); }
+    managed<T>& operator[](size_t index) { return items_[index]; }
+    const managed<T>& operator[](size_t index) const { return items_[index]; }
+
+    /// Access first element (throws if empty)
+    managed<T>& first() {
+        if (items_.empty()) { LOG_ERROR("results", "first() called on empty Results"); throw std::out_of_range("Results is empty"); }
+        return items_.front();
+    }
+
+    /// Access last element (throws if empty)
+    managed<T>& last() {
+        if (items_.empty()) { LOG_ERROR("results", "last() called on empty Results"); throw std::out_of_range("Results is empty"); }
+        return items_.back();
+    }
+
+    // ========================================================================
+    // Query API - returns new results with filter/sort applied
+    // ========================================================================
+
+    /// Filter results with SQL WHERE predicate
+    /// Usage: auto adults = results.where("age > 18");
+    results<T> where(const std::string& predicate) const {
+        std::string new_where = where_clause_.empty() ? predicate
+            : "(" + where_clause_ + ") AND (" + predicate + ")";
+        return results<T>(db_, table_name_, new_where, order_clause_, limit_, offset_);
+    }
+
+    /// Sort results by column
+    /// Usage: auto sorted = results.sort("name", true);
+    results<T> sort(const std::string& column, bool ascending = true) const {
+        std::string new_order = column + (ascending ? " ASC" : " DESC");
+        return results<T>(db_, table_name_, where_clause_, new_order, limit_, offset_);
+    }
+
+    /// Limit number of results
+    results<T> limit(size_t count) const {
+        return results<T>(db_, table_name_, where_clause_, order_clause_, count, offset_);
+    }
+
+    /// Skip first N results
+    results<T> offset(size_t count) const {
+        return results<T>(db_, table_name_, where_clause_, order_clause_, limit_, count);
+    }
+
+    // ========================================================================
+    // Observation API
+    // ========================================================================
+
+    /// Observe changes with full snapshot (legacy API)
+    /// Returns a token that must be retained - observation stops when token is destroyed
+    /// Callback is dispatched on the scheduler associated with the database
+    notification_token observe(observer_t callback);
+
+    /// Observe changes with detailed change info (realm-cpp style)
+    /// Callback receives results_change with insertions/deletions/modifications
+    notification_token observe(change_observer_t callback);
+
+#if LATTICE_HAS_COROUTINES
+    /// Create a coroutine-based change stream for async iteration
+    /// Usage: for co_await (auto& change : results.changes()) { ... }
+    change_stream<collection_change> changes();
+#endif
+
+private:
+    std::vector<managed<T>> items_;
+    lattice_db* db_ = nullptr;
+
+    // Query state for chaining
+    std::string table_name_;
+    std::string where_clause_;
+    std::string order_clause_;
+    size_t limit_ = 0;
+    size_t offset_ = 0;
+
+    /// Execute the query and populate items_
+    void execute_query();
+};
+
+// ============================================================================
+// Configuration for lattice_db (matches Lattice.Configuration in Swift)
+// ============================================================================
+
+// Forward declarations for migration
+class migration_context;
+class lattice_db;
+
+/// Migration block type. Called when schema changes are detected, BEFORE auto-migration.
+/// Use this to transform data before columns are removed or types change.
+/// @param context Migration context with pending changes and enumeration methods
+using migration_block_t = std::function<void(migration_context& context)>;
+
+struct configuration {
+    // Opaque native launch custody. Copying transports an already issued owner.
+    detail::ordinary_context ordinary_context;
+    /// Database file path. Use ":memory:" for in-memory database.
+    std::string path = ":memory:";
+
+    /// Scheduler for dispatching callbacks. nullptr = immediate_scheduler.
+    std::shared_ptr<scheduler> sched = nullptr;
+
+    /// WebSocket URL for sync. Empty string = sync disabled.
+    /// Example: "ws://localhost:8080/sync"
+    std::string websocket_url;
+
+    /// Authorization token for sync. Required if websocket_url is set.
+    std::string authorization_token;
+    std::shared_ptr<detail::ordinary_managed_product_credentials> managed_product_credentials;
+    ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
+    std::string ordinary_model_profile; // Bounded selector; never model/source authority.
+
+    // Explicit app expectation, not authority. The trusted SDK transport and
+    // same physical describe exchange must independently authenticate it.
+    std::string recovery_source_expectation;
+
+    /// Target schema version. Default is 1 (initial schema).
+    /// If the database is at a lower version, migrations will run.
+    /// If the database is at a higher version, an error is thrown.
+    int32_t target_schema_version = 1;
+
+    /// Migration block. Called when schema changes are detected, BEFORE auto-migration.
+    /// This allows you to transform data before columns are removed or types change.
+    /// Example: copying lat/lon to new geo_bounds columns before lat/lon are dropped.
+    migration_block_t migration_block;
+
+    /// Read-only mode. When true:
+    /// - Database is opened with a plain SQLITE_OPEN_READONLY connection that
+    ///   joins a concurrent writer's WAL (sees committed-but-not-yet-
+    ///   checkpointed rows). NOT immutable — immutable opens ignore the WAL,
+    ///   which is wrong for any live, WAL-backed Lattice database.
+    /// - No table creation or schema changes
+    /// - No sync, no change hooks
+    /// Use this for read-only/dynamic opens of live databases.
+    bool read_only = false;
+
+    /// Statement-level busy timeout (ms) for all connections of this database.
+    /// Headless/server processes keep the default; interactive apps should set
+    /// a small value (e.g. 5000) so a stuck writer can't hang the UI thread.
+    int busy_timeout_ms = kDefaultBusyTimeoutMs;
+
+    /// Audit-history retention, in seconds. 0 = keep forever (the pre-1.5
+    /// behavior). When > 0 the database runs one small maintenance thread
+    /// that prunes AuditLog entries every attached process has already
+    /// delivered — see prune_audit_log(). Cursor-safe: ids are never
+    /// renumbered, and N processes on one file share one prune per window.
+    int64_t audit_retention_seconds = 0;
+
+    /// This database's OWN sync connections register their replication slot
+    /// as an OBSERVER: a read-only dial whose upload floor never advances.
+    /// Observer slots are excluded from the compaction floor so a read-only
+    /// replica can still prune its history. Set for read-only / observer-token
+    /// connections; never inferred from the sync filter (an empty filter
+    /// means "upload everything", not "observer").
+    bool sync_is_observer = false;
+
+    /// Sync tuning knobs, forwarded verbatim into every synchronizer this
+    /// database creates (WSS and IPC). Every field is optional: unset means
+    /// "keep sync_config's default" — this struct never re-states defaults,
+    /// so changing a default in sync.hpp changes it everywhere at once.
+    struct sync_tuning {
+        std::optional<size_t> chunk_size;
+        std::optional<int> max_reconnect_attempts;
+        std::optional<double> base_delay_seconds;
+        std::optional<double> max_delay_seconds;
+        std::optional<int64_t> stable_connection_ms;
+        std::optional<int> upload_coalesce_ms;
+        std::optional<int> checkpoint_passive_interval_ms;
+        std::optional<int> checkpoint_truncate_interval_ms;
+        std::optional<bool> use_upload_floor;
+
+        /// Overlay the set fields onto a sync_config. Values that would
+        /// break the synchronizer are ignored here too (defense at the second
+        /// boundary — the bridge setters already filter): chunk_size 0 would
+        /// permanently stall uploads; nonpositive backoff delays busy-spin
+        /// reconnects.
+        void apply(sync_config& cfg) const {
+            if (chunk_size && *chunk_size > 0) cfg.chunk_size = *chunk_size;
+            if (max_reconnect_attempts) cfg.max_reconnect_attempts = *max_reconnect_attempts;
+            if (base_delay_seconds && *base_delay_seconds > 0) cfg.base_delay_seconds = *base_delay_seconds;
+            if (max_delay_seconds && *max_delay_seconds > 0) cfg.max_delay_seconds = *max_delay_seconds;
+            if (stable_connection_ms) cfg.stable_connection_ms = *stable_connection_ms;
+            if (upload_coalesce_ms) cfg.upload_coalesce_ms = *upload_coalesce_ms;
+            if (checkpoint_passive_interval_ms) cfg.checkpoint_passive_interval_ms = *checkpoint_passive_interval_ms;
+            if (checkpoint_truncate_interval_ms) cfg.checkpoint_truncate_interval_ms = *checkpoint_truncate_interval_ms;
+            if (use_upload_floor) cfg.use_upload_floor = *use_upload_floor;
+        }
+    };
+    sync_tuning tuning;
+
+    // Default constructor - in-memory, no sync
+    configuration() = default;
+
+    // Path only - file-based, no sync
+    explicit configuration(const std::string& p) : path(p) {}
+
+    // Path + scheduler - file-based, no sync, custom scheduler
+    configuration(const std::string& p, std::shared_ptr<lattice::scheduler> s)
+        : path(p), sched(std::move(s)) {}
+
+    // Full configuration with sync
+    configuration(const std::string& p,
+                  const std::string& ws_url,
+                  const std::string& auth_token,
+                  std::shared_ptr<lattice::scheduler> s = nullptr)
+        : path(p), sched(std::move(s)), websocket_url(ws_url), authorization_token(auth_token) {}
+
+    /// Upload filter. nullopt = sync everything (default).
+    std::optional<std::vector<sync_filter_entry>> sync_filter;
+
+    /// IPC sync targets. Each entry specifies a channel name and optional filter.
+    struct ipc_target {
+        std::string channel;
+        std::optional<std::vector<sync_filter_entry>> sync_filter;
+        /// Optional explicit socket path. When set, bypasses resolve_ipc_socket_path().
+        /// Required for cross-platform IPC (e.g. macOS host ↔ iOS simulator) where
+        /// HOME differs between processes.
+        std::optional<std::string> socket_path;
+        /// A4 — see sync_config::narrowing_emits_removals. true (default):
+        /// narrowing the filter clears the paired spoke's mirror via marked
+        /// filter-removal DELETEs (personal-sync semantics). false:
+        /// narrowing is bookkeeping-only and the spoke keeps its mirror
+        /// (group-channel semantics: "stop new sharing", never un-share).
+        bool narrowing_emits_removals = true;
+    };
+    std::vector<ipc_target> ipc_targets;
+
+    /// Explicit requested WAL-file extent admission, in bytes. Unset preserves
+    /// legacy opens; no quota is guessed from journal_size_limit. This first
+    /// route supports a canonical native MAIN path, with no ATTACH/URI/VFS
+    /// override. All writers must enroll the same policy before a store-wide
+    /// bound is claimed. MAIN, SHM and physical allocation are not included.
+    std::optional<sqlite3_int64> wal_extent_limit_bytes;
+
+    /// Returns true if WSS sync is configured (websocket_url is not empty)
+    bool is_sync_enabled() const {
+        return !websocket_url.empty() && !authorization_token.empty();
+    }
+
+    /// Returns true if any IPC targets are configured
+    bool is_ipc_enabled() const {
+        return !ipc_targets.empty();
+    }
+
+    /// True for any in-memory path form: plain ":memory:", the anonymous
+    /// shared-cache URI ("file::memory:?cache=shared"), or a NAMED memory URI
+    /// ("file:<name>?mode=memory&cache=shared" — the 1.0 `.memory(named:)`
+    /// storage form; same-name opens share one same-process database).
+    static bool path_is_memory(const std::string& p) {
+        if (p.empty() || p == ":memory:") return true;
+        // URI forms are only URI-parsed by SQLite when they START with
+        // "file:" — an on-disk path merely CONTAINING ':memory:' or
+        // 'mode=memory' is a regular file and must not be classified memory.
+        if (p.compare(0, 5, "file:") != 0) return false;
+        if (p.find(":memory:") != std::string::npos) return true;
+        auto q = p.find('?');
+        return q != std::string::npos && p.find("mode=memory", q) != std::string::npos;
+    }
+
+    /// Returns true if this is an in-memory database (either :memory: or shared cache URI)
+    bool is_in_memory() const { return path_is_memory(path); }
+};
+
+namespace detail {
+inline configuration ordinary_wal_configuration(configuration config) {
+    // The owner must retain the actual policy its writer receives, even when
+    // a native caller bypasses the Swift cache. Memory/readonly gain no route.
+    if(!config.read_only&&!config.is_in_memory())
+        config.wal_extent_limit_bytes=ordinary_select_wal_extent_limit(config.path,
+            config.ordinary_context,config.wal_extent_limit_bytes);
+    return config;
+}
+}
+
+// Backwards compatibility alias
+using db_config = configuration;
+
+// ============================================================================
+// Migration Context - Passed to migration block for data transformation
+// ============================================================================
+
+/// Row data for migration - maps column name to value
+using migration_row = std::unordered_map<std::string, column_value_t>;
+
+/// Describes pending schema changes for a single table
+struct table_changes {
+    std::string table_name;
+    std::vector<std::string> added_columns;    // New columns being added
+    std::vector<std::string> removed_columns;  // Columns being removed
+    std::vector<std::string> changed_columns;  // Columns with type changes
+
+    bool has_changes() const {
+        return !added_columns.empty() || !removed_columns.empty() || !changed_columns.empty();
+    }
+};
+
+/// Context passed to migration block. Provides methods to enumerate and
+/// transform objects during schema migration.
+///
+/// The migration block is called BEFORE auto-migration, so:
+/// - Old columns still exist (you can read from them)
+/// - New columns may not exist yet (auto-migration adds them after)
+///
+/// Typical flow:
+/// 1. Check pending_changes() to see what's changing
+/// 2. Use enumerate_objects() to read old data and prepare new values
+/// 3. After your block returns, auto-migration runs (adds/removes columns)
+class migration_context {
+public:
+    explicit migration_context(database& db) : db_(db) {}
+
+    /// Get all pending schema changes across all tables.
+    /// Use this to decide which tables need data transformation.
+    const std::vector<table_changes>& pending_changes() const {
+        return pending_changes_;
+    }
+
+    /// Check if a specific table has pending changes.
+    bool has_changes_for(const std::string& table_name) const {
+        for (const auto& tc : pending_changes_) {
+            if (tc.table_name == table_name && tc.has_changes()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Get pending changes for a specific table (nullptr if none).
+    const table_changes* changes_for(const std::string& table_name) const {
+        for (const auto& tc : pending_changes_) {
+            if (tc.table_name == table_name) {
+                return &tc;
+            }
+        }
+        return nullptr;
+    }
+
+    /// Enumerate all objects in a table for migration.
+    /// The callback receives:
+    /// - old_row: The original row data (read-only, includes columns being removed)
+    /// - new_row: Mutable row data to write (pre-populated with old values)
+    ///
+    /// Note: Write to columns that exist in the current schema. For new columns
+    /// that don't exist yet, the values will be applied after auto-migration
+    /// adds them (stored temporarily and applied via UPDATE).
+    ///
+    /// Example: Migrating lat/lon to geo_bounds
+    /// ```cpp
+    /// ctx.enumerate_objects("Place", [](const migration_row& old_row, migration_row& new_row) {
+    ///     double lat = std::get<double>(old_row.at("latitude"));
+    ///     double lon = std::get<double>(old_row.at("longitude"));
+    ///     new_row["location_minLat"] = lat;
+    ///     new_row["location_maxLat"] = lat;
+    ///     new_row["location_minLon"] = lon;
+    ///     new_row["location_maxLon"] = lon;
+    /// });
+    /// ```
+    void enumerate_objects(
+        const std::string& table_name,
+        std::function<void(const migration_row& old_row, migration_row& new_row)> block) {
+        auto rows = db_.query("SELECT * FROM " + table_name);
+        LOG_INFO("migration_context", "migrating %zu rows for table %s", rows.size(), table_name.c_str());
+        for (const auto& old_row : rows) {
+            migration_row new_row = old_row;
+            block(old_row, new_row);
+            int64_t row_id = 0;
+            auto id_it = old_row.find("id");
+            if (id_it != old_row.end() && std::holds_alternative<int64_t>(id_it->second)) {
+                row_id = std::get<int64_t>(id_it->second);
+            }
+            if (row_id > 0) {
+                pending_updates_[table_name][row_id] = std::move(new_row);
+            }
+        }
+    }
+
+    /// Rename a property (copies old column value to new column name).
+    /// Useful when renaming without type change.
+    void rename_property(const std::string& table_name,
+                         const std::string& old_name,
+                         const std::string& new_name) {
+        std::string sql = "UPDATE " + table_name + " SET " + new_name + " = " + old_name;
+        db_.execute(sql);
+    }
+
+    /// Delete all objects in a table.
+    void delete_all(const std::string& table_name) {
+        db_.execute("DELETE FROM " + table_name);
+    }
+
+    /// Execute raw SQL for complex migrations.
+    void execute_sql(const std::string& sql) {
+        db_.execute(sql);
+    }
+
+    /// Query raw SQL for reading data.
+    std::vector<migration_row> query_sql(const std::string& sql) {
+        return db_.query(sql);
+    }
+
+    // -- Internal methods (used by lattice_db) --
+
+    /// Add pending changes for a table (called by lattice_db during schema diff)
+    void add_table_changes(table_changes changes) {
+        pending_changes_.push_back(std::move(changes));
+    }
+
+    /// Queue a row update for application after schema migration
+    void queue_row_update(const std::string& table_name, int64_t row_id, migration_row row_data) {
+        pending_updates_[table_name][row_id] = std::move(row_data);
+    }
+
+    /// Apply pending updates after auto-migration has added new columns
+    void apply_pending_updates() {
+        LOG_INFO("migration", "apply_pending_updates: %zu tables queued", pending_updates_.size());
+        for (const auto& [table_name, rows] : pending_updates_) {
+            LOG_INFO("migration", "  applying %zu row updates for %s", rows.size(), table_name.c_str());
+            // Get current table columns to filter out columns that no longer exist
+            auto existing_cols = db_.get_table_info(table_name);
+            LOG_DEBUG("migration", "  current table has %zu columns", existing_cols.size());
+
+            size_t update_count = 0;
+            size_t skip_count = 0;
+            for (const auto& [row_id, new_row] : rows) {
+                // Build UPDATE statement - only include columns that exist in the table
+                std::ostringstream sql;
+                std::vector<column_value_t> params;
+
+                sql << "UPDATE " << table_name << " SET ";
+                bool first = true;
+
+                for (const auto& [col, val] : new_row) {
+                    if (col == "id" || col == "globalId") continue;
+
+                    // Only include columns that exist in the current schema
+                    if (existing_cols.find(col) == existing_cols.end()) {
+                        LOG_INFO("migration", "  skipping column %s (not in table %s)", col.c_str(), table_name.c_str());
+                        continue;
+                    }
+
+                    if (!first) sql << ", ";
+                    first = false;
+                    sql << col << " = ?";
+                    params.push_back(val);
+                }
+
+                if (!params.empty()) {
+                    sql << " WHERE id = ?";
+                    params.push_back(row_id);
+
+                    try {
+                        db_.execute(sql.str(), params);
+                        update_count++;
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("migration", "Update failed for %s row %lld: %s",
+                                  table_name.c_str(), (long long)row_id, e.what());
+                    }
+                } else {
+                    skip_count++;
+                    LOG_INFO("migration", "  row %lld: no updatable columns (all skipped)", (long long)row_id);
+                }
+            }
+            LOG_INFO("migration", "  %s: %zu updated, %zu skipped", table_name.c_str(), update_count, skip_count);
+        }
+        pending_updates_.clear();
+    }
+
+    /// Check if there are any pending changes
+    bool has_any_changes() const {
+        for (const auto& tc : pending_changes_) {
+            if (tc.has_changes()) return true;
+        }
+        return false;
+    }
+
+private:
+    database& db_;
+    std::vector<table_changes> pending_changes_;
+    // Pending row updates: table_name -> row_id -> new_row_data
+    std::unordered_map<std::string, std::unordered_map<int64_t, migration_row>> pending_updates_;
+};
+
+// ============================================================================
+// Main database interface
+// ============================================================================
+
+// Native destruction ownership, independent of admission or store authority.
+// A forked child must not destroy inherited threads, futures, callbacks or
+// mutex-bearing resource graphs. Keep their actual ownership in one allocation;
+// the native creator PID is captured before allocation and cannot be supplied.
+namespace detail {
+template<typename T> class process_bound_resource_owner {
+    struct native_deleter {
+        pid_t creator_pid;
+        void operator()(T* value) const noexcept {
+            if (!value || creator_pid != ::getpid()) return;
+            // The real payload remains heap-owned throughout each arbitrary
+            // target destruction. This final fallback must not allocate or
+            // leave a nonempty automatic target bundle across a fork.
+            if constexpr (requires(T& fields, pid_t creator) {
+                fields.prepare_native_target_destruction(creator);
+            }) {
+                if (!value->prepare_native_target_destruction(creator_pid)) return;
+            }
+            if (creator_pid == ::getpid()) delete value;
+            // Foreign-process copy is deliberately abandoned without touching
+            // T or releasing inherited descriptor locks. OS exit reclaims it.
+        }
+    };
+    std::unique_ptr<T,native_deleter> value_;
+public:
+    template<typename... Args> explicit process_bound_resource_owner(Args&&... args)
+        : value_(nullptr,native_deleter{::getpid()}) {
+        value_.reset(new T(std::forward<Args>(args)...));
+    }
+    process_bound_resource_owner(const process_bound_resource_owner&)=delete;
+    process_bound_resource_owner& operator=(const process_bound_resource_owner&)=delete;
+    process_bound_resource_owner(process_bound_resource_owner&&)=delete;
+    process_bound_resource_owner& operator=(process_bound_resource_owner&&)=delete;
+    T& get() const noexcept { return *value_; }
+    bool in_creator_process() const noexcept {
+        return value_.get_deleter().creator_pid == ::getpid();
+    }
+};
+}
+
+class lattice_db {
+    struct owned_resources;
+    detail::process_bound_resource_owner<owned_resources> process_resources_;
+    struct recovery_commit_batch;
+    friend class detail::authenticated_relay_setup;
+    // Never published or cached. Only the one-shot source administrator can construct it.
+    lattice_db(const configuration& config, detail::recovery_owner_schema catalog, std::shared_ptr<database> writer)
+        : process_resources_(config,std::move(catalog),std::move(writer)) {
+        setup_administrative_transaction_hooks();
+        alive_count().fetch_add(1,std::memory_order_relaxed);
+    }
+    struct checked_managed_existing_key {
+    private:
+        friend class swift_lattice;
+        friend class lattice_db;
+        checked_managed_existing_key() = default;
+    };
+    friend class swift_lattice;
+    lattice_db(const configuration& config,detail::recovery_owner_schema catalog,
+        std::shared_ptr<database> writer,checked_managed_existing_key)
+        :process_resources_(config,std::move(catalog),std::move(writer),checked_managed_existing_key{}) {
+        require_creator_process();
+        detail::ordinary_require_creator(config_.ordinary_context);
+        if(!config_.ordinary_context||!db_||config_.read_only||config_.is_in_memory()||
+           config_.is_sync_enabled()||config_.is_ipc_enabled()||config_.audit_retention_seconds!=0)
+            throw db_error("checked existing owner requires its quiescent native context");
+        setup_store_write_gate();
+        register_sql_functions();
+        note_tables_for_all_schemas();
+        // Last, nonthrowing Core construction step. Derived failure unwinds
+        // through the real destructor; earlier Core failure has no count.
+        alive_count().fetch_add(1,std::memory_order_relaxed);
+    }
+    struct checked_mounted_server_existing_key {
+    private:
+        friend class swift_lattice;
+        friend class lattice_db;
+        checked_mounted_server_existing_key() = default;
+    };
+    lattice_db(const configuration& config,detail::recovery_owner_schema catalog,
+        std::shared_ptr<database> writer,checked_mounted_server_existing_key)
+        :process_resources_(config,std::move(catalog),std::move(writer),checked_mounted_server_existing_key{}) {
+        require_creator_process();
+        if(config_.ordinary_context||!db_||config_.read_only||config_.is_in_memory()||
+           config_.is_sync_enabled()||config_.is_ipc_enabled()||config_.audit_retention_seconds!=0||
+           config_.managed_product_credentials||recovery_continuous_)
+            throw db_error("checked mounted server requires a quiescent no-context owner");
+        setup_store_write_gate();
+        register_sql_functions();
+        note_tables_for_all_schemas();
+        alive_count().fetch_add(1,std::memory_order_relaxed);
+    }
+    void publish_checked_existing_facilities() {
+        require_creator_process();
+        if(!checked_existing_unpublished_)throw db_error("checked existing owner already published");
+        // From this point an exception must run full original facility cleanup.
+        checked_existing_unpublished_=false;
+        setup_change_hook();
+        instance_registry::instance().register_instance(config_.path,this,guard_);
+        adopt_path_wal_eviction_threshold();
+        setup_cross_process_notifier();
+    }
+    void setup_administrative_transaction_hooks();
+public:
+    // Construct with path (uses default scheduler, no sync)
+    explicit lattice_db(const std::string& path)
+        : process_resources_(path) {
+        setup_store_write_gate();
+        ensure_tables();
+        setup_change_hook();
+        instance_registry::instance().register_instance(config_.path, this, guard_);
+        adopt_path_wal_eviction_threshold();
+        setup_cross_process_notifier();
+    }
+
+    // Construct in-memory (uses default scheduler, no sync)
+    lattice_db()
+        : process_resources_() {
+        setup_store_write_gate();
+        ensure_tables();
+        setup_change_hook();
+        instance_registry::instance().register_instance(config_.path, this, guard_);
+        adopt_path_wal_eviction_threshold();
+        setup_cross_process_notifier();
+    }
+
+    // Construct with full configuration (including optional sync)
+    // defer_sync: when true, skips sync/ipc setup — caller must call
+    // setup_sync_if_configured() + setup_ipc_if_configured() after
+    // all tables are created (used by swift_lattice).
+    static std::atomic<int64_t>& alive_count() {
+        static std::atomic<int64_t> count{0};
+        return count;
+    }
+
+    /// True once close() has been called. Reads/writes on the connections
+    /// short-circuit to empty (the guard lives in the `database` wrapper).
+    bool is_closed() const { return !owns_creator_process() || closed_.load(std::memory_order_seq_cst); }
+
+    // When using :memory: with sync enabled, we need a shared cache URI so the
+    // sync db (separate lattice_db instance) connects to the SAME in-memory database.
+    static std::string resolve_path(const configuration& config) {
+        if (config.path == ":memory:" && config.is_sync_enabled()) {
+            return "file::memory:?cache=shared";
+        }
+        return config.path;
+    }
+
+    explicit lattice_db(const configuration& config, bool defer_sync = false)
+        : lattice_db(config,defer_sync,detail::recovery_owner_schema::capture_native()) {}
+
+protected:
+    bool owns_creator_process() const noexcept { return process_resources_.in_creator_process(); }
+    void require_creator_process() const {
+        if (!owns_creator_process()) throw std::runtime_error("inherited lattice owner belongs to another process");
+    }
+    // Swift supplies complete immutable declarations before base-constructor
+    // bootstrap. A virtual getter here would see only the base subobject.
+    lattice_db(const configuration& config, bool defer_sync, detail::recovery_owner_schema recovery_schemas, std::shared_ptr<detail::recovery_continuous_admission> continuous = {}, std::shared_ptr<detail::database_open_ledger> connection_ledger = {})
+        : process_resources_(config,std::move(recovery_schemas),std::move(continuous),std::move(connection_ledger)) {
+        // Update config_.path to the resolved path so instance_registry keys match
+        // between the main db and sync db (both use "file::memory:?cache=shared").
+        config_.path = resolve_path(config);
+        setup_store_write_gate();
+        auto n = alive_count().fetch_add(1, std::memory_order_relaxed) + 1;
+        LOG_INFO("lattice_db", "CREATED (this=%p, path=%s, ipc=%d, sync=%d, alive=%lld)",
+                 (void*)this, config.path.c_str(), config.is_ipc_enabled() ? 1 : 0,
+                 config.is_sync_enabled() ? 1 : 0, (long long)n);
+        LOG_DEBUG("lattice_db", "ctor start path=%s read_only=%d", config.path.c_str(), config.read_only);
+        if (!config.read_only) {
+            LOG_DEBUG("lattice_db", "ensure_tables");
+            ensure_tables();
+            if (!recovery_continuous_) heal_collapsed_sync_state();
+            LOG_DEBUG("lattice_db", "setup_change_hook");
+            setup_change_hook();
+            if (!defer_sync && !recovery_continuous_) {
+                LOG_DEBUG("lattice_db", "setup_sync_if_configured");
+                setup_sync_if_configured();
+                LOG_DEBUG("lattice_db", "setup_ipc_if_configured");
+                setup_ipc_if_configured();
+            }
+        }
+        if (recovery_continuous_) return; // Retained factory publishes only after exact owned enrollment.
+        LOG_DEBUG("lattice_db", "register_instance");
+        instance_registry::instance().register_instance(config_.path, this, guard_);
+        adopt_path_wal_eviction_threshold();
+        LOG_DEBUG("lattice_db", "setup_cross_process_notifier");
+        setup_cross_process_notifier();
+        start_audit_maintenance();   // no-op unless audit_retention_seconds > 0
+        LOG_DEBUG("lattice_db", "ctor done");
+    }
+
+    bool recovery_producer_bootstrapped()const noexcept{return recovery_producer_bootstrapped_;}
+    const detail::recovery_owner_schema& recovery_declarations()const noexcept{return recovery_schemas_;}
+
+public:
+
+    /// One-time repair at open: collapse audit entries whose per-sync state
+    /// rows already cover every registered replication slot. Historic
+    /// binaries compared against a stale config snapshot instead of the live
+    /// slot registry, leaving entries marked-synced-but-never-collapsed —
+    /// which also made the passive pending count (sync progress UI) grow
+    /// forever. Safe by construction: only touches entries every live slot
+    /// has acknowledged.
+    void heal_collapsed_sync_state() {
+        try {
+            // The live slot inventory and both bookkeeping writes must use
+            // the same owned transaction. A stale count from before BEGIN can
+            // otherwise erase work for a channel registered in between.
+            with_audit_prune_transaction_([&]() -> int64_t {
+                if (!db_->table_exists("_lattice_sync_state") ||
+                    !db_->table_exists("_lattice_replication_slots")) return 0;
+                const auto rows = db_->query(
+                    "SELECT COUNT(*) AS cnt FROM _lattice_replication_slots");
+                if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("cnt")))
+                    throw db_error("sync healing requires an exact live slot count");
+                const auto slots = std::get<int64_t>(rows[0].at("cnt"));
+                if (slots < 1) return 0;
+
+                // A retired channel's retained ACK must never stand in for a
+                // missing ACK from a live channel. Once every live slot has
+                // confirmed, all state rows for that original can collapse.
+                const std::string confirmed =
+                    "SELECT st.audit_entry_id FROM _lattice_sync_state st "
+                    "WHERE st.is_synchronized = 1 AND EXISTS ("
+                    "  SELECT 1 FROM _lattice_replication_slots rs WHERE rs.sync_id = st.sync_id) "
+                    "GROUP BY st.audit_entry_id HAVING COUNT(DISTINCT st.sync_id) >= ?";
+                db_->execute("UPDATE AuditLog SET isSynchronized = 1 WHERE id IN (" + confirmed + ")", {slots});
+                db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id IN (" + confirmed + ")", {slots});
+                return 0;
+            });
+        } catch (...) {
+            // The owned helper settles only its own transaction. A caller's
+            // already-open transaction is refused and remains untouched.
+            LOG_WARN("lattice_db", "heal_collapsed_sync_state failed (non-fatal)");
+        }
+    }
+
+    ~lattice_db();
+
+    // Non-copyable and non-moveable (due to mutex and sqlite hooks)
+    lattice_db(const lattice_db&) = delete;
+    lattice_db& operator=(const lattice_db&) = delete;
+    lattice_db(lattice_db&&) = delete;
+    lattice_db& operator=(lattice_db&&) = delete;
+
+    // ========================================================================
+    // Add API - matches Swift's lattice.add(object) pattern
+    // Takes unmanaged object, inserts into DB, returns managed object
+    // ========================================================================
+    // MARK: Add
+
+    /// Add an unmanaged object to the database
+    /// Returns a managed object bound to this database
+    /// Usage: auto trip = db.add(Trip{"Costa Rica", 10});
+    template<typename T>
+    managed<std::decay_t<T>> add(T&& obj) {
+        using U = std::decay_t<T>;
+        managed<U> m(std::forward<T>(obj));
+        store_write_gate_hold gate(*this);  // §4.1: writes vs. captures never overlap
+        bind_managed(m, managed<U>::schema());
+        return m;
+    }
+
+    /// Add an unmanaged object with explicit schema (for dynamic objects)
+    template<typename T>
+    managed<std::decay_t<T>> add(T&& obj, const model_schema& schema,
+                                  const std::vector<std::string>& conflict_columns = {},
+                                  const std::string& preserved_global_id = "") {
+        using U = std::decay_t<T>;
+        managed<U> m(std::forward<T>(obj));
+        store_write_gate_hold gate(*this);  // §4.1: writes vs. captures never overlap
+        bind_managed(m, schema, conflict_columns, preserved_global_id);
+        return m;
+    }
+    
+    // MARK: Add Bulk
+    /// Add multiple objects in a single transaction (bulk insert)
+    /// More efficient than calling add() in a loop
+    template<typename T>
+    std::vector<managed<std::decay_t<T>>> add_bulk(std::vector<T>&& objects) {
+        using U = std::decay_t<T>;
+        const auto& schema = managed<U>::schema();
+        return add_bulk_with_schema(std::move(objects), schema);
+    }
+
+    /// Add multiple objects with explicit schema (for dynamic objects)
+    /// conflict_columns: if non-empty, uses ON CONFLICT DO UPDATE for upsert
+    template<typename T>
+    std::vector<managed<std::decay_t<T>>> add_bulk_with_schema(std::vector<T>&& objects, const model_schema& schema,
+                                                               const std::vector<std::string>& conflict_columns = {}) {
+        using U = std::decay_t<T>;
+
+        if (objects.empty()) {
+            return {};
+        }
+
+        // §4.1 per-store write gate: the whole bulk transaction (including
+        // the DDL probes below) is one writer scope vs. sibling captures.
+        store_write_gate_hold gate(*this);
+
+        // Ensure table exists
+        std::vector<column_def> columns;
+        columns.reserve(schema.properties.size());
+        for (const auto& prop : schema.properties) {
+            columns.push_back({prop.name, prop.type, prop.nullable, false, false});
+        }
+        db_->ensure_table({schema.table_name, columns});
+
+        // Ensure vec0 tables exist for any vector columns (with triggers)
+        // This must happen BEFORE the inserts so triggers can fire
+        // Use the first object to infer dimensions
+        for (const auto& prop : schema.properties) {
+            if (prop.is_vector && prop.type == column_type::blob) {
+                // Find vector data in first object to infer dimensions
+                managed<U> temp(objects[0]);
+                auto values = temp.collect_values();
+                for (const auto& [name, value] : values) {
+                    if (name == prop.name && std::holds_alternative<std::vector<uint8_t>>(value)) {
+                        const auto& vec_data = std::get<std::vector<uint8_t>>(value);
+                        if (!vec_data.empty()) {
+                            int dimensions = static_cast<int>(vec_data.size() / sizeof(float));
+                            ensure_vec0_table(schema.table_name, prop.name, dimensions);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Build the SQL: INSERT INTO table (globalId, col1, col2, ...) VALUES (?, ?, ?, ...)
+        std::ostringstream sql;
+        sql << "INSERT INTO " << schema.table_name << " (globalId";
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::primitive) {
+                if (prop.is_geo_bounds) {
+                    // geo_bounds expands to 4 columns (matches CREATE TABLE pattern)
+                    sql << ", " << prop.name << "_minLat";
+                    sql << ", " << prop.name << "_maxLat";
+                    sql << ", " << prop.name << "_minLon";
+                    sql << ", " << prop.name << "_maxLon";
+                } else {
+                    sql << ", " << prop.name;
+                }
+            }
+        }
+        sql << ") VALUES (?";
+        size_t param_count = 1;
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::primitive) {
+                if (prop.is_geo_bounds) {
+                    // geo_bounds needs 4 placeholders
+                    sql << ", ?, ?, ?, ?";
+                    param_count += 4;
+                } else {
+                    sql << ", ?";
+                    ++param_count;
+                }
+            }
+        }
+        sql << ")";
+
+        // Add ON CONFLICT clause for upsert if conflict_columns provided
+        if (!conflict_columns.empty()) {
+            sql << " ON CONFLICT (";
+            bool first = true;
+            for (const auto& col : conflict_columns) {
+                if (!first) sql << ", ";
+                sql << col;
+                first = false;
+            }
+            sql << ")";
+            std::ostringstream set_clause;
+            first = true;
+            for (const auto& prop : schema.properties) {
+                if (prop.kind != property_kind::primitive) continue;
+                // Skip conflict columns and globalId
+                bool is_conflict = false;
+                for (const auto& cc : conflict_columns) {
+                    if (cc == prop.name) { is_conflict = true; break; }
+                }
+                if (is_conflict) continue;
+                if (!first) set_clause << ", ";
+                set_clause << prop.name << " = excluded." << prop.name;
+                first = false;
+            }
+            if (first) {
+                // No columns to update — every primitive column is part of the conflict key.
+                sql << " DO NOTHING";
+            } else {
+                sql << " DO UPDATE SET " << set_clause.str();
+            }
+        }
+
+        // Prepare once
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_->internal_handle(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            LOG_ERROR("db", "Failed to prepare bulk insert: %s", sqlite3_errmsg(db_->internal_handle()));
+            throw std::runtime_error("Failed to prepare bulk insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
+        }
+
+        std::vector<managed<U>> results;
+        results.reserve(objects.size());
+
+        // For a bulk upsert, any row that collides resolves to an UPDATE of an existing row
+        // a live @Model instance may be backing. Signal flush_changes (which runs on this
+        // thread at commit) to populate changed_fields so those live instances refresh.
+        // Harmless for rows that insert fresh: they have no registered observer yet.
+        if (!conflict_columns.empty()) {
+            tls_notify_local_object_observers_ = true;
+        }
+
+        // Use a transaction for efficiency
+        bool was_in_transaction = false;
+        try {
+            if (!db_->is_in_transaction()) {
+                db_->begin_transaction();
+            } else {
+                was_in_transaction = true;
+            }
+
+            for (auto&& obj : objects) {
+                managed<U> m(std::forward<T>(obj));
+
+                // Generate globalId
+                auto gid = generate_global_id();
+
+                // Bind parameters
+                int idx = 1;
+                sqlite3_bind_text(stmt, idx++, gid.c_str(), -1, SQLITE_TRANSIENT);
+
+                // Collect and bind primitive values
+                auto values = m.collect_values();
+                for (const auto& prop : schema.properties) {
+                    if (prop.kind == property_kind::primitive) {
+                        if (prop.is_geo_bounds) {
+                            // geo_bounds: bind 4 expanded columns
+                            std::array<std::string, 4> suffixes = {"_minLat", "_maxLat", "_minLon", "_maxLon"};
+                            for (const auto& suffix : suffixes) {
+                                std::string col_name = prop.name + suffix;
+                                bool found = false;
+                                for (const auto& [name, val] : values) {
+                                    if (name == col_name) {
+                                        db_->bind_value(stmt, idx++, val);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    sqlite3_bind_null(stmt, idx++);
+                                }
+                            }
+                        } else {
+                            // Find the value for this property
+                            bool found = false;
+                            for (const auto& [name, val] : values) {
+                                if (name == prop.name) {
+                                    db_->bind_value(stmt, idx++, val);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                sqlite3_bind_null(stmt, idx++);
+                            }
+                        }
+                    }
+                }
+
+                // Execute
+                if (db_->step_statement_(stmt) != SQLITE_DONE) {
+                    LOG_ERROR("db", "Failed to insert (bulk): %s", sqlite3_errmsg(db_->internal_handle()));
+                    throw std::runtime_error("Failed to insert: " + std::string(sqlite3_errmsg(db_->internal_handle())));
+                }
+
+                // Get the new ID (or existing ID for upsert)
+                auto id = sqlite3_last_insert_rowid(db_->internal_handle());
+                primary_key_t actual_id = id;
+                global_id_t actual_gid = gid;
+
+                // For upsert, last_insert_rowid returns 0 if only update happened
+                if (!conflict_columns.empty() && id == 0) {
+                    // Query back to get actual id/globalId
+                    std::ostringstream where;
+                    std::vector<column_value_t> params;
+                    bool first = true;
+                    for (const auto& col : conflict_columns) {
+                        for (const auto& [name, val] : values) {
+                            if (name == col) {
+                                if (!first) where << " AND ";
+                                where << col << " = ?";
+                                params.push_back(val);
+                                first = false;
+                                break;
+                            }
+                        }
+                    }
+                    auto rows = query_read("SELECT id, globalId FROM " + schema.table_name +
+                                                " WHERE " + where.str(), params);
+                    if (!rows.empty()) {
+                        actual_id = std::get<int64_t>(rows[0].at("id"));
+                        actual_gid = std::get<std::string>(rows[0].at("globalId"));
+                    }
+                }
+
+                // Bind the managed object
+                m.db_ = db_.get();
+                m.lattice_ = this;
+                m.table_name_ = schema.table_name;
+                m.id_ = actual_id;
+                m.global_id_ = actual_gid;
+                m.bind_to_db();
+
+                results.push_back(std::move(m));
+
+                // Reset for next iteration
+                sqlite3_reset(stmt);
+                sqlite3_clear_bindings(stmt);
+            }
+
+            if (!was_in_transaction) {
+                db_->commit();
+            }
+        } catch (...) {
+            if (db_->is_in_transaction()) {
+                db_->rollback();
+            }
+            auto msg = sqlite3_errmsg(db_->internal_handle());
+            sqlite3_finalize(stmt);
+            throw;
+        }
+
+        sqlite3_finalize(stmt);
+        return results;
+    }
+
+    // MARK: Bind Managed
+    /// Internal: Bind a managed object to the database with explicit schema
+    /// Inserts row, assigns IDs, and binds properties so writes go to DB
+    /// Used by swift_lattice for dynamic objects where schema comes from the instance
+    /// conflict_columns: if non-empty, uses ON CONFLICT DO UPDATE for upsert
+    template<typename T>
+    void bind_managed(managed<T>& obj, const model_schema& schema,
+                      const std::vector<std::string>& conflict_columns = {},
+                      const std::string& preserved_global_id = "") {
+        // Convert property_descriptors to column_defs for table creation
+        std::vector<column_def> columns;
+        columns.reserve(schema.properties.size());
+        for (const auto& prop : schema.properties) {
+            columns.push_back({prop.name, prop.type, prop.nullable, false, false});
+        }
+
+        // Ensure table exists
+        db_->ensure_table({schema.table_name, columns});
+
+        // Collect values and add globalId.
+        //
+        // `preserved_global_id` arrives from sync replay (and from
+        // any other caller bridge — Swift `add(_:preservingGlobalId:)`,
+        // the C-API, etc.) bearing whatever case the source emitted.
+        // Swift's `UUID.uuidString` defaults to UPPERCASE; our own
+        // `generate_global_id()` emits LOWERCASE (std::hex). Without
+        // canonicalising here, sync-replayed rows land with uppercase
+        // `globalId` while the same logical row's locally-created
+        // counterpart on the originator is stored lowercase. The
+        // mismatch is silent for direct equality reads (the C++
+        // globalId-lookup paths happen to normalise) but breaks any
+        // TEXT-on-TEXT join through link tables — SQLite default
+        // `BINARY` collation is case-sensitive, so a `WHERE rhs IN
+        // (SELECT globalId FROM Target ...)` chain (which `@Relation`
+        // backlinks generate) silently filters synced rows out.
+        // Found via ClaudeCodeIRC's AskQuestion / AskVote: peers'
+        // votes synced and `vote.question` resolved correctly, but
+        // `q.votes` returned 0 on the host. Lowering at this single
+        // ingestion point also propagates to `obj.global_id_` (used
+        // by every later `set_link` insert into `_<S>_<T>_<f>` link
+        // tables) and the geo-list parent_id, so the canonical form
+        // is enforced uniformly downstream.
+        auto values = obj.collect_values();
+        auto gid = preserved_global_id.empty() ? generate_global_id() : preserved_global_id;
+        std::transform(gid.begin(), gid.end(), gid.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        values.insert(values.begin(), {"globalId", gid});
+
+        // Ensure vec0 tables exist for any vector columns (with triggers)
+        // This must happen BEFORE the insert so triggers can fire
+        for (const auto& prop : schema.properties) {
+            if (prop.is_vector && prop.type == column_type::blob) {
+                // Find the vector data in values to infer dimensions
+                for (const auto& [name, value] : values) {
+                    if (name == prop.name && std::holds_alternative<std::vector<uint8_t>>(value)) {
+                        const auto& vec_data = std::get<std::vector<uint8_t>>(value);
+                        if (!vec_data.empty()) {
+                            int dimensions = static_cast<int>(vec_data.size() / sizeof(float));
+                            ensure_vec0_table(schema.table_name, prop.name, dimensions);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Insert row (triggers will handle vec0 sync)
+        // For an upsert, the insert may resolve to an UPDATE of an existing row that a
+        // live @Model instance is backing. That UPDATE never runs a Swift setter, so signal
+        // flush_changes (which runs synchronously on this thread inside db_->insert for a
+        // file DB) to populate changed_fields and fire the live instance's object observers.
+        // Harmless on a pure INSERT: the new row has no registered observer yet.
+        if (!conflict_columns.empty()) {
+            tls_notify_local_object_observers_ = true;
+        }
+        auto id = db_->insert(schema.table_name, values, conflict_columns);
+
+        // Upserts must rebind to the row that actually holds the data: when
+        // ON CONFLICT takes the DO UPDATE path the pre-existing row keeps its
+        // id AND globalId — binding the object to the freshly generated gid
+        // would point every subsequent link write (junction rows reference
+        // rows by globalId) at a row that doesn't exist. insert() reports the
+        // affected rowid via RETURNING (0 for DO NOTHING); re-read identity on
+        // the WRITE connection — read_db() can't see rows inside an open
+        // transaction.
+        primary_key_t actual_id = id;
+        global_id_t actual_gid = gid;
+        if (!conflict_columns.empty()) {
+            if (id != 0) {
+                auto rows = db_->query(
+                    "SELECT globalId FROM " + schema.table_name + " WHERE id = ?", {id});
+                if (!rows.empty()) {
+                    actual_gid = std::get<std::string>(rows[0].at("globalId"));
+                }
+            } else {
+                // DO NOTHING hit a conflict: look the row up by its conflict key.
+                std::ostringstream where;
+                std::vector<column_value_t> params;
+                bool first = true;
+                for (const auto& col : conflict_columns) {
+                    for (const auto& [name, val] : values) {
+                        if (name == col) {
+                            if (!first) where << " AND ";
+                            where << col << " = ?";
+                            params.push_back(val);
+                            first = false;
+                            break;
+                        }
+                    }
+                }
+                auto rows = db_->query("SELECT id, globalId FROM " + schema.table_name +
+                                       " WHERE " + where.str(), params);
+                if (!rows.empty()) {
+                    actual_id = std::get<int64_t>(rows[0].at("id"));
+                    actual_gid = std::get<std::string>(rows[0].at("globalId"));
+                }
+            }
+        }
+
+        // Bind the managed object to the database
+        obj.db_ = db_.get();
+        obj.lattice_ = this;
+        obj.table_name_ = schema.table_name;
+        obj.id_ = actual_id;
+        obj.global_id_ = actual_gid;
+
+        // Bind all properties so writes go to DB
+        obj.bind_to_db();
+
+        // Persist geo_bounds lists (must happen after bind_to_db so properties are bound)
+        persist_geo_bounds_lists(obj, schema.table_name, actual_gid);
+    }
+
+    // Persist geo_bounds lists if the managed type supports them
+    // Uses the global has_geo_bounds_lists trait defined at namespace level
+    template<typename ManagedT>
+    void persist_geo_bounds_lists(ManagedT& obj, const std::string& table_name, const std::string& global_id) {
+        if constexpr (has_geo_bounds_lists<ManagedT>::value) {
+            auto geo_lists = obj.collect_geo_bounds_lists();
+            for (const auto& [prop_name, bounds_list] : geo_lists) {
+                if (!bounds_list.empty()) {
+                    // Ensure list table exists
+                    ensure_geo_bounds_list_table(table_name, prop_name);
+
+                    // Insert each bounds entry
+                    std::string list_table = "_" + table_name + "_" + prop_name;
+                    for (const auto& bounds : bounds_list) {
+                        std::string sql = "INSERT INTO " + list_table +
+                            " (parent_id, minLat, maxLat, minLon, maxLon) VALUES (?, ?, ?, ?, ?)";
+                        db_->execute(sql, {global_id, bounds.min_lat, bounds.max_lat, bounds.min_lon, bounds.max_lon});
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Query API - matches Swift's lattice.objects(T.self) pattern
+    // Returns results<T> directly (not query builder)
+    // ========================================================================
+
+    /// Get all objects of type T
+    /// Usage: auto trips = db.objects<Trip>();
+    template<typename T>
+    results<T> objects() {
+        const auto& schema = managed<T>::schema();
+        std::string sql = "SELECT * FROM " + schema.table_name;
+        // Use read connection for queries (concurrent reads)
+        auto rows = query_read(sql);
+
+        std::vector<managed<T>> items;
+        items.reserve(rows.size());
+        for (const auto& row : rows) {
+            items.push_back(hydrate<T>(row));
+        }
+
+        return results<T>(std::move(items), this);
+    }
+
+    /// Get a query builder for type T (supports spatial queries)
+    /// Usage: db.query<Place>().within_bbox("location", ...).execute()
+    template<typename T>
+    query<T> query() {
+        return ::lattice::query<T>(*this);
+    }
+
+    // Get the scheduler for this database
+    std::shared_ptr<scheduler> get_scheduler() const { return scheduler_; }
+
+    // Get the configuration
+    const configuration& config() const { return config_; }
+
+    /// Flag indicating if this connection is the sync coordinator
+    /// When true, audit logs are generated but not uploaded (they come from remote)
+    bool is_synchronizer() const {
+        require_creator_process(); return is_synchronizer_; }
+    void set_is_synchronizer(bool value) {
+        require_creator_process(); is_synchronizer_ = value; }
+
+    /// True when other same-process instances registered under this path can
+    /// read this instance's committed writes: file DBs and shared-cache memory
+    /// DBs share storage, so notifications must fan out via the instance
+    /// registry. Plain :memory: instances collide on the registry key
+    /// (":memory:") but have ISOLATED storage — fanning out to them would
+    /// deliver events about rows that don't exist in their database. Single
+    /// source of the fan-out policy (used by flush_changes and sync.cpp's
+    /// notify_observers).
+    bool storage_shared_across_instances() const {
+        return !config_.is_in_memory() ||
+               config_.path.find("cache=shared") != std::string::npos;
+    }
+
+    /// Append a change to the buffer (called from update hook)
+    void append_to_change_buffer(const std::string& table, const std::string& op,
+                                  int64_t row_id, const std::string& global_id, bool main_schema = true) {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        change_buffer_.emplace_back(table, op, row_id, global_id, main_schema);
+    }
+
+    /// Discard buffered-but-undelivered changes (rollback path — wired as the
+    /// rolled-back txn hook in setup_change_hook). Wholesale clear is correct:
+    /// the buffer only ever holds the currently-open transaction's rows —
+    /// every commit flushes it via the WAL hook or the post-statement drain.
+    void discard_change_buffer() {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        change_buffer_.clear();
+    }
+
+    /// Flush buffered changes and notify observers. File DBs arrive here from
+    /// the WAL hook; memory/Emscripten DBs from the post-statement drain in
+    /// db.cpp (docs/design-deferred-memory-delivery.md). Broadcasts to all
+    /// instances sharing this database path.
+    ///
+    /// Returns true when at least one batch was delivered — the WAL hook
+    /// uses this to signal the invalidation hooks for empty-buffer commits
+    /// (bookkeeping-table-only transactions still grow the WAL a keeper
+    /// pins, so EVERY settled commit must signal; results spec §2.3).
+    ///
+    /// Bounded drain-until-empty: an observer callback that WRITES during
+    /// delivery buffers new entries while is_flushing_ suppresses its nested
+    /// flush — without the loop those entries would strand until the next
+    /// unrelated write. The cap guards against a callback that writes on
+    /// every fire; leftovers past the cap still deliver on the next write.
+    bool flush_changes() {
+        constexpr int kMaxDrainIterations = 64;
+        bool delivered_any = false;
+        for (int i = 0; i < kMaxDrainIterations; ++i) {
+            if (!flush_changes_once()) return delivered_any;
+            delivered_any = true;
+        }
+        LOG_WARN("flush_changes", "change buffer still non-empty after %d drain iterations — "
+                 "an observer callback writes on every fire; remaining entries deliver on the next write",
+                 kMaxDrainIterations);
+        return delivered_any;
+    }
+
+    /// Single flush pass (implementation detail of flush_changes). Returns
+    /// false when there was nothing to deliver (empty buffer or re-entrant
+    /// call under is_flushing_); true after delivering one batch, so the
+    /// caller re-checks the buffer for observer-callback writes.
+    bool flush_changes_once() { return flush_changes_once_impl(nullptr, nullptr); }
+
+private:
+    std::function<void()> capture_topology_settlement(database& writer) {
+        {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            // Match the ordinary empty-buffer tail without stealing a flush or
+            // an owned recovery/delivery reservation that is still in progress.
+            if (change_buffer_.empty() && !is_flushing_ &&
+                !recovery_change_buffer_reserved_ && topology_delivery_depth_ == 0)
+                return [] {};
+        }
+        auto batch = std::make_shared<recovery_commit_batch>();
+        std::function<void()> delivery = [this, batch] { deliver_topology_settlement(*batch); };
+        if (!flush_changes_once_impl(&writer, batch.get(), true)) return {};
+        return delivery;
+    }
+
+    void deliver_topology_settlement(const recovery_commit_batch& batch) {
+        {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if (topology_delivery_depth_ == std::numeric_limits<size_t>::max())
+                throw db_error("topology delivery depth exhausted");
+            ++topology_delivery_depth_;
+        }
+        struct delivery_depth {
+            lattice_db& owner;
+            bool active = true;
+            bool release() {
+                std::lock_guard<std::mutex> lock(owner.change_buffer_mutex_);
+                active = false;
+                return --owner.topology_delivery_depth_ == 0;
+            }
+            ~delivery_depth() { if (active) release(); }
+        } depth{*this};
+        auto alive = [&](auto&& fn) {
+            if (storage_shared_across_instances())
+                instance_registry::instance().for_each_alive(config_.path, fn);
+            else fn(this);
+        };
+        if (batch.audit_frontier) alive([&](lattice_db* owner) {
+            auto seen = owner->last_seen_audit_id_.load(std::memory_order_acquire);
+            while (seen < *batch.audit_frontier &&
+                   !owner->last_seen_audit_id_.compare_exchange_weak(
+                       seen, *batch.audit_frontier, std::memory_order_release,
+                       std::memory_order_acquire)) {}
+        });
+        alive([&](lattice_db* owner) {
+            owner->fire_invalidation_hooks_local(batch.invalidations, invalidation_reason::commit);
+        });
+        if (!batch.events.empty()) alive([&](lattice_db* owner) {
+            owner->notify_changes_batched_impl(batch.events, &batch.typed_event_indices);
+        });
+        if (batch.needs_upload_hint) trigger_sync_upload();
+        if (shared_xproc_notifier_ && !config_.read_only) shared_xproc_notifier_->post_notification();
+        if (depth.release()) {
+            // One captured batch plus at most 63 callback-write batches keeps
+            // the original 64-pass drain bound. No later rollback can mutate
+            // the already resolved captured events delivered above.
+            for (int i = 1; i < 64; ++i) if (!flush_changes_once()) return;
+            LOG_WARN("flush_changes", "change buffer still non-empty after %d drain iterations — "
+                     "an observer callback writes on every fire; remaining entries deliver on the next write", 64);
+        }
+    }
+
+    // Only engine-owned frames supply a batch/writer. Topology captures use
+    // ordinary event semantics and resolve through the exact admitted writer;
+    // recovery retains its distinct audit/changed-field rules.
+    bool flush_changes_once_impl(database* recovery_writer, recovery_commit_batch* batch,
+                                 bool ordinary_capture = false) {
+        const bool recovery_capture = batch && !ordinary_capture;
+        if(administrative_owner_) {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if(!change_buffer_.empty()||is_flushing_)
+                throw db_error("closed source administration cannot publish model changes");
+            return false;
+        }
+        LOG_DEBUG("flush_changes", "Called");
+        std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> changes;
+        decltype(changes) original_changes;
+        {
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
+            // An owned transaction may not turn an active delivery into an
+            // empty captured batch and then commit. Actual admission refuses
+            // this state first; retain refusal at the final capture boundary.
+            if (recovery_capture && topology_delivery_depth_ != 0)
+                throw db_error("owned notification capture during topology delivery");
+            if (change_buffer_.empty() || is_flushing_ || topology_delivery_depth_ != 0 ||
+                (recovery_change_buffer_reserved_ && !recovery_capture)) return false;
+            if (ordinary_capture) {
+                // Build the detached ordinary batch before consuming its live
+                // records. Allocation/query failures keep the original pending.
+                changes = change_buffer_;
+                original_changes = changes;
+            } else {
+                changes = std::move(change_buffer_);
+                change_buffer_.clear();
+            }
+            is_flushing_ = true;
+        }
+
+        // Exception-safe reset: observer exceptions propagate to the writer
+        // (plain C++ frames via the post-statement drain) and must not leave
+        // is_flushing_ set — that would silently disable delivery forever.
+        struct flushing_reset {
+            lattice_db* self;
+            ~flushing_reset() {
+                std::lock_guard<std::mutex> lock(self->change_buffer_mutex_);
+                self->is_flushing_ = false;
+            }
+        } reset_guard{this};
+
+        // Read-and-clear the one-shot upsert flag set by add()/add_bulk on THIS thread
+        // (flush_changes always runs on the writing thread). When set, populate
+        // changed_fields for local UPDATEs below so live object observers fire — an upsert
+        // mutates the row in SQL without a Swift setter, so nothing else notifies them.
+        // Cleared up-front (before any throwing DB query) so an exception can't leak it.
+        const bool notify_local_objects = tls_notify_local_object_observers_;
+        tls_notify_local_object_observers_ = false;
+        struct capture_flag_restore {
+            bool capture, original; int exceptions = std::uncaught_exceptions();
+            ~capture_flag_restore() {
+                if (capture && original && std::uncaught_exceptions() > exceptions)
+                    lattice_db::tls_notify_local_object_observers_ = true;
+            }
+        } restore_flag{ordinary_capture, notify_local_objects};
+
+        LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
+
+        const auto batch_query = [&](const std::string& sql,
+                                     const std::vector<column_value_t>& params = {}) {
+            if (ordinary_capture) {
+                if (auto* operation = database::attachment_sql_scope::operation_for(recovery_writer))
+                    operation->check();
+                if (recovery_writer->is_closed()) throw db_error("topology settlement writer closed");
+                auto rows = recovery_writer->query(sql, params);
+                if (recovery_writer->is_closed()) throw db_error("topology settlement writer closed");
+                return rows;
+            }
+            return recovery_writer ? recovery_writer->query(sql, params) : query_read(sql, params);
+        };
+
+        // Backfill globalId for AuditLog INSERTs buffered by the update hook.
+        // The memory/Emscripten hook buffers them with an empty globalId — the
+        // row wasn't safely readable from inside the hook; here the transaction
+        // has settled and it is. One IN query covers the whole batch.
+        {
+            std::string audit_id_list;
+            for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
+                if (table == "AuditLog" && op == "INSERT" && global_id.empty()) {
+                    if (!audit_id_list.empty()) audit_id_list += ",";
+                    audit_id_list += std::to_string(row_id);
+                }
+            }
+            if (!audit_id_list.empty()) {
+                std::unordered_map<int64_t, std::string> gid_by_id;
+                auto rows = batch_query(
+                    "SELECT id, globalId FROM AuditLog WHERE id IN (" + audit_id_list + ")");
+                for (const auto& row : rows) {
+                    auto id_it = row.find("id");
+                    auto gid_it = row.find("globalId");
+                    if (id_it != row.end() && gid_it != row.end() &&
+                        std::holds_alternative<int64_t>(id_it->second) &&
+                        std::holds_alternative<std::string>(gid_it->second)) {
+                        gid_by_id[std::get<int64_t>(id_it->second)] =
+                            std::get<std::string>(gid_it->second);
+                    }
+                }
+                for (auto& [table, op, row_id, global_id, main_schema] : changes) {
+                    if (table == "AuditLog" && op == "INSERT" && global_id.empty()) {
+                        auto it = gid_by_id.find(row_id);
+                        if (it != gid_by_id.end()) global_id = it->second;
+                    }
+                }
+                if (recovery_capture) {
+                    // ROLLBACK TO does not invoke SQLite's rollback hook. A
+                    // nested failed helper can leave a buffered audit row that
+                    // no longer exists, or whose rowid a later insert reused.
+                    // Only surviving addressed rows supply durable events and
+                    // cursor evidence, each once. The write view stays owned.
+                    std::unordered_set<int64_t> retained;
+                    changes.erase(std::remove_if(changes.begin(), changes.end(),
+                        [&](const auto& change) {
+                            if (std::get<0>(change) != "AuditLog" || std::get<1>(change) != "INSERT")
+                                return false;
+                            const auto row_id = std::get<2>(change);
+                            return gid_by_id.find(row_id) == gid_by_id.end() ||
+                                !retained.insert(row_id).second;
+                        }), changes.end());
+                }
+            }
+        }
+
+        // Helper: iterate alive instances sharing this path, guarded by
+        // refcount so the destructor waits for in-flight calls to complete.
+        // Plain in-memory DBs each have isolated storage, so only notify this instance.
+        // Shared cache in-memory DBs share storage, so use registry like file DBs.
+        auto for_each_alive = [&](auto&& fn) {
+            if (storage_shared_across_instances()) {
+                instance_registry::instance().for_each_alive(config_.path, fn);
+            } else {
+                fn(this);
+            }
+        };
+
+        // Advance cross-process cursor on ALL instances sharing this path
+        // BEFORE notifying observers. This prevents any instance's
+        // cross-process handler from re-dispatching entries that
+        // flush_changes is about to (or just did) deliver.
+        if (recovery_capture) {
+            // Recovery buffers the actual inserted audit rows, including file
+            // stores. A suppressed model edit has no new audit frontier and
+            // must not adopt an unrelated historical MAX(id).
+            for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
+                if (table == "AuditLog" && op == "INSERT" && row_id > 0 &&
+                    (!batch->audit_frontier || row_id > *batch->audit_frontier))
+                    batch->audit_frontier = row_id;
+            }
+        } else if (shared_xproc_notifier_) {
+            // The committing writer sees this commit even if an ordinary
+            // reader still holds an older implicit snapshot.
+            auto max_rows = ordinary_capture
+                ? batch_query("SELECT MAX(id) AS max_id FROM AuditLog")
+                : db_->query("SELECT MAX(id) AS max_id FROM AuditLog");
+            if (!max_rows.empty()) {
+                auto it = max_rows[0].find("max_id");
+                if (it != max_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                    const auto max_id = std::get<int64_t>(it->second);
+                    if (ordinary_capture) batch->audit_frontier = max_id;
+                    else for_each_alive([max_id](lattice_db* inst) {
+                        inst->last_seen_audit_id_.store(max_id, std::memory_order_release);
+                    });
+                }
+            }
+        }
+
+        // Resolve internal tables (link tables, geo_bounds list tables) to their
+        // parent tables. Internal table changes are translated to parent UPDATE
+        // notifications — e.g. a link table INSERT becomes a parent table UPDATE.
+        // The _lattice_meta value stores the parent table name.
+        // Maps link table name → "parent_table:property_name"
+        std::unordered_map<std::string, std::string> internal_table_parents;
+        bool had_internal_changes = false;
+        for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
+            if (table == "AuditLog" || internal_table_parents.count(table)) continue;
+            auto meta = batch_query(
+                "SELECT value FROM _lattice_meta WHERE key = ?",
+                {"internal_table:" + table}
+            );
+            if (!meta.empty()) {
+                auto val_it = meta[0].find("value");
+                if (val_it != meta[0].end() && std::holds_alternative<std::string>(val_it->second)) {
+                    internal_table_parents[table] = std::get<std::string>(val_it->second);
+                }
+            }
+        }
+
+        // Build one batched event vector for this flush. All five
+        // notification kinds (model change, internal-table change,
+        // parent-table UPDATE for an internal-table change, AuditLog
+        // INSERT for the model change, AuditLog INSERT for the
+        // internal-table change) accumulate here. One
+        // `notify_changes_batched(events)` dispatch per alive instance
+        // happens at the bottom of this function — that's what makes
+        // a multi-row transaction (and a cascade delete) reach
+        // observers as a single fire.
+        std::vector<change_event> events;
+        std::vector<size_t> typed_event_indices;
+        events.reserve(changes.size() * 2);   // roughly one model + one audit per change
+
+        // A recovery body may deliberately suppress AuditLog creation and
+        // overlay several fields. Historical changedFieldsNames cannot describe
+        // its final state. Read each physical model layout once while the owned
+        // writer still pins it, and conservatively refresh all model properties.
+        std::unordered_map<std::string, std::string> recovery_field_names;
+        const auto recovery_fields = [&](const std::string& table) -> const std::string& {
+            const auto found = recovery_field_names.find(table);
+            if (found != recovery_field_names.end()) return found->second;
+            const auto columns = batch_query(
+                "SELECT name FROM pragma_table_info(?, 'main') ORDER BY cid", {table});
+            if (columns.empty()) throw db_error("recovery notification model schema is unavailable");
+            auto names = nlohmann::json::array();
+            std::unordered_set<std::string> physical_names;
+            for (const auto& column : columns) {
+                const auto it = column.find("name");
+                if (it == column.end() || !std::holds_alternative<std::string>(it->second))
+                    throw db_error("recovery notification model column is invalid");
+                const auto& name = std::get<std::string>(it->second);
+                physical_names.insert(name);
+                if (name != "id" && name != "globalId") names.push_back(name);
+            }
+            // Core and Swift expand a geo property into this exact quartet,
+            // while object observers accept its logical property name. Add a
+            // conservative alias without dropping physical names or claiming a
+            // schema type. Coincidental scalar quartets merely refresh extra.
+            for (const auto& column : columns) {
+                const auto& name = std::get<std::string>(column.at("name"));
+                constexpr std::string_view suffix = "_minLat";
+                if (name.size() <= suffix.size() ||
+                    name.compare(name.size() - suffix.size(), suffix.size(), suffix.data(), suffix.size()) != 0) continue;
+                const auto prefix = name.substr(0, name.size() - suffix.size());
+                if (physical_names.find(prefix) == physical_names.end() &&
+                    physical_names.find(prefix + "_maxLat") != physical_names.end() &&
+                    physical_names.find(prefix + "_minLon") != physical_names.end() &&
+                    physical_names.find(prefix + "_maxLon") != physical_names.end()) names.push_back(prefix);
+            }
+            return recovery_field_names.emplace(table, names.dump()).first->second;
+        };
+
+        // Pass 1: model changes + internal-table → parent-UPDATE translation.
+        for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
+            auto it = internal_table_parents.find(table);
+            if (it != internal_table_parents.end() && !it->second.empty()) {
+                // Internal table — emit both the link table itself (for
+                // List.observe / VirtualList.observe) and the parent table
+                // (for @LatticeQuery / table-level observers + per-object
+                // observers for Swift Observation).
+                // Parse potentially semicolon-separated "parent:property" entries
+                // (union tables can have multiple parents: "Feed:item;Post:featured").
+                auto& meta_value = it->second;
+                size_t pos = 0;
+                bool first_notify = true;
+                while (pos < meta_value.size()) {
+                    auto semi = meta_value.find(';', pos);
+                    auto segment = (semi == std::string::npos)
+                        ? meta_value.substr(pos) : meta_value.substr(pos, semi - pos);
+                    auto colon_pos = segment.find(':');
+                    std::string parent_table = (colon_pos != std::string::npos)
+                        ? segment.substr(0, colon_pos) : segment;
+                    std::string property_name = (colon_pos != std::string::npos)
+                        ? segment.substr(colon_pos + 1) : "";
+
+                    std::string changed_fields = property_name.empty()
+                        ? "" : "[\"" + property_name + "\"]";
+
+                    LOG_DEBUG("flush_changes", "Internal table %s -> notify link + parent UPDATE %s (prop=%s)",
+                              table.c_str(), parent_table.c_str(), property_name.c_str());
+
+                    // Emit the internal table itself only once (on first parent iteration).
+                    if (first_notify) {
+                        if (main_schema) typed_event_indices.push_back(events.size());
+                        events.emplace_back(table, op, row_id, global_id, "");
+                        first_notify = false;
+                    }
+                    // Parent-table UPDATE with row_id=0 + changed_fields = broadcast
+                    // mode in notify_changes_batched (fires per-object observers on
+                    // every live row of `parent_table`).
+                    if (main_schema) typed_event_indices.push_back(events.size());
+                    events.emplace_back(parent_table, "UPDATE", 0, "", changed_fields);
+
+                    pos = (semi == std::string::npos) ? meta_value.size() : semi + 1;
+                }
+                had_internal_changes = true;
+            } else {
+                // Look up changedFieldsNames from AuditLog so object observers can trigger
+                // Swift Observation, in two cases that bypass a Swift setter:
+                //   - applying remote changes (IPC sync)
+                //   - a local upsert/bulk-insert (notify_local_objects) that resolved to an
+                //     UPDATE — SQL mutated the row, no setter ran, so nothing else notifies
+                //     the live instance.
+                // For local setter changes, changed_fields stays empty — the Swift setter
+                // already handles observation via withMutation.
+                std::string changed_fields;
+                if (recovery_capture && row_id > 0 && table != "AuditLog" &&
+                    !table.empty() && table.front() != '_') {
+                    changed_fields = recovery_fields(table);
+                } else if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
+                    && row_id > 0 && table != "AuditLog") {
+                    auto cfn_rows = batch_query(
+                        "SELECT changedFieldsNames FROM AuditLog "
+                        "WHERE tableName = ? AND rowId = ? ORDER BY id DESC LIMIT 1",
+                        {table, row_id}
+                    );
+                    if (!cfn_rows.empty()) {
+                        auto cfn_it = cfn_rows[0].find("changedFieldsNames");
+                        if (cfn_it != cfn_rows[0].end() &&
+                            std::holds_alternative<std::string>(cfn_it->second)) {
+                            changed_fields = std::get<std::string>(cfn_it->second);
+                        }
+                    }
+                }
+                LOG_DEBUG("flush_changes", "Buffering model change: table=%s op=%s changed_fields=%s",
+                          table.c_str(), op.c_str(), changed_fields.c_str());
+                if (main_schema) typed_event_indices.push_back(events.size());
+                events.emplace_back(table, op, row_id, global_id, changed_fields);
+            }
+        }
+
+        // Pass 2: AuditLog INSERT events for each non-internal model change.
+        // Skip derivation whenever the update hook buffers AuditLog INSERTs
+        // directly (pass 1): native memory stores and every Emscripten store.
+        // Emscripten persistent paths also use DELETE journal + deferred drain;
+        // classifying only by path would deliver each audit row twice.
+        // Native file stores derive entries after their WAL commit as before.
+        // Internal table AuditLog entries are skipped — handled in pass 3.
+#ifdef __EMSCRIPTEN__
+        constexpr bool audit_inserts_buffered_directly = true;
+#else
+        const bool audit_inserts_buffered_directly = recovery_capture || config_.is_in_memory();
+#endif
+        bool triggered_regular_audit = false;
+        for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
+            // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
+            if (table == "AuditLog") continue;
+            // Direct entries have already been included by pass 1.
+            if (audit_inserts_buffered_directly) continue;
+            // Internal tables — AuditLog entries handled in pass 3 below
+            if (internal_table_parents.count(table)) continue;
+            // Sync bookkeeping tables (_lattice_sync_state, _SyncControl,
+            // _lattice_replication_slots, …) are never audited — this pass's
+            // tail-scan lookup is definitionally futile for them and, before
+            // the covering index existed, full-scanned AuditLog per write
+            // (observed live: 1000 _lattice_sync_state UPSERTs per apply
+            // batch × 187k-row AuditLog ≈ minutes of CPU per batch, starving
+            // the IPC ACK path). Link tables were skipped above; any other
+            // underscore table is bookkeeping with no observable model.
+            if (!table.empty() && table[0] == '_') continue;
+
+            LOG_DEBUG("flush_changes", "Querying AuditLog for table=%s rowId=%lld op=%s", table.c_str(), (long long)row_id, op.c_str());
+
+            // Query for AuditLog entry created by trigger for this model change
+            auto audit_rows = batch_query(
+                "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND rowId = ? AND operation = ? ORDER BY id DESC LIMIT 1",
+                {table, row_id, op}
+            );
+
+            LOG_DEBUG("flush_changes", "AuditLog query returned %zu rows", audit_rows.size());
+
+            if (!audit_rows.empty()) {
+                const auto& row = audit_rows[0];
+                auto id_it = row.find("id");
+                auto gid_it = row.find("globalId");
+                if (id_it != row.end() && gid_it != row.end() &&
+                    std::holds_alternative<int64_t>(id_it->second) &&
+                    std::holds_alternative<std::string>(gid_it->second)) {
+                    int64_t audit_row_id = std::get<int64_t>(id_it->second);
+                    std::string audit_global_id = std::get<std::string>(gid_it->second);
+
+                    LOG_DEBUG("flush_changes", "Buffering AuditLog observer fire: rowId=%lld", (long long)audit_row_id);
+                    events.emplace_back("AuditLog", "INSERT", audit_row_id, audit_global_id, "");
+                    triggered_regular_audit = true;
+                }
+            } else {
+                LOG_DEBUG("flush_changes", "No AuditLog entry found!");
+            }
+        }
+
+        // Pass 3: AuditLog INSERT events for internal-table changes — also
+        // need to reach lattice.observe() consumers (e.g. objectWillChange
+        // dispatches in SwiftUI). apply_remote_changes stores the SOURCE
+        // rowId (not local) for link tables, so we match by
+        // tableName+operation only, not by rowId.
+        if (had_internal_changes && !audit_inserts_buffered_directly) {
+            for (const auto& [table, op, row_id, global_id, main_schema] : changes) {
+                if (!internal_table_parents.count(table)) continue;
+
+                auto audit_rows = batch_query(
+                    "SELECT id, globalId FROM AuditLog WHERE tableName = ? AND operation = ? ORDER BY id DESC LIMIT 1",
+                    {table, op}
+                );
+                if (!audit_rows.empty()) {
+                    const auto& row = audit_rows[0];
+                    auto id_it = row.find("id");
+                    auto gid_it = row.find("globalId");
+                    if (id_it != row.end() && gid_it != row.end() &&
+                        std::holds_alternative<int64_t>(id_it->second) &&
+                        std::holds_alternative<std::string>(gid_it->second)) {
+                        int64_t audit_row_id = std::get<int64_t>(id_it->second);
+                        std::string audit_global_id = std::get<std::string>(gid_it->second);
+                        LOG_DEBUG("flush_changes", "Buffering AuditLog observer fire (internal table %s): rowId=%lld",
+                                  table.c_str(), (long long)audit_row_id);
+                        events.emplace_back("AuditLog", "INSERT", audit_row_id, audit_global_id, "");
+                        triggered_regular_audit = true;
+                    }
+                }
+            }
+        }
+
+        // Synchronous invalidation hooks (results spec §2.3): inline on the
+        // writer's thread, after the commit settled, BEFORE the scheduler-
+        // dispatched table-observer fan-out below. Payload = this batch's
+        // changed table names (post internal-table→parent translation,
+        // deduped, commit order). Fanned to every alive same-path instance —
+        // the same policy the observer fan-out uses — which is what makes a
+        // commit through the synchronizer's dedicated handle (or any second
+        // handle) bump the app coordinator's epoch before the write returns.
+        {
+            // Detailed payload (Commit 4 additive overload): per changed
+            // table, in commit order, deduped — plus the changed-fields
+            // union when (and only when) every event for the table was an
+            // UPDATE with a known changedFieldsNames list. Basic hooks see
+            // exactly the historical table-name vector via the registration
+            // adapter in add_invalidation_hook.
+            std::vector<invalidation_table_change> changed;
+            std::vector<char> update_only;                 // parallel to `changed`
+            std::vector<std::vector<std::string>> fields;  // parallel to `changed`
+            changed.reserve(events.size());
+            for (const auto& ev : events) {
+                const auto& table = std::get<0>(ev);
+                const auto& op = std::get<1>(ev);
+                const auto& cfn = std::get<4>(ev);
+                size_t idx = 0;
+                for (; idx < changed.size(); ++idx) {
+                    if (changed[idx].table == table) break;
+                }
+                if (idx == changed.size()) {
+                    changed.push_back({table, std::string()});
+                    update_only.push_back(1);
+                    fields.emplace_back();
+                }
+                // The recovery list is conservative refresh information, not
+                // an exact changed-field proof for query-disjointness skips.
+                if (recovery_capture || op != "UPDATE" || cfn.empty() ||
+                    !parse_changed_fields_names(cfn, fields[idx])) {
+                    update_only[idx] = 0;  // fields unknown or membership may change
+                }
+            }
+            for (size_t i = 0; i < changed.size(); ++i) {
+                if (!update_only[i]) continue;
+                std::string joined;
+                for (const auto& f : fields[i]) {
+                    if (!joined.empty()) joined += ',';
+                    joined += f;
+                }
+                changed[i].changed_fields = std::move(joined);
+            }
+            if (batch) batch->invalidations = std::move(changed);
+            else for_each_alive([&changed](lattice_db* instance) {
+                instance->fire_invalidation_hooks_local(changed,
+                                                        invalidation_reason::commit);
+            });
+        }
+
+        // Single batched dispatch — one observer fire per (observer × table)
+        // for this WAL flush. This is what gives wire-relay consumers
+        // (e.g. ClaudeCodeIRC's RoomSyncServer) one frame per logical
+        // transaction even when that transaction spans the parent DELETE
+        // plus its cascade link-table DELETEs.
+        if (batch) {
+            batch->events = std::move(events);
+            batch->typed_event_indices = std::move(typed_event_indices);
+        }
+        else if (!events.empty()) {
+            for_each_alive([&events, &typed_event_indices](lattice_db* instance) {
+                instance->notify_changes_batched_impl(events, &typed_event_indices);
+            });
+        }
+
+        // Internal table changes need to reach the synchronizer. Only trigger
+        // when no regular AuditLog notification was fired (regular notifications
+        // already cause the synchronizer to pick up ALL unsynced entries including
+        // internal ones). Dispatch via scheduler to avoid calling sync_now() from
+        // within the WAL hook — synchronous calls race with WebSocket ACK handlers.
+        // Recovery's genuine audit INSERT events already provide upload hints.
+        // Audit-suppressed canonical/link changes create no outgoing operation.
+        if (batch) batch->needs_upload_hint = ordinary_capture && had_internal_changes && !triggered_regular_audit;
+        else if (had_internal_changes && !triggered_regular_audit) {
+            trigger_sync_upload();
+        }
+
+        // Post cross-process notification (cursor already advanced above)
+        if (!batch && shared_xproc_notifier_ && !config_.read_only) {
+            shared_xproc_notifier_->post_notification();
+        }
+
+        if (ordinary_capture) {
+            // No callback has run and all queries used the still-held writer.
+            // Unknown recursive mutation is refusal, never consumption of a
+            // different transaction's buffer. The old records remain intact
+            // until the complete resolved batch and its delivery are owned.
+            std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+            if (change_buffer_ != original_changes)
+                throw db_error("topology settlement buffer changed during capture");
+            change_buffer_.clear();
+        }
+        // is_flushing_ cleared by reset_guard on scope exit (also on unwind).
+        LOG_DEBUG("flush_changes", "Done");
+        return true;
+    }
+
+public:
+    // ========================================================================
+    // Sync API (matches Lattice.swift)
+    // ========================================================================
+
+    /// Returns true if sync is configured and enabled
+    bool is_sync_enabled() const {
+        require_creator_process(); return config_.is_sync_enabled(); }
+
+    /// Returns true if currently connected to sync server
+    bool is_sync_connected() const;
+
+    /// Returns true if this instance owns a sync agent (WSS or IPC).
+    /// Used by Swift to decide whether to observe progress from the in-process
+    /// synchronizer or fall back to AuditLog-based passive observation.
+    bool is_sync_agent() const {
+        require_creator_process();
+        if (configured_sync_present()) return true;
+        if (sync_lock_fd_ >= 0) return true;
+        for (const auto& ipc : ipc_synchronizers_) {
+            if (ipc.lock_fd >= 0) return true;
+        }
+        return false;
+    }
+
+    /// Manually trigger sync (uploads pending changes)
+    void sync_now();
+
+    /// Update the sync filter at runtime, triggering reconciliation.
+    /// FAN-OUT: applies ONE filter to the WSS synchronizer AND every IPC
+    /// synchronizer. Correct only for single-channel databases — on a
+    /// multi-channel hub (N filtered IPC targets) use the per-channel
+    /// overload; fanning one filter across channels with different scopes
+    /// reconciles every channel against the wrong filter.
+    void update_sync_filter(std::vector<sync_filter_entry> filter);
+
+    /// Update ONE channel's sync filter at runtime, triggering that
+    /// channel's reconciliation only. `channel` matches an ipc_target's
+    /// channel name; the empty string targets the WSS synchronizer. Also
+    /// writes the filter into config_.ipc_targets so a lazily-created
+    /// synchronizer (accept callback not yet fired) picks it up.
+    void update_sync_filter(const std::string& channel, std::vector<sync_filter_entry> filter);
+
+    /// Clear the sync filter, reverting to syncing everything.
+    /// FAN-OUT across all synchronizers — same caveat as the fan-out
+    /// update_sync_filter; use the per-channel overload on hubs.
+    void clear_sync_filter();
+
+    /// Clear ONE channel's sync filter ("" = WSS).
+    void clear_sync_filter(const std::string& channel);
+
+    /// Connect to sync server (called automatically if configured)
+    void connect_sync();
+
+    /// Disconnect from sync server
+    void disconnect_sync();
+
+    /// Set callback for sync state changes
+    void set_on_sync_state_change(std::function<void(bool connected)> handler);
+
+    /// Set callback for sync errors
+    void set_on_sync_error(std::function<void(const std::string& error)> handler);
+
+    /// Get aggregated sync progress across all synchronizers (WSS + IPC)
+    synchronizer::sync_progress get_sync_progress() const;
+
+    /// Set callback for sync progress updates (fires on synchronizer thread)
+    void set_on_sync_progress(synchronizer::on_progress_handler handler);
+
+    /// Set callback for cross-process idle hints. Fires on the xproc background
+    /// thread when a Darwin notification arrives but no new AuditLog entries exist
+    /// (e.g., sync daemon marked entries as synchronized). NOT dispatched through
+    /// the scheduler — runs directly on the notification thread.
+    void set_on_xproc_idle(std::function<void()> handler) {
+        require_creator_process();
+        std::lock_guard<std::mutex> lock(xproc_idle_mutex_);
+        on_xproc_idle_ = std::move(handler);
+    }
+
+    // ========================================================================
+    // Observation API
+    // ========================================================================
+
+    // Observer ID type
+    using observer_id = uint64_t;
+
+    // Additive payload-free recovery signal. Opt-in, coalescible and retried
+    // after callback failure; it never fabricates CollectionChange/AuditLog.
+    // Native file stores poll while these listeners or typed managed observers
+    // are registered. This does not activate a sync/recovery dispatcher.
+    observer_id add_recovery_refresh_observer(std::function<void()> callback);
+    void remove_recovery_refresh_observer(observer_id token);
+    void request_recovery_refresh() noexcept;
+
+    // Enroll this ready file original in the existing process worker. No
+    // observer or sync role is required. Memory/read-only originals return
+    // false; closed owners and registration/startup failures throw. Repeated
+    // successful enrollment is idempotent. Close uses the same owner drain.
+    bool enable_automatic_read_pool_maintenance();
+
+    // One row's worth of change metadata, batched into the observer
+    // callback's vector. Same fields the per-row signature exposed
+    // historically — table name, operation, row id, global row id,
+    // changedFieldsNames JSON. `notify_changes_batched` and `flush_changes`
+    // both produce vectors of these.
+    using change_event = std::tuple<std::string,   // table
+                                    std::string,   // operation ("INSERT"|"UPDATE"|"DELETE")
+                                    int64_t,       // row_id
+                                    std::string,   // global_row_id
+                                    std::string>;  // changed_fields_names
+
+    // Register a table observer. The callback fires once per flush — the WAL
+    // hook for file DBs, the transaction-settled drain for memory/Emscripten
+    // DBs (docs/design-deferred-memory-delivery.md) — with the batch of
+    // rows from that flush whose tableName matches `table_name`. A single
+    // logical transaction is one fire; per-row delivery is just the
+    // degenerate case (one-element batch).
+    //
+    // Returns an ID that can be used to unregister.
+    observer_id add_table_observer(const std::string& table_name,
+                                    std::function<void(const std::vector<change_event>&)> callback) {
+        std::lock_guard<std::mutex> lock(observers_mutex_);
+        auto id = next_observer_id_.fetch_add(1, std::memory_order_relaxed);
+        table_observers_[table_name][id] = std::move(callback);
+        return id;
+    }
+
+    // Remove a table observer
+    void remove_table_observer(const std::string& table_name, observer_id id) {
+        // A callback's final capture may cancel another observer. Release it
+        // after unlocking, while keeping removal itself linearized under lock.
+        std::function<void(const std::vector<change_event>&)> removed;
+        {
+            std::lock_guard<std::mutex> lock(observers_mutex_);
+            auto table_it = table_observers_.find(table_name);
+            if (table_it == table_observers_.end()) return;
+            auto observer_it = table_it->second.find(id);
+            if (observer_it == table_it->second.end()) return;
+            removed.swap(observer_it->second);
+            table_it->second.erase(observer_it);
+        }
+    }
+
+    // ========================================================================
+    // Per-Object Observation API (matches Swift's observationRegistrar)
+    // ========================================================================
+
+    /// Register an observer for a specific object (by table and row ID)
+    /// Returns an ID that can be used to unregister
+    observer_id add_object_observer(const std::string& table_name, int64_t row_id,
+                                     std::function<void(const std::string&)> callback) {
+        auto id = next_observer_id_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            object_observers_[table_name][row_id].emplace_back(id, std::move(callback));
+        }
+        try { recovery_subscriptions_changed(); }
+        catch (...) { remove_object_observer(table_name, row_id, id); throw; }
+        return id;
+    }
+
+    /// Remove a specific object observer
+    void remove_object_observer(const std::string& table_name, int64_t row_id, observer_id id) {
+        std::function<void(const std::string&)> removed;
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            auto table_it = object_observers_.find(table_name);
+            if (table_it == object_observers_.end()) return;
+
+            auto row_it = table_it->second.find(row_id);
+            if (row_it == table_it->second.end()) return;
+
+            auto& observers = row_it->second;
+            auto it = std::find_if(observers.begin(), observers.end(),
+                [id](const auto& entry) { return entry.first == id; });
+            if (it != observers.end()) {
+                removed.swap(it->second);
+                // Shift the empty slot with swaps: preserve survivor order and
+                // never destroy a surviving callback while holding the mutex.
+                for (auto next = it + 1; next != observers.end(); ++it, ++next) {
+                    it->swap(*next);
+                }
+                observers.pop_back();
+            }
+
+            // Clean up empty entries
+            if (observers.empty()) {
+                table_it->second.erase(row_it);
+                if (table_it->second.empty()) {
+                    object_observers_.erase(table_it);
+                }
+            }
+        }
+    }
+
+    /// Remove all observers for a specific object
+    void remove_all_object_observers(const std::string& table_name, int64_t row_id) {
+        std::vector<std::pair<observer_id, std::function<void(const std::string&)>>> removed;
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            auto table_it = object_observers_.find(table_name);
+            if (table_it == object_observers_.end()) return;
+            auto row_it = table_it->second.find(row_id);
+            if (row_it != table_it->second.end()) {
+                removed.swap(row_it->second);
+                table_it->second.erase(row_it);
+            }
+            if (table_it->second.empty()) {
+                object_observers_.erase(table_it);
+            }
+        }
+    }
+
+    // Single notification path. Fires once per (table observer × table)
+    // with that table's slice of `changes`, all inside one scheduler
+    // dispatch. Per-object observers stay per-row but dispatched in the
+    // SAME invoke, in input order so commit ordering is preserved.
+    //
+    // History note: an earlier per-row implementation called the observer
+    // callback once per change. That broke wire-relay consumers (e.g.
+    // ClaudeCodeIRC's RoomSyncServer.broadcastEntries) because the relay
+    // shipped one wire frame per fire — cascade audits (parent DELETE + N
+    // link-table DELETEs from one transaction) fragmented across N
+    // frames, leaving a window where the receiving lattice had a
+    // non-null FK to a deleted row → SIGSEGV in
+    // dynamic_object::get_object. Per-batch delivery here, combined with
+    // the cascade-transaction wrap in lattice_db::remove, makes one wire
+    // frame per logical transaction.
+    //
+    // The earlier `notify_change` (singular) and `collect_observer_callbacks`
+    // helper are gone — single-row events become one-element batches.
+    void notify_changes_batched(const std::vector<change_event>& changes) {
+        notify_changes_batched_impl(changes, nullptr);
+    }
+
+private:
+    // nullptr denotes main-schema events produced by sync/xproc. Hook batches
+    // carry an explicit selection, so an attached row cannot alias a main row.
+    void notify_changes_batched_impl(const std::vector<change_event>& changes,
+                                    const std::vector<size_t>* typed_indices) {
+        // Group by table (preserves intra-table order from input vector).
+        std::unordered_map<std::string, std::vector<change_event>> by_table;
+        by_table.reserve(changes.size());
+        for (const auto& c : changes) {
+            by_table[std::get<0>(c)].push_back(c);
+        }
+
+        std::vector<std::function<void()>> all_callbacks;
+
+        // Table-level observers: ONE callback per (observer × table) with
+        // the table's full batch.
+        {
+            std::lock_guard<std::mutex> lock(observers_mutex_);
+            for (auto& [table, batch] : by_table) {
+                auto it = table_observers_.find(table);
+                if (it == table_observers_.end()) continue;
+                for (const auto& [id, cb] : it->second) {
+                    all_callbacks.push_back([cb, batch] { cb(batch); });
+                }
+            }
+        }
+
+        // Per-object observers: per-row, in input commit order. Two cases:
+        //  (a) row_id > 0 → match observers for that specific (table, rowId).
+        //  (b) row_id == 0 with non-empty changed_fields → broadcast: fire
+        //      every per-object observer registered on this table.
+        //      Used by flush_changes when an internal-table change
+        //      translates to a parent-table UPDATE — every live model
+        //      instance for that parent table needs Swift Observation
+        //      to trigger (e.g. VStackNode.children).
+        {
+            std::lock_guard<std::mutex> lock(object_observers_mutex_);
+            for (const auto& [table, op, row_id, global_row_id, changed_fields] : changes) {
+                auto table_it = object_observers_.find(table);
+                if (table_it == object_observers_.end()) continue;
+
+                if (row_id == 0 && !changed_fields.empty()) {
+                    for (const auto& [rid, observer_map] : table_it->second) {
+                        for (const auto& [id, callback] : observer_map) {
+                            all_callbacks.push_back([callback, changed_fields] {
+                                callback(changed_fields);
+                            });
+                        }
+                    }
+                } else {
+                    auto row_it = table_it->second.find(row_id);
+                    if (row_it == table_it->second.end()) continue;
+                    for (const auto& [id, callback] : row_it->second) {
+                        all_callbacks.push_back([callback, changed_fields] {
+                            callback(changed_fields);
+                        });
+                    }
+                }
+            }
+        }
+
+        const auto append_typed = [&](const change_event& event) {
+            const auto& [table, op, row, gid, fields] = event;
+            managed_observers_.append(table, op, row, gid, fields, all_callbacks);
+        };
+        if (typed_indices) {
+            for (const auto index : *typed_indices) append_typed(changes.at(index));
+        } else {
+            for (const auto& event : changes) append_typed(event);
+        }
+        if (all_callbacks.empty()) return;
+        scheduler_->invoke([callbacks = std::move(all_callbacks)]() mutable {
+            for (auto& cb : callbacks) {
+                cb();
+            }
+        });
+    }
+
+public:
+    // ========================================================================
+    // Synchronous invalidation hooks — Live Results item A, spec §2.3
+    // (lattice repo docs/design-results-item-A-SPEC.md; bridged in Commit 4)
+    // ========================================================================
+    //
+    // Hooks fire INLINE ON THE WRITER'S THREAD once per settled top-level
+    // transaction, after the commit is durable (file DBs: inside the WAL
+    // hook's post-commit C frame; memory DBs: the transaction-settled drain,
+    // docs/design-deferred-memory-delivery.md §3.4) and BEFORE the
+    // scheduler-dispatched table-observer fan-out (notify_changes_batched at
+    // the bottom of flush_changes_once). Delivery fans out per PATH via
+    // instance_registry::for_each_alive: a commit through ANY alive same-path
+    // instance — a second app handle, the synchronizer's dedicated handle —
+    // fires every same-path instance's hooks synchronously, which is what
+    // makes cross-handle read-your-writes hold by construction.
+    //
+    // CALLBACK CONTRACT (normative, spec §2.3): the callback runs on the
+    // writer's thread — for file DBs inside SQLite's C hook frame, for
+    // rollbacks inside sqlite3_rollback_hook's C frame. It is restricted to
+    // atomic epoch increments / per-shape dirty-flag stores / eviction-flag
+    // stores: NO SQL, no allocation-heavy work, nothing that can throw, and
+    // no lock that ANY thread in the process ever holds across a SQL
+    // statement or backend call. Every lock a hook takes must be a leaf lock
+    // — the hook frame can run with the writer connection's FULLMUTEX held,
+    // and a reader holding the same lock across SQL on that connection is an
+    // ABBA hang (this repo shipped exactly that once: see the
+    // pacer_mutex_/connection-mutex history at sync.cpp start_pacer()).
+
+    /// Why an invalidation hook fired.
+    enum class invalidation_reason : int {
+        /// A top-level transaction settled. Payload = the batch's changed
+        /// table names (post internal-table→parent translation, deduped, in
+        /// commit order). EMPTY when the commit touched only unbuffered
+        /// bookkeeping tables — the signal is table-agnostic by design
+        /// (spec §2.3: keeper retirement must be driven by EVERY commit;
+        /// the payload only refines which shapes drop caches).
+        commit = 0,
+        /// A transaction rolled back. No change batch is ever delivered for
+        /// it (deferred-delivery §3.4), so memory-family captures that raced
+        /// the transaction must re-capture at the next access (spec §4.1).
+        rollback = 1,
+        /// Generation-advance request (spec §3.3/§3.4): the pacer's TRUNCATE
+        /// was beaten by a held read snapshot, or WAL-threshold eviction
+        /// wants keepers re-pinned. Consumers advance their epoch so facades
+        /// re-pin at the next access and the next checkpoint lands behind
+        /// them.
+        advance = 2,
+        /// Durable recovery content changed. Payload is empty/unknown; all
+        /// current shapes must invalidate content, not merely repin a reader.
+        recovery = 3,
+    };
+
+    using invalidation_hook_fn =
+        std::function<void(const std::vector<std::string>& changed_tables,
+                           invalidation_reason reason)>;
+
+    /// Per-table change detail for the additive Commit-4 hook overload
+    /// (results spec §2.3 v1.1 / Commit 8). `changed_fields` is NON-EMPTY
+    /// only when EVERY event for `table` in the settled batch was an UPDATE
+    /// with a known changed-field list — the only case in which the v1.1
+    /// disjointness skip may fire — and holds the comma-joined, deduped
+    /// union of plain field names (e.g. "age,name"). EMPTY means the
+    /// consumer MUST invalidate: INSERT/DELETE present (pre-change
+    /// membership is unknowable post-hoc), fields unknown (local setter
+    /// writes carry no changedFieldsNames), or a rollback/advance signal.
+    /// Delivered from Commit 4; unused until Commit 8 by design.
+    struct invalidation_table_change {
+        std::string table;
+        std::string changed_fields;
+    };
+
+    using invalidation_hook_detailed_fn =
+        std::function<void(const std::vector<invalidation_table_change>& changes,
+                           invalidation_reason reason)>;
+
+    /// Register a synchronous invalidation hook. Returns a token for
+    /// remove_invalidation_hook. See the section comment above for the
+    /// (strict) callback contract.
+    uint64_t add_invalidation_hook(invalidation_hook_fn hook) {
+        return add_invalidation_hook_detailed(
+            [hook = std::move(hook)](const std::vector<invalidation_table_change>& changes,
+                                     invalidation_reason reason) {
+                std::vector<std::string> tables;
+                tables.reserve(changes.size());
+                for (const auto& c : changes) tables.push_back(c.table);
+                hook(tables, reason);
+            });
+    }
+
+    /// Additive overload (results spec Commit 4): identical firing contract
+    /// to add_invalidation_hook, with the per-table changed-fields payload
+    /// (see invalidation_table_change). Shares the token space.
+    uint64_t add_invalidation_hook_detailed(invalidation_hook_detailed_fn hook) {
+        std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
+        auto token = next_invalidation_hook_token_++;
+        invalidation_hooks_.emplace_back(token, std::move(hook));
+        return token;
+    }
+
+    /// Remove a previously registered invalidation hook. Safe to call from
+    /// inside a hook callback (hooks are copied out before invocation).
+    void remove_invalidation_hook(uint64_t token) {
+        invalidation_hook_detailed_fn removed;
+        {
+            std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
+            auto it = std::find_if(invalidation_hooks_.begin(), invalidation_hooks_.end(),
+                [token](const auto& entry) { return entry.first == token; });
+            if (it == invalidation_hooks_.end()) return;
+            removed.swap(it->second);
+            // Move the empty slot to the end without releasing any survivor.
+            for (auto next = it + 1; next != invalidation_hooks_.end(); ++it, ++next) {
+                it->swap(*next);
+            }
+            invalidation_hooks_.pop_back();
+        }
+    }
+
+    /// Fire hooks on every alive same-path instance (isolated `:memory:`
+    /// stores fire locally only — identical policy to the observer fan-out,
+    /// storage_shared_across_instances()). Public because sync.cpp signals
+    /// through it (mark-synced commits on memory stores, pacer advance
+    /// requests); ordinary commits/rollbacks signal automatically.
+    void fire_invalidation_hooks(const std::vector<std::string>& changed_tables,
+                                 invalidation_reason reason) {
+        if (storage_shared_across_instances()) {
+            instance_registry::instance().for_each_alive(config_.path,
+                [&changed_tables, reason](lattice_db* inst) {
+                    inst->fire_invalidation_hooks_local(changed_tables, reason);
+                });
+        } else {
+            fire_invalidation_hooks_local(changed_tables, reason);
+        }
+    }
+
+    /// Spec §3.3: ask every same-path coordinator to advance its generation
+    /// so facades re-pin at next access (and the NEXT truncate lands behind
+    /// them). Delivered through the invalidation-hook path, fanned per path
+    /// — the synchronizer owns its own lattice_db instance, so signalling
+    /// only its own hooks would miss the app handles holding the keepers.
+    void request_generation_advance() {
+        if (db_) retire_projection_store(db_->physical_identity());
+        fire_invalidation_hooks({}, invalidation_reason::advance);
+    }
+
+private:
+    void fire_invalidation_hooks_local(const std::vector<std::string>& changed_tables,
+                                       invalidation_reason reason) {
+        // Table-names-only fire sites (rollback, advance, sync's mark-synced
+        // signal) carry no field detail: empty changed_fields = "must
+        // invalidate", per the invalidation_table_change contract.
+        std::vector<invalidation_table_change> changes;
+        changes.reserve(changed_tables.size());
+        for (const auto& t : changed_tables) changes.push_back({t, std::string()});
+        fire_invalidation_hooks_local(changes, reason);
+    }
+
+    void fire_invalidation_hooks_local(const std::vector<invalidation_table_change>& changes,
+                                       invalidation_reason reason) {
+        // Copy under the (leaf) mutex, invoke outside it: a hook body may
+        // legally call remove_invalidation_hook, and the lock must never be
+        // observable as held across a callback.
+        std::vector<invalidation_hook_detailed_fn> hooks;
+        {
+            std::lock_guard<std::mutex> lock(invalidation_hooks_mutex_);
+            if (invalidation_hooks_.empty()) return;
+            hooks.reserve(invalidation_hooks_.size());
+            for (const auto& [token, fn] : invalidation_hooks_) hooks.push_back(fn);
+        }
+        for (const auto& fn : hooks) fn(changes, reason);
+    }
+
+    /// Parse a changedFieldsNames payload (JSON array of quoted names, e.g.
+    /// `["age","name"]`) into `out`, deduping. Returns false when the string
+    /// yields no names (unknown format) — callers must then treat the batch's
+    /// fields as unknown. Field names are plain identifiers; no escape
+    /// handling is needed, and anything unparseable degrades to "unknown"
+    /// (= must invalidate), never to a wrong skip.
+    static bool parse_changed_fields_names(const std::string& s,
+                                           std::vector<std::string>& out) {
+        bool any = false;
+        size_t pos = 0;
+        while ((pos = s.find('"', pos)) != std::string::npos) {
+            auto end = s.find('"', pos + 1);
+            if (end == std::string::npos) break;
+            std::string name = s.substr(pos + 1, end - pos - 1);
+            if (!name.empty()) {
+                any = true;
+                if (std::find(out.begin(), out.end(), name) == out.end()) {
+                    out.push_back(std::move(name));
+                }
+            }
+            pos = end + 1;
+        }
+        return any;
+    }
+
+    /// LEAF lock — held only for registration bookkeeping, never across SQL
+    /// or a callback (see the §2.3 contract above).
+    std::mutex& invalidation_hooks_mutex_ = process_resources_.get().invalidation_hooks_mutex_;
+    std::vector<std::pair<uint64_t, invalidation_hook_detailed_fn>>& invalidation_hooks_ = process_resources_.get().invalidation_hooks_;
+    uint64_t& next_invalidation_hook_token_ = process_resources_.get().next_invalidation_hook_token_;
+
+public:
+    // ========================================================================
+    // Read-generation pool (keepers) — Live Results item A, spec §2.2/§2.5/§3
+    // ========================================================================
+    //
+    // A read generation is a plain held read transaction (BEGIN + one pin
+    // SELECT — BEGIN DEFERRED takes no snapshot until the first read, so the
+    // pin makes acquisition a fence) on a pooled, dedicated read-only
+    // connection. Every read executed at that generation sees one SQLite WAL
+    // MVCC snapshot; no API beyond BEGIN/COMMIT is used.
+    //
+    // File (WAL) databases only. Memory-family stores are REFUSED (return 0;
+    // spec §4.1): a held read transaction on a shared-cache connection takes
+    // table read locks that fail same-name writers immediately with
+    // SQLITE_LOCKED, and private `:memory:` has only the single write
+    // connection, so a held read txn would wedge every write. Those storages
+    // get materialized-id generations at the Swift layer instead (Commit 5).
+    // Emscripten (DELETE journal, single connection) is refused for the same
+    // reason.
+    //
+    // WAL retention (spec §3): keepers pin WAL frames at their snapshot.
+    // Bounds, in engagement order: (1) every settled commit signals the
+    // invalidation hooks, so coordinators re-pin promptly; (2) idle TTL and
+    // an absolute age cap, enforced by run_read_pool_maintenance(); (3) the
+    // hard bound — when the WAL hook sees the log exceed
+    // wal_keeper_eviction_threshold_bytes_, ALL keepers on ALL same-path
+    // instances are force-retired and one bounded TRUNCATE-else-PASSIVE
+    // checkpoint runs in the resulting reader gap (§3.4).
+
+    /// Acquire a new read generation. Returns its id, or 0 when this storage
+    /// refuses keepers (memory family, Emscripten, closed instance) or the
+    /// store cannot be pinned — callers treat 0 as "no keeper" and fall back
+    /// to their non-generation path.
+    ///
+    /// Pool cap (default 3): acquiring beyond capacity force-retires the
+    /// OLDEST live generation (spec §2.2(e)) — reads against it re-resolve
+    /// through the tolerant ladder. A pending WAL-threshold eviction is
+    /// attempted first without waiting for foreign readers. A busy checkpoint
+    /// stays pending for bounded maintenance retry (§3.4).
+    /// Private owned cursors never use the tolerant generation fallback.
+    projection_read_operation start_projection(const projection_query& query);
+    void cancel_projection_reads(projection_status reason = projection_status::snapshot_expired);
+    size_t projection_resources_outstanding() const;
+
+    uint64_t acquire_read_generation() {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        detail::ordinary_before_open(config_.path,config_.ordinary_context);
+        note_history_uncaptured_connection(); // Before any keeper can leave the pool or begin an off-list native open.
+#ifdef __EMSCRIPTEN__
+        return 0;
+#else
+        if (closed_.load(std::memory_order_seq_cst)) return 0;
+        if (config_.is_in_memory()) return 0;  // §4.1: NO keepers (covers named shared-cache memory)
+        run_pending_wal_eviction_if_any(/*checkpoint_busy_budget_ms=*/0);
+
+        std::shared_ptr<database> conn;
+        std::shared_ptr<read_generation> victim;
+        {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            if (!idle_read_pool_.empty()) {
+                conn = idle_read_pool_.back();
+                idle_read_pool_.pop_back();
+            } else if (live_generations_.size() >= read_pool_capacity_) {
+                victim = live_generations_.front();  // oldest
+            }
+        }
+        if (victim) {
+            force_retire_generation(victim);
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            if (!idle_read_pool_.empty()) {
+                conn = idle_read_pool_.back();
+                idle_read_pool_.pop_back();
+            }
+        }
+        try {
+            if (!conn) {
+                // Select the final 2,000-page keeper cache at construction.
+                // Ordinary readers retain their 50,000-page default.
+                conn = database::make_read_keeper(config_.path, config_.busy_timeout_ms, config_.ordinary_context,connection_ledger_);
+            }
+            conn->validate_ordinary_current_();
+            conn->execute("BEGIN");
+            conn->query("SELECT 1 FROM sqlite_schema LIMIT 1");  // the pin/fence
+        } catch (const db_error&) {
+            if(config_.ordinary_context)throw; // Managed refusal cannot enter tolerant fallback.
+            return 0;  // unopenable/racing-close store — caller falls back
+        }
+        auto gen = std::make_shared<read_generation>();
+        gen->conn = std::move(conn);
+        gen->pinned_at = std::chrono::steady_clock::now();
+        gen->last_read_steady_ms.store(steady_ms_now(), std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            gen->id = next_read_generation_id_++;
+            live_generations_.push_back(gen);
+        }
+        if (closed_.load(std::memory_order_seq_cst)) {
+            // Lost the race with close(): its retire-all pass may have missed
+            // this generation. Undo — post-close acquisitions must not leak
+            // a held read transaction.
+            force_retire_generation(gen);
+            return 0;
+        }
+        return gen->id;
+#endif
+    }
+
+    /// Add a logical hold on a live generation (iterators, in-flight render
+    /// batches). Returns false when the generation is already retired or
+    /// retiring — the caller re-resolves.
+    bool retain_read_generation(uint64_t generation_id) {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        std::lock_guard<std::mutex> lock(read_pool_mutex_);
+        for (auto& gen : live_generations_) {
+            if (gen->id == generation_id) {
+                if (gen->retiring.load(std::memory_order_relaxed)) return false;
+                ++gen->refcount;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Drop a hold. At refcount 0 the generation retires: its keeper
+    /// transaction COMMITs and the connection returns to the idle pool.
+    /// Releasing an already-retired id is a no-op (TTL/threshold/lifecycle
+    /// retirement can race a facade's release — that is expected).
+    void release_read_generation(uint64_t generation_id) {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        std::shared_ptr<read_generation> to_retire;
+        {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            for (auto it = live_generations_.begin(); it != live_generations_.end(); ++it) {
+                if ((*it)->id == generation_id) {
+                    if (--(*it)->refcount <= 0) {
+                        to_retire = *it;
+                        to_retire->retiring.store(true, std::memory_order_release);
+                        live_generations_.erase(it);
+                    }
+                    break;
+                }
+            }
+        }
+        if (to_retire) commit_and_pool(to_retire, /*force=*/false);
+    }
+
+    /// Execute one read statement at a held generation, on its keeper
+    /// connection (one MVCC snapshot for the generation's lifetime).
+    /// Returns nullopt when the generation is no longer live — retired,
+    /// retiring (§3.4: liveness is re-validated under the pool lock before
+    /// EVERY statement AND re-checked after it returns), unknown, or the
+    /// read lost the race with a force-retire (interrupted mid-statement).
+    /// Callers re-resolve and serve through the tolerant ladder; no
+    /// exception escapes.
+    /// Commit 4 builds the bridge's objects_at/count_at/query_ids_at on
+    /// top of this primitive (same SQL builders, keeper-routed).
+    std::optional<std::vector<database::row_t>> query_at_generation(
+        uint64_t generation_id, const std::string& sql,
+        const std::vector<column_value_t>& params = {}) {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        detail::ordinary_before_open(config_.path,config_.ordinary_context);
+        std::shared_ptr<read_generation> gen;
+        {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            for (auto& g : live_generations_) {
+                if (g->id == generation_id) {
+                    if (g->retiring.load(std::memory_order_relaxed)) return std::nullopt;
+                    gen = g;
+                    gen->in_flight.fetch_add(1, std::memory_order_acq_rel);
+                    break;
+                }
+            }
+        }
+        if (!gen) return std::nullopt;
+        // RAII: the in-flight counter is the §2.2/§3.2 "active reads"
+        // definition — it must drop on every exit path or TTL retirement
+        // would treat the generation as permanently active.
+        struct in_flight_release {
+            read_generation* gen;
+            ~in_flight_release() {
+                gen->last_read_steady_ms.store(steady_ms_now(), std::memory_order_relaxed);
+                gen->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        } release{gen.get()};
+        if (test_hook_generation_query_gap_) test_hook_generation_query_gap_();
+        try {
+            gen->conn->validate_ordinary_current_();
+            auto rows = gen->conn->query(sql, params);
+            // TOCTOU re-check (item-A adversarial finding 1): a force-retire
+            // that began AFTER the liveness check above sets `retiring`
+            // (release, under the pool lock) BEFORE its COMMIT. If this
+            // statement was delayed past that COMMIT — sqlite3_interrupt
+            // no-ops on a statement that has not started — it executed at
+            // the WRONG snapshot (post-COMMIT autocommit head state, or a
+            // successor generation's transaction) with no error. Any such
+            // read must observe the flag here and be discarded. The
+            // conservative cost — dropping a right-snapshot read that merely
+            // raced the flag mid-statement — is the §1.2 rung-1 carve-out:
+            // the caller re-resolves through the tolerant ladder.
+            if (gen->retiring.load(std::memory_order_acquire)) return std::nullopt;
+            return rows;
+        } catch (const db_error&) {
+            if(config_.ordinary_context)throw;
+            // Interrupted by a force-retire, or the store went away.
+            return std::nullopt;
+        }
+    }
+
+    /// Live generations held by THIS instance.
+    size_t local_read_generations_outstanding() {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        const size_t projections = projection_resources_outstanding();
+        std::lock_guard<std::mutex> lock(read_pool_mutex_);
+        return live_generations_.size() + projections;
+    }
+
+    /// Live generations across EVERY alive same-path instance. Spec §3.3
+    /// instance scoping (normative): all retention policy reads aggregate
+    /// per path via the instance registry — the synchronizer owns its OWN
+    /// lattice_db instance and multiple app-side instances per path are
+    /// normal (TSR resolves), so consulting any single instance would read
+    /// 0 from the wrong one (adversarial-review finding #4).
+    size_t read_generations_outstanding() {
+        detail::ordinary_require_creator(config_.ordinary_context);
+        size_t total = 0;
+        instance_registry::instance().for_each_alive(config_.path,
+            [&total](lattice_db* inst) {
+                std::lock_guard<std::mutex> lock(inst->read_pool_mutex_);
+                total += inst->live_generations_.size();
+            });
+        // Physical projection identities include foreign parents' attached
+        // leases, once per operation, independent of URI/symlink spelling.
+        if (db_) total += projection_store_readers(db_->physical_identity());
+        return total;
+    }
+
+    /// Spec §3.2 maintenance entry — callable WITHOUT a synchronizer (the
+    /// Swift coordinator's maintenance timer is the actor of record for
+    /// every storage/config; a sync pacer is only ever a second caller).
+    /// (a) TTL-retires generations with no active reads — "active reads" =
+    /// in-flight statements on the keeper (the core counter above), NOT
+    /// logical accesses: a visible-but-warm screen issuing zero SQL does not
+    /// hold a keeper alive. (b) Force-retires generations older than the
+    /// absolute age cap even when actively read (facades re-pin; per-table
+    /// exactly-once delivery keeps untouched shapes' caches valid across the
+    /// re-pin). (c) Executes pending WAL-threshold evictions (§3.4).
+    void run_read_pool_maintenance() {
+        const int64_t now_ms = steady_ms_now();
+        const int64_t ttl_ms = read_generation_ttl_ms_.load(std::memory_order_relaxed);
+        const int64_t max_age_ms = read_generation_max_age_ms_.load(std::memory_order_relaxed);
+        std::vector<std::shared_ptr<read_generation>> to_retire;
+        {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = live_generations_.begin(); it != live_generations_.end();) {
+                auto& gen = *it;
+                const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - gen->pinned_at).count();
+                const bool idle = gen->in_flight.load(std::memory_order_acquire) == 0;
+                const int64_t idle_ms =
+                    now_ms - gen->last_read_steady_ms.load(std::memory_order_relaxed);
+                const bool ttl_expired = ttl_ms > 0 && idle && idle_ms >= ttl_ms;
+                const bool over_age = max_age_ms > 0 && age_ms >= max_age_ms;
+                if (ttl_expired || over_age) {
+                    gen->retiring.store(true, std::memory_order_release);
+                    to_retire.push_back(gen);
+                    it = live_generations_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& gen : to_retire) commit_and_pool(gen, /*force=*/true);
+        run_pending_wal_eviction_if_any();
+    }
+
+    /// Spec §3.2's SECOND enforcement caller (item-A adversarial finding 3):
+    /// run read-pool maintenance on EVERY alive same-path instance. The sync
+    /// pacer calls this at its maybe_checkpoint cadence — the keepers live
+    /// on the app handles, not on the synchronizer's own lattice_db, so a
+    /// local-only call would maintain nothing (the same per-path aggregation
+    /// the §3.3 TRUNCATE gate uses). The Swift coordinator's maintenance
+    /// timer remains the actor of record; this is belt coverage for sync
+    /// lattices. Runs SQL (keeper COMMITs, checkpoint attempts): never call
+    /// under a lock or from a hook frame.
+    void run_read_pool_maintenance_all_instances() {
+        if (storage_shared_across_instances()) {
+            instance_registry::instance().for_each_alive(config_.path,
+                [](lattice_db* inst) { inst->run_read_pool_maintenance(); });
+        } else {
+            run_read_pool_maintenance();
+        }
+    }
+
+    /// Force-retire every live generation on this instance (§3.4 protocol:
+    /// retiring flag under the pool lock → sqlite3_interrupt for wedged
+    /// in-flight statements → bounded COMMIT retry). Used by threshold
+    /// eviction (on every same-path instance), close-ordering (§4.6), and —
+    /// bridged in Commit 4 — Lattice.retireAllGenerations() (§3.6 iOS
+    /// suspension contract).
+    void retire_all_read_generations() {
+        if (db_) retire_projection_store(db_->physical_identity());
+        cancel_projection_reads(projection_status::snapshot_expired);
+        std::vector<std::shared_ptr<read_generation>> gens;
+        {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            for (auto& gen : live_generations_) {
+                gen->retiring.store(true, std::memory_order_release);
+            }
+            gens.swap(live_generations_);
+        }
+        for (auto& gen : gens) commit_and_pool(gen, /*force=*/true);
+    }
+
+    // -- Pool tunables (defaults per spec §1.7 ResultsTuning; the Swift layer
+    //    forwards its per-Lattice values across the bridge in Commit 4/5) --
+
+    /// Idle TTL before a generation with no active reads self-retires on the
+    /// next maintenance tick. Default 30 s; <= 0 disables TTL retirement.
+    void set_read_generation_ttl_ms(int64_t ms) {
+        read_generation_ttl_ms_.store(ms, std::memory_order_relaxed);
+    }
+
+    /// Absolute age cap: maintenance force-retires generations older than
+    /// this even when actively read. <= 0 disables. (The spec mandates the
+    /// cap but names no default; 5 minutes here.)
+    void set_read_generation_max_age_ms(int64_t ms) {
+        read_generation_max_age_ms_.store(ms, std::memory_order_relaxed);
+    }
+
+    /// WAL size at which ALL keepers on ALL same-path instances are
+    /// force-retired to open a reader gap so the log can rewind/truncate
+    /// (spec §3.4 — the hard WAL bound). Default 16 MB; <= 0 disables.
+    ///
+    /// PER-PATH propagation (item-A adversarial finding 2): the threshold is
+    /// consumed by each instance's OWN WAL hook, and the writes that grow
+    /// the WAL fastest arrive through OTHER same-path instances — the
+    /// synchronizer's dedicated lattice_db applying sync chunks, IPC
+    /// instances, second app handles. Setting only this instance's atomic
+    /// would leave those hooks at the default forever. The setter therefore
+    /// fans out to every alive same-path instance and records the value at
+    /// the registry so instances opened later adopt it (mirrors the §3.3
+    /// per-path aggregation of read_generations_outstanding). Isolated
+    /// `:memory:` stores stay instance-local — they share the literal
+    /// ":memory:" registry key without sharing storage (and have no WAL).
+    void set_wal_keeper_eviction_threshold_bytes(int64_t bytes) {
+        wal_keeper_eviction_threshold_bytes_.store(bytes, std::memory_order_relaxed);
+        if (!storage_shared_across_instances()) return;
+        instance_registry::instance().set_wal_eviction_threshold_for_path(config_.path, bytes);
+        instance_registry::instance().for_each_alive(config_.path,
+            [bytes](lattice_db* inst) {
+                inst->wal_keeper_eviction_threshold_bytes_.store(bytes,
+                                                                 std::memory_order_relaxed);
+            });
+    }
+    int64_t wal_keeper_eviction_threshold_bytes() const {
+        return wal_keeper_eviction_threshold_bytes_.load(std::memory_order_relaxed);
+    }
+
+    /// Diagnostics/tests: whether this instance's WAL hook has flagged a
+    /// pending threshold eviction that no gap has serviced yet.
+    bool wal_eviction_pending() const {
+        return wal_eviction_pending_.load(std::memory_order_relaxed);
+    }
+
+    /// Diagnostics/tests: keeper connections parked in the idle pool.
+    size_t idle_read_pool_size() {
+        std::lock_guard<std::mutex> lock(read_pool_mutex_);
+        return idle_read_pool_.size();
+    }
+
+    /// TEST SEAM (item-A adversarial finding 1): when set, invoked in
+    /// query_at_generation between the in-flight bump and statement
+    /// execution — lets tests widen the force-retire TOCTOU window
+    /// deterministically. Assign only before spawning reader threads (the
+    /// member is read unsynchronized); never set in production.
+    std::function<void()>& test_hook_generation_query_gap_ = process_resources_.get().test_hook_generation_query_gap_;
+
+    // ========================================================================
+    // Per-store write gate — Live Results item A, spec §4.1 mechanism 2
+    // ========================================================================
+
+    /// Acquire/release the per-store write gate. No-ops for file and
+    /// isolated `:memory:` stores — the gate exists only where
+    /// cross-connection shared-cache table locks bite (named/anonymous
+    /// shared-cache memory stores). Thread-affine and re-entrant; an
+    /// unpaired release (e.g. a defensive rollback with no matching begin)
+    /// is a no-op.
+    void acquire_store_write_gate() {
+        if (!store_write_gate_) return;
+        store_write_gate_->lock();
+        ++tls_store_gate_depths()[this];
+    }
+    void release_store_write_gate() {
+        if (!store_write_gate_) return;
+        auto& depths = tls_store_gate_depths();
+        auto it = depths.find(this);
+        if (it == depths.end() || it->second == 0) return;
+        if (--it->second == 0) depths.erase(it);
+        store_write_gate_->unlock();
+    }
+
+    /// The raw gate — null when this store has none. Same-path instances
+    /// share one gate. Commit 4's capture/hydration batches (query_ids_at)
+    /// hold it around their capture transaction; exposed now so tests (and
+    /// any early adopter of the capture pattern) can too.
+    std::shared_ptr<std::recursive_timed_mutex> store_write_gate() const {
+        return store_write_gate_;
+    }
+
+    /// RAII scope for the gate (writers: whole transaction; captures: the
+    /// capture txn). Never construct inside a hook frame (§2.3).
+    struct store_write_gate_hold {
+        lattice_db* db;
+        explicit store_write_gate_hold(lattice_db& d) : db(&d) {
+            db->acquire_store_write_gate();
+        }
+        ~store_write_gate_hold() { db->release_store_write_gate(); }
+        store_write_gate_hold(const store_write_gate_hold&) = delete;
+        store_write_gate_hold& operator=(const store_write_gate_hold&) = delete;
+    };
+
+private:
+    // -- Read-generation pool internals ------------------------------------
+
+    struct read_generation {
+        uint64_t id = 0;
+        std::shared_ptr<database> conn;   // keeper: holds the open read txn
+        int refcount = 1;                 // guarded by read_pool_mutex_
+        std::atomic<int> in_flight{0};    // statements executing right now
+        /// Set (release, under read_pool_mutex_) on EVERY retire path
+        /// before the keeper COMMIT; re-checked (acquire) after each
+        /// generation statement returns — the finding-1 TOCTOU belt.
+        std::atomic<bool> retiring{false};
+        std::chrono::steady_clock::time_point pinned_at{};
+        std::atomic<int64_t> last_read_steady_ms{0};
+    };
+
+    static int64_t steady_ms_now() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    /// COMMIT a generation's keeper transaction and return the connection to
+    /// the idle pool. `force` = the §3.4 force-retire protocol: (i) the
+    /// retiring flag was already set under the pool lock (new reads refuse
+    /// and re-resolve), (ii) sqlite3_interrupt kicks wedged in-flight
+    /// statements (SQLite refuses COMMIT while statements are in progress),
+    /// (iii) COMMIT retries within a bounded budget. A connection whose
+    /// COMMIT never succeeds is dropped instead of pooled — sqlite3_close_v2
+    /// rolls the read txn back when the last shared_ptr releases; it is
+    /// never reused mid-transaction. Runs SQL: never call under a lock.
+    void commit_and_pool(const std::shared_ptr<read_generation>& gen, bool force) {
+        auto& conn = gen->conn;
+        if (!conn) return;
+        if (force && gen->in_flight.load(std::memory_order_acquire) > 0) {
+            conn->interrupt();
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        bool committed = false;
+        for (;;) {
+            try {
+                if (conn->is_closed() || !conn->is_in_transaction()) {
+                    committed = true;  // nothing left to close
+                    break;
+                }
+                conn->execute("COMMIT");
+                committed = true;
+                break;
+            } catch (const db_error&) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                if (force && gen->in_flight.load(std::memory_order_acquire) > 0) {
+                    conn->interrupt();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        if (committed && !conn->is_closed()) {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            // NEVER pool while the generation still has in-flight statements
+            // (item-A adversarial finding 1): a delayed reader — liveness
+            // checked and in_flight bumped, then descheduled before its
+            // statement started, so the force-retire's interrupt no-opped —
+            // could otherwise execute inside a SUCCESSOR generation's
+            // transaction after a re-acquire re-pins this connection: a
+            // wrong-snapshot read with no error and no stale sentinel.
+            // Dropping the connection is cheaper than a wrong-snapshot read.
+            // The 0-read is final: every retire path erased this generation
+            // from live_generations_ under the pool lock before reaching
+            // here, and in_flight only grows in query_at_generation's
+            // find-under-lock — so it can only fall from now on.
+            //
+            // Duplicate guard: concurrent release/force-retire of the same
+            // generation can both reach here (retire is idempotent); pooling
+            // one connection twice would hand two future generations the
+            // same handle.
+            if (!closed_.load(std::memory_order_seq_cst) &&
+                gen->in_flight.load(std::memory_order_acquire) == 0 &&
+                idle_read_pool_.size() + live_generations_.size() < read_pool_capacity_ &&
+                std::find(idle_read_pool_.begin(), idle_read_pool_.end(), conn) ==
+                    idle_read_pool_.end()) {
+                idle_read_pool_.push_back(conn);
+            }
+        }
+        // else: dropped — freed when the last in-flight reader's shared_ptr goes.
+    }
+
+    /// §3.4 force-retire: flag under the pool lock, then interrupt + bounded
+    /// COMMIT outside it.
+    void force_retire_generation(const std::shared_ptr<read_generation>& gen) {
+        {
+            std::lock_guard<std::mutex> lock(read_pool_mutex_);
+            gen->retiring.store(true, std::memory_order_release);
+            live_generations_.erase(
+                std::remove(live_generations_.begin(), live_generations_.end(), gen),
+                live_generations_.end());
+        }
+        commit_and_pool(gen, /*force=*/true);
+    }
+
+    /// §3.4 coordinated reader gap. When any same-path instance's WAL hook
+    /// crossed the eviction threshold: force-retire ALL keepers on ALL
+    /// same-path instances — regardless of generation age or active reads
+    /// (an age precondition would defeat the cap in exactly the burst case
+    /// it exists for) — then, once aggregate outstanding == 0, run one
+    /// TRUNCATE-else-PASSIVE checkpoint. Foreground acquisition uses zero
+    /// lock wait; maintenance retains its bounded wait. Clear the flags only
+    /// after successful truncation: a foreign reader or racing acquire must
+    /// leave the request pending even when no later write re-flags it.
+    void run_pending_wal_eviction_if_any(int checkpoint_busy_budget_ms = 250) {
+#ifndef __EMSCRIPTEN__
+        if (config_.is_in_memory()) return;
+        bool pending = false;
+        instance_registry::instance().for_each_alive(config_.path,
+            [&pending](lattice_db* inst) {
+                pending = pending ||
+                          inst->wal_eviction_pending_.load(std::memory_order_relaxed);
+            });
+        if (!pending) return;
+        std::vector<std::pair<std::shared_ptr<projection_pressure_source>, uint64_t>> pressure;
+        instance_registry::instance().for_each_alive(config_.path,
+            [&pressure](lattice_db* inst) {
+                for (const auto& source : inst->projection_pressure_sources()) {
+                    if (source->pending()) pressure.emplace_back(source, source->raised.load());
+                }
+                inst->retire_all_read_generations();
+            });
+        for (const auto& [source, _] : pressure) retire_projection_store(source->identity);
+        for (const auto& [source, _] : pressure)
+            if (projection_store_readers(source->identity) != 0) return;
+        if (read_generations_outstanding() != 0) return;  // racing acquire — retry next tick
+        if (!db_ || config_.read_only || closed_.load(std::memory_order_seq_cst)) return;
+        auto res = db_->wal_checkpoint(/*truncate=*/true, checkpoint_busy_budget_ms);
+        if (res.rc != SQLITE_OK || res.busy != 0) {
+            db_->wal_checkpoint(/*truncate=*/false);
+            return;  // retain the obligation for the next maintenance tick
+        }
+        for (const auto& [source, through] : pressure) source->acknowledge(through);
+        instance_registry::instance().for_each_alive(config_.path,
+            [](lattice_db* inst) {
+                // Clear first, then detect any later raise. Hook ordering is
+                // raise generation -> legacy pending flag, so neither racing
+                // sequence can erase a newer pressure episode.
+                inst->wal_eviction_pending_.store(false, std::memory_order_seq_cst);
+                for (const auto& source : inst->projection_pressure_sources())
+                    if (source->pending()) inst->wal_eviction_pending_.store(true, std::memory_order_seq_cst);
+            });
+#endif
+    }
+
+    void setup_store_write_gate() {
+        store_write_gate_ = (config_.is_in_memory() && storage_shared_across_instances())
+            ? instance_registry::instance().write_gate(config_.path)
+            : nullptr;
+    }
+
+    /// Adopt the registry's per-path WAL eviction threshold at open (item-A
+    /// adversarial finding 2): a synchronizer/IPC instance created AFTER the
+    /// app handle configured the store must not run its WAL hook at the
+    /// default. Called after register_instance — a concurrent setter then
+    /// either sees this instance in its fan-out or has already published the
+    /// registry value read here; either way the latest set wins.
+    void adopt_path_wal_eviction_threshold() {
+        if (!storage_shared_across_instances()) return;
+        if (auto bytes = instance_registry::instance()
+                             .wal_eviction_threshold_for_path(config_.path)) {
+            wal_keeper_eviction_threshold_bytes_.store(*bytes, std::memory_order_relaxed);
+        }
+    }
+
+    static std::unordered_map<const lattice_db*, int>& tls_store_gate_depths() {
+        thread_local std::unordered_map<const lattice_db*, int> depths;
+        return depths;
+    }
+
+    /// LEAF lock (spec §2.3 invariant): held for pool bookkeeping only,
+    /// NEVER across a SQL statement — keeper BEGIN/pin/COMMIT and all
+    /// generation reads run outside it.
+    std::mutex& read_pool_mutex_ = process_resources_.get().read_pool_mutex_;
+    std::vector<std::shared_ptr<read_generation>>& live_generations_ = process_resources_.get().live_generations_;
+    std::vector<std::shared_ptr<database>>& idle_read_pool_ = process_resources_.get().idle_read_pool_;
+    size_t& read_pool_capacity_ = process_resources_.get().read_pool_capacity_;             // spec §1.7 keeperPoolSize default
+    uint64_t& next_read_generation_id_ = process_resources_.get().next_read_generation_id_;      // guarded by read_pool_mutex_
+    std::atomic<int64_t>& read_generation_ttl_ms_ = process_resources_.get().read_generation_ttl_ms_;        // §1.7 generationTTLSeconds
+    std::atomic<int64_t>& read_generation_max_age_ms_ = process_resources_.get().read_generation_max_age_ms_;   // §3.2(b) absolute cap
+    std::atomic<int64_t>& wal_keeper_eviction_threshold_bytes_ = process_resources_.get().wal_keeper_eviction_threshold_bytes_;  // §1.7/§3.4
+    /// Set from the WAL hook's C frame (atomic store — hook-frame legal)
+    /// when the log crosses the threshold; consumed by
+    /// run_pending_wal_eviction_if_any() aggregating across the path.
+    std::atomic<bool>& wal_eviction_pending_ = process_resources_.get().wal_eviction_pending_;
+    /// Cached at setup_change_hook time — the WAL hook frame may not run SQL.
+    int64_t& wal_page_size_ = process_resources_.get().wal_page_size_;
+    /// Per-path shared-cache write gate (null for file/isolated stores).
+    std::shared_ptr<std::recursive_timed_mutex>& store_write_gate_ = process_resources_.get().store_write_gate_;
+
+public:
+    // Find by primary key
+    template<typename T>
+    std::optional<managed<T>> find(primary_key_t id) {
+        const auto& schema = managed<T>::schema();
+        return find<T>(id, schema.table_name);
+    }
+
+    template<typename T>
+    std::optional<managed<T>> find(primary_key_t id, const std::string& table_name) {
+        std::string sql = "SELECT * FROM " + table_name + " WHERE id = ?";
+        // Use read connection for queries
+        auto rows = query_read(sql, {id});
+
+        if (rows.empty()) {
+            return std::nullopt;
+        }
+        return hydrate<T>(rows[0], table_name);
+    }
+    
+    // Find by global ID (table name from schema)
+    template<typename T>
+    std::optional<managed<T>> find_by_global_id(const global_id_t& gid) {
+        return find_by_global_id<T>(gid, managed<T>::schema().table_name);
+    }
+
+    // Find by global ID (explicit table name for dynamic objects)
+    template<typename T>
+    std::optional<managed<T>> find_by_global_id(const global_id_t& gid, const std::string& table_name) {
+        std::string sql = "SELECT * FROM " + table_name + " WHERE globalId = ?";
+        // Use read connection for queries
+        auto rows = query_read(sql, {gid});
+
+        if (rows.empty()) {
+            return std::nullopt;
+        }
+        return hydrate<T>(rows[0], table_name);
+    }
+
+    // Remove an object - version with explicit table name (for dynamic objects)
+    template<typename T>
+    void remove(managed<T>& obj, const std::string& table_name) {
+        if (!obj.is_valid()) return;
+
+        auto gid = obj.global_id();
+
+        // §4.1 per-store write gate: the delete + cascade transaction is one
+        // writer scope vs. sibling captures (no-op off shared-cache stores).
+        store_write_gate_hold write_gate(*this);
+
+        // Wrap the parent DELETE + cascade loop in a single transaction
+        // so all audit rows commit together. Without this each
+        // statement auto-commits separately, the WAL hook flushes once
+        // per statement, and the changeStream yields the parent
+        // DELETE and each link-table DELETE in different batches.
+        // Wire-relay consumers that re-frame per yield (e.g.
+        // ClaudeCodeIRC's `RoomSyncServer.broadcastEntries`) then ship
+        // multiple wire frames for one logical delete; the receiver
+        // applies them as separate transactions, opening a window
+        // where reading the link traverses a non-null FK pointing at a
+        // row that's already gone — SIGSEGV in
+        // `dynamic_object::get_object`. Re-entrancy: respect callers
+        // already inside a transaction (matches the `add_bulk` / sync
+        // pattern at line ~909).
+        bool was_in_transaction = false;
+        try {
+            if (!db_->is_in_transaction()) {
+                db_->begin_transaction();
+            } else {
+                was_in_transaction = true;
+            }
+
+            db_->remove(table_name, obj.id_);
+
+            // Cascade: clean up internal-table rows that referenced this object.
+            //
+            // Three kinds of internal tables coexist in `_lattice_meta`:
+            //  • Link tables (regular + virtual): have an `rhs` column, need
+            //    `DELETE … WHERE rhs = ?`.
+            //  • Single-parent `@Union` tables: have no `rhs` column. Their
+            //    parent's `BEFORE DELETE` trigger (see
+            //    `create_union_cascade_trigger`) already removed the union row
+            //    inside this transaction — nothing to do here.
+            //  • Geo_bounds list tables: have `parent_id`, not `rhs`. Need
+            //    `DELETE … WHERE parent_id = ?` when the parent is deleted.
+            //
+            // We dispatch via the in-memory side indexes (`link_tables_`,
+            // `list_tables_by_parent_`) populated at registration time so the
+            // cascade walker only issues queries that match each table's
+            // schema. This replaces the older "iterate every `internal_table:%`
+            // and rely on try/catch as a column-existence test" pattern, which
+            // was both O(all_internal_tables) per delete and noisy — every
+            // attempt against a union or list table hit the SQLite error
+            // logger before being swallowed.
+            if (!gid.empty()) {
+                // Regular link tables that target this type — typically a
+                // small set, often empty for leaf types (e.g. historical
+                // signals nothing else points at).
+                auto target_it = link_tables_by_rhs_target_.find(table_name);
+                if (target_it != link_tables_by_rhs_target_.end()) {
+                    for (const auto& link_table : target_it->second) {
+                        if (db_->table_exists(link_table)) {
+                            db_->execute(
+                                "DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                        }
+                    }
+                }
+                // Defensive: link tables registered without a known target
+                // (rare; normally empty after `ensure_link_tables()`).
+                for (const auto& link_table : link_tables_unknown_target_) {
+                    if (db_->table_exists(link_table)) {
+                        db_->execute(
+                            "DELETE FROM " + link_table + " WHERE rhs = ?", {gid});
+                    }
+                }
+                // Virtual link tables — polymorphic rhs, scope by rhs_type.
+                for (const auto& link_table : virtual_link_tables_) {
+                    if (db_->table_exists(link_table)) {
+                        db_->execute(
+                            "DELETE FROM " + link_table +
+                            " WHERE rhs = ? AND rhs_type = ?",
+                            {gid, table_name});
+                    }
+                }
+                auto list_it = list_tables_by_parent_.find(table_name);
+                if (list_it != list_tables_by_parent_.end()) {
+                    for (const auto& list_table : list_it->second) {
+                        if (db_->table_exists(list_table)) {
+                            db_->execute(
+                                "DELETE FROM " + list_table + " WHERE parent_id = ?",
+                                {gid});
+                        }
+                    }
+                }
+
+                // Defensive vec0 cleanup: the DELETE trigger should have removed
+                // the vec0 entry, but under write contention it can silently fail.
+                cleanup_vec0_entries(table_name, {gid});
+            }
+
+            if (!was_in_transaction) {
+                db_->commit();
+            }
+        } catch (...) {
+            if (!was_in_transaction && db_->is_in_transaction()) {
+                db_->rollback();
+            }
+            throw;
+        }
+
+        if (!obj.lattice_) obj.notify_deleted();
+        obj.db_ = nullptr;
+        obj.id_ = 0;
+    }
+
+    // Remove an object - gets table name from schema
+    template<typename T>
+    void remove(managed<T>& obj) {
+        remove(obj, managed<T>::schema().table_name);
+    }
+
+    // Count rows in a table (with optional WHERE clause)
+    // SQL builder for count — extracted (results spec Commit 4) so the
+    // bridge's generation-scoped count_at routes the SAME statement text
+    // through query_at_generation. Pure string construction; the result
+    // always aliases the count column as `cnt`.
+    static std::string build_count_sql(
+        const std::string& table_name,
+        const std::optional<std::string>& where_clause = std::nullopt,
+        const std::optional<std::string>& group_by = std::nullopt,
+        const std::optional<std::string>& distinct_by = std::nullopt) {
+        std::string sql;
+
+        bool has_distinct = distinct_by.has_value() && !distinct_by->empty();
+        bool has_group = group_by.has_value() && !group_by->empty();
+
+        if (has_distinct && has_group) {
+            // Count distinct group_by values after deduplicating by distinct_by
+            sql = "SELECT COUNT(DISTINCT " + *group_by + ") as cnt FROM (SELECT * FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
+            sql += " GROUP BY " + *distinct_by + ")";
+        } else if (has_distinct) {
+            sql = "SELECT COUNT(DISTINCT " + *distinct_by + ") as cnt FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
+        } else if (has_group) {
+            sql = "SELECT COUNT(DISTINCT " + *group_by + ") as cnt FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
+        } else {
+            sql = "SELECT COUNT(*) as cnt FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
+        }
+        return sql;
+    }
+
+    size_t count(const std::string& table_name,
+                 std::optional<std::string> where_clause = std::nullopt,
+                 std::optional<std::string> group_by = std::nullopt,
+                 std::optional<std::string> distinct_by = std::nullopt,
+                 const std::vector<column_value_t>& params = {}) {
+        auto rows = query_read(build_count_sql(table_name, where_clause, group_by, distinct_by), params);
+        if (!rows.empty()) {
+            auto it = rows[0].find("cnt");
+            if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                return static_cast<size_t>(std::get<int64_t>(it->second));
+            }
+        }
+        return 0;
+    }
+
+    // Framework tables whose globalIds are never the rhs of a link, and
+    // which have no vec0 columns. Skipping the cascade for these turns
+    // delete_history (millions of AuditLog rows × N link tables of no-op
+    // DELETEs that bloat the WAL) into a single DELETE.
+    static bool is_non_cascading_table(const std::string& t) {
+        if (t == "AuditLog") return true;
+        if (t == "_SyncControl") return true;
+        if (t.rfind("_lattice_", 0) == 0) return true;
+        return false;
+    }
+
+    // Delete rows from a table (with optional WHERE clause)
+    /// `params` bind the `?` placeholders in `where_clause`. NOTE the
+    /// where clause is re-issued in EVERY cascade statement below (the parent
+    /// SELECT is inlined as a subquery rather than materialized), so each of
+    /// those statements must be handed the same bindings — a parameterized
+    /// predicate whose bindings were passed only to the final DELETE would
+    /// cascade against the wrong row set.
+    bool delete_where(const std::string& table_name, std::optional<std::string> where_clause = std::nullopt,
+                      const std::vector<column_value_t>& params = {}) {
+        try {
+            const bool skip_cascade = is_non_cascading_table(table_name);
+
+            std::vector<std::string> gids_for_vec0;
+
+            if (!skip_cascade) {
+                // Collect gids first for vec0 cleanup, then issue one bulk
+                // DELETE per cascade target table. See `remove(...)` for the
+                // per-kind rationale (link vs union vs list).
+                std::string select_sql = "SELECT globalId FROM " + table_name;
+                if (where_clause.has_value()) {
+                    select_sql += " WHERE " + *where_clause;
+                }
+                auto gid_rows = db_->query(select_sql, params);
+
+                for (const auto& gid_row : gid_rows) {
+                    auto gid_it = gid_row.find("globalId");
+                    if (gid_it == gid_row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                    auto gid = std::get<std::string>(gid_it->second);
+                    if (gid.empty()) continue;
+                    gids_for_vec0.push_back(gid);
+                }
+
+                if (!gids_for_vec0.empty()) {
+                    // Build the subquery once; reuse for every cascade target.
+                    // Re-running the parent SELECT inside each DELETE keeps the
+                    // statement parameter-free and lets SQLite stream rows.
+                    std::string parent_sub = "SELECT globalId FROM " + table_name;
+                    if (where_clause.has_value()) {
+                        parent_sub += " WHERE " + *where_clause;
+                    }
+
+                    auto target_it = link_tables_by_rhs_target_.find(table_name);
+                    if (target_it != link_tables_by_rhs_target_.end()) {
+                        for (const auto& link_table : target_it->second) {
+                            if (db_->table_exists(link_table)) {
+                                db_->execute(
+                                    "DELETE FROM " + link_table +
+                                    " WHERE rhs IN (" + parent_sub + ")", params);
+                            }
+                        }
+                    }
+                    for (const auto& link_table : link_tables_unknown_target_) {
+                        if (db_->table_exists(link_table)) {
+                            db_->execute(
+                                "DELETE FROM " + link_table +
+                                " WHERE rhs IN (" + parent_sub + ")", params);
+                        }
+                    }
+                    for (const auto& link_table : virtual_link_tables_) {
+                        if (db_->table_exists(link_table)) {
+                            // `rhs_type = ?` precedes the subquery in the
+                            // statement text, so its binding must precede the
+                            // predicate's.
+                            std::vector<column_value_t> virtual_params;
+                            virtual_params.reserve(params.size() + 1);
+                            virtual_params.push_back(table_name);
+                            virtual_params.insert(virtual_params.end(), params.begin(), params.end());
+                            db_->execute(
+                                "DELETE FROM " + link_table +
+                                " WHERE rhs_type = ? AND rhs IN (" + parent_sub + ")",
+                                virtual_params);
+                        }
+                    }
+                    auto list_it = list_tables_by_parent_.find(table_name);
+                    if (list_it != list_tables_by_parent_.end()) {
+                        for (const auto& list_table : list_it->second) {
+                            if (db_->table_exists(list_table)) {
+                                db_->execute(
+                                    "DELETE FROM " + list_table +
+                                    " WHERE parent_id IN (" + parent_sub + ")", params);
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::string sql = "DELETE FROM " + table_name;
+            if (where_clause.has_value()) {
+                sql += " WHERE " + *where_clause;
+            }
+            db_->execute(sql, params);
+
+            if (!skip_cascade) {
+                // Defensive vec0 cleanup: the DELETE trigger should have removed
+                // vec0 entries, but under write contention it can silently fail.
+                cleanup_vec0_entries(table_name, gids_for_vec0);
+            }
+
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    /// Compact the audit log by replacing all entries with INSERT records
+    /// representing the current state of all objects.
+    /// This drops all history and creates a fresh snapshot.
+    /// Backward-compatible wrapper for force_compact_audit_log().
+    /// @return Number of INSERT entries created
+    int64_t compact_audit_log() {
+        return force_compact_audit_log();
+    }
+
+    /// Current value of the persistent _SyncControl.disabled flag (0 if unset).
+    /// Internal operations that temporarily disable sync must restore THIS
+    /// value, not hardcode 0 — a user who deliberately disabled auditing
+    /// keeps it disabled across compaction/history operations.
+    int64_t read_sync_disabled_flag() const {
+        try {
+            auto rows = db_->query("SELECT disabled FROM _SyncControl WHERE id = 1");
+            if (!rows.empty()) {
+                if (const auto* i = std::get_if<int64_t>(&rows[0].at("disabled"))) return *i;
+            }
+        } catch (...) {}
+        return 0;
+    }
+
+    /// Hard-delete rows WITHOUT relaying the deletes: each row's DELETE
+    /// audit entry carries the `__lattice_filter_removal` marker, which WSS
+    /// receivers skip-and-ack (they never apply it) and IPC receivers record
+    /// fully-synchronized (A4). The rows vanish HERE; every peer keeps its
+    /// own copy untouched.
+    ///
+    /// This is the one sanctioned emitter of group-wide hard deletes — the
+    /// server-side tombstone purge. A NORMAL delete would be catastrophic
+    /// there: members' spokes would apply it, and because the purged rows
+    /// sit in each member's spoke→hub sync set, the DELETE would classify
+    /// onward into their personal hubs and fan out to every one of their
+    /// devices.
+    ///
+    /// The row deletions run with sync disabled (so the audit triggers stay
+    /// silent) and the marked entries are written by hand, all in one
+    /// transaction — a normal trigger-written DELETE entry appearing next
+    /// to the marked one would resurrect exactly the relay this exists to
+    /// suppress.
+    /// @return rows actually deleted
+    int64_t delete_rows_no_relay(const std::string& table,
+                                 const std::vector<std::string>& global_row_ids) {
+        if (global_row_ids.empty()) return 0;
+        const int64_t prev_disabled = read_sync_disabled_flag();
+        int64_t deleted = 0;
+        db_->begin_transaction();
+        try {
+            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+            for (const auto& gid : global_row_ids) {
+                db_->execute("DELETE FROM \"" + table + "\" WHERE globalId = ? COLLATE NOCASE",
+                             {gid});
+                if (sqlite3_changes(db_->internal_handle()) == 0) continue;
+                deleted++;
+                // Shape mirrors reconcile's narrowing synthesis (sync.cpp):
+                // the ONLY producer of marked deletes until now, and the
+                // shape every apply gate matches on.
+                db_->execute(
+                    "INSERT INTO AuditLog (globalId, tableName, operation, rowId, globalRowId, "
+                    "changedFields, changedFieldsNames, isFromRemote, isSynchronized) "
+                    "VALUES (?, ?, 'DELETE', 0, ?, '{}', '[\"__lattice_filter_removal\"]', 0, 0)",
+                    {generate_global_id(), table, gid});
+            }
+            db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+            db_->commit();
+        } catch (...) {
+            db_->rollback();
+            // The flag write above rolled back with everything else, but
+            // restore defensively in case the txn died after a partial step.
+            try { db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1",
+                               {prev_disabled}); } catch (...) {}
+            throw;
+        }
+        return deleted;
+    }
+
+    /// Repair audit rows whose timestamp landed in the REAL column as TEXT.
+    /// The pre-fix apply path bound the wire's ISO-8601 string directly, so
+    /// those rows fell out of every date-based query and every age-based
+    /// maintenance sweep (2.0M rows on a production hub). unixepoch()
+    /// parses the ISO forms; unparseable values are left alone rather than
+    /// zeroed. Idempotent — typed-REAL rows are not matched.
+    /// @return rows normalized
+    int64_t normalize_audit_timestamps() {
+        db_->execute(
+            "UPDATE AuditLog SET timestamp = unixepoch(timestamp) "
+            "WHERE typeof(timestamp) = 'text' AND unixepoch(timestamp) IS NOT NULL");
+        return static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+    }
+
+    /// Nuclear compaction: deletes ALL history, regenerates INSERT snapshots,
+    /// and resets all replication slot cursors to 0.
+    /// Active synchronizers will re-sync all data.
+    /// @return Number of INSERT entries created
+    int64_t force_compact_audit_log() {
+        return generate_history_owned_(20000, true, true);
+    }
+
+    /// Re-arm a synchronizer's filtered snapshot for a fresh peer: forget
+    /// per-sync upload tracking and filtered-set membership so the next
+    /// reconcile_sync_filter() re-synthesizes INSERTs for the full filtered
+    /// subset. Local data is untouched; upload volume stays proportional to
+    /// the filter, never the whole AuditLog.
+    ///
+    /// The sync-set wipe is scoped to this sync_id (per-sync_id shape) — it
+    /// cannot corrupt other synchronizers' filtered-set membership, so the
+    /// full re-arm is safe on any topology, including multi-channel hubs.
+    void reset_sync_state(const std::string& sync_id) {
+        require_creator_process();
+        detail::reset_sync_channel_with_producer_fence(*this,sync_id,false);
+        LOG_INFO("lattice_db", "reset_sync_state(%s): cleared per-sync state (sync_state, sync_set, slot cursors)",
+                 sync_id.c_str());
+    }
+
+    /// A6 — permanently retire a sync channel: delete its `_lattice_sync_state`
+    /// rows, its `_lattice_sync_set` membership, AND its replication slot.
+    /// Call when a channel is gone for good (e.g. the daemon dropped a group
+    /// membership), NOT for a reconnecting channel (use reset_sync_state).
+    /// Leftover state from a dead channel is actively harmful: its stale slot
+    /// pins safe compaction forever, and (pre-scoping) its confirmed
+    /// sync_state rows inflated the eager-collapse count — an entry could
+    /// collapse to isSynchronized=1 before a still-live channel relayed it.
+    void remove_sync_channel_state(const std::string& sync_id) {
+        require_creator_process();
+        detail::reset_sync_channel_with_producer_fence(*this,sync_id,true);
+        LOG_INFO("lattice_db", "remove_sync_channel_state(%s): channel retired (state, set, slot removed)",
+                 sync_id.c_str());
+    }
+
+    /// Slot-aware compaction: deletes only AuditLog entries that ALL
+    /// registered synchronizers have confirmed receiving.
+    /// Safe to call during active sync — no re-sync storm.
+    /// @param stale_threshold_seconds If > 0, evict slots inactive for this long
+    /// @return Number of entries deleted, or -1 if no slots exist (no-op)
+    int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            // 1. Optionally evict stale slots
+            if (stale_threshold_seconds > 0) {
+                db_->execute(
+                    "DELETE FROM _lattice_replication_slots "
+                    "WHERE last_active_at < datetime('now', '-' || ? || ' seconds')",
+                    {stale_threshold_seconds});
+            }
+
+            // 2. Deletion bound: MIN(upload_floor) over live slots — the floor is
+            // the CONTIGUOUS resolved frontier ("no entry pending for this
+            // sync_id has id <= upload_floor", advanced only as ids resolve by
+            // ack or skip). confirmed_audit_id must NOT participate: it is a
+            // HOLEY high-watermark (advance takes each ACKed chunk's max, and a
+            // partial apply acks only the applied subset — confirmed jumps past
+            // unacked lower ids; observed live: 1,087 entries pending BELOW a
+            // channel's confirmed). Compacting to it deletes un-uploaded history
+            // unrecoverably; compacting to the floor is exactly safe.
+            // Observer slots (this database's own read-only dials) never advance
+            // a floor and are excluded — otherwise a read-only replica could never
+            // prune its own history. The column is added lazily on legacy files.
+            ensure_observer_column(*db_);
+            auto rows = db_->query(
+                "SELECT COUNT(*) as cnt, MIN(upload_floor) as safe_id "
+                "FROM _lattice_replication_slots WHERE is_observer = 0");
+
+            if (rows.empty()) return -1;
+
+            auto cnt_it = rows[0].find("cnt");
+            auto safe_it = rows[0].find("safe_id");
+            if (cnt_it == rows[0].end() || safe_it == rows[0].end())
+                return -1;
+
+            int64_t slot_count = 0;
+            if (std::holds_alternative<int64_t>(cnt_it->second)) {
+                slot_count = std::get<int64_t>(cnt_it->second);
+            }
+
+            // 3. If no slots or safe_id <= 0 → no-op
+            if (slot_count == 0) return -1;
+
+            int64_t safe_id = 0;
+            if (std::holds_alternative<int64_t>(safe_it->second)) {
+                safe_id = std::get<int64_t>(safe_it->second);
+            }
+            if (safe_id <= 0) return 0;
+
+            // 4. Delete floor-covered entries — in ONE transaction. The bare
+            // autocommit sequence could commit a mixed state on mid-pass crash
+            // (flag flipped but rows half-deleted, or AuditLog pruned with its
+            // sync-state rows orphaned); a transaction makes crash = clean
+            // rollback, including the _SyncControl flag flip.
+            return delete_audit_below_in_transaction_(safe_id, audit_cursor_row_needed_());
+        });
+    }
+
+    /// Retention-based pruning — the cursor-safe tear-out for a store that
+    /// has NO sync partners (every local Orbital room, every single-process
+    /// app), and an additional bound for one that has them.
+    ///
+    /// What "safe" means here: the audit log's only local readers are the
+    /// live change feeds — each attached process seeds a cursor from MAX(id)
+    /// at open and reads forward, and a fresh open never replays history —
+    /// so an entry is dead once every process has delivered it, which is
+    /// milliseconds after its commit. The bound is therefore INSERTION time,
+    /// not the row's `timestamp` column: applied remote rows keep their
+    /// origin timestamp (older than their insertion), and a timestamp-based
+    /// bound would either delete fresh rows sitting below a stale one or
+    /// force a scan through every row's payload (the column sits after
+    /// `changedFields`, so reading it walks the overflow chain).
+    ///
+    /// Insertion time is tracked by WATERMARKS: `record_audit_watermark()`
+    /// stores (now, MAX(id)) in `_lattice_meta` (key `audit_wm:<epoch>`), and
+    /// the prune bound is the largest id recorded at or before
+    /// `now - retention`: every id at or below it existed a full retention
+    /// window ago. O(1) per sample, no index, no scan, immune to timestamp
+    /// skew. The first prune lands one window after sampling began.
+    ///
+    /// With replication slots the bound is additionally capped by the
+    /// MIN(upload_floor) over NON-observer slots (a synchronizer needs the
+    /// history it has not uploaded); observer slots are ignored. Never
+    /// touches sqlite_sequence. Returns rows removed.
+    int64_t prune_audit_log(int64_t retention_seconds) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
+        if (retention_seconds <= 0) return 0;
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            const double now = now_epoch_();
+            const double cutoff = now - static_cast<double>(retention_seconds);
+            record_audit_watermark_(now);   // always sample, so a bound exists next time
+            auto wm = audit_watermark_before_(cutoff);
+            if (!wm || *wm <= 0) return 0;
+            int64_t bound = *wm;
+
+            ensure_observer_column(*db_);
+            auto rows = db_->query(
+                "SELECT COUNT(*) AS cnt, MIN(upload_floor) AS floor "
+                "FROM _lattice_replication_slots WHERE is_observer = 0");
+            if (!rows.empty()) {
+                int64_t cnt = 0;
+                if (const auto* c = std::get_if<int64_t>(&rows[0].at("cnt"))) cnt = *c;
+                if (cnt > 0) {
+                    int64_t floor = 0;
+                    if (const auto* f = std::get_if<int64_t>(&rows[0].at("floor"))) floor = *f;
+                    bound = std::min(bound, floor);
+                }
+            }
+            if (bound <= 0) return 0;
+
+            // Samples older than one window BEFORE the cutoff can never be the
+            // bound again — drop them so the meta table stays a handful of rows.
+            db_->execute(
+                "DELETE FROM _lattice_meta WHERE key LIKE 'audit_wm:%' "
+                "AND CAST(substr(key, 10) AS REAL) < ?",
+                {cutoff - static_cast<double>(retention_seconds)});
+            return delete_audit_below_in_transaction_(bound, audit_cursor_row_needed_());
+        });
+    }
+
+    /// Store a (now, MAX(id)) watermark for prune_audit_log(). Cheap (one
+    /// pk-btree MAX + one meta upsert); safe to call from any process.
+    void record_audit_watermark() { record_audit_watermark_(now_epoch_()); }
+
+    /// Backdate every recorded watermark by `seconds` (test-only, the
+    /// `backdate_replication_slots` counterpart): makes "a retention window
+    /// elapsed" deterministic without wall-clock sleeps.
+    void backdate_audit_watermarks(int64_t seconds) {
+        auto rows = db_->query("SELECT key, value FROM _lattice_meta WHERE key LIKE 'audit_wm:%'", {});
+        for (const auto& row : rows) {
+            const auto* key = std::get_if<std::string>(&row.at("key"));
+            const auto* value = std::get_if<std::string>(&row.at("value"));
+            if (!key || !value) continue;
+            const int64_t when = std::atoll(key->c_str() + 9);   // strlen("audit_wm:") == 9
+            db_->execute("DELETE FROM _lattice_meta WHERE key = ?", {*key});
+            db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                         {std::string("audit_wm:") + std::to_string(when - seconds), *value});
+        }
+    }
+
+    /// Flip one of this database's replication slots to/from observer.
+    void set_replication_slot_observer(const std::string& sync_id, bool is_observer) {
+        lattice::set_replication_slot_observer(*db_, sync_id, is_observer);
+    }
+
+    // ---- compaction internals (shared by safe_compact_audit_log / prune_audit_log)
+
+    /// The newest isFromRemote row is the LEGACY download-resume cursor.
+    /// Since the cursor moved into _lattice_replication_slots
+    /// (last_received_event_id, written per applied chunk and eagerly
+    /// seeded), the row only needs preserving while some slot still has a
+    /// NULL cursor — i.e. a channel that has neither seeded nor received
+    /// since the upgrade. Once every slot carries a cursor, compaction may
+    /// reclaim the row.
+    bool audit_cursor_row_needed_() {
+        bool has_cursor_col = false;
+        for (const auto& row : db_->query(
+                 "PRAGMA table_info(_lattice_replication_slots)", {})) {
+            auto it = row.find("name");
+            if (it != row.end() && std::holds_alternative<std::string>(it->second) &&
+                std::get<std::string>(it->second) == "last_received_event_id") {
+                has_cursor_col = true;
+                break;
+            }
+        }
+        if (!has_cursor_col) return true;
+        auto nulls = db_->query(
+            "SELECT COUNT(*) AS c FROM _lattice_replication_slots "
+            "WHERE last_received_event_id IS NULL");
+        return nulls.empty() ||
+               !std::holds_alternative<int64_t>(nulls[0].at("c")) ||
+               std::get<int64_t>(nulls[0].at("c")) != 0;
+    }
+
+    /// Compatibility entry point: the caller's bound may be stricter, but
+    /// cannot bypass the writer floors or a newly required legacy cursor.
+    int64_t delete_audit_below_(int64_t safe_id, bool preserve_cursor_row) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
+        if (safe_id <= 0) return 0;
+        return with_audit_prune_transaction_([&]() -> int64_t {
+            ensure_observer_column(*db_);
+            const auto floors = db_->query(
+                "SELECT MIN(upload_floor) AS floor FROM _lattice_replication_slots "
+                "WHERE is_observer = 0");
+            if (!floors.empty()) {
+                if (const auto* floor = std::get_if<int64_t>(&floors[0].at("floor")))
+                    safe_id = std::min(safe_id, *floor);
+            }
+            if (safe_id <= 0) return 0;
+            return delete_audit_below_in_transaction_(
+                safe_id, preserve_cursor_row || audit_cursor_row_needed_());
+        });
+    }
+
+private:
+    friend struct audit_maintenance_test_access;
+    friend struct sync_entry_rollback_test_access;
+    friend struct detail::sync_discovery_test_access;
+    friend struct detail::receive_delivery_guard_access;
+    friend std::vector<std::string> apply_remote_changes(
+        lattice_db&, const std::vector<audit_log_entry>&);
+    friend std::vector<std::string> apply_remote_changes_for(
+        lattice_db&, const std::vector<audit_log_entry>&, const std::string&);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&, const std::optional<std::string>&);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&, const std::optional<std::string>&,
+        detail::canonical_upstream_delivery*);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&, const std::optional<std::string>&,
+        detail::canonical_upstream_delivery*,detail::ordinary_provisional_delivery*);
+    std::vector<std::string> apply_remote_changes_impl_(
+        const std::vector<audit_log_entry>&,const std::optional<std::string>&,
+        detail::canonical_upstream_delivery*,detail::ordinary_provisional_delivery*,
+        detail::ordinary_source_upload_delivery*);
+
+    void publish_local_audit_id_(int64_t row_id);
+
+    template<typename F>
+    int64_t with_audit_prune_transaction_(F&& body) {
+        int64_t result = 0;
+        if (store_write_gate_)
+            database::maintenance_scope::probe_before_store_gate(*db_);
+        {
+            store_write_gate_hold gate(*this);
+            database::maintenance_scope ownership(*db_);
+            // Ownership rejects an existing same-connection transaction.
+            // BEGIN then excludes every other connection until COMMIT.
+            db_->begin_transaction();
+            try {
+                // Recheck durable enrollment after BEGIN excludes sibling
+                // enrollment; an earlier context-only check is insufficient.
+                detail::require_recovery_local_producer_maintenance_absent(*db_);
+                detail::require_receive_guard_history_unblocked(*db_);
+                result = std::forward<F>(body)();
+                db_->commit();
+                // COMMIT actually executes even after logical close. A WAL
+                // callback can begin a successor transaction; it is not ours
+                // to reject or roll back after successful COMMIT returns.
+            } catch (...) {
+                // Preserve the original error. A failed rollback makes this
+                // wrapper unusable; subsequent operations must not join an
+                // indeterminate transaction through its normal API.
+                try {
+                    if (db_->is_in_transaction()) db_->rollback();
+                    if (db_->is_in_transaction())
+                        throw db_error("audit maintenance rollback did not settle its transaction");
+                }
+                catch (...) { db_->closed_.store(true, std::memory_order_release); }
+                throw;
+            }
+        }
+        // Memory/WASM settled callbacks may enter another thread/connection.
+        // No maintenance mutex or newly acquired store gate survives delivery.
+        db_->drain_if_settled();
+        return result;
+    }
+
+    // Called only while this thread owns the complete write transaction.
+    // Safety bounds, cursor requirements and the saved trigger flag therefore
+    // come from the same protected state as the deletion.
+    int64_t delete_audit_below_in_transaction_(int64_t safe_id, bool preserve_cursor_row) {
+        // Do not use the legacy best-effort getter: a failed read must never
+        // become a fabricated flag value that is later committed as restore.
+        const auto flag_rows = db_->query("SELECT disabled FROM _SyncControl WHERE id = 1");
+        if (flag_rows.size() != 1)
+            throw db_error("audit maintenance requires one sync control row");
+        const auto flag = flag_rows[0].find("disabled");
+        if (flag == flag_rows[0].end() || !std::holds_alternative<int64_t>(flag->second))
+            throw db_error("audit maintenance requires an integer sync control flag");
+        const int64_t prev_disabled = std::get<int64_t>(flag->second);
+        // Receipts may not exist yet on a database that never applied remote
+        // entries. Their creation participates in this transaction as well.
+        db_->execute("CREATE TABLE IF NOT EXISTS _lattice_applied_receipts ("
+                     "  globalId TEXT PRIMARY KEY)", {});
+        db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+        // The inherited public count uses sqlite3_changes(int). Decide
+        // invalidation independently: on older deployment targets a delete
+        // larger than INT_MAX must still advance the cooperative revision.
+        const std::string deletion_predicate = preserve_cursor_row
+            ? "id <= ? AND id NOT IN (SELECT id FROM AuditLog WHERE isFromRemote = 1 ORDER BY id DESC LIMIT 1)"
+            : "id <= ?";
+        const auto existence = db_->query(
+            "SELECT EXISTS(SELECT 1 FROM AuditLog WHERE " + deletion_predicate + ") AS removes", {safe_id});
+        if (existence.size() != 1 || !std::holds_alternative<int64_t>(existence[0].at("removes")))
+            throw db_error("audit maintenance requires an exact deletion predicate result");
+        const auto removes = std::get<int64_t>(existence[0].at("removes"));
+        if (removes != 0 && removes != 1) throw db_error("invalid audit deletion predicate result");
+        if (preserve_cursor_row) {
+            db_->execute(
+                "DELETE FROM AuditLog WHERE id <= ? AND id NOT IN ("
+                "  SELECT id FROM AuditLog WHERE isFromRemote = 1 "
+                "  ORDER BY id DESC LIMIT 1)", {safe_id});
+        } else {
+            db_->execute("DELETE FROM AuditLog WHERE id <= ?", {safe_id});
+        }
+        const int64_t deleted = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+        if (removes != 0) advance_history_revision_in_transaction_();
+        db_->execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id <= ?", {safe_id});
+        db_->execute(R"(
+            DELETE FROM _lattice_applied_receipts WHERE rowid <=
+                (SELECT COALESCE(MAX(rowid), 0) FROM _lattice_applied_receipts)
+                - 500000
+        )", {});
+        db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+        return deleted;
+    }
+
+public:
+
+    double now_epoch_() const {
+        auto rows = db_->query("SELECT unixepoch('subsec') AS t", {});
+        if (rows.empty()) return 0;
+        const auto& v = rows[0].at("t");
+        if (const auto* d = std::get_if<double>(&v)) return *d;
+        if (const auto* i = std::get_if<int64_t>(&v)) return static_cast<double>(*i);
+        return 0;
+    }
+
+    void record_audit_watermark_(double now) {
+        auto rows = db_->query("SELECT COALESCE(MAX(id), 0) AS m FROM AuditLog", {});
+        int64_t max_id = 0;
+        if (!rows.empty()) {
+            if (const auto* m = std::get_if<int64_t>(&rows[0].at("m"))) max_id = *m;
+        }
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {std::string("audit_wm:") + std::to_string(static_cast<int64_t>(now)),
+                      std::to_string(max_id)});
+    }
+
+    /// Largest recorded MAX(id) among watermarks taken at or before `cutoff`.
+    std::optional<int64_t> audit_watermark_before_(double cutoff) const {
+        auto rows = db_->query(
+            "SELECT MAX(CAST(value AS INTEGER)) AS m FROM _lattice_meta "
+            "WHERE key LIKE 'audit_wm:%' AND CAST(substr(key, 10) AS REAL) <= ?",
+            {cutoff});
+        if (rows.empty()) return std::nullopt;
+        if (const auto* m = std::get_if<int64_t>(&rows[0].at("m"))) return *m;
+        return std::nullopt;
+    }
+
+    // ---- retention maintenance thread (armed only when audit_retention_seconds > 0)
+
+    void start_audit_maintenance() {
+        require_creator_process();
+        if (config_.read_only || config_.audit_retention_seconds <= 0) return;
+        if (audit_maint_thread_.joinable()) return;
+        audit_maint_thread_ = std::thread([this] {
+            const auto period = std::chrono::seconds(
+                std::max<int64_t>(1, config_.audit_retention_seconds / 2));
+            std::unique_lock<std::mutex> lock(audit_maint_mutex_);
+            for (;;) {
+                audit_maint_cv_.wait_for(lock, period, [this] { return audit_maint_stop_; });
+                if (audit_maint_stop_) return;
+                // DB work runs with the maintenance mutex RELEASED (the pacer's
+                // ABBA lesson: connection work under a wake-up mutex deadlocks
+                // against a writer whose change hook wants that mutex).
+                lock.unlock();
+                run_audit_retention_tick();
+                lock.lock();
+                if (audit_maint_stop_) return;
+            }
+        });
+    }
+
+    void stop_audit_maintenance() {
+        require_creator_process();
+        {
+            std::lock_guard<std::mutex> lock(audit_maint_mutex_);
+            audit_maint_stop_ = true;
+        }
+        audit_maint_cv_.notify_all();
+        if (audit_maint_thread_.joinable()) audit_maint_thread_.join();
+    }
+
+    /// One retention tick. N handles/processes on one file coordinate through
+    /// `_lattice_meta['audit_prune_at']`: one conditional write claims a half
+    /// window and prunes; everyone else just records a watermark
+    /// so sampling never starves. Busy/locked errors are ordinary here (a
+    /// writer mid-transaction) — logged at debug, retried next tick.
+    void run_audit_retention_tick() {
+        if (closed_.load(std::memory_order_acquire) || config_.read_only ||
+            config_.audit_retention_seconds <= 0) return;
+        std::string claim_stamp;
+        bool claimed = false;
+        try {
+            const double now = now_epoch_();
+            const double half = static_cast<double>(config_.audit_retention_seconds) / 2.0;
+            claim_stamp = std::to_string(now);
+            // A separate SELECT and unconditional stamp lets simultaneous
+            // handles both prune. SQLite serializes this test-and-write across
+            // connections and processes; only the winner receives a row.
+            const auto claim = db_->query(
+                "INSERT INTO _lattice_meta(key, value) VALUES('audit_prune_at', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+                "WHERE COALESCE(CAST(_lattice_meta.value AS REAL), 0) <= ? "
+                "RETURNING value", {claim_stamp, now - half});
+            if (claim.empty()) { record_audit_watermark_(now); return; }
+            claimed = true;
+            const int64_t removed = prune_audit_log(config_.audit_retention_seconds);
+            if (removed > 0) {
+                LOG_INFO("lattice_db", "audit retention: pruned %lld entries older than %llds (path=%s)",
+                         (long long)removed, (long long)config_.audit_retention_seconds,
+                         config_.path.c_str());
+            }
+        } catch (const std::exception& e) {
+            if (claimed) {
+                // A failed pass should be retried next tick. Compare the exact
+                // stamp so a slower failed owner cannot erase a newer claim.
+                // If cleanup is also busy, ordinary expiry remains the fallback.
+                try {
+                    db_->execute("DELETE FROM _lattice_meta WHERE key = 'audit_prune_at' AND value = ?",
+                                 {claim_stamp});
+                } catch (...) {}
+            }
+            LOG_DEBUG("lattice_db", "audit retention tick skipped: %s", e.what());
+        }
+    }
+
+    /// Backdate all replication slots' last_active_at by the given number of seconds.
+    /// Test-only: allows deterministic stale-slot eviction without wall-clock sleeps.
+    void backdate_replication_slots(int64_t seconds) {
+        db_->execute(
+            "UPDATE _lattice_replication_slots "
+            "SET last_active_at = datetime(last_active_at, '-' || ? || ' seconds')",
+            {seconds});
+    }
+
+    /// Generate audit log INSERT entries for objects not already in the audit log.
+    /// Unlike compact_audit_log, this preserves existing entries and only adds
+    /// entries for objects that are missing from the audit log.
+    /// Useful for initial migration when enabling sync on existing data.
+    /// @return Number of INSERT entries created
+    /// @param mark_synthesized When true (A5), the generated INSERT snapshots
+    /// carry synthesized=1: receivers apply them insert-if-absent rather than
+    /// as unconditional upserts, so regeneration from possibly-stale LOCAL
+    /// state (a client's nuclear compact) can never revert a peer's newer
+    /// edits or resurrect tombstones. Pass false only when this database is
+    /// the CANONICAL copy (e.g. server-side history compaction) and receivers
+    /// SHOULD be refreshed to exactly this state.
+    int64_t generate_history(int64_t batch_size = 20000, bool mark_synthesized = true) {
+        return generate_history_owned_(batch_size, mark_synthesized, false);
+    }
+
+private:
+    friend struct history_generation_test_access;
+    static constexpr const char* history_revision_key_ = "history_generation_revision_v1";
+
+    struct history_operation_hold {
+        lattice_db& owner;
+        explicit history_operation_hold(lattice_db& value) : owner(value) {
+            if (owner.history_generation_active_.exchange(true, std::memory_order_acq_rel))
+                throw db_error("history generation is already active on this owner");
+        }
+        ~history_operation_hold() { owner.history_generation_active_.store(false, std::memory_order_release); }
+        history_operation_hold(const history_operation_hold&) = delete;
+        history_operation_hold& operator=(const history_operation_hold&) = delete;
+    };
+
+    // Called only inside an owned write transaction. A missing row is the
+    // pre-protocol generation. Unknown/malformed metadata is never accepted.
+    std::string history_revision_in_transaction_() {
+        const auto rows = db_->query("SELECT value FROM main._lattice_meta WHERE key = ?",
+                                     {std::string(history_revision_key_)});
+        if (rows.empty()) return {};
+        if (rows.size() != 1) throw db_error("invalid history generation metadata");
+        const auto it = rows[0].find("value");
+        if (it == rows[0].end() || !std::holds_alternative<std::string>(it->second))
+            throw db_error("invalid history generation metadata");
+        const auto& value = std::get<std::string>(it->second);
+        if (value.size() != 36) throw db_error("invalid history generation metadata");
+        for (size_t i = 0; i < value.size(); ++i) {
+            const char c = value[i];
+            if (i == 8 || i == 13 || i == 18 || i == 23) {
+                if (c != '-') throw db_error("invalid history generation metadata");
+            } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                throw db_error("invalid history generation metadata");
+            }
+        }
+        return value;
+    }
+
+    std::string advance_history_revision_in_transaction_() {
+        // Validate an existing value before replacing it; corruption is not a reset.
+        (void)history_revision_in_transaction_();
+        const auto value = generate_global_id();
+        db_->execute("INSERT INTO main._lattice_meta(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     {std::string(history_revision_key_), value});
+        return value;
+    }
+
+    int64_t history_sync_flag_in_transaction_() {
+        const auto rows = db_->query("SELECT disabled FROM main._SyncControl WHERE id=1");
+        if (rows.size() != 1) throw db_error("history generation requires one sync control row");
+        const auto it = rows[0].find("disabled");
+        if (it == rows[0].end() || !std::holds_alternative<int64_t>(it->second))
+            throw db_error("history generation requires an integer sync control flag");
+        return std::get<int64_t>(it->second);
+    }
+
+    int64_t history_schema_in_transaction_() {
+        const auto rows = db_->query("PRAGMA main.schema_version");
+        if (rows.size() != 1 || !std::holds_alternative<int64_t>(rows[0].at("schema_version")))
+            throw db_error("history generation requires a schema generation");
+        return std::get<int64_t>(rows[0].at("schema_version"));
+    }
+
+    struct history_table_plan {
+        std::string name;
+        std::vector<std::unordered_map<std::string, column_value_t>> columns;
+        bool link = false;
+        bool rhs_type = false;
+        std::optional<int64_t> maximum;
+    };
+
+    // Each phase uses the already-qualified maintenance ownership/rollback
+    // scope. Nothing is held across all commits except a fail-fast operation
+    // admission bit. Revision comparison detects cooperative resets/prunes
+    // on other connections; old binaries and raw DELETEs do not participate.
+    int64_t generate_history_owned_(int64_t batch_size, bool mark_synthesized, bool force,
+                                  const std::function<void(bool)>& between_units_for_testing = {}) {
+        detail::require_recovery_local_producer_maintenance_absent(*db_);
+        history_operation_hold admission(*this);
+        if (batch_size <= 0) batch_size = 20000;
+        // sqlite3_changes is an int on every supported deployment, including
+        // older Apple OS versions without the changes64 entry point.
+        if (batch_size > static_cast<int64_t>(std::numeric_limits<int>::max()))
+            throw db_error("history generation batch size exceeds the supported count range");
+        std::vector<history_table_plan> plans;
+        std::string revision;
+        int64_t schema_version = 0;
+        int64_t total_entries = 0;
+        // A unique index is owned only by this invocation. Force's finite
+        // frontier needs no anti-join index, and no pre-existing index is dropped.
+        const std::string index_name = force ? std::string{} :
+            "_lattice_history_generation_" + generate_global_id();
+        bool index_created = false;
+        const auto cleanup = [&] {
+            if (!index_created) return;
+            with_audit_prune_transaction_([&]() -> int64_t {
+                db_->execute("DROP INDEX IF EXISTS main." + managed_quote_identifier(index_name));
+                return 0;
+            });
+            index_created = false;
+        };
+        try {
+            with_audit_prune_transaction_([&]() -> int64_t {
+                revision = history_revision_in_transaction_();
+                // Remote apply lazily creates this internal dedup table. Own
+                // that setup before capturing the schema cookie so a first
+                // ordinary apply between batches does not invalidate us.
+                // Existing receipts survive both force and standalone history.
+                db_->execute("CREATE TABLE IF NOT EXISTS main._lattice_applied_receipts ("
+                             "  globalId TEXT PRIMARY KEY)", {});
+                const auto tables = db_->query(
+                    "SELECT name FROM main.sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%' "
+                    "AND name NOT IN ('AuditLog', '_SyncControl', '_lattice_meta', '_lattice_sync_state', "
+                    "                 '_lattice_sync_set', '_lattice_replication_slots', '_lattice_applied_receipts') "
+                    "AND name NOT LIKE '\\_lattice\\_%' ESCAPE '\\' "
+                    "AND name NOT LIKE '%_vec0' AND name NOT LIKE '%_rtree%' "
+                    "AND name NOT LIKE '%\\_fts' ESCAPE '\\' "
+                    "AND name NOT LIKE '%\\_fts\\_%' ESCAPE '\\' "
+                    "AND name NOT LIKE '%\\_old' ESCAPE '\\'");
+                for (const auto& row : tables) {
+                    history_table_plan plan;
+                    plan.name = std::get<std::string>(row.at("name"));
+                    plan.columns = db_->query("PRAGMA main.table_info(" + managed_quote_identifier(plan.name) + ")");
+                    bool has_id = false, has_global = false, has_lhs = false, has_rhs = false;
+                    bool integer_primary_id = false, shadowed_rowid = false;
+                    int primary_columns = 0;
+                    for (const auto& col : plan.columns) {
+                        const auto& name = std::get<std::string>(col.at("name"));
+                        if (std::get<int64_t>(col.at("pk")) > 0) ++primary_columns;
+                        std::string folded = name;
+                        for (auto& c : folded) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                        if (folded == "rowid" || folded == "_rowid_" || folded == "oid") shadowed_rowid = true;
+                        if (name == "id") {
+                            has_id = true;
+                            integer_primary_id = std::get<std::string>(col.at("type")) == "INTEGER" &&
+                                                 std::get<int64_t>(col.at("pk")) == 1;
+                        } else if (name == "globalId") has_global = true;
+                        else if (name == "lhs") has_lhs = true;
+                        else if (name == "rhs") has_rhs = true;
+                        else if (name == "rhs_type") plan.rhs_type = true;
+                    }
+                    plan.link = has_lhs && has_rhs && has_global && !has_id;
+                    if (!plan.link && !(has_id && has_global)) continue;
+                    if (force) {
+                        bool separate_primary_index = false;
+                        for (const auto& index : db_->query("PRAGMA main.index_list(" + managed_quote_identifier(plan.name) + ")")) {
+                            const auto origin = index.find("origin");
+                            if (origin != index.end() && std::holds_alternative<std::string>(origin->second) &&
+                                std::get<std::string>(origin->second) == "pk") separate_primary_index = true;
+                        }
+                        // A sole INTEGER PRIMARY KEY alias has no separate PK
+                        // index. DESC/non-alias and WITHOUT ROWID shapes do.
+                        if (!plan.link && (!integer_primary_id || primary_columns != 1 || separate_primary_index))
+                            throw db_error("force history generation requires a sole integer rowid primary key");
+                        if (plan.link && shadowed_rowid)
+                            throw db_error("force history generation requires an unshadowed link rowid");
+                        const auto maximum = db_->query("SELECT MAX(" + std::string(plan.link ? "rowid" : "id") +
+                            ") AS k FROM main." + managed_quote_identifier(plan.name));
+                        const auto& key = maximum.at(0).at("k");
+                        if (const auto* value = std::get_if<int64_t>(&key)) plan.maximum = *value;
+                        else if (!std::holds_alternative<std::nullptr_t>(key))
+                            throw db_error("force history generation requires an integer row frontier");
+                    }
+                    plans.push_back(std::move(plan));
+                }
+                if (force) {
+                    const int64_t disabled = history_sync_flag_in_transaction_();
+                    db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
+                    db_->execute("DELETE FROM main.AuditLog");
+                    db_->execute("DELETE FROM main._lattice_sync_state");
+                    db_->execute("DELETE FROM main._lattice_sync_set");
+                    db_->execute("UPDATE main._lattice_replication_slots SET confirmed_audit_id=0,upload_floor=0");
+                    // AuditLog sqlite_sequence is deliberately retained.
+                    revision = advance_history_revision_in_transaction_();
+                    db_->execute("UPDATE main._SyncControl SET disabled=? WHERE id=1", {disabled});
+                } else {
+                    db_->execute("CREATE INDEX main." + managed_quote_identifier(index_name) +
+                                 " ON AuditLog(tableName,globalRowId)");
+                    index_created = true;
+                }
+                schema_version = history_schema_in_transaction_();
+                return 0;
+            });
+            // Private, per-invocation friend-test seam. Never installed on the
+            // owner or called under the owned transaction/store gate. Public
+            // entry points pass no callback; actual production hooks stay intact.
+            if (between_units_for_testing) between_units_for_testing(true);
+            const auto validate_generation = [&] {
+                if (history_revision_in_transaction_() != revision)
+                    throw db_error("history generation was invalidated by another reset or prune");
+                if (history_schema_in_transaction_() != schema_version)
+                    throw db_error("history generation schema changed between batches");
+            };
+            for (const auto& plan : plans) {
+                const auto& table_name = plan.name;
+                const auto& cols = plan.columns;
+                const bool is_link = plan.link;
+                const bool has_rhs_type = plan.rhs_type;
+                if (force && !plan.maximum) continue;
+                std::ostringstream json_cols;
+                std::ostringstream json_names;
+                std::string row_id_expr = "id";
+                std::string order_expr = "t.id";
+
+                if (is_link) {
+                    // Exactly the live link trigger's payload (create_link_table_triggers /
+                    // create_virtual_link_table_triggers) so a receiver applies a
+                    // regenerated link the same way it applies a live one.
+                    json_cols << "'lhs', lhs, 'rhs', rhs";
+                    json_names << "'lhs', 'rhs'";
+                    if (has_rhs_type) {
+                        json_cols << ", 'rhs_type', rhs_type";
+                        json_names << ", 'rhs_type'";
+                    }
+                    row_id_expr = "0";
+                    order_expr = "t.rowid";
+                } else {
+                    bool first = true;
+                    for (const auto& col : cols) {
+                        auto name_it = col.find("name");
+                        auto type_it = col.find("type");
+                        if (name_it == col.end() || !std::holds_alternative<std::string>(name_it->second))
+                            continue;
+
+                        std::string col_name = std::get<std::string>(name_it->second);
+                        // Skip id and globalId - they're handled separately
+                        if (col_name == "id" || col_name == "globalId")
+                            continue;
+
+                        std::string col_type;
+                        if (type_it != col.end() && std::holds_alternative<std::string>(type_it->second)) {
+                            col_type = std::get<std::string>(type_it->second);
+                        }
+
+                        if (!first) {
+                            json_cols << ", ";
+                            json_names << ", ";
+                        }
+                        first = false;
+
+                        // Wrap BLOB columns with hex() for JSON compatibility
+                        if (col_type == "BLOB") {
+                            json_cols << "'" << col_name << "', hex(" << col_name << ")";
+                        } else {
+                            json_cols << "'" << col_name << "', " << col_name;
+                        }
+                        json_names << "'" << col_name << "'";
+                    }
+                    if (first) continue;  // Preserve the existing no-payload table behavior
+                }
+
+
+                std::ostringstream base;
+                base << "INSERT INTO main.AuditLog (tableName,operation,rowId,globalRowId,"
+                     << "changedFields,changedFieldsNames,isSynchronized,timestamp,synthesized) "
+                     << "SELECT ?, 'INSERT', " << row_id_expr << ",globalId,json_object(" << json_cols.str()
+                     << "),json_array(" << json_names.str() << "),0,unixepoch('subsec'),"
+                     << (mark_synthesized ? 1 : 0) << " FROM main." << managed_quote_identifier(table_name) << " t ";
+                const std::string key = is_link ? "t.rowid" : "t.id";
+                std::optional<int64_t> previous;
+                for (;;) {
+                    bool exhausted = false;
+                    const int64_t inserted = with_audit_prune_transaction_([&]() -> int64_t {
+                        validate_generation();
+                        std::string where;
+                        std::vector<column_value_t> params{table_name};
+                        if (force) {
+                            std::string range = key + " <= ?";
+                            std::vector<column_value_t> bounds{*plan.maximum};
+                            if (previous) { range += " AND " + key + " > ?"; bounds.push_back(*previous); }
+                            bounds.push_back(batch_size);
+                            const auto frontier = db_->query("SELECT MAX(k) AS last_key,COUNT(*) AS selected FROM (SELECT " +
+                                key + " AS k FROM main." + managed_quote_identifier(table_name) + " t WHERE " + range +
+                                " ORDER BY " + key + " LIMIT ?)", bounds);
+                            const auto selected = std::get<int64_t>(frontier.at(0).at("selected"));
+                            if (selected == 0) { exhausted = true; return 0; }
+                            const auto upper = std::get<int64_t>(frontier.at(0).at("last_key"));
+                            where = "WHERE " + key + " <= ?";
+                            params.push_back(upper);
+                            if (previous) { where += " AND " + key + " > ?"; params.push_back(*previous); }
+                            previous = upper;
+                            exhausted = selected < batch_size;
+                        } else {
+                            where = "WHERE NOT EXISTS (SELECT 1 FROM main.AuditLog a WHERE a.tableName=? AND a.globalRowId=t.globalId)";
+                            params.push_back(table_name);
+                        }
+                        where += " ORDER BY " + order_expr + " LIMIT ?";
+                        params.push_back(batch_size);
+                        const auto disabled = history_sync_flag_in_transaction_();
+                        db_->execute("UPDATE main._SyncControl SET disabled=1 WHERE id=1");
+                        db_->execute(base.str() + where, params);
+                        const auto count = static_cast<int64_t>(sqlite3_changes(db_->internal_handle()));
+                        if (count > std::numeric_limits<int64_t>::max() - total_entries)
+                            throw db_error("history generation count overflow");
+                        db_->execute("UPDATE main._SyncControl SET disabled=? WHERE id=1", {disabled});
+                        return count;
+                    });
+                    total_entries += inserted;
+                    if (between_units_for_testing) between_units_for_testing(false);
+                    if (force ? exhausted : inserted < batch_size) break;
+                }
+            }
+            with_audit_prune_transaction_([&]() -> int64_t { validate_generation(); return 0; });
+            cleanup();
+            return total_entries;
+        } catch (...) {
+            const auto original = std::current_exception();
+            try { cleanup(); }
+            catch (...) { LOG_ERROR("lattice_db", "history generation index cleanup failed; original error retained"); }
+            std::rethrow_exception(original);
+        }
+    }
+
+public:
+
+    // SQL builder for query_rows — extracted (results spec Commit 4) so the
+    // bridge's generation-scoped reads (objects_at/query_ids_at) route the
+    // SAME statement text through query_at_generation instead of read_db().
+    // `select_list` is "*" for row queries and "id" for id-vector captures.
+    // Pure string construction: no connection, never throws (beyond OOM).
+    static std::string build_query_rows_sql(
+        const std::string& table_name,
+        const std::optional<std::string>& where_clause = std::nullopt,
+        const std::optional<std::string>& order_by = std::nullopt,
+        std::optional<int64_t> limit = std::nullopt,
+        std::optional<int64_t> offset = std::nullopt,
+        const std::optional<std::string>& group_by = std::nullopt,
+        const std::optional<std::string>& distinct_by = std::nullopt,
+        const std::string& select_list = "*") {
+
+        std::ostringstream sql;
+
+        bool has_distinct = distinct_by && !distinct_by->empty();
+        bool has_group = group_by && !group_by->empty();
+
+        if (has_distinct && has_group) {
+            // Dedup via inner GROUP BY, then apply outer GROUP BY
+            sql << "SELECT " << select_list << " FROM (SELECT * FROM " << table_name;
+            if (where_clause && !where_clause->empty()) {
+                sql << " WHERE " << *where_clause;
+            }
+            sql << " GROUP BY " << *distinct_by << ")";
+            sql << " GROUP BY " << *group_by;
+        } else {
+            sql << "SELECT " << select_list << " FROM " << table_name;
+            if (where_clause && !where_clause->empty()) {
+                sql << " WHERE " << *where_clause;
+            }
+            if (has_distinct) {
+                sql << " GROUP BY " << *distinct_by;
+            } else if (has_group) {
+                sql << " GROUP BY " << *group_by;
+            }
+        }
+
+        if (order_by && !order_by->empty()) {
+            sql << " ORDER BY " << *order_by;
+        }
+        if (limit) {
+            sql << " LIMIT " << *limit;
+        }
+        if (offset) {
+            sql << " OFFSET " << *offset;
+        }
+        return sql.str();
+    }
+
+    // Query objects from a table with optional filtering, sorting, and pagination
+    // Returns raw row data - caller is responsible for hydrating into managed objects
+    /// `params` bind the `?` placeholders in `where_clause`, positionally.
+    /// Empty (the default) is the all-literal predicate every pre-existing
+    /// caller passes, so their statement text and behavior are unchanged.
+    std::vector<std::unordered_map<std::string, column_value_t>> query_rows(
+        const std::string& table_name,
+        std::optional<std::string> where_clause = std::nullopt,
+        std::optional<std::string> order_by = std::nullopt,
+        std::optional<int64_t> limit = std::nullopt,
+        std::optional<int64_t> offset = std::nullopt,
+        std::optional<std::string> group_by = std::nullopt,
+        std::optional<std::string> distinct_by = std::nullopt,
+        const std::vector<column_value_t>& params = {}) {
+        return query_read(build_query_rows_sql(
+            table_name, where_clause, order_by, limit, offset, group_by, distinct_by), params);
+    }
+
+    // Query objects from a table with optional filtering, sorting, and pagination
+    // Returns raw row data - caller is responsible for hydrating into managed objects
+    std::vector<std::unordered_map<std::string, column_value_t>> query_union_rows(
+        const std::vector<std::string>& table_names,
+        std::optional<std::string> where_clause = std::nullopt,
+        std::optional<std::string> order_by = std::nullopt,
+        std::optional<int64_t> limit = std::nullopt,
+        std::optional<int64_t> offset = std::nullopt,
+        const std::vector<column_value_t>& params = {}) {
+
+        if (table_names.empty()) {
+            return {};
+        }
+
+        // Get columns for each table using PRAGMA table_info (name -> type)
+        std::vector<std::map<std::string, std::string>> table_columns;
+        for (const auto& table_name : table_names) {
+            auto pragma_result = query_read("PRAGMA table_info(" + table_name + ")");
+            std::map<std::string, std::string> cols;
+            for (const auto& row : pragma_result) {
+                auto name_it = row.find("name");
+                auto type_it = row.find("type");
+                if (name_it != row.end() && type_it != row.end()) {
+                    auto col_name = std::get<std::string>(name_it->second);
+                    auto col_type = std::get<std::string>(type_it->second);
+                    cols[col_name] = col_type;
+                }
+            }
+            table_columns.push_back(std::move(cols));
+        }
+
+        // Routing metadata belongs to each physical arm, not to the shared
+        // model schema. An attached-only model's passthrough view has these
+        // columns even when a different, main-only model does not. ATTACH
+        // rejects either reserved name in physical model columns beforehand.
+        std::vector<bool> routed_arms;
+        bool has_routed_arm = false;
+        for (const auto& columns : table_columns) {
+            const bool routed = columns.count("_source") != 0 &&
+                                columns.count("_lattice_attach_token") != 0;
+            routed_arms.push_back(routed);
+            has_routed_arm = has_routed_arm || routed;
+        }
+
+        // Find shared columns (intersection where name AND type match)
+        std::vector<std::string> shared_columns;
+        if (!table_columns.empty()) {
+            for (const auto& [name, type] : table_columns[0]) {
+                if (has_routed_arm &&
+                    (name == "_source" || name == "_lattice_attach_token")) continue;
+                bool shared = true;
+                for (size_t i = 1; i < table_columns.size(); i++) {
+                    auto it = table_columns[i].find(name);
+                    if (it == table_columns[i].end() || it->second != type) {
+                        shared = false;
+                        break;
+                    }
+                }
+                if (shared) {
+                    shared_columns.push_back(name);
+                }
+            }
+        }
+
+        // Inner limit must be offset + limit to ensure we fetch enough rows
+        // from each table before the outer query applies the final offset
+        std::optional<int64_t> inner_limit = std::nullopt;
+        if (limit) {
+            inner_limit = *limit + offset.value_or(0);
+        }
+
+        std::ostringstream sql;
+        sql << "SELECT * FROM ( ";
+        for (size_t i = 0; i < table_names.size(); i++) {
+            const auto& table_name = table_names[i];
+
+            sql << "SELECT * FROM (";
+            sql << "SELECT '" << table_name << "' AS _type";
+
+            // Select only shared columns
+            for (const auto& col : shared_columns) {
+                sql << ", \"" << col << "\"";
+            }
+
+            if (has_routed_arm) {
+                if (routed_arms[i]) {
+                    // Qualify metadata references: if the view disappears
+                    // between metadata inspection and execution, SQLite must
+                    // fail the query instead of treating a quoted missing
+                    // column as a string literal.
+                    const auto relation = managed_quote_identifier(table_name);
+                    sql << ", " << relation << ".\"_source\" AS \"_source\""
+                        << ", " << relation << ".\"_lattice_attach_token\" AS \"_lattice_attach_token\"";
+                } else {
+                    sql << ", 'main' AS \"_source\", 0 AS \"_lattice_attach_token\"";
+                }
+            }
+
+            // Pin a registered main-model arm even if ATTACH installs a
+            // same-named TEMP view after the PRAGMA above. Routed arms retain
+            // their logical view and carry its actual per-row source/token.
+            // This preserves physical identity, not an atomic topology snapshot.
+            sql << " FROM " << (routed_arms[i] ? managed_quote_identifier(table_name)
+                                             : managed_table_sql(table_name));
+            if (where_clause && !where_clause->empty()) {
+                sql << " WHERE " << *where_clause;
+            }
+            if (order_by && !order_by->empty()) {
+                sql << " ORDER BY " << *order_by;
+            }
+            if (inner_limit) {
+                sql << " LIMIT " << *inner_limit;
+            }
+            sql << " ) ";
+            if (i != table_names.size() - 1) {
+                sql << " UNION ALL ";
+            }
+        }
+        sql << ")";
+        if (order_by && !order_by->empty()) {
+            sql << " ORDER BY " << *order_by;
+        }
+        if (limit) {
+            sql << " LIMIT " << *limit;
+        }
+        if (offset) {
+            sql << " OFFSET " << *offset;
+        }
+        // The predicate is emitted ONCE PER UNIONED TABLE above, so its
+        // bindings repeat once per table, in the same order. Passing `params`
+        // unreplicated would bind only the first arm and leave the rest
+        // unbound (SQLite treats unbound parameters as NULL — every later arm
+        // would silently return no rows).
+        std::vector<column_value_t> repeated;
+        if (!params.empty()) {
+            repeated.reserve(params.size() * table_names.size());
+            for (size_t i = 0; i < table_names.size(); i++) {
+                repeated.insert(repeated.end(), params.begin(), params.end());
+            }
+        }
+        return query_read(sql.str(), repeated);
+    }
+
+#if defined(LATTICE_SYNC_COMMIT_PROBE)
+    // Test-only; no new owner, raw-handle escape, statement, transaction or
+    // lifetime policy. Caller retains and serially owns this instance until
+    // finish on the same native thread, with no close/reopen in between.
+    // Arm LAST in a successful one-insert checked transaction body: the next
+    // backend operation must be its COMMIT. Same-thread raw SQL/reentrancy
+    // between arm and COMMIT is outside the fixture contract.
+    int32_t sync_commit_probe_arm(uint64_t operation, uint64_t attempt) noexcept {
+        if (!operation || !attempt) return 1;
+        if (sync_commit_probe_detail::snapshot().status != 2) return 2;
+        if (closed_.load(std::memory_order_acquire) || !db_ ||
+            db_->is_closed() || config_.is_in_memory()) return 3;
+        auto* connection = db_->internal_handle();
+        if (!connection ||
+            txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
+            sqlite3_get_autocommit(connection) ||
+            sqlite3_txn_state(connection, "main") != SQLITE_TXN_WRITE) return 4;
+        return sync_commit_probe_detail::arm(this, connection, operation, attempt);
+    }
+    sync_commit_probe_receipt sync_commit_probe_finish(uint64_t operation,
+                                                       uint64_t attempt) noexcept {
+        // Deliberately no db access: errors/rollback may already have closed
+        // the transaction. A matching finish must clear even an unconsumed arm.
+        return sync_commit_probe_detail::finish(this, operation, attempt);
+    }
+#endif
+
+    // Transaction support. On shared-cache stores the per-store write gate
+    // (results spec §4.1) is held for the duration of the transaction, so
+    // generation captures on sibling handles never interleave a
+    // cross-connection write transaction (SQLITE_LOCKED in both directions).
+    // File and isolated-:memory: stores: the gate calls are no-ops.
+    void begin_transaction() {
+        require_catalog_callback_absent();
+        acquire_store_write_gate();
+        try {
+            db_->begin_transaction_owned_(txn_owner_thread_);
+        } catch (...) {
+            release_store_write_gate();
+            throw;
+        }
+        // The successful physical BEGIN published this existing stamp before
+        // releasing its SQLite mutex. Other threads can defer without ever
+        // borrowing this transaction or seeing an unpublished Core WRITE.
+    }
+    void commit() {
+        require_catalog_callback_absent();
+        try {
+            db_->end_transaction_owned_(false, txn_owner_thread_);
+        } catch (...) {
+            // COMMIT can fail with the transaction still open (BUSY) — keep
+            // the gate; the caller retries or rolls back. If the txn is
+            // already gone (auto-rollback), release now.
+            if (!db_->is_in_transaction()) {
+                release_store_write_gate();
+            }
+            throw;
+        }
+        release_store_write_gate();
+    }
+    void rollback() {
+        require_catalog_callback_absent();
+        try {
+            db_->end_transaction_owned_(true, txn_owner_thread_);
+        } catch (...) {
+            if (!db_->is_in_transaction()) {
+                release_store_write_gate();
+            }
+            throw;
+        }
+        release_store_write_gate();
+    }
+
+    template<typename F>
+    void write(F&& block) {
+        begin_transaction();
+        try {
+            block();
+            commit();
+        } catch (...) {
+            rollback();
+            throw;
+        }
+    }
+
+    /// Attach another lattice's database under an alias derived from its
+    /// filename, exposing overlapping tables as UNION views and
+    /// attached-only tables as passthrough views. Idempotent: attaching the
+    /// same database again is a no-op; the same alias for a DIFFERENT path
+    /// throws. Schema overlap is validated BEFORE any side effect — a
+    /// mismatch throws with no dangling ATTACH and no half-created views.
+    /// Live scalar fields retain this typed attachment generation. Detach and
+    /// reattach never revive old fields, even for the same physical file.
+    /// Raw SQL topology changes do not participate in this lifetime contract.
+    /// SQLite callbacks must catch native exceptions; typed topology changes
+    /// and vector writes from an active attached scalar callback are rejected.
+    /// Serialized against detach() by an internal mutex.
+    void attach(lattice_db& lattice);
+
+    /// Remove an attached lattice: drops the views that referenced it,
+    /// DETACHes on every handle (bounded retry while an in-flight statement
+    /// on another thread briefly locks the schema), and regenerates the
+    /// remaining aliases' views — main-table visibility is restored once
+    /// the last alias is gone. Idempotent: detaching something not attached
+    /// is a no-op.
+    void detach(lattice_db& lattice);
+    void detach_alias(const std::string& alias);
+
+    /// Current topology only; no SQL. Callers can conservatively disable
+    /// identity-only optimizations when row ids span physical stores.
+    bool has_attached_stores() const {
+        std::lock_guard<std::mutex> lock(attach_mutex_);
+        return !attached_dbs_.empty();
+    }
+
+    /// Legacy raw connection access. The caller must keep this lattice alive
+    /// and serialize the reference against close/reopen/maintenance. These raw
+    /// signatures remain source-compatible; they are not owned reader leases.
+    database& db() { detail::ordinary_require_creator(config_.ordinary_context);require_catalog_callback_absent();return *db_; }
+    database& read_db() { detail::ordinary_require_creator(config_.ordinary_context);return *borrow_read_connection(); }
+    database& xproc_read_db() { detail::ordinary_require_creator(config_.ordinary_context);return *borrow_xproc_read_connection(); }
+
+    /// Owned internal read access. Keep this lattice alive through the entire
+    /// borrow, including its release: writer hooks refer back to the lattice.
+    /// Borrowed connections are for read-only use: no DML or write-capable
+    /// UDFs, especially on a retired writer fallback. Writer hooks target the
+    /// lattice's current writer.
+    /// Readers may finish on a retired connection, so retirement does not
+    /// promise an exclusive checkpoint/VACUUM gap or erase SQLite busy results.
+    /// Only the explicit-transaction owning thread reads through the writer;
+    /// xproc prefers its dedicated connection even on that thread.
+    // Denial-only callback guard; it does not create a read/write origin.
+    void require_catalog_callback_absent() const;
+    std::shared_ptr<database> borrow_read_connection();
+    std::shared_ptr<database> borrow_xproc_read_connection();
+    std::vector<database::row_t> query_read(
+        const std::string& sql, const std::vector<column_value_t>& params = {});
+    std::vector<database::row_t> query_xproc(
+        const std::string& sql, const std::vector<column_value_t>& params = {});
+
+    /// Retire published readers without waiting for borrowers. Last-owner
+    /// destruction occurs off locks acquired here; callers must not retain
+    /// external SQLite/attachment locks across final-owner destruction. Existing
+    /// leases retain their connection until the complete query/callback tail.
+    void close_read_db();
+    /// Raw writer users still require exclusive maintenance serialization.
+    /// Broad projection admission is paused/drained before writer retirement;
+    /// successful reopen restores topology/pressure before admission resumes.
+    /// Do not retain an external SQLite/attachment lock across retirement:
+    /// final connection destruction can invoke application-owned destructors.
+    void close_write_db();
+    void reopen_write_db();
+
+    /// Explicitly close all database connections and stop background services.
+    /// The parent must outlive in-flight operations and owned reader borrows.
+    /// SQLite's logical close guard short-circuits later operations; an already
+    /// running operation may finish. This does not grant raw getter safety.
+    void close();
+    lattice_close_result close_checked() noexcept;
+
+    /// Publish a fully opened reader pair with current attached views, or leave
+    /// the prior published state intact. A newer close/reopen invalidates a
+    /// staged open instead of allowing it to undo that lifecycle transition.
+    /// Contended attachment bookkeeping is refused, never waited on behind a
+    /// potentially held writer SQLite mutex. No published half-pair on error.
+    void reopen_read_db();
+
+    // ------------------------------------------------------------------
+    // In-memory-only registration helpers. These populate the same
+    // registries the ensure_* functions maintain, with no SQL writes —
+    // used by the write-free fast path when the schema fingerprint proves
+    // the backing tables already exist.
+    // ------------------------------------------------------------------
+    void note_link_table(const std::string& link_table_name,
+                         const std::string& rhs_target_table) {
+        // Record by rhs target if known, otherwise into the defensive bucket.
+        // Both buckets accept idempotent re-insert (set semantics).
+        if (!rhs_target_table.empty()) {
+            link_tables_by_rhs_target_[rhs_target_table].insert(link_table_name);
+            // Drop any stale "unknown target" entry from a prior bare call.
+            link_tables_unknown_target_.erase(link_table_name);
+        } else if (!is_known_link_table(link_table_name)) {
+            link_tables_unknown_target_.insert(link_table_name);
+        }
+    }
+
+    void note_virtual_link_table(const std::string& link_table_name) {
+        virtual_link_tables_.insert(link_table_name);
+    }
+
+    void note_geo_list_table(const std::string& model_table,
+                             const std::string& list_table) {
+        // Cascade walker side index: parent-row deletes need to clean these
+        // by `parent_id = ?` (no `rhs` column on geo_bounds list tables).
+        auto& parent_lists = list_tables_by_parent_[model_table];
+        if (std::find(parent_lists.begin(), parent_lists.end(), list_table) ==
+            parent_lists.end()) {
+            parent_lists.push_back(list_table);
+        }
+    }
+
+    // Create a link table on demand (public for managed<T*> access)
+    void ensure_link_table(const std::string& link_table_name,
+                           const std::string& parent_table = "",
+                           const std::string& rhs_target_table = "") {
+        // Register as internal table — AuditLog entries won't be surfaced to observers.
+        // Changes are translated into UPDATE notifications on the parent table.
+        register_internal_table(link_table_name, parent_table);
+        note_link_table(link_table_name, rhs_target_table);
+
+        if (!db_->table_exists(link_table_name)) {
+            // Create link table with globalId for sync and PRIMARY KEY to prevent duplicates
+            // Matches Lattice.swift's createLinkTable()
+            db_->execute(detail::ordinary_schema_recipe::link_table(link_table_name));
+        }
+
+        // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
+        create_link_table_triggers(link_table_name);
+    }
+
+    // Create a virtual link table on demand (for VirtualList - polymorphic collections)
+    void ensure_virtual_link_table(const std::string& link_table_name, const std::string& parent_table = "") {
+        register_internal_table(link_table_name, parent_table);
+        note_virtual_link_table(link_table_name);
+
+        if (!db_->table_exists(link_table_name)) {
+            // Virtual link table adds rhs_type column for type discrimination
+            db_->execute(detail::ordinary_schema_recipe::virtual_link_table(link_table_name));
+        }
+
+        // Always ensure audit triggers exist (CREATE TRIGGER IF NOT EXISTS is safe)
+        create_virtual_link_table_triggers(link_table_name);
+    }
+
+    // Create a union table on demand. Union tables are internal tables that store
+    // one row per union field instance. The parent model stores the union row's
+    // globalId as a TEXT column.
+    void ensure_union_table(const std::string& union_table_name,
+                            const union_descriptor& desc,
+                            const std::string& parent_table,
+                            const std::string& property_name) {
+        register_union_internal_table(union_table_name, parent_table, property_name);
+
+        // Check if table exists and needs migration (new cases added)
+        std::vector<std::string> old_col_names;
+        if (db_->table_exists(union_table_name)) {
+            auto existing_cols = db_->get_table_info(union_table_name);
+            bool needs_rebuild = false;
+            for (const auto& c : desc.cases) {
+                if (c.values.empty()) continue;
+                if (c.values.size() == 1 && c.values[0].param_name.empty()) {
+                    if (existing_cols.find(c.case_name) == existing_cols.end())
+                        needs_rebuild = true;
+                } else {
+                    for (const auto& v : c.values) {
+                        if (existing_cols.find(c.case_name + "__" + v.param_name) == existing_cols.end())
+                            needs_rebuild = true;
+                    }
+                }
+                if (needs_rebuild) break;
+            }
+            if (!needs_rebuild) return;
+
+            // Collect old column names for data copy
+            for (const auto& [col, _] : existing_cols) old_col_names.push_back(col);
+
+            // Drop old triggers + rename
+            drop_model_table_triggers(union_table_name);
+            db_->execute("DROP INDEX IF EXISTS idx_" + union_table_name + "_case");
+            db_->execute("ALTER TABLE " + union_table_name + " RENAME TO " + union_table_name + "_old");
+        }
+
+        auto generated=detail::ordinary_schema_recipe::union_table(union_table_name,desc);
+        const auto& columns=generated.columns;
+        db_->execute(generated.sql);
+
+        // If rebuilding, copy old data and drop the old table
+        if (!old_col_names.empty()) {
+            // Build column list common to both old and new tables
+            std::string common_cols = "id, globalId, \"case\"";
+            for (const auto& col : old_col_names) {
+                if (col == "id" || col == "globalId" || col == "case") continue;
+                common_cols += ", " + col;
+            }
+            db_->execute("INSERT INTO " + union_table_name + " (" + common_cols + ") "
+                        "SELECT " + common_cols + " FROM " + union_table_name + "_old");
+            db_->execute("DROP TABLE " + union_table_name + "_old");
+        }
+
+        db_->execute("CREATE INDEX IF NOT EXISTS idx_" + union_table_name +
+                     "_case ON " + union_table_name + "(\"case\")");
+        create_model_table_triggers(union_table_name, columns);
+    }
+
+    // Register a union table as internal, supporting multiple parents.
+    // Format: "Feed:item" or "Feed:item;Post:featured" for multi-parent.
+    void register_union_internal_table(const std::string& table_name,
+                                       const std::string& parent_table,
+                                       const std::string& property_name) {
+        std::string new_entry = parent_table + ":" + property_name;
+        auto rows = db_->query(
+            "SELECT value FROM _lattice_meta WHERE key = ?",
+            {"internal_table:" + table_name});
+
+        if (rows.empty()) {
+            db_->execute(
+                "INSERT INTO _lattice_meta(key, value) VALUES(?, ?)",
+                {"internal_table:" + table_name, new_entry});
+        } else {
+            auto existing = std::get<std::string>(rows[0].at("value"));
+            if (existing.find(new_entry) == std::string::npos) {
+                db_->execute(
+                    "UPDATE _lattice_meta SET value = ? WHERE key = ?",
+                    {existing + ";" + new_entry, "internal_table:" + table_name});
+            }
+        }
+    }
+
+    // Cascade-delete owned union rows when the parent is deleted.
+    void create_union_cascade_trigger(const std::string& parent_table,
+                                      const std::string& field_name,
+                                      const std::string& union_table_name) {
+        db_->execute(detail::ordinary_schema_recipe::union_cascade(parent_table,field_name,union_table_name));
+    }
+
+    /// Get column types for a table (for sync schema lookup)
+    /// Returns map of column_name -> column_type
+    std::unordered_map<std::string, column_type> get_table_schema(const std::string& table_name) {
+        auto info = db_->get_table_info(table_name);
+        std::unordered_map<std::string, column_type> schema;
+        for (const auto& [col, sql_type] : info) {
+            if (sql_type == "INTEGER") {
+                schema[col] = column_type::integer;
+            } else if (sql_type == "REAL") {
+                schema[col] = column_type::real;
+            } else if (sql_type == "BLOB") {
+                schema[col] = column_type::blob;
+            } else {
+                schema[col] = column_type::text;
+            }
+        }
+        return schema;
+    }
+
+    // ========================================================================
+    // Vector Search API (sqlite-vec integration)
+    // ========================================================================
+
+    /// Distance metric for vector search
+    enum class distance_metric {
+        l2,      // Euclidean distance (default)
+        cosine,  // Cosine distance
+        l1       // Manhattan distance
+    };
+
+    /// Result from a KNN query: globalId + distance
+    struct knn_result {
+        std::string global_id;
+        double distance;
+    };
+
+private:
+    friend struct vec0_maintenance_test_access;
+    // Install/clear only with all participating threads joined. The private
+    // friend harness uses these phases for deterministic admission barriers.
+    std::function<void(const char*, const char*)>& test_hook_vec0_maintenance_ = process_resources_.get().test_hook_vec0_maintenance_;
+
+    struct vec0_maintenance_frame {
+        sqlite3* connection;
+        vec0_maintenance_frame* previous;
+        explicit vec0_maintenance_frame(sqlite3* handle)
+            : connection(handle), previous(active_vec0_maintenance_) {
+            active_vec0_maintenance_ = this;
+        }
+        ~vec0_maintenance_frame() { active_vec0_maintenance_ = previous; }
+    };
+    static inline thread_local vec0_maintenance_frame* active_vec0_maintenance_ = nullptr;
+
+    // Shared-cache memory reuses its existing store write gate. Isolated
+    // memory and DELETE-journal WASM need only this per-instance gate.
+    std::recursive_timed_mutex& vec0_memory_maintenance_gate_ = process_resources_.get().vec0_memory_maintenance_gate_;
+
+    struct vec0_sqlite_hold {
+        sqlite3_mutex* mutex;
+        explicit vec0_sqlite_hold(sqlite3* connection)
+            : mutex(sqlite3_db_mutex(connection)) {
+            if (!mutex) throw db_error("vec0 maintenance requires a SQLite mutex");
+            sqlite3_mutex_enter(mutex);
+        }
+        ~vec0_sqlite_hold() noexcept { sqlite3_mutex_leave(mutex); }
+        vec0_sqlite_hold(const vec0_sqlite_hold&) = delete;
+        vec0_sqlite_hold& operator=(const vec0_sqlite_hold&) = delete;
+    };
+
+    template<typename F>
+    std::invoke_result_t<F> with_vec0_serialization(const char* operation,
+                                                   bool allow_internal_nesting,
+                                                   F&& body, database* captured_writer = nullptr) {
+        auto* writer = captured_writer ? captured_writer : db_.get();
+        // Offer the turn before any store/SQLite hold. Nested wrapper calls
+        // inside the actual vec0 body must not wait while owning those locks.
+        database::sql_entry_scope entry(*writer);
+        auto* connection = writer->internal_handle();
+        if (!allow_internal_nesting) {
+            for (auto* active = active_vec0_maintenance_; active; active = active->previous) {
+                if (active->connection == connection) {
+                    throw db_error("reentrant vec0 maintenance on the same connection");
+                }
+            }
+        }
+        notify_vec0_maintenance_test_hook(operation, "attempt");
+        auto run = [&]() -> std::invoke_result_t<F> {
+            vec0_maintenance_frame active(connection);
+            notify_vec0_maintenance_test_hook(operation, "acquired");
+            return std::forward<F>(body)();
+        };
+#ifdef __EMSCRIPTEN__
+        // DELETE journal uses post-statement delivery even for file paths.
+        constexpr bool post_statement_delivery = true;
+#else
+        const bool post_statement_delivery = config_.is_in_memory();
+#endif
+        if (post_statement_delivery) {
+            // Never hold SQLite across a memory settled callback. Reuse the
+            // shared store gate rather than introducing a second lock order.
+            auto& gate = store_write_gate_ ? *store_write_gate_ : vec0_memory_maintenance_gate_;
+            std::lock_guard<std::recursive_timed_mutex> hold(gate);
+            return run();
+        }
+        // File WAL callbacks already run on SQLite's writer thread. Holding
+        // this same recursive mutex creates no maintenance->SQLite inversion.
+        vec0_sqlite_hold hold(connection);
+        return run();
+    }
+
+protected:
+    // The Swift bridge's complete reconcile operation shares the same
+    // storage-appropriate scope with core vacuum. No startup-future wait.
+    template<typename F>
+    std::invoke_result_t<F> with_vec0_maintenance(const char* operation, F&& body) {
+        return with_vec0_serialization(operation, false, std::forward<F>(body));
+    }
+
+    void notify_vec0_maintenance_test_hook(const char* operation, const char* phase) {
+        if (test_hook_vec0_maintenance_) test_hook_vec0_maintenance_(operation, phase);
+    }
+
+public:
+    /// Ensure a vec0 virtual table exists for a vector column.
+    /// Table name format: _{ModelTable}_{column}_vec
+    /// Dimensions are inferred from first insert; 0 only upgrades an existing sidecar.
+    /// Also creates triggers to keep vec0 in sync with main table.
+    /// When ivf_nlist > 0, creates the table with IVF indexing.
+    void ensure_vec0_table(const std::string& model_table,
+                           const std::string& column_name,
+                           int dimensions,
+                           int ivf_nlist = 0, int ivf_nprobe = 0) {
+        ensure_vec0_table_on(*db_, model_table, column_name, dimensions, ivf_nlist, ivf_nprobe);
+    }
+
+private:
+    friend struct managed<std::vector<uint8_t>>;
+    // Attached scalar admission pins this exact writer through sidecar SQL.
+    // Keep the existing serialization, maintenance frame and test hook phases;
+    // Preserve captured identity across writer maintenance; the route admission
+    // also excludes owner publication until SQL and deferred delivery complete.
+    void ensure_vec0_table_on(database& writer, const std::string& model_table,
+                             const std::string& column_name, int dimensions,
+                             int ivf_nlist = 0, int ivf_nprobe = 0) {
+        with_vec0_serialization("ensure", true, [&] {
+            // Strip schema prefix (e.g. "main.Memory" → "Memory") — vec0 tables
+            // are always in the default schema, but hydrated objects from attached
+            // databases carry schema-qualified table names.
+            auto dot = model_table.find('.');
+            const std::string& bare_table = (dot != std::string::npos)
+                ? model_table.substr(dot + 1) : model_table;
+            const auto generated = detail::vec0_program(bare_table, column_name);
+            const auto& vec_table = generated.table;
+            const auto& programs = generated.sql;
+            const auto& names = generated.names;
+            auto stored_sql = [](std::string sql) {
+                // SQLite removes IF NOT EXISTS from sqlite_schema.sql.
+                const std::string prefix = "CREATE TRIGGER IF NOT EXISTS ";
+                if (sql.compare(0, prefix.size(), prefix) == 0) sql.replace(0, prefix.size(), "CREATE TRIGGER ");
+                return sql;
+            };
+            size_t maximum_sql = 0;
+            for (const auto& sql : programs) maximum_sql = std::max(maximum_sql, sql.size());
+            if (maximum_sql > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+                throw db_error("vec0 generated trigger SQL is too large");
+            auto exists = [&] {
+                return !writer.query("SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?", {vec_table}).empty();
+            };
+            auto inspect = [&] {
+                // Inspect only reserved generated names, and bound stored SQL
+                // before the generic query copies it. An unrelated user trigger
+                // is preserved; a conflicting reserved definition is refused.
+                auto rows = writer.query(
+                    "SELECT name,CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB))<=? "
+                    "THEN sql END AS sql FROM main.sqlite_schema WHERE type='trigger' "
+                    "AND name IN (?,?,?,?) LIMIT 5",
+                    {static_cast<int64_t>(maximum_sql), names[0], names[1], names[2], names[3]});
+                std::set<std::string> found;
+                for (const auto& row : rows) {
+                    const auto* name = std::get_if<std::string>(&row.at("name"));
+                    const auto* sql = std::get_if<std::string>(&row.at("sql"));
+                    if (!name || !sql) throw db_error("vec0 reserved trigger definition is invalid or oversized");
+                    const auto it = std::find(names.begin(), names.end(), *name);
+                    if (it == names.end() || *sql != stored_sql(programs[static_cast<size_t>(it - names.begin())]) ||
+                        !found.insert(*name).second)
+                        throw db_error("vec0 reserved trigger definition is not a supported generated program");
+                }
+                return found;
+            };
+            const bool present = exists();
+            const auto initial_programs = inspect();
+            // Zero dimensions is existing-sidecar-only admission. In particular
+            // an empty managed value cannot invent a dimension or a vec0 table.
+            if (!present && dimensions == 0) return;
+            if (!present && dimensions < 0) throw db_error("vec0 dimensions must be positive for creation");
+            if (initial_programs.size() == programs.size() && present) return;
+
+            // Recheck under a savepoint so an unknown reserved definition or
+            // failed DDL cannot leave a partial metadata upgrade. This nests
+            // inside normal schema setup or an already owned write transaction.
+            writer.execute("SAVEPOINT lattice_vec0_trigger_upgrade");
+            try {
+                const auto found = inspect();
+                if (!exists()) {
+                    if (dimensions <= 0) throw db_error("vec0 sidecar disappeared during trigger admission");
+                    writer.execute(detail::vec0_create_table_program(
+                        vec_table, dimensions, ivf_nlist, ivf_nprobe));
+                }
+                for (size_t i = 0; i < programs.size(); ++i)
+                    if (!found.count(names[i])) writer.execute(programs[i]);
+                if (inspect().size() != programs.size()) throw db_error("vec0 generated trigger installation incomplete");
+                writer.execute("RELEASE lattice_vec0_trigger_upgrade");
+            } catch (...) {
+                const auto primary = std::current_exception();
+                try {
+                    writer.execute("ROLLBACK TO lattice_vec0_trigger_upgrade");
+                    writer.execute("RELEASE lattice_vec0_trigger_upgrade");
+                } catch (...) {
+                    // Do not expose a writer whose partial DDL could not unwind.
+                    writer.closed_.store(true, std::memory_order_release);
+                    try { std::rethrow_exception(primary); }
+                    catch (...) { std::throw_with_nested(db_error("vec0 trigger upgrade rollback failed; writer closed")); }
+                }
+                std::rethrow_exception(primary);
+            }
+        }, &writer);
+    }
+
+public:
+    /// Ensure an R*Tree virtual table exists for a geo_bounds column.
+    /// Table name format: _{ModelTable}_{column}_rtree
+    /// Also creates triggers to keep R*Tree in sync with main table.
+    void ensure_rtree_table(const std::string& model_table,
+                            const std::string& column_name) {
+        std::string rtree_table = "_" + model_table + "_" + column_name + "_rtree";
+
+        // Check if table already exists
+        std::string check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
+        auto results = db_->query(check_sql, {rtree_table});
+        bool table_exists = !results.empty();
+        if (table_exists) {
+            // Table exists — verify sync triggers are intact (rebuild_table can drop them)
+            auto trig = db_->query(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='"
+                + rtree_table + "_insert' LIMIT 1");
+            if (!trig.empty()) return;
+            // Fall through to recreate triggers only
+        }
+
+        // Create R*Tree virtual table (if it doesn't exist)
+        // Uses row id for joining back to main table
+        if (!table_exists) {
+            db_->execute(detail::ordinary_schema_recipe::rtree_table(rtree_table));
+        }
+
+        // Column names in main table
+        std::string minLat = column_name + "_minLat";
+        std::string maxLat = column_name + "_maxLat";
+        std::string minLon = column_name + "_minLon";
+        std::string maxLon = column_name + "_maxLon";
+
+        // Create triggers to keep R*Tree in sync with main table.
+        // Use main.-qualified model_table in ON clause so triggers work
+        // even when a TEMP UNION ALL view shadows the model table (from attach()).
+        // Note: SQLite forbids qualified names inside trigger bodies.
+        // INSERT trigger - add to R*Tree when row is inserted with non-null geo data
+        db_->execute(detail::ordinary_schema_recipe::rtree_insert(model_table,column_name));
+
+        // UPDATE trigger - update R*Tree when geo columns change
+        db_->execute(detail::ordinary_schema_recipe::rtree_update(model_table,column_name));
+
+        // DELETE trigger - remove from R*Tree when row is deleted
+        db_->execute(detail::ordinary_schema_recipe::rtree_delete(model_table,column_name));
+
+        // Populate rtree from existing data (only on first creation)
+        if (!table_exists) {
+            repopulate_geo_bounds_rtree(model_table, column_name);
+        }
+    }
+
+    /// Repopulate an rtree table from the main table data.
+    /// Clears and repopulates to ensure correct values after migration.
+    void repopulate_geo_bounds_rtree(const std::string& model_table,
+                                     const std::string& column_name) {
+        std::string rtree_table = "_" + model_table + "_" + column_name + "_rtree";
+        std::string minLat = column_name + "_minLat";
+        std::string maxLat = column_name + "_maxLat";
+        std::string minLon = column_name + "_minLon";
+        std::string maxLon = column_name + "_maxLon";
+
+        // Clear existing rtree data
+        db_->execute("DELETE FROM " + rtree_table);
+
+        // Repopulate from main table
+        db_->execute(detail::ordinary_schema_recipe::rtree_population(model_table,column_name));
+    }
+
+    /// Ensure all geo_bounds rtree tables exist for a set of model schemas.
+    /// Call this AFTER migration data has been applied to ensure rtrees contain correct data.
+    void ensure_geo_bounds_rtrees(const std::vector<model_schema>& schemas) {
+        for (const auto& schema : schemas) {
+            for (const auto& prop : schema.properties) {
+                if (prop.is_geo_bounds && prop.kind != property_kind::list) {
+                    ensure_rtree_table(schema.table_name, prop.name);
+                }
+            }
+        }
+    }
+
+    /// Ensure an FTS5 virtual table exists for a text column.
+    /// Creates external content FTS5 table + INSERT/UPDATE/DELETE triggers.
+    void ensure_fts5_table(const std::string& model_table,
+                           const std::string& column_name) {
+        const auto fts_table = detail::fts5_porter_table_name(model_table, column_name);
+
+        // Preserve ordinary lazy setup behavior. Recovery admission must
+        // independently validate the complete descriptor; this existence
+        // shortcut is not a proof that all derived programs are intact.
+        const bool table_exists = db_->table_exists(fts_table);
+        if (table_exists) {
+            auto trig = db_->query(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='"
+                + fts_table + "_insert' LIMIT 1");
+            if (!trig.empty()) return;
+        }
+        const auto program = detail::fts5_porter_program(model_table, column_name);
+        if (!table_exists) db_->execute(program.create_table);
+        for (const auto& trigger : program.triggers) db_->execute(trigger.sql);
+        if (!table_exists) db_->execute(program.populate);
+    }
+
+    /// Ensure all FTS5 tables exist for a set of model schemas.
+    void ensure_fts5_tables(const std::vector<model_schema>& schemas) {
+        for (const auto& schema : schemas) {
+            for (const auto& prop : schema.properties) {
+                if (prop.is_full_text && prop.type == column_type::text) {
+                    ensure_fts5_table(schema.table_name, prop.name);
+                }
+            }
+        }
+    }
+
+    /// Ensure a geo_bounds list table exists with its R*Tree.
+    /// Creates table: _<ModelTable>_<column> with parent_id and geo bounds columns
+    /// Creates R*Tree: _<ModelTable>_<column>_rtree for spatial indexing
+    void ensure_geo_bounds_list_table(const std::string& model_route,
+                                      const std::string& column_name) {
+        const auto route = managed_route(model_route);
+        const std::string& model_table = route.table;
+        std::string list_table = "_" + model_table + "_" + column_name;
+        if (route.schema_sql != "main") {
+            // Attached schemas are owned by their source. Never create a
+            // main-schema sidecar while mutating an attached managed object.
+            auto rows = db_->query("SELECT name FROM " + route.schema_sql +
+                ".sqlite_master WHERE type = 'table' AND name = ?", {list_table});
+            if (rows.empty()) throw db_error("attached geographic list table is missing");
+            return;
+        }
+        std::string rtree_table = list_table + "_rtree";
+
+        // Register as internal table — AuditLog entries won't be surfaced to observers.
+        // Always register (idempotent) so existing databases get the metadata.
+        register_internal_table(list_table, model_table);
+        note_geo_list_table(model_table, list_table);
+
+        // Check if table already exists
+        if (db_->table_exists(list_table)) {
+            return;
+        }
+
+        // Create geo_bounds list table
+        // Uses parent_id (globalId of parent) for relationship, like link tables
+        db_->execute(detail::ordinary_schema_recipe::geo_list_table(list_table));
+
+        // Create index for efficient parent lookups
+        db_->execute(detail::ordinary_schema_recipe::geo_list_parent_index(list_table));
+
+        // Create R*Tree virtual table for spatial indexing (if it doesn't exist)
+        if (!db_->table_exists(rtree_table)) {
+            db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_table(rtree_table));
+        }
+
+        // Create triggers to keep R*Tree in sync with list table
+        // INSERT trigger
+        db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_insert(list_table));
+
+        // UPDATE trigger
+        db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_update(list_table));
+
+        // DELETE trigger
+        db_->execute(detail::ordinary_schema_recipe::geo_list_rtree_delete(list_table));
+
+        // Create audit triggers for sync
+        create_geo_bounds_list_triggers(list_table);
+    }
+
+    /// Create audit triggers for a geo_bounds list table (for sync/observation)
+    void create_geo_bounds_list_triggers(const std::string& list_table) {
+        for(const auto& sql:detail::ordinary_schema_recipe::geo_list_audit(list_table))db_->execute(sql);
+    }
+
+    /// Idempotent, atomic refresh of one vec0 index row (Aug 2026 UNIQUE/lock
+    /// storm fix). Returns true if a write happened, false if the index
+    /// already held the row with these exact bytes.
+    ///
+    /// Two rules, each load-bearing:
+    ///   1. READ before writing. The writer's triggers fire inside its own
+    ///      transaction, so by the time any reconcile runs the shadow tables
+    ///      are usually already correct — every process that hears about a
+    ///      row re-writing identical data is what produced 28,308 UNIQUE
+    ///      failures and a write-lock storm on the hub (Aug 13 incident).
+    ///      The point-plan read takes no write lock at all.
+    ///   2. When a write IS needed, UPDATE-then-conditional-INSERT under one
+    ///      write transaction — the exact pattern the vec0 triggers use
+    ///      (vec0 DELETE is unreliable, and autocommit DELETE+INSERT pairs
+    ///      from concurrent processes interleave into UNIQUE failures; the
+    ///      held write lock makes interleaving impossible).
+    bool refresh_vec0_row(const std::string& vec_table,
+                          const std::string& global_id,
+                          const std::vector<uint8_t>& vec_data) {
+        try {
+            auto existing = db_->query(
+                "SELECT embedding FROM " + vec_table + " WHERE global_id = ?",
+                {global_id});
+            if (!existing.empty()) {
+                auto it = existing[0].find("embedding");
+                if (it != existing[0].end() &&
+                    std::holds_alternative<std::vector<uint8_t>>(it->second) &&
+                    std::get<std::vector<uint8_t>>(it->second) == vec_data) {
+                    return false;
+                }
+            }
+        } catch (...) {
+            // Unreadable index row — fall through and rewrite it.
+        }
+        // Join an enclosing transaction if one is open on this connection
+        // (trigger/apply context); otherwise own the write transaction.
+        const bool own_txn = !db_->is_in_transaction();
+        if (own_txn) db_->begin_transaction();
+        try {
+            db_->execute("UPDATE " + vec_table + " SET embedding = ? WHERE global_id = ?",
+                         {vec_data, global_id});
+            db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) "
+                         "SELECT ?, ? WHERE NOT EXISTS "
+                         "(SELECT 1 FROM " + vec_table + " WHERE global_id = ?)",
+                         {global_id, vec_data, global_id});
+            if (own_txn) db_->commit();
+        } catch (...) {
+            if (own_txn) { try { db_->rollback(); } catch (...) {} }
+            throw;
+        }
+        return true;
+    }
+
+    /// Reconcile vec0 entries on this connection for a synced row.
+    /// Called when another connection wrote to the model table. Usually a
+    /// no-op read (the writer's triggers already indexed the row) — see
+    /// refresh_vec0_row for why it must never be a blind rewrite.
+    void reconcile_vec0(const std::string& table, const std::string& global_id) {
+        try {
+            auto pattern = "_" + table + "_%_vec";
+            auto vec_tables = db().query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                {pattern});
+            LOG_DEBUG("vec0_reconcile", "table=%s globalId=%s pattern=%s matches=%zu",
+                      table.c_str(), global_id.c_str(), pattern.c_str(), vec_tables.size());
+
+            for (const auto& vt_row : vec_tables) {
+                auto name_it = vt_row.find("name");
+                if (name_it == vt_row.end() || !std::holds_alternative<std::string>(name_it->second)) continue;
+                auto& vec_table = std::get<std::string>(name_it->second);
+
+                auto prefix_len = table.size() + 2; // "_" + table + "_"
+                auto suffix_len = 4; // "_vec"
+                if (vec_table.size() <= prefix_len + suffix_len) continue;
+                auto col = vec_table.substr(prefix_len, vec_table.size() - prefix_len - suffix_len);
+
+                auto data_rows = db().query(
+                    "SELECT " + col + " FROM " + table + " WHERE globalId = ?",
+                    {global_id});
+                if (data_rows.empty()) continue;
+
+                auto col_it = data_rows[0].find(col);
+                if (col_it == data_rows[0].end() ||
+                    !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                if (vec_data.empty()) continue;
+
+                refresh_vec0_row(vec_table, global_id, vec_data);
+            }
+        } catch (...) {
+            // Non-fatal — vec0 is an optimization layer
+        }
+    }
+
+    /// Explicitly remove vec0 entries for the given globalIds.
+    /// Call after DELETE FROM model table to clean up entries that the
+    /// DELETE trigger may have failed to remove (vec0 DELETE is unreliable
+    /// inside triggers under write contention — SQLITE_BUSY is silently
+    /// swallowed, leaving orphan entries that bloat chunk storage).
+    void cleanup_vec0_entries(const std::string& table_name,
+                              const std::vector<std::string>& global_ids) {
+        if (global_ids.empty()) return;
+        try {
+            auto pattern = "_" + table_name + "_%_vec";
+            auto vec_tables = db_->query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                {pattern});
+            for (const auto& vt_row : vec_tables) {
+                auto name_it = vt_row.find("name");
+                if (name_it == vt_row.end() || !std::holds_alternative<std::string>(name_it->second)) continue;
+                auto& vec_table = std::get<std::string>(name_it->second);
+                for (const auto& gid : global_ids) {
+                    try {
+                        db_->execute("DELETE FROM " + vec_table + " WHERE global_id = ?", {gid});
+                    } catch (...) {
+                        // vec0 table may not exist yet — non-fatal
+                    }
+                }
+            }
+        } catch (...) {
+            // Non-fatal — vec0 is an optimization layer
+        }
+    }
+
+    /// Rebuild the vec0 index for a model table by dropping and recreating it
+    /// with only live entries. Call when orphan accumulation has bloated the
+    /// chunk storage beyond acceptable size.
+    /// Returns the number of entries in the rebuilt index.
+    int64_t rebuild_vec0(const std::string& model_table,
+                         const std::string& column_name,
+                         int dimensions) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+
+        // Drop the existing vec0 table and all its shadow tables
+        if (db_->table_exists(vec_table)) {
+            // Drop triggers first
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+            db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_clear");
+            db_->execute("DROP TABLE IF EXISTS " + vec_table);
+        }
+
+        // Recreate vec0 table and triggers
+        ensure_vec0_table(model_table, column_name, dimensions);
+
+        // Re-insert from model table (using main. to avoid TEMP views)
+        std::string main_table = "main." + model_table;
+        auto rows = db_->query(
+            "SELECT globalId, " + column_name + " FROM " + main_table + " "
+            "WHERE " + column_name + " IS NOT NULL "
+            "AND length(" + column_name + ") > 0");
+
+        int64_t count = 0;
+        for (const auto& row : rows) {
+            auto gid_it = row.find("globalId");
+            if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+            auto& gid = std::get<std::string>(gid_it->second);
+            auto col_it = row.find(column_name);
+            if (col_it == row.end() ||
+                !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+            auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+            if (vec_data.empty()) continue;
+            try {
+                db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                            {gid, vec_data});
+                ++count;
+            } catch (...) {}
+        }
+
+        LOG_INFO("vec0", "rebuild_vec0: %s rebuilt with %lld entries",
+                 vec_table.c_str(), (long long)count);
+        return count;
+    }
+
+    /// Update or insert a vector into the vec0 table.
+    /// vector_data should be packed float32 bytes (4 bytes per dimension).
+    void upsert_vec0(const std::string& model_table,
+                     const std::string& column_name,
+                     const std::string& global_id,
+                     const std::vector<uint8_t>& vector_data) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+
+        // Infer dimensions and ensure table exists
+        int dimensions = static_cast<int>(vector_data.size() / sizeof(float));
+        if (dimensions > 0) {
+            ensure_vec0_table(model_table, column_name, dimensions);
+        }
+
+        refresh_vec0_row(vec_table, global_id, vector_data);
+    }
+
+    /// Delete a vector from the vec0 table.
+    void delete_vec0(const std::string& model_table,
+                     const std::string& column_name,
+                     const std::string& global_id) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+        std::string sql = "DELETE FROM " + vec_table + " WHERE global_id = ?";
+        try {
+            db_->execute(sql, {global_id});
+        } catch (...) {
+            // Table might not exist yet, ignore
+        }
+    }
+
+    /// Drop and rebuild the vec0 virtual table for a model+column, re-inserting
+    /// all vectors from the model table. Use this to reclaim space from orphan
+    /// entries that accumulated from trigger failures or table rebuilds.
+    /// Returns the number of vectors re-inserted, or -1 on failure.
+    int64_t vacuum_vec0(const std::string& model_table,
+                        const std::string& column_name) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+        try {
+            return with_vec0_maintenance("vacuum", [&]() -> int64_t {
+                // Infer dimensions from existing vec0 info or first non-empty
+                // embedding. The info table is absent when the index was never
+                // created (rows applied by sync bypass the lazy create path) —
+                // that case MUST fall through to the sample probe so this
+                // function can build the index from scratch, not just rebuild it.
+                int dimensions = 0;
+                if (db_->table_exists(vec_table + "_info")) {
+                    auto info_rows = db_->query(
+                        "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
+                    if (!info_rows.empty()) {
+                        auto it = info_rows[0].find("value");
+                        if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                            dimensions = static_cast<int>(std::get<int64_t>(it->second));
+                        }
+                    }
+                }
+                if (dimensions == 0) {
+                    auto sample = db_->query(
+                        "SELECT length(" + column_name + ") as len FROM main." + model_table +
+                        " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0 LIMIT 1");
+                    if (!sample.empty()) {
+                        auto it = sample[0].find("len");
+                        if (it != sample[0].end() && std::holds_alternative<int64_t>(it->second)) {
+                            dimensions = static_cast<int>(std::get<int64_t>(it->second)) / static_cast<int>(sizeof(float));
+                        }
+                    }
+                }
+                if (dimensions == 0) return 0;
+
+                // Drop the vec0 virtual table (cascades to shadow tables)
+                db_->execute("DROP TABLE IF EXISTS " + vec_table);
+                notify_vec0_maintenance_test_hook("vacuum", "after-drop");
+
+                // Recreate vec0 + triggers
+                ensure_vec0_table(model_table, column_name, dimensions);
+
+                // Re-insert all vectors from the model table
+                auto all_rows = db_->query(
+                    "SELECT globalId, " + column_name + " FROM main." + model_table +
+                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
+
+                int64_t count = 0;
+                for (const auto& row : all_rows) {
+                    auto gid_it = row.find("globalId");
+                    if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                    auto& gid = std::get<std::string>(gid_it->second);
+                    auto col_it = row.find(column_name);
+                    if (col_it == row.end() ||
+                        !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                    auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                    if (vec_data.empty()) continue;
+                    try {
+                        db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                    {gid, vec_data});
+                        count++;
+                    } catch (...) {}
+                }
+
+                LOG_INFO("vacuum_vec0", "Rebuilt %s: %lld vectors from %zu rows",
+                         vec_table.c_str(), (long long)count, all_rows.size());
+
+                return count;
+            });
+        } catch (const std::exception& e) {
+            LOG_ERROR("vacuum_vec0", "Failed to vacuum %s: %s", vec_table.c_str(), e.what());
+            return -1;
+        }
+    }
+
+    /// Train IVF vector index for a vec0 table.
+    /// If the table is not already IVF, rebuilds it with adaptive nlist/nprobe.
+    /// Then runs compute-centroids to build k-means clusters.
+    /// Idempotent — skips if already trained or too few vectors.
+    bool train_vec0(const std::string& model_table, const std::string& column_name) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+        try {
+            // Already trained? Skip.
+            bool is_ivf = db_->table_exists(vec_table + "_ivf_centroids00");
+            if (is_ivf) {
+                auto trained = db_->query(
+                    "SELECT value FROM " + vec_table + "_info WHERE key = 'ivf_trained_0'");
+                if (!trained.empty()) {
+                    auto it = trained[0].find("value");
+                    if (it != trained[0].end() && std::holds_alternative<int64_t>(it->second)
+                        && std::get<int64_t>(it->second) == 1)
+                        return true;
+                }
+            }
+
+            // Infer dimensions
+            int dimensions = 0;
+            if (db_->table_exists(vec_table)) {
+                auto info_rows = db_->query(
+                    "SELECT value FROM " + vec_table + "_info WHERE key = 'dimensions'");
+                if (!info_rows.empty()) {
+                    auto it = info_rows[0].find("value");
+                    if (it != info_rows[0].end() && std::holds_alternative<int64_t>(it->second))
+                        dimensions = static_cast<int>(std::get<int64_t>(it->second));
+                }
+            }
+            if (dimensions == 0) {
+                auto sample = db_->query(
+                    "SELECT length(" + column_name + ") as len FROM main." + model_table +
+                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0 LIMIT 1");
+                if (!sample.empty()) {
+                    auto it = sample[0].find("len");
+                    if (it != sample[0].end() && std::holds_alternative<int64_t>(it->second))
+                        dimensions = static_cast<int>(std::get<int64_t>(it->second)) / static_cast<int>(sizeof(float));
+                }
+            }
+            if (dimensions == 0) return false;
+
+            // Count vectors
+            int64_t count = 0;
+            auto cnt = db_->query(
+                "SELECT COUNT(*) as cnt FROM main." + model_table +
+                " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
+            if (!cnt.empty()) {
+                auto it = cnt[0].find("cnt");
+                if (it != cnt[0].end() && std::holds_alternative<int64_t>(it->second))
+                    count = std::get<int64_t>(it->second);
+            }
+            if (count < 16) {
+                LOG_INFO("train_vec0", "Skipping %s: only %lld vectors", vec_table.c_str(), (long long)count);
+                return false;
+            }
+
+            // Rebuild as IVF if not already
+            if (!is_ivf) {
+                int nlist = std::clamp(static_cast<int>(std::sqrt(static_cast<double>(count))), 4, 256);
+                int nprobe = std::max(nlist / 2, 2);
+
+                LOG_INFO("train_vec0", "Rebuilding %s as IVF (nlist=%d, nprobe=%d, %lld vectors, dims=%d)",
+                         vec_table.c_str(), nlist, nprobe, (long long)count, dimensions);
+
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_insert");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_update");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_delete");
+                db_->execute("DROP TRIGGER IF EXISTS " + vec_table + "_clear");
+                db_->execute("DROP TABLE IF EXISTS " + vec_table);
+                ensure_vec0_table(model_table, column_name, dimensions, nlist, nprobe);
+
+                // Re-insert all vectors
+                auto all_rows = db_->query(
+                    "SELECT globalId, " + column_name + " FROM main." + model_table +
+                    " WHERE " + column_name + " IS NOT NULL AND length(" + column_name + ") > 0");
+                for (const auto& row : all_rows) {
+                    auto gid_it = row.find("globalId");
+                    if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                    auto col_it = row.find(column_name);
+                    if (col_it == row.end() || !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                    auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                    if (vec_data.empty()) continue;
+                    try {
+                        db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                    {std::get<std::string>(gid_it->second), vec_data});
+                    } catch (...) {}
+                }
+            }
+
+            // Compute centroids
+            LOG_INFO("train_vec0", "Computing centroids for %s (%lld vectors)",
+                     vec_table.c_str(), (long long)count);
+            db_->execute("INSERT INTO " + vec_table + "(" + vec_table + ") VALUES ('compute-centroids')");
+            LOG_INFO("train_vec0", "Training complete for %s", vec_table.c_str());
+            return true;
+        } catch (const std::exception& e) {
+            LOG_ERROR("train_vec0", "Failed to train %s: %s", vec_table.c_str(), e.what());
+            return false;
+        }
+    }
+
+    /// Perform a KNN (K-Nearest Neighbors) query.
+    /// Returns up to k results sorted by distance.
+    /// Optional where_clause filters on the main model table (e.g., "category = 'foo'").
+    std::vector<knn_result> knn_query(const std::string& model_table,
+                                       const std::string& column_name,
+                                       const std::vector<uint8_t>& query_vector,
+                                       int k,
+                                       distance_metric metric = distance_metric::l2,
+                                       const std::optional<std::string>& where_clause = std::nullopt) {
+        std::string vec_table = "_" + model_table + "_" + column_name + "_vec";
+
+        std::string dist_func;
+        switch (metric) {
+            case distance_metric::cosine: dist_func = "vec_distance_cosine"; break;
+            case distance_metric::l1: dist_func = "vec_distance_L1"; break;
+            default: dist_func = "vec_distance_L2"; break;
+        }
+
+        std::vector<knn_result> results;
+
+        LOG_DEBUG("knn_query", "START table=%s vec=%s k=%d metric=%s",
+                  model_table.c_str(), vec_table.c_str(), k, dist_func.c_str());
+
+        // Ensure vec0 table exists. It may not have been created yet if
+        // data arrived via sync after ensure_swift_tables ran with no vector data,
+        // or if inserts happened before vec0 was created (C API path).
+        if (!db_->table_exists(vec_table)) {
+            int dimensions = static_cast<int>(query_vector.size() / sizeof(float));
+            if (dimensions > 0) {
+                ensure_vec0_table(model_table, column_name, dimensions);
+                // Backfill: rows inserted before vec0 existed won't have
+                // triggered the INSERT trigger. Re-insert them now.
+                try {
+                    auto rows = db_->query(
+                        "SELECT globalId, " + column_name + " FROM " + model_table + " "
+                        "WHERE " + column_name + " IS NOT NULL "
+                        "AND length(" + column_name + ") > 0");
+                    for (const auto& row : rows) {
+                        auto gid_it = row.find("globalId");
+                        if (gid_it == row.end() || !std::holds_alternative<std::string>(gid_it->second)) continue;
+                        auto& gid = std::get<std::string>(gid_it->second);
+                        auto col_it = row.find(column_name);
+                        if (col_it == row.end() ||
+                            !std::holds_alternative<std::vector<uint8_t>>(col_it->second)) continue;
+                        auto& vec_data = std::get<std::vector<uint8_t>>(col_it->second);
+                        if (vec_data.empty()) continue;
+                        try {
+                            db_->execute("INSERT INTO " + vec_table + "(global_id, embedding) VALUES (?, ?)",
+                                        {gid, vec_data});
+                        } catch (...) {}
+                    }
+                } catch (...) {}
+            }
+        }
+
+        // Query main DB's vec table
+        if (db_->table_exists(vec_table)) {
+            LOG_DEBUG("knn_query", "querying main vec table: %s", vec_table.c_str());
+            auto main_results = knn_query_single(
+                "main", vec_table, model_table, dist_func, query_vector, k, where_clause);
+            LOG_DEBUG("knn_query", "main query returned %zu results", main_results.size());
+            results.insert(results.end(), main_results.begin(), main_results.end());
+        }
+
+        // Query each attached DB's vec table
+        for (const auto& alias : attached_aliases_) {
+            std::string qualified_vec = "\"" + alias + "\"." + vec_table;
+            // Check if the attached DB has this vec table
+            std::string check_sql = "SELECT name FROM \"" + alias + "\".sqlite_master "
+                                    "WHERE type='table' AND name=?";
+            auto check = db_->query(check_sql, {vec_table});
+            if (check.empty()) {
+                LOG_DEBUG("knn_query", "attached DB %s has no vec table %s, skipping",
+                         alias.c_str(), vec_table.c_str());
+                continue;
+            }
+
+            LOG_DEBUG("knn_query", "querying attached vec table: %s.%s", alias.c_str(), vec_table.c_str());
+            auto attached_results = knn_query_single(
+                "\"" + alias + "\"", vec_table, model_table, dist_func, query_vector, k, where_clause);
+            LOG_DEBUG("knn_query", "attached query returned %zu results", attached_results.size());
+            results.insert(results.end(), attached_results.begin(), attached_results.end());
+        }
+
+        // Sort by distance and take top k
+        std::sort(results.begin(), results.end(),
+                  [](const knn_result& a, const knn_result& b) { return a.distance < b.distance; });
+        if (results.size() > static_cast<size_t>(k)) {
+            results.resize(k);
+        }
+        return results;
+    }
+
+    /// Run a knn query against a single schema's vec table.
+    std::vector<knn_result> knn_query_single(
+            const std::string& schema,
+            const std::string& vec_table,
+            const std::string& model_table,
+            const std::string& dist_func,
+            const std::vector<uint8_t>& query_vector,
+            int k,
+            const std::optional<std::string>& where_clause) {
+        std::string qualified_vec = schema + "." + vec_table;
+
+        std::ostringstream sql;
+        if (where_clause && !where_clause->empty()) {
+            // With filter: JOIN model table (TEMP VIEW for UNION ALL) and apply WHERE clause
+            sql << "SELECT v.global_id, " << dist_func << "(v.embedding, ?) as distance "
+                << "FROM " << qualified_vec << " v "
+                << "JOIN " << model_table << " ON " << model_table << ".globalId = v.global_id "
+                << "WHERE " << *where_clause << " "
+                << "ORDER BY distance LIMIT " << k;
+        } else if (dist_func == "vec_distance_L2") {
+            // No filter, L2: use vec0's native MATCH for fastest performance
+            sql << "SELECT global_id, distance FROM " << qualified_vec
+                << " WHERE embedding MATCH ? AND k = " << k;
+        } else {
+            // No filter, non-L2: use explicit distance function
+            sql << "SELECT global_id, " << dist_func << "(embedding, ?) as distance "
+                << "FROM " << qualified_vec
+                << " ORDER BY distance LIMIT " << k;
+        }
+
+        LOG_DEBUG("knn_query_single", "SQL: %s", sql.str().c_str());
+        auto t0 = std::chrono::steady_clock::now();
+        auto rows = db_->query(sql.str(), {query_vector});
+        auto t1 = std::chrono::steady_clock::now();
+        auto query_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        LOG_DEBUG("knn_query_single", "query took %lldms, %zu rows", (long long)query_ms, rows.size());
+
+        std::vector<knn_result> results;
+        results.reserve(rows.size());
+        for (const auto& row : rows) {
+            knn_result r;
+            auto gid_it = row.find("global_id");
+            if (gid_it != row.end() && std::holds_alternative<std::string>(gid_it->second)) {
+                r.global_id = std::get<std::string>(gid_it->second);
+            }
+            auto dist_it = row.find("distance");
+            if (dist_it != row.end()) {
+                if (std::holds_alternative<double>(dist_it->second)) {
+                    r.distance = std::get<double>(dist_it->second);
+                } else if (std::holds_alternative<int64_t>(dist_it->second)) {
+                    r.distance = static_cast<double>(std::get<int64_t>(dist_it->second));
+                }
+            }
+            results.push_back(r);
+        }
+        return results;
+    }
+
+protected:
+    // Attached database aliases (set by attach()) for cross-DB knn/fts queries
+    std::vector<std::string>& attached_aliases_ = process_resources_.get().attached_aliases_;
+
+    // attach/detach bookkeeping — all guarded by attach_mutex_:
+    // (alias, path) pairs for idempotence checks, and the names of every
+    // TEMP view attach created so regeneration can drop exactly what it
+    // owns (view names are the bare table names; the set is identical on
+    // every view-bearing handle).
+    std::mutex& attach_mutex_ = process_resources_.get().attach_mutex_;
+    std::vector<std::pair<std::string, std::string>>& attached_dbs_ = process_resources_.get().attached_dbs_;
+    std::unordered_map<std::string, int64_t>& attached_route_tokens_ = process_resources_.get().attached_route_tokens_;
+    std::unordered_map<int64_t, std::shared_ptr<const void>>& attached_route_metadata_ = process_resources_.get().attached_route_metadata_;
+    int64_t& next_attachment_token_ = process_resources_.get().next_attachment_token_;
+    std::set<std::string>& attached_view_names_ = process_resources_.get().attached_view_names_;
+    std::map<std::string, std::string>& attached_view_sql_ = process_resources_.get().attached_view_sql_;
+    std::map<std::string, std::shared_ptr<const physical_store_identity>>& attached_projection_identities_ = process_resources_.get().attached_projection_identities_;
+    bool& attachment_topology_valid_ = process_resources_.get().attachment_topology_valid_;
+    std::map<std::string,std::shared_ptr<const detail::ordinary_cohort_attachment_binding>>& attached_cohort_bindings_ = process_resources_.get().attached_cohort_bindings_;
+
+    // Scalar admission reads this view only while holding its writer mutex.
+    // Topology changes publish under attach_mutex_; invalidation is allocation
+    // free and precedes the first DETACH side effect, including failed DETACH.
+    friend class detail::ordinary_cohort_attachment_access;
+    friend class detail::ordinary_export_access;
+    // Exact retained exporter/profile owner slots from the finite D8 header.
+    // Only the actual bootstrap COMMIT and private exporter/receiver paths set them.
+    bool& ordinary_schema_initialized_here_ = process_resources_.get().ordinary_schema_initialized_here_;
+    std::shared_ptr<const detail::ordinary_child_origin>& ordinary_child_origin_ = process_resources_.get().ordinary_child_origin_;
+    // Private fixed-connection custody, installed before the history child rendezvous.
+    // The marker is a refusal boundary, never a source or completion grant.
+    std::atomic<bool>& ordinary_connection_construction_seen_ = process_resources_.get().ordinary_connection_construction_seen_;
+    detail::ordinary_shared_publication<detail::ordinary_history_child_connections>& ordinary_history_child_connections_ = process_resources_.get().ordinary_history_child_connections_;
+    void note_history_uncaptured_connection();
+    friend struct detail::ordinary_history_open_ledger_test_access;
+    std::shared_ptr<detail::database_open_ledger>& connection_ledger_ = process_resources_.get().connection_ledger_;
+    detail::ordinary_shared_publication<const detail::ordinary_managed_profile>& ordinary_managed_profile_ = process_resources_.get().ordinary_managed_profile_;
+    detail::ordinary_weak_publication<const detail::ordinary_managed_receiver_preservation>& ordinary_receiver_preservation_ = process_resources_.get().ordinary_receiver_preservation_;
+    // Only the actual validated restart publisher associates a receive request.
+    detail::ordinary_weak_publication<const detail::ordinary_receiver_wss_request>& ordinary_receiver_wss_ = process_resources_.get().ordinary_receiver_wss_;
+    std::atomic<bool>& ordinary_export_enrolled_here_ = process_resources_.get().ordinary_export_enrolled_here_;
+    std::atomic<bool>& ordinary_receive_enrolled_here_ = process_resources_.get().ordinary_receive_enrolled_here_;
+    friend class detail::managed_route_scope;
+    friend class model_base;
+    friend struct detail::recovery_writer_access;
+    friend struct detail::recovery_refresh_access;
+    friend class detail::canonical_writer_adapter;
+    friend class detail::recovery_local_producer_adapter;
+    friend class detail::recovery_continuous_producer;
+    std::shared_ptr<detail::recovery_continuous_admission>& recovery_continuous_ = process_resources_.get().recovery_continuous_;
+    friend class detail::ordinary_managed_ipc_access;
+    friend class detail::ordinary_receiver_wss_access;
+    friend class detail::ordinary_receiver_session;
+    friend class detail::ordinary_managed_start_capture_tail;
+    std::mutex& managed_wss_mutex_ = process_resources_.get().managed_wss_mutex_;
+    bool& managed_wss_starting_ = process_resources_.get().managed_wss_starting_;
+    std::shared_ptr<detail::configured_managed_handlers>& managed_wss_handlers_ = process_resources_.get().managed_wss_handlers_;
+    std::shared_ptr<detail::configured_recovery_connection>& managed_wss_connection_ = process_resources_.get().managed_wss_connection_;
+    std::shared_ptr<const detail::ordinary_managed_owner_release>& managed_wss_start_release_ = process_resources_.get().managed_wss_start_release_;
+    std::shared_ptr<detail::configured_managed_handlers> configured_listener_cell();
+    bool remember_configured_state(const synchronizer::on_state_change_handler&);
+    bool remember_configured_error(const synchronizer::on_error_handler&);
+    bool remember_configured_progress(const synchronizer::on_progress_handler&);
+    void begin_configured_listener_retirement();
+    bool retire_configured_listener_targets();
+    bool finish_configured_listener_retirement();
+    std::shared_ptr<detail::configured_recovery_connection> configured_connection() const noexcept;
+    bool configured_sync_present() const noexcept;
+    bool configured_sync_connected() const;
+    void configured_sync_now();
+    void configured_sync_upload();
+    void configured_sync_connect();
+    void configured_sync_disconnect();
+    void configured_sync_state(std::function<void(bool)>);
+    void configured_sync_error(std::function<void(const std::string&)>);
+    void configured_sync_progress(synchronizer::on_progress_handler);
+    synchronizer::sync_progress configured_sync_progress() const;
+    lattice_close_result configured_sync_close(std::chrono::steady_clock::time_point) noexcept;
+    const detail::recovery_owner_schema& recovery_schemas_ = process_resources_.get().recovery_schemas_;
+    bool& recovery_producer_bootstrapped_ = process_resources_.get().recovery_producer_bootstrapped_;
+    bool& administrative_owner_ = process_resources_.get().administrative_owner_;
+    bool& checked_existing_unpublished_ = process_resources_.get().checked_existing_unpublished_;
+    friend struct managed_attachment_test_access;
+    friend struct topology_admission_test_access;
+    struct managed_attachment_binding {
+        std::string alias, filename;
+        int64_t token;
+        std::weak_ptr<database> writer;
+        mutable std::atomic<bool> valid{true};
+        managed_attachment_binding(std::string a, std::string f, int64_t t, std::shared_ptr<database> w)
+            : alias(std::move(a)), filename(std::move(f)), token(t), writer(std::move(w)) {}
+    };
+    using managed_attachment_view = std::vector<std::shared_ptr<const managed_attachment_binding>>;
+    std::shared_ptr<const managed_attachment_view>& managed_attachment_view_ = process_resources_.get().managed_attachment_view_;
+    // Covers admitted SQL and its deferred tail. Writer maintenance refuses
+    // publication while nonzero; it never waits for callbacks under a mutex.
+    std::atomic<size_t>& active_managed_attachment_operations_ = process_resources_.get().active_managed_attachment_operations_;
+    void publish_managed_attachment(const std::string& alias, const std::string& path,
+                                    int64_t token, const std::shared_ptr<database>& writer);
+    std::shared_ptr<const managed_attachment_view> managed_view_for_writer(
+        const std::shared_ptr<database>& writer) const;
+
+    // Only these attachment helpers access database's private metadata funnel.
+    static std::vector<std::string> attachment_column_names(
+        database* db, const std::string& schema_sql, const std::string& table_name,
+        database::attachment_operation&);
+    static std::unordered_set<std::string> attachment_model_tables(
+        database* db, const char* master, database::attachment_operation&);
+
+    /// Owned snapshots survive reader retirement through topology operations.
+    /// The owning vector must outlive the attachment lock so final releases
+    /// cannot invoke database/function destructors under that lock.
+    std::vector<std::shared_ptr<database>> view_handles();
+    void restore_attached_views(database& connection);
+    void rebuild_attached_views(const std::vector<std::shared_ptr<database>>& handles,
+                                database::attachment_operation&);
+    // Preserve the existing protected caller/test entry; it creates one budget.
+    void detach_alias_if_current(const std::string& alias,
+                                 const std::optional<std::string>& expected_path,
+                                 std::optional<int64_t> expected_token);
+    void detach_alias_if_current(const std::string& alias,
+                                 const std::optional<std::string>& expected_path,
+                                 std::optional<int64_t> expected_token, database::attachment_operation&);
+
+    // Opaque immutable extension metadata shares the topology lock/lifetime.
+    // The Swift bridge supplies its own schema snapshot; Core never inspects it.
+    void attach_with_metadata(lattice_db& source, std::shared_ptr<const void> metadata);
+    void attach_with_metadata_impl(lattice_db& source, std::shared_ptr<const void>& metadata,
+                                   database::attachment_operation&);
+    void invalidate_attachment_route(const std::string& alias, database::attachment_operation& operation) {
+        auto it = attached_route_tokens_.find(alias);
+        if (it == attached_route_tokens_.end()) return;
+        if (auto view = std::atomic_load(&managed_attachment_view_)) {
+            for (const auto& route : *view)
+                if (route->token == it->second) route->valid.store(false, std::memory_order_release);
+        }
+        auto metadata = attached_route_metadata_.find(it->second);
+        if (metadata != attached_route_metadata_.end()) {
+            // One alias can retire per public call. Move to its fixed slot:
+            // no allocation or final capture destruction under attach_mutex_.
+            operation.retired_metadata = std::move(metadata->second);
+            attached_route_metadata_.erase(metadata);
+        }
+        attached_route_tokens_.erase(it);
+    }
+
+    /// Raw SQL BEGIN does not establish Core transaction ownership.
+    bool owns_write_transaction() const {
+        return db_ && !db_->is_closed() && db_->is_in_transaction() &&
+            txn_owner_thread_.load(std::memory_order_acquire) == std::this_thread::get_id();
+    }
+
+private:
+    template<typename U> friend class query;
+    template<typename U> friend class results;
+    friend class projection_service;
+    friend struct projection_operation_state;
+    friend struct owned_catalog_state;
+    friend struct projection_pressure_test_access;
+    friend class synchronizer_base;
+    friend class synchronizer;
+
+    void shutdown_projection_reads();
+    void pause_projection_reads();
+    void resume_projection_reads();
+    std::mutex& projection_service_mutex_ = process_resources_.get().projection_service_mutex_;
+    std::shared_ptr<projection_service>& projection_service_ = process_resources_.get().projection_service_;
+    // Retained across service replacement/maintenance so native batches from a
+    // prior service still count against this parent's aggregate capture quota.
+    std::shared_ptr<projection_capture_account>& projection_capture_account_ = process_resources_.get().projection_capture_account_;
+    bool& projection_admission_paused_ = process_resources_.get().projection_admission_paused_; // protected by service mutex
+
+    using projection_pressure_map = std::map<std::string, std::shared_ptr<projection_pressure_source>, std::less<>>;
+    struct projection_pressure_map_deleter {
+        // Keep nested map destruction in the native translation unit. Swift's
+        // optimized C++ import can otherwise emit references to libc++ template
+        // helpers that have no emitted definition in the final executable.
+        void operator()(const projection_pressure_map* value) const noexcept;
+    };
+    void setup_projection_pressure();
+    void replace_projection_pressure_source(const std::string& schema,
+                                           std::shared_ptr<projection_pressure_source> source);
+    void publish_projection_pressure(std::unique_ptr<const projection_pressure_map> next);
+    void raise_projection_pressure(const char* schema) noexcept;
+    std::vector<std::shared_ptr<projection_pressure_source>> projection_pressure_sources() const;
+    void deactivate_projection_pressure();
+    // Two-slot grace protocol: hook readers increment before loading a map,
+    // recheck the current slot, and release before callbacks/SQL. Publishers
+    // switch slots then drain only old readers, outside SQLite/registry locks.
+    // All protocol atomics are seq_cst. At most two immutable maps exist.
+    std::atomic<unsigned>& projection_pressure_slot_ = process_resources_.get().projection_pressure_slot_;
+    std::atomic<uint64_t> (&projection_pressure_readers_)[2] = process_resources_.get().projection_pressure_readers_;
+    std::atomic<const projection_pressure_map*> (&projection_pressure_maps_)[2] = process_resources_.get().projection_pressure_maps_;
+    std::unique_ptr<const projection_pressure_map, projection_pressure_map_deleter> (&projection_pressure_owners_)[2] = process_resources_.get().projection_pressure_owners_;
+
+    configuration& config_ = process_resources_.get().config_;
+    // Publication only: never hold this mutex across SQLite, callbacks, or
+    // destruction. attach -> publication is the only nested lock direction.
+    std::mutex& connection_ownership_mutex_ = process_resources_.get().connection_ownership_mutex_;
+    uint64_t& connection_revision_ = process_resources_.get().connection_revision_;
+    std::shared_ptr<database>& db_ = process_resources_.get().db_;       // Write connection / fallback owner
+    std::shared_ptr<database>& read_db_ = process_resources_.get().read_db_;
+    std::shared_ptr<detail::recovery_refresh_state>& recovery_refresh_ = process_resources_.get().recovery_refresh_;
+    void recovery_subscriptions_changed();
+    // Thread that opened the current explicit transaction (see read_db()).
+    std::atomic<std::thread::id>& txn_owner_thread_ = process_resources_.get().txn_owner_thread_;  // Read-only connection for concurrent reads
+    std::shared_ptr<database>& xproc_read_db_ = process_resources_.get().xproc_read_db_;  // Dedicated read connection for xproc handler
+                                               // (avoids SQLite lock contention with read_db_
+                                               // when observer callbacks query on MainActor)
+    // Set by close() for is_closed(). Published and borrowed owners retain the
+    // wrapper; database::close() provides the logical read/write guard.
+    std::atomic<bool>& closed_ = process_resources_.get().closed_;
+    std::shared_ptr<scheduler>& scheduler_ = process_resources_.get().scheduler_;
+    std::unique_ptr<synchronizer>& synchronizer_ = process_resources_.get().synchronizer_;
+    // Payload-free immutable policy shared by pending, active and dormant
+    // same-path/URL owners. Its registry lock never spans owner work.
+    std::shared_ptr<const detail::sync_policy_reservation>& sync_policy_ = process_resources_.get().sync_policy_;
+
+    // IPC sync
+    struct ipc_sync_state {
+        std::unique_ptr<ipc_endpoint> endpoint;
+        std::unique_ptr<synchronizer> sync;
+        int lock_fd = -1;  // flock on <channel>.ipc.lock — mirrors sync_lock_fd_ for WSS
+    };
+    std::vector<ipc_sync_state>& ipc_synchronizers_ = process_resources_.get().ipc_synchronizers_;
+
+    // Sync callbacks — stored for retroactive application to lazily-created synchronizers.
+    // Protected by ipc_callbacks_mutex_ to avoid races between the accept thread
+    // (which creates IPC synchronizers) and the main thread (which sets callbacks).
+    std::mutex& ipc_callbacks_mutex_ = process_resources_.get().ipc_callbacks_mutex_;
+    std::function<void(bool)>& on_sync_state_change_ = process_resources_.get().on_sync_state_change_;
+    std::function<void(const std::string&)>& on_sync_error_ = process_resources_.get().on_sync_error_;
+    synchronizer::on_progress_handler& on_sync_progress_ = process_resources_.get().on_sync_progress_;
+
+    // Cross-process idle hint — fires on the xproc background thread (NOT the
+    // scheduler) when a Darwin notification arrives but no new AuditLog entries
+    // exist. Used by passive sync progress observers to re-check pending counts
+    // without going through the general observer system / MainActor scheduler.
+    std::mutex& xproc_idle_mutex_ = process_resources_.get().xproc_idle_mutex_;
+    std::function<void()>& on_xproc_idle_ = process_resources_.get().on_xproc_idle_;
+
+    // Synchronizer flag - true if this connection handles remote changes
+    bool& is_synchronizer_ = process_resources_.get().is_synchronizer_;
+
+    // Cross-process flock for WSS sync ownership.
+    // >= 0 means this process holds the lock and owns the WSS synchronizer.
+    // -1 means lock not held (another process owns it, or sync not configured).
+    int& sync_lock_fd_ = process_resources_.get().sync_lock_fd_;
+
+    struct recovery_commit_batch {
+        std::vector<change_event> events;
+        std::vector<size_t> typed_event_indices;
+        std::vector<invalidation_table_change> invalidations;
+        std::optional<int64_t> audit_frontier;
+        bool needs_upload_hint = false;
+    };
+    // Guarded by change_buffer_mutex_. A generic flush cannot steal the
+    // admitted recovery transaction's rows, including a preexisting drain
+    // that already cleared txn_dirty_ before this frame acquired SQLite.
+    bool& recovery_change_buffer_reserved_ = process_resources_.get().recovery_change_buffer_reserved_;
+    // Only off-lock topology delivery holds this depth. Callback writes keep
+    // their existing bounded outer drain instead of recursively delivering.
+    size_t& topology_delivery_depth_ = process_resources_.get().topology_delivery_depth_; // guarded by change_buffer_mutex_
+    // Physical-writer publication also refuses same-thread recursive SQLite
+    // callbacks during an admitted private install; whole-owner close may fence
+    // new admission without replacing the retained writer.
+    std::atomic<size_t>& active_recovery_install_operations_ = process_resources_.get().active_recovery_install_operations_;
+
+    // Change buffering - accumulates changes until WAL hook fires
+    std::mutex& change_buffer_mutex_ = process_resources_.get().change_buffer_mutex_;
+    std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>>& change_buffer_ = process_resources_.get().change_buffer_;  // (table, op, rowId, globalId, mainSchema)
+    bool& is_flushing_ = process_resources_.get().is_flushing_;
+
+public:
+    /// Set by apply_remote_changes to signal that flush_changes should look up
+    /// changedFieldsNames from AuditLog and pass them to object observers.
+    /// Local Swift setter changes don't need this (the setter handles observation).
+    std::atomic<bool>& applying_remote_changes_ = process_resources_.get().applying_remote_changes_;
+
+    /// Set by the upsert/bulk-insert paths so flush_changes() populates changed_fields
+    /// for the resulting local UPDATE — lets live object instances backing the conflicted
+    /// row refresh (objectWillChange / Observation / .observe). Unlike a direct Swift
+    /// setter, an upsert mutates the row entirely in SQL and never self-notifies, so the
+    /// object observer would otherwise see empty changed_fields and skip the row.
+    /// thread_local (not a shared atomic) because flush_changes always runs synchronously
+    /// on the writing thread (driven by the update/WAL hook inside sqlite3_step), so each
+    /// write pairs with its own flush — no cross-thread race on a shared flag.
+    static inline thread_local bool tls_notify_local_object_observers_ = false;
+private:
+
+protected:
+    // Initialize synchronizer if configured
+    void setup_sync_if_configured();
+
+    // Initialize IPC synchronizers if configured
+    void setup_ipc_if_configured();
+
+private:
+    // Tear down synchronizer and (when fire_handoff) hand off to a sibling
+    // instance with the same wssEndpoint URL. The hand-off block resurrects
+    // a dormant sibling so cross-instance sync continuity survives the
+    // closing of the current owner.
+    //
+    // `fire_handoff = false` skips the hand-off block. Used by the URL-
+    // change kick path in `setup_sync_if_configured`: when a new instance
+    // with a different URL kicks an old instance to take over the flock,
+    // we MUST NOT let the kicked instance resurrect another same-URL
+    // sibling — that would re-hold the flock against our new URL and
+    // re-trigger the same bug.
+    void teardown_sync(bool fire_handoff = true);
+    lattice_close_result teardown_sync_checked(bool fire_handoff = true) noexcept;
+
+    // Synchronizer registry — ensures at most one synchronizer per {path, websocket_url}
+    static bool try_register_sync_key(const std::string& path, const std::string& ws_url);
+    static void unregister_sync_key(const std::string& path, const std::string& ws_url);
+
+    // Trigger synchronizer upload for internal table changes (defined after sync.hpp)
+    void trigger_sync_upload();
+
+    // Table-level observer storage (for Results observation)
+    std::mutex& observers_mutex_ = process_resources_.get().observers_mutex_;
+    // Table and object registrations hold different registry mutexes. Token
+    // allocation is shared; registry publication stays under each own mutex.
+    std::atomic<observer_id>& next_observer_id_ = process_resources_.get().next_observer_id_;
+    std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>>& table_observers_ = process_resources_.get().table_observers_;
+
+    // Per-object observer storage (for individual model observation)
+    // Maps: tableName -> rowId -> [observer callbacks]
+    detail::managed_observation_state& managed_observers_ = process_resources_.get().managed_observers_;
+    std::mutex& object_observers_mutex_ = process_resources_.get().object_observers_mutex_;
+    std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void(const std::string&)>>>>>& object_observers_ = process_resources_.get().object_observers_;
+
+    // Setup hooks for change notifications
+    // Update hook buffers changes, WAL hook flushes on commit (matches Swift's pattern)
+    void setup_change_hook() {
+        setup_projection_pressure(); setup_change_hook(*db_);
+        detail::publish_recovery_local_producer(*this, *db_);
+    }
+    void setup_change_hook(database& connection);
+
+    // Cross-process observation — notifier is owned by instance_registry
+    // (one per path per process). This is a non-owning pointer for post_notification.
+    cross_process_notifier*& shared_xproc_notifier_ = process_resources_.get().shared_xproc_notifier_;
+    std::atomic<int64_t>& last_seen_audit_id_ = process_resources_.get().last_seen_audit_id_;
+
+    // Audit-retention maintenance thread (see start_audit_maintenance()).
+    std::thread& audit_maint_thread_ = process_resources_.get().audit_maint_thread_;
+    std::atomic<bool>& history_generation_active_ = process_resources_.get().history_generation_active_;
+    std::mutex& audit_maint_mutex_ = process_resources_.get().audit_maint_mutex_;
+    std::condition_variable& audit_maint_cv_ = process_resources_.get().audit_maint_cv_;
+    bool& audit_maint_stop_ = process_resources_.get().audit_maint_stop_;
+    // Shared mutex captured by the xproc callback lambda so it outlives this
+    // object.  The destructor locks it while unregistering, preventing the
+    // callback from accessing a partially-destroyed lattice_db.
+    std::shared_ptr<std::mutex>& xproc_callback_mutex_ = process_resources_.get().xproc_callback_mutex_;
+    /// Heap-allocated guard for safe cross-instance notification.
+    /// Set alive=false before teardown; spin on refcount before destroying members.
+    std::shared_ptr<instance_guard>& guard_ = process_resources_.get().guard_;
+
+    // Cascade walker side indexes — populated by the `ensure_*` registration
+    // sites at startup, read by `remove(...)` and `delete_where(...)` to
+    // dispatch only the cleanup queries that actually match each table's
+    // schema. Avoids iterating every `_lattice_meta` `internal_table:%` row
+    // and avoids issuing `DELETE … WHERE rhs = ?` against tables (unions,
+    // geo_bounds lists) that have no `rhs` column. Written only during
+    // single-threaded `ensure_tables`; read after init under the DB write
+    // lock — no separate mutex required.
+    //
+    // Regular link tables, indexed by their rhs target type. A delete of T
+    // only needs to clean junction rows whose `rhs` references T, so the
+    // walker iterates `link_tables_by_rhs_target_[T]` — typically a small
+    // set, often empty for leaf types like LatticeHistoricalSignal.
+    std::unordered_map<std::string, std::unordered_set<std::string>>& link_tables_by_rhs_target_ = process_resources_.get().link_tables_by_rhs_target_;
+    // Defensive bucket for regular link tables registered without a known
+    // target (e.g. the idempotent `ensure_link_table(name)` re-call from
+    // `managed<T*>::set_link`). After `ensure_link_tables()` has run during
+    // init, every link table is also recorded under its rhs target, so this
+    // set is normally empty — but the walker still iterates it for safety.
+    std::unordered_set<std::string>& link_tables_unknown_target_ = process_resources_.get().link_tables_unknown_target_;
+    // Virtual link tables — rhs is polymorphic, but `rhs_type` scopes per
+    // row, so the walker can issue `WHERE rhs = ? AND rhs_type = ?` to
+    // target precisely without per-target indexing.
+    std::unordered_set<std::string>& virtual_link_tables_ = process_resources_.get().virtual_link_tables_;
+    // parent_table -> list tables to clean via `parent_id = ?`.
+    std::unordered_map<std::string, std::vector<std::string>>& list_tables_by_parent_ = process_resources_.get().list_tables_by_parent_;
+
+    // True if `link_table_name` is already recorded under a known rhs target.
+    // Used so a later bare `ensure_link_table(name)` call doesn't pollute the
+    // unknown-target bucket when the target was registered earlier.
+    bool is_known_link_table(const std::string& link_table_name) const {
+        for (const auto& [target, set] : link_tables_by_rhs_target_) {
+            if (set.find(link_table_name) != set.end()) return true;
+        }
+        return false;
+    }
+
+    void setup_cross_process_notifier();
+public:
+    void handle_cross_process_notification();
+private:
+
+    void ensure_tables() {
+        // Per-connection SQL function registration — required on BOTH paths
+        // (triggers call sync_disabled() at execution time on this connection).
+        register_sql_functions();
+        // Enrolled programs must be validated before any ordinary migration can
+        // replace them. Bootstrap returns bounded untrusted facts; exact schema,
+        // SQL and this constructor's physical hook publication admit the writer.
+        if (detail::prepare_recovery_local_producer(*this, db_)) {
+            if (!fingerprint_marker_valid(compute_core_fingerprint_key()))
+                throw db_error("local producer enrolled schema requires explicit migration");
+            note_tables_for_all_schemas();
+            recovery_producer_bootstrapped_=true;
+            return;
+        }
+
+        // FAST PATH: when the schema fingerprint marker matches the current
+        // schema cookie, every statement below is provably a no-op. Populate
+        // in-memory registries only — zero writes, no write lock taken.
+        const std::string fp_key = compute_core_fingerprint_key();
+        if (fingerprint_marker_valid(fp_key)) {
+            note_tables_for_all_schemas();
+            LOG_DEBUG("lattice_db", "ensure_tables: fast path (fingerprint match)");
+            return;
+        }
+
+        // SLOW PATH: first open, schema change, or external DDL since the
+        // marker was stored. One IMMEDIATE transaction so concurrent opens
+        // serialize via begin_transaction's backoff instead of failing with
+        // "database is locked", and so the marker commits atomically with the
+        // DDL it describes. Note: config_.migration_block runs inside this
+        // transaction — it must not manage its own transactions.
+        transaction txn(*db_, /*exclusive=*/false);
+
+        // Double-checked: another process may have completed this exact pass
+        // between our probe above and acquiring the write lock.
+        if (fingerprint_marker_valid_in_txn(fp_key)) {
+            note_tables_for_all_schemas();
+            txn.commit();
+            LOG_DEBUG("lattice_db", "ensure_tables: fast path after lock (sibling completed)");
+            return;
+        }
+
+        // A missing guard family in an already populated schema is an upgrade,
+        // not proof that prior receive history was complete. Capture this under
+        // the owned bootstrap transaction before creating any internal table.
+        const bool receive_legacy_origin = !db_->query(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").empty();
+        detail::initialize_receive_guard_schema(*db_, receive_legacy_origin);
+
+        // First create sync control table
+        ensure_sync_control_table();
+
+        // Create meta table for schema versioning
+        ensure_lattice_meta_table();
+
+        // Create AuditLog BEFORE model tables (triggers reference it)
+        ensure_audit_log_table();
+
+        // Phase 1: Detect all schema changes (but don't apply yet)
+        migration_context migration_ctx(*db_);
+        std::vector<const model_schema*> new_tables;
+        std::vector<const model_schema*> existing_tables;
+
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            if (!db_->table_exists(schema->table_name)) {
+                new_tables.push_back(schema);
+            } else {
+                existing_tables.push_back(schema);
+                // Detect changes for this table
+                auto changes = detect_table_changes(*schema);
+                if (changes.has_changes()) {
+                    migration_ctx.add_table_changes(std::move(changes));
+                }
+            }
+        }
+
+        // Phase 2: If migration block is set and there are changes, call it
+        if (config_.migration_block && migration_ctx.has_any_changes()) {
+            config_.migration_block(migration_ctx);
+        }
+
+        // Phase 3: Create new tables
+        for (const auto* schema : new_tables) {
+            create_model_table(*schema);
+        }
+
+        // Phase 4: Apply auto-migration to existing tables
+        for (const auto* schema : existing_tables) {
+            migrate_model_table(*schema);
+        }
+
+        // Phase 5: Apply pending updates from migration block
+        // (now that new columns exist)
+        migration_ctx.apply_pending_updates();
+
+        ensure_link_tables();
+
+        // Phase 6: per-property UNIQUE constraint indexes (guarded DDL,
+        // naming mirrors the bridge's Phase 8 — see the method comment).
+        // Runs for new AND existing tables so an is_unique added to an
+        // existing schema gains its index on the next slow-path open.
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            ensure_unique_property_indexes(*schema);
+            // Metadata-only admission for registered existing vector sidecars.
+            // No inference, backfill, or creation from an empty model column.
+            for (const auto& prop : schema->properties)
+                if (prop.is_vector && prop.type == column_type::blob)
+                    ensure_vec0_table(schema->table_name, prop.name, 0);
+        }
+
+        store_fingerprint_marker(fp_key);
+        txn.commit();
+        ordinary_schema_initialized_here_=!receive_legacy_origin;
+    }
+
+    /// Detect schema changes for a table without applying them.
+    /// Returns table_changes describing what would change.
+    table_changes detect_table_changes(const model_schema& schema) {
+        table_changes changes;
+        changes.table_name = schema.table_name;
+
+        // Get existing columns from database
+        auto existing = db_->get_table_info(schema.table_name);
+
+        // Build expected columns map
+        std::unordered_map<std::string, std::string> model_cols;
+        model_cols["id"] = "INTEGER";
+        model_cols["globalId"] = "TEXT";
+        for (const auto& prop : schema.properties) {
+            if (prop.is_geo_bounds) {
+                model_cols[prop.name + "_minLat"] = "REAL";
+                model_cols[prop.name + "_maxLat"] = "REAL";
+                model_cols[prop.name + "_minLon"] = "REAL";
+                model_cols[prop.name + "_maxLon"] = "REAL";
+            } else {
+                model_cols[prop.name] = sql_type_string(prop.type);
+            }
+        }
+
+        // Find added columns
+        for (const auto& [col, type] : model_cols) {
+            auto it = existing.find(col);
+            if (it == existing.end()) {
+                changes.added_columns.push_back(col);
+            } else if (it->second != type) {
+                changes.changed_columns.push_back(col);
+            }
+        }
+
+        // Find removed columns. Machinery columns are never "removed": Phase 8
+        // materializes `<link>__link_gid` shadow columns for @Unique
+        // constraints that reference links — they're owned by the constraint
+        // machinery, not the user schema. Treating them as removals rebuilds
+        // the whole table on EVERY open (and the rebuild drops the shadow that
+        // Phase 8 then re-adds — an endless rebuild cycle across binaries).
+        for (const auto& [col, type] : existing) {
+            if (is_machinery_column(col)) continue;
+            if (model_cols.find(col) == model_cols.end()) {
+                changes.removed_columns.push_back(col);
+            }
+        }
+
+        return changes;
+    }
+
+    /// Columns created and maintained by Lattice machinery rather than the
+    /// user schema. The `__link_gid` suffix is reserved: Phase 8 shadow
+    /// columns for @Unique constraints that include to-one links.
+    static bool is_machinery_column(const std::string& col) {
+        static const std::string suffix = "__link_gid";
+        return col.size() > suffix.size() &&
+               col.compare(col.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    void create_model_table(const model_schema& schema) {
+        std::vector<std::pair<std::string,column_type>> columns;
+        db_->execute(detail::ordinary_schema_recipe::model_table(schema,columns));
+
+        // Create audit triggers for sync/observation — with the schema's
+        // no_history set, and the marker ensure_audit_triggers compares on
+        // later opens (a fresh table took this path, not recreate_…).
+        std::set<std::string> no_history;
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::primitive && !prop.is_geo_bounds && prop.no_history) {
+                no_history.insert(prop.name);
+            }
+        }
+        create_model_table_triggers(schema.table_name, columns, no_history);
+        ensure_lattice_meta_table();
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {"trigger_flags:" + schema.table_name, no_history_marker(schema)});
+
+        // Create R*Tree tables for geo_bounds properties
+        for (const auto& prop : schema.properties) {
+            if (prop.is_geo_bounds) {
+                if (prop.kind == property_kind::list) {
+                    // geo_bounds list - create separate table with R*Tree
+                    ensure_geo_bounds_list_table(schema.table_name, prop.name);
+                } else {
+                    // Single geo_bounds - create R*Tree for main table columns
+                    ensure_rtree_table(schema.table_name, prop.name);
+                }
+            }
+        }
+    }
+
+    std::string sql_type_string(column_type type) {
+        switch (type) {
+            case column_type::integer: return "INTEGER";
+            case column_type::real: return "REAL";
+            case column_type::text: return "TEXT";
+            case column_type::blob: return "BLOB";
+        }
+        return "TEXT";
+    }
+
+public:
+    /// Per-property UNIQUE constraint indexes for the core table-DDL path.
+    ///
+    /// `property_descriptor::is_unique` survives into the schema fingerprint
+    /// but historically produced no DDL on this path — the CREATE UNIQUE INDEX
+    /// pass existed only in the Swift bridge's constraint-driven "Phase 8"
+    /// (ensure_swift_tables). Databases created through the core registry (or
+    /// through the C ABI before its is_unique→constraint canonicalization)
+    /// therefore never enforced uniqueness that Swift-created databases did.
+    ///
+    /// Naming MIRRORS the bridge's Phase 8 exactly: `unique_<table>_<i>`,
+    /// where i is the ordinal of the constraint for this table — here, the
+    /// ordinal of the is_unique property in schema declaration order, which is
+    /// the position the equivalent single-column constraint occupies in the
+    /// bridge's constraints vector for the same logical schema. Identical
+    /// names mean a database created by one path and reopened by the other
+    /// sees the index already present (IF NOT EXISTS) instead of growing a
+    /// second, differently-named unique index on the same column.
+    ///
+    /// Only primitive, non-geo properties are emitted (they are real columns
+    /// on the table). Link-kind uniques require the bridge's shadow-column
+    /// machinery; their ordinal is still consumed so names stay aligned.
+    ///
+    /// If duplicate data predates the constraint, deduplicate first (keep the
+    /// newest row per unique value) — same recovery the bridge pass performs.
+    void ensure_unique_property_indexes(const model_schema& schema) {
+        size_t ordinal = 0;
+        for (const auto& prop : schema.properties) {
+            if (!prop.is_unique) continue;
+            const size_t i = ordinal++;
+            if (prop.kind != property_kind::primitive || prop.is_geo_bounds) {
+                continue;  // no single base-table column to index; ordinal reserved
+            }
+            const std::string sql =
+                detail::ordinary_schema_recipe::core_unique_index(schema.table_name,i,prop.name);
+            try {
+                db_->execute(sql);
+            } catch (...) {
+                // Duplicate data exists — deduplicate (keep newest row per value).
+                LOG_WARN("lattice_db", "Deduplicating %s for unique constraint on (%s)",
+                         schema.table_name.c_str(), prop.name.c_str());
+                db_->execute(
+                    "DELETE FROM " + schema.table_name + " WHERE id NOT IN ("
+                    "SELECT MAX(id) FROM " + schema.table_name +
+                    " GROUP BY " + prop.name + ")");
+                db_->execute(sql);
+            }
+        }
+    }
+
+private:
+
+    void migrate_model_table(const model_schema& schema) {
+        LOG_INFO("migrate", "migrate_model_table: %s", schema.table_name.c_str());
+        // Get existing columns from database
+        auto existing = db_->get_table_info(schema.table_name);
+        LOG_INFO("migrate", "  existing columns: %zu", existing.size());
+        for (const auto& [col, type] : existing) {
+            LOG_DEBUG("migrate", "    existing: %s (%s)", col.c_str(), type.c_str());
+        }
+
+        // Build model schema map: column_name -> SQL_TYPE
+        // geo_bounds properties expand to 4 columns (but not geo_bounds lists)
+        std::unordered_map<std::string, std::string> model_cols;
+        model_cols["id"] = "INTEGER";
+        model_cols["globalId"] = "TEXT";
+        for (const auto& prop : schema.properties) {
+            // Skip list properties - they use separate tables (link_list, geo_bounds_list)
+            if (prop.kind == property_kind::list) {
+                continue;
+            }
+            if (prop.is_geo_bounds) {
+                model_cols[prop.name + "_minLat"] = "REAL";
+                model_cols[prop.name + "_maxLat"] = "REAL";
+                model_cols[prop.name + "_minLon"] = "REAL";
+                model_cols[prop.name + "_maxLon"] = "REAL";
+            } else {
+                model_cols[prop.name] = sql_type_string(prop.type);
+            }
+        }
+
+        // Find added, removed, and changed columns
+        std::vector<std::string> added;
+        std::vector<std::string> removed;
+        std::vector<std::string> changed;
+
+        for (const auto& [col, type] : model_cols) {
+            auto it = existing.find(col);
+            if (it == existing.end()) {
+                added.push_back(col);
+            } else if (it->second != type) {
+                changed.push_back(col);
+            }
+        }
+        for (const auto& [col, type] : existing) {
+            // Machinery columns (`<link>__link_gid` Phase-8 shadows) are not
+            // user schema — counting them as removals rebuilds the table on
+            // every open by any binary whose schema doesn't carry them.
+            if (is_machinery_column(col)) continue;
+            if (model_cols.find(col) == model_cols.end()) {
+                removed.push_back(col);
+            }
+        }
+
+        LOG_INFO("migrate", "  model columns: %zu, added: %zu, removed: %zu, changed: %zu",
+                 model_cols.size(), added.size(), removed.size(), changed.size());
+        for (const auto& col : added) {
+            LOG_INFO("migrate", "    + added: %s", col.c_str());
+        }
+        for (const auto& col : removed) {
+            LOG_INFO("migrate", "    - removed: %s", col.c_str());
+        }
+        for (const auto& col : changed) {
+            LOG_INFO("migrate", "    ~ changed: %s", col.c_str());
+        }
+
+        // No changes needed
+        if (added.empty() && removed.empty() && changed.empty()) {
+            // Still ensure geo_bounds LIST tables exist (they're separate join tables)
+            // Single geo_bounds rtrees are created in Phase 6 after all migrations
+            for (const auto& prop : schema.properties) {
+                if (prop.is_geo_bounds && prop.kind == property_kind::list) {
+                    ensure_geo_bounds_list_table(schema.table_name, prop.name);
+                }
+            }
+            // Retroactive safety: ensure audit triggers exist — a previous bug in
+            // rebuild_table could silently drop them during schema migration.
+            ensure_audit_triggers(schema);
+            return;
+        }
+
+        // Add new columns with ALTER TABLE
+        bool columns_added = false;
+        bool geo_bounds_added = false;
+        for (const auto& col : added) {
+            if (col == "id" || col == "globalId") continue;  // Built-in columns
+
+            // Check if this is a geo_bounds column (ends with _minLat, _maxLat, etc.)
+            bool is_geo_col = false;
+            std::string geo_prop_name;
+            for (const auto& prop : schema.properties) {
+                if (prop.is_geo_bounds) {
+                    if (col == prop.name + "_minLat" || col == prop.name + "_maxLat" ||
+                        col == prop.name + "_minLon" || col == prop.name + "_maxLon") {
+                        is_geo_col = true;
+                        geo_prop_name = prop.name;
+                        break;
+                    }
+                }
+            }
+
+            if (is_geo_col) {
+                // Add geo_bounds column (nullable REAL)
+                std::string sql = "ALTER TABLE " + schema.table_name +
+                    " ADD COLUMN " + col + " REAL";
+                db_->execute(sql);
+                columns_added = true;
+                geo_bounds_added = true;
+            } else {
+                // Find the property to get its type and default
+                for (const auto& prop : schema.properties) {
+                    if (prop.name == col) {
+                        std::string sql = "ALTER TABLE " + schema.table_name +
+                            " ADD COLUMN " + col + " " + sql_type_string(prop.type);
+                        if (!prop.nullable) {
+                            // For NOT NULL columns, need a DEFAULT
+                            switch (prop.type) {
+                                case column_type::integer: sql += " DEFAULT 0"; break;
+                                case column_type::real: sql += " DEFAULT 0.0"; break;
+                                case column_type::text: sql += " DEFAULT ''"; break;
+                                case column_type::blob: sql += " DEFAULT X''"; break;
+                            }
+                        }
+                        db_->execute(sql);
+                        columns_added = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Ensure geo_bounds LIST tables exist (these are separate join tables, not affected by migration timing)
+        for (const auto& prop : schema.properties) {
+            if (prop.is_geo_bounds && prop.kind == property_kind::list) {
+                ensure_geo_bounds_list_table(schema.table_name, prop.name);
+            }
+        }
+
+        // NOTE: rtree creation for single geo_bounds properties is deferred.
+        // During migration, columns are added first, then data is updated via apply_pending_updates(),
+        // and finally ensure_geo_bounds_rtrees() is called to create rtree tables with correct data.
+
+        // If columns were removed or changed type, need to rebuild the table
+        // (DROP COLUMN has limitations in SQLite, so always use rebuild for safety)
+        if (!removed.empty() || !changed.empty()) {
+            rebuild_table(schema, existing, model_cols);
+        } else if (columns_added) {
+            // Recreate triggers to include new columns in audit logging
+            recreate_model_table_triggers(schema);
+        }
+    }
+
+    void ensure_audit_triggers(const model_schema& schema) {
+        // Presence + INTEGRITY check. A real audit trigger always gates on
+        // sync_disabled(); if the insert trigger is missing OR its body lacks
+        // that gate — e.g. a hand-installed `WHEN (0)` stub squatting the
+        // name so a naive existence check passes forever — drop and recreate
+        // all three. This exact tampering silently killed all Memory sync on
+        // a production hub for six days (Jul 2026): every write after the
+        // stub produced no audit entry while every counter looked healthy.
+        // Tampering bumps the SQLite schema cookie, which invalidates the
+        // fingerprint marker and forces the slow path, so this check is
+        // guaranteed to run on the next open. (The old "if the insert
+        // trigger exists, all three do" assumption was also false in that
+        // incident — the UPDATE trigger had been dropped outright.)
+        auto rows = db_->query(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='Audit"
+            + schema.table_name + "Insert' LIMIT 1");
+        bool healthy = false;
+        if (!rows.empty()) {
+            auto it = rows[0].find("sql");
+            healthy = it != rows[0].end() &&
+                      std::holds_alternative<std::string>(it->second) &&
+                      std::get<std::string>(it->second).find("sync_disabled") != std::string::npos;
+            if (!healthy) {
+                LOG_ERROR("lattice_db",
+                          "audit trigger 'Audit%sInsert' exists WITHOUT a sync_disabled() "
+                          "gate (hand-tampered stub?) — recreating all audit triggers",
+                          schema.table_name.c_str());
+            }
+        }
+        // A flag-only schema change (a column gaining/losing no_history) adds
+        // no column, so the migration path lands here with nothing else to
+        // do — the marker comparison is what rebuilds the UPDATE trigger.
+        if (healthy && audit_trigger_flags_stale(schema)) {
+            LOG_INFO("lattice_db", "audit triggers for '%s' predate its no_history flags — recreating",
+                     schema.table_name.c_str());
+            healthy = false;
+        }
+        if (!healthy) {
+            recreate_model_table_triggers(schema);
+        }
+    }
+
+    void recreate_model_table_triggers(const model_schema& schema) {
+        // Drop existing triggers
+        drop_model_table_triggers(schema.table_name);
+
+        // Build column list for triggers
+        // geo_bounds properties expand to 4 columns
+        std::vector<std::pair<std::string, column_type>> columns;
+        std::set<std::string> no_history;
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::primitive) {
+                if (prop.is_geo_bounds) {
+                    columns.emplace_back(prop.name + "_minLat", column_type::real);
+                    columns.emplace_back(prop.name + "_maxLat", column_type::real);
+                    columns.emplace_back(prop.name + "_minLon", column_type::real);
+                    columns.emplace_back(prop.name + "_maxLon", column_type::real);
+                } else {
+                    columns.emplace_back(prop.name, prop.type);
+                    if (prop.no_history) no_history.insert(prop.name);
+                }
+            }
+        }
+
+        // Create new triggers with all columns
+        create_model_table_triggers(schema.table_name, columns, no_history);
+        // Remember which columns the installed triggers treat as no-history,
+        // so ensure_audit_triggers can tell "this store's triggers predate
+        // the flag" from "already current" without parsing trigger SQL.
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {"trigger_flags:" + schema.table_name, no_history_marker(schema)});
+    }
+
+    /// Sorted, comma-joined no_history column list — the value stored under
+    /// `_lattice_meta['trigger_flags:<table>']`. Empty when none.
+    static std::string no_history_marker(const model_schema& schema) {
+        std::set<std::string> names;
+        for (const auto& prop : schema.properties) {
+            if (prop.kind == property_kind::primitive && !prop.is_geo_bounds && prop.no_history) {
+                names.insert(prop.name);
+            }
+        }
+        std::string out;
+        for (const auto& n : names) { if (!out.empty()) out += ','; out += n; }
+        return out;
+    }
+
+    /// The installed triggers' no_history set differs from the schema's.
+    /// A store without the marker is "current" only when the schema has no
+    /// no_history columns — so stores that never used the flag do nothing,
+    /// and a model that GAINS the flag gets its triggers rebuilt once.
+    bool audit_trigger_flags_stale(const model_schema& schema) {
+        const std::string want = no_history_marker(schema);
+        std::string have;
+        try {
+            auto rows = db_->query("SELECT value FROM _lattice_meta WHERE key = ?",
+                                   {"trigger_flags:" + schema.table_name});
+            if (!rows.empty()) {
+                if (const auto* s = std::get_if<std::string>(&rows[0].at("value"))) have = *s;
+            }
+        } catch (...) {}
+        return want != have;
+    }
+
+    void rebuild_table(const model_schema& schema,
+                       const std::unordered_map<std::string, std::string>& existing,
+                       const std::unordered_map<std::string, std::string>& model_cols) {
+        const std::string& table = schema.table_name;
+        std::string tmp = table + "_old";
+        LOG_INFO("migrate", "rebuild_table: %s -> %s", table.c_str(), tmp.c_str());
+
+        // 1. Drop ALL triggers on this table before rename — SQLite preserves
+        //    trigger names after ALTER TABLE RENAME, so CREATE TRIGGER IF NOT
+        //    EXISTS would skip creation, leaving the new table without triggers
+        //    once the old table (and its triggers) are dropped. This affects
+        //    AuditLog, FTS5, vec0, and R*Tree sync triggers.
+        {
+            auto trigger_rows = db_->query(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='"
+                + table + "'");
+            for (const auto& row : trigger_rows) {
+                db_->execute("DROP TRIGGER IF EXISTS "
+                             + std::get<std::string>(row.at("name")));
+            }
+        }
+
+        // 2. Drop and recreate vec0 virtual tables for vector columns.
+        //    The INSERT INTO...SELECT in step 6 fires vec0 INSERT triggers
+        //    which create fresh entries. Without this drop, old entries from
+        //    the pre-rebuild table persist as orphans (same globalId gets a
+        //    new vec0 rowid while the old one stays, bloating chunk storage).
+        for (const auto& prop : schema.properties) {
+            if (prop.is_vector && prop.type == column_type::blob) {
+                std::string vec_table = "_" + table + "_" + prop.name + "_vec";
+                if (db_->table_exists(vec_table)) {
+                    LOG_INFO("migrate", "rebuild_table: dropping vec0 table %s", vec_table.c_str());
+                    db_->execute("DROP TABLE IF EXISTS " + vec_table);
+                    // Shadow tables are dropped automatically by vec0
+                }
+            }
+        }
+
+        // 3. Rename existing table
+        db_->execute("ALTER TABLE " + table + " RENAME TO " + tmp);
+
+        // 4. Create new table with correct schema (including fresh triggers)
+        create_model_table(schema);
+
+        // 4. Build column lists for INSERT
+        // - dest_cols: column names for the INSERT INTO clause
+        // - src_exprs: expressions for the SELECT clause (column name or default value)
+        std::vector<std::string> dest_cols;
+        std::vector<std::string> src_exprs;
+
+        dest_cols.push_back("id");
+        dest_cols.push_back("globalId");
+        src_exprs.push_back("id");
+        src_exprs.push_back("globalId");
+
+        for (const auto& prop : schema.properties) {
+            // Skip list properties - they use separate tables (link_list, geo_bounds_list)
+            if (prop.kind == property_kind::list) {
+                continue;
+            }
+            if (prop.is_geo_bounds) {
+                // geo_bounds expands to 4 columns
+                std::array<std::string, 4> suffixes = {"_minLat", "_maxLat", "_minLon", "_maxLon"};
+                for (const auto& suffix : suffixes) {
+                    std::string col_name = prop.name + suffix;
+                    dest_cols.push_back(col_name);
+                    if (existing.find(col_name) != existing.end()) {
+                        src_exprs.push_back(col_name);
+                    } else {
+                        src_exprs.push_back("0.0");  // Default for REAL geo columns
+                    }
+                }
+            } else {
+                dest_cols.push_back(prop.name);
+                if (existing.find(prop.name) != existing.end()) {
+                    // Column exists in old table - copy it
+                    src_exprs.push_back(prop.name);
+                } else {
+                    // New column - use default value
+                    std::string default_val;
+                    switch (prop.type) {
+                        case column_type::integer: default_val = "0"; break;
+                        case column_type::real: default_val = "0.0"; break;
+                        case column_type::text: default_val = "''"; break;
+                        case column_type::blob: default_val = "X''"; break;
+                    }
+                    src_exprs.push_back(default_val);
+                }
+            }
+        }
+
+        // 5. Copy data with defaults for new columns
+        std::string dest_str = dest_cols[0];
+        std::string src_str = src_exprs[0];
+        for (size_t i = 1; i < dest_cols.size(); ++i) {
+            dest_str += ", " + dest_cols[i];
+            src_str += ", " + src_exprs[i];
+        }
+        std::string copy_sql = "INSERT INTO " + table + " (" + dest_str + ") SELECT " + src_str + " FROM " + tmp;
+        LOG_INFO("migrate", "rebuild_table: copying data: %s", copy_sql.c_str());
+        // The copy is a schema-SHAPE operation, not user writes — it must
+        // not mint audit entries. The new table's audit triggers are already
+        // live here, and an unbracketed copy re-audits the ENTIRE table as
+        // fresh INSERTs (full payloads: ~218K rows per migration on a
+        // production hub, ~2.2M in one dev-loop day — the Aug 2026
+        // audit-explosion incident's largest local generator). Same
+        // _SyncControl bracket as generate_history/delete_rows_no_relay.
+        {
+            const int64_t prev_disabled = read_sync_disabled_flag();
+            db_->execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+            try {
+                db_->execute(copy_sql);
+                db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+            } catch (...) {
+                db_->execute("UPDATE _SyncControl SET disabled = ? WHERE id = 1", {prev_disabled});
+                throw;
+            }
+        }
+
+        // Verify row count after copy
+        auto count_rows = db_->query("SELECT COUNT(*) as cnt FROM " + table);
+        if (!count_rows.empty()) {
+            auto cnt = std::get<int64_t>(count_rows[0].at("cnt"));
+            LOG_INFO("migrate", "rebuild_table: %lld rows copied to %s", (long long)cnt, table.c_str());
+        }
+
+        // 6. Drop old table
+        LOG_INFO("migrate", "rebuild_table: dropping %s", tmp.c_str());
+        db_->execute("DROP TABLE " + tmp);
+
+        // 7. Populate rtree tables for geo_bounds properties (data now exists)
+        for (const auto& prop : schema.properties) {
+            if (prop.is_geo_bounds && prop.kind != property_kind::list) {
+                std::string rtree_table = "_" + table + "_" + prop.name + "_rtree";
+                std::string minLat = prop.name + "_minLat";
+                std::string maxLat = prop.name + "_maxLat";
+                std::string minLon = prop.name + "_minLon";
+                std::string maxLon = prop.name + "_maxLon";
+
+                std::ostringstream populate_sql;
+                populate_sql << "INSERT OR IGNORE INTO " << rtree_table << "(id, minLat, maxLat, minLon, maxLon) "
+                             << "SELECT id, " << minLat << ", " << maxLat << ", " << minLon << ", " << maxLon << " "
+                             << "FROM " << table << " "
+                             << "WHERE " << minLat << " IS NOT NULL";
+                db_->execute(populate_sql.str());
+            }
+        }
+    }
+
+    void ensure_link_tables() {
+        // Eagerly create junction tables for all registered schemas.
+        // Without this, link tables only exist after a local write — breaking
+        // receive() on relay/downstream nodes that never write locally.
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            for (const auto& prop : schema->properties) {
+                if (prop.kind == property_kind::virtual_list ||
+                    prop.kind == property_kind::virtual_link) {
+                    std::string table_name = "_" + schema->table_name + "_" + prop.name;
+                    ensure_virtual_link_table(table_name, schema->table_name);
+                } else if (prop.kind == property_kind::list && !prop.is_geo_bounds &&
+                           !prop.target_table.empty()) {
+                    std::string table_name = "_" + schema->table_name + "_" +
+                                             prop.target_table + "_" + prop.name;
+                    ensure_link_table(table_name, schema->table_name, prop.target_table);
+                } else if (prop.kind == property_kind::link && !prop.target_table.empty()) {
+                    std::string table_name = "_" + schema->table_name + "_" +
+                                             prop.target_table + "_" + prop.name;
+                    ensure_link_table(table_name, schema->table_name, prop.target_table);
+                }
+            }
+        }
+    }
+
+    /// In-memory-only counterpart of the ensure path for the write-free fast
+    /// path: populates the same registries (link-table buckets, virtual link
+    /// set, geo-list parent index) using the same naming rules as
+    /// ensure_link_tables() / ensure_geo_bounds_list_table(), but issues no
+    /// SQL writes — the tables provably exist when the fingerprint matches.
+    void note_tables_for_all_schemas() {
+        for (const auto* schema : schema_registry::instance().all_schemas()) {
+            for (const auto& prop : schema->properties) {
+                if (prop.kind == property_kind::virtual_list ||
+                    prop.kind == property_kind::virtual_link) {
+                    note_virtual_link_table("_" + schema->table_name + "_" + prop.name);
+                } else if (prop.kind == property_kind::list && prop.is_geo_bounds) {
+                    note_geo_list_table(schema->table_name,
+                                        "_" + schema->table_name + "_" + prop.name);
+                } else if ((prop.kind == property_kind::list ||
+                            prop.kind == property_kind::link) &&
+                           !prop.target_table.empty()) {
+                    note_link_table("_" + schema->table_name + "_" +
+                                    prop.target_table + "_" + prop.name,
+                                    prop.target_table);
+                }
+            }
+        }
+    }
+
+    void ensure_audit_log_table() {
+        // Create AuditLog table matching Lattice.swift's schema
+        std::string sql = detail::ordinary_schema_recipe::audit_table();
+        db_->execute(sql);
+
+        // A5 provenance column for pre-existing databases. Guarded ALTER —
+        // reaching it on the open fast path requires the
+        // kLatticeSchemaFormatEpoch bump (epoch 5).
+        try {
+            db_->execute("ALTER TABLE AuditLog ADD COLUMN synthesized INTEGER DEFAULT 0");
+        } catch (const std::exception&) {
+            // Column already exists.
+        }
+
+        // Partial index for sync queries — only indexes unsynchronized entries,
+        // which are the ones query_audit_log_for_sync needs to scan.
+        db_->execute(detail::ordinary_schema_recipe::audit_pending_index());
+
+        // Covering index for flush_changes' change→audit-entry lookups
+        // (pass 2: tableName+rowId+operation; pass 3 uses the tableName
+        // prefix). Without it each lookup is a full reverse scan — lethal
+        // on large AuditLogs during bulk applies. Existing DBs gain it via
+        // the kLatticeSchemaFormatEpoch bump (fingerprint slow path re-runs
+        // this guarded DDL).
+        db_->execute(detail::ordinary_schema_recipe::audit_lookup_index());
+    }
+
+    void ensure_sync_control_table() {
+        // Create _SyncControl table for temporarily disabling sync
+        db_->execute(detail::ordinary_schema_recipe::sync_control_table());
+        db_->execute(detail::ordinary_schema_recipe::sync_control_initial());
+
+        // Create _lattice_sync_set table for tracking filtered sync membership,
+        // scoped PER SYNCHRONIZER (sync_id). Two channels with different
+        // filters on one database must not share membership state: with the
+        // old shared shape, channel A's classify saw channel B's rows in the
+        // set and synthesized real DELETEs for them (`!matches && in_set`),
+        // and reconcile Phase 1 emitted filter-removal DELETEs for the other
+        // channel's rows — cross-channel mirror wipes.
+        db_->execute(detail::ordinary_schema_recipe::sync_set());
+
+        // Create _lattice_sync_state table for per-synchronizer sync tracking.
+        // Each row tracks whether a specific synchronizer has synced a given AuditLog entry.
+        // Absence of a row = pending for that sync_id.
+        db_->execute(detail::ordinary_schema_recipe::sync_state());
+        // Partial index for efficient pending-entry queries per sync_id
+        db_->execute(detail::ordinary_schema_recipe::sync_state_pending());
+
+        // Create _lattice_replication_slots table for slot-aware compaction.
+        // Each synchronizer registers a slot; compaction only deletes entries
+        // below the minimum confirmed_audit_id across all active slots.
+        db_->execute(detail::ordinary_schema_recipe::replication_slots());
+
+        // upload_floor: per-slot SCAN BOUND for query_audit_log_for_sync —
+        // invariant: no entry pending for this sync_id has id <= upload_floor.
+        // Strictly a bound, never the source of truth (the sync_state
+        // conditions remain authoritative), so an under-advanced floor is
+        // always safe: crash recovery is "re-scan a window the conditions
+        // filter back out". Distinct from confirmed_audit_id, which advances
+        // to ACK-chunk MAX and can therefore sit above still-unACKed lower
+        // entries. Guarded ALTER for existing DBs — reaching it on the open
+        // fast path requires the kLatticeSchemaFormatEpoch bump below.
+        try {
+            db_->execute(
+                detail::ordinary_schema_recipe::replication_upload_floor());
+        } catch (const std::exception&) {
+            // Column already exists.
+        }
+
+        // Runs AFTER the slots table exists — the rebuild's attribution rule
+        // reads it. Reaching this on existing DBs requires the
+        // kLatticeSchemaFormatEpoch bump (same contract as the ALTER above).
+        migrate_sync_set_to_per_sync_id();
+        ensure_cursor_column(*db_);
+    }
+
+    /// One-time rebuild of _lattice_sync_set from the pre-per-sync_id shape
+    /// (PK (table_name, global_row_id), no sync_id column).
+    ///
+    /// Attribution rule: when exactly ONE replication slot exists, all
+    /// existing membership rows belong to it (the filtered-hub topology that
+    /// produced them — a single filtered IPC synchronizer; unfiltered
+    /// synchronizers never touch the set). With zero or multiple slots the
+    /// rows are dropped: multi-slot databases hold no filtered synchronizers
+    /// today, so their sets are empty/unused, and reconcile Phase 2
+    /// re-synthesizes membership idempotently if that assumption is ever
+    /// wrong (bandwidth-only cost, surfaced by the Phase-2 synthesis-count
+    /// soak metric).
+    void migrate_sync_set_to_per_sync_id() {
+        auto cols = db_->query("PRAGMA table_info(_lattice_sync_set)");
+        if (cols.empty()) return;  // no table (fresh DB creates the new shape above)
+        for (const auto& c : cols) {
+            auto it = c.find("name");
+            if (it != c.end() && std::holds_alternative<std::string>(it->second)
+                && std::get<std::string>(it->second) == "sync_id") {
+                return;  // already the per-sync_id shape
+            }
+        }
+
+        std::string attributed_sync_id;
+        auto slots = db_->query("SELECT sync_id FROM _lattice_replication_slots");
+        if (slots.size() == 1) {
+            auto it = slots[0].find("sync_id");
+            if (it != slots[0].end() && std::holds_alternative<std::string>(it->second)) {
+                attributed_sync_id = std::get<std::string>(it->second);
+            }
+        }
+
+        const bool was_in_txn = db_->is_in_transaction();
+        if (!was_in_txn) db_->begin_transaction();
+        try {
+            db_->execute("ALTER TABLE _lattice_sync_set RENAME TO _lattice_sync_set_v1");
+            db_->execute(R"(
+                CREATE TABLE _lattice_sync_set (
+                    sync_id TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    global_row_id TEXT NOT NULL,
+                    PRIMARY KEY (sync_id, table_name, global_row_id)
+                )
+            )");
+            if (!attributed_sync_id.empty()) {
+                db_->execute(
+                    "INSERT INTO _lattice_sync_set (sync_id, table_name, global_row_id) "
+                    "SELECT ?, table_name, global_row_id FROM _lattice_sync_set_v1",
+                    {attributed_sync_id});
+            }
+            db_->execute("DROP TABLE _lattice_sync_set_v1");
+            if (!was_in_txn) db_->commit();
+        } catch (...) {
+            if (!was_in_txn && db_->is_in_transaction()) {
+                try { db_->rollback(); } catch (...) {}
+            }
+            throw;
+        }
+        LOG_INFO("lattice_db", "migrated _lattice_sync_set to per-sync_id shape (%s)",
+                 attributed_sync_id.empty() ? "dropped rows: no single-slot attribution"
+                                            : ("attributed to " + attributed_sync_id).c_str());
+    }
+
+    /// Register per-connection SQL functions. This is connection state, not a
+    /// database write — it must run on EVERY open, including the write-free
+    /// fast path (triggers reference sync_disabled() at execution time).
+    void register_sql_functions() { register_sql_functions(*db_); }
+    void register_sql_functions(database& connection) {
+        // sync_disabled() lets triggers check if sync is disabled
+        sqlite3_create_function(
+            connection.internal_handle(),
+            "sync_disabled",
+            0,  // No arguments
+            SQLITE_UTF8,
+            connection.internal_handle(),  // Pass db handle as user data
+            [](sqlite3_context* ctx, int, sqlite3_value**) {
+                sqlite3* db = static_cast<sqlite3*>(sqlite3_user_data(ctx));
+                sqlite3_stmt* stmt = nullptr;
+                int disabled = 0;
+
+                if (sqlite3_prepare_v2(db, "SELECT disabled FROM _SyncControl WHERE id=1", -1, &stmt, nullptr) == SQLITE_OK) {
+                    if (sqlite3_step(stmt) == SQLITE_ROW) {
+                        disabled = sqlite3_column_int(stmt, 0);
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_result_int(ctx, disabled);
+            },
+            nullptr,
+            nullptr
+        );
+    }
+
+protected:
+    // ========================================================================
+    // Schema Version Management (protected for swift_lattice access)
+    // ========================================================================
+
+    void ensure_lattice_meta_table() {
+        db_->execute(detail::ordinary_schema_recipe::metadata_table());
+        // Initialize schema version to 1 if not set
+        db_->execute(detail::ordinary_schema_recipe::metadata_initial_version());
+    }
+
+    // ========================================================================
+    // Schema fingerprint fast path
+    //
+    // Steady-state opens of an unchanged database are write-free: a marker row
+    // in _lattice_meta records (fingerprint of the binary's registered schemas
+    // → SQLite schema cookie at the time the schemas were last ensured). When
+    // the marker matches and the cookie hasn't moved, every CREATE/INSERT in
+    // the ensure path is provably a no-op and is skipped entirely — no write
+    // lock is taken at open. Any DDL by any process bumps the cookie and
+    // forces one slow-path revalidation, which re-stores the marker.
+    // ========================================================================
+
+    /// Bump this whenever the SQL *templates* for internal DDL change:
+    /// audit/link/shadow trigger bodies, internal table DDL (_SyncControl,
+    /// _lattice_meta, AuditLog, link/virtual-link/geo-list/union tables),
+    /// vec0/FTS5/R*Tree creation SQL. Existing databases only re-run the
+    /// ensure path when the fingerprint changes — a template edit without an
+    /// epoch bump leaves stale triggers in already-fingerprinted databases.
+    ///
+    /// Epoch 2: _lattice_replication_slots gained upload_floor (guarded
+    /// ALTER in ensure_sync_control_table — without this bump the fast path
+    /// skips the ALTER on every existing DB and the sync engine SELECTs a
+    /// missing column on its hot path).
+    ///
+    /// Epoch 3: AuditLog gained idx_audit_log_change_lookup (covering index
+    /// for flush_changes' change→audit lookups; guarded CREATE INDEX in
+    /// ensure_audit_log_table). Folded into the same unreleased train as
+    /// epoch 2 — no released binary ever wrote an epoch-2 marker.
+    ///
+    /// Epoch 4: the core ensure path gained the per-property unique-index
+    /// pass (ensure_unique_property_indexes: guarded CREATE UNIQUE INDEX
+    /// `unique_<table>_<i>`, mirroring the bridge's Phase 8 naming).
+    /// `is_unique` was ALREADY serialized in stored fingerprints while
+    /// emitting no DDL, so an existing fingerprinted database whose schema
+    /// carries the flag would fast-path past the new pass forever without
+    /// this bump. (On the bridge path the C ABI's is_unique→constraint
+    /// canonicalization changes the swift fingerprint for affected DBs
+    /// anyway; the bump makes the revalidation guarantee uniform across
+    /// both fingerprint families.) All new DDL is guarded/absent-object —
+    /// auto-migration-safe on revalidation. RELEASED in 1.0.1 — this number
+    /// is burned; anything later takes the next one.
+    ///
+    /// Epoch 5: _lattice_sync_set rebuilt to the per-sync_id shape
+    /// (migrate_sync_set_to_per_sync_id in ensure_sync_control_table —
+    /// without this bump the fast path skips the rebuild on every existing
+    /// DB and the sync engine binds a sync_id column that doesn't exist).
+    /// Renumbered from 4 during the rebase onto 1.0.1: this branch and the
+    /// released unique-index pass both originally claimed 4.
+    ///
+    /// Epoch 6: AuditLog gained the `synthesized` provenance column (A5
+    /// insert-if-absent semantics for locally-synthesized full-row
+    /// snapshots; guarded ALTER in ensure_audit_log_table). Epoch 5 ships
+    /// alone as Engram Groups increment 0; this train is increment 1.
+    /// Renumbered from 5 by the same rebase.
+    /// Epoch 7: generated vec0 programs gain empty/NULL update clearing.
+    /// Both Core and Swift fingerprint families must revalidate old sidecar
+    /// metadata. This does not backfill already-stale untouched index rows.
+    // Epoch 8 adds the durable receive-delivery guard before producer/schema
+    // admission. Legacy origins remain explicitly unverified until recovery.
+    static constexpr int kLatticeSchemaFormatEpoch = 8;
+
+public:
+    /// Public accessor for the schema-format epoch (exposed on the C ABI as
+    /// lattice_schema_format_epoch()). The constant itself stays protected
+    /// with the rest of the fingerprint machinery above.
+    static constexpr int schema_format_epoch() noexcept { return kLatticeSchemaFormatEpoch; }
+
+protected:
+    static uint64_t fnv1a_hash(const std::string& s) {
+        uint64_t h = 1469598103934665603ULL;
+        for (unsigned char c : s) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    /// Canonical serialization of one property covering every DDL-driving
+    /// attribute. If an attribute can change the generated DDL (columns,
+    /// indexes, FTS5, vec0, R*Tree, union tables), it MUST appear here —
+    /// otherwise a code change to that attribute is silently skipped forever.
+    static void serialize_property_for_fingerprint(std::ostringstream& out,
+                                                   const property_descriptor& p) {
+        out << p.name << '\x01'
+            << static_cast<int>(p.type) << '\x01'
+            << static_cast<int>(p.kind) << '\x01'
+            << (p.nullable ? 1 : 0)
+            << (p.is_vector ? 1 : 0)
+            << (p.is_geo_bounds ? 1 : 0)
+            << (p.is_full_text ? 1 : 0)
+            << (p.is_indexed ? 1 : 0)
+            << (p.is_unique ? 1 : 0)
+            << (p.is_union ? 1 : 0)
+            << (p.no_history ? 1 : 0) << '\x01'
+            << p.target_table << '\x01'
+            << p.link_table << '\x01'
+            << p.column_name;
+        if (p.is_union) {
+            out << '\x02' << p.union_desc.union_table_name;
+            for (const auto& c : p.union_desc.cases) {
+                out << '\x03' << c.case_name;
+                for (const auto& v : c.values) {
+                    out << '\x04' << v.param_name << '\x01'
+                        << static_cast<int>(v.type)
+                        << (v.is_link ? 1 : 0) << '\x01'
+                        << v.link_target;
+                }
+            }
+        }
+        out << '\n';
+    }
+
+    /// Fingerprint key for the C++ schema registry (the core layer's view).
+    /// Schemas are sorted by table name — the registry is an unordered_map, so
+    /// iteration order is not stable across runs.
+    std::string compute_core_fingerprint_key() const {
+        std::ostringstream out;
+        out << "epoch:" << kLatticeSchemaFormatEpoch << '\n'
+            << "target_schema_version:" << config_.target_schema_version << '\n';
+        std::vector<const model_schema*> schemas;
+        if(recovery_schemas_.valid()) {
+            for(const auto& [name,schema]:recovery_schemas_.models)
+                if(!recovery_schemas_.swift_models.count(name))schemas.push_back(&schema);
+        } else {
+            // Outside the private recovery bounds, ordinary opening retains
+            // its existing schema behavior. Recovery admission refuses first.
+            schemas=schema_registry::instance().all_schemas();
+        }
+        std::sort(schemas.begin(), schemas.end(),
+                  [](const model_schema* a, const model_schema* b) {
+                      return a->table_name < b->table_name;
+                  });
+        for (const auto* schema : schemas) {
+            out << "table:" << schema->table_name << '\n';
+            for (const auto& prop : schema->properties) {
+                serialize_property_for_fingerprint(out, prop);
+            }
+        }
+        std::ostringstream hex;
+        hex << std::hex << std::setfill('0') << std::setw(16) << fnv1a_hash(out.str());
+        return "schema_fingerprint:" + hex.str();
+    }
+
+    /// Current value of SQLite's schema cookie. Bumped by any DDL from any
+    /// connection/process (and read inside an open transaction it reflects
+    /// in-transaction DDL on this connection).
+    int64_t read_schema_cookie() const {
+        auto rows = db_->query("PRAGMA schema_version");
+        if (rows.empty() || rows[0].empty()) return -1;
+        const auto& v = rows[0].begin()->second;
+        if (const auto* i = std::get_if<int64_t>(&v)) return *i;
+        if (const auto* s = std::get_if<std::string>(&v)) return std::atoll(s->c_str());
+        return -1;
+    }
+
+    /// Check the fingerprint marker WITHOUT wrapping in a transaction.
+    /// Call either inside an explicit read transaction (fast-path probe) or
+    /// inside the slow path's IMMEDIATE transaction (double-checked locking).
+    bool fingerprint_marker_valid_in_txn(const std::string& key) const {
+        if (!db_->table_exists("_lattice_meta")) return false;  // fresh DB
+        auto rows = db_->query("SELECT value FROM _lattice_meta WHERE key = ?", {key});
+        if (rows.empty()) return false;
+        const auto* stored = std::get_if<std::string>(&rows[0].at("value"));
+        if (!stored) return false;
+        int64_t stored_cookie = std::atoll(stored->c_str());
+        int64_t current_cookie = read_schema_cookie();
+        return current_cookie >= 0 && stored_cookie == current_cookie;
+    }
+
+    /// Fast-path probe: marker + cookie read under one read transaction so the
+    /// pair can't be torn by concurrent DDL between the two statements.
+    bool fingerprint_marker_valid(const std::string& key) const {
+        bool valid = false;
+        try {
+            db_->execute("BEGIN");
+            valid = fingerprint_marker_valid_in_txn(key);
+            db_->execute("COMMIT");
+        } catch (const db_error&) {
+            try { db_->execute("ROLLBACK"); } catch (...) {}
+            valid = false;
+        }
+        return valid;
+    }
+
+    /// Store/refresh the marker for `key` with the current schema cookie.
+    /// Must run inside the slow path's transaction, AFTER all DDL, so the
+    /// captured cookie reflects this pass's schema changes. Prunes markers
+    /// whose cookie no longer matches (they would revalidate anyway).
+    void store_fingerprint_marker(const std::string& key) {
+        int64_t cookie = read_schema_cookie();
+        if (cookie < 0) return;
+        const std::string cookie_str = std::to_string(cookie);
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES(?, ?)",
+                     {key, cookie_str});
+        db_->execute(
+            "DELETE FROM _lattice_meta WHERE key LIKE 'schema_fingerprint:%' "
+            "AND key <> ? AND value <> ?",
+            {key, cookie_str});
+    }
+
+    void store_recovery_fingerprints() {
+        store_fingerprint_marker(compute_core_fingerprint_key());
+        if(!recovery_schemas_.swift_fingerprint.empty())
+            store_fingerprint_marker(recovery_schemas_.swift_fingerprint);
+    }
+
+    /// Register a table as internal. Its AuditLog entries will be used for sync
+    /// but not surfaced to external observers (e.g. changeStream).
+    /// The parent_table is stored as the value — changes to the internal table
+    /// are translated into UPDATE notifications on the parent table.
+    void register_internal_table(const std::string& table_name, const std::string& parent_table = "") {
+        db_->execute(
+            "INSERT OR IGNORE INTO _lattice_meta(key, value) VALUES(?, ?)",
+            {"internal_table:" + table_name, parent_table}
+        );
+    }
+
+    /// Store a schema snapshot as JSON for a specific version.
+    /// This allows us to recreate old schema during incremental migrations.
+    void store_schema_snapshot(int version, const std::vector<model_schema>& schemas) {
+        std::ostringstream json;
+        json << "{";
+        bool first_table = true;
+        for (const auto& schema : schemas) {
+            if (!first_table) json << ",";
+            first_table = false;
+            json << "\"" << schema.table_name << "\":{";
+            bool first_prop = true;
+            for (const auto& prop : schema.properties) {
+                if (!first_prop) json << ",";
+                first_prop = false;
+                json << "\"" << prop.name << "\":{";
+                json << "\"type\":" << static_cast<int>(prop.type) << ",";
+                json << "\"kind\":" << static_cast<int>(prop.kind) << ",";
+                json << "\"nullable\":" << (prop.nullable ? "true" : "false") << ",";
+                json << "\"is_vector\":" << (prop.is_vector ? "true" : "false") << ",";
+                json << "\"is_geo_bounds\":" << (prop.is_geo_bounds ? "true" : "false");
+                if (!prop.target_table.empty()) {
+                    json << ",\"target_table\":\"" << prop.target_table << "\"";
+                }
+                if (!prop.link_table.empty()) {
+                    json << ",\"link_table\":\"" << prop.link_table << "\"";
+                }
+                json << "}";
+            }
+            json << "}";
+        }
+        json << "}";
+
+        // Escape single quotes for SQL
+        std::string json_str = json.str();
+        std::string escaped;
+        for (char c : json_str) {
+            if (c == '\'') escaped += "''";
+            else escaped += c;
+        }
+
+        db_->execute("INSERT OR REPLACE INTO _lattice_meta(key, value) VALUES('schema_v"
+                     + std::to_string(version) + "', '" + escaped + "')");
+    }
+
+    /// Get the schema snapshot for a specific version.
+    /// Returns empty string if not found.
+    std::string get_schema_snapshot(int version) {
+        auto results = db_->query("SELECT value FROM _lattice_meta WHERE key = 'schema_v"
+                                  + std::to_string(version) + "'");
+        if (!results.empty()) {
+            return std::get<std::string>(results[0].at("value"));
+        }
+        return "";
+    }
+
+    void drop_model_table_triggers(const std::string& table_name) {
+        db_->execute("DROP TRIGGER IF EXISTS AuditLog_Update_" + table_name);
+        db_->execute("DROP TRIGGER IF EXISTS Audit" + table_name + "Insert");
+        db_->execute("DROP TRIGGER IF EXISTS Audit" + table_name + "Delete");
+    }
+
+    void create_model_table_triggers(const std::string& table_name,
+                                      const std::vector<std::pair<std::string, column_type>>& columns,
+                                      const std::set<std::string>& no_history = {},
+                                      const std::string& canonical_receipt_tail = {},
+                                      std::vector<std::string>* emitted = nullptr) {
+        if (!emitted && detail::preserve_recovery_local_producer_relation(*db_, table_name)) return;
+        // Skip if no columns to track
+        if (columns.empty()) return;
+
+        // Helper to wrap BLOB columns with hex() for JSON compatibility
+        auto value_expr = [](const std::string& prefix, const std::string& col, column_type type) {
+            if (type == column_type::blob) {
+                return "hex(" + prefix + "." + col + ")";
+            }
+            return prefix + "." + col;
+        };
+
+        // Build the changed fields comparison for UPDATE trigger
+        std::string update_when_clause;
+        std::string json_fields;
+        std::string json_names;
+
+        for (size_t i = 0; i < columns.size(); ++i) {
+            const auto& [col, type] = columns[i];
+            if (i > 0) {
+                update_when_clause += " OR ";
+                json_fields += ",";
+                json_names += ",";
+            }
+            update_when_clause += "OLD." + col + " IS NOT NEW." + col;
+            // For UPDATE: only include changed fields (simple values like Swift's format).
+            // A no_history column records THAT it changed (it still gates the
+            // trigger and appears in changedFieldsNames) but never its value:
+            // a streamed column rewritten ~10×/s otherwise copies its whole,
+            // growing body into every audit row (a 325 KB think block left
+            // 1.5 GB of history). Sync late-binds the live value at upload.
+            if (no_history.count(col)) {
+                json_fields += "'" + col + "', NULL";
+            } else {
+                json_fields += "'" + col + "', "
+                    "CASE WHEN OLD." + col + " IS NOT NEW." + col + " THEN " + value_expr("NEW", col, type) + " ELSE NULL END";
+            }
+            json_names += "CASE WHEN OLD." + col + " IS NOT NEW." + col + " THEN '" + col + "' ELSE NULL END";
+        }
+
+        // INSERT JSON (all fields)
+        std::string insert_json_fields;
+        std::string insert_json_names;
+        for (size_t i = 0; i < columns.size(); ++i) {
+            const auto& [col, type] = columns[i];
+            if (i > 0) {
+                insert_json_fields += ",";
+                insert_json_names += ",";
+            }
+            insert_json_fields += "'" + col + "', " + value_expr("NEW", col, type);
+            insert_json_names += "'" + col + "'";
+        }
+
+        // DELETE JSON (all old fields)
+        std::string delete_json_fields;
+        std::string delete_json_names;
+        for (size_t i = 0; i < columns.size(); ++i) {
+            const auto& [col, type] = columns[i];
+            if (i > 0) {
+                delete_json_fields += ",";
+                delete_json_names += ",";
+            }
+            delete_json_fields += "'" + col + "', " + value_expr("OLD", col, type);
+            delete_json_names += "'" + col + "'";
+        }
+
+        // UPDATE trigger
+        std::string update_trigger = "CREATE TRIGGER IF NOT EXISTS AuditLog_Update_" + table_name +
+            " AFTER UPDATE ON " + table_name +
+            " WHEN ((sync_disabled() = 0) AND (" + update_when_clause + "))"
+            " BEGIN"
+            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
+            "   VALUES ("
+            "       '" + table_name + "',"
+            "       'UPDATE',"
+            "       OLD.id,"
+            "       OLD.globalId,"
+            "       json_object(" + json_fields + "),"
+            "       json_array(" + json_names + "),"
+            "       unixepoch('subsec')"
+            "   );" + canonical_receipt_tail +
+            " END";
+        if (emitted) emitted->push_back(update_trigger); else db_->execute(update_trigger);
+
+        // INSERT trigger
+        std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Insert"
+            " AFTER INSERT ON " + table_name +
+            " WHEN (sync_disabled() = 0)"
+            " BEGIN"
+            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
+            "   VALUES ("
+            "       '" + table_name + "',"
+            "       'INSERT',"
+            "       NEW.id,"
+            "       NEW.globalId,"
+            "       json_object(" + insert_json_fields + "),"
+            "       json_array(" + insert_json_names + "),"
+            "       unixepoch('subsec')"
+            "   );" + canonical_receipt_tail +
+            " END";
+        if (emitted) emitted->push_back(insert_trigger); else db_->execute(insert_trigger);
+
+        // DELETE trigger
+        std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + table_name + "Delete"
+            " AFTER DELETE ON " + table_name +
+            " WHEN (sync_disabled() = 0)"
+            " BEGIN"
+            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
+            "   VALUES ("
+            "       '" + table_name + "',"
+            "       'DELETE',"
+            "       OLD.id,"
+            "       OLD.globalId,"
+            "       json_object(" + delete_json_fields + "),"
+            "       json_array(" + delete_json_names + "),"
+            "       unixepoch('subsec')"
+            "   );" + canonical_receipt_tail +
+            " END";
+        if (emitted) emitted->push_back(delete_trigger); else db_->execute(delete_trigger);
+    }
+
+    void create_link_table_triggers(const std::string& link_table_name,
+                                    const std::string& canonical_receipt_tail = {},
+                                    std::vector<std::string>* emitted = nullptr) {
+        if (!emitted && detail::preserve_recovery_local_producer_relation(*db_, link_table_name)) return;
+        if (!emitted && db_->canonical_trigger_only_) {
+            detail::require_canonical_relation(*db_, link_table_name);
+            return; // Exact fixed-scope programs were validated at attachment.
+        }
+        // INSERT trigger for link table
+        std::string insert_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Insert"
+            " AFTER INSERT ON " + link_table_name +
+            " WHEN (sync_disabled() = 0)"
+            " BEGIN"
+            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
+            "   VALUES ("
+            "       '" + link_table_name + "',"
+            "       'INSERT',"
+            "       0,"
+            "       NEW.globalId,"
+            "       json_object('lhs', NEW.lhs, 'rhs', NEW.rhs),"
+            "       json_array('lhs', 'rhs'),"
+            "       unixepoch('subsec')"
+            "   );" + canonical_receipt_tail +
+            " END";
+        if (emitted) emitted->push_back(insert_trigger); else db_->execute(insert_trigger);
+
+        // DELETE trigger for link table
+        std::string delete_trigger = "CREATE TRIGGER IF NOT EXISTS Audit" + link_table_name + "Delete"
+            " AFTER DELETE ON " + link_table_name +
+            " WHEN (sync_disabled() = 0)"
+            " BEGIN"
+            "   INSERT INTO AuditLog (tableName, operation, rowId, globalRowId, changedFields, changedFieldsNames, timestamp)"
+            "   VALUES ("
+            "       '" + link_table_name + "',"
+            "       'DELETE',"
+            "       0,"
+            "       OLD.globalId,"
+            "       json_object('lhs', OLD.lhs, 'rhs', OLD.rhs),"
+            "       json_array('lhs', 'rhs'),"
+            "       unixepoch('subsec')"
+            "   );" + canonical_receipt_tail +
+            " END";
+        if (emitted) emitted->push_back(delete_trigger); else db_->execute(delete_trigger);
+    }
+
+    void create_virtual_link_table_triggers(const std::string& link_table_name) {
+        for(const auto& sql:detail::ordinary_schema_recipe::virtual_link_audit(link_table_name))db_->execute(sql);
+    }
+
+    std::string generate_global_id() {
+        // Independent stores have independent write gates, but share this
+        // generator. Serialize both draws as one UUID; formatting needs no lock.
+        static std::mutex generator_mutex;
+        uint64_t a, b;
+        {
+            std::lock_guard<std::mutex> lock(generator_mutex);
+            static std::random_device rd;
+            static std::mt19937_64 gen(rd());
+            static std::uniform_int_distribution<uint64_t> dis;
+            a = dis(gen);
+            b = dis(gen);
+        }
+
+        a = (a & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
+        b = (b & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+
+        std::ostringstream ss;
+        ss << std::hex << std::setfill('0');
+        ss << std::setw(8) << ((a >> 32) & 0xFFFFFFFF) << "-";
+        ss << std::setw(4) << ((a >> 16) & 0xFFFF) << "-";
+        ss << std::setw(4) << (a & 0xFFFF) << "-";
+        ss << std::setw(4) << ((b >> 48) & 0xFFFF) << "-";
+        ss << std::setw(12) << (b & 0xFFFFFFFFFFFFULL);
+
+        return ss.str();
+    }
+
+protected:
+    int get_schema_version() {
+        auto results = db_->query("SELECT value FROM _lattice_meta WHERE key = 'schema_version'");
+        if (!results.empty()) {
+            return std::stoi(std::get<std::string>(results[0].at("value")));
+        }
+        return 1;  // Default version
+    }
+
+    void set_schema_version(int version) {
+        db_->execute("UPDATE _lattice_meta SET value = '" + std::to_string(version) + "' WHERE key = 'schema_version'");
+    }
+    
+    // Exposed for swift_lattice to create tables from Swift schemas
+    void create_model_table_public(const model_schema& schema) {
+        create_model_table(schema);
+    }
+
+    // Exposed for swift_lattice to migrate tables from Swift schemas
+    void migrate_model_table_public(const model_schema& schema) {
+        migrate_model_table(schema);
+    }
+
+    // Exposed for swift_lattice to detect changes before migration
+    table_changes detect_table_changes_public(const model_schema& schema) {
+        return detect_table_changes(schema);
+    }
+
+    template<typename T>
+    managed<T> hydrate(const database::row_t& row) {
+        const auto& schema = managed<T>::schema();
+        return hydrate<T>(row, schema.table_name);
+    }
+
+    // Hydrate with explicit table name (for dynamic objects like swift_dynamic_object)
+    template<typename T>
+    managed<T> hydrate(const database::row_t& row, const std::string& table_name) {
+        managed<T> obj;
+
+        // Set base properties
+        auto id_it = row.find("id");
+        if (id_it != row.end()) {
+            obj.id_ = std::get<int64_t>(id_it->second);
+        }
+
+        auto gid_it = row.find("globalId");
+        if (gid_it != row.end()) {
+            obj.global_id_ = std::get<std::string>(gid_it->second);
+        }
+
+        obj.lattice_ = this;
+
+        // If _source column present (from same-model UNION attach view),
+        // qualify table_name so lazy reads/writes target the correct schema.
+        auto source_it = row.find("_source");
+        if (source_it != row.end() && std::holds_alternative<std::string>(source_it->second)) {
+            auto source_schema = std::get<std::string>(source_it->second);
+            obj.table_name_ = source_schema + "." + table_name;
+            auto token_it = row.find("_lattice_attach_token");
+            obj.attachment_token_ = source_schema == "main" ? 0 : -1;
+            if (source_schema != "main" && token_it != row.end() &&
+                std::holds_alternative<int64_t>(token_it->second) &&
+                std::get<int64_t>(token_it->second) > 0) {
+                obj.attachment_token_ = std::get<int64_t>(token_it->second);
+            }
+            if (source_schema != "main") {
+                // Capture pointer + weak identity from one writer publication.
+                // Include missing-token rows so access fails as an invalid
+                // managed route instead of silently becoming unmanaged.
+                std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+                auto writer = db_;
+                obj.db_ = writer.get();
+                obj.attachment_writer_ = writer;
+            } else {
+                // Main hydration retains its existing inexpensive path.
+                obj.db_ = db_.get();
+            }
+        } else {
+            obj.db_ = db_.get();
+            obj.table_name_ = table_name;
+        }
+
+        // Model identity is metadata of the managed wrapper. T itself is the
+        // unmanaged dynamic value and has no .source member. Keep this apart
+        // from row-value hydration so live fields remain statement-fresh.
+        if constexpr (has_source_member<managed<T>>::value) {
+            obj.source.table_name = table_name;
+        }
+
+        // Populate the source object's values from the row
+        if constexpr (has_source_member<T>::value) {
+            for (const auto& [key, value] : row) {
+                if (key != "id" && key != "globalId" && key != "_source" && key != "_lattice_attach_token") {
+                    obj.source.values[key] = value;
+                }
+            }
+            obj.source.table_name = table_name;
+        }
+
+        // Bind properties to DB
+        obj.bind_to_db();
+
+        return obj;
+    }
+
+private:
+    // Original declarations and ordering are preserved inside the actual
+    // owning allocation, so creator-process automatic teardown is unchanged.
+    // The wrapper retains only non-owning references plus the native holder.
+    struct owned_resources {
+        std::mutex invalidation_hooks_mutex_;
+        std::vector<std::pair<uint64_t, invalidation_hook_detailed_fn>> invalidation_hooks_;
+        uint64_t next_invalidation_hook_token_ = 1;
+        std::function<void()> test_hook_generation_query_gap_;
+        std::mutex read_pool_mutex_;
+        std::vector<std::shared_ptr<read_generation>> live_generations_;
+        std::vector<std::shared_ptr<database>> idle_read_pool_;
+        size_t read_pool_capacity_ = 3;
+        uint64_t next_read_generation_id_ = 1;
+        std::atomic<int64_t> read_generation_ttl_ms_{30'000};
+        std::atomic<int64_t> read_generation_max_age_ms_{300'000};
+        std::atomic<int64_t> wal_keeper_eviction_threshold_bytes_{16ll << 20};
+        std::atomic<bool> wal_eviction_pending_{false};
+        int64_t wal_page_size_ = 4096;
+        std::shared_ptr<std::recursive_timed_mutex> store_write_gate_;
+        std::function<void(const char*, const char*)> test_hook_vec0_maintenance_;
+        std::recursive_timed_mutex vec0_memory_maintenance_gate_;
+        std::vector<std::string> attached_aliases_;
+        mutable std::mutex attach_mutex_;
+        std::vector<std::pair<std::string, std::string>> attached_dbs_;
+        std::unordered_map<std::string, int64_t> attached_route_tokens_;
+        std::unordered_map<int64_t, std::shared_ptr<const void>> attached_route_metadata_;
+        int64_t next_attachment_token_ = 1;
+        std::set<std::string> attached_view_names_;
+        std::map<std::string, std::string> attached_view_sql_;
+        std::map<std::string, std::shared_ptr<const physical_store_identity>> attached_projection_identities_;
+        bool attachment_topology_valid_ = true;
+        std::map<std::string,std::shared_ptr<const detail::ordinary_cohort_attachment_binding>> attached_cohort_bindings_;
+        bool ordinary_schema_initialized_here_=false;
+        std::shared_ptr<const detail::ordinary_child_origin> ordinary_child_origin_;
+        std::shared_ptr<detail::database_open_ledger> connection_ledger_; // Installed before every constructor-owned native open.
+        std::atomic<bool> ordinary_connection_construction_seen_{false};
+        detail::ordinary_shared_publication<detail::ordinary_history_child_connections> ordinary_history_child_connections_;
+        detail::ordinary_shared_publication<const detail::ordinary_managed_profile> ordinary_managed_profile_;
+        detail::ordinary_weak_publication<const detail::ordinary_managed_receiver_preservation> ordinary_receiver_preservation_;
+        detail::ordinary_weak_publication<const detail::ordinary_receiver_wss_request> ordinary_receiver_wss_;
+        std::atomic<bool> ordinary_export_enrolled_here_{false};
+        std::atomic<bool> ordinary_receive_enrolled_here_{false};
+        std::shared_ptr<detail::recovery_continuous_admission> recovery_continuous_;
+        mutable std::mutex managed_wss_mutex_;
+        bool managed_wss_starting_=false;
+        std::shared_ptr<detail::configured_managed_handlers> managed_wss_handlers_;
+        std::shared_ptr<detail::configured_recovery_connection> managed_wss_connection_;
+        // Actual first-local start destruction only, never admission/source authority.
+        std::shared_ptr<const detail::ordinary_managed_owner_release> managed_wss_start_release_;
+        const detail::recovery_owner_schema recovery_schemas_=detail::recovery_owner_schema::capture_native();
+        bool recovery_producer_bootstrapped_=false;
+        bool administrative_owner_=false;
+        bool checked_existing_unpublished_=false;
+        std::shared_ptr<const managed_attachment_view> managed_attachment_view_;
+        std::atomic<size_t> active_managed_attachment_operations_{0};
+        mutable std::mutex projection_service_mutex_;
+        std::shared_ptr<projection_service> projection_service_;
+        std::shared_ptr<projection_capture_account> projection_capture_account_;
+        bool projection_admission_paused_ = false;
+        mutable std::atomic<unsigned> projection_pressure_slot_{0};
+        mutable std::atomic<uint64_t> projection_pressure_readers_[2]{};
+        std::atomic<const projection_pressure_map*> projection_pressure_maps_[2]{};
+        std::unique_ptr<const projection_pressure_map, projection_pressure_map_deleter> projection_pressure_owners_[2];
+        configuration config_;
+        std::mutex connection_ownership_mutex_;
+        uint64_t connection_revision_ = 0;
+        std::shared_ptr<database> db_;
+        std::shared_ptr<database> read_db_;
+        std::shared_ptr<detail::recovery_refresh_state> recovery_refresh_;
+        std::atomic<std::thread::id> txn_owner_thread_{};
+        std::shared_ptr<database> xproc_read_db_;
+        std::atomic<bool> closed_{false};
+        std::shared_ptr<scheduler> scheduler_;
+        std::unique_ptr<synchronizer> synchronizer_;
+        std::shared_ptr<const detail::sync_policy_reservation> sync_policy_;
+        std::vector<ipc_sync_state> ipc_synchronizers_;
+        std::mutex ipc_callbacks_mutex_;
+        std::function<void(bool)> on_sync_state_change_;
+        std::function<void(const std::string&)> on_sync_error_;
+        synchronizer::on_progress_handler on_sync_progress_;
+        std::mutex xproc_idle_mutex_;
+        std::function<void()> on_xproc_idle_;
+        bool is_synchronizer_ = false;
+        int sync_lock_fd_ = -1;
+        bool recovery_change_buffer_reserved_ = false;
+        size_t topology_delivery_depth_ = 0;
+        std::atomic<size_t> active_recovery_install_operations_{0};
+        std::mutex change_buffer_mutex_;
+        std::vector<std::tuple<std::string, std::string, int64_t, std::string, bool>> change_buffer_;
+        bool is_flushing_ = false;
+        std::atomic<bool> applying_remote_changes_{false};
+        std::mutex observers_mutex_;
+        std::atomic<observer_id> next_observer_id_{1};
+        std::map<std::string, std::map<observer_id, std::function<void(const std::vector<change_event>&)>>> table_observers_;
+        detail::managed_observation_state managed_observers_;
+        std::mutex object_observers_mutex_;
+        std::map<std::string, std::map<int64_t, std::vector<std::pair<observer_id, std::function<void(const std::string&)>>>>> object_observers_;
+        cross_process_notifier* shared_xproc_notifier_ = nullptr;
+        std::atomic<int64_t> last_seen_audit_id_{0};
+        std::thread audit_maint_thread_;
+        std::atomic<bool> history_generation_active_{false};
+        std::mutex audit_maint_mutex_;
+        std::condition_variable audit_maint_cv_;
+        bool audit_maint_stop_ = false;
+        std::shared_ptr<std::mutex> xproc_callback_mutex_ = std::make_shared<std::mutex>();
+        std::shared_ptr<instance_guard> guard_ = std::make_shared<instance_guard>();
+        std::unordered_map<std::string, std::unordered_set<std::string>> link_tables_by_rhs_target_;
+        std::unordered_set<std::string> link_tables_unknown_target_;
+        std::unordered_set<std::string> virtual_link_tables_;
+        std::unordered_map<std::string, std::vector<std::string>> list_tables_by_parent_;
+
+        // Final automatic-destruction fallback only, after actual app
+        // destructor/close phases. Preserve ordinary listener persistence.
+        // Empty std::function assignment destroys its target in this full
+        // expression without allocating; no target-owning local survives it.
+        bool prepare_native_target_destruction(pid_t creator) noexcept {
+            if (creator != ::getpid()) return false;
+            on_sync_progress_ = nullptr;
+            if (creator != ::getpid()) return false;
+            on_sync_error_ = nullptr;
+            if (creator != ::getpid()) return false;
+            on_sync_state_change_ = nullptr;
+            if (creator != ::getpid()) return false;
+            return true;
+        }
+
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<database>,checked_managed_existing_key);
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<database>,checked_mounted_server_existing_key);
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<database>);
+        explicit owned_resources(const std::string&);
+        owned_resources();
+        owned_resources(const configuration&,detail::recovery_owner_schema,std::shared_ptr<detail::recovery_continuous_admission>,std::shared_ptr<detail::database_open_ledger> = {});
+    };
+};
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
+    std::shared_ptr<database> writer,checked_managed_existing_key)
+    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(detail::ordinary_wal_configuration(config)),db_(std::move(writer)),
+     scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,
+    std::shared_ptr<database> writer,checked_mounted_server_existing_key)
+    :recovery_schemas_(std::move(catalog)),checked_existing_unpublished_(true),config_(detail::ordinary_wal_configuration(config)),db_(std::move(writer)),
+     scheduler_(config.sched?config.sched:std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema catalog,std::shared_ptr<database> writer)
+    : recovery_schemas_(std::move(catalog)), administrative_owner_(true), config_(detail::ordinary_wal_configuration(config)), db_(std::move(writer)) {}
+inline lattice_db::owned_resources::owned_resources(const std::string& path)
+        : config_(path)
+        , db_(std::make_shared<database>(path, database::open_mode::read_write))
+        , read_db_(!configuration::path_is_memory(path) ? std::make_shared<database>(path, database::open_mode::read_only) : nullptr)
+        , scheduler_(std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources()
+        : config_()
+        , db_(std::make_shared<database>(":memory:", database::open_mode::read_write))
+        , read_db_(nullptr)  // In-memory DB can't have separate read connection
+        , scheduler_(std::make_shared<immediate_scheduler>()) {}
+inline lattice_db::owned_resources::owned_resources(const configuration& config,detail::recovery_owner_schema recovery_schemas,std::shared_ptr<detail::recovery_continuous_admission> continuous,std::shared_ptr<detail::database_open_ledger> connection_ledger)
+        : recovery_continuous_(std::move(continuous))
+        , recovery_schemas_(std::move(recovery_schemas))
+        , config_(detail::ordinary_wal_configuration(config))
+        , connection_ledger_(std::move(connection_ledger))
+        , db_(recovery_continuous_ ? detail::open_continuous_writer(config_,recovery_continuous_) : database::make_owned_connection(resolve_path(config_),
+              config_.read_only ? database::open_mode::read_only : database::open_mode::read_write,
+              config_.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config_.ordinary_context,connection_ledger_,false,config_.wal_extent_limit_bytes))
+        , read_db_(config.read_only ? nullptr :
+                   (!config.is_in_memory() && !config.is_sync_enabled() ? database::make_owned_connection(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_) : nullptr))
+        , xproc_read_db_(!config.is_in_memory() && !config.read_only ?
+                         database::make_owned_connection(config.path, database::open_mode::read_only, config.busy_timeout_ms, std::shared_ptr<database_read_control>{}, config.ordinary_context,connection_ledger_) : nullptr)
+        , scheduler_(config.sched ? config.sched : std::make_shared<immediate_scheduler>()) {}
+
+
+// ============================================================================
+// Query template implementations
+// ============================================================================
+
+template<typename T>
+std::vector<managed<T>> query<T>::execute() {
+    const auto& schema = managed<T>::schema();
+    const std::string& table = schema.table_name;
+
+    std::string sql;
+
+    if (geo_bbox_) {
+        // Check if this is a geo_bounds list (separate table) or single geo_bounds (inline columns)
+        std::string list_table = "_" + table + "_" + geo_column_;
+        std::string list_rtree_table = list_table + "_rtree";
+        std::string single_rtree_table = "_" + table + "_" + geo_column_ + "_rtree";
+
+        // Check if list table exists - if so, use list query pattern
+        bool is_list = db_.db().table_exists(list_table);
+
+        if (is_list) {
+            // Geo bounds list: join through list table's R*Tree
+            // Match parent's globalId to list table's parent_id
+            sql = "SELECT DISTINCT " + table + ".* FROM " + table +
+                  " JOIN " + list_table + " lt ON " + table + ".globalId = lt.parent_id" +
+                  " JOIN " + list_rtree_table + " r ON lt.id = r.id" +
+                  " WHERE r.minLat <= " + std::to_string(geo_bbox_->max_lat) +
+                  " AND r.maxLat >= " + std::to_string(geo_bbox_->min_lat) +
+                  " AND r.minLon <= " + std::to_string(geo_bbox_->max_lon) +
+                  " AND r.maxLon >= " + std::to_string(geo_bbox_->min_lon);
+        } else {
+            // Single geo_bounds: join main table's R*Tree directly
+            sql = "SELECT " + table + ".* FROM " + table +
+                  " JOIN " + single_rtree_table + " r ON " + table + ".id = r.id" +
+                  " WHERE r.minLat <= " + std::to_string(geo_bbox_->max_lat) +
+                  " AND r.maxLat >= " + std::to_string(geo_bbox_->min_lat) +
+                  " AND r.minLon <= " + std::to_string(geo_bbox_->max_lon) +
+                  " AND r.maxLon >= " + std::to_string(geo_bbox_->min_lon);
+        }
+
+        // Add additional WHERE clause if present
+        if (!where_clause_.empty()) {
+            sql += " AND " + where_clause_;
+        }
+    } else {
+        sql = "SELECT * FROM " + table;
+        if (!where_clause_.empty()) {
+            sql += " WHERE " + where_clause_;
+        }
+    }
+
+    if (!order_clause_.empty()) {
+        sql += " ORDER BY " + order_clause_;
+    }
+    if (limit_ > 0) {
+        sql += " LIMIT " + std::to_string(limit_);
+    }
+    if (offset_ > 0) {
+        sql += " OFFSET " + std::to_string(offset_);
+    }
+
+    // Use read connection for queries
+    auto rows = db_.query_read(sql);
+    std::vector<managed<T>> items;
+    items.reserve(rows.size());
+
+    for (const auto& row : rows) {
+        items.push_back(db_.hydrate<T>(row));
+    }
+
+    return items;
+}
+
+template<typename T>
+size_t query<T>::count() {
+    const auto& schema = managed<T>::schema();
+    const std::string& table = schema.table_name;
+
+    std::string sql;
+
+    if (geo_bbox_) {
+        // Spatial query with R*Tree join
+        std::string rtree_table = "_" + table + "_" + geo_column_ + "_rtree";
+        sql = "SELECT COUNT(*) as cnt FROM " + table +
+              " JOIN " + rtree_table + " r ON " + table + ".id = r.id" +
+              " WHERE r.minLat <= " + std::to_string(geo_bbox_->max_lat) +
+              " AND r.maxLat >= " + std::to_string(geo_bbox_->min_lat) +
+              " AND r.minLon <= " + std::to_string(geo_bbox_->max_lon) +
+              " AND r.maxLon >= " + std::to_string(geo_bbox_->min_lon);
+
+        if (!where_clause_.empty()) {
+            sql += " AND " + where_clause_;
+        }
+    } else {
+        sql = "SELECT COUNT(*) as cnt FROM " + table;
+        if (!where_clause_.empty()) {
+            sql += " WHERE " + where_clause_;
+        }
+    }
+
+    // Use read connection for queries
+    auto rows = db_.query_read(sql);
+    if (!rows.empty()) {
+        auto it = rows[0].find("cnt");
+        if (it != rows[0].end()) {
+            return static_cast<size_t>(std::get<int64_t>(it->second));
+        }
+    }
+    return 0;
+}
+
+template<typename T>
+std::optional<managed<T>> query<T>::first() {
+    limit_ = 1;
+    auto items = execute();
+    if (items.empty()) {
+        return std::nullopt;
+    }
+    return std::move(items[0]);
+}
+
+// ============================================================================
+// managed<T*> template implementations (to-one relationships)
+// ============================================================================
+
+template<typename T>
+bool managed<T*, std::enable_if_t<is_model<T>::value>>::has_value() const {
+    if (is_bound()) {
+        return get_linked_id().has_value();
+    }
+    return cached_object_ != nullptr;
+}
+
+template<typename T>
+managed<T>* managed<T*, std::enable_if_t<is_model<T>::value>>::get_value() const {
+    if (!has_value()) return nullptr;
+    load_if_needed();
+    return cached_object_.get();
+}
+
+template<typename T>
+std::optional<global_id_t> managed<T*, std::enable_if_t<is_model<T>::value>>::get_linked_id() const {
+    if (!is_bound() || link_table_.empty()) return std::nullopt;
+
+    // Link table may not exist yet if no link has been set
+    if (!db->table_exists(link_table_)) {
+        return std::nullopt;
+    }
+
+    std::string sql = "SELECT rhs FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE";
+    auto rows = db->query(sql, {parent_global_id_});
+
+    if (rows.empty()) {
+        return std::nullopt;
+    }
+
+    auto it = rows[0].find("rhs");
+    if (it != rows[0].end() && std::holds_alternative<std::string>(it->second)) {
+        return std::get<std::string>(it->second);
+    }
+    return std::nullopt;
+}
+
+template<typename T>
+void managed<T*, std::enable_if_t<is_model<T>::value>>::set_link(const global_id_t& child_global_id) {
+    if (!is_bound() || link_table_.empty()) return;
+
+    // Ensure link table exists
+    lattice->ensure_link_table(link_table_);
+
+    // Delete existing link first
+    clear_link();
+
+    // Insert new link
+    std::string sql = "INSERT INTO " + link_table_ + " (lhs, rhs) VALUES (?, ?)";
+    db->execute(sql, {parent_global_id_, child_global_id});
+}
+
+template<typename T>
+void managed<T*, std::enable_if_t<is_model<T>::value>>::clear_link() {
+    if (!is_bound() || link_table_.empty()) return;
+
+    // Link table may not exist yet
+    if (!db->table_exists(link_table_)) return;
+
+    std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE";
+    db->execute(sql, {parent_global_id_});
+}
+
+template<typename T>
+void managed<T*, std::enable_if_t<is_model<T>::value>>::load_if_needed() const {
+    if (loaded_) return;
+    loaded_ = true;
+
+    auto child_gid = get_linked_id();
+    if (!child_gid.has_value()) {
+        cached_object_.reset();
+        return;
+    }
+
+    // Find the child object by global ID, using target_table_ if set
+    auto found = lattice->find_by_global_id<T>(*child_gid, get_target_table());
+    if (found.has_value()) {
+        cached_object_ = std::make_shared<managed<T>>(std::move(*found));
+    }
+}
+
+// operator=(const T&) - the nice UX: owner.pet = Pet{"Fido", 30.0}
+template<typename T>
+managed<T*, std::enable_if_t<is_model<T>::value>>&
+managed<T*, std::enable_if_t<is_model<T>::value>>::operator=(const T& obj) {
+    // Create managed version from unmanaged struct and bind to DB
+    managed<T> m(obj);
+    if (lattice != nullptr) {
+        if constexpr(has_instance_schema<T>::value) {
+            lattice->bind_managed(m, obj.instance_schema());
+        } else {
+            lattice->bind_managed(m, managed<T>::schema());
+        }
+    }
+
+    if (is_bound() && m.is_valid()) {
+        set_link(m.global_id());
+    }
+
+    cached_object_ = std::make_shared<managed<T>>(std::move(m));
+    loaded_ = true;
+    return *this;
+}
+
+template<typename T>
+managed<T*, std::enable_if_t<is_model<T>::value>>&
+managed<T*, std::enable_if_t<is_model<T>::value>>::operator=(managed<T>* obj) {
+    if (obj == nullptr) {
+        return operator=(nullptr);
+    }
+
+    // If the object isn't in the database yet, bind it
+    if (!obj->is_valid() && lattice != nullptr) {
+        if constexpr(has_instance_schema<T>::value) {
+            lattice->bind_managed(*obj, obj->instance_schema());
+        } else {
+            lattice->bind_managed(*obj, managed<T>::schema());
+        }
+    }
+
+    if (is_bound() && obj->is_valid()) {
+        set_link(obj->global_id());
+    }
+
+    cached_object_ = std::make_shared<managed<T>>(*obj);
+    loaded_ = true;
+    return *this;
+}
+
+template<typename T>
+managed<T*, std::enable_if_t<is_model<T>::value>>&
+managed<T*, std::enable_if_t<is_model<T>::value>>::operator=(managed<T*> obj) {
+    if (!obj.has_value()) {
+        return operator=(nullptr);
+    }
+
+    // If the object isn't in the database yet, bind it
+    if (!obj->is_valid() && lattice != nullptr) {
+        lattice->bind_managed(*obj, managed<T>::schema());
+    }
+
+    if (is_bound() && obj->is_valid()) {
+        set_link(obj->global_id());
+    }
+
+    cached_object_ = std::make_shared<managed<T>>(*obj);
+    loaded_ = true;
+    return *this;
+}
+
+template<typename T>
+managed<T*, std::enable_if_t<is_model<T>::value>>&
+managed<T*, std::enable_if_t<is_model<T>::value>>::operator=(std::nullptr_t) {
+    if (is_bound()) {
+        clear_link();
+    }
+    cached_object_.reset();
+    loaded_ = true;
+    return *this;
+}
+
+// ============================================================================
+// managed<std::vector<T*>> template implementations (to-many relationships)
+// ============================================================================
+
+template<typename T>
+size_t managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::size() const {
+    if (!is_bound() || link_table_.empty()) return cached_objects_.size();
+
+    // Link table may not exist yet
+    if (!db->table_exists(link_table_)) return 0;
+
+    // Load the full object list so size() and operator[] see the same data.
+    // Without this, size() could return a different count than the number of
+    // elements load_if_needed() fetches, causing Collection conformance
+    // violations ("more than count elements") when iterating.
+    load_if_needed();
+    return cached_objects_.size();
+}
+
+template<typename T>
+std::vector<global_id_t> managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::get_linked_ids() const {
+    if (!is_bound() || link_table_.empty()) return {};
+
+    // Link table may not exist yet
+    if (!db->table_exists(link_table_)) return {};
+
+    // ORDER BY rowid to preserve insertion order
+    std::string sql = "SELECT rhs FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE ORDER BY rowid";
+    auto rows = db->query(sql, {parent_global_id_});
+
+    std::vector<global_id_t> ids;
+    ids.reserve(rows.size());
+    for (const auto& row : rows) {
+        auto it = row.find("rhs");
+        if (it != row.end() && std::holds_alternative<std::string>(it->second)) {
+            ids.push_back(std::get<std::string>(it->second));
+        }
+    }
+    return ids;
+}
+
+template<typename T>
+std::vector<typename managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::typed_link>
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::get_typed_linked_ids() const {
+    if (!is_bound() || link_table_.empty()) return {};
+    if (!db->table_exists(link_table_)) return {};
+
+    std::string sql = "SELECT rhs_type, rhs FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE ORDER BY rowid";
+    auto rows = db->query(sql, {parent_global_id_});
+
+    std::vector<typed_link> links;
+    links.reserve(rows.size());
+    for (const auto& row : rows) {
+        auto type_it = row.find("rhs_type");
+        auto id_it = row.find("rhs");
+        if (type_it != row.end() && id_it != row.end() &&
+            std::holds_alternative<std::string>(type_it->second) &&
+            std::holds_alternative<std::string>(id_it->second)) {
+            links.push_back({std::get<std::string>(type_it->second),
+                             std::get<std::string>(id_it->second)});
+        }
+    }
+    return links;
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::add_virtual_link(
+    const global_id_t& child_global_id, const std::string& child_table) {
+    if (!is_bound() || link_table_.empty()) return;
+
+    lattice->ensure_virtual_link_table(link_table_, table_name);
+
+    std::string sql = "INSERT OR IGNORE INTO " + link_table_ + " (lhs, rhs, rhs_type) VALUES (?, ?, ?)";
+    db->execute(sql, {parent_global_id_, child_global_id, child_table});
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::add_link(const global_id_t& child_global_id) {
+    if (!is_bound() || link_table_.empty()) return;
+
+    // Ensure link table exists
+    lattice->ensure_link_table(link_table_);
+
+    // OR IGNORE: list membership is a set — PRIMARY KEY(lhs, rhs) — so
+    // appending an element that is already a member is a no-op, not a
+    // constraint failure. Upsert paths re-append after rebinding to a
+    // pre-existing row; erroring there would make every upsert+append
+    // caller check membership first.
+    std::string sql = "INSERT OR IGNORE INTO " + link_table_ + " (lhs, rhs) VALUES (?, ?)";
+    db->execute(sql, {parent_global_id_, child_global_id});
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::load_if_needed() const {
+    if (loaded_) return;
+    loaded_ = true;
+
+    cached_objects_.clear();
+
+    if (is_virtual_) {
+        auto typed_ids = get_typed_linked_ids();
+        cached_objects_.reserve(typed_ids.size());
+        for (const auto& [type, gid] : typed_ids) {
+            auto found = lattice->find_by_global_id<T>(gid, type);
+            if (found.has_value()) {
+                cached_objects_.push_back(std::make_shared<managed<T>>(std::move(*found)));
+            }
+        }
+    } else {
+        auto child_gids = get_linked_ids();
+        cached_objects_.reserve(child_gids.size());
+
+        auto target_table = !target_table_.empty() ? target_table_ : managed<T>::schema().table_name;
+
+        for (const auto& gid : child_gids) {
+            auto found = lattice->find_by_global_id<T>(gid, target_table);
+            if (found.has_value()) {
+                cached_objects_.push_back(std::make_shared<managed<T>>(std::move(*found)));
+            }
+        }
+    }
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::checked_load(size_t index) const {
+    load_if_needed();
+    if (index < cached_objects_.size()) return;
+    // Stale cache: another connection may have appended to the list since it
+    // loaded. Reload once at current database state before giving up.
+    loaded_ = false;
+    cached_objects_.clear();
+    load_if_needed();
+    if (index < cached_objects_.size()) return;
+    throw std::out_of_range(
+        "lattice: list index " + std::to_string(index) + " out of range (" +
+        std::to_string(cached_objects_.size()) + " elements) for link table " + link_table_);
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::push_back(managed<T>* obj) {
+    if (obj == nullptr) return;
+
+    if (is_bound() && obj->is_valid()) {
+        if (is_virtual_) {
+            add_virtual_link(obj->global_id(), obj->table_name_);
+        } else {
+            add_link(obj->global_id());
+        }
+    }
+
+    cached_objects_.push_back(std::make_shared<managed<T>>(*obj));
+}
+
+// push_back(const T&) - the nice UX: trip.destinations.push_back(Destination{...})
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::push_back(const T& obj) {
+    // Create managed version and bind to DB
+    managed<T> m(obj);
+    if (lattice != nullptr) {
+        lattice->bind_managed(m, managed<T>::schema());
+    }
+
+    if (is_bound() && m.is_valid()) {
+        if (is_virtual_) {
+            add_virtual_link(m.global_id(), m.table_name_);
+        } else {
+            add_link(m.global_id());
+        }
+    }
+
+    cached_objects_.push_back(std::make_shared<managed<T>>(std::move(m)));
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::erase(managed<T>* obj) {
+    if (!obj || !obj->is_valid()) return;
+
+    if (is_bound() && !link_table_.empty() && db->table_exists(link_table_)) {
+        if (is_virtual_) {
+            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE AND rhs = ? COLLATE NOCASE AND rhs_type = ?";
+            db->execute(sql, {parent_global_id_, obj->global_id(), obj->table_name_});
+        } else {
+            std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE AND rhs = ? COLLATE NOCASE";
+            db->execute(sql, {parent_global_id_, obj->global_id()});
+        }
+    }
+
+    // Remove from cache
+    cached_objects_.erase(
+        std::remove_if(cached_objects_.begin(), cached_objects_.end(),
+            [&](const std::shared_ptr<managed<T>>& p) {
+                return p && p->global_id() == obj->global_id();
+            }),
+        cached_objects_.end());
+    loaded_ = false;
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::clear() {
+    if (is_bound() && !link_table_.empty() && db->table_exists(link_table_)) {
+        std::string sql = "DELETE FROM " + link_table_ + " WHERE lhs = ? COLLATE NOCASE";
+        db->execute(sql, {parent_global_id_});
+    }
+    cached_objects_.clear();
+    loaded_ = false;
+}
+
+template<typename T>
+typename managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::iterator
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::begin() {
+    load_if_needed();
+    return iterator(cached_objects_.begin());
+}
+
+template<typename T>
+typename managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::iterator
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::end() {
+    load_if_needed();
+    return iterator(cached_objects_.end());
+}
+
+template<typename T>
+typename managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::operator[](size_t index) {
+    load_if_needed();
+    return element_proxy(this, index);
+}
+
+template<typename T>
+const managed<T>& managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::operator[](size_t index) const {
+    checked_load(index);
+    return *cached_objects_[index];
+}
+
+template<typename T>
+void managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::replace_link_at(
+    size_t index, const global_id_t& new_child_global_id) {
+    if (!is_bound() || parent_global_id_.empty()) return;
+
+    load_if_needed();
+    if (index >= cached_objects_.size()) {
+        LOG_ERROR("link_list", "replace_link_at: index %zu >= cached size %zu", index, cached_objects_.size());
+        throw std::out_of_range("Link list index out of range");
+    }
+
+    // Get the old global ID at this position
+    auto linked_ids = get_linked_ids();
+    if (index >= linked_ids.size()) {
+        LOG_ERROR("link_list", "replace_link_at: index %zu >= linked_ids size %zu", index, linked_ids.size());
+        throw std::out_of_range("Link list index out of range");
+    }
+    const auto& old_child_global_id = linked_ids[index];
+
+    // Update the link table: change child_global_id where position matches
+    std::string sql = "UPDATE " + link_table_ +
+                      " SET child_global_id = ? WHERE parent_global_id = ? AND child_global_id = ?";
+    db->execute(sql, {new_child_global_id, parent_global_id_, old_child_global_id});
+
+    // Invalidate cache so next access reloads
+    loaded_ = false;
+    cached_objects_.clear();
+}
+
+// element_proxy implementations
+template<typename T>
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy::operator managed<T>&() const {
+    list_->checked_load(index_);
+    return *list_->cached_objects_[index_];
+}
+
+template<typename T>
+managed<T>* managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy::operator->() const {
+    list_->checked_load(index_);
+    return list_->cached_objects_[index_].get();
+}
+
+template<typename T>
+typename managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy&
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy::operator=(const T& obj) {
+    if (!list_->is_bound() || !list_->lattice) return *this;
+
+    // Add the new object to the database
+    auto added = list_->lattice->template add<T>(obj);
+    list_->replace_link_at(index_, added.global_id());
+
+    return *this;
+}
+
+template<typename T>
+typename managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy&
+managed<std::vector<T*>, std::enable_if_t<is_model<T>::value>>::element_proxy::operator=(managed<T>* obj) {
+    if (!list_->is_bound() || !obj || !obj->is_managed()) return *this;
+
+    list_->replace_link_at(index_, obj->global_id());
+
+    return *this;
+}
+
+// ============================================================================
+// results<T>::execute_query() implementation
+// ============================================================================
+
+template<typename T>
+void results<T>::execute_query() {
+    if (!db_) return;
+
+    // Build SQL query
+    std::string sql = "SELECT * FROM " + table_name_;
+    if (!where_clause_.empty()) {
+        sql += " WHERE " + where_clause_;
+    }
+    if (!order_clause_.empty()) {
+        sql += " ORDER BY " + order_clause_;
+    }
+    // SQLite requires LIMIT before OFFSET, and OFFSET requires LIMIT
+    if (limit_ > 0) {
+        sql += " LIMIT " + std::to_string(limit_);
+        if (offset_ > 0) {
+            sql += " OFFSET " + std::to_string(offset_);
+        }
+    } else if (offset_ > 0) {
+        // OFFSET without LIMIT: use -1 (unlimited) for LIMIT
+        sql += " LIMIT -1 OFFSET " + std::to_string(offset_);
+    }
+
+    // Execute and hydrate using read connection
+    auto rows = db_->query_read(sql);
+    items_.clear();
+    items_.reserve(rows.size());
+    for (const auto& row : rows) {
+        items_.push_back(db_->template hydrate<T>(row));
+    }
+}
+
+// ============================================================================
+// results<T>::observe() implementations
+// ============================================================================
+
+/// Legacy observe - receives full snapshot on each change
+template<typename T>
+notification_token results<T>::observe(observer_t callback) {
+    if (!db_) {
+        // Can't observe results without a database reference
+        return notification_token();
+    }
+
+    const auto& schema = managed<T>::schema();
+    std::string table_name = schema.table_name;
+
+    // Register observer that re-queries and calls the callback. The
+    // batched fire still re-queries once and delivers the snapshot —
+    // the legacy `observe(observer_t)` API doesn't surface per-row
+    // info, so the batch size is irrelevant; it just triggers a refresh.
+    auto observer_id = db_->add_table_observer(table_name,
+        [db = db_, callback = std::move(callback), table_name](
+            const std::vector<lattice_db::change_event>& batch) {
+            (void)batch;
+            // Re-query to get fresh results using read connection
+            std::string sql = "SELECT * FROM " + table_name;
+            auto rows = db->query_read(sql);
+
+            std::vector<managed<T>> items;
+            items.reserve(rows.size());
+            for (const auto& row : rows) {
+                items.push_back(db->template hydrate<T>(row));
+            }
+
+            // Call the user's callback with fresh data
+            callback(items);
+        }
+    );
+
+    // Return token that removes observer when destroyed
+    return notification_token([db = db_, table_name, observer_id] {
+        db->remove_table_observer(table_name, observer_id);
+    });
+}
+
+/// New observe - receives detailed change info (realm-cpp style)
+template<typename T>
+notification_token results<T>::observe(change_observer_t callback) {
+    if (!db_) {
+        return notification_token();
+    }
+
+    const auto& schema = managed<T>::schema();
+    std::string table_name = schema.table_name;
+
+    // Track the previous state to compute diffs
+    auto prev_ids = std::make_shared<std::vector<int64_t>>();
+    for (const auto& item : items_) {
+        prev_ids->push_back(item.id());
+    }
+
+    // Register observer that computes change info. Each batched fire
+    // produces one merged `results_change` covering every row in the
+    // batch — preserves the existing `observe(change_observer_t)` shape
+    // (one callback per fire) while honoring batched delivery from the
+    // notification path.
+    auto observer_id = db_->add_table_observer(table_name,
+        [this, db = db_, callback = std::move(callback), table_name, prev_ids](
+            const std::vector<lattice_db::change_event>& batch) {
+
+            // Re-query to get current state using read connection
+            std::string sql = "SELECT id FROM " + table_name;
+            auto rows = db->query_read(sql);
+
+            std::vector<int64_t> current_ids;
+            current_ids.reserve(rows.size());
+            for (const auto& row : rows) {
+                auto it = row.find("id");
+                if (it != row.end() && std::holds_alternative<int64_t>(it->second)) {
+                    current_ids.push_back(std::get<int64_t>(it->second));
+                }
+            }
+
+            // Compute changes
+            typename results<T>::results_change change;
+            change.collection = this;
+
+            // Find insertions (in current but not in prev)
+            for (size_t i = 0; i < current_ids.size(); ++i) {
+                if (std::find(prev_ids->begin(), prev_ids->end(), current_ids[i]) == prev_ids->end()) {
+                    change.insertions.push_back(i);
+                }
+            }
+
+            // Find deletions (in prev but not in current)
+            for (size_t i = 0; i < prev_ids->size(); ++i) {
+                if (std::find(current_ids.begin(), current_ids.end(), (*prev_ids)[i]) == current_ids.end()) {
+                    change.deletions.push_back(i);
+                }
+            }
+
+            // Find modifications: any UPDATE entry in the batch whose
+            // row_id is still present in current_ids contributes a
+            // modification at that row's index.
+            for (const auto& [_, op, row_id, __, ___] : batch) {
+                if (op != "UPDATE") continue;
+                for (size_t i = 0; i < current_ids.size(); ++i) {
+                    auto it = std::find(prev_ids->begin(), prev_ids->end(), current_ids[i]);
+                    if (it != prev_ids->end() && current_ids[i] == row_id) {
+                        change.modifications.push_back(i);
+                    }
+                }
+            }
+
+            // Update prev_ids for next change
+            *prev_ids = current_ids;
+
+            // Update items_ with fresh data using read connection
+            std::string full_sql = "SELECT * FROM " + table_name;
+            auto full_rows = db->query_read(full_sql);
+            items_.clear();
+            items_.reserve(full_rows.size());
+            for (const auto& row : full_rows) {
+                items_.push_back(db->template hydrate<T>(row));
+            }
+
+            // Call callback
+            callback(change);
+        }
+    );
+
+    return notification_token([db = db_, table_name, observer_id] {
+        db->remove_table_observer(table_name, observer_id);
+    });
+}
+
+#if LATTICE_HAS_COROUTINES
+/// Create a coroutine-based change stream
+template<typename T>
+change_stream<collection_change> results<T>::changes() {
+    if (!db_) {
+        return change_stream<collection_change>();
+    }
+
+    const auto& schema = managed<T>::schema();
+    std::string table_name = schema.table_name;
+    auto db = db_;
+
+    return change_stream<collection_change>([db, table_name](auto push) {
+        // Register observer that pushes changes to the stream. Each
+        // batched fire pushes ONE collection_change containing every
+        // row in the batch — preserves stream-of-changes semantics
+        // while honoring batched delivery.
+        auto observer_id = db->add_table_observer(table_name,
+            [push, table_name](const std::vector<lattice_db::change_event>& batch) {
+                collection_change change;
+                for (const auto& [_, op, row_id, __, ___] : batch) {
+                    if (op == "INSERT") {
+                        change.insertions.push_back(static_cast<uint64_t>(row_id));
+                    } else if (op == "UPDATE") {
+                        change.modifications.push_back(static_cast<uint64_t>(row_id));
+                    } else if (op == "DELETE") {
+                        change.deletions.push_back(static_cast<uint64_t>(row_id));
+                    }
+                }
+                push(change);
+            }
+        );
+
+        return notification_token([db, table_name, observer_id] {
+            db->remove_table_observer(table_name, observer_id);
+        });
+    });
+}
+#endif
+
+} // namespace lattice
+
+// ============================================================================
+// Include sync.hpp here so synchronizer is fully defined
+// ============================================================================
+
+namespace lattice {
+
+// ============================================================================
+// lattice_db sync method implementations
+// (synchronizer is fully defined via sync.hpp included above)
+// ============================================================================
+
+inline void lattice_db::teardown_sync(bool fire_handoff) {
+    const auto result=teardown_sync_checked(fire_handoff);
+    if(result.error)std::rethrow_exception(result.error);
+}
+inline lattice_close_result lattice_db::teardown_sync_checked(bool fire_handoff) noexcept {
+    lattice_close_result result;
+    if (!owns_creator_process()) {
+        try { throw std::runtime_error("inherited lattice cleanup belongs to another process"); }
+        catch (...) { result.remember(std::current_exception()); }
+        return result;
+    }
+    const auto attempt=[&](auto&& operation) noexcept {
+        try {operation();}catch(...) {result.remember(std::current_exception());}
+    };
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(2000);
+    if(configured_sync_present())result.merge(configured_sync_close(deadline));
+    const auto drain=[&](synchronizer_base* sync) noexcept {
+        if(!sync)return;const auto outcome=sync->drain_checked(deadline);
+        result.remember(outcome.error,false);
+        if(static_cast<int>(outcome.state)>static_cast<int>(result.sync))result.sync=outcome.state;
+    };
+    for(auto& ipc:ipc_synchronizers_)drain(ipc.sync.get());
+    drain(synchronizer_.get());
+    // Disconnect every route before destroying any child owner. Failure on
+    // one route must not skip the remaining disconnect/reset/registry phases.
+    for(auto& ipc:ipc_synchronizers_)if(ipc.sync)attempt([&]{ipc.sync->disconnect();});
+    if(synchronizer_)attempt([&]{synchronizer_->disconnect();});
+    for(const auto& target:config_.ipc_targets)attempt([&]{unregister_sync_key(config_.path,"ipc:"+target.channel);});
+    for(auto& ipc:ipc_synchronizers_) {
+        if(ipc.sync) {
+            const auto cleanup=ipc.sync->cleanup_error_;ipc.sync.reset();
+            if(cleanup)result.remember(*cleanup);
+        }
+        if(ipc.endpoint){attempt([&]{ipc.endpoint->stop();});ipc.endpoint.reset();}
+        if(ipc.lock_fd>=0){::flock(ipc.lock_fd,LOCK_UN);::close(ipc.lock_fd);ipc.lock_fd=-1;}
+    }
+    ipc_synchronizers_.clear();
+    const bool had_wss=bool(synchronizer_);
+    if(had_wss) {
+        attempt([&]{unregister_sync_key(config_.path,config_.websocket_url);});
+        const auto cleanup=synchronizer_->cleanup_error_;synchronizer_.reset();
+        if(cleanup)result.remember(*cleanup);
+    }
+    // Even an incomplete/failed construction may have acquired this lock.
+    if(sync_lock_fd_>=0){::flock(sync_lock_fd_,LOCK_UN);::close(sync_lock_fd_);sync_lock_fd_=-1;}
+    if(had_wss&&fire_handoff)attempt([&]{
+        bool handed_off=false;
+        instance_registry::instance().for_each_alive(config_.path,[&](lattice_db* sibling){
+            if(!handed_off&&sibling!=this&&sibling->config_.is_sync_enabled()&&sibling->config_.websocket_url==config_.websocket_url){
+                sibling->setup_sync_if_configured();handed_off=true;
+            }
+        });
+    });
+    return result;
+}
+inline void lattice_db::close() {
+    const auto result=close_checked();
+    if(result.error)std::rethrow_exception(result.error);
+}
+inline lattice_close_result lattice_db::close_checked() noexcept {
+    lattice_close_result result;
+    if (!owns_creator_process()) {
+        try { throw std::runtime_error("inherited lattice cleanup belongs to another process"); }
+        catch (...) { result.remember(std::current_exception()); }
+        return result;
+    }
+    try { require_catalog_callback_absent(); }
+    catch (...) { result.remember(std::current_exception()); return result; }
+    const auto attempt=[&](auto&& operation) noexcept {
+        try {operation();}catch(...) {result.remember(std::current_exception());}
+    };
+    std::unique_ptr<detail::native_retirement_storage<std::shared_ptr<database>,std::shared_ptr<database>,std::shared_ptr<database>>> retained;
+    try{retained=std::make_unique<detail::native_retirement_storage<std::shared_ptr<database>,std::shared_ptr<database>,std::shared_ptr<database>>>();}
+    catch(...){result.remember(std::current_exception());return result;}
+    auto& writer=retained->get<0>();auto& reader=retained->get<1>();auto& xproc=retained->get<2>();
+    attempt([&]{
+        std::lock_guard<std::mutex> lock(connection_ownership_mutex_);
+        closed_.store(true,std::memory_order_seq_cst);guard_->alive.store(false,std::memory_order_seq_cst);++connection_revision_;
+        writer=db_;reader=read_db_;xproc=xproc_read_db_;
+    });
+    attempt([&]{begin_configured_listener_retirement();});
+    attempt([&]{managed_observers_.retire();});
+    attempt([&]{shutdown_projection_reads();});
+    guard_->alive.store(false,std::memory_order_seq_cst);
+    const int own=instance_guard::tls_depth(guard_.get());
+    while(guard_->notify_refcount.load(std::memory_order_seq_cst)>own)std::this_thread::yield();
+    attempt([&]{stop_audit_maintenance();});
+    result.merge(teardown_sync_checked());sync_policy_.reset();
+    attempt([&]{if(scheduler_)scheduler_->shutdown();});
+    attempt([&]{if(!finish_configured_listener_retirement()){
+        result.cleanup_complete=false;
+        // Preserve the actual configured/callback self-join refusal. Listener
+        // debt cannot downgrade a reentrant report or replace a first failure.
+        if(result.sync!=sync_drain_state::failed&&result.sync!=sync_drain_state::reentrant_pending)
+            result.sync=sync_drain_state::deadline_pending;
+    }});
+    if(!owns_creator_process()){result.cleanup_complete=false;return result;}
+    attempt([&]{instance_registry::instance().unregister_instance(config_.path,this);});
+    shared_xproc_notifier_=nullptr;
+    attempt([&]{retire_all_read_generations();});
+    std::vector<std::shared_ptr<database>> retired_idle;
+    attempt([&]{
+        std::lock_guard<std::mutex> lock(read_pool_mutex_);
+        retired_idle.swap(idle_read_pool_);
+    });
+    for(auto& conn:retired_idle){
+        if(!owns_creator_process())return result;
+        attempt([&]{conn->close();});
+        if(!owns_creator_process())return result;
+        conn.reset(); // Last native/custody destruction occurs OFF the pool leaf.
+        if(!owns_creator_process())return result;
+    }
+    attempt([&]{deactivate_projection_pressure();});
+    if(writer)attempt([&]{writer->close();});
+    if(reader)attempt([&]{reader->close();});
+    if(xproc)attempt([&]{xproc->close();});
+    return result;
+}
+inline lattice_db::~lattice_db() {
+    // All automatic resource ownership is in process_resources_. References
+    // below have no destruction work; its native deleter abandons the entire
+    // inherited payload before any member destructor, mutex or thread join.
+    if (!owns_creator_process()) return;
+    if(administrative_owner_||checked_existing_unpublished_) {
+        closed_.store(true,std::memory_order_seq_cst);
+        guard_->alive.store(false,std::memory_order_seq_cst);
+        try{begin_configured_listener_retirement();(void)retire_configured_listener_targets();}catch(...){}
+        if(!owns_creator_process())return;
+        alive_count().fetch_sub(1,std::memory_order_relaxed);
+        return; // Only connection-local settlement hooks exist; no public facilities were published.
+    }
+    // Keep the destructor's original retirement order. Every cleanup phase
+    // still runs after a drain/transport/scheduler failure; destruction has no
+    // reporting return and never turns pending work into an ACK claim.
+    const auto attempt=[](auto&& operation) noexcept {try{operation();}catch(...){}};
+    closed_.store(true, std::memory_order_seq_cst);
+    guard_->alive.store(false, std::memory_order_seq_cst);
+    attempt([&]{begin_configured_listener_retirement();});
+    attempt([&]{managed_observers_.retire();});
+    attempt([&]{deactivate_projection_pressure();});
+    attempt([&]{shutdown_projection_reads();});
+    auto n = alive_count().fetch_sub(1, std::memory_order_relaxed) - 1;
+    LOG_INFO("lattice_db", "DESTROYING (this=%p, path=%s, alive=%lld)",
+             (void*)this, config_.path.c_str(), (long long)n);
+    // close() may have already been called; each step is idempotent.
+    // 0. The retention thread must be joined before any member is torn down.
+    attempt([&]{stop_audit_maintenance();});
+    // 1. Mark as dying (idempotent if close() already ran).
+    LOG_INFO("lattice_db", "~dtor: setting alive=false, refcount=%d",
+             (int)guard_->notify_refcount.load(std::memory_order_seq_cst));
+    guard_->alive.store(false, std::memory_order_seq_cst);
+    // 2. Wait for in-flight notify_change() calls on OTHER threads. Exclude
+    //    this thread's own holds — a destructor reached from inside an
+    //    observer callback (callback dropped the last reference) would
+    //    otherwise wait for itself forever (observed live: 97%-CPU yield
+    //    spin, 184 CPU-minutes, during the Swift suite).
+    const int _own_holds = instance_guard::tls_depth(guard_.get());
+    int _spin_iter = 0;
+    while (guard_->notify_refcount.load(std::memory_order_seq_cst) > _own_holds) {
+        if (++_spin_iter % 1000000 == 0) {
+            LOG_INFO("lattice_db", "~dtor: SPINNING refcount=%d own=%d iter=%d",
+                     (int)guard_->notify_refcount.load(std::memory_order_seq_cst), _own_holds, _spin_iter);
+        }
+        std::this_thread::yield();
+    }
+    LOG_INFO("lattice_db", "~dtor: refcount drained (own holds: %d)", _own_holds);
+    // 3. Stop all sync threads.
+    (void)teardown_sync_checked();
+    sync_policy_.reset();
+    LOG_INFO("lattice_db", "~dtor: teardown_sync done");
+    // 3b. Retire the read-generation pool (idempotent if close() already
+    //     ran): COMMIT keeper transactions before the wrappers are freed at
+    //     member destruction — spec §4.6 ordering.
+    attempt([&]{retire_all_read_generations();});
+    // 4. Drain scheduler.
+    LOG_INFO("lattice_db", "~dtor: shutting down scheduler");
+    attempt([&]{if (scheduler_) scheduler_->shutdown();});
+    attempt([&]{(void)finish_configured_listener_retirement();});
+    if(!owns_creator_process())return;
+    LOG_INFO("lattice_db", "~dtor: scheduler shutdown done");
+    // 5. Unregister. Do NOT hold xproc_callback_mutex_ during unregister —
+    //    unregister_instance takes registry mutex_, and may destroy the notifier
+    //    (stop_listening → thread join). The notifier callback also takes
+    //    registry mutex_ via for_each_alive → deadlock if we hold both.
+    LOG_INFO("lattice_db", "~dtor: calling unregister_instance");
+    attempt([&]{instance_registry::instance().unregister_instance(config_.path, this);});
+    LOG_INFO("lattice_db", "~dtor: unregister done");
+    shared_xproc_notifier_ = nullptr;
+    LOG_INFO("lattice_db", "~dtor: complete");
+}
+
+inline bool lattice_db::is_sync_connected() const {
+    require_creator_process();
+    if(configured_sync_present())return configured_sync_connected();
+    return synchronizer_ && synchronizer_->is_connected();
+}
+
+inline void lattice_db::sync_now() {
+    require_creator_process();
+    if(configured_sync_present()){configured_sync_now();return;}
+    if (synchronizer_) {
+        synchronizer_->sync_now();
+    }
+}
+
+inline void lattice_db::update_sync_filter(std::vector<sync_filter_entry> filter) {
+    require_creator_process();
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
+    LOG_INFO("lattice_db", "update_sync_filter: %zu entries, wss=%d, ipc_syncs=%zu (db=%s)",
+             filter.size(), synchronizer_ ? 1 : 0, ipc_synchronizers_.size(), config_.path.c_str());
+    if (synchronizer_) {
+        synchronizer_->update_sync_filter(filter);
+    }
+    for (size_t i = 0; i < ipc_synchronizers_.size(); ++i) {
+        // Update the config so lazily-created synchronizers (accept callback
+        // hasn't fired yet) pick up the latest filter.
+        if (i < config_.ipc_targets.size()) {
+            config_.ipc_targets[i].sync_filter = filter;
+        }
+        if (ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->update_sync_filter(filter);
+        }
+    }
+}
+
+inline void lattice_db::update_sync_filter(const std::string& channel,
+                                           std::vector<sync_filter_entry> filter) {
+    require_creator_process();
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
+    if (channel.empty()) {
+        LOG_INFO("lattice_db", "update_sync_filter(wss): %zu entries (db=%s)",
+                 filter.size(), config_.path.c_str());
+        config_.sync_filter = filter;
+        if (synchronizer_) {
+            synchronizer_->update_sync_filter(std::move(filter));
+        }
+        return;
+    }
+    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
+        if (config_.ipc_targets[i].channel != channel) continue;
+        LOG_INFO("lattice_db", "update_sync_filter(%s): %zu entries (db=%s)",
+                 channel.c_str(), filter.size(), config_.path.c_str());
+        // Config write first — lazily-created synchronizers (accept callback
+        // hasn't fired yet) read their filter from the config entry.
+        config_.ipc_targets[i].sync_filter = filter;
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->update_sync_filter(std::move(filter));
+        }
+        return;
+    }
+    LOG_ERROR("lattice_db", "update_sync_filter: unknown channel '%s' (db=%s)",
+              channel.c_str(), config_.path.c_str());
+}
+
+inline void lattice_db::clear_sync_filter() {
+    require_creator_process();
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
+    if (synchronizer_) {
+        synchronizer_->clear_sync_filter();
+    }
+    for (auto& ipc : ipc_synchronizers_) {
+        if (ipc.sync) {
+            ipc.sync->clear_sync_filter();
+        }
+    }
+}
+
+inline void lattice_db::clear_sync_filter(const std::string& channel) {
+    require_creator_process();
+    if(recovery_continuous_)throw db_error("continuous sync coverage is immutable");
+    if (channel.empty()) {
+        config_.sync_filter = std::nullopt;
+        if (synchronizer_) synchronizer_->clear_sync_filter();
+        return;
+    }
+    for (size_t i = 0; i < config_.ipc_targets.size(); ++i) {
+        if (config_.ipc_targets[i].channel != channel) continue;
+        config_.ipc_targets[i].sync_filter = std::nullopt;
+        if (i < ipc_synchronizers_.size() && ipc_synchronizers_[i].sync) {
+            ipc_synchronizers_[i].sync->clear_sync_filter();
+        }
+        return;
+    }
+    LOG_ERROR("lattice_db", "clear_sync_filter: unknown channel '%s' (db=%s)",
+              channel.c_str(), config_.path.c_str());
+}
+
+inline void lattice_db::trigger_sync_upload() {
+    require_creator_process();
+    if(configured_sync_present()){configured_sync_upload();return;}
+    // Dispatch via scheduler instead of calling sync_now() synchronously.
+    // This method is called from the WAL hook; a synchronous sync_now()
+    // would call upload_pending_changes() which sends data over the transport.
+    // The remote ACK can arrive on the receive thread and call
+    // mark_as_synced() → begin_transaction() while we're still inside the
+    // WAL hook, causing "cannot start a transaction within a transaction".
+    if (synchronizer_ && synchronizer_->is_connected()) {
+        scheduler_->invoke([this]() {
+            if (synchronizer_ && synchronizer_->is_connected()) {
+                synchronizer_->sync_now();
+            }
+        });
+    }
+    for (auto& ipc : ipc_synchronizers_) {
+        if (ipc.sync && ipc.sync->is_connected()) {
+            scheduler_->invoke([&ipc]() {
+                if (ipc.sync && ipc.sync->is_connected()) {
+                    ipc.sync->sync_now();
+                }
+            });
+        }
+    }
+}
+
+inline void lattice_db::connect_sync() {
+    require_creator_process();
+    if(configured_sync_present()){configured_sync_connect();return;}
+    if (synchronizer_) {
+        synchronizer_->connect();
+    } else if (config_.is_sync_enabled()) {
+        // Lazily create synchronizer if config is set but sync wasn't started
+        setup_sync_if_configured();
+    }
+}
+
+inline void lattice_db::disconnect_sync() {
+    require_creator_process();
+    if(configured_sync_present()){configured_sync_disconnect();return;}
+    if (synchronizer_) {
+        synchronizer_->disconnect();
+    }
+}
+
+inline void lattice_db::set_on_sync_state_change(std::function<void(bool connected)> handler) {
+    require_creator_process();
+    detail::native_retirement_storage<synchronizer::on_state_change_handler,synchronizer::on_state_change_handler> held;
+    held.get<0>().swap(handler);
+    if(is_closed())throw db_error("application listener registration is retired");
+    if(!remember_configured_state(held.get<0>())||!owns_creator_process())return;
+    if(configured_sync_present()){configured_sync_state(std::move(held.get<0>()));return;}
+    held.get<1>()=held.get<0>(); // Actual copy off the application leaf.
+    if(!owns_creator_process())return;
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);
+        if(is_closed())return;on_sync_state_change_.swap(held.get<0>());
+    }
+    if(!held.release<0>())return; // Actual displaced target, before next owner access.
+    if(synchronizer_)synchronizer_->set_on_state_change(std::move(held.get<1>()));
+}
+
+inline void lattice_db::set_on_sync_error(std::function<void(const std::string& error)> handler) {
+    require_creator_process();
+    detail::native_retirement_storage<synchronizer::on_error_handler,synchronizer::on_error_handler> held;
+    held.get<0>().swap(handler);
+    if(is_closed())throw db_error("application listener registration is retired");
+    if(!remember_configured_error(held.get<0>())||!owns_creator_process())return;
+    if(configured_sync_present()){configured_sync_error(std::move(held.get<0>()));return;}
+    held.get<1>()=held.get<0>(); // Actual copy off the application leaf.
+    if(!owns_creator_process())return;
+    {std::lock_guard<std::mutex> lock(managed_wss_mutex_);
+        if(is_closed())return;on_sync_error_.swap(held.get<0>());
+    }
+    if(!held.release<0>())return; // Actual displaced target, before next owner access.
+    if(synchronizer_)synchronizer_->set_on_error(std::move(held.get<1>()));
+}
+
+inline synchronizer::sync_progress lattice_db::get_sync_progress() const {
+    require_creator_process();
+    // Walk all instances on the same path — the synchronizer may live on a sibling.
+    synchronizer::sync_progress agg;
+    instance_registry::instance().for_each_alive(config_.path,
+        [&agg](lattice_db* sibling) {
+            if(sibling->configured_sync_present()){
+                const auto p=sibling->configured_sync_progress();
+                agg.pending_upload+=p.pending_upload;agg.total_upload+=p.total_upload;agg.acked+=p.acked;agg.received+=p.received;
+            }
+            if (sibling->synchronizer_) {
+                auto p = sibling->synchronizer_->get_progress();
+                agg.pending_upload += p.pending_upload;
+                agg.total_upload += p.total_upload;
+                agg.acked += p.acked;
+                agg.received += p.received;
+            }
+            for (const auto& ipc : sibling->ipc_synchronizers_) {
+                if (ipc.sync) {
+                    auto p = ipc.sync->get_progress();
+                    agg.pending_upload += p.pending_upload;
+                    agg.total_upload += p.total_upload;
+                    agg.acked += p.acked;
+                    agg.received += p.received;
+                }
+            }
+        });
+    return agg;
+}
+
+inline void lattice_db::set_on_sync_progress(synchronizer::on_progress_handler handler) {
+    require_creator_process();
+    detail::native_retirement_storage<synchronizer::on_progress_handler> requested;
+    requested.get<0>().swap(handler);
+    if(is_closed())throw db_error("application listener registration is retired");
+    LOG_INFO("lattice_db", "set_on_sync_progress called (this=%p, path=%s, handler=%s)",
+             (void*)this, config_.path.c_str(), requested.get<0>() ? "SET" : "NULL");
+    // Walk all instances on the same path — the synchronizer may live on a sibling.
+    // Lock ipc_callbacks_mutex_ on each sibling to synchronize with the IPC accept
+    // callback, which creates synchronizers on the accept thread.
+    instance_registry::instance().for_each_alive_creator_bound(config_.path,
+        [&requested](lattice_db* sibling) {
+            sibling->require_creator_process();
+            if(!sibling->remember_configured_progress(requested.get<0>())||!sibling->owns_creator_process())return;
+            if(sibling->configured_sync_present()){
+                detail::native_retirement_storage<synchronizer::on_progress_handler> forwarding;
+                forwarding.get<0>()=requested.get<0>();
+                if(!sibling->owns_creator_process())return;
+                sibling->configured_sync_progress(std::move(forwarding.get<0>()));
+                return; // Continuous configuration excludes IPC targets.
+            }
+            detail::native_retirement_storage<synchronizer::on_progress_handler,synchronizer::on_progress_handler> local;
+            auto& replacement=local.get<0>();replacement=requested.get<0>();
+            if(!sibling->owns_creator_process())return;
+            {std::lock_guard<std::mutex> lock(sibling->managed_wss_mutex_);
+                if(sibling->is_closed())return;
+                sibling->on_sync_progress_.swap(replacement);
+            }
+            if(!local.release<0>())return;
+            detail::native_retirement_leaf_lock lock(sibling->ipc_callbacks_mutex_);
+            LOG_INFO("lattice_db", "  visiting sibling=%p, sync=%p, ipc_count=%zu",
+                     (void*)sibling,
+                     sibling->synchronizer_ ? (void*)sibling->synchronizer_.get() : nullptr,
+                     sibling->ipc_synchronizers_.size());
+            if (sibling->synchronizer_) {
+                local.get<1>()=requested.get<0>();
+                if(!sibling->owns_creator_process())return;
+                sibling->synchronizer_->set_on_progress(std::move(local.get<1>()));
+                if(!sibling->owns_creator_process())return;
+            }
+            for (size_t i = 0; i < sibling->ipc_synchronizers_.size(); ++i) {
+                auto& ipc = sibling->ipc_synchronizers_[i];
+                LOG_INFO("lattice_db", "  ipc[%zu].sync=%p", i,
+                         ipc.sync ? (void*)ipc.sync.get() : nullptr);
+                if (ipc.sync) {
+                    local.get<1>()=requested.get<0>();
+                    if(!sibling->owns_creator_process())return;
+                    ipc.sync->set_on_progress(std::move(local.get<1>()));
+                    if(!sibling->owns_creator_process())return;
+                }
+            }
+        });
+}
+
+// Implementation of managed<std::vector<uint8_t>> methods that need lattice_db
+inline void managed<std::vector<uint8_t>>::ensure_vec0_for_blob(
+    lattice_db* lattice, const std::string& table,
+    const std::string& column, const std::vector<uint8_t>& val) {
+    if (lattice) {
+        const int dimensions = static_cast<int>(val.size() / sizeof(float));
+        if (val.empty() || dimensions > 0)
+            lattice->ensure_vec0_table(table, column, dimensions);
+    }
+}
+
+// The optional wrapper has already admitted/pinned its route. Do not look up a
+// replacement writer or take another route admission while executing this body.
+inline void managed<std::vector<uint8_t>>::set_optional_value_on(
+    database& writer, lattice_db* lattice, const std::string& table,
+    const std::string& column, int64_t row,
+    const std::optional<std::vector<uint8_t>>& val, bool is_vector_column) {
+    if (is_vector_column && lattice) {
+        const int dimensions = val ? static_cast<int>(val->size() / sizeof(float)) : 0;
+        if (!val || val->empty() || dimensions > 0)
+            lattice->ensure_vec0_table_on(writer, table, column, dimensions);
+    }
+    column_value_t value = nullptr;
+    if (val) value = *val;
+    writer.update(managed_table_sql(table), row, {{column, std::move(value)}});
+}
+
+inline void managed<std::vector<uint8_t>>::set_value(const std::vector<uint8_t>& val) {
+    unmanaged_value = val;
+    if (!is_bound()) return;
+    detail::managed_route_scope route_guard(db, lattice, table_name, attachment_token, attachment_writer, is_vector_column);
+
+    // If this is a vector column, ensure vec0 table + triggers exist
+    // This handles the migration case where vec0 wasn't created initially
+    if (is_vector_column) {
+        if (attachment_token > 0 && lattice) {
+            const int dimensions = static_cast<int>(val.size() / sizeof(float));
+            if (val.empty() || dimensions > 0)
+                lattice->ensure_vec0_table_on(*db, table_name, column_name, dimensions);
+        } else {
+            ensure_vec0_for_blob(lattice, table_name, column_name, val);
+        }
+    }
+
+    std::string sql = "UPDATE " + managed_table_sql(table_name) + " SET " + column_name + " = ? WHERE id = ?";
+    db->execute(sql, {val, row_id});
+}
+
+// ============================================================================
+// managed<std::vector<geo_bounds>> method implementations
+// ============================================================================
+
+inline void managed<std::vector<geo_bounds>>::push_back(const geo_bounds& bounds) {
+    if (!is_bound()) {
+        unmanaged_value.push_back(bounds);
+        return;
+    }
+
+    // Ensure the list table exists
+    if (lattice) {
+        lattice->ensure_geo_bounds_list_table(table_name, column_name);
+    }
+
+    // Insert into list table
+    std::string sql = "INSERT INTO " + list_table_ +
+        " (parent_id, minLat, maxLat, minLon, maxLon) VALUES (?, ?, ?, ?, ?)";
+    db->execute(sql, {
+        parent_global_id_,
+        bounds.min_lat,
+        bounds.max_lat,
+        bounds.min_lon,
+        bounds.max_lon
+    });
+
+    // Update cache
+    cached_objects_.push_back(bounds);
+}
+
+inline void managed<std::vector<geo_bounds>>::erase(size_t index) {
+    if (!is_bound()) {
+        if (index < unmanaged_value.size()) {
+            unmanaged_value.erase(unmanaged_value.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+        return;
+    }
+
+    load_if_needed();
+    if (index >= cached_objects_.size()) return;
+
+    // Get the id of the row to delete
+    std::string sql = "SELECT id FROM " + list_table_ +
+        " WHERE parent_id = ? ORDER BY id LIMIT 1 OFFSET ?";
+    auto rows = db->query(sql, {parent_global_id_, static_cast<int64_t>(index)});
+
+    if (!rows.empty()) {
+        auto it = rows[0].find("id");
+        if (it != rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
+            int64_t row_id_to_delete = std::get<int64_t>(it->second);
+            db->execute("DELETE FROM " + list_table_ + " WHERE id = ?", {row_id_to_delete});
+        }
+    }
+
+    // Update cache
+    cached_objects_.erase(cached_objects_.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+inline void managed<std::vector<geo_bounds>>::clear() {
+    if (!is_bound()) {
+        unmanaged_value.clear();
+        return;
+    }
+
+    // Delete all entries for this parent
+    std::string sql = "DELETE FROM " + list_table_ + " WHERE parent_id = ?";
+    db->execute(sql, {parent_global_id_});
+
+    // Clear cache
+    cached_objects_.clear();
+    is_loaded_ = true;  // Mark as loaded (empty)
+}
+
+} // namespace lattice

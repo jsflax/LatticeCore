@@ -1,0 +1,2859 @@
+#include "TestHelpers.hpp"
+#include <regex>
+#include <set>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <csignal>
+#include <cstdio>
+#include <deque>
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include <unistd.h>
+#endif
+
+// ============================================================================
+// Sync Unit Tests — AuditLog, sync protocol, synchronizer
+// ============================================================================
+
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+void bounded_mock_case(const std::function<void()>& body) {
+    struct Style {
+        std::string old = GTEST_FLAG_GET(death_test_style);
+        ~Style() { GTEST_FLAG_SET(death_test_style, old); }
+    } style;
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGALRM);
+        if (std::signal(SIGALRM, SIG_DFL) == SIG_ERR ||
+            sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+        alarm(10);
+        try {
+            body();
+            if (::testing::Test::HasFailure()) _exit(1);
+            std::fputs("mock_transport_complete\n", stderr);
+            _exit(0);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "mock_transport_failure: %s\n", error.what());
+            _exit(1);
+        }
+    }, ::testing::ExitedWithCode(0), "mock_transport_complete");
+}
+
+// The default immediate scheduler can send on both the caller and pacer
+// threads. The mock owns the synchronization of its own collected messages.
+void mock_concurrent_send_snapshot() {
+    lattice::mock_sync_transport transport;
+    constexpr int messages_per_sender = 512;
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    int ready = 0;
+    bool start = false;
+    std::atomic<bool> gate_timed_out{false};
+    auto sender = [&](const char* prefix) {
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            ++ready;
+            gate_cv.notify_all();
+            if (!gate_cv.wait_for(lock, std::chrono::seconds(5), [&] { return start; })) {
+                gate_timed_out.store(true);
+                return;
+            }
+        }
+        for (int i = 0; i < messages_per_sender; ++i) {
+            transport.send(lattice::transport_message::from_string(
+                std::string(prefix) + std::to_string(i) + std::string(128, 'x')));
+            if (i % 8 == 0) std::this_thread::yield();
+        }
+    };
+    std::thread left(sender, "left-");
+    std::thread right(sender, "right-");
+    bool both_ready;
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        both_ready = gate_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ready == 2; });
+        start = true; // release and join even if admission failed
+    }
+    gate_cv.notify_all();
+    bool snapshots_valid = true;
+    size_t prior_size = 0;
+    for (int sample = 0; sample < 256; ++sample) {
+        const auto snapshot = transport.get_sent_messages();
+        if (snapshot.size() < prior_size || snapshot.size() > 2 * messages_per_sender) {
+            snapshots_valid = false;
+        }
+        prior_size = snapshot.size();
+        for (const auto& message : snapshot) {
+            const auto text = message.as_string();
+            if ((text.rfind("left-", 0) != 0 && text.rfind("right-", 0) != 0) ||
+                text.size() < 133 || text.substr(text.size() - 128) != std::string(128, 'x')) {
+                snapshots_valid = false;
+            }
+        }
+        std::this_thread::yield();
+    }
+    left.join();
+    right.join();
+    ASSERT_TRUE(both_ready);
+    ASSERT_FALSE(gate_timed_out.load());
+    EXPECT_TRUE(snapshots_valid);
+    const auto snapshot = transport.get_sent_messages();
+    ASSERT_EQ(snapshot.size(), 2u * messages_per_sender);
+    std::set<std::string> observed;
+    for (const auto& message : snapshot) observed.insert(message.as_string());
+    ASSERT_EQ(observed.size(), 2u * messages_per_sender);
+    for (int i = 0; i < messages_per_sender; ++i) {
+        EXPECT_EQ(observed.count("left-" + std::to_string(i) + std::string(128, 'x')), 1u);
+        EXPECT_EQ(observed.count("right-" + std::to_string(i) + std::string(128, 'x')), 1u);
+    }
+    const auto retained_first = snapshot.front().as_string();
+    transport.clear_sent_messages();
+    EXPECT_TRUE(transport.get_sent_messages().empty());
+    EXPECT_EQ(snapshot.size(), 2u * messages_per_sender);
+    EXPECT_EQ(snapshot.front().as_string(), retained_first);
+}
+
+void mock_callback_reentry() {
+    lattice::mock_sync_transport transport;
+    int opens = 0;
+    int messages = 0;
+    int errors = 0;
+    int closes = 0;
+    transport.set_on_open([&] {
+        ++opens;
+        EXPECT_EQ(transport.state(), lattice::transport_state::open);
+        transport.send(lattice::transport_message::from_string("open"));
+        transport.set_on_open({});
+    });
+    transport.set_on_message([&](const lattice::transport_message& message) {
+        ++messages;
+        transport.send(message);
+        transport.set_on_message([&](const lattice::transport_message&) { ++messages; });
+    });
+    transport.set_on_error([&](const std::string&) {
+        ++errors;
+        EXPECT_EQ(transport.get_sent_messages().size(), 2u);
+        transport.set_on_error({});
+    });
+    transport.set_on_close([&](int code, const std::string&) {
+        ++closes;
+        EXPECT_EQ(code, 1000);
+        EXPECT_EQ(transport.state(), lattice::transport_state::closed);
+        transport.clear_sent_messages();
+        transport.set_on_close({});
+    });
+    transport.connect("ws://mock");
+    transport.simulate_message(lattice::transport_message::from_string("message"));
+    transport.simulate_message(lattice::transport_message::from_string("replacement"));
+    transport.simulate_error("error");
+    transport.simulate_error("removed");
+    transport.disconnect();
+    transport.connect("ws://mock");
+    transport.disconnect();
+    EXPECT_EQ(opens, 1);
+    EXPECT_EQ(messages, 2);
+    EXPECT_EQ(errors, 1);
+    EXPECT_EQ(closes, 1);
+    EXPECT_TRUE(transport.get_sent_messages().empty());
+}
+
+} // namespace
+TEST(MockTransport, ConcurrentSendAndSnapshotRetainEveryMessage) {
+    bounded_mock_case(mock_concurrent_send_snapshot);
+}
+TEST(MockTransport, CallbacksReenterAndReplaceHandlersWithoutHoldingStateLock) {
+    bounded_mock_case(mock_callback_reentry);
+}
+#endif
+
+// ----------------------------------------------------------------------------
+// AuditLog Triggers
+// ----------------------------------------------------------------------------
+
+TEST(Sync, InsertTrigger) {
+    lattice::lattice_db db;
+    db.db().execute("DELETE FROM AuditLog");
+
+    auto person = db.add(TestPerson{"AuditTest", 25, std::nullopt});
+
+    auto logs = db.db().query(
+        "SELECT * FROM AuditLog WHERE tableName = 'TestPerson' AND operation = 'INSERT'");
+    ASSERT_EQ(logs.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(logs[0].at("globalRowId")), person.global_id());
+
+    auto fields = std::get<std::string>(logs[0].at("changedFields"));
+    EXPECT_NE(fields.find("name"), std::string::npos);
+    EXPECT_NE(fields.find("age"), std::string::npos);
+}
+
+TEST(Sync, UpdateTrigger) {
+    lattice::lattice_db db;
+    auto person = db.add(TestPerson{"Orig", 25, std::nullopt});
+    db.db().execute("DELETE FROM AuditLog WHERE operation = 'UPDATE'");
+
+    person.name = "Updated";
+
+    auto logs = db.db().query(
+        "SELECT * FROM AuditLog WHERE tableName = 'TestPerson' AND operation = 'UPDATE'");
+    ASSERT_EQ(logs.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(logs[0].at("globalRowId")), person.global_id());
+}
+
+TEST(Sync, DeleteTrigger) {
+    lattice::lattice_db db;
+    auto person = db.add(TestPerson{"ToDelete", 25, std::nullopt});
+    std::string gid = person.global_id();
+    db.remove(person);
+
+    auto logs = db.db().query(
+        "SELECT * FROM AuditLog WHERE tableName = 'TestPerson' AND operation = 'DELETE' AND globalRowId = ?",
+        {gid});
+    EXPECT_EQ(logs.size(), 1u);
+}
+
+TEST(Sync, LinkTableTrigger) {
+    lattice::lattice_db db;
+    db.db().execute("DELETE FROM AuditLog");
+
+    auto owner = db.add(TestOwner{"LinkOwner", nullptr});
+    owner.pet = TestPet{"LinkPet", 15.0};
+
+    auto logs = db.db().query(
+        "SELECT * FROM AuditLog WHERE tableName LIKE '%TestOwner_TestPet_pet%' AND operation = 'INSERT'");
+    EXPECT_EQ(logs.size(), 1u);
+}
+
+TEST(Sync, SyncControlDisables) {
+    lattice::lattice_db db;
+    db.db().execute("DELETE FROM AuditLog");
+
+    // Disable sync
+    db.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+    auto silent = db.add(TestPerson{"SilentPerson", 30, std::nullopt});
+
+    auto logs = db.db().query(
+        "SELECT * FROM AuditLog WHERE globalRowId = ?", {silent.global_id()});
+    EXPECT_EQ(logs.size(), 0u);
+
+    // Re-enable
+    db.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+    silent.name = "Updated";
+
+    logs = db.db().query(
+        "SELECT * FROM AuditLog WHERE globalRowId = ?", {silent.global_id()});
+    EXPECT_EQ(logs.size(), 1u);
+}
+
+// ----------------------------------------------------------------------------
+// AuditLog Compaction
+// ----------------------------------------------------------------------------
+
+TEST(Sync, CompactAuditLog) {
+    lattice::lattice_db db;
+    db.db().execute("DELETE FROM AuditLog");
+
+    auto p1 = db.add(TestPerson{"Alice", 25, std::nullopt});
+    auto p2 = db.add(TestPerson{"Bob", 30, std::string("bob@example.com")});
+    auto d1 = db.add(TestDog{"Max", 25.5, true});
+
+    p1.name = "Alice Updated";
+    p1.age = 26;
+    p2.email = std::optional<std::string>("bob.new@example.com");
+    d1.weight = 26.0;
+
+    // Pre-compact: at least 7 entries (3 INSERT + 4 UPDATE)
+    auto pre = db.db().query("SELECT COUNT(*) as cnt FROM AuditLog");
+    EXPECT_GE(std::get<int64_t>(pre[0].at("cnt")), 7);
+
+    int64_t created = db.compact_audit_log();
+    EXPECT_EQ(created, 3);
+
+    // Post-compact: 3 INSERT entries with current state
+    auto post = db.db().query("SELECT COUNT(*) as cnt FROM AuditLog");
+    EXPECT_EQ(std::get<int64_t>(post[0].at("cnt")), 3);
+
+    auto inserts = db.db().query("SELECT COUNT(*) as cnt FROM AuditLog WHERE operation = 'INSERT'");
+    EXPECT_EQ(std::get<int64_t>(inserts[0].at("cnt")), 3);
+
+    // Verify compacted state has updated values
+    auto alice_log = db.db().query(
+        "SELECT changedFields FROM AuditLog WHERE tableName = 'TestPerson' AND globalRowId = ?",
+        {p1.global_id()});
+    ASSERT_EQ(alice_log.size(), 1u);
+    auto fields = std::get<std::string>(alice_log[0].at("changedFields"));
+    EXPECT_NE(fields.find("Alice Updated"), std::string::npos);
+}
+
+TEST(Sync, CompactAuditLogSchemaless) {
+    TempDB tmp{"compact"};
+
+    // Create with schema
+    {
+        lattice::configuration config(tmp.str());
+        lattice::lattice_db db(config);
+        auto p1 = db.add(TestPerson{"Alice", 30, std::string("alice@test.com")});
+        p1.age = 31;
+    }
+
+    // Reopen without schema, compact
+    {
+        lattice::configuration config(tmp.str());
+        lattice::lattice_db db(config);
+        int64_t compacted = db.compact_audit_log();
+        EXPECT_EQ(compacted, 1);
+    }
+
+    // Reopen with schema, verify data
+    {
+        lattice::configuration config(tmp.str());
+        lattice::lattice_db db(config);
+        auto persons = db.objects<TestPerson>();
+        ASSERT_EQ(persons.size(), 1u);
+        EXPECT_EQ(int(persons[0].age), 31);
+    }
+}
+
+TEST(Sync, GenerateHistory) {
+    lattice::lattice_db db;
+    db.db().execute("DELETE FROM AuditLog");
+
+    // Add objects with sync disabled
+    db.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+    db.add(TestPerson{"NoAudit1", 20, std::nullopt});
+    db.add(TestPerson{"NoAudit2", 25, std::nullopt});
+    db.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+
+    // Add one with audit
+    db.add(TestPerson{"WithAudit", 30, std::nullopt});
+
+    auto pre = db.db().query("SELECT COUNT(*) as cnt FROM AuditLog");
+    EXPECT_EQ(std::get<int64_t>(pre[0].at("cnt")), 1);
+
+    int64_t generated = db.generate_history();
+    EXPECT_EQ(generated, 2);
+
+    auto post = db.db().query("SELECT COUNT(*) as cnt FROM AuditLog");
+    EXPECT_EQ(std::get<int64_t>(post[0].at("cnt")), 3);
+
+    // Second run → nothing
+    EXPECT_EQ(db.generate_history(), 0);
+}
+
+// ----------------------------------------------------------------------------
+// Sync Protocol — JSON encoding/decoding
+// ----------------------------------------------------------------------------
+
+TEST(Sync, AuditLogEntryJson) {
+    lattice::audit_log_entry entry;
+    entry.id = 1;
+    entry.global_id = "abc-123";
+    entry.table_name = "TestPerson";
+    entry.operation = "INSERT";
+    entry.row_id = 42;
+    entry.global_row_id = "row-uuid-456";
+    entry.changed_fields = {{"name", lattice::any_property("Alice")},
+                            {"age", lattice::any_property(30)}};
+    entry.changed_fields_names = {"name", "age"};
+    entry.timestamp = "2024-01-01T00:00:00Z";
+    entry.is_from_remote = false;
+    entry.is_synchronized = false;
+
+    std::string json = entry.to_json();
+    EXPECT_NE(json.find("\"tableName\":\"TestPerson\""), std::string::npos);
+    EXPECT_NE(json.find("\"operation\":\"INSERT\""), std::string::npos);
+
+    auto parsed = lattice::audit_log_entry::from_json(json);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->table_name, "TestPerson");
+    EXPECT_EQ(parsed->operation, "INSERT");
+    EXPECT_EQ(parsed->global_row_id, "row-uuid-456");
+}
+
+TEST(Sync, ServerSentEventJson) {
+    lattice::audit_log_entry entry;
+    entry.global_id = "abc-123";
+    entry.table_name = "TestPerson";
+    entry.operation = "INSERT";
+    entry.global_row_id = "row-uuid";
+    entry.changed_fields = {{"name", lattice::any_property("Alice")}};
+    entry.changed_fields_names = {"name"};
+    entry.timestamp = "2024-01-01T00:00:00Z";
+
+    // Audit log event
+    auto audit_event = lattice::server_sent_event::make_audit_log({entry});
+    auto json = audit_event.to_json();
+    EXPECT_NE(json.find("\"auditLog\":["), std::string::npos);
+
+    auto parsed = lattice::server_sent_event::from_json(json);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->event_type, lattice::server_sent_event::type::audit_log);
+    EXPECT_EQ(parsed->audit_logs.size(), 1u);
+
+    // Ack event
+    auto ack = lattice::server_sent_event::make_ack({"id-1", "id-2", "id-3"});
+    auto ack_json = ack.to_json();
+    auto parsed_ack = lattice::server_sent_event::from_json(ack_json);
+    ASSERT_TRUE(parsed_ack.has_value());
+    EXPECT_EQ(parsed_ack->event_type, lattice::server_sent_event::type::ack);
+    EXPECT_EQ(parsed_ack->acked_ids.size(), 3u);
+}
+
+TEST(Sync, GenerateInstructionInsert) {
+    lattice::audit_log_entry entry;
+    entry.table_name = "TestPerson";
+    entry.operation = "INSERT";
+    entry.global_row_id = "uuid-123";
+    entry.changed_fields = {{"name", lattice::any_property("Bob")},
+                            {"age", lattice::any_property(25)}};
+    entry.changed_fields_names = {"name", "age"};
+
+    auto [sql, params] = entry.generate_instruction();
+    EXPECT_NE(sql.find("INSERT INTO TestPerson"), std::string::npos);
+    EXPECT_NE(sql.find("ON CONFLICT(globalId) DO UPDATE"), std::string::npos);
+    EXPECT_EQ(params.size(), 3u);  // globalId, name, age
+}
+
+TEST(Sync, GenerateInstructionUpdate) {
+    lattice::audit_log_entry entry;
+    entry.table_name = "TestPerson";
+    entry.operation = "UPDATE";
+    entry.global_row_id = "uuid-123";
+    entry.changed_fields = {{"name", lattice::any_property("Bobby")}};
+    entry.changed_fields_names = {"name"};
+
+    auto [sql, params] = entry.generate_instruction();
+    EXPECT_NE(sql.find("UPDATE TestPerson SET"), std::string::npos);
+    EXPECT_NE(sql.find("WHERE globalId = ?"), std::string::npos);
+    // Value-guarded update (B2): the WHERE re-binds each changed value via
+    // "col IS NOT ?" so changes()==0 identifies a genuine no-op.
+    EXPECT_NE(sql.find("name IS NOT ?"), std::string::npos);
+    EXPECT_EQ(params.size(), 3u);  // name, globalId, guard re-bind of name
+}
+
+TEST(Sync, GenerateInstructionDelete) {
+    lattice::audit_log_entry entry;
+    entry.table_name = "TestPerson";
+    entry.operation = "DELETE";
+    entry.global_row_id = "uuid-123";
+
+    auto [sql, params] = entry.generate_instruction();
+    EXPECT_NE(sql.find("DELETE FROM TestPerson WHERE globalId = ?"), std::string::npos);
+    EXPECT_EQ(params.size(), 1u);
+}
+
+// ----------------------------------------------------------------------------
+// Synchronizer with Mock WebSocket
+// ----------------------------------------------------------------------------
+
+TEST(Sync, LegacyNetworkFactoryAcceptsSchedulerContext) {
+    // mock_network_factory implements only the original no-argument virtual.
+    // The scheduler-aware entry point must preserve that implementation.
+    lattice::mock_network_factory legacy_factory;
+    lattice::network_factory& factory = legacy_factory;
+    auto scheduler = std::make_shared<lattice::immediate_scheduler>();
+    auto transport = factory.create_sync_transport(scheduler);
+    ASSERT_NE(transport, nullptr);
+    EXPECT_EQ(transport.get(), legacy_factory.last_websocket());
+    EXPECT_EQ(transport->state(), lattice::transport_state::closed);
+
+    transport->connect("ws://test.invalid/scheduler-fallback");
+    EXPECT_EQ(transport->state(), lattice::transport_state::open);
+    transport->disconnect();
+}
+
+TEST(Sync, SynchronizerConnectAndUpload) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"sync"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+
+    lattice::sync_config config;
+    config.websocket_url = "ws://localhost:8080/sync";
+    config.authorization_token = "test-token";
+    config.sync_id = "test-sync";
+    config.all_active_sync_ids = {"test-sync"};
+
+    db->add(TestPerson{"SyncTest", 40, std::nullopt});
+
+    lattice::synchronizer sync(std::move(db), config);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+
+    bool connected = false;
+    sync.set_on_state_change([&](bool state) { connected = state; });
+    sync.connect();
+    EXPECT_TRUE(connected);
+    EXPECT_TRUE(sync.is_connected());
+
+    // Trigger upload
+    sync.sync_now();
+    auto sent = mock_ws->get_sent_messages();
+    ASSERT_FALSE(sent.empty());
+    EXPECT_NE(sent[0].as_string().find("\"auditLog\""), std::string::npos);
+
+    sync.disconnect();
+    EXPECT_FALSE(sync.is_connected());
+}
+
+TEST(Sync, SynchronizerReceiveAck) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"syncack"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    lattice::lattice_db reader_db(lattice::configuration(tmp.str()));
+
+    lattice::sync_config config;
+    config.websocket_url = "ws://localhost:8080/sync";
+    config.authorization_token = "test-token";
+    config.sync_id = "test-sync";
+    config.all_active_sync_ids = {"test-sync"};
+
+    db->add(TestPerson{"AckTest", 40, std::nullopt});
+    lattice::synchronizer sync(std::move(db), config);
+    auto* mock_ws = mock_factory->last_websocket();
+
+    sync.connect();
+    sync.sync_now();
+
+    // Send ack for all unsynced entries
+    auto unsynced = lattice::query_audit_log(reader_db.db(), true);
+    ASSERT_FALSE(unsynced.empty());
+
+    std::vector<std::string> to_ack;
+    for (const auto& e : unsynced) to_ack.push_back(e.global_id);
+    mock_ws->simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_ack(to_ack).to_json()));
+
+    auto still_unsynced = lattice::query_audit_log(reader_db.db(), true);
+    EXPECT_TRUE(still_unsynced.empty());
+
+    sync.disconnect();
+}
+
+TEST(Sync, SynchronizerReceiveRemote) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"syncremote"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    lattice::lattice_db reader_db(lattice::configuration(tmp.str()));
+
+    lattice::sync_config config;
+    config.websocket_url = "ws://localhost:8080/sync";
+    config.authorization_token = "test-token";
+    config.sync_id = "test-sync";
+    config.all_active_sync_ids = {"test-sync"};
+
+    lattice::synchronizer sync(std::move(db), config);
+    auto* mock_ws = mock_factory->last_websocket();
+    sync.connect();
+
+    // Simulate remote INSERT
+    lattice::audit_log_entry remote;
+    remote.global_id = "remote-audit-1";
+    remote.table_name = "TestPerson";
+    remote.operation = "INSERT";
+    remote.row_id = 999;
+    remote.global_row_id = "remote-person-uuid";
+    remote.changed_fields = {{"name", lattice::any_property("RemotePerson")},
+                             {"age", lattice::any_property(50)}};
+    remote.changed_fields_names = {"name", "age"};
+    remote.timestamp = "2024-01-01T00:00:00Z";
+
+    mock_ws->simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_audit_log({remote}).to_json()));
+
+    // Verify ack sent back
+    auto ack_sent = mock_ws->get_sent_messages();
+    ASSERT_FALSE(ack_sent.empty());
+
+    // Verify remote person created
+    auto found = reader_db.find_by_global_id<TestPerson>("remote-person-uuid");
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(std::string(found->name), "RemotePerson");
+    EXPECT_EQ(int(found->age), 50);
+
+    sync.disconnect();
+}
+
+// ----------------------------------------------------------------------------
+// Synchronizer destroy race
+// ----------------------------------------------------------------------------
+
+class slow_mock_transport : public lattice::sync_transport {
+public:
+    void connect(const std::string&,
+                 const std::map<std::string, std::string>&) override {
+        state_ = lattice::transport_state::open;
+        if (on_open_) on_open_();
+    }
+    void disconnect() override { state_ = lattice::transport_state::closed; }
+    lattice::transport_state state() const override { return state_; }
+    void send(const lattice::transport_message&) override {}
+    void set_on_open(on_open_handler h) override { on_open_ = h; }
+    void set_on_message(on_message_handler) override {}
+    void set_on_error(on_error_handler) override {}
+    void set_on_close(on_close_handler) override {}
+private:
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_open_handler on_open_;
+};
+
+TEST(Sync, DestroyRaceNocrash) {
+    TempDB tmp{"destroyrace"};
+
+    lattice::configuration db_cfg(tmp.str(),
+                                  std::make_shared<lattice::std_thread_scheduler>());
+    auto db = std::make_unique<lattice::lattice_db>(db_cfg);
+
+    for (int i = 0; i < 500; i++) {
+        db->add(TestPerson{"race-" + std::to_string(i), i, std::nullopt});
+    }
+
+    lattice::sync_config sync_cfg;
+    sync_cfg.sync_id = "destroy-race";
+    sync_cfg.all_active_sync_ids = {"destroy-race"};
+    sync_cfg.sync_filter = std::vector<lattice::sync_filter_entry>{
+        {"TestPerson", std::string("name = 'IMPOSSIBLE'")}
+    };
+
+    auto transport = std::make_unique<slow_mock_transport>();
+    auto sync = std::make_unique<lattice::synchronizer>(
+        std::move(db), sync_cfg, std::move(transport));
+    sync->connect();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    sync.reset();  // Destroy while scheduler thread may be running
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // If we get here without crashing, the test passes
+}
+
+// ----------------------------------------------------------------------------
+// Apply remote changes with vec0 (E2E bug scenario)
+// ----------------------------------------------------------------------------
+
+TEST(Sync, ApplyRemoteVec0OnTarget) {
+    TempDB tmp{"syncvec0"};
+
+    // Set up sync_db that receives remote changes
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+
+    // Create the vector table setup
+    db->db().execute(
+        "CREATE TABLE IF NOT EXISTS VectorDoc ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "globalId TEXT UNIQUE NOT NULL, "
+        "title TEXT NOT NULL, "
+        "embedding BLOB)");
+    db->ensure_vec0_table("VectorDoc", "embedding", 3);
+
+    // Simulate applying a remote INSERT with an embedding
+    auto emb = pack_floats({1.0f, 0.0f, 0.0f});
+    // Build the hex string for the BLOB
+    std::string hex;
+    for (auto byte : emb) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", byte);
+        hex += buf;
+    }
+
+    db->db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+    db->db().execute(
+        "INSERT INTO VectorDoc (globalId, title, embedding) "
+        "VALUES ('remote-vec-1', 'RemoteDoc', unhex(?))",
+        {hex});
+    db->db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+
+    // The vec0 trigger should have populated the vec0 table
+    // OR we need to reconcile
+    db->reconcile_vec0("VectorDoc", "embedding");
+
+    // Now knn_query should find the remote document
+    auto qvec = pack_floats({1.0f, 0.0f, 0.0f});
+    auto results = db->knn_query("VectorDoc", "embedding", qvec, 1,
+                                  lattice::lattice_db::distance_metric::l2);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results[0].global_id, "remote-vec-1");
+}
+
+// ============================================================================
+// Exploratory tests targeting known sync bugs
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// BLOB round-trip through audit_log_entry JSON (BlobColumnRoundTrip bug)
+// The BLOB goes: trigger hex() → AuditLog JSON → to_json() → from_json()
+//              → generate_instruction(schema) → unhex(?) → INSERT
+// Each step can corrupt the data.
+// ----------------------------------------------------------------------------
+
+TEST(Sync, BlobJsonRoundTrip) {
+    // Simulate what happens when a BLOB column goes through the full
+    // sync JSON serialization/deserialization cycle.
+
+    // Original float vector
+    std::vector<float> original = {1.0f, 2.0f, 3.0f, 4.5f, -0.5f};
+    auto blob = pack_floats(original);
+
+    // Step 1: The audit trigger stores hex(blob) as a string in changedFields JSON.
+    // Simulate: json_object('embedding', hex(blob)) produces a plain hex string.
+    std::string hex_str;
+    for (auto byte : blob) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", byte);
+        hex_str += buf;
+    }
+
+    // Step 2: Build an audit_log_entry as if read from AuditLog table
+    // The changedFields from the trigger is: {"label":"test","embedding":"0000803F..."}
+    // parse_changed_fields reads this and creates any_property values
+    std::string trigger_json = "{\"label\":\"blob test\",\"embedding\":\"" + hex_str + "\"}";
+    auto fields = lattice::audit_log_entry::parse_changed_fields(trigger_json);
+    ASSERT_EQ(fields.size(), 2u);
+    ASSERT_NE(fields.find("embedding"), fields.end());
+
+    // The embedding should be string_kind (raw hex from trigger, no {kind,value} wrapper)
+    auto& emb_prop = fields.at("embedding");
+    EXPECT_EQ(emb_prop.kind, lattice::any_property_kind::string_kind);
+
+    // Step 3: Serialize to sync JSON (to_json → from_json round-trip)
+    lattice::audit_log_entry entry;
+    entry.global_id = "blob-test-1";
+    entry.table_name = "VectorDoc";
+    entry.operation = "INSERT";
+    entry.global_row_id = "blob-uuid-1";
+    entry.changed_fields = fields;
+    entry.changed_fields_names = {"label", "embedding"};
+    entry.timestamp = "2024-01-01T00:00:00Z";
+
+    std::string json = entry.to_json();
+    auto parsed = lattice::audit_log_entry::from_json(json);
+    ASSERT_TRUE(parsed.has_value());
+
+    // Step 4: Check that the parsed entry's embedding field survived
+    auto emb_it = parsed->changed_fields.find("embedding");
+    ASSERT_NE(emb_it, parsed->changed_fields.end());
+
+    // After round-trip through {kind, value} JSON, it should still be usable
+    auto col_val = emb_it->second.to_column_value();
+
+    // Step 5: generate_instruction with schema marking embedding as BLOB
+    std::unordered_map<std::string, lattice::column_type> schema;
+    schema["label"] = lattice::column_type::text;
+    schema["embedding"] = lattice::column_type::blob;
+    auto [sql, params] = parsed->generate_instruction(schema);
+
+    // SQL should contain unhex(?) for the embedding column
+    EXPECT_NE(sql.find("unhex(?)"), std::string::npos)
+        << "SQL should use unhex(?) for BLOB columns: " << sql;
+
+    // Step 6: Actually apply it to a real database and verify
+    lattice::lattice_db db;
+    db.db().execute(
+        "CREATE TABLE IF NOT EXISTS VectorDoc ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "globalId TEXT UNIQUE NOT NULL, "
+        "label TEXT NOT NULL, "
+        "embedding BLOB)");
+
+    db.db().execute(sql, params);
+
+    // Verify the BLOB was stored correctly
+    auto rows = db.db().query(
+        "SELECT label, embedding FROM VectorDoc WHERE globalId = 'blob-uuid-1'");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(rows[0].at("label")), "blob test");
+
+    // Verify embedding round-trips correctly
+    auto stored_blob = std::get<std::vector<uint8_t>>(rows[0].at("embedding"));
+    ASSERT_EQ(stored_blob.size(), blob.size());
+    auto stored_floats = unpack_floats(stored_blob);
+    ASSERT_EQ(stored_floats.size(), original.size());
+    for (size_t i = 0; i < original.size(); i++) {
+        EXPECT_NEAR(stored_floats[i], original[i], 0.001)
+            << "Float mismatch at index " << i;
+    }
+}
+
+TEST(Sync, BlobSurvivesServerSentEventRoundTrip) {
+    // Full SSE round-trip: entry → SSE JSON → parse → apply
+    std::vector<float> original = {1.0f, 2.0f, 3.0f, 4.5f, -0.5f};
+    auto blob = pack_floats(original);
+    std::string hex_str;
+    for (auto byte : blob) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", byte);
+        hex_str += buf;
+    }
+
+    lattice::audit_log_entry entry;
+    entry.global_id = "sse-blob-1";
+    entry.table_name = "VectorDoc";
+    entry.operation = "INSERT";
+    entry.global_row_id = "sse-blob-uuid";
+    entry.changed_fields = {
+        {"label", lattice::any_property("sse test")},
+        {"embedding", lattice::any_property(hex_str)}  // stored as string_kind
+    };
+    entry.changed_fields_names = {"label", "embedding"};
+    entry.timestamp = "2024-01-01T00:00:00Z";
+
+    // Full SSE round-trip
+    auto sse = lattice::server_sent_event::make_audit_log({entry});
+    auto sse_json = sse.to_json();
+    auto parsed_sse = lattice::server_sent_event::from_json(sse_json);
+    ASSERT_TRUE(parsed_sse.has_value());
+    ASSERT_EQ(parsed_sse->audit_logs.size(), 1u);
+
+    auto& parsed_entry = parsed_sse->audit_logs[0];
+
+    // Apply to database
+    lattice::lattice_db db;
+    db.db().execute(
+        "CREATE TABLE IF NOT EXISTS VectorDoc ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "globalId TEXT UNIQUE NOT NULL, "
+        "label TEXT NOT NULL, "
+        "embedding BLOB)");
+
+    auto schema = db.get_table_schema("VectorDoc");
+    auto [sql, params] = parsed_entry.generate_instruction(schema);
+    db.db().execute(sql, params);
+
+    // Verify
+    auto rows = db.db().query(
+        "SELECT label, embedding FROM VectorDoc WHERE globalId = 'sse-blob-uuid'");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(rows[0].at("label")), "sse test");
+
+    auto stored = std::get<std::vector<uint8_t>>(rows[0].at("embedding"));
+    auto floats = unpack_floats(stored);
+    ASSERT_EQ(floats.size(), original.size());
+    for (size_t i = 0; i < original.size(); i++) {
+        EXPECT_NEAR(floats[i], original[i], 0.001);
+    }
+}
+
+TEST(Sync, BlobVec0QueryableAfterRemoteApply) {
+    // E2E: sync applies INSERT with BLOB → vec0 trigger fires →
+    // knn_query finds the data on the SAME connection
+    TempDB tmp{"blobvec0"};
+
+    lattice::lattice_db db(lattice::configuration(tmp.str()));
+    db.db().execute(
+        "CREATE TABLE IF NOT EXISTS VectorDoc ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "globalId TEXT UNIQUE NOT NULL, "
+        "label TEXT NOT NULL, "
+        "embedding BLOB)");
+    db.ensure_vec0_table("VectorDoc", "embedding", 5);
+
+    // Simulate apply_remote_changes: disable sync, insert, re-enable
+    std::vector<float> vec = {1.0f, 2.0f, 3.0f, 4.5f, -0.5f};
+    auto blob = pack_floats(vec);
+    std::string hex_str;
+    for (auto byte : blob) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", byte);
+        hex_str += buf;
+    }
+
+    db.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+    db.db().execute(
+        "INSERT INTO VectorDoc (globalId, label, embedding) "
+        "VALUES ('sync-vec-1', 'synced doc', unhex(?))",
+        {hex_str});
+    db.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+
+    // vec0 trigger fires even with sync_disabled (it doesn't check sync_disabled)
+    auto qvec = pack_floats(vec);
+    auto results = db.knn_query("VectorDoc", "embedding", qvec, 1,
+                                 lattice::lattice_db::distance_metric::l2);
+    ASSERT_EQ(results.size(), 1u) << "vec0 data should be queryable after sync insert";
+    EXPECT_EQ(results[0].global_id, "sync-vec-1");
+    EXPECT_NEAR(results[0].distance, 0.0, 0.001);
+}
+
+TEST(Sync, BlobVec0CrossConnectionAfterRemoteApply) {
+    // THE ACTUAL BUG: sync_db applies INSERT → main_db can't query vec0
+    TempDB tmp{"blobvec0cross"};
+
+    // sync_db applies the change
+    lattice::lattice_db sync_db(lattice::configuration(tmp.str()));
+    sync_db.db().execute(
+        "CREATE TABLE IF NOT EXISTS VectorDoc ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "globalId TEXT UNIQUE NOT NULL, "
+        "label TEXT NOT NULL, "
+        "embedding BLOB)");
+    sync_db.ensure_vec0_table("VectorDoc", "embedding", 5);
+
+    std::vector<float> vec = {1.0f, 2.0f, 3.0f, 4.5f, -0.5f};
+    auto blob = pack_floats(vec);
+    std::string hex;
+    for (auto b : blob) { char buf[3]; snprintf(buf, 3, "%02X", b); hex += buf; }
+
+    sync_db.db().execute("UPDATE _SyncControl SET disabled = 1 WHERE id = 1");
+    sync_db.db().execute(
+        "INSERT INTO VectorDoc (globalId, label, embedding) "
+        "VALUES ('cross-vec-1', 'cross doc', unhex(?))",
+        {hex});
+    sync_db.db().execute("UPDATE _SyncControl SET disabled = 0 WHERE id = 1");
+
+    // main_db opens a separate connection — can it query vec0?
+    lattice::lattice_db main_db(lattice::configuration(tmp.str()));
+
+    // The base table row should be visible
+    auto rows = main_db.db().query("SELECT label FROM VectorDoc WHERE globalId = 'cross-vec-1'");
+    ASSERT_EQ(rows.size(), 1u) << "Base table row should be visible cross-connection";
+    EXPECT_EQ(std::get<std::string>(rows[0].at("label")), "cross doc");
+
+    // knn_query with self-healing reconciliation
+    auto qvec = pack_floats(vec);
+    auto results = main_db.knn_query("VectorDoc", "embedding", qvec, 1,
+                                      lattice::lattice_db::distance_metric::l2);
+    EXPECT_EQ(results.size(), 1u)
+        << "BUG: vec0 data from sync_db not queryable on main_db even after reconciliation";
+    if (!results.empty()) {
+        EXPECT_EQ(results[0].global_id, "cross-vec-1");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Deleted row skipped on catchup (DeletedRowSkippedOnCatchup bug)
+// When INSERT + DELETE for the same globalId are in the AuditLog,
+// applying both should result in no row.
+// ----------------------------------------------------------------------------
+
+TEST(Sync, DeletedRowCancelsOnApply) {
+    TempDB tmp{"deletecatchup"};
+    lattice::lattice_db db(lattice::configuration(tmp.str()));
+
+    // Simulate catchup: source had INSERT then DELETE for the same object
+    lattice::audit_log_entry insert_entry;
+    insert_entry.global_id = "catchup-1";
+    insert_entry.table_name = "TestPerson";
+    insert_entry.operation = "INSERT";
+    insert_entry.row_id = 1;
+    insert_entry.global_row_id = "deleted-person-uuid";
+    insert_entry.changed_fields = {
+        {"name", lattice::any_property("will be deleted")},
+        {"age", lattice::any_property(25)}
+    };
+    insert_entry.changed_fields_names = {"name", "age"};
+    insert_entry.timestamp = "2024-01-01T00:00:01Z";
+
+    lattice::audit_log_entry delete_entry;
+    delete_entry.global_id = "catchup-2";
+    delete_entry.table_name = "TestPerson";
+    delete_entry.operation = "DELETE";
+    delete_entry.row_id = 1;
+    delete_entry.global_row_id = "deleted-person-uuid";
+    delete_entry.timestamp = "2024-01-01T00:00:02Z";
+
+    // Apply both in order — should result in no row
+    lattice::apply_remote_changes(db, {insert_entry, delete_entry});
+
+    // The deleted person should NOT exist
+    auto persons = db.objects<TestPerson>();
+    EXPECT_EQ(persons.size(), 0u)
+        << "INSERT + DELETE should cancel out on catchup";
+
+    // Now apply a second INSERT (the "alive" note)
+    lattice::audit_log_entry alive_entry;
+    alive_entry.global_id = "catchup-3";
+    alive_entry.table_name = "TestPerson";
+    alive_entry.operation = "INSERT";
+    alive_entry.row_id = 2;
+    alive_entry.global_row_id = "alive-person-uuid";
+    alive_entry.changed_fields = {
+        {"name", lattice::any_property("alive note")},
+        {"age", lattice::any_property(30)}
+    };
+    alive_entry.changed_fields_names = {"name", "age"};
+    alive_entry.timestamp = "2024-01-01T00:00:03Z";
+
+    lattice::apply_remote_changes(db, {alive_entry});
+
+    // Only the alive person should exist
+    persons = db.objects<TestPerson>();
+    EXPECT_EQ(persons.size(), 1u);
+    if (!persons.empty()) {
+        EXPECT_EQ(std::string(persons[0].name), "alive note");
+    }
+}
+
+TEST(Sync, ChunkedProcessing) {
+    // >50 entries should process in multiple chunks
+    lattice::lattice_db db;
+    db.db().execute("DELETE FROM AuditLog");
+
+    // Add 60 objects to generate 60 audit entries
+    db.write([&]() {
+        for (int i = 0; i < 60; i++) {
+            db.add(TestPerson{"Chunk" + std::to_string(i), i, std::nullopt});
+        }
+    });
+
+    auto logs = db.db().query("SELECT COUNT(*) as cnt FROM AuditLog");
+    EXPECT_GE(std::get<int64_t>(logs[0].at("cnt")), 60);
+}
+
+TEST(Sync, DuplicateEntrySkipped) {
+    TempDB tmp{"dupskip"};
+    lattice::lattice_db db(lattice::configuration(tmp.str()));
+
+    lattice::audit_log_entry entry;
+    entry.global_id = "dup-1";
+    entry.table_name = "TestPerson";
+    entry.operation = "INSERT";
+    entry.row_id = 1;
+    entry.global_row_id = "dup-person-uuid";
+    entry.changed_fields = {
+        {"name", lattice::any_property("Duplicate")},
+        {"age", lattice::any_property(25)}
+    };
+    entry.changed_fields_names = {"name", "age"};
+    entry.timestamp = "2024-01-01T00:00:00Z";
+
+    // Apply once
+    lattice::apply_remote_changes(db, {entry});
+    EXPECT_EQ(db.objects<TestPerson>().size(), 1u);
+
+    // Apply again — should be skipped (same globalId)
+    lattice::apply_remote_changes(db, {entry});
+    EXPECT_EQ(db.objects<TestPerson>().size(), 1u);
+}
+
+// ----------------------------------------------------------------------------
+// Explicit lifecycle changes invalidate retries that have not started dialing.
+// ----------------------------------------------------------------------------
+
+#ifndef __EMSCRIPTEN__
+namespace {
+class reconnect_manual_scheduler final : public lattice::scheduler {
+    mutable std::mutex mutex_;
+    std::deque<std::function<void()>> pending_;
+    std::thread::id executing_;
+    bool stopped_ = false;
+public:
+    void invoke(std::function<void()>&& fn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!stopped_) pending_.push_back(std::move(fn));
+    }
+    bool is_on_thread() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return executing_ == std::this_thread::get_id();
+    }
+    bool is_same_as(const lattice::scheduler* other) const noexcept override {
+        return this == other;
+    }
+    bool can_invoke() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !stopped_;
+    }
+    void shutdown() override {
+        std::deque<std::function<void()>> retired;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopped_ = true;
+            pending_.swap(retired);
+        }
+        // Destroy captures outside the queue lock, like production schedulers.
+    }
+    size_t pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pending_.size();
+    }
+    bool run_one() {
+        std::function<void()> fn;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_.empty()) return false;
+            fn = std::move(pending_.front());
+            pending_.pop_front();
+            executing_ = std::this_thread::get_id();
+        }
+        try { fn(); }
+        catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            executing_ = {};
+            throw;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        executing_ = {};
+        return true;
+    }
+};
+
+// No socket or network. connect deliberately stays CONNECTING so the tests
+// cannot accidentally rely on is_connected_ to suppress an obsolete retry.
+class reconnect_controlled_transport final : public lattice::sync_transport {
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_error_handler on_error_;
+    const bool redialable_;
+    size_t connects_ = 0;
+public:
+    explicit reconnect_controlled_transport(bool redialable) : redialable_(redialable) {}
+    void connect(const std::string&, const std::map<std::string, std::string>&) override {
+        ++connects_;
+        state_ = lattice::transport_state::connecting;
+    }
+    void disconnect() override { state_ = lattice::transport_state::closed; }
+    lattice::transport_state state() const override { return state_; }
+    bool supports_reconnect() const override { return redialable_; }
+    void send(const lattice::transport_message&) override {}
+    void set_on_open(on_open_handler) override {}
+    void set_on_message(on_message_handler) override {}
+    void set_on_error(on_error_handler handler) override { on_error_ = std::move(handler); }
+    void set_on_close(on_close_handler) override {}
+    void fail() {
+        state_ = lattice::transport_state::closed;
+        if (on_error_) on_error_("controlled connection failure");
+    }
+    size_t connects() const { return connects_; }
+};
+
+struct reconnect_controlled_case {
+    std::shared_ptr<reconnect_manual_scheduler> queue = std::make_shared<reconnect_manual_scheduler>();
+    reconnect_controlled_transport* transport = nullptr;
+    std::unique_ptr<lattice::synchronizer> sync;
+    explicit reconnect_controlled_case(bool wss = true, bool redialable = true) {
+        auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(":memory:", queue));
+        lattice::sync_config config;
+        config.websocket_url = wss ? "ws://test.invalid/controlled-retry" : "";
+        config.sync_id = "controlled-retry";
+        config.all_active_sync_ids = {config.sync_id};
+        config.base_delay_seconds = 0;
+        config.max_delay_seconds = 0;
+        config.upload_coalesce_ms = 0;
+        config.checkpoint_passive_interval_ms = 0; // no pacer thread
+        auto owned_transport = std::make_unique<reconnect_controlled_transport>(redialable);
+        transport = owned_transport.get();
+        sync = std::make_unique<lattice::synchronizer>(std::move(db), config,
+                                                    std::move(owned_transport));
+    }
+};
+} // namespace
+
+TEST(Sync, QueuedReconnectCannotUndoExplicitDisconnect) {
+    reconnect_controlled_case test;
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 1u);
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->disconnect();
+    ASSERT_TRUE(test.queue->run_one()); // execute the already-admitted retry
+    EXPECT_EQ(test.transport->connects(), 1u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::closed);
+    EXPECT_FALSE(test.sync->is_connected());
+    // Old queued work must not silently re-enable admission for a later error.
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+
+TEST(Sync, QueuedReconnectCannotJoinAnExplicitReplacement) {
+    reconnect_controlled_case test;
+    test.sync->connect();
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->disconnect();
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 2u);
+    ASSERT_EQ(test.transport->state(), lattice::transport_state::connecting);
+    ASSERT_FALSE(test.sync->is_connected());
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 2u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::connecting);
+    // A failure belonging to the current lifecycle still gets its own retry.
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 3u);
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+
+TEST(Sync, ExplicitConnectInvalidatesAnOlderQueuedReconnect) {
+    reconnect_controlled_case test(false); // injected/IPC dialer policy
+    test.sync->connect();
+    test.transport->fail();
+    ASSERT_EQ(test.queue->pending(), 1u);
+    test.sync->connect(); // replacement without a preceding explicit stop
+    ASSERT_EQ(test.transport->connects(), 2u);
+    ASSERT_TRUE(test.queue->run_one());
+    EXPECT_EQ(test.transport->connects(), 2u);
+    EXPECT_EQ(test.transport->state(), lattice::transport_state::connecting);
+}
+
+TEST(Sync, ExplicitConnectPreservesNonRedialableTransportPolicy) {
+    reconnect_controlled_case test(false, false);
+    test.sync->connect();
+    ASSERT_EQ(test.transport->connects(), 1u); // initial connect remains allowed
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+    test.sync->disconnect();
+    test.sync->connect();
+    EXPECT_EQ(test.transport->connects(), 2u);
+    test.transport->fail();
+    EXPECT_EQ(test.queue->pending(), 0u);
+}
+#endif
+
+// ----------------------------------------------------------------------------
+// Backoff: flapping endpoint must walk the exponential ladder
+// ----------------------------------------------------------------------------
+
+namespace {
+/// Transport that opens successfully and then immediately errors — the
+/// "flapping endpoint" shape that used to pin backoff at base_delay forever
+/// (reconnect_attempts_ was reset on every open).
+class flappy_mock_transport : public lattice::sync_transport {
+public:
+    void connect(const std::string&,
+                 const std::map<std::string, std::string>&) override {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            connect_times_.push_back(std::chrono::steady_clock::now());
+        }
+        state_ = lattice::transport_state::open;
+        if (on_open_) on_open_();
+        state_ = lattice::transport_state::closed;
+        if (on_error_) on_error_("simulated flap");
+    }
+    void disconnect() override { state_ = lattice::transport_state::closed; }
+    lattice::transport_state state() const override { return state_; }
+    void send(const lattice::transport_message&) override {}
+    void set_on_open(on_open_handler h) override { on_open_ = h; }
+    void set_on_message(on_message_handler) override {}
+    void set_on_error(on_error_handler h) override { on_error_ = h; }
+    void set_on_close(on_close_handler) override {}
+
+    size_t connect_count() {
+        std::lock_guard<std::mutex> lock(m_);
+        return connect_times_.size();
+    }
+    std::vector<std::chrono::steady_clock::time_point> connect_times() {
+        std::lock_guard<std::mutex> lock(m_);
+        return connect_times_;
+    }
+private:
+    std::mutex m_;
+    std::vector<std::chrono::steady_clock::time_point> connect_times_;
+    lattice::transport_state state_ = lattice::transport_state::closed;
+    on_open_handler on_open_;
+    on_error_handler on_error_;
+};
+}  // namespace
+
+TEST(Sync, BackoffNotResetOnFlappyOpen) {
+    TempDB tmp{"flappybackoff"};
+    lattice::configuration db_cfg(tmp.str(),
+                                  std::make_shared<lattice::std_thread_scheduler>());
+    auto db = std::make_unique<lattice::lattice_db>(db_cfg);
+
+    lattice::sync_config cfg;
+    cfg.sync_id = "flappy";
+    cfg.all_active_sync_ids = {"flappy"};
+    cfg.base_delay_seconds = 0.2;
+    cfg.max_delay_seconds = 10.0;
+    cfg.stable_connection_ms = 60'000;  // flaps are instant — never "stable"
+
+    auto transport = std::make_unique<flappy_mock_transport>();
+    auto* flappy = transport.get();
+    auto sync = std::make_unique<lattice::synchronizer>(
+        std::move(db), cfg, std::move(transport));
+
+    sync->connect();
+
+    // Wait for at least 4 connects (initial + 3 backoff reconnects:
+    // 0.2s + 0.4s + 0.8s ≈ 1.4s plus scheduling slack).
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (flappy->connect_count() < 4 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    auto times = flappy->connect_times();
+    ASSERT_GE(times.size(), 4u) << "expected ≥4 connect attempts, got " << times.size();
+
+    // Inter-connect gaps must grow: with attempts never reset on open, gap i
+    // is ~base * 2^i. Assert the 3rd gap comfortably exceeds the 1st — a
+    // reset-on-open regression pins every gap at ~base and fails this.
+    auto gap = [&](size_t i) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   times[i + 1] - times[i]).count();
+    };
+    EXPECT_GE(gap(2), gap(0) * 2)
+        << "backoff did not escalate: gaps " << gap(0) << "ms, "
+        << gap(1) << "ms, " << gap(2) << "ms";
+
+    sync.reset();
+}
+
+// ----------------------------------------------------------------------------
+// Progress counters: windowed catch-up keeps pending == in-flight, exactly
+// ----------------------------------------------------------------------------
+
+TEST(Sync, WindowedCounterSanity) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"windowcounters"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "window-sync";
+    cfg.all_active_sync_ids = {"window-sync"};
+    cfg.chunk_size = 2;  // window = 2 * chunk_size = 4
+
+    const int kEntries = 10;
+    for (int i = 0; i < kEntries; ++i) {
+        db->add(TestPerson{"win-" + std::to_string(i), i, std::nullopt});
+    }
+
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+
+    sync.connect();
+    ASSERT_TRUE(sync.is_connected());
+
+    // The catch-up ships in windows of ≤4. Repeatedly ACK whatever was sent;
+    // at every step pending must equal the (windowed) in-flight count — the
+    // pre-fix accounting counted the whole classified backlog per pass, so
+    // pending ratcheted upward and never returned to 0.
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> acked_ids;
+    int64_t max_pending_seen = 0;
+
+    for (int round = 0; round < 20 && (int)acked_ids.size() < kEntries; ++round) {
+        auto progress = sync.get_progress();
+        max_pending_seen = std::max(max_pending_seen, progress.pending_upload);
+        ASSERT_LE(progress.pending_upload, 4)
+            << "pending exceeded the send window during catch-up";
+
+        // Collect globalIds from every frame sent so far and ACK the new ones.
+        std::vector<std::string> to_ack;
+        for (const auto& msg : mock_ws->get_sent_messages()) {
+            auto s = msg.as_string();
+            for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end;
+                 it != end; ++it) {
+                auto id = (*it)[1].str();
+                if (acked_ids.insert(id).second) to_ack.push_back(id);
+            }
+        }
+        if (to_ack.empty()) break;
+        mock_ws->simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_ack(to_ack).to_json()));
+    }
+
+    auto final_progress = sync.get_progress();
+    EXPECT_EQ((int)acked_ids.size(), kEntries) << "not every entry was sent+ACKed";
+    EXPECT_EQ(final_progress.pending_upload, 0) << "pending must return to 0";
+    EXPECT_EQ(final_progress.acked, kEntries);
+    EXPECT_EQ(final_progress.total_upload, kEntries)
+        << "total must count actually-sent entries exactly (no backlog re-count)";
+    EXPECT_LE(max_pending_seen, 4);
+
+    sync.disconnect();
+    // A second pass finds nothing new to send.
+    auto sent_before = mock_ws->get_sent_messages().size();
+    sync.connect();
+    sync.sync_now();
+    // (Frames may include non-audit control messages; assert no audit re-send
+    // by checking no NEW globalIds appear.)
+    std::set<std::string> post_ids;
+    for (const auto& msg : mock_ws->get_sent_messages()) {
+        auto s = msg.as_string();
+        for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end;
+             it != end; ++it) {
+            post_ids.insert((*it)[1].str());
+        }
+    }
+    EXPECT_EQ(post_ids.size(), acked_ids.size())
+        << "reconnect re-sent already-ACKed entries";
+    (void)sent_before;
+    sync.disconnect();
+}
+
+// ----------------------------------------------------------------------------
+// Throttle: a write burst coalesces into leading-edge + one trailing tick
+// ----------------------------------------------------------------------------
+
+TEST(Sync, ThrottleCoalescing) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"throttle"};
+    auto owned_db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    // The synchronizer takes ownership; the raw pointer stays valid for the
+    // test's lifetime and lets writes hit the AuditLog observer synchronously
+    // (no cross-process notification fuzz).
+    auto* db_ptr = owned_db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "throttle-sync";
+    cfg.all_active_sync_ids = {"throttle-sync"};
+    cfg.upload_coalesce_ms = 200;
+
+    lattice::synchronizer sync(std::move(owned_db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+    ASSERT_TRUE(sync.is_connected());
+
+    auto audit_frames = [&] {
+        size_t n = 0;
+        for (const auto& msg : mock_ws->get_sent_messages()) {
+            if (msg.as_string().find("\"auditLog\"") != std::string::npos) n++;
+        }
+        return n;
+    };
+    ASSERT_EQ(audit_frames(), 0u) << "empty DB must send nothing on connect";
+
+    // First write after idle: leading edge — must ship without waiting for
+    // the window.
+    db_ptr->add(TestPerson{"burst-0", 0, std::nullopt});
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        while (audit_frames() < 1 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    EXPECT_EQ(audit_frames(), 1u) << "leading edge did not fire immediately";
+
+    // Burst inside the window: all coalesce into ONE trailing-edge tick.
+    for (int i = 1; i < 10; ++i) {
+        db_ptr->add(TestPerson{"burst-" + std::to_string(i), i, std::nullopt});
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // window 200 + slack
+
+    const auto frames = audit_frames();
+    EXPECT_GE(frames, 2u) << "trailing-edge tick never fired — burst entries stranded";
+    EXPECT_LE(frames, 3u) << "burst was not coalesced (" << frames << " audit frames for 10 writes; "
+                             "pre-fix behavior sent one pass per write)";
+
+    // Every entry must have shipped despite the coalescing.
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> ids;
+    for (const auto& msg : mock_ws->get_sent_messages()) {
+        auto s = msg.as_string();
+        for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+            ids.insert((*it)[1].str());
+        }
+    }
+    EXPECT_EQ(ids.size(), 10u) << "coalescing dropped entries";
+
+    sync.disconnect();
+}
+
+// ----------------------------------------------------------------------------
+// WAL checkpoint: primitive fail-fast semantics + pacer-driven truncation
+// ----------------------------------------------------------------------------
+
+TEST(Sync, CheckpointPrimitiveUnderLoad) {
+    TempDB tmp{"ckptprim"};
+    lattice::lattice_db db{lattice::configuration(tmp.str())};
+    const auto wal_path = tmp.str() + "-wal";
+
+    for (int i = 0; i < 200; ++i) {
+        db.add(TestPerson{"wal-" + std::to_string(i), i, std::nullopt});
+    }
+    ASSERT_TRUE(std::filesystem::exists(wal_path));
+    ASSERT_GT(std::filesystem::file_size(wal_path), 0u);
+
+    // No readers: TRUNCATE must fully reset the WAL.
+    auto res = db.db().wal_checkpoint(true, 250);
+    EXPECT_EQ(res.busy, 0);
+    EXPECT_EQ(std::filesystem::file_size(wal_path), 0u);
+
+    // Grow again, then pin the WAL with a held read transaction on a second
+    // connection — TRUNCATE must FAIL FAST (bounded by the busy budget),
+    // not stall the writer indefinitely.
+    for (int i = 0; i < 50; ++i) {
+        db.add(TestPerson{"wal2-" + std::to_string(i), i, std::nullopt});
+    }
+    lattice::lattice_db reader{lattice::configuration(tmp.str())};
+    reader.db().execute("BEGIN");
+    (void)reader.db().query("SELECT COUNT(*) FROM TestPerson");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto busy_res = db.db().wal_checkpoint(true, 250);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    EXPECT_NE(busy_res.busy, 0) << "checkpoint should report busy with a pinned reader";
+    EXPECT_LT(elapsed, 1500) << "TRUNCATE must fail fast, not stall (took " << elapsed << "ms)";
+
+    // PASSIVE never blocks and still makes backfill progress.
+    auto passive = db.db().wal_checkpoint(false);
+    EXPECT_EQ(passive.rc, 0);
+
+    reader.db().execute("COMMIT");
+    auto after = db.db().wal_checkpoint(true, 250);
+    EXPECT_EQ(after.busy, 0);
+    EXPECT_EQ(std::filesystem::file_size(wal_path), 0u);
+}
+
+TEST(Sync, PacerDrivenTruncateWhenIdle) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"ckptpacer"};
+    auto owned_db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = owned_db.get();
+    const auto sync_wal = tmp.str() + "-wal";
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "ckpt-sync";
+    cfg.all_active_sync_ids = {"ckpt-sync"};
+    cfg.upload_coalesce_ms = 50;
+    cfg.checkpoint_passive_interval_ms = 100;
+    cfg.checkpoint_truncate_interval_ms = 150;
+
+    lattice::synchronizer sync(std::move(owned_db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+
+    for (int i = 0; i < 100; ++i) {
+        db_ptr->add(TestPerson{"pcw-" + std::to_string(i), i, std::nullopt});
+    }
+    // ACK until ALL 100 entries are confirmed — the burst ships in a leading
+    // tick + a trailing tick ~coalesce_ms later, so an early pending==0 (after
+    // ACKing just the leading entry) does NOT mean the backlog is done.
+    //
+    // Model a REAL server: ACK every delivery, including at-least-once
+    // DUPLICATES. A trailing coalesced tick can enumerate entries just before
+    // the floor advance from a prior ACK commits and re-send them; if the
+    // duplicate is never re-ACKed it stays in_flight forever and pending
+    // never drains (observed on the slower Linux container, where the tick
+    // interleaves the ACK round-trip that macOS timing never splits).
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> acked;
+    size_t seen_msgs = 0;
+    auto ack_new_messages = [&]() {
+        auto msgs = mock_ws->get_sent_messages();
+        std::vector<std::string> to_ack;
+        for (size_t m = seen_msgs; m < msgs.size(); ++m) {
+            auto s = msgs[m].as_string();
+            for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+                auto id = (*it)[1].str();
+                acked.insert(id);
+                to_ack.push_back(id);  // duplicates included, like a real server
+            }
+        }
+        seen_msgs = msgs.size();
+        if (!to_ack.empty()) {
+            mock_ws->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_ack(to_ack).to_json()));
+        }
+        return !to_ack.empty();
+    };
+    for (int round = 0; round < 60 && (int)acked.size() < 100; ++round) {
+        if (!ack_new_messages()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_EQ((int)acked.size(), 100) << "not all burst entries were sent";
+    // Pending drains to 0 once the last ACK lands — keep ACKing late
+    // redeliveries while we wait, as a live server would.
+    {
+        const auto ack_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (sync.get_progress().pending_upload != 0 &&
+               std::chrono::steady_clock::now() < ack_deadline) {
+            ack_new_messages();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(sync.get_progress().pending_upload, 0);
+
+    // Within a few heartbeat cycles the idle-gated TRUNCATE must land and
+    // reset the -wal (there are no other connections pinning it).
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    uintmax_t wal_size = std::filesystem::exists(sync_wal)
+        ? std::filesystem::file_size(sync_wal) : 0;
+    while (wal_size > 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wal_size = std::filesystem::exists(sync_wal)
+            ? std::filesystem::file_size(sync_wal) : 0;
+    }
+    if (wal_size > 0) {
+        // Diagnostic split: if a direct TRUNCATE succeeds, the pacer path is
+        // broken; if it reports busy, a connection is pinning the WAL.
+        auto direct = db_ptr->db().wal_checkpoint(true, 250);
+        std::cerr << "[diag] direct TRUNCATE: rc=" << direct.rc
+                  << " busy=" << direct.busy
+                  << " log=" << direct.log_frames
+                  << " ckpt=" << direct.checkpointed
+                  << " wal_now=" << (std::filesystem::exists(sync_wal)
+                                         ? std::filesystem::file_size(sync_wal) : 0)
+                  << std::endl;
+    }
+    EXPECT_EQ(wal_size, 0u) << "pacer never truncated the WAL while idle";
+
+    sync.disconnect();
+}
+
+// Results spec §3.2 second enforcement caller (item-A adversarial finding 3):
+// the sync pacer runs read-pool maintenance at its maybe_checkpoint cadence,
+// aggregated per PATH — the keepers live on the APP handles, not on the
+// synchronizer's own lattice_db instance, so a local-only call would police
+// nothing. Pinned minimally: an idle keeper on a same-path app handle (tiny
+// TTL) must be TTL-retired by the pacer alone — no manual
+// run_read_pool_maintenance call anywhere.
+TEST(Sync, PacerRunsReadPoolMaintenancePerPath) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"pacermaint"};
+    // App-side handle: owns the keeper the pacer must police.
+    lattice::lattice_db app{lattice::configuration(tmp.str())};
+    app.add(TestPerson{"x", 1, std::nullopt});
+    app.set_read_generation_ttl_ms(50);
+
+    auto gen = app.acquire_read_generation();
+    ASSERT_NE(gen, 0u);
+    (void)app.query_at_generation(gen, "SELECT 1 AS one");
+    ASSERT_EQ(app.local_read_generations_outstanding(), 1u);
+
+    // Synchronizer topology: its OWN lattice_db on the same path; the pacer
+    // heartbeat doubles as the maintenance cadence. No connect() needed —
+    // the pacer starts with the synchronizer.
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "maint-sync";
+    cfg.all_active_sync_ids = {"maint-sync"};
+    cfg.upload_coalesce_ms = 50;
+    cfg.checkpoint_passive_interval_ms = 100;
+    lattice::synchronizer sync(
+        std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str())), cfg);
+
+    // Within a few heartbeats the pacer's per-path maintenance must
+    // TTL-retire the APP instance's idle generation.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (app.local_read_generations_outstanding() != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(app.local_read_generations_outstanding(), 0u)
+        << "the pacer never ran per-path read-pool maintenance";
+    EXPECT_FALSE(app.query_at_generation(gen, "SELECT 1 AS one").has_value())
+        << "the TTL-retired generation must refuse reads";
+    app.release_read_generation(gen);  // late release: no-op
+
+    sync.disconnect();
+}
+
+// ----------------------------------------------------------------------------
+// Upload floor: incremental cursor — bounded scans, at-least-once preserved
+// ----------------------------------------------------------------------------
+
+namespace {
+int64_t read_floor(lattice::database& db, const std::string& sync_id) {
+    auto rows = db.query(
+        "SELECT upload_floor FROM _lattice_replication_slots WHERE sync_id = ?",
+        {sync_id});
+    if (rows.empty()) return -1;
+    return std::get<int64_t>(rows[0].at("upload_floor"));
+}
+
+std::set<std::string> collect_and_ack_all(lattice::mock_sync_transport* ws,
+                                          lattice::synchronizer& sync,
+                                          int expected,
+                                          int max_rounds = 60) {
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> acked;
+    for (int round = 0; round < max_rounds && (int)acked.size() < expected; ++round) {
+        std::vector<std::string> to_ack;
+        for (const auto& msg : ws->get_sent_messages()) {
+            auto s = msg.as_string();
+            for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+                auto id = (*it)[1].str();
+                if (acked.insert(id).second) to_ack.push_back(id);
+            }
+        }
+        if (!to_ack.empty()) {
+            ws->simulate_message(lattice::transport_message::from_string(
+                lattice::server_sent_event::make_ack(to_ack).to_json()));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    return acked;
+}
+}  // namespace
+
+TEST(Sync, CursorAdvancesOnAck) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorack"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "cursor-sync";
+    cfg.all_active_sync_ids = {"cursor-sync"};
+
+    const int kEntries = 25;
+    for (int i = 0; i < kEntries; ++i) {
+        db_ptr->add(TestPerson{"cur-" + std::to_string(i), i, std::nullopt});
+    }
+    auto max_id_rows = db_ptr->db().query("SELECT MAX(id) AS m FROM AuditLog");
+    const int64_t max_audit_id = std::get<int64_t>(max_id_rows[0].at("m"));
+
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+
+    auto acked = collect_and_ack_all(mock_ws, sync, kEntries);
+    ASSERT_EQ((int)acked.size(), kEntries);
+
+    // Floor reaches the highest enumerated audit id once everything resolves.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    int64_t floor = -1;
+    while (std::chrono::steady_clock::now() < deadline) {
+        floor = read_floor(db_ptr->db(), "cursor-sync");
+        if (floor >= max_audit_id) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    EXPECT_GE(floor, max_audit_id) << "floor did not advance after full ACK";
+
+    // A fresh pass finds nothing (bounded query returns empty; no re-sends).
+    auto frames_before = mock_ws->get_sent_messages().size();
+    sync.sync_now();
+    EXPECT_EQ(mock_ws->get_sent_messages().size(), frames_before)
+        << "fully-ACKed backlog was re-sent";
+    sync.disconnect();
+}
+
+TEST(Sync, CursorHoldsBelowUnackedAndResendsAfterReconnect) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorhold"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "hold-sync";
+    cfg.all_active_sync_ids = {"hold-sync"};
+    cfg.chunk_size = 3;  // window = 6 < backlog
+
+    const int kEntries = 20;
+    for (int i = 0; i < kEntries; ++i) {
+        db_ptr->add(TestPerson{"hold-" + std::to_string(i), i, std::nullopt});
+    }
+
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    ASSERT_NE(mock_ws, nullptr);
+    sync.connect();
+
+    // ACK exactly the FIRST window, nothing more: floor must stay below the
+    // first unACKed id.
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::vector<std::string> first_window;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (first_window.empty() && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& msg : mock_ws->get_sent_messages()) {
+                auto s = msg.as_string();
+                for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+                    first_window.push_back((*it)[1].str());
+                }
+            }
+            if (first_window.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_FALSE(first_window.empty());
+    ASSERT_LE(first_window.size(), 6u) << "send window exceeded 2*chunk_size";
+    mock_ws->simulate_message(lattice::transport_message::from_string(
+        lattice::server_sent_event::make_ack(first_window).to_json()));
+
+    // Everything eventually ships window by window (post-ACK kicks) — but at
+    // this instant, unACKed entries exist and the floor must sit below them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto pending_rows = db_ptr->db().query(
+        "SELECT MIN(a.id) AS m FROM AuditLog a WHERE a.isSynchronized = 0"
+        " AND NOT EXISTS (SELECT 1 FROM _lattice_sync_state ss"
+        "  WHERE ss.audit_entry_id = a.id AND ss.sync_id = 'hold-sync' AND ss.is_synchronized = 1)");
+    if (!pending_rows.empty() &&
+        std::holds_alternative<int64_t>(pending_rows[0].at("m"))) {
+        const int64_t min_pending = std::get<int64_t>(pending_rows[0].at("m"));
+        const int64_t floor = read_floor(db_ptr->db(), "hold-sync");
+        EXPECT_LT(floor, min_pending)
+            << "floor advanced past a pending (unACKed) entry — data loss";
+    }
+
+    // Sever the transport mid-backlog, reconnect: the remaining entries are
+    // re-queried (bounded) and re-sent — none skipped.
+    mock_ws->simulate_error("simulated drop");
+    sync.connect();
+    auto acked = collect_and_ack_all(mock_ws, sync, kEntries);
+    EXPECT_EQ((int)acked.size(), kEntries)
+        << "entries were lost across the reconnect (floor skipped them)";
+    sync.disconnect();
+}
+
+TEST(Sync, CursorCrashRecoveryStaleLowFloor) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorcrash"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "crash-sync";
+    cfg.all_active_sync_ids = {"crash-sync"};
+
+    for (int i = 0; i < 10; ++i) {
+        db_ptr->add(TestPerson{"cr-" + std::to_string(i), i, std::nullopt});
+    }
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    sync.connect();
+    auto acked = collect_and_ack_all(mock_ws, sync, 10);
+    ASSERT_EQ((int)acked.size(), 10);
+
+    // Simulate a crash BEFORE the floor persisted: force it stale-low.
+    db_ptr->db().execute(
+        "UPDATE _lattice_replication_slots SET upload_floor = 0 WHERE sync_id = 'crash-sync'");
+
+    // Reconnect: worst case is a re-scan; the sync_state conditions filter
+    // everything back out — nothing is re-sent, and the floor re-advances.
+    mock_ws->simulate_error("crash");
+    auto frames_before = mock_ws->get_sent_messages().size();
+    sync.connect();
+    sync.sync_now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::regex gid_re("\"globalId\"\\s*:\\s*\"([^\"]+)\"");
+    std::set<std::string> post;
+    for (size_t i = frames_before; i < mock_ws->get_sent_messages().size(); ++i) {
+        auto s = mock_ws->get_sent_messages()[i].as_string();
+        for (std::sregex_iterator it(s.begin(), s.end(), gid_re), end; it != end; ++it) {
+            post.insert((*it)[1].str());
+        }
+    }
+    EXPECT_TRUE(post.empty()) << "stale-low floor caused re-sends of synced entries";
+    sync.disconnect();
+}
+
+TEST(Sync, CursorBoundedQueryUnderStall) {
+    auto mock_factory = std::make_shared<lattice::mock_network_factory>();
+    lattice::set_network_factory(mock_factory);
+
+    TempDB tmp{"cursorstall"};
+    auto db = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    auto* db_ptr = db.get();
+
+    lattice::sync_config cfg;
+    cfg.websocket_url = "ws://localhost:8080/sync";
+    cfg.authorization_token = "test-token";
+    cfg.sync_id = "stall-sync";
+    cfg.all_active_sync_ids = {"stall-sync"};
+    cfg.chunk_size = 2;  // window = 4
+
+    const int kBacklog = 50;
+    for (int i = 0; i < kBacklog; ++i) {
+        db_ptr->add(TestPerson{"st-" + std::to_string(i), i, std::nullopt});
+    }
+    lattice::synchronizer sync(std::move(db), cfg);
+    auto* mock_ws = mock_factory->last_websocket();
+    sync.connect();  // server never ACKs — stalled
+
+    // Multiple passes against the stalled server: every audit frame must be
+    // window-bounded (the pre-floor behavior re-sent/re-parsed the whole
+    // backlog per pass).
+    std::regex entries_re("\"globalId\"");
+    for (int i = 0; i < 3; ++i) {
+        sync.sync_now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    for (const auto& msg : mock_ws->get_sent_messages()) {
+        auto s = msg.as_string();
+        if (s.find("\"auditLog\"") == std::string::npos) continue;
+        size_t n = 0;
+        for (std::sregex_iterator it(s.begin(), s.end(), entries_re), end; it != end; ++it) n++;
+        // Each entry serializes exactly one top-level globalId; chunks are
+        // ≤ chunk_size entries. Generous bound: ≤ 3x chunk to absorb nested
+        // globalId-like fields in changedFields payloads.
+        EXPECT_LE(n, cfg.chunk_size * 3)
+            << "a frame carried far more than one chunk — unbounded re-send";
+    }
+    // pending stays window-bounded, never inflates toward the backlog size.
+    EXPECT_LE(sync.get_progress().pending_upload, (int64_t)(cfg.chunk_size * 2));
+    sync.disconnect();
+}
+
+TEST(Sync, ExistingDbGainsUploadFloor) {
+    TempDB tmp{"floormigrate"};
+    // Create a DB and fingerprint it, then verify a reopen exposes the new
+    // column (the epoch bump forces the slow path through the guarded ALTER).
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        db.add(TestPerson{"mig", 1, std::nullopt});
+    }
+    {
+        lattice::lattice_db db{lattice::configuration(tmp.str())};
+        // Must not throw, and the column must exist with default 0.
+        db.db().execute(R"(
+            INSERT INTO _lattice_replication_slots (sync_id, last_active_at)
+            VALUES ('mig-sync', datetime('now'))
+            ON CONFLICT(sync_id) DO UPDATE SET last_active_at = datetime('now')
+        )");
+        auto rows = db.db().query(
+            "SELECT upload_floor FROM _lattice_replication_slots WHERE sync_id = 'mig-sync'");
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::get<int64_t>(rows[0].at("upload_floor")), 0);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// flush_changes change→audit lookup must be indexed (epoch 3)
+// ----------------------------------------------------------------------------
+// Without idx_audit_log_change_lookup, every pass-2 lookup in flush_changes
+// reverse-SCANs the whole AuditLog. Observed live: per-sync-mode applies
+// write one _lattice_sync_state row per entry, and each write's futile
+// lookup scanned a 187k-row AuditLog — minutes of CPU per 1000-entry batch,
+// starving the IPC ACK path into a permanent resend storm. (The bookkeeping
+// tables are additionally skipped in pass 2 now; this pins the index for
+// the model-table lookups that remain.)
+TEST(Sync, AuditChangeLookupIndexed) {
+    TempDB tmp{"idxcheck"};
+    lattice::lattice_db db(lattice::configuration(tmp.str()));
+
+    auto count = db.db().query(
+        "SELECT COUNT(*) AS c FROM sqlite_master "
+        "WHERE type='index' AND name='idx_audit_log_change_lookup'");
+    ASSERT_EQ(count.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(count[0].at("c")), 1);
+
+    auto plan = db.db().query(
+        "EXPLAIN QUERY PLAN SELECT id, globalId FROM AuditLog "
+        "WHERE tableName = 'X' AND rowId = 1 AND operation = 'INSERT' "
+        "ORDER BY id DESC LIMIT 1");
+    ASSERT_FALSE(plan.empty());
+    bool uses_index = false;
+    for (const auto& row : plan) {
+        auto it = row.find("detail");
+        if (it == row.end() || !std::holds_alternative<std::string>(it->second)) continue;
+        const auto& d = std::get<std::string>(it->second);
+        EXPECT_EQ(d.find("SCAN AuditLog"), std::string::npos)
+            << "pass-2 lookup shape still scans: " << d;
+        if (d.find("idx_audit_log_change_lookup") != std::string::npos) uses_index = true;
+    }
+    EXPECT_TRUE(uses_index) << "lookup does not use idx_audit_log_change_lookup";
+}
+
+// ----------------------------------------------------------------------------
+// Destroy-from-callback: no self-spin, no self-join
+// ----------------------------------------------------------------------------
+// An observer callback that releases the LAST reference to its lattice runs
+// ~lattice_db ON the notify thread while for_each_alive still holds the
+// guard's notify_refcount — the drain wait must exclude the current thread's
+// own holds or it waits for itself forever (observed live: 97%-CPU yield
+// spin, 184 CPU-minutes, intermittent full-suite hangs). The scheduler
+// shutdown reached from its own worker must detach, not self-join.
+TEST(Sync, DestroyFromObserverCallbackDoesNotHang) {
+    TempDB tmp{"cbdestroy"};
+    auto a = std::make_unique<lattice::lattice_db>(lattice::configuration(tmp.str()));
+    lattice::lattice_db b{lattice::configuration(tmp.str())};  // same path
+
+    std::atomic<bool> fired{false};
+    a->add_table_observer("AuditLog",
+        [&a, &fired](const std::vector<lattice::lattice_db::change_event>&) {
+            if (a) a.reset();  // destroy A from inside its own notification
+            fired.store(true, std::memory_order_release);
+        });
+
+    b.add(TestPerson{"boom", 1, std::nullopt});  // cross-instance notify → A
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!fired.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(fired.load()) << "observer never fired";
+    EXPECT_EQ(a, nullptr) << "callback did not destroy the instance";
+}
+
+// 1.0 item I1: configuration::sync_tuning overlays only its SET fields onto a
+// sync_config; unset fields keep sync.hpp's defaults (forward-only — the
+// tuning struct never re-states a default).
+TEST(SyncTuningTest, ApplyOverlaysOnlySetFields) {
+    lattice::sync_config defaults;  // capture library defaults for comparison
+    lattice::sync_config cfg;
+    lattice::configuration::sync_tuning tuning;
+
+    tuning.chunk_size = 1;
+    tuning.upload_coalesce_ms = 750;
+    tuning.use_upload_floor = false;
+    tuning.apply(cfg);
+
+    EXPECT_EQ(cfg.chunk_size, 1u);
+    EXPECT_EQ(cfg.upload_coalesce_ms, 750);
+    EXPECT_FALSE(cfg.use_upload_floor);
+    // Unset knobs must remain exactly the library defaults.
+    EXPECT_EQ(cfg.max_reconnect_attempts, defaults.max_reconnect_attempts);
+    EXPECT_EQ(cfg.base_delay_seconds, defaults.base_delay_seconds);
+    EXPECT_EQ(cfg.max_delay_seconds, defaults.max_delay_seconds);
+    EXPECT_EQ(cfg.stable_connection_ms, defaults.stable_connection_ms);
+    EXPECT_EQ(cfg.checkpoint_passive_interval_ms, defaults.checkpoint_passive_interval_ms);
+    EXPECT_EQ(cfg.checkpoint_truncate_interval_ms, defaults.checkpoint_truncate_interval_ms);
+
+    // Empty tuning is a strict no-op.
+    lattice::sync_config untouched;
+    lattice::configuration::sync_tuning{}.apply(untouched);
+    EXPECT_EQ(untouched.chunk_size, defaults.chunk_size);
+    EXPECT_EQ(untouched.upload_coalesce_ms, defaults.upload_coalesce_ms);
+    EXPECT_EQ(untouched.use_upload_floor, defaults.use_upload_floor);
+}
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include <exception>
+#include <stdexcept>
+namespace {
+struct sync_operation_gate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool signalled = false;
+    void signal() {
+        { std::lock_guard<std::mutex> lock(mutex); signalled = true; }
+        cv.notify_all();
+    }
+    bool wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(5), [&] { return signalled; });
+    }
+};
+
+// Real synchronizer transport boundary. Only the first send is held; later
+// sends ACK synchronously to exercise same-thread callback reentry as well.
+struct held_sync_transport final : lattice::mock_sync_transport {
+    sync_operation_gate entered, release;
+    std::atomic<bool> first{true};
+    std::atomic<int> active_sends{0};
+    std::atomic<bool> overlapped{false};
+    void send(const lattice::transport_message& message) override {
+        struct Active {
+            held_sync_transport& owner;
+            explicit Active(held_sync_transport& value) : owner(value) {
+                if (owner.active_sends.fetch_add(1) != 0) owner.overlapped.store(true);
+            }
+            ~Active() { owner.active_sends.fetch_sub(1); }
+        } active{*this};
+        lattice::mock_sync_transport::send(message);
+        auto event = lattice::server_sent_event::from_json(message.as_string());
+        if (!event || event->event_type != lattice::server_sent_event::type::audit_log ||
+            event->audit_logs.empty()) throw std::runtime_error("expected nonempty audit frame");
+        if (first.exchange(false)) {
+            entered.signal();
+            if (!release.wait()) throw std::runtime_error("initial send gate timed out");
+            // The second caller submitted this frame's exact ACK while held.
+            return;
+        }
+        std::vector<std::string> ids;
+        for (const auto& entry : event->audit_logs) ids.push_back(entry.global_id);
+        simulate_message(lattice::transport_message::from_string(
+            lattice::server_sent_event::make_ack(ids).to_json()));
+    }
+};
+}
+
+TEST(Sync, ImmediateQueueSerializesFilterAndACKDuringUpload) {
+    bounded_mock_case([] {
+        auto require = [](bool condition, const char* message) {
+            if (!condition) throw std::runtime_error(message);
+        };
+        TempDB tmp{"sync_operation_queue"};
+        lattice::configuration db_config(tmp.str());
+        db_config.audit_retention_seconds = 0;
+        auto owned = std::make_unique<lattice::lattice_db>(db_config);
+        auto* db = owned.get();
+        for (int age = 1; age <= 3; ++age)
+            db->add(TestPerson{"queue-" + std::to_string(age), age, std::nullopt});
+        auto seeds = db->db().query(
+            "SELECT a.globalId AS audit_gid, a.globalRowId AS row_gid, p.age AS age "
+            "FROM AuditLog a JOIN TestPerson p ON p.globalId=a.globalRowId "
+            "WHERE a.tableName='TestPerson' AND a.operation='INSERT' ORDER BY p.age");
+        require(seeds.size() == 3, "exact three original INSERT audits required");
+        std::vector<std::string> audit_ids, row_ids;
+        for (size_t i = 0; i < seeds.size(); ++i) {
+            require(std::get<int64_t>(seeds[i].at("age")) == static_cast<int64_t>(i + 1),
+                    "seed age identity mismatch");
+            audit_ids.push_back(std::get<std::string>(seeds[i].at("audit_gid")));
+            row_ids.push_back(std::get<std::string>(seeds[i].at("row_gid")));
+        }
+        lattice::sync_config config;
+        config.sync_id = "controlled-operation-queue";
+        config.all_active_sync_ids = {config.sync_id};
+        config.upload_coalesce_ms = 0;
+        config.checkpoint_passive_interval_ms = 0;
+        config.checkpoint_truncate_interval_ms = 0;
+        config.narrowing_emits_removals = false;
+        config.sync_filter = std::vector<lattice::sync_filter_entry>{{"TestPerson", "age = 1"}};
+        auto transport = std::make_unique<held_sync_transport>();
+        auto* wire = transport.get();
+        std::mutex ack_mutex;
+        std::vector<std::string> acked;
+        std::atomic<bool> ack_inside_send{false};
+        lattice::synchronizer sync(std::move(owned), config, std::move(transport));
+        sync.set_on_sync_complete([&](const std::vector<std::string>& ids) {
+            if (wire->active_sends.load() != 0) ack_inside_send.store(true);
+            std::lock_guard<std::mutex> lock(ack_mutex);
+            acked.insert(acked.end(), ids.begin(), ids.end());
+        });
+        std::exception_ptr opening_error, caller_error;
+        std::thread opening([&] {
+            try { sync.connect(); } catch (...) { opening_error = std::current_exception(); }
+        });
+        const bool entered = wire->entered.wait();
+        sync_operation_gate submitted;
+        std::thread caller;
+        bool caller_returned = false;
+        if (entered) {
+            caller = std::thread([&] {
+                try {
+                    // Both arrive while the same real upload is held. Only the
+                    // latest filter may reconcile; neither may run concurrently.
+                    sync.update_sync_filter({{"TestPerson", "age = 2"}});
+                    sync.update_sync_filter({{"TestPerson", "age = 3"}});
+                    wire->simulate_message(lattice::transport_message::from_string(
+                        lattice::server_sent_event::make_ack({audit_ids[0]}).to_json()));
+                    sync.sync_now();
+                } catch (...) { caller_error = std::current_exception(); }
+                submitted.signal();
+            });
+            caller_returned = submitted.wait();
+        }
+        const auto held_messages = wire->get_sent_messages();
+        bool no_ack_while_held;
+        { std::lock_guard<std::mutex> lock(ack_mutex); no_ack_while_held = acked.empty(); }
+        wire->release.signal(); // Always release before joining or throwing.
+        if (caller.joinable()) caller.join();
+        opening.join(); // Idle inline drain includes all queued filter/ACK work.
+        if (opening_error) std::rethrow_exception(opening_error);
+        if (caller_error) std::rethrow_exception(caller_error);
+        require(entered && caller_returned, "second caller must return while first send remains held");
+        require(held_messages.size() == 1 && no_ack_while_held,
+                "filter/ACK work executed before the held upload returned");
+        require(!wire->overlapped.load() && !ack_inside_send.load(),
+                "real sends or ACK completion overlapped/reentered a send");
+
+        auto sent_entries = [&] {
+            std::vector<lattice::audit_log_entry> result;
+            for (const auto& message : wire->get_sent_messages()) {
+                auto event = lattice::server_sent_event::from_json(message.as_string());
+                require(event && event->event_type == lattice::server_sent_event::type::audit_log,
+                        "unexpected transport frame");
+                result.insert(result.end(), event->audit_logs.begin(), event->audit_logs.end());
+            }
+            return result;
+        };
+        auto sent = sent_entries();
+        require(sent.size() == 2 && sent[0].global_id == audit_ids[0] &&
+                sent[1].global_id == audit_ids[2] && sent[0].operation == "INSERT" &&
+                sent[1].operation == "INSERT", "expected exact first/latest INSERT audits, no middle filter");
+        { std::lock_guard<std::mutex> lock(ack_mutex);
+          require(acked == std::vector<std::string>({audit_ids[0], audit_ids[2]}),
+                  "queued and reentrant ACKs must complete in exact order"); }
+        require(sync.get_progress().pending_upload == 0, "both exact frames must be ACKed");
+        auto members = db->db().query(
+            "SELECT global_row_id FROM _lattice_sync_set WHERE sync_id = ? AND table_name = 'TestPerson'",
+            {config.sync_id});
+        require(members.size() == 1 && std::get<std::string>(members[0].at("global_row_id")) == row_ids[2],
+                "latest filter membership must select only age 3");
+
+        // A subsequent write tests persistent latest-filter state, not just
+        // which of two queued lambdas happened to emit during the first drain.
+        db->db().execute("UPDATE TestPerson SET name = ? WHERE age = ?", {std::string("middle-updated"), int64_t{2}});
+        db->db().execute("UPDATE TestPerson SET name = ? WHERE age = ?", {std::string("latest-updated"), int64_t{3}});
+        auto updated = db->db().query(
+            "SELECT globalId FROM AuditLog WHERE tableName='TestPerson' AND operation='UPDATE' "
+            "AND globalRowId = ? ORDER BY id DESC LIMIT 1", {row_ids[2]});
+        require(updated.size() == 1, "latest row UPDATE audit missing");
+        const auto update_id = std::get<std::string>(updated[0].at("globalId"));
+        sync.sync_now();
+        sent = sent_entries();
+        require(sent.size() == 3 && sent[2].global_id == update_id && sent[2].operation == "UPDATE" &&
+                sent[2].global_row_id == row_ids[2], "only the exact latest-filter UPDATE may be sent");
+        require(sent[2].changed_fields_to_json().find("latest-updated") != std::string::npos,
+                "latest UPDATE value must cross the actual transport");
+        { std::lock_guard<std::mutex> lock(ack_mutex);
+          require(acked == std::vector<std::string>({audit_ids[0], audit_ids[2], update_id}),
+                  "final exact audit ACK set/order mismatch"); }
+        require(!wire->overlapped.load() && !ack_inside_send.load() &&
+                sync.get_progress().pending_upload == 0, "final send/ACK serialization or pending state invalid");
+        sync.disconnect(); // Lifecycle changes occur only after both callers joined.
+    });
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct PlatformTransportProbe {
+    std::vector<lattice::platform_transport_callbacks> attempts;
+    std::vector<std::string> urls;
+    std::vector<lattice::HeadersMap> headers;
+    std::vector<lattice::platform_transport_callbacks> sends;
+    int disconnects = 0, destroys = 0;
+    bool all_retired_at_destroy = false;
+    std::unique_ptr<lattice::sync_transport> make() {
+        return std::unique_ptr<lattice::sync_transport>(lattice::make_owned_platform_sync_transport(
+            this,
+            [](void* p, const void* url, const void* headers, const void* callbacks) {
+                auto& probe = *static_cast<PlatformTransportProbe*>(p);
+                probe.urls.push_back(*static_cast<const std::string*>(url));
+                probe.headers.push_back(*static_cast<const lattice::HeadersMap*>(headers));
+                probe.attempts.push_back(*static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+            },
+            [](void* p) { ++static_cast<PlatformTransportProbe*>(p)->disconnects; },
+            [](void* p, const void*, const void* callbacks) {
+                static_cast<PlatformTransportProbe*>(p)->sends.push_back(
+                    *static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+            },
+            [](void* p) {
+                auto& probe = *static_cast<PlatformTransportProbe*>(p);
+                ++probe.destroys;
+                probe.all_retired_at_destroy = std::all_of(probe.attempts.begin(), probe.attempts.end(),
+                    [](const auto& endpoint) { return !endpoint.is_current(); });
+            }));
+    }
+};
+
+void platform_attempt_fences() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int opens = 0, messages = 0, errors = 0, closes = 0;
+    owner->set_on_open([&] { ++opens; });
+    owner->set_on_message([&](const auto&) { ++messages; });
+    owner->set_on_error([&](const auto&) { ++errors; });
+    owner->set_on_close([&](int, const auto&) { ++closes; });
+    owner->connect("wss://first", {{"Authorization", "fixture-only"}});
+    auto first = probe.attempts.back();
+    EXPECT_FALSE(first.trigger_on_message(lattice::transport_message::from_string("before-open")));
+    ASSERT_TRUE(first.trigger_on_open());
+    EXPECT_FALSE(first.trigger_on_open());
+    owner->send(lattice::transport_message::from_string("one"));
+    ASSERT_EQ(probe.sends.size(), 1u);
+    EXPECT_TRUE(probe.sends.front().matches(first));
+    owner->connect("wss://second");
+    auto second = probe.attempts.back();
+    EXPECT_FALSE(first.matches(second));
+    EXPECT_FALSE(first.is_current());
+    EXPECT_FALSE(first.trigger_on_open());
+    EXPECT_FALSE(first.trigger_on_message(lattice::transport_message::from_string("stale")));
+    EXPECT_FALSE(first.trigger_on_error("stale send completion"));
+    EXPECT_FALSE(first.trigger_on_close(1006, "stale close"));
+    ASSERT_TRUE(second.trigger_on_open());
+    ASSERT_TRUE(second.trigger_on_message(lattice::transport_message::from_string("current")));
+    EXPECT_EQ(owner->state(), lattice::transport_state::open);
+    EXPECT_EQ(opens, 2); EXPECT_EQ(messages, 1); EXPECT_EQ(errors, 0); EXPECT_EQ(closes, 0);
+    EXPECT_EQ(probe.urls, (std::vector<std::string>{"wss://first", "wss://second"}));
+    EXPECT_EQ(probe.headers.front().at("Authorization"), "fixture-only");
+}
+
+void platform_disconnect_reconnect() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int opens = 0; owner->set_on_open([&] { ++opens; });
+    owner->connect("ws://fixture");
+    auto first = probe.attempts.back(); ASSERT_TRUE(first.trigger_on_open());
+    owner->disconnect();
+    EXPECT_EQ(probe.disconnects, 1);
+    EXPECT_EQ(owner->state(), lattice::transport_state::closed);
+    EXPECT_FALSE(first.is_current());
+    EXPECT_FALSE(first.trigger_on_error("cancel completion"));
+    owner->send(lattice::transport_message::from_string("closed"));
+    EXPECT_TRUE(probe.sends.empty());
+    owner->connect("ws://fixture");
+    auto second = probe.attempts.back();
+    EXPECT_FALSE(first.matches(second));
+    EXPECT_TRUE(second.trigger_on_open());
+    owner->send(lattice::transport_message::from_string("reconnected"));
+    ASSERT_EQ(probe.sends.size(), 1u);
+    EXPECT_TRUE(probe.sends.back().matches(second));
+    EXPECT_EQ(opens, 2);
+}
+
+void platform_retained_endpoint_after_delete() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int calls = 0;
+    auto capture = std::make_shared<int>(7); std::weak_ptr<int> weak = capture;
+    owner->set_on_message([&, capture](const auto&) { ++calls; });
+    capture.reset();
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    owner.reset();
+    EXPECT_EQ(probe.destroys, 1);
+    EXPECT_TRUE(probe.all_retired_at_destroy);
+    EXPECT_TRUE(weak.expired());
+    EXPECT_FALSE(endpoint.is_current());
+    EXPECT_FALSE(endpoint.trigger_on_message(lattice::transport_message::from_string("after-delete")));
+    EXPECT_FALSE(endpoint.trigger_on_open());
+    EXPECT_FALSE(endpoint.trigger_on_error("after-delete"));
+    EXPECT_FALSE(endpoint.trigger_on_close(1000, "after-delete"));
+    EXPECT_EQ(calls, 0);
+    lattice::platform_transport_callbacks empty;
+    EXPECT_FALSE(empty.is_current()); EXPECT_FALSE(empty.matches(endpoint));
+    EXPECT_FALSE(empty.trigger_on_open());
+}
+
+void platform_callback_can_destroy_transport() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    int calls = 0;
+    owner->set_on_message([&](const auto&) {
+        ++calls;
+        EXPECT_TRUE(endpoint.is_current());
+        owner.reset();
+        EXPECT_FALSE(endpoint.is_current());
+        EXPECT_EQ(probe.destroys, 1);
+    });
+    EXPECT_TRUE(endpoint.trigger_on_message(lattice::transport_message::from_string("retire")));
+    EXPECT_EQ(calls, 1);
+    EXPECT_FALSE(endpoint.trigger_on_message(lattice::transport_message::from_string("late")));
+}
+
+void platform_terminal_event_once() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    int errors = 0, closes = 0;
+    owner->set_on_error([&](const auto&) { ++errors; });
+    owner->set_on_close([&](int, const auto&) { ++closes; });
+    owner->connect("ws://fixture");
+    auto first = probe.attempts.back();
+    EXPECT_TRUE(first.trigger_on_error("handshake refused"));
+    EXPECT_FALSE(first.trigger_on_open());
+    EXPECT_FALSE(first.trigger_on_close(1006, "duplicate failure"));
+    EXPECT_FALSE(first.trigger_on_error("duplicate error"));
+    owner->connect("ws://fixture");
+    auto second = probe.attempts.back(); ASSERT_TRUE(second.trigger_on_open());
+    EXPECT_TRUE(second.trigger_on_close(1000, "closed"));
+    EXPECT_FALSE(second.trigger_on_error("late receive error"));
+    EXPECT_EQ(errors, 1); EXPECT_EQ(closes, 1);
+    EXPECT_EQ(owner->state(), lattice::transport_state::closed);
+}
+
+void platform_admitted_callback_can_settle_after_retirement() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    std::mutex mutex; std::condition_variable ready;
+    bool entered = false, release = false, completed = false, timed_out = false;
+    owner->set_on_message([&](const auto&) {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true; ready.notify_all();
+        if (!ready.wait_for(lock, std::chrono::seconds(5), [&] { return release; })) timed_out = true;
+        completed = true;
+    });
+    std::thread thread([&] { endpoint.trigger_on_message(lattice::transport_message::from_string("admitted")); });
+    struct Cleanup {
+        std::mutex& mutex; std::condition_variable& ready; bool& release; std::thread& thread;
+        ~Cleanup() { { std::lock_guard<std::mutex> lock(mutex); release = true; } ready.notify_all(); if (thread.joinable()) thread.join(); }
+    } cleanup{mutex, ready, release, thread};
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }));
+    }
+    owner.reset();
+    EXPECT_EQ(probe.destroys, 1);
+    EXPECT_FALSE(endpoint.trigger_on_message(lattice::transport_message::from_string("new-admission")));
+    { std::lock_guard<std::mutex> lock(mutex); release = true; }
+    ready.notify_all(); thread.join();
+    EXPECT_TRUE(completed); EXPECT_FALSE(timed_out);
+}
+
+void platform_capture_destruction_outside_lock() {
+    PlatformTransportProbe probe;
+    auto owner = probe.make(); ASSERT_NE(owner, nullptr);
+    owner->connect("ws://fixture");
+    auto endpoint = probe.attempts.back(); ASSERT_TRUE(endpoint.trigger_on_open());
+    struct Reenter {
+        lattice::platform_transport_callbacks endpoint; int* destroyed;
+        ~Reenter() { (void)endpoint.is_current(); ++*destroyed; }
+    };
+    int destroyed = 0;
+    auto capture = std::make_shared<Reenter>(); capture->endpoint = endpoint; capture->destroyed = &destroyed;
+    owner->set_on_message([capture](const auto&) {});
+    capture.reset();
+    owner->set_on_message({});
+    EXPECT_EQ(destroyed, 1);
+    auto last = std::make_shared<Reenter>(); last->endpoint = endpoint; last->destroyed = &destroyed;
+    owner->set_on_error([last](const auto&) {}); last.reset();
+    owner.reset();
+    EXPECT_EQ(destroyed, 2);
+}
+} // namespace
+TEST(PlatformTransport, OldAttemptCannotDeliverToReplacement) { bounded_mock_case(platform_attempt_fences); }
+TEST(PlatformTransport, ExplicitDisconnectAllowsFreshReconnect) { bounded_mock_case(platform_disconnect_reconnect); }
+TEST(PlatformTransport, RetainedEndpointAfterNativeDeleteIsInert) { bounded_mock_case(platform_retained_endpoint_after_delete); }
+TEST(PlatformTransport, CallbackCanDeleteNativeTransport) { bounded_mock_case(platform_callback_can_destroy_transport); }
+TEST(PlatformTransport, TerminalEventClosesOnlyItsAttemptOnce) { bounded_mock_case(platform_terminal_event_once); }
+TEST(PlatformTransport, AlreadyAdmittedCallbackSettlesWithoutBlockingRetirement) { bounded_mock_case(platform_admitted_callback_can_settle_after_retirement); }
+TEST(PlatformTransport, HandlerCapturesAreDestroyedOutsideCellLock) { bounded_mock_case(platform_capture_destruction_outside_lock); }
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace lattice::detail {
+struct platform_transport_test_access {
+    static void before_error(const platform_transport_callbacks& endpoint, std::function<void()> callback) {
+        std::lock_guard<std::mutex> lock(endpoint.cell_->mutex);
+        endpoint.cell_->before_error_delivery.swap(callback);
+    }
+};
+}
+namespace {
+void platform_admitted_old_error_preserves_replacement_owner() {
+    PlatformTransportProbe probe;
+    auto transport = probe.make(); ASSERT_NE(transport, nullptr);
+    TempDB file{"platform_owner_generation"};
+    auto database = std::make_unique<lattice::lattice_db>(lattice::configuration(file.str()));
+    lattice::sync_config config;
+    config.websocket_url = "ws://fixture/generation";
+    config.sync_id = "platform-generation";
+    config.all_active_sync_ids = {config.sync_id};
+    config.max_reconnect_attempts = 0;
+    config.upload_coalesce_ms = 0;
+    lattice::synchronizer sync(std::move(database), config, std::move(transport));
+    std::atomic<int> errors{0};
+    sync.set_on_error([&](const std::string&) { ++errors; });
+    sync.connect();
+    ASSERT_EQ(probe.attempts.size(), 1u);
+    auto first = probe.attempts.front(); ASSERT_TRUE(first.trigger_on_open());
+    ASSERT_TRUE(sync.is_connected());
+    std::mutex mutex; std::condition_variable ready;
+    bool entered = false, release = false, timed_out = false;
+    lattice::detail::platform_transport_test_access::before_error(first, [&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true; ready.notify_all();
+        if (!ready.wait_for(lock, std::chrono::seconds(5), [&] { return release; })) timed_out = true;
+    });
+    std::thread delivery([&] { first.trigger_on_error("old admitted completion"); });
+    struct Cleanup {
+        std::mutex& mutex; std::condition_variable& ready; bool& release; std::thread& delivery;
+        ~Cleanup() { { std::lock_guard<std::mutex> lock(mutex); release = true; } ready.notify_all(); if (delivery.joinable()) delivery.join(); }
+    } cleanup{mutex, ready, release, delivery};
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }));
+    }
+    // The real endpoint has copied the old handler and released its mutex.
+    // Reconnect the same REAL synchronizer before that handler reaches owner
+    // admission; its captured old lifecycle must not become the current one.
+    lattice::detail::platform_transport_test_access::before_error(first, {});
+    sync.connect();
+    ASSERT_EQ(probe.attempts.size(), 2u);
+    auto second = probe.attempts.back(); ASSERT_TRUE(second.trigger_on_open());
+    ASSERT_TRUE(sync.is_connected());
+    { std::lock_guard<std::mutex> lock(mutex); release = true; }
+    ready.notify_all(); delivery.join();
+    EXPECT_FALSE(timed_out);
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_TRUE(second.is_current());
+    EXPECT_TRUE(sync.is_connected());
+    sync.disconnect();
+}
+}
+TEST(PlatformTransport, AdmittedOldErrorCannotBorrowReplacementOwnerGeneration) {
+    bounded_mock_case(platform_admitted_old_error_preserves_replacement_owner);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace lattice::detail {
+struct platform_attempt_owner_test_access {
+    static void before_message(const platform_transport_callbacks& endpoint, std::function<void()> callback) {
+        std::lock_guard<std::mutex> lock(endpoint.cell_->mutex);
+        endpoint.cell_->before_message_delivery.swap(callback);
+    }
+};
+}
+namespace {
+struct RetryPlatformProbe : PlatformTransportProbe {
+    // Foreign platform connect runs outside the native endpoint leaf. Only
+    // the owned stop-race fixture supplies this normally empty rendezvous.
+    std::function<void()> after_connect;
+    std::unique_ptr<lattice::sync_transport> make() {
+        return std::unique_ptr<lattice::sync_transport>(lattice::make_owned_platform_sync_transport(
+            this,
+            [](void* p, const void* url, const void* headers, const void* callbacks) {
+                auto& probe = *static_cast<RetryPlatformProbe*>(p);
+                probe.urls.push_back(*static_cast<const std::string*>(url));
+                probe.headers.push_back(*static_cast<const lattice::HeadersMap*>(headers));
+                probe.attempts.push_back(*static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+                if (probe.after_connect) probe.after_connect();
+            },
+            [](void* p) { ++static_cast<RetryPlatformProbe*>(p)->disconnects; },
+            [](void* p, const void*, const void* callbacks) {
+                static_cast<RetryPlatformProbe*>(p)->sends.push_back(
+                    *static_cast<const lattice::platform_transport_callbacks*>(callbacks));
+            },
+            [](void* p) {
+                auto& probe = *static_cast<RetryPlatformProbe*>(p); ++probe.destroys;
+                probe.all_retired_at_destroy = std::all_of(probe.attempts.begin(), probe.attempts.end(),
+                    [](const auto& endpoint) { return !endpoint.is_current(); });
+            }));
+    }
+};
+struct PlatformRetryCase {
+    TempDB file{"platform_retry_owner"};
+    std::shared_ptr<reconnect_manual_scheduler> queue = std::make_shared<reconnect_manual_scheduler>();
+    RetryPlatformProbe probe;
+    lattice::lattice_db* database = nullptr;
+    std::atomic<int> errors{0};
+    std::unique_ptr<lattice::synchronizer> sync;
+    PlatformRetryCase() {
+        auto owned = std::make_unique<lattice::lattice_db>(lattice::configuration(file.str(), queue));
+        database = owned.get();
+        lattice::sync_config config;
+        config.websocket_url = "wss://fixture/automatic-retry";
+        config.sync_id = "wss:platform-automatic-retry";
+        config.all_active_sync_ids = {config.sync_id};
+        config.base_delay_seconds = 0; config.max_delay_seconds = 0;
+        config.max_reconnect_attempts = 2;
+        config.upload_coalesce_ms = 0; config.checkpoint_passive_interval_ms = 0;
+        sync = std::make_unique<lattice::synchronizer>(std::move(owned), config, probe.make());
+        sync->set_on_error([this](const std::string&) { ++errors; });
+        sync->connect();
+    }
+    void drain() {
+        for (size_t n=0;n<256;++n) if (!queue->run_one()) return;
+        throw lattice::db_error("platform retry fixture turn budget exceeded");
+    }
+    auto snapshot() {
+        std::vector<std::vector<lattice::database::row_t>> result;
+        for (const auto* table : {"TestPerson", "AuditLog", "_lattice_sync_state", "_lattice_receive_guard", "_lattice_receive_guard_store"})
+            result.push_back(database->db().query(std::string("SELECT * FROM ")+table+" ORDER BY 1"));
+        return result;
+    }
+};
+struct HeldPlatformMessage {
+    std::mutex mutex; std::condition_variable ready;
+    bool entered=false, release=false, timed_out=false, endpoint_admitted=false;
+    std::thread delivery;
+    HeldPlatformMessage(const lattice::platform_transport_callbacks& endpoint, lattice::transport_message message) {
+        lattice::detail::platform_attempt_owner_test_access::before_message(endpoint,[this] {
+            std::unique_lock<std::mutex> lock(mutex); entered=true; ready.notify_all();
+            if (!ready.wait_for(lock,std::chrono::seconds(5),[this] { return release; })) timed_out=true;
+        });
+        delivery=std::thread([this,endpoint,message=std::move(message)] { endpoint_admitted=endpoint.trigger_on_message(message); });
+    }
+    bool wait() { std::unique_lock<std::mutex> lock(mutex); return ready.wait_for(lock,std::chrono::seconds(5),[this] { return entered; }); }
+    void finish() { { std::lock_guard<std::mutex> lock(mutex); release=true; } ready.notify_all(); if(delivery.joinable())delivery.join(); }
+    ~HeldPlatformMessage() { finish(); }
+};
+void platform_automatic_retry_rejects_old_message(bool valid) {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open()); test.drain();
+    ASSERT_TRUE(test.sync->is_connected());
+    lattice::lattice_db source{lattice::configuration(":memory:")};
+    source.add(TestPerson{"ActualOriginalHeldBeforeOwnerAdmission",42,std::nullopt});
+    const auto originals=lattice::query_audit_log(source.db());
+    ASSERT_EQ(originals.size(),1u);
+    const auto payload=lattice::transport_message::from_string(valid ?
+        lattice::server_sent_event::make_audit_log(originals).to_json() : "malformed old physical attempt");
+    HeldPlatformMessage held(first,payload);
+    ASSERT_TRUE(held.wait());
+    lattice::detail::platform_attempt_owner_test_access::before_message(first,{});
+    // Actual terminal callback schedules the real automatic retry. There is
+    // no public connect(), lifecycle advance, mocked owner or manual redial.
+    ASSERT_TRUE(first.trigger_on_close(1006,"automatic retry trigger"));
+    EXPECT_FALSE(first.trigger_on_error("duplicate terminal"));
+    test.drain();
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    const auto second=test.probe.attempts.back();
+    ASSERT_FALSE(first.matches(second));
+    ASSERT_TRUE(second.trigger_on_open()); test.drain();
+    ASSERT_TRUE(test.sync->is_connected());
+    const auto before=test.snapshot();const auto sends=test.probe.sends.size();
+    held.finish();test.drain();
+    EXPECT_TRUE(held.endpoint_admitted); EXPECT_FALSE(held.timed_out);
+    EXPECT_EQ(test.snapshot(),before); EXPECT_EQ(test.errors.load(),0);
+    EXPECT_EQ(test.probe.sends.size(),sends);
+    EXPECT_TRUE(second.is_current()); EXPECT_TRUE(test.sync->is_connected());
+    // Positive control: exactly the same payload on the replacement reaches
+    // the real parser/intake and either notifies once or installs its original.
+    ASSERT_TRUE(second.trigger_on_message(payload)); test.drain();
+    if(valid) {
+        const auto rows=test.database->db().query("SELECT name FROM TestPerson");
+        ASSERT_EQ(rows.size(),1u);
+        EXPECT_EQ(std::get<std::string>(rows[0].at("name")),"ActualOriginalHeldBeforeOwnerAdmission");
+        const auto imported=test.database->db().query("SELECT globalId FROM AuditLog WHERE globalId=?",{originals[0].global_id});
+        ASSERT_EQ(imported.size(),1u);
+        EXPECT_EQ(std::get<std::string>(imported[0].at("globalId")),originals[0].global_id);
+        EXPECT_EQ(test.errors.load(),0);
+        EXPECT_GT(test.probe.sends.size(),sends);
+    } else EXPECT_EQ(test.errors.load(),1);
+    test.sync->disconnect();
+}
+void platform_queued_automatic_retry_cannot_undo_stop() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    HeldPlatformMessage held(first,lattice::transport_message::from_string("stopped old message"));
+    ASSERT_TRUE(held.wait());
+    lattice::detail::platform_attempt_owner_test_access::before_message(first,{});
+    ASSERT_TRUE(first.trigger_on_close(1006,"queued retry"));
+    ASSERT_GT(test.queue->pending(),0u);
+    test.sync->disconnect();test.drain();
+    held.finish();test.drain();
+    EXPECT_TRUE(held.endpoint_admitted);EXPECT_FALSE(held.timed_out);
+    EXPECT_EQ(test.probe.attempts.size(),1u);
+    EXPECT_FALSE(test.sync->is_connected());EXPECT_FALSE(first.is_current());
+    EXPECT_EQ(test.errors.load(),0);
+    EXPECT_FALSE(first.trigger_on_error("late terminal cannot restart"));
+    test.drain();EXPECT_EQ(test.probe.attempts.size(),1u);
+}
+void platform_admitted_retry_dial_settles_after_stop_without_reenabling() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    std::mutex mutex;std::condition_variable ready;
+    bool entered=false,release=false,timed_out=false;
+    test.probe.after_connect=[&] {
+        std::unique_lock<std::mutex> lock(mutex);entered=true;ready.notify_all();
+        if(!ready.wait_for(lock,std::chrono::seconds(5),[&] {return release;}))timed_out=true;
+    };
+    ASSERT_TRUE(first.trigger_on_close(1006,"retry dial held in actual platform"));
+    std::thread retry([&] {test.drain();});
+    struct Cleanup {
+        std::mutex& mutex;std::condition_variable& ready;bool& release;std::thread& retry;
+        ~Cleanup(){{std::lock_guard<std::mutex> lock(mutex);release=true;}ready.notify_all();if(retry.joinable())retry.join();}
+    } cleanup{mutex,ready,release,retry};
+    {std::unique_lock<std::mutex> lock(mutex);ASSERT_TRUE(ready.wait_for(lock,std::chrono::seconds(5),[&] {return entered;}));}
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    const auto second=test.probe.attempts.back();
+    // The actual retry has published its endpoint and entered the foreign
+    // dial. Stop may let that admitted call return, but cannot be resurrected.
+    test.sync->disconnect();
+    EXPECT_FALSE(second.trigger_on_open());
+    EXPECT_FALSE(second.trigger_on_message(lattice::transport_message::from_string("stopped dial")));
+    EXPECT_FALSE(second.trigger_on_error("stopped completion"));
+    {std::lock_guard<std::mutex> lock(mutex);release=true;}ready.notify_all();retry.join();
+    EXPECT_FALSE(timed_out);test.drain();
+    EXPECT_EQ(test.probe.attempts.size(),2u);EXPECT_FALSE(test.sync->is_connected());
+    EXPECT_EQ(test.errors.load(),0);EXPECT_FALSE(first.is_current());EXPECT_FALSE(second.is_current());
+    test.probe.after_connect={};
+}
+}
+TEST(PlatformTransport, AutomaticRetryRejectsOldMalformedMessageBeforeOwnerAdmission) {
+    bounded_mock_case([] { platform_automatic_retry_rejects_old_message(false); });
+}
+TEST(PlatformTransport, AutomaticRetryRejectsOldOriginalBeforeOwnerAdmission) {
+    bounded_mock_case([] { platform_automatic_retry_rejects_old_message(true); });
+}
+TEST(PlatformTransport, QueuedAutomaticRetryAndHeldOldMessageCannotUndoStop) {
+    bounded_mock_case(platform_queued_automatic_retry_cannot_undo_stop);
+}
+TEST(PlatformTransport, AdmittedAutomaticRetryDialCanSettleWithoutUndoingConcurrentStop) {
+    bounded_mock_case(platform_admitted_retry_dial_settles_after_stop_without_reenabling);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+void platform_current_terminal_identity_notifies_once_and_retries() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    ASSERT_TRUE(first.trigger_on_error("one current terminal"));
+    EXPECT_FALSE(first.trigger_on_error("duplicate error"));
+    EXPECT_FALSE(first.trigger_on_close(1006,"duplicate close"));
+    test.drain();
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    EXPECT_EQ(test.errors.load(),1);
+    const auto second=test.probe.attempts.back();
+    ASSERT_TRUE(second.trigger_on_open());test.drain();
+    EXPECT_TRUE(test.sync->is_connected());EXPECT_EQ(test.errors.load(),1);
+    test.sync->disconnect();
+}
+}
+TEST(PlatformTransport, CurrentClosedAttemptDeliversExactlyOneTerminalOwnerNotification) {
+    bounded_mock_case(platform_current_terminal_identity_notifies_once_and_retries);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+void platform_closed_attempt_rejects_message_before_queued_retry_dials() {
+    PlatformRetryCase test;
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    const auto first=test.probe.attempts.front();
+    ASSERT_TRUE(first.trigger_on_open());test.drain();
+    HeldPlatformMessage held(first,lattice::transport_message::from_string("closed attempt before retry"));
+    ASSERT_TRUE(held.wait());
+    lattice::detail::platform_attempt_owner_test_access::before_message(first,{});
+    ASSERT_TRUE(first.trigger_on_close(1006,"closed before owner admission"));
+    // Keep the automatic retry queued: this refusal comes from A's live
+    // fence closing, not from an already published replacement B.
+    ASSERT_EQ(test.probe.attempts.size(),1u);
+    held.finish();
+    EXPECT_TRUE(held.endpoint_admitted);EXPECT_FALSE(held.timed_out);
+    test.drain();
+    EXPECT_EQ(test.errors.load(),0);
+    ASSERT_EQ(test.probe.attempts.size(),2u);
+    ASSERT_TRUE(test.probe.attempts.back().trigger_on_open());test.drain();
+    EXPECT_TRUE(test.sync->is_connected());
+    test.sync->disconnect();
+}
+}
+TEST(PlatformTransport, ClosedAttemptRejectsHeldMessageBeforeAutomaticRetryDials) {
+    bounded_mock_case(platform_closed_attempt_rejects_message_before_queued_retry_dials);
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+enum class OrdinaryTerminalRetirement { none, progress, notification };
+void ordinary_terminal_callback_retirement(bool error,OrdinaryTerminalRetirement retirement) {
+    PlatformTransportProbe probe;
+    auto database=std::make_unique<lattice::lattice_db>(lattice::configuration(":memory:"));
+    lattice::sync_config config;
+    config.websocket_url="ws://fixture/callback-retirement";
+    config.sync_id="ordinary-terminal-callback-retirement";
+    config.all_active_sync_ids={config.sync_id};
+    config.base_delay_seconds=0;config.max_delay_seconds=0;config.max_reconnect_attempts=1;
+    config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;
+    auto sync=std::make_unique<lattice::synchronizer>(std::move(database),config,probe.make());
+    sync->connect();ASSERT_EQ(probe.attempts.size(),1u);
+    const auto first=probe.attempts.front();ASSERT_TRUE(first.trigger_on_open());ASSERT_TRUE(sync->is_connected());
+    std::vector<std::string> callbacks;
+    sync->set_on_progress([&](const auto&){
+        callbacks.push_back("progress");
+        if(retirement==OrdinaryTerminalRetirement::progress)sync.reset();
+    });
+    sync->set_on_error([&](const auto&){
+        callbacks.push_back("error");
+        if(retirement==OrdinaryTerminalRetirement::notification)sync.reset();
+    });
+    sync->set_on_state_change([&](bool connected){
+        if(connected)return;
+        callbacks.push_back("close");
+        if(retirement==OrdinaryTerminalRetirement::notification)sync.reset();
+    });
+    // The exact native immediate adapter executes these real terminal
+    // callbacks synchronously. No simulated owner or shortened retry policy
+    // substitutes for callback admission; the physical endpoint owns its cell.
+    ASSERT_TRUE(error?first.trigger_on_error("ordinary terminal failure"):
+        first.trigger_on_close(1006,"ordinary terminal close"));
+    const std::vector<std::string> expected=retirement==OrdinaryTerminalRetirement::progress?
+        std::vector<std::string>{"progress"}:std::vector<std::string>{"progress",error?"error":"close"};
+    EXPECT_EQ(callbacks,expected);
+    if(retirement==OrdinaryTerminalRetirement::none) {
+        // Positive control: normal notification still precedes the real
+        // automatic replacement dial, with the configured retry allowance.
+        ASSERT_TRUE(sync);ASSERT_EQ(probe.attempts.size(),2u);EXPECT_EQ(probe.destroys,0);
+        EXPECT_FALSE(first.matches(probe.attempts.back()));
+        EXPECT_TRUE(probe.attempts.back().is_current());
+        sync.reset();
+    } else {
+        EXPECT_FALSE(sync);EXPECT_EQ(probe.attempts.size(),1u);
+    }
+    EXPECT_EQ(probe.destroys,1);EXPECT_TRUE(probe.all_retired_at_destroy);
+    EXPECT_FALSE(first.trigger_on_error("late after retirement"));
+    EXPECT_FALSE(first.trigger_on_close(1006,"late after retirement"));
+    EXPECT_FALSE(first.trigger_on_open());EXPECT_EQ(callbacks,expected);
+}
+}
+TEST(SyncCallbackRetirement, ErrorProgressCanDestroyActualOwnerBeforeContinuation) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(true,OrdinaryTerminalRetirement::progress);});
+}
+TEST(SyncCallbackRetirement, CloseProgressCanDestroyActualOwnerBeforeContinuation) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(false,OrdinaryTerminalRetirement::progress);});
+}
+TEST(SyncCallbackRetirement, InlineErrorNotificationCanDestroyActualOwnerBeforeReconnect) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(true,OrdinaryTerminalRetirement::notification);});
+}
+TEST(SyncCallbackRetirement, InlineCloseNotificationCanDestroyActualOwnerBeforeReconnect) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(false,OrdinaryTerminalRetirement::notification);});
+}
+TEST(SyncCallbackRetirement, CurrentErrorPreservesProgressNotificationAndAutomaticDial) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(true,OrdinaryTerminalRetirement::none);});
+}
+TEST(SyncCallbackRetirement, CurrentClosePreservesProgressNotificationAndAutomaticDial) {
+    bounded_mock_case([]{ordinary_terminal_callback_retirement(false,OrdinaryTerminalRetirement::none);});
+}
+#endif
+
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+namespace {
+struct AckCompletionCapture {unsigned after_retirement=0;};
+void actual_ack_completion_keeps_capture(bool replace_handler) {
+    PlatformTransportProbe probe;
+    auto database=std::make_unique<lattice::lattice_db>(lattice::configuration(":memory:"));
+    database->add(TestPerson{"completion capture original",37,std::nullopt});
+    const auto originals=lattice::query_audit_log(database->db());ASSERT_EQ(originals.size(),1u);
+    const std::vector<std::string> ids{originals.front().global_id};
+    lattice::sync_config config;config.websocket_url="ws://fixture/ack-completion-retirement";
+    config.sync_id="ack-completion-retirement";config.all_active_sync_ids={config.sync_id};
+    config.upload_coalesce_ms=0;config.checkpoint_passive_interval_ms=0;
+    auto sync=std::make_unique<lattice::synchronizer>(std::move(database),config,probe.make());
+    sync->connect();ASSERT_EQ(probe.attempts.size(),1u);const auto endpoint=probe.attempts.front();
+    ASSERT_TRUE(endpoint.trigger_on_open());ASSERT_EQ(sync->get_progress().pending_upload,1);
+    ASSERT_EQ(probe.sends.size(),1u);
+    auto capture=std::make_shared<AckCompletionCapture>();const std::weak_ptr<AckCompletionCapture> weak=capture;
+    unsigned calls=0,replacement_calls=0,capture_uses=0;bool alive_after=false;std::vector<std::string> received;
+    sync->set_on_sync_complete([&,capture=std::move(capture)](const auto& actual) {
+        // Resolve all outside targets before a deliberately destructive call.
+        // On the unfixed path, weak expiration is observable without touching
+        // the destroyed callable again; only a live copy accesses its capture.
+        auto* const owner=&sync;auto* const observed=&alive_after;auto* const watched=&weak;
+        auto* const replaced=&replacement_calls;auto* const used=&capture_uses;const bool replace=replace_handler;
+        ++calls;received=actual;
+        if(replace)(*owner)->set_on_sync_complete([replaced](const auto&){++*replaced;});
+        else owner->reset();
+        *observed=!watched->expired();
+        if(*observed)*used=++capture->after_retirement;
+    });
+    ASSERT_FALSE(weak.expired());
+    const auto frame=lattice::transport_message::from_string(lattice::server_sent_event::make_ack(ids).to_json());
+    ASSERT_TRUE(endpoint.trigger_on_message(frame));
+    EXPECT_EQ(calls,1u);EXPECT_EQ(received,ids);EXPECT_TRUE(alive_after);EXPECT_EQ(capture_uses,1u);
+    EXPECT_TRUE(weak.expired()); // The invocation copy has now really retired.
+    if(replace_handler) {
+        ASSERT_TRUE(sync);EXPECT_EQ(sync->get_progress().pending_upload,0);
+        ASSERT_TRUE(endpoint.trigger_on_message(frame));EXPECT_EQ(replacement_calls,1u);EXPECT_EQ(calls,1u);
+        sync.reset();
+    } else EXPECT_FALSE(sync);
+    EXPECT_EQ(probe.destroys,1);EXPECT_TRUE(probe.all_retired_at_destroy);
+    EXPECT_FALSE(endpoint.trigger_on_message(frame));EXPECT_EQ(calls,1u);
+}
+}
+TEST(SyncCallbackRetirement, ActualAckCompletionCanDeleteOwnerAndContinueUsingItsCapture) {
+    bounded_mock_case([]{actual_ack_completion_keeps_capture(false);});
+}
+TEST(SyncCallbackRetirement, ActualAckCompletionCanReplaceItselfAndContinueUsingItsCapture) {
+    bounded_mock_case([]{actual_ack_completion_keeps_capture(true);});
+}
+#endif

@@ -174,13 +174,20 @@ enum class stream_kind { content, receipts };
 // Bounded streaming form of the same canonical encoding used by whole helpers.
 // Retains only manifest/limits, counters and the last key, never prior records.
 // Discard after any append/finish refusal. A digest is integrity, not authority.
+struct package_limits;
+class encoded_package;
 class stream_hasher {
     friend class validated_sequence;
+    friend encoded_package assemble_package(const attempt&, uint64_t,
+        const request&, uint64_t, const lease&,
+        const std::vector<content_item>&, const std::vector<receipt_item>&,
+        const package_limits&, std::optional<uint64_t>);
     struct state;
     std::unique_ptr<state> state_;
     explicit stream_hasher(std::unique_ptr<state>);
     stream_hasher clone() const;
-    // Only the friend cursor may reuse its same-call effective-limit check.
+    // Only the friend cursor/package builder may reuse the SAME immutable
+    // input after its complete same-call effective-limit shape check.
     // Whole-stream state, ordering, count/byte and hash checks still apply.
     void append_validated(const content_item&);
 public:

@@ -32,7 +32,8 @@ struct SWIFT_CONFORMS_TO_PROTOCOL(LatticeSwiftModule.OptionalProtocol) swift_dyn
 
     swift_dynamic_object(const swift_dynamic_object&) = default;
     swift_dynamic_object& operator=(const swift_dynamic_object&) = default;
-    swift_dynamic_object(swift_dynamic_object&&) = default;
+    swift_dynamic_object(swift_dynamic_object&&) noexcept = default;
+    swift_dynamic_object& operator=(swift_dynamic_object&&) noexcept = default;
     
     bool has_value() const SWIFT_NAME(hasValue()) {
         return table_name != "";

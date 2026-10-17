@@ -360,6 +360,12 @@ class synchronizer_base {
     // Retained by close across reset; destructor cleanup failures cannot be
     // recovered from a destroyed synchronizer or substituted for a drain error.
     std::shared_ptr<std::exception_ptr> cleanup_error_=std::make_shared<std::exception_ptr>();
+    struct handler_publications;
+    template<class Handler> class handler_snapshot;
+    const uint64_t handler_creator_=detail::database_native_process();
+    const std::shared_ptr<handler_publications> handlers_;
+    template<class Handler> void publish_handler(Handler);
+    template<class Handler> Handler copy_handler()const;
 public:
     using on_sync_complete_handler = std::function<void(const std::vector<std::string>& synced_ids)>;
     using on_error_handler = std::function<void(const std::string& error)>;
@@ -430,14 +436,9 @@ public:
     void clear_sync_filter();
 
     // Event handlers
-    void set_on_sync_complete(on_sync_complete_handler handler) { on_sync_complete_ = std::move(handler); }
-    void set_on_error(on_error_handler handler) { on_error_ = std::move(handler); }
-    void set_on_state_change(on_state_change_handler handler) {
-        on_state_change_ = std::move(handler);
-        if (on_state_change_ && is_connected_) {
-            scheduler_->invoke([this] { on_state_change_(true); });
-        }
-    }
+    void set_on_sync_complete(on_sync_complete_handler handler);
+    void set_on_error(on_error_handler handler);
+    void set_on_state_change(on_state_change_handler handler);
 
     // Progress
     void set_on_progress(on_progress_handler handler);
@@ -539,6 +540,12 @@ protected:
     void pump_discovery(std::shared_ptr<detail::sync_discovery_operation> initial = {});
     void background_operation(const char* stage,const std::function<void()>& work) noexcept;
     void schedule_background(const char* stage,std::function<void()> work);
+    // Value copies retain their original reporting/capture points, off the
+    // publication leaf. Already-dispatched reporting pins without another copy.
+    on_error_handler copy_error_handler()const;
+    on_sync_complete_handler copy_completion_handler()const;
+    on_state_change_handler copy_state_handler()const;
+    void report_dispatched_error(const std::exception_ptr&,const char*)noexcept;
 
     /// Consecutive ack-timeout failures (no ACK before the resend deadline).
     /// Grows the resend deadline (10s, 20s, 40s… capped) so a stalled server
@@ -623,9 +630,6 @@ protected:
     /// floor for the life of the connection and vetoes all compaction.
     void reconcile_open_with_db();
 
-    on_sync_complete_handler on_sync_complete_;
-    on_error_handler on_error_;
-    on_state_change_handler on_state_change_;
     mutable std::mutex progress_handler_mutex_;
     on_progress_handler on_progress_;
 

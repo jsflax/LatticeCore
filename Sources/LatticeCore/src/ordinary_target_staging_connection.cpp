@@ -1,4 +1,5 @@
 #include "ordinary_target_staging_connection.hpp"
+#include "ordinary_target_terminal_allocation.hpp"
 #include "ordinary_target_history_spool.hpp"
 #include "ordinary_managed_history.hpp"
 #include "ordinary_target_staging_io.hpp"
@@ -12,6 +13,7 @@
 #endif
 #include "ordinary_history_receive.hpp"
 #include "../include/lattice/db.hpp"
+#include "../include/lattice/native_retirement_storage.hpp"
 #include <array>
 #include <initializer_list>
 #include <cstdint>
@@ -21,7 +23,9 @@
 #include <limits>
 #include <algorithm>
 #include <optional>
+#include <vector>
 #include "database_retirement.hpp"
+#include "database_open_ledger.hpp" // Actual new fixed-scope ledger methods require complete private type.
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -42,13 +46,14 @@ constexpr const char* main_leaf="store.sqlite";
 struct birth_registry {
     const ordinary_launch::process_identity process=ordinary_launch::current_process();
     std::mutex mutex;
-    std::size_t charged=0;
+    std::size_t charged=0;std::uint64_t serial=0;
+    std::array<bool,256> occupied{};std::array<std::uint64_t,256> serials{};
     std::array<std::shared_ptr<const ordinary_unpublished_group_target>,256> targets;
     std::array<std::shared_ptr<ordinary_target_staging_connection>,256> originals;
 };
 birth_registry& registry() {
-    // No refund or static teardown: failed allocations and every returned
-    // original remain charged until this actual process ends.
+    // Failed/unknown originals retain actual charged slots. Only the distinct
+    // terminal first-tail producer can return an exact ended slot/serial.
     static auto* retained=new birth_registry;
     if(ordinary_launch::current_process()!=retained->process)
         birth_fail("target MAIN registry inherited or replaced");
@@ -56,12 +61,13 @@ birth_registry& registry() {
 }
 }
 struct ordinary_target_staging_connection::state {
+    ordinary_target_scope_root_tail terminal_receiving_tail_{this,6}; // First: all actual state members end before this tail.
     const std::shared_ptr<const ordinary_unpublished_group_target> target;
     const std::shared_ptr<ordinary_target_staging_io> io;
     const ordinary_launch::process_identity process=ordinary_launch::current_process();
     const std::thread::id thread=std::this_thread::get_id();
     const ordinary_launch::deadline end;
-    const std::size_t registry_slot;
+    const std::size_t registry_slot;const std::uint64_t registry_serial;
     bool row_import_attempted=false;std::uint64_t row_import_scopes=0;
     bool import_suspension_attempted=false;
     bool history_chain_attempted=false;std::uint64_t history_chain_scopes=0;
@@ -73,6 +79,10 @@ struct ordinary_target_staging_connection::state {
     bool raw_ending_attempted=false,raw_ending_returned=false;
     terminal_raw_retirement_result raw_ending_result=terminal_raw_retirement_result::retained_debt;
     std::shared_ptr<ordinary_target_history_spool> history_spool;
+    struct terminal_raw_objects_ending;
+    bool raw_objects_attempted=false,raw_objects_allocation_returned=false,raw_objects_allocation_exception_returned=false;
+    std::shared_ptr<terminal_raw_objects_ending> raw_objects_original;
+    std::exception_ptr raw_objects_first_failure;
     struct terminal_vfs_disposition {
         bool attempted=false,returned=false;
         terminal_vfs_retirement_result result=terminal_vfs_retirement_result::retained_debt;
@@ -92,6 +102,15 @@ struct ordinary_target_staging_connection::state {
         std::shared_ptr<database_retirement_state> retirement_original;
         std::exception_ptr first_failure;
     } terminal_scope; // Fixed before MAIN birth, strong exact history before real binding reset.
+    struct terminal_scope_roots_ending;
+    bool scope_roots_attempted=false,scope_roots_allocation_returned=false,scope_roots_allocation_exception_returned=false;
+    std::shared_ptr<terminal_scope_roots_ending> scope_roots_original;
+    std::exception_ptr scope_roots_first_failure;
+    ordinary_target_terminal_allocation receiving_allocations,collection_allocations; // Actual fixed request DATA before Native effects.
+    struct terminal_receiving_ending;
+    bool receiving_ending_attempted=false,receiving_allocation_returned=false,receiving_allocation_exception_returned=false;
+    std::shared_ptr<terminal_receiving_ending> receiving_ending_original;
+    std::exception_ptr receiving_first_failure;
     bool bound=false;
     std::string fixed_main_path; // Derived once from actual original before MAIN birth.
     int member_fd=-1;
@@ -117,8 +136,9 @@ struct ordinary_target_staging_connection::state {
         std::shared_ptr<resource> original; // SAME issued resource survives first return/phase retirement.
     };
     struct resource {
+        ordinary_target_scope_root_tail terminal_scope_root_{this,3}; // First: preserves real implicit resource endings.
         const std::uint64_t cookie;
-        explicit resource(std::uint64_t original):cookie(original) {}
+        explicit resource(std::uint64_t original):cookie(original) {terminal_scope_root_.construction_returned_=true;}
         int fd=-1;std::uint64_t device=0,inode=0;std::int64_t size=0;
         bool journal=false,birth=false,named=false,borrowed=false,borrow_attempted=false;
         bool birth_attempted=false,birth_entered=false,birth_returned=false;
@@ -230,10 +250,11 @@ struct ordinary_target_staging_connection::state {
         std::exception_ptr first_failure;
     } general_files;
     struct call_bank {
+        ordinary_target_scope_root_tail terminal_scope_root_{this,2}; // First: all actual call/resource owners end first.
         const database_scope::scope_state* const issuer;
         std::array<native_call,maximum_calls> calls{};
         std::size_t count=0;
-        explicit call_bank(const database_scope::scope_state* original):issuer(original) {}
+        explicit call_bank(const database_scope::scope_state* original):issuer(original) {terminal_scope_root_.construction_returned_=true;}
     };
     std::size_t journal_count=0; // Highest live-slot index, never a lifetime birth quota.
     std::uint64_t journal_generation=1,scope_generation=0,callback_generation=0;
@@ -262,9 +283,10 @@ struct ordinary_target_staging_connection::state {
     struct stat first_stat{};
 #endif
     state(std::shared_ptr<const ordinary_unpublished_group_target> target_,
-        std::shared_ptr<ordinary_target_staging_io> io_,ordinary_launch::deadline end_,std::size_t slot)
-        :target(std::move(target_)),io(std::move(io_)),end(end_),registry_slot(slot) {
+        std::shared_ptr<ordinary_target_staging_io> io_,ordinary_launch::deadline end_,std::size_t slot,std::uint64_t serial)
+        :target(std::move(target_)),io(std::move(io_)),end(end_),registry_slot(slot),registry_serial(serial) {
         resources[0]=std::make_shared<resource>((std::uint64_t(1)<<7)|1); // MAIN original before any Native birth.
+        terminal_receiving_tail_.construction_returned_=true;
     }
     ~state() {
 #ifdef LATTICE_TARGET_MAIN_POSIX
@@ -286,8 +308,38 @@ struct ordinary_target_staging_connection::state {
 #include "ordinary_target_general_files.inc"
 #include "ordinary_target_terminal_vfs.inc"
 #include "ordinary_target_terminal_scope.inc"
+#include "ordinary_target_terminal_raw_objects.inc"
+#include "ordinary_target_terminal_scope_roots.inc"
+#include "ordinary_target_terminal_receiving_payloads.inc"
+#include "ordinary_target_terminal_collection.inc"
+// Distinct post-RAW history. The old pre-input observer requires live
+// Native cleanup objects and cannot be reused after their actual endings.
+bool ordinary_target_staging_connection::terminal_raw_objects_context_known(
+    const ordinary_group_target_receiving_owner& owner,const void*& scope,std::uint64_t& generation)const noexcept {
+    try {
+        const auto native=state_;
+        if(!native||!native->creator_current()||native->facade.lock().get()!=this||!native->shell||
+           !terminal_raw_objects_ended(owner)||!native->raw_objects_original)return false;
+        const auto& first=*native->raw_objects_original;
+        if(!first.scope||!first.generation||first.original.lock()!=native||first.facade!=this||
+           first.owner!=&owner||first.owner_original.lock().get()!=&owner||
+           !owner.terminal_inputs_ended(*this)||
+           !terminal_receiver_input_history_matches(owner,first.scope,first.generation))return false;
+        scope=first.scope;generation=first.generation;return true;
+    }catch(...){return false;}
+}
+bool ordinary_target_staging_connection::terminal_programme_originals_known(
+    const ordinary_group_target_receiving_owner& owner,const ordinary_group_target_schema_original& schema,
+    const std::array<const void*,4>& programmes,const std::array<std::exception_ptr,4>& failures)const noexcept {
+    try {
+        const auto native=state_;
+        return native&&native->creator_current()&&native->facade.lock().get()==this&&native->shell&&
+            terminal_raw_objects_ended(owner)&&
+            native->shell->target_terminal_programme_originals_known_(*this,owner,schema,programmes,failures);
+    }catch(...){return false;}
+}
 ordinary_target_staging_connection::ordinary_target_staging_connection(std::shared_ptr<state> value)
-    :state_(std::move(value)){}
+    :state_(std::move(value)){terminal_receiving_tail_.construction_returned_=true;}
 ordinary_target_staging_connection::~ordinary_target_staging_connection()=default;
 
 void ordinary_target_staging_connection::prepare(
@@ -296,18 +348,20 @@ void ordinary_target_staging_connection::prepare(
     std::shared_ptr<ordinary_target_staging_connection>& retained,ordinary_launch::deadline end) {
     if(retained)birth_fail("target MAIN output already holds an original");
     if(!target)birth_fail("target MAIN actual target missing");
-    auto& owners=registry();std::size_t slot=0;bool already_reserved=false;
+    auto& owners=registry();std::size_t slot=0;std::uint64_t serial=0;bool already_reserved=false;
     {std::lock_guard<std::mutex> lock(owners.mutex);
-        for(std::size_t n=0;n<owners.charged;++n)if(owners.targets[n].get()==target.get()) {
+        for(std::size_t n=0;n<owners.originals.size();++n)if(owners.occupied[n]&&owners.targets[n].get()==target.get()) {
             retained=owners.originals[n];already_reserved=true;break;}
         if(!already_reserved) {
-            if(owners.charged==owners.originals.size())birth_fail("target MAIN original registry exhausted");
-            slot=owners.charged;owners.targets[slot]=target;++owners.charged;
+            if(owners.charged==owners.originals.size()||owners.serial==UINT64_MAX)birth_fail("target MAIN original registry exhausted");
+            for(std::size_t n=0;n<owners.originals.size();++n)if(!owners.occupied[n]){slot=n;break;}
+            owners.occupied[slot]=true;serial=owners.serials[slot]=++owners.serial;
+            owners.targets[slot]=target;++owners.charged;
         }}
     // The actual target reservation survives allocation/current failures too.
     // A later call cannot replace it with a fresh connection original.
     if(already_reserved)birth_fail("target MAIN original already reserved");
-    auto native=std::make_shared<state>(target,io,end,slot);
+    auto native=std::make_shared<state>(target,io,end,slot,serial);
     auto original=std::shared_ptr<ordinary_target_staging_connection>(new ordinary_target_staging_connection(native));
     {std::lock_guard<std::mutex> lock(owners.mutex);owners.originals[slot]=original;}
     retained=original; // Strong custody precedes claim, native birth and errors.
@@ -385,7 +439,8 @@ void ordinary_target_staging_connection::require_target_identity(
     const auto& native=*state_;native.require_local(end);
     auto& owners=registry();
     {std::lock_guard<std::mutex> lock(owners.mutex);
-        if(native.registry_slot>=owners.charged||owners.originals[native.registry_slot].get()!=this||
+        if(native.registry_slot>=owners.originals.size()||!owners.occupied[native.registry_slot]||
+            owners.serials[native.registry_slot]!=native.registry_serial||owners.originals[native.registry_slot].get()!=this||
             owners.targets[native.registry_slot].get()!=target)
             birth_fail("target MAIN registry association differs");}
     if(!target||native.target.get()!=target||!native.io)
@@ -646,6 +701,8 @@ bool ordinary_target_staging_connection::terminal_receiver_input_history_matches
     const ordinary_group_target_receiving_owner& owner,const void* scope_original,std::uint64_t generation)const noexcept {
     try {
         const auto native=state_;
+        if(native&&native->creator_current()&&native->scope_roots_attempted)
+            return terminal_scope_root_identity_matches(owner,scope_original,generation);
         if(!native||!native->creator_current()||native->facade.lock().get()!=this||!native->shell||
            !native->target||!native->io||native->abandoned_main.selected)return false;
         const auto original=owner.terminal_abandonment_original(*this,native->target,native->io);
@@ -708,7 +765,52 @@ bool ordinary_target_staging_connection::terminal_native_phases_ended(
     return native&&native->creator_current()&&native->facade.lock().get()==this&&native->shell&&
         native->shell->target_terminal_native_phases_ended_(*this,owner);
 }
+bool ordinary_target_staging_connection::retire_terminal_native_outer_roots(
+    const ordinary_group_target_receiving_owner& owner)noexcept {
+    const auto native=state_;
+    if(!native||!native->creator_current()||native->facade.lock().get()!=this||!native->shell)return false;
+    return native->shell->retire_target_terminal_native_outer_roots_(*this,owner)==
+        ::lattice::database::terminal_native_outer_result::roots_ended;
+}
+bool ordinary_target_staging_connection::retire_terminal_native_pages(
+    const ordinary_group_target_receiving_owner& owner)noexcept {
+    const auto native=state_;
+    if(!native||!native->creator_current()||native->facade.lock().get()!=this||!native->shell)return false;
+    return native->shell->retire_target_terminal_native_pages_(*this,owner)==
+        ::lattice::database::terminal_native_pages_result::pages_ended;
+}
+bool ordinary_target_staging_connection::retire_terminal_native_statics(
+    const ordinary_group_target_receiving_owner& owner)noexcept {
+    const auto native=state_;
+    if(!native||!native->creator_current()||native->facade.lock().get()!=this||!native->shell)return false;
+    return native->shell->retire_target_terminal_native_statics_(*this,owner)==
+        ::lattice::database::terminal_native_statics_result::objects_ended;
+}
+bool ordinary_target_staging_connection::terminal_native_statics_ended(
+    const ordinary_group_target_receiving_owner& owner)const noexcept {
+    const auto native=state_;
+    return native&&native->creator_current()&&native->facade.lock().get()==this&&native->shell&&
+        native->shell->target_terminal_native_statics_ended_(*this,owner);
+}
+bool ordinary_target_staging_connection::terminal_native_pages_ended(
+    const ordinary_group_target_receiving_owner& owner)const noexcept {
+    const auto native=state_;
+    return native&&native->creator_current()&&native->facade.lock().get()==this&&native->shell&&
+        native->shell->target_terminal_native_pages_ended_(*this,owner);
+}
+bool ordinary_target_staging_connection::terminal_native_outer_roots_ended(
+    const ordinary_group_target_receiving_owner& owner)const noexcept {
+    const auto native=state_;
+    return native&&native->creator_current()&&native->facade.lock().get()==this&&native->shell&&
+        native->shell->target_terminal_native_outer_roots_ended_(*this,owner);
+}
 #if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+ordinary_target_lifetime_observation ordinary_target_staging_connection::qualification_lifetime_observation(
+    const ordinary_group_target_receiving_owner& owner)const noexcept {
+    const auto native=state_;
+    if(!native||!native->creator_current()||native->facade.lock().get()!=this||!native->shell)return {};
+    return native->shell->qualification_target_lifetime_observation_(*this,owner);
+}
 std::uint64_t ordinary_target_staging_connection::qualification_disposition_observation()const noexcept {
     const auto native=state_;if(!native||!native->creator_current())return 0;
     using fixture=ordinary_receiver_reclamation_fixture;
@@ -985,3 +1087,13 @@ nlohmann::json ordinary_target_reclamation_fixture::construct_and_abandon(
 }
 }
 #endif
+
+namespace lattice::detail {
+bool ordinary_target_staging_connection::terminal_programme_history_known(
+    const ordinary_group_target_receiving_owner& owner,const void* schema,
+    const std::array<const void*,4>& originals,const std::array<std::exception_ptr,4>& failures)const noexcept {
+    const auto native=state_;
+    return native&&native->creator_current()&&native->facade.lock().get()==this&&native->shell&&
+        schema&&native->shell->target_terminal_programme_history_known_(*this,owner,schema,originals,failures);
+}
+}

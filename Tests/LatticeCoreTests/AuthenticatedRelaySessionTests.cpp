@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "FixtureCheckedOwnerEnding.hpp"
 #include "CanonicalWriterTestAccess.hpp"
 #include "CanonicalReadyAdoptionTestAccess.hpp"
 #include "../../Sources/LatticeCore/src/canonical_ready_named_profile.hpp"
@@ -19,6 +20,9 @@
 #include <chrono>
 #include <thread>
 #include <condition_variable>
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/stat.h>
+#endif
 
 #if defined(__APPLE__) || defined(__linux__)
 namespace lattice::detail {
@@ -34,6 +38,9 @@ struct authenticated_relay_catalog_test_access {
     }
     static const recovery_owner_schema& catalog(const lattice_db& owner) noexcept {
         return canonical_writer_adapter::authenticated_catalog(owner);
+    }
+    static std::shared_ptr<instance_guard> guard(const lattice_db& owner) noexcept {
+        return canonical_writer_adapter::authenticated_owner_guard(owner);
     }
 };
 }
@@ -80,7 +87,7 @@ protected:
         owner=swift_lattice_ref::shared_for_lattice(ref->get());ASSERT_TRUE(owner);
         if(auto* n=instance_registry::instance().get_or_create_notifier(file.str()))n->stop_listening();
     }
-    void TearDown()override {setup.close_on_io();setup={};if(owner)owner->close();owner.reset();ref.reset();}
+    void TearDown()override {setup.close_on_io();setup={};detail::end_fixture_owner_checked(owner.get(),"authenticated-owner");owner.reset();ref.reset();}
     relay_recovery_setup open(const json& p,const json& c,std::shared_ptr<RelayRouteState> state={}) {
         return ref->open_relay_recovery_setup(p.dump(),c.dump(),new RelayRoute{state?state:route},RelayRoute::current,RelayRoute::destroy);
     }
@@ -1269,6 +1276,35 @@ struct ReadyLifecycleGate {
     void release(){std::lock_guard lock(mutex);released=true;changed.notify_all();}
     bool timedOut(){std::lock_guard lock(mutex);return timed_out;}
 };
+// A fatal assertion must release the real worker before joining the caller.
+// Unknown caller ending skips every Native/TempDB destructor for outer custody.
+struct ReadyLifecycleJoinedCaller {
+    struct result_state {std::atomic<bool> finished{false};lattice_close_result report;std::exception_ptr error;};
+    std::shared_ptr<result_state> result=std::make_shared<result_state>();
+    std::vector<std::shared_ptr<ReadyLifecycleGate>> release;
+    std::thread worker;
+    ReadyLifecycleJoinedCaller(std::vector<std::shared_ptr<ReadyLifecycleGate>> gates,
+            std::function<lattice_close_result()> work):release(std::move(gates)) {
+        worker=std::thread([state=result,work=std::move(work)]{
+            try{state->report=work();}catch(...){state->error=std::current_exception();}
+            state->finished.store(true,std::memory_order_release);
+        });
+    }
+    void join()noexcept {
+        if(!worker.joinable())return;
+        for(const auto& gate:release)gate->release();
+        const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+        while(!result->finished.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if(!result->finished.load(std::memory_order_acquire)) {
+            std::fprintf(stderr,"maintenance caller ending debt pid=%ld pgid=%ld; preserving owned test namespace\n",long(::getpid()),long(::getpgrp()));::_exit(96);
+        }
+        try{worker.join();}catch(...) {
+            std::fprintf(stderr,"maintenance caller join error pid=%ld pgid=%ld; preserving owned test namespace\n",long(::getpid()),long(::getpgrp()));::_exit(96);
+        }
+    }
+    ~ReadyLifecycleJoinedCaller(){join();}
+};
 struct ReadyLifecycleEvents {
     std::mutex mutex;std::function<void(const char*)> callback;
     std::atomic<unsigned> settled{0},published{0};
@@ -1459,7 +1495,14 @@ TEST_F(AuthenticatedReadyLifecycle, ClosedOwnerAfterMaintenanceCommitCannotRetai
     setup=lifecycle_setup();const auto d=description(setup);const auto q=request(d);lease(setup,q,d);
     const auto frames=owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index");
     enabled->store(true);auto temporary=lifecycle_setup(2);ASSERT_TRUE(until([&]{return paused->arrived();}));
-    temporary.close_on_io();temporary={};setup.close_on_io();setup={};owner->close();paused->release();events->set({});reopen_owner();
+    temporary.close_on_io();temporary={};setup.close_on_io();setup={};
+    const auto guard=detail::authenticated_relay_catalog_test_access::guard(*owner);
+    const auto before=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());
+    ReadyLifecycleJoinedCaller closing({paused},[keep=owner]{return keep->close_checked();});
+    ASSERT_TRUE(until([&]{return detail::authenticated_ready_maintenance_test_observation::retirement(guard.get()).requested>before.requested;}));
+    EXPECT_FALSE(closing.result->finished.load(std::memory_order_acquire));
+    paused->release();closing.join();ASSERT_FALSE(closing.result->error);ASSERT_TRUE(closing.result->report.cleanup_complete);
+    events->set({});reopen_owner();
     setup=lifecycle_setup();const auto next=description(setup);auto resumed=q;resumed.route_generation=std::stoull(next["routeGeneration"].get<std::string>());
     EXPECT_TRUE(lease(setup,resumed,next,"resume")["leaseAvailable"].get<bool>());
     EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_frame ORDER BY binding,frame_index"),frames);
@@ -2200,6 +2243,143 @@ CompletedDisposalSnapshot completed_disposal_state(database& db) {
     state["sqlite_schema"]=db.query("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name");
     return state;
 }
+// Failure-only fixed ASCII report from the SAME two compared snapshots.
+// No new SQL, exception rethrow, clock read or live source resampling.
+std::array<char,4096> completed_disposal_difference(const CompletedDisposalSnapshot& expected,
+    const CompletedDisposalSnapshot& actual,const char* phase) noexcept {
+    std::array<char,4096> out{};size_t used=0,changed_tables=0,shown_tables=0;
+    const auto append=[&](const char* format,auto... args){
+        if(used>=out.size()-1)return;
+        const auto n=std::snprintf(out.data()+used,out.size()-used,format,args...);
+        if(n>0)used+=std::min(static_cast<size_t>(n),out.size()-used-1);
+    };
+    const auto value=[&](const column_value_t* v){
+        if(!v){append("absent");return;}append("type%zu:",v->index());
+        if(const auto* n=std::get_if<int64_t>(v))append("%lld",static_cast<long long>(*n));
+        else {
+            const unsigned char* data=nullptr;size_t count=0;
+            if(const auto* t=std::get_if<std::string>(v)){data=reinterpret_cast<const unsigned char*>(t->data());count=t->size();}
+            else if(const auto* b=std::get_if<std::vector<uint8_t>>(v)){data=b->data();count=b->size();}
+            if(data){append("bytes%zu:hex",count);for(size_t n=0;n<std::min(count,size_t{48});++n)append("%02x",unsigned(data[n]));if(count>48)append("[truncated]");}
+        }
+    };
+    append("phase=%s exactComparedSnapshots=1",phase);
+    auto e=expected.begin(),a=actual.begin();
+    while(e!=expected.end()||a!=actual.end()){
+        const bool ee=e!=expected.end(),aa=a!=actual.end();
+        const bool take_e=ee&&(!aa||e->first<=a->first),take_a=aa&&(!ee||a->first<=e->first);
+        const auto* er=take_e?&e->second:nullptr;const auto* ar=take_a?&a->second:nullptr;
+        const auto& table=take_e?e->first:a->first;
+        if(!er||!ar||*er!=*ar){
+            ++changed_tables;
+            if(shown_tables++<8){
+                append(" table=%.*s expectedRows=%zu actualRows=%zu",128,table.c_str(),er?er->size():0,ar?ar->size():0);
+                const size_t rows=std::max(er?er->size():0,ar?ar->size():0);
+                for(size_t row=0;row<rows;++row){
+                    const auto* ev=er&&row<er->size()?&er->at(row):nullptr;const auto* av=ar&&row<ar->size()?&ar->at(row):nullptr;
+                    if(ev&&av&&*ev==*av)continue;append(" firstDifferentRow=%zu",row);
+                    // Inspect at most the first four different cells, retaining
+                    // both sides and fixed hex bytes rather than UTF8 guesses.
+                    size_t shown=0;
+                    if(ev)for(const auto& [column,cell]:*ev){
+                        const auto at=av?av->find(column):database::row_t::const_iterator{};
+                        const auto* other=av&&at!=av->end()?&at->second:nullptr;
+                        if(other&&cell==*other)continue;if(shown++>=4)break;
+                        append(" col=%.*s expected=",128,column.c_str());value(&cell);append(" actual=");value(other);
+                    }
+                    if(av)for(const auto& [column,cell]:*av){
+                        if(ev&&ev->count(column))continue;if(shown++>=4)break;
+                        append(" col=%.*s expected=absent actual=",128,column.c_str());value(&cell);
+                    }
+                    break;
+                }
+            }
+        }
+        if(take_e)++e;if(take_a)++a;
+    }
+    append(" changedTables=%zu displayTruncated=%d",changed_tables,int(changed_tables>8||used==out.size()-1));
+    return out;
+}
+struct CompletedDisposalRawFault {
+    struct statement {int prepare=SQLITE_MISUSE,bind=SQLITE_OK,step=SQLITE_MISUSE,finalize=SQLITE_MISUSE;};
+    std::array<statement,8> statements{};size_t issued=0;
+    bool identity=false,marker=false,marker_removed=false,ended=false,committed=false;
+    int open=SQLITE_MISUSE,busy=SQLITE_MISUSE,close=SQLITE_MISUSE;
+    sqlite3_int64 changes=-1;
+    bool valid()const noexcept {
+        if(!identity||!marker||!marker_removed||!ended||!committed||open!=SQLITE_OK||busy!=SQLITE_OK||close!=SQLITE_OK||changes!=1||issued!=6)return false;
+        for(size_t n=0;n<issued;++n)if(statements[n].prepare!=SQLITE_OK||statements[n].bind!=SQLITE_OK||statements[n].step!=SQLITE_DONE||statements[n].finalize!=SQLITE_OK)return false;
+        return true;
+    }
+};
+CompletedDisposalRawFault replace_ready_fault_bytes(TempDB& temp,const std::vector<uint8_t>& binding,int64_t index,const std::vector<uint8_t>& data) {
+    CompletedDisposalRawFault result;
+    if(binding.empty()||binding.size()>2048||index<0||data.size()>4194304)return result;
+    // Two issued corrupt/restore calls. Unknown first-close pointers are never
+    // retried or refunded; the exact real store name also remains on disk.
+    static std::array<sqlite3*,2> unknown{};sqlite3** cell=nullptr;
+    for(auto& value:unknown)if(!value){cell=&value;break;}if(!cell)return result;
+    const auto original=temp.path;auto sentinel=std::filesystem::path(original.string()+".raw-ending-retained-do-not-create");
+    const auto pending=std::filesystem::path(original.string()+".raw-ending.pending");const auto path=original.string();
+    struct stat before{},after{},unused{};
+    if(::lstat(path.c_str(),&before)||!S_ISREG(before.st_mode)||::lstat(sentinel.c_str(),&unused)==0)return result;
+    std::FILE* marker=std::fopen(pending.c_str(),"wx");if(!marker)return result;
+    const int wrote=std::fputs("stock SQLite first ending unproved; preserve this exact fixture MAIN/WAL/SHM\n",marker),marker_closed=std::fclose(marker);
+    if(wrote<0||marker_closed)return result;result.marker=true;
+    // Preallocated path swap removes only TempDB's later deletion authority.
+    // On actual first close0 it is restored; UNKNOWN retains the real path and
+    // sidecars, marker and native pointer. The placeholder is never created.
+    temp.path.swap(sentinel);
+    std::string guard;bool okay=true;
+    const auto statement=[&](const char* sql,bool read_guard=false,bool update=false){
+        if(result.issued==result.statements.size()){okay=false;return;}
+        auto& fact=result.statements[result.issued++];sqlite3_stmt* actual=nullptr;const char* tail=nullptr;
+        fact.prepare=sqlite3_prepare_v2(*cell,sql,-1,&actual,&tail);
+        if(fact.prepare==SQLITE_OK&&actual&&tail&&!*tail){
+            if(update){fact.bind=sqlite3_bind_blob64(actual,1,data.data(),data.size(),SQLITE_TRANSIENT);
+                if(fact.bind==SQLITE_OK)fact.bind=sqlite3_bind_blob64(actual,2,binding.data(),binding.size(),SQLITE_TRANSIENT);
+                if(fact.bind==SQLITE_OK)fact.bind=sqlite3_bind_int64(actual,3,index);}
+            if(fact.bind==SQLITE_OK){fact.step=sqlite3_step(actual);
+                if(read_guard&&fact.step==SQLITE_ROW){
+                    const auto n=sqlite3_column_bytes(actual,0);const auto* bytes=sqlite3_column_text(actual,0);
+                    if(sqlite3_column_type(actual,0)==SQLITE_TEXT&&bytes&&n>0&&n<=8192){
+                        // SQLite owns these bytes until the actual next step.
+                        // Allocation failure is caught below before first close.
+                        try{guard.assign(reinterpret_cast<const char*>(bytes),static_cast<size_t>(n));}catch(...){okay=false;}
+                        fact.step=sqlite3_step(actual);
+                    }
+                }
+                if(update&&fact.step==SQLITE_DONE)result.changes=sqlite3_changes64(*cell);
+            }
+        }
+        if(actual)fact.finalize=sqlite3_finalize(actual); // exact first finalize
+        if(fact.prepare!=SQLITE_OK||fact.bind!=SQLITE_OK||fact.step!=SQLITE_DONE||fact.finalize!=SQLITE_OK)okay=false;
+    };
+    result.open=sqlite3_open_v2(path.c_str(),cell,SQLITE_OPEN_READWRITE|SQLITE_OPEN_NOFOLLOW,nullptr); // NO CREATE/URI
+    if(result.open==SQLITE_OK&&*cell){
+        const char* actual=sqlite3_db_filename(*cell,"main");int moved=-1;
+        result.identity=actual&&path==actual&&!::lstat(actual,&after)&&S_ISREG(after.st_mode)&&before.st_dev==after.st_dev&&before.st_ino==after.st_ino&&
+            sqlite3_file_control(*cell,"main",SQLITE_FCNTL_HAS_MOVED,&moved)==SQLITE_OK&&!moved;
+        result.busy=sqlite3_busy_timeout(*cell,100);
+        if(result.identity&&result.busy==SQLITE_OK){
+            statement("SELECT CASE WHEN typeof(sql)='text' AND length(CAST(sql AS BLOB)) BETWEEN 1 AND 8192 THEN sql END FROM main.sqlite_schema WHERE type='trigger' AND name='_lattice_canonical_ready_frame_guard_UPDATE' LIMIT 2",true);
+            if(okay&&!guard.empty())statement("BEGIN IMMEDIATE");else okay=false;
+            if(okay)statement("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
+            if(okay)statement("UPDATE main._lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",false,true);
+            if(result.changes!=1)okay=false;
+            if(okay)statement(guard.c_str()); // exact bounded original trigger, one statement/no tail
+            if(okay){statement("COMMIT");result.committed=okay;}
+            if(!result.committed&&!sqlite3_get_autocommit(*cell))statement("ROLLBACK"); // first cleanup result retained
+        }
+    }
+    if(*cell){result.close=sqlite3_close(*cell);if(result.close==SQLITE_OK){*cell=nullptr;result.ended=true;}} // first close only
+    else result.ended=true; // open returned no native handle; this is not close0
+    if(result.ended){
+        temp.path.swap(sentinel);
+        std::error_code error;result.marker_removed=std::filesystem::remove(pending,error)&&!error;
+    }else std::fprintf(stderr,"raw ready fixture first close UNKNOWN; original namespace retained close=%d\n",result.close);
+    return result;
+}
 struct CompletedDisposalAudit {
     detail::canonical_ready_read_test_observation::observation trace;
     detail::canonical_ready_read_test_observation::observation* previous=detail::canonical_ready_read_test_observation::current;
@@ -2315,17 +2495,19 @@ TEST_F(AuthenticatedCompletedDisposal, AbsentRetryStillAuditsAnotherCapsulesOffP
     const auto before=state();const auto tail=owner->db().query("SELECT binding,frame_index,data FROM _lattice_canonical_ready_frame ORDER BY frame_index DESC LIMIT 1").at(0);
     ASSERT_GT(std::get<int64_t>(tail.at("frame_index")),0);
     const auto replace=[&](const std::vector<uint8_t>& data){
-        database raw(file.str());const auto guard=std::get<std::string>(raw.query("SELECT sql FROM sqlite_master WHERE name='_lattice_canonical_ready_frame_guard_UPDATE'").at(0).at("sql"));
-        raw.begin_transaction();raw.execute("DROP TRIGGER _lattice_canonical_ready_frame_guard_UPDATE");
-        raw.execute("UPDATE _lattice_canonical_ready_frame SET data=? WHERE binding=? AND frame_index=?",{data,tail.at("binding"),tail.at("frame_index")});
-        raw.execute(guard);raw.commit();
+        const auto actual=replace_ready_fault_bytes(file,std::get<std::vector<uint8_t>>(tail.at("binding")),std::get<int64_t>(tail.at("frame_index")),data);
+        ASSERT_TRUE(actual.valid())<<"open="<<actual.open<<" identity="<<actual.identity<<" changes="<<actual.changes<<" committed="<<actual.committed<<" firstClose="<<actual.close<<" ended="<<actual.ended;
+        for(size_t n=0;n<actual.issued;++n){EXPECT_EQ(actual.statements[n].prepare,SQLITE_OK)<<n;EXPECT_EQ(actual.statements[n].bind,SQLITE_OK)<<n;
+            EXPECT_EQ(actual.statements[n].step,SQLITE_DONE)<<n;EXPECT_EQ(actual.statements[n].finalize,SQLITE_OK)<<n;}
     };
     replace({'{','}'});const auto corrupt=state();
     {CompletedDisposalAudit audit;AddressedReadAuthorizerFault commit(owner->db(),false);const auto refused=discard(q,d);
         EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(audit.trace.full_audits,1u);EXPECT_EQ(commit.commits,0u);}
     EXPECT_EQ(state(),corrupt);EXPECT_FALSE(owner->db().is_in_transaction());
-    replace(std::get<std::vector<uint8_t>>(tail.at("data")));EXPECT_EQ(state(),before);
-    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");EXPECT_EQ(state(),before);
+    replace(std::get<std::vector<uint8_t>>(tail.at("data")));const auto restored=state();
+    EXPECT_EQ(restored,before)<<completed_disposal_difference(before,restored,"restored-original-frame").data();
+    EXPECT_EQ(discard(q,d).at("settlement").at("state"),"committed");const auto retried=state();
+    EXPECT_EQ(retried,before)<<completed_disposal_difference(before,retried,"successful-final-discard").data();
 }
 
 TEST_F(AuthenticatedCompletedDisposal, CommitDenialRestoresExtantCapsuleAndCannotPublishAnAbsentRetryCommit) {
@@ -2372,16 +2554,89 @@ TEST_F(AuthenticatedReceiptCoverageV3, CompletedAbsentDiscardStillRequiresActual
     (void)lease(setup,q,d,"prepare",1000);const auto coverage_before=coverage(),receipts_before=receipts();const auto global_before=global_state();
     ASSERT_EQ(completed_disposal_answer(invoke(setup,command("discard",q,d))).at("settlement").at("state"),"committed");
     const auto terminal=all_state();EXPECT_EQ(coverage(),coverage_before);EXPECT_EQ(receipts(),receipts_before);EXPECT_EQ(global_state(),global_before);
-    for(unsigned kind=0;kind<3;++kind) {
+    // Registered v3 requests still require their exact producer/namespace.
+    // The separate v2 terminal-only tests below explicitly refine the former
+    // blanket version refusal without granting any capsule disposal or receipt.
+    for(unsigned kind=0;kind<2;++kind) {
         SCOPED_TRACE(kind);auto wrong=q;auto& changed=std::get<ready_wire::request>(wrong.body);
         if(kind==0)changed.registered_producer->producer=producer(2);
         if(kind==1){changed.receipt_namespace="other";changed.receipts.clear();}
-        if(kind==2){wrong.version=2;changed.registered_producer.reset();changed.receipt_namespace.reset();changed.receipts.clear();}
         seal(wrong,d);const auto refused=completed_disposal_answer(invoke(setup,command("discard",wrong,d)));
         EXPECT_NE(refused.at("settlement").at("state"),"committed");EXPECT_EQ(all_state(),terminal);
     }
     EXPECT_EQ(completed_disposal_answer(invoke(setup,command("discard",q,d))).at("settlement").at("state"),"committed");EXPECT_EQ(all_state(),terminal);
 }
+
+TEST_F(AuthenticatedReceiptCoverageV3, MigratedV2TerminalDiscardProvesOnlyCurrentNoEffectAndKeepsRouteFence) {
+    open();authorize();const auto original=entry(803,"actual pre-migration capsule");
+    ASSERT_EQ(setup.receive(frame(original)).ids(),std::vector<std::string>{original.global_id});
+    const auto old_d=description(setup);auto legacy=request(old_d);
+    std::get<ready_wire::request>(legacy.body).receipts={{original.global_id,"app",{{original.table_name,original.global_row_id}}}};seal(legacy,old_d);
+    (void)lease(setup,legacy,old_d,"prepare",1000);ASSERT_EQ(count("_lattice_canonical_ready_transfer"),1);
+    const auto high_water=owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding");
+    setup.close_on_io();setup={};
+    ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
+    setup=covered_setup();const auto d=description(setup);legacy.route_generation=std::stoull(d.at("routeGeneration").get<std::string>());
+    ASSERT_EQ(count("_lattice_canonical_ready_transfer"),0);ASSERT_EQ(count("_lattice_canonical_ready_frame"),0);
+    const auto before=all_state();
+    auto held=invoke(setup,command("discard",legacy,d));const auto answer=completed_disposal_answer(held);
+    EXPECT_EQ(answer.at("settlement").at("state"),"committed");EXPECT_FALSE(answer.contains("predecessor"));
+    EXPECT_FALSE(answer.contains("receipts"));EXPECT_EQ(all_state(),before);
+    EXPECT_EQ(owner->db().query("SELECT * FROM _lattice_canonical_ready_binding ORDER BY binding"),high_water);
+    EXPECT_EQ(completed_disposal_answer(invoke(setup,command("discard",legacy,d))).at("settlement").at("state"),"committed");
+    EXPECT_EQ(all_state(),before);EXPECT_EQ(count("_lattice_canonical_receipt_origin"),0);EXPECT_TRUE(coverage().empty());
+    const auto stop=setup.stop_token();ASSERT_TRUE(stop.live());stop.stop();EXPECT_FALSE(held.publishable());
+    held={};EXPECT_TRUE(stop.drained());
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, V2TerminalOnlyCannotDisposeActiveCapsuleOrPrepareOrResumeRegisteredSource) {
+    setup=covered_setup();const auto d=description(setup);auto exact=request(d);exact.version=3;
+    auto& body=std::get<ready_wire::request>(exact.body);body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace="app";seal(exact,d);
+    (void)lease(setup,exact,d,"prepare",1000);const auto active=all_state();
+    auto legacy=exact;legacy.version=2;auto& old=std::get<ready_wire::request>(legacy.body);old.registered_producer.reset();old.receipt_namespace.reset();seal(legacy,d);
+    EXPECT_NE(completed_disposal_answer(invoke(setup,command("discard",legacy,d))).at("settlement").at("state"),"committed");
+    EXPECT_EQ(all_state(),active);EXPECT_EQ(count("_lattice_canonical_ready_transfer"),1);
+    for(const auto* op:{"prepare","resume"}) {
+        const auto result=invoke(setup,command(op,legacy,d,1000));ASSERT_EQ(result.status_code(),1);
+        const auto response=json::parse(result.wire());EXPECT_FALSE(response.at("leaseAvailable").get<bool>());EXPECT_EQ(all_state(),active);
+    }
+    ASSERT_EQ(completed_disposal_answer(invoke(setup,command("discard",exact,d))).at("settlement").at("state"),"committed");
+    EXPECT_EQ(count("_lattice_canonical_ready_transfer"),0);
+}
+
+TEST_F(AuthenticatedReceiptCoverageV3, V2TerminalOnlyRequiresExactAuthorityKeyHighWaterAndActualCommit) {
+    setup=covered_setup();const auto d=description(setup);auto exact=request(d);exact.version=3;
+    auto& body=std::get<ready_wire::request>(exact.body);body.registered_producer=detail::recovery_receipt_binding{producer(),relay_uuid(5100),7,1};body.receipt_namespace="app";seal(exact,d);
+    (void)lease(setup,exact,d,"prepare",1000);
+    ASSERT_EQ(completed_disposal_answer(invoke(setup,command("discard",exact,d))).at("settlement").at("state"),"committed");
+    auto legacy=exact;legacy.version=2;auto& old=std::get<ready_wire::request>(legacy.body);old.registered_producer.reset();old.receipt_namespace.reset();seal(legacy,d);
+    const auto terminal=all_state();
+    for(unsigned kind=0;kind<5;++kind) {
+        SCOPED_TRACE(kind);auto wrong=legacy;auto& q=std::get<ready_wire::request>(wrong.body);
+        if(kind==0){q.source.schema_digest[0]=q.source.schema_digest[0]=='a'?'b':'a';q.expected.binding=q.source;}
+        if(kind==1){q.source.epoch=relay_uuid(9841);q.expected.binding=q.source;}
+        if(kind==2)wrong.logical.receiver_incarnation=relay_uuid(9842);
+        if(kind==3)wrong.logical.channel="foreign-channel";
+        if(kind==4)wrong.logical.sequence=2;
+        seal(wrong,d);const auto result=invoke(setup,command("discard",wrong,d));
+        if(kind==4)EXPECT_NE(completed_disposal_answer(result).at("settlement").at("state"),"committed");
+        else EXPECT_NE(result.status_code(),1);
+        EXPECT_EQ(all_state(),terminal);
+    }
+    for(const auto& selected:{std::string("app"),std::string("other")}) {
+        auto peer=covered_setup(selected,2);const auto pd=description(peer);const auto other=request(pd);const auto before=all_state();
+        EXPECT_NE(completed_disposal_answer(invoke(peer,command("discard",other,pd))).at("settlement").at("state"),"committed");
+        EXPECT_EQ(all_state(),before);
+    }
+    {AddressedReadAuthorizerFault denied(owner->db(),false,true);
+        const auto answer=completed_disposal_answer(invoke(setup,command("discard",legacy,d)));
+        EXPECT_EQ(denied.commits,1u);EXPECT_EQ(answer.at("settlement").at("state"),"rolledBack");
+        EXPECT_EQ(answer.at("settlement").at("primaryError"),true);}
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(all_state(),terminal);
+    EXPECT_EQ(completed_disposal_answer(invoke(setup,command("discard",legacy,d))).at("settlement").at("state"),"committed");
+    EXPECT_EQ(all_state(),terminal);
+}
+
 }
 #endif
 
@@ -3105,6 +3360,208 @@ TEST_F(CanonicalSchemaCacheContinuity, ActualMigrationCommitDenialRestoresCookie
     EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(cookie(),before_cookie);EXPECT_EQ(all_state(),before);
     ASSERT_EQ(ref->migrate_relay_receipt_coverage(policy().dump(),covered_policy().dump()),1)<<last_bridge_error();
     EXPECT_GT(cookie(),before_cookie);expect_current(prior_markers);
+}
+}
+#endif
+
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+TEST_F(AuthenticatedRelaySession, OrdinaryCloseDoesNotLaunchAuthenticatedMaintenanceService) {
+    const auto before=detail::authenticated_ready_maintenance_test_observation::retirement(nullptr);
+    const auto result=owner->close_checked();
+    const auto after=detail::authenticated_ready_maintenance_test_observation::retirement(nullptr);
+    EXPECT_TRUE(result.cleanup_complete);EXPECT_FALSE(result.error);EXPECT_EQ(after.launches,before.launches);
+}
+TEST_F(AuthenticatedReadyLifecycle, NeverEnrolledOwnerDoesNotWaitForAnUnrelatedHeldMaintenanceWorker) {
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,once](const char* point){if(std::strcmp(point,"before-maintenance")==0&&!once->exchange(true))paused->wait();});
+    setup=lifecycle_setup();ASSERT_TRUE(until([&]{return paused->arrived();}));
+    TempDB other_file{"maintenance-unrelated-close"};
+    swift_configuration c(other_file.str(),std::make_shared<immediate_scheduler>());c.audit_retention_seconds=0;
+    std::unique_ptr<swift_lattice_ref> other_ref;
+#if LATTICE_HAS_FRT
+    other_ref.reset(swift_lattice_ref::create(c,{relay_schema()}));
+#else
+    other_ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(c,{relay_schema()}));
+#endif
+    auto other=swift_lattice_ref::shared_for_lattice(other_ref->get());ASSERT_TRUE(other);
+    const auto before=detail::authenticated_ready_maintenance_test_observation::retirement(nullptr);
+    const auto start=std::chrono::steady_clock::now();const auto closed=other->close_checked();
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count();
+    EXPECT_TRUE(closed.cleanup_complete);EXPECT_FALSE(closed.error);EXPECT_LT(elapsed,1000);
+    EXPECT_EQ(detail::authenticated_ready_maintenance_test_observation::retirement(nullptr).launches,before.launches);
+    other.reset();other_ref.reset();paused->release();
+}
+TEST_F(AuthenticatedReadyLifecycle, CloseWaitsForActualMaintenanceWorkerAndTwoConcurrentTickets) {
+    const auto paused=gate();auto enabled=std::make_shared<std::atomic<bool>>(false),once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,enabled,once](const char* point){if(enabled->load()&&std::strcmp(point,"before-maintenance")==0&&!once->exchange(true))paused->wait();});
+    setup=lifecycle_setup();const auto d=description(setup);lease(setup,request(d),d);
+    const auto guard=detail::authenticated_relay_catalog_test_access::guard(*owner);
+    enabled->store(true);setup.close_on_io();setup={};ASSERT_TRUE(until([&]{return paused->arrived();}));
+    const auto before=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());ASSERT_TRUE(before.available);ASSERT_EQ(before.matching_registrations,1u);
+    ReadyLifecycleJoinedCaller closing({paused},[keep=owner]{return keep->close_checked();});
+    ASSERT_TRUE(until([&]{return detail::authenticated_ready_maintenance_test_observation::retirement(guard.get()).requested>before.requested;}));
+    const auto first=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());
+    EXPECT_EQ(first.matching_registrations,0u);EXPECT_LT(first.settled,first.requested);
+    ReadyLifecycleJoinedCaller second({paused},[guard]{return detail::retire_authenticated_ready_maintenance(guard,std::chrono::steady_clock::now()+std::chrono::seconds(2));});
+    ASSERT_TRUE(until([&]{return detail::authenticated_ready_maintenance_test_observation::retirement(guard.get()).requested>=before.requested+2;}));
+    EXPECT_FALSE(closing.result->finished.load(std::memory_order_acquire));EXPECT_FALSE(second.result->finished.load(std::memory_order_acquire));
+    paused->release();second.join();closing.join();
+    ASSERT_FALSE(second.result->error);ASSERT_FALSE(closing.result->error);
+    EXPECT_TRUE(second.result->report.cleanup_complete);EXPECT_TRUE(closing.result->report.cleanup_complete);
+    const auto after=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());EXPECT_GE(after.settled,before.requested+2);
+}
+TEST_F(AuthenticatedReadyLifecycle, WorkerCaptureDeadlineRefusalStaysIncompleteUntilActualRelease) {
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,once](const char* point){if(std::strcmp(point,"before-maintenance")==0&&!once->exchange(true))paused->wait();});
+    setup=lifecycle_setup();ASSERT_TRUE(until([&]{return paused->arrived();}));setup.close_on_io();setup={};
+    const auto guard=detail::authenticated_relay_catalog_test_access::guard(*owner);
+    ReadyLifecycleJoinedCaller closing({paused},[keep=owner]{return keep->close_checked();});
+    ASSERT_TRUE(until([&]{return closing.result->finished.load(std::memory_order_acquire);}));
+    ASSERT_FALSE(closing.result->error);EXPECT_FALSE(closing.result->report.cleanup_complete);ASSERT_TRUE(closing.result->report.error);
+    const auto pending=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());
+    ASSERT_TRUE(pending.available);EXPECT_LT(pending.settled,pending.requested);
+    try{std::rethrow_exception(closing.result->report.error);}catch(const db_error& error){EXPECT_NE(std::string(error.what()).find("deadline pending"),std::string::npos);}
+    paused->release();closing.join();
+    // A later, explicit close is a new attempt. It cannot relabel the retained
+    // first report: the worker must now actually pass its capture boundary.
+    const auto ended=owner->close_checked();EXPECT_TRUE(ended.cleanup_complete);EXPECT_FALSE(ended.error);
+    EXPECT_FALSE(closing.result->report.cleanup_complete);EXPECT_TRUE(closing.result->report.error);
+}
+TEST_F(AuthenticatedReadyLifecycle, ZeroMapEntriesDoNotEndTheActualCopiedWorkerBatch) {
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    const auto guard=detail::authenticated_relay_catalog_test_access::guard(*owner);
+    events->set([paused,once,guard](const char* point){
+        if(std::strcmp(point,"maintenance-published")!=0)return;
+        const auto actual=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());
+        if(actual.available&&actual.matching_registrations==0&&!once->exchange(true))paused->wait();
+    });
+    setup=lifecycle_setup();setup.close_on_io();setup={};ASSERT_TRUE(until([&]{return paused->arrived();}));
+    const auto before=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());ASSERT_TRUE(before.available);ASSERT_EQ(before.matching_registrations,0u);
+    ReadyLifecycleJoinedCaller closing({paused},[keep=owner]{return keep->close_checked();});
+    ASSERT_TRUE(until([&]{return detail::authenticated_ready_maintenance_test_observation::retirement(guard.get()).requested>before.requested;}));
+    EXPECT_FALSE(closing.result->finished.load(std::memory_order_acquire));
+    paused->release();closing.join();ASSERT_FALSE(closing.result->error);EXPECT_TRUE(closing.result->report.cleanup_complete);
+}
+TEST_F(AuthenticatedReadyLifecycle, CloseWaitsForFinalSourceProbeCaptureDestructorAfterPublication) {
+    const auto work_gate=gate(),tail_gate=gate();
+    struct tail_capture {std::shared_ptr<ReadyLifecycleGate> gate;~tail_capture(){gate->wait();}};
+    auto marker=std::make_shared<tail_capture>();marker->gate=tail_gate;
+    auto probe=std::make_shared<detail::authenticated_ready_maintenance_test_observation::probe>();probe->owner=owner.get();
+    probe->observed=[events=events,marker](const char* point){events->observe(point);};
+    auto displaced=detail::authenticated_ready_maintenance_test_observation::exchange(probe);probe.reset();marker.reset();
+    auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([work_gate,once](const char* point){if(std::strcmp(point,"before-maintenance")==0&&!once->exchange(true))work_gate->wait();});
+    setup=lifecycle_setup();ASSERT_TRUE(until([&]{return work_gate->arrived();}));
+    // The original source now solely owns this selected probe/capture. Global
+    // test selection and every setup are released before actual owner close.
+    detail::authenticated_ready_maintenance_test_observation::exchange(std::move(displaced));
+    setup.close_on_io();setup={};
+    const auto guard=detail::authenticated_relay_catalog_test_access::guard(*owner);
+    const auto before=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());
+    ReadyLifecycleJoinedCaller closing({work_gate,tail_gate},[keep=owner]{return keep->close_checked();});
+    ASSERT_TRUE(until([&]{return detail::authenticated_ready_maintenance_test_observation::retirement(guard.get()).requested>before.requested;}));
+    work_gate->release();ASSERT_TRUE(until([&]{return tail_gate->arrived();}));
+    const auto held=detail::authenticated_ready_maintenance_test_observation::retirement(guard.get());
+    EXPECT_LT(held.settled,held.requested);EXPECT_FALSE(closing.result->finished.load(std::memory_order_acquire));
+    tail_gate->release();closing.join();ASSERT_FALSE(closing.result->error);EXPECT_TRUE(closing.result->report.cleanup_complete);
+}
+TEST_F(AuthenticatedReadyLifecycle, ConcurrentRetirementCannotPassAnotherCallersActualRemovalDestructorTail) {
+    // First hold the real singleton worker on A. B is enrolled only afterwards,
+    // so its entry cannot have appeared in that worker's already-copied batch.
+    const auto worker_gate=gate(),tail_gate=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([worker_gate,once](const char* point){if(std::strcmp(point,"before-maintenance")==0&&!once->exchange(true))worker_gate->wait();});
+    setup=lifecycle_setup();ASSERT_TRUE(until([&]{return worker_gate->arrived();}));
+    TempDB target_file{"maintenance-unbatched-target"};
+    swift_configuration c(target_file.str(),std::make_shared<immediate_scheduler>());c.audit_retention_seconds=0;
+    std::unique_ptr<swift_lattice_ref> target_ref;
+#if LATTICE_HAS_FRT
+    target_ref.reset(swift_lattice_ref::create(c,{relay_schema()}));
+#else
+    target_ref=std::make_unique<swift_lattice_ref>(swift_lattice_ref::create(c,{relay_schema()}));
+#endif
+    auto target=swift_lattice_ref::shared_for_lattice(target_ref->get());ASSERT_TRUE(target);
+    const auto target_guard=detail::authenticated_relay_catalog_test_access::guard(*target);
+    struct tail_capture {std::shared_ptr<ReadyLifecycleGate> gate;~tail_capture(){gate->wait();}};
+    auto marker=std::make_shared<tail_capture>();marker->gate=tail_gate;
+    auto probe=std::make_shared<detail::authenticated_ready_maintenance_test_observation::probe>();probe->owner=target.get();
+    probe->observed=[marker](const char*){};
+    auto displaced=detail::authenticated_ready_maintenance_test_observation::exchange(probe);probe.reset();marker.reset();
+    // Restore selection even if enrollment/authorization asserts: target-held
+    // probe captures remain independent and every referenced gate outlives it.
+    struct restore_probe {
+        std::shared_ptr<const detail::authenticated_ready_maintenance_test_observation::probe> prior;bool armed=true;
+        void restore(){if(armed){armed=false;detail::authenticated_ready_maintenance_test_observation::exchange(std::move(prior));}}
+        ~restore_probe(){restore();}
+    } restore{std::move(displaced)};
+    relay_recovery_setup target_setup;
+    struct target_ending {
+        relay_recovery_setup& setup;std::shared_ptr<lattice::swift_lattice>& owner;restore_probe& probe;
+        std::shared_ptr<ReadyLifecycleGate> worker,tail;
+        ~target_ending()noexcept {
+            worker->release();tail->release();
+            try {
+                probe.restore();setup.close_on_io();setup={};
+                if(owner&&!owner->close_checked().cleanup_complete)throw std::runtime_error("target ending incomplete");
+            }catch(...) {
+                std::fprintf(stderr,"maintenance target ending debt pid=%ld pgid=%ld; preserving owned test namespace\n",long(::getpid()),long(::getpgrp()));::_exit(96);
+            }
+        }
+    } ending{target_setup,target,restore,worker_gate,tail_gate};
+    target_setup=target_ref->open_relay_recovery_setup(lifecycle_policy().dump(),connection(2).dump(),new RelayRoute{std::make_shared<RelayRouteState>()},RelayRoute::current,RelayRoute::destroy);
+    ASSERT_TRUE(target_setup.valid())<<last_bridge_error();restore.restore();
+    const auto registered=detail::authenticated_ready_maintenance_test_observation::retirement(target_guard.get());
+    ASSERT_TRUE(registered.available);ASSERT_EQ(registered.matching_registrations,1u);
+    target_setup.close_on_io();target_setup={};
+    ReadyLifecycleJoinedCaller first({worker_gate,tail_gate},[target]{return target->close_checked();});
+    ASSERT_TRUE(until([&]{return tail_gate->arrived();}));
+    const auto removed=detail::authenticated_ready_maintenance_test_observation::retirement(target_guard.get());
+    ASSERT_TRUE(removed.available);ASSERT_EQ(removed.matching_registrations,0u);ASSERT_EQ(removed.active_removal_originals,1u);
+    ReadyLifecycleJoinedCaller second({worker_gate,tail_gate},[target_guard]{return detail::retire_authenticated_ready_maintenance(target_guard,std::chrono::steady_clock::now()+std::chrono::seconds(2));});
+    ASSERT_TRUE(until([&]{return detail::authenticated_ready_maintenance_test_observation::retirement(target_guard.get()).requested>removed.requested;}));
+    const auto before_worker_release=detail::authenticated_ready_maintenance_test_observation::retirement(target_guard.get());
+    worker_gate->release();
+    ASSERT_TRUE(until([&]{return detail::authenticated_ready_maintenance_test_observation::retirement(target_guard.get()).boundaries>before_worker_release.boundaries;}));
+    const auto held=detail::authenticated_ready_maintenance_test_observation::retirement(target_guard.get());
+    EXPECT_EQ(held.active_removal_originals,1u);EXPECT_LT(held.settled,held.requested);
+    EXPECT_FALSE(first.result->finished.load(std::memory_order_acquire));EXPECT_FALSE(second.result->finished.load(std::memory_order_acquire));
+    tail_gate->release();second.join();first.join();ASSERT_FALSE(first.result->error);ASSERT_FALSE(second.result->error);
+    EXPECT_TRUE(first.result->report.cleanup_complete);EXPECT_TRUE(second.result->report.cleanup_complete);
+    EXPECT_EQ(detail::authenticated_ready_maintenance_test_observation::retirement(target_guard.get()).active_removal_originals,0u);
+    target.reset();target_ref.reset();
+}
+TEST_F(AuthenticatedReadyLifecycle, MaintenanceWorkerReentrantCloseRefusesSelfWaitThenExternalCloseSettles) {
+    struct outcome {std::atomic<bool> enabled{false},once{false},returned{false};lattice_close_result report;int64_t elapsed_ms=-1;};
+    const auto result=std::make_shared<outcome>();const auto keep=owner;
+    events->set([result,keep](const char* point){
+        if(result->enabled.load()&&std::strcmp(point,"before-maintenance")==0&&!result->once.exchange(true)) {
+            const auto start=std::chrono::steady_clock::now();result->report=keep->close_checked();
+            result->elapsed_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count();
+            result->returned.store(true,std::memory_order_release);
+        }
+    });
+    setup=lifecycle_setup();result->enabled.store(true);setup.close_on_io();setup={};
+    ASSERT_TRUE(until([&]{return result->returned.load(std::memory_order_acquire);}));
+    EXPECT_FALSE(result->report.cleanup_complete);ASSERT_TRUE(result->report.error);EXPECT_LT(result->elapsed_ms,1000);
+    try{std::rethrow_exception(result->report.error);}catch(const db_error& error){EXPECT_NE(std::string(error.what()).find("own worker"),std::string::npos);}
+    events->set({});const auto external=owner->close_checked();EXPECT_TRUE(external.cleanup_complete);EXPECT_FALSE(external.error);
+}
+TEST_F(AuthenticatedReadyLifecycle, RegistrationPausedBeforePublicationCannotReenrollAClosedOriginal) {
+    const auto paused=gate();auto once=std::make_shared<std::atomic<bool>>(false);
+    events->set([paused,once](const char* point){if(std::strcmp(point,"before-maintenance-register")==0&&!once->exchange(true))paused->wait();});
+    const auto guard=detail::authenticated_relay_catalog_test_access::guard(*owner);
+    // Snapshot arguments and hold the actual original wrapper, without a fake
+    // source, registry entry, alive transition or maintenance admission.
+    const auto p=lifecycle_policy().dump(),c=connection().dump();auto* actual=ref.get();
+    std::atomic<bool> valid{true};
+    ReadyLifecycleJoinedCaller opening({paused},[&,keep=owner]{
+        auto value=actual->open_relay_recovery_setup(p,c,new RelayRoute{route},RelayRoute::current,RelayRoute::destroy);
+        valid.store(value.valid(),std::memory_order_release);value.close_on_io();return lattice_close_result{};
+    });
+    ASSERT_TRUE(until([&]{return paused->arrived();}));const auto closed=owner->close_checked();EXPECT_TRUE(closed.cleanup_complete);
+    paused->release();opening.join();ASSERT_FALSE(opening.result->error);EXPECT_FALSE(valid.load(std::memory_order_acquire));
+    EXPECT_EQ(detail::authenticated_ready_maintenance_test_observation::retirement(guard.get()).matching_registrations,0u);
 }
 }
 #endif

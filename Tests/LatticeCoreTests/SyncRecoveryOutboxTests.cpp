@@ -1,5 +1,6 @@
 #include "TestHelpers.hpp"
 #include "../../Sources/LatticeCore/src/sync_recovery_outbox.hpp"
+#include "../../Sources/LatticeCore/src/recovery_writer_access.hpp"
 #include <set>
 #include <string_view>
 
@@ -49,7 +50,9 @@ protected:
         owner.db().execute("INSERT INTO AuditLog(globalId,tableName,operation,rowId,globalRowId,changedFields,"
             "changedFieldsNames,isFromRemote,isSynchronized,timestamp,synthesized) VALUES(?,?,?,0,?,?,?,?,?,42.25,?)",
             {event,table,op,global_row_id,fields,names,remote,global_sync,synthesized});
-        return static_cast<int64_t>(sqlite3_last_insert_rowid(owner.db().handle()));
+        // SQL reads the actual connection's last insert identity without
+        // publishing a public native escape before the later owned capture.
+        return std::get<int64_t>(owner.db().query("SELECT last_insert_rowid() AS id").at(0).at("id"));
     }
     void receipt(int64_t id,const std::string& channel,int64_t synchronized) {
         owner.db().execute("INSERT INTO _lattice_sync_state(audit_entry_id,sync_id,is_synchronized) VALUES(?,?,?)",
@@ -239,7 +242,7 @@ TEST_F(SyncRecoveryOutbox, CallerRollbackDiscardsCapturedAndLateWrittenState) {
 
 TEST_F(SyncRecoveryOutbox, CountColumnFieldAndLogicalBudgetsRefuseWithoutAnyWrite) {
     person(); OwnedTransaction tx(owner); const auto normal=capture();
-    auto* handle=owner.db().handle(); const auto before=sqlite3_total_changes64(handle);
+    auto* handle=recovery_writer_access::active_handle(owner,owner.db()); const auto before=sqlite3_total_changes64(handle);
     Authorizer auth(handle);
     const auto original=limits;
     for(int dimension=0;dimension<8;++dimension) {
@@ -332,7 +335,7 @@ TEST_F(SyncRecoveryOutbox, PendingReceiptWithoutRetainedAuditBodyRefuses) {
 }
 
 TEST_F(SyncRecoveryOutbox, SqlFailureFinalizesStatementsAndLeavesCallerTransactionUntouched) {
-    person(); OwnedTransaction tx(owner); auto* handle=owner.db().handle();
+    person(); OwnedTransaction tx(owner); auto* handle=recovery_writer_access::active_handle(owner,owner.db());
     const int initial_statements=statement_count(handle);
     { Authorizer auth(handle); auth.deny_name=true;
       expect_error(error_code::sql_error,[&]{capture();}); EXPECT_EQ(auth.writes,0);

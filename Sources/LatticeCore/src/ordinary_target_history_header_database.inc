@@ -7,6 +7,7 @@
 namespace lattice {
 struct database::target_staging_state::history_header_native {
     using arguments=std::vector<column_value_t>;
+    terminal_native_static_tail terminal_static; // FIRST: actual member death, not source-null inference.
     database* const shell;
     const bool raw_pages; // Selected only by the private unmounted target programme.
     const std::weak_ptr<detail::ordinary_group_target_receiving_owner> owner;
@@ -77,7 +78,7 @@ struct database::target_staging_state::history_header_native {
     // constructor is selected; static binding copies are held before effects.
     history_header_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
         std::shared_ptr<detail::ordinary_group_target_schema_original> input,arguments stage_row,arguments meta_row,bool raw)
-        :shell(&actual),raw_pages(raw),owner(receiving),schema(std::move(input)),stage(std::move(stage_row)),meta(std::move(meta_row)),stage_key{stage.at(0)} {
+        :terminal_static(actual,this,input.get(),1,receiving),shell(&actual),raw_pages(raw),owner(receiving),schema(std::move(input)),stage(std::move(stage_row)),meta(std::move(meta_row)),stage_key{stage.at(0)} {
         const std::array<const char*,4> names{"_lattice_ordered_history_stage_v1",raw_pages?detail::ordinary_target_raw_history_storage_recipe::page_name:"_lattice_ordered_history_page_v1","_lattice_ordered_history_receive_v1","_lattice_ordered_history_receive_key_v1"};
         const std::array<const char*,4> create{detail::ordinary_history_storage_recipe::stage,raw_pages?detail::ordinary_target_raw_history_storage_recipe::page:detail::ordinary_history_storage_recipe::page,detail::ordinary_history_storage_recipe::meta,detail::ordinary_history_storage_recipe::key};
         std::size_t at=0;for(std::size_t table=0;table<names.size();++table) {
@@ -99,6 +100,7 @@ struct database::target_staging_state::history_header_native {
             }
         }
         logical_bytes=retained;
+        terminal_static.constructor_returned();
     }
     void require(database& actual,bool unwind=false)const {
         const auto state=actual.target_staging_;
@@ -243,7 +245,7 @@ void database::require_target_catalog_ending_(const detail::ordinary_target_stag
 bool database::target_history_header_native_ending_()const noexcept {
     try {
         const auto state=target_staging_;const auto actual=state?state->history_header:nullptr;
-        if(!state||!state->current_creator()||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
+        if(!state||!state->current_creator()||state->terminal_native_statics_attempted||!actual||actual->shell!=this||!actual->scope||actual->ending||actual->first_failure||
            !actual->guard_registration_entered||!actual->guard_registration_returned||actual->first_guard_registration_rc!=SQLITE_OK||
            !actual->userdata||actual->guard_destroy_entered||actual->guard_destroy_returned||actual->completed_operations!=22||actual->guard_invocations!=2)
             return false;
@@ -286,7 +288,7 @@ bool database::target_history_raw_storage_(const detail::ordinary_target_staging
 }
 bool database::target_history_guard_destroyed_()const noexcept {
     const auto state=target_staging_;const auto actual=state?state->history_header:nullptr;
-    if(!state||!state->current_creator())return false;
+    if(!state||!state->current_creator()||state->terminal_native_statics_attempted)return false;
     if(!target_history_page_guard_destroyed_())return false;
     if(!actual)return true; // Native work is only after this exact field is retained.
     if(!actual->userdata)return !actual->guard_registration_entered;

@@ -41,6 +41,8 @@ template<typename... Values> class native_retirement_storage final {
     };
     std::unique_ptr<fields,native_deleter> fields_;
 public:
+    // Exact actual separate `new fields{}` request, without wrapper/control guesses.
+    static constexpr std::size_t allocation_bytes()noexcept{return sizeof(fields);}
     native_retirement_storage():fields_(nullptr,native_deleter{::getpid()}) {
         fields_.reset(new fields{});
     }

@@ -6,7 +6,6 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <limits>
-#include <set>
 #include <type_traits>
 
 namespace lattice::detail::canonical_range {
@@ -221,27 +220,61 @@ template<class Page> std::string page_hash(const Page& p){
 }
 template<class Page> void page_valid(const Page& p,const limits& b){page_shape(p,b);digest(p.digest);check(page_hash(p)==p.digest,"canonical page digest mismatch");}
 
-// Same safety pattern as v1, kept private so no v1 parser/ABI behavior changes.
+// Build the DOM in the same bounded SAX pass that admits its syntax. Container
+// values stay on this bounded stack until complete; no pointer into a growing
+// parent array survives a callback. V1 and the public framing API are unchanged.
 struct bounded_sax : nlohmann::json_sax<json> {
     const limits& budget;size_t nodes=0;
-    struct level{bool object;std::set<std::string> keys;};std::vector<level> stack;
+    struct level{json value;std::optional<std::string> key;};std::vector<level> stack;
+    json root;bool complete=false;
     explicit bounded_sax(const limits& b):budget(b){}
     bool node(){return ++nodes<=budget.nodes;}
-    bool null() override{return node();}bool boolean(bool) override{return node();}
-    bool number_integer(number_integer_t) override{return node();}bool number_unsigned(number_unsigned_t) override{return node();}
+    bool value_expected() const {
+        return stack.empty()?!complete:stack.back().value.is_array()||stack.back().key.has_value();
+    }
+    bool append(json value){
+        if(stack.empty()){
+            if(complete)return false;
+            root=std::move(value);complete=true;return true;
+        }
+        auto& parent=stack.back();
+        if(parent.value.is_array()){parent.value.push_back(std::move(value));return true;}
+        if(!parent.key)return false;
+        const auto inserted=parent.value.emplace(std::move(*parent.key),std::move(value));
+        parent.key.reset();return inserted.second;
+    }
+    bool null() override{return node()&&append(json(nullptr));}
+    bool boolean(bool value) override{return node()&&append(json(value));}
+    bool number_integer(number_integer_t value) override{return node()&&append(json(value));}
+    bool number_unsigned(number_unsigned_t value) override{return node()&&append(json(value));}
     bool number_float(number_float_t,const string_t&) override{return false;}
-    bool string(string_t& s) override{return s.size()<=budget.string_bytes&&node();}
+    bool string(string_t& s) override{return s.size()<=budget.string_bytes&&node()&&append(json(std::move(s)));}
     bool binary(binary_t&) override{return false;}
-    bool start(bool object){if(!node()||stack.size()>=budget.depth)return false;stack.push_back({object,{}});return true;}
+    bool start(bool object){
+        if(!value_expected()||!node()||stack.size()>=budget.depth)return false;
+        stack.push_back({object?json::object():json::array(),std::nullopt});return true;
+    }
     bool start_object(std::size_t) override{return start(true);}bool start_array(std::size_t) override{return start(false);}
-    bool key(string_t& s) override{return !stack.empty()&&stack.back().object&&s.size()<=budget.string_bytes&&node()&&stack.back().keys.insert(s).second;}
-    bool end_object() override{stack.pop_back();return true;}bool end_array() override{stack.pop_back();return true;}
+    bool key(string_t& s) override{
+        if(stack.empty()||!stack.back().value.is_object()||stack.back().key||s.size()>budget.string_bytes||!node())return false;
+        auto& parent=stack.back();
+        // Every earlier value is already inserted before its next sibling key.
+        // Compare decoded keys, including escaped aliases, in the actual DOM.
+        if(parent.value.contains(s))return false;
+        parent.key=std::move(s);return true;
+    }
+    bool end(bool object){
+        if(stack.empty()||stack.back().value.is_object()!=object||stack.back().key)return false;
+        auto value=std::move(stack.back().value);stack.pop_back();return append(std::move(value));
+    }
+    bool end_object() override{return end(true);}bool end_array() override{return end(false);}
     bool parse_error(std::size_t,const std::string&,const nlohmann::detail::exception&) override{return false;}
 };
 json parse(std::string_view raw,const limits& b,uint64_t cap){
     budgets(b);check(!raw.empty()&&raw.size()<=cap,"raw canonical frame exceeds budget");
-    const std::string owned(raw);bounded_sax sax(b);check(json::sax_parse(owned,&sax),"invalid or over-budget canonical JSON");
-    return json::parse(owned);
+    bounded_sax sax(b);
+    check(json::sax_parse(raw.begin(),raw.end(),&sax)&&sax.complete&&sax.stack.empty(),"invalid or over-budget canonical JSON");
+    return std::move(sax.root);
 }
 void keys(const json& j,std::initializer_list<const char*> fields){check(j.is_object()&&j.size()==fields.size(),"missing or unknown canonical field");for(const auto* k:fields)check(j.contains(k),"missing canonical field");}
 std::string text(const json& j){check(j.is_string(),"canonical string required");return j.get<std::string>();}
@@ -843,7 +876,17 @@ encoded_package assemble_package(const attempt& a,uint64_t route,const request& 
     m.counts.content_pages=content_pages.size();m.counts.receipt_pages=receipt_pages.size();
     check(add(add(content_pages.size(),receipt_pages.size()),2)<=policy.frames,"package total frames exceeded");
     m.rebase_digest=rebase_sha256(a,r,b);
-    m.content_digest=content_sha256(m,rows,b);m.receipt_digest=receipts_sha256(m,receipts,b);
+    {
+        // The complete initial content_shape/order/byte pass above
+        // admitted these SAME const rows under this exact effective b.
+        // Reuse only that local shape result; whole-stream state,
+        // ordering, totals and every payload byte are still hashed.
+        stream_hasher content(m,stream_kind::content,b);
+        check(rows.size()==m.counts.identities,"whole content count mismatch");
+        for(const auto& row:rows)content.append_validated(row);
+        m.content_digest=content.finish();
+    }
+    m.receipt_digest=receipts_sha256(m,receipts,b);
     m.manifest_digest=manifest_sha256(m,b);
     validated_sequence sequence(a,r,m,local);
     const auto retain=[&](frame value) {

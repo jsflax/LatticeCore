@@ -1,6 +1,6 @@
 #pragma once
 #include <lattice/sync.hpp>
-#include "vendor/picosha2/picosha2.h"
+#include "canonical_ready_sha256.hpp"
 #include <array>
 #include <bit>
 #include <algorithm>
@@ -15,10 +15,20 @@ inline uint8_t ordinary_export_scalar_tag(const column_value_t& value) {
     return 4;
 }
 class ordinary_export_fingerprint {
-    picosha2::hash256_one_by_one hash_;
+    ready_sha256_state hash_;
 public:
-    void number(uint64_t value){std::array<uint8_t,8> bytes{};for(unsigned i=0;i<8;++i)bytes[i]=static_cast<uint8_t>(value>>(56-8*i));hash_.process(bytes.begin(),bytes.end());}
-    template<class T> void bytes(const T& value){number(value.size());hash_.process(value.begin(),value.end());}
+    void number(uint64_t value) {
+        std::array<uint8_t,8> bytes{};
+        for(unsigned i=0;i<8;++i)bytes[i]=static_cast<uint8_t>(value>>(56-8*i));
+        hash_.process(std::string_view(reinterpret_cast<const char*>(bytes.data()),bytes.size()));
+    }
+    template<class T> void bytes(const T& value) {
+        // Existing producers supply strings, string views or byte vectors.
+        // Consume the borrowed range synchronously; only a partial block is copied.
+        static_assert(sizeof(*value.data())==1);
+        number(value.size());
+        if(!value.empty())hash_.process(std::string_view(reinterpret_cast<const char*>(value.data()),value.size()));
+    }
     void scalar(const column_value_t& value) {
         number(ordinary_export_scalar_tag(value));
         if(const auto* p=std::get_if<int64_t>(&value))number(static_cast<uint64_t>(*p));
@@ -44,7 +54,7 @@ public:
             bytes(identity.digest);
         }
     }
-    std::string finish(){hash_.finish();return picosha2::get_hash_hex_string(hash_);}
+    std::string finish(){return picosha2::bytes_to_hex_string(hash_.digest_bytes());}
 };
 inline std::string ordinary_history_storage_seal(const char* domain,const std::vector<column_value_t>& row,std::size_t count) {
     ordinary_export_fingerprint seal;seal.bytes(std::string_view(domain));seal.number(count);

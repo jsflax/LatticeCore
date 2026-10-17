@@ -883,3 +883,49 @@ TEST_F(Vec0Test, ConcurrentUpsertSameRow_NoUniqueThrow) {
     EXPECT_EQ(std::get<int64_t>(cnt[0].at("c")), 1)
         << "exactly one index row must survive the race";
 }
+
+
+TEST_F(Vec0Test, IvfOwnedLookupsEndBeforeTheNextCallerOperation) {
+    lattice::lattice_db db;
+    createVectorTable(db);
+    for (int i = 0; i < 32; ++i)
+        insertDoc(db, "seed-" + std::to_string(i), "seed", {float(i), 1.0f, 2.0f});
+    ASSERT_TRUE(db.train_vec0("VectorDoc", "embedding"));
+    const auto trained = db.db().query(
+        "SELECT value FROM _VectorDoc_embedding_vec_info WHERE key = 'ivf_trained_0'");
+    ASSERT_EQ(trained.size(), 1u);
+    ASSERT_EQ(std::get<int64_t>(trained[0].at("value")), 1);
+    // Diagnostic raw access is no admission grant. Observe actual VM state;
+    // never guess ownership from SQL or prune/finalize a retained statement.
+    auto* native = db.db().handle();
+    auto expect_no_busy_original = [&] {
+        for (auto* statement = sqlite3_next_stmt(native, nullptr); statement;
+             statement = sqlite3_next_stmt(native, statement))
+            EXPECT_FALSE(sqlite3_stmt_busy(statement)) << sqlite3_sql(statement);
+    };
+    expect_no_busy_original();
+    db.begin_transaction();
+    for (int i = 0; i < 50; ++i) {
+        insertDoc(db, "next-" + std::to_string(i), "after training", {float(i), 3.0f, 4.0f});
+        expect_no_busy_original();
+        ASSERT_TRUE(db.db().is_in_transaction());
+    }
+    db.commit();
+    ASSERT_FALSE(db.db().is_in_transaction());
+    const auto total = db.db().query("SELECT COUNT(*) AS n FROM VectorDoc");
+    ASSERT_EQ(std::get<int64_t>(total[0].at("n")), 82);
+    const auto expected = pack_floats({49.0f, 3.0f, 4.0f});
+    const auto point = db.db().query(
+        "SELECT embedding FROM _VectorDoc_embedding_vec WHERE global_id = ?", {std::string("next-49")});
+    ASSERT_EQ(point.size(), 1u);
+    EXPECT_EQ(std::get<std::vector<uint8_t>>(point[0].at("embedding")), expected);
+    expect_no_busy_original();
+    db.begin_transaction();
+    db.db().execute("DELETE FROM VectorDoc WHERE globalId = ?", {std::string("next-49")});
+    expect_no_busy_original();
+    db.commit();
+    EXPECT_FALSE(db.db().is_in_transaction());
+    const auto remaining = db.db().query("SELECT COUNT(*) AS n FROM _VectorDoc_embedding_vec");
+    EXPECT_EQ(std::get<int64_t>(remaining[0].at("n")), 81);
+    expect_no_busy_original();
+}

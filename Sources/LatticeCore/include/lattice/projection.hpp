@@ -48,6 +48,8 @@ class projection_store_ticket {
 public:
     projection_store_ticket() = default;
     projection_status publish(uint64_t operation_id, const std::shared_ptr<database_read_control>& control) const;
+    // Same registry/ID issuer for an actual original-reader operation.
+    projection_status publish_unique(const std::shared_ptr<database_read_control>& control) const;
     void release() noexcept;
 private:
     friend projection_store_ticket capture_projection_stores(const std::vector<std::shared_ptr<const physical_store_identity>>&);

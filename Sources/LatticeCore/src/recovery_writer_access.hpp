@@ -8,7 +8,7 @@ namespace lattice::detail {
 enum class recovery_install_state { refused, rolled_back, committed, unsettled, ownership_lost };
 // Internal controller/automatic-export no-effect outcome. Never a transaction
 // settlement and is never set after notification reservation or BEGIN.
-enum class recovery_install_deferred { none, connection_mutex, engine_read, store_gate };
+enum class recovery_install_deferred { none, connection_mutex, engine_read, store_gate, core_write };
 struct recovery_install_result {
     recovery_install_deferred deferred = recovery_install_deferred::none;
     recovery_install_state state = recovery_install_state::refused;
@@ -56,6 +56,46 @@ extern thread_local void (*after_write_admission)();
 // private install frame below. It never creates ownership from autocommit=false.
 // Its returned pointer is valid only within the caller's admitted transaction.
 struct recovery_writer_access {
+    // One controller's real no-effect retry episode. This is denial-only;
+    // it holds no transaction, source grant, ticket or store-write gate.
+    class controller_admission_intent {
+        // Only fixed cell metadata/strong-pointer moves occur under this leaf;
+        // never SQL, callbacks, another mutex acquisition or final destruction.
+        std::mutex mutex_;
+        std::shared_ptr<database> writer_;
+        database::topology_wait_scope waiting_;
+    public:
+        class turn {
+            controller_admission_intent& value_;
+            turn* previous_;
+            std::unique_lock<std::mutex> capture_;
+            const std::shared_ptr<database> writer_;
+            database::topology_wait_scope::bypass bypass_;
+            static thread_local turn* current_;
+            friend class controller_admission_intent;
+        public:
+            explicit turn(controller_admission_intent& value) : value_(value),previous_(current_),capture_(value.mutex_),
+                writer_(value.writer_),bypass_(value.waiting_) { capture_.unlock();current_=this; }
+            ~turn() noexcept { current_=previous_; }
+            turn(const turn&)=delete;turn& operator=(const turn&)=delete;
+        };
+        struct retired_custody {
+            std::shared_ptr<database> writer;
+            std::shared_ptr<database_retirement_state> retirement;
+            void reset() noexcept { retirement.reset();writer.reset(); } // caller is off leaf
+        };
+        void begin(const std::shared_ptr<lattice_db>&,std::chrono::steady_clock::time_point);
+        // Metadata-only retirement may run under the coordinator leaf. Move
+        // strong custody out; its caller destroys that returned owner off leaf.
+        retired_custody retire() noexcept {
+            std::lock_guard lock(mutex_);waiting_.release();
+            return {std::move(writer_),waiting_.take_retired_original()};
+        }
+        void release() noexcept { auto retired=retire(); }
+        controller_admission_intent()=default;
+        controller_admission_intent(const controller_admission_intent&)=delete;
+        controller_admission_intent& operator=(const controller_admission_intent&)=delete;
+    };
     static database* active_writer(lattice_db& owner);
     // Internal engine SQL only: borrow the exact already-owned writer without
     // registering the public raw-handle escape. No ownership is synthesized.

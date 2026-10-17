@@ -9,7 +9,61 @@ std::uint64_t history_creator() noexcept {
 #endif
 }
 }
+// Optional per-reservation DATA. No callback, owner, payload, registry or
+// permission is retained; an observer can outlive the Native tail harmlessly.
+struct ordinary_history_refund_cell {
+    const std::uint64_t creator;
+    explicit ordinary_history_refund_cell(std::uint64_t original_creator):creator(original_creator){}
+    std::atomic<ordinary_history_refund_status> phase{ordinary_history_refund_status::held};
+};
+static_assert(sizeof(ordinary_history_refund_cell)<=64);
+ordinary_history_refund_status ordinary_history_refund_observation::status()const noexcept {
+    if(!cell_)return ordinary_history_refund_status::unavailable;
+    if(cell_->creator!=history_creator())return ordinary_history_refund_status::inherited;
+    return cell_->phase.load(std::memory_order_acquire);
+}
+namespace {
+using history_refund_cell=std::shared_ptr<ordinary_history_refund_cell>;
+history_refund_cell history_refund_load(const history_refund_cell& source)noexcept {
+    return std::atomic_load_explicit(&source,std::memory_order_acquire);
+}
+history_refund_cell history_refund_observe(history_refund_cell& source,std::uint64_t original_creator) {
+    if(original_creator!=history_creator())throw db_error("inherited history refund observation");
+    auto observed=history_refund_load(source);
+    if(observed&&observed->creator!=original_creator)throw db_error("history refund observation creator differs");
+    if(!observed){
+        // Explicit observer allocation only, outside every Native ownership
+        // leaf. A losing candidate contains DATA only and issues no authority.
+        auto candidate=std::make_shared<ordinary_history_refund_cell>(original_creator);
+        // A process allocator can cross a fork. Never publish into inherited
+        // Native storage or bind the cell to the allocator continuation PID.
+        if(original_creator!=history_creator())throw db_error("history refund allocation crossed creator");
+        if(std::atomic_compare_exchange_strong_explicit(&source,&observed,candidate,
+            std::memory_order_acq_rel,std::memory_order_acquire))observed=std::move(candidate);
+    }
+    if(original_creator!=history_creator())throw db_error("history refund publication crossed creator");
+    return observed;
+}
+void history_refund_quarantine(const history_refund_cell& observed)noexcept {
+    if(!observed||observed->creator!=history_creator())return;
+    auto expected=ordinary_history_refund_status::held;
+    (void)observed->phase.compare_exchange_strong(expected,ordinary_history_refund_status::quarantined,
+        std::memory_order_release,std::memory_order_relaxed);
+}
+void history_refund_returned(const history_refund_cell& observed)noexcept {
+    if(!observed||observed->creator!=history_creator())return;
+    // A contradictory/quarantined outcome never becomes success. Only the
+    // actual original reservation's returned destructor reaches this helper.
+    auto expected=ordinary_history_refund_status::held;
+    (void)observed->phase.compare_exchange_strong(expected,ordinary_history_refund_status::refunded,
+        std::memory_order_release,std::memory_order_relaxed);
+}
+}
+
+namespace { history_refund_cell history_refund_for_cut(const ordinary_history_export_state&)noexcept; }
 struct ordinary_mounted_history_source_state {
+    // Nil unless a source-private test explicitly observes this SAME slot.
+    history_refund_cell refund_observation;
     // Optional makes callback-capable release explicit, last and off-leaf.
     std::optional<ordinary_resource_reservation<false>> reservation;
     std::shared_ptr<lattice_db> owner;
@@ -27,15 +81,19 @@ struct ordinary_mounted_history_source_state {
         :reservation(std::move(charge)),owner(std::move(held)),limits(policy),mounted(std::move(roots)){}
     static void dispose(ordinary_mounted_history_source_state* value)noexcept {
         if(!value||value->creator!=history_creator())return; // Reuse the inherited record as quarantine.
+        auto observed=std::move(value->refund_observation); // Strong-zero: no observer factory can still access this state.
         value->owner.reset();if(value->creator!=history_creator())return;
         std::vector<std::string>{}.swap(value->mounted);std::string{}.swap(value->scope);std::string{}.swap(value->schema);std::string{}.swap(value->device);std::string{}.swap(value->inode);
         value->reservation.reset();if(value->creator!=history_creator())return;
         delete value;
+        history_refund_returned(observed); // Actual common reservation reset AND storage destruction returned.
     }
 };
 // Preallocated final custody uses one real quota/registration; raw marker clears
 // only after all admitted factory/deleter tails and native closes are proved.
 struct ordinary_history_destruction_tail {
+    // Standalone reservations move this exact DATA cell with their real tail.
+    history_refund_cell refund_observation;
     const std::uint64_t creator=history_creator();
     std::optional<ordinary_resource_reservation<false>> reservation;
     std::shared_ptr<ordinary_mounted_history_source_state> mounted;
@@ -44,6 +102,7 @@ struct ordinary_history_destruction_tail {
     static void finish(void* raw)noexcept {
         auto* value=static_cast<ordinary_history_destruction_tail*>(raw);
         if(!value||value->creator!=history_creator())return;
+        auto observed=std::move(value->refund_observation);
         value->reservation.reset();if(value->creator!=history_creator())return;
         auto mounted=std::move(value->mounted);const auto creator=value->creator;
         const auto construction=value->construction;const auto cut=value->cut;
@@ -53,8 +112,8 @@ struct ordinary_history_destruction_tail {
             {std::lock_guard lock(mounted->leaf);
                 if(construction&&mounted->retained_construction==construction)mounted->retained_construction=nullptr;
                 if(cut&&mounted->retained_cut==cut)mounted->retained_cut=nullptr;}
-            mounted.reset(); // No later inherited work after arbitrary registration release.
-        }
+            mounted.reset(); // Registration alone publishes its common refund, not this cut.
+        } else history_refund_returned(observed); // Exact standalone reset + tail storage destruction returned.
     }
     static void dispose(ordinary_history_destruction_tail* value)noexcept {finish(value);}
 };
@@ -103,6 +162,8 @@ history_construction_custody history_retain_construction(std::optional<ordinary_
     return result;
 }
 struct ordinary_history_export_state {
+    // Mounted cuts use mounted->refund_observation; never a second allowance.
+    history_refund_cell refund_observation;
     std::optional<ordinary_resource_reservation<false>> reservation;
     std::shared_ptr<ordinary_mounted_history_source_state> mounted;
 
@@ -130,17 +191,18 @@ struct ordinary_history_export_state {
         if(!value||value->creator!=history_creator())return;
         // A strong-zero/expired weak pointer is not child/native destruction.
         // Keep the actual state + same charge on any unproved native close.
-        if(!value->child_connections)return; // Missing real constructor witnesses are not a closed child.
+        const auto observed=history_refund_for_cut(*value);
+        if(!value->child_connections){history_refund_quarantine(observed);return;} // Missing real witnesses never refund.
         // Seal before close: deny new factories, while already admitted native
         // operations retain their exact entry through actual later destruction.
-        if(!value->child_connections->seal_fixed_scope())return;
+        if(!value->child_connections->seal_fixed_scope()){history_refund_quarantine(observed);return;}
         auto closed=value->owner->close_checked();
         // Moves leave the stack report empty even if a callback forked; no
         // last exception target is automatically released in the child.
         value->disposal_error=std::move(closed.error);
         value->disposal_cleanup_error=std::move(closed.cleanup_error);
         if(value->creator!=history_creator())return;
-        if(!closed.cleanup_complete||value->disposal_cleanup_error)return;
+        if(!closed.cleanup_complete||value->disposal_cleanup_error){history_refund_quarantine(observed);return;}
         value->owner.reset();if(value->creator!=history_creator())return;
         // Pending off-list natives keep the preallocated SAME tail, then reclaim on their genuine last-deleter return.
         // Clear any callback-capable witness/exception targets separately, and
@@ -151,6 +213,7 @@ struct ordinary_history_export_state {
         auto* tail=value->destruction_tail;
         tail->mounted=std::move(value->mounted);
         if(value->reservation){tail->reservation.emplace(std::move(*value->reservation));value->reservation.reset();}
+        tail->refund_observation=std::move(value->refund_observation);
         tail->cut=value;
         // Child logical cleanup returned, but actual off-list wrappers may
         // remain live. All cut metadata/object storage dies before handoff.
@@ -160,6 +223,44 @@ struct ordinary_history_export_state {
     }
 
 };
+
+namespace {
+history_refund_cell history_refund_for_cut(const ordinary_history_export_state& original)noexcept {
+    return original.mounted?history_refund_load(original.mounted->refund_observation):history_refund_load(original.refund_observation);
+}
+}
+ordinary_history_refund_observation ordinary_export_access::observe_history_refund(const ordinary_history_export& original) {
+    const auto state=original.state_; // Actual strong owner fences observation attachment against disposal.
+    if(!state||state->creator!=history_creator())throw db_error("history refund observation lacks creator-owned cut");
+    auto observed=state->mounted?history_refund_observe(state->mounted->refund_observation,state->creator):history_refund_observe(state->refund_observation,state->creator);
+    return ordinary_history_refund_observation(std::move(observed));
+}
+ordinary_history_refund_observation ordinary_export_access::observe_history_refund(const ordinary_mounted_history_source& original) {
+    const auto state=original.state_;
+    if(!state||state->creator!=history_creator())throw db_error("history refund observation lacks creator-owned registration");
+    return ordinary_history_refund_observation(history_refund_observe(state->refund_observation,state->creator));
+}
+bool ordinary_export_access::history_has_refund_observation(const ordinary_history_export& original)noexcept {
+    const auto state=original.state_;
+    return state&&state->creator==history_creator()&&bool(history_refund_for_cut(*state));
+}
+lattice_close_result ordinary_export_access::close_history_child_for_test(const ordinary_history_export& original) {
+    const auto state=original.state_;
+    if(!state||state->creator!=history_creator()||!state->owner)throw db_error("actual history test child unavailable");
+    return state->owner->close_checked();
+}
+std::shared_ptr<database> ordinary_export_access::history_child_xproc_for_test(const ordinary_history_export& original) {
+    const auto state=original.state_;
+    if(!state||state->creator!=history_creator()||!state->owner)throw db_error("actual history test child unavailable");
+    return state->owner->borrow_xproc_read_connection();
+}
+catalog_stream_operation ordinary_export_access::history_child_catalog_for_test(const ordinary_history_export& original,
+    const std::string& request,int64_t budget) {
+    const auto state=original.state_;
+    if(!state||state->creator!=history_creator()||!state->owner)throw db_error("actual history test child unavailable");
+    return make_catalog_stream_operation(state->owner,request,budget);
+}
+
 struct ordinary_history_page_state {
     // Real immutable cut ownership survives page bytes on every final thread.
     std::shared_ptr<ordinary_history_export_state> owner;
@@ -206,7 +307,7 @@ std::shared_ptr<ordinary_history_export_state> history_owned_state(
     std::optional<ordinary_history_prior_source_observation> prior=std::nullopt,std::string mounted_relation={}){
     // Bound the SUM of native registration + current-cut retention, rather
     // than giving each owner a separate eight-MiB allowance on one slot.
-    size_t bytes=history_capacity_retained_payload+sizeof(ordinary_history_export_state)+sizeof(ordinary_history_destruction_tail)+sizeof(ordinary_history_page_state)+sizeof(ordinary_history_construction_tail)+sizeof(ordinary_history_child_connections)+database_open_ledger::maximum_opens*(sizeof(database_retirement_state)+1024)+record.header.size()+record.identity.stage.size()+record.identity.source.size()+record.identity.scope.size()+record.identity.schema.size()+record.identity.device.size()+record.identity.inode.size()+record.content_digest.size()+record.seal.size()+4096;
+    size_t bytes=history_capacity_retained_payload+sizeof(ordinary_history_refund_cell)+sizeof(ordinary_history_export_state)+sizeof(ordinary_history_destruction_tail)+sizeof(ordinary_history_page_state)+sizeof(ordinary_history_construction_tail)+sizeof(ordinary_history_child_connections)+database_open_ledger::maximum_opens*(sizeof(database_retirement_state)+1024)+record.header.size()+record.identity.stage.size()+record.identity.source.size()+record.identity.scope.size()+record.identity.schema.size()+record.identity.device.size()+record.identity.inode.size()+record.content_digest.size()+record.seal.size()+4096;
     if(prior)bytes+=prior->scope.size()+prior->source.size()+prior->schema_digest.size()+sizeof(*prior);
     if(mounted_relation.size()>262144)refuse("mounted relation retained byte bound");bytes+=mounted_relation.capacity();
     if(mounted){bytes+=history_capacity_retained_payload+sizeof(*mounted)+mounted->scope.size()+mounted->schema.size()+mounted->device.size()+mounted->inode.size()+mounted->mounted.size()*sizeof(std::string);for(const auto& name:mounted->mounted)bytes+=name.size();}

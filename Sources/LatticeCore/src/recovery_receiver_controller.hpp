@@ -7,7 +7,9 @@
 
 namespace lattice::detail {
 class recovery_receiver_route;
+class recovery_controller_executor;
 class committed_export_frame;
+class controller_worker_original;
 
 // One instance per actual continuous physical session. Construction and route
 // registration belong to retained producer admission; neither an application
@@ -18,18 +20,35 @@ class recovery_receiver_controller final : public std::enable_shared_from_this<r
     friend class recovery_unknown_reconciliation;
     friend struct recovery_reconciliation_reservation;
     friend struct recovery_receiver_controller_test_access;
+    friend struct controller_fixture_worker_selection;
     // Restriction/observation only; captured before a real route is published.
     // The fixture peer cannot construct controllers, grants or source views.
     struct test_probe {
         const lattice_db* owner=nullptr;
         std::function<std::shared_ptr<void>(const char*)> scope;
         std::function<void(const char*)> observed;
+        // Optional passive DATA only; production and old fault probes leave null.
+        std::function<void(const char*)> admission_observed;
+        // Passive completion of the existing physical-phase owned unit only.
+        // This never requests a yield, grants admission, or changes a deadline.
+        std::function<void()> phase_committed;
+        // Passive DATA capture after validated phase4 owned COMMIT, before the
+        // candidate descriptor is visible to any actual restricted route.
+        std::function<void()> reconciliation_prepublication;
+        // Passive copied DATA only: actual next request deferred until all
+        // retained request/reply bytes have ended. No admission or wake grant.
+        std::function<void()> response_capacity_wait;
     };
     static std::mutex test_mutex_;
     static std::shared_ptr<const test_probe> test_probe_;
+    // Separate fixture ending observation; fault-probe replacement cannot erase it.
+    using worker_observer=std::function<void(const recovery_controller_executor&)>;
+    static std::shared_ptr<const worker_observer> test_worker_observer_;
     struct state;
     std::unique_ptr<state> state_;
-    explicit recovery_receiver_controller(const recovery_continuous_policy&);
+    explicit recovery_receiver_controller(const recovery_continuous_policy&,
+        const std::shared_ptr<controller_worker_original>&);
+    void retire_for_deletion();
     static canonical_scoped_limits limits(const recovery_continuous_policy&);
     static void initialize_owned(std::shared_ptr<lattice_db>,const recovery_continuous_policy&);
     static void validate_reopen_owned(std::shared_ptr<lattice_db>,const recovery_continuous_policy&,int64_t phase,int64_t barrier,int64_t attempt);
@@ -38,7 +57,9 @@ class recovery_receiver_controller final : public std::enable_shared_from_this<r
         const std::shared_ptr<scheduler>&,const std::shared_ptr<sync_callback_lifetime>&);
     void wake(const std::shared_ptr<recovery_receiver_route>&);
     void turn();
-    void dropped_turn()noexcept;
+    void dropped_turn(const void* scheduled_token)noexcept;
+    void arm_admission_retry(int64_t);
+    void scheduling_failed(std::exception_ptr)noexcept;
     void retire(recovery_receiver_route*)noexcept;
     static bool reconciliation_route_current(const std::shared_ptr<const recovery_reconciliation_descriptor>&,
         const std::shared_ptr<recovery_continuous_route>&,const std::shared_ptr<lattice_db>&,uint64_t);
@@ -73,9 +94,17 @@ class recovery_receiver_route final : public std::enable_shared_from_this<recove
     std::shared_ptr<state> state_;
     std::shared_ptr<recovery_receiver_controller> controller_;
     recovery_receiver_route(std::shared_ptr<recovery_receiver_controller>,std::shared_ptr<state>);
+    enum class notification : unsigned { resumed=1,renew=2,reconcile=4,error=8 };
+    void post(notification,std::exception_ptr = {});
+    void drain_notifications();
     void wake();
     void request();
-    void notifications(std::function<void()>,std::function<void()>,std::function<void(std::exception_ptr)>,std::function<void()> reconciliation={});
+    // A delivery ACK is not a new external recovery request. A current phase4
+    // pass retains its exact handoff cursor until real refreeze publication.
+    void legacy_delivery_acknowledged();
+    void request_impl(const std::weak_ptr<recovery_receiver_route>*,
+                      const std::weak_ptr<recovery_receiver_controller>*);
+    void notifications(std::function<void()>,std::function<void()>,std::function<void(const std::exception_ptr&)>,std::function<void()> reconciliation={},std::function<void()> wake_notifications={});
     bool receive(const platform_transport_callbacks&,uint64_t,const transport_message&);
     bool blocks_ordinary()const noexcept;
     bool creator_current()const noexcept;

@@ -148,4 +148,17 @@ TEST_F(ObserverCursorRegression, AuditDisabledCommitPreservesRollbackCursorRecov
         << "a blanket monotonic cursor CAS would prevent this existing recovery";
 }
 
+// A rollback must not require a later local commit to repair its xproc cursor.
+TEST_F(ObserverCursorRegression, RollbackWithoutLocalSuccessorDoesNotHideExternalReusedAuditID) {
+    ASSERT_NO_FATAL_FAILURE(rollback_three());
+    ASSERT_NO_FATAL_FAILURE(external_insert());
+    ASSERT_EQ(audit_max(owner->db()), 6)
+        << "the independent real writer reused the rolled-back audit ID";
+    owner->handle_cross_process_notification();
+    EXPECT_EQ(inserts, (std::vector<int64_t>{6}))
+        << "the actual external audit must be delivered without an intervening local commit";
+    owner->handle_cross_process_notification();
+    EXPECT_EQ(inserts, (std::vector<int64_t>{6})) << "the same committed audit delivers once";
+}
+
 } // namespace

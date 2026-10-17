@@ -77,6 +77,7 @@ class ordinary_unpublished_group_target final {
     friend class ordinary_target_staging_io;
     friend class ordinary_managed_child_admission;
     friend class ordinary_export_access;
+    mutable ordinary_target_scope_root_tail terminal_receiving_tail_{this,9}; // First: actual role members end first.
     const std::shared_ptr<const ordinary_managed_child_admission> admission_;
     const std::size_t slot_;
     mutable std::atomic<bool> claimed_{false};
@@ -103,7 +104,7 @@ class ordinary_unpublished_group_target final {
     };
     bool claim_staging_abandonment(const ordinary_target_staging_connection*,abandonment_binding&)const noexcept;
     ordinary_unpublished_group_target(std::shared_ptr<const ordinary_managed_child_admission> owner,std::size_t slot)
-        :admission_(std::move(owner)),slot_(slot){}
+        :admission_(std::move(owner)),slot_(slot){terminal_receiving_tail_.construction_returned_=true;}
     void require_staging_original(ordinary_launch::deadline)const;
     std::string staging_main_path(ordinary_launch::deadline)const;
     void bind_staging_connection(const std::shared_ptr<ordinary_target_staging_connection>&,

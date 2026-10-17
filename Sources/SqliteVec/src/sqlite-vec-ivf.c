@@ -338,41 +338,31 @@ static int ivf_cell_create(vec0_vtab *p, int col_idx, i64 centroid_id,
 static int ivf_cell_find_or_create(vec0_vtab *p, int col_idx, i64 centroid_id,
                                      i64 *out_cell_id, int *out_n) {
   int rc;
-  // Find existing cell with space
-  rc = ivf_ensure_stmt(p, &p->stmtIvfCellMeta[col_idx],
-      "SELECT rowid, n_vectors FROM " VEC0_SHADOW_IVF_CELLS_NAME
-      " WHERE centroid_id = ? AND n_vectors < %d LIMIT 1",
-      col_idx);
-  // The %d in the format won't work with ivf_ensure_stmt since it only has 3
-  // format args. Use a direct approach instead.
-  sqlite3_finalize(p->stmtIvfCellMeta[col_idx]);
-  p->stmtIvfCellMeta[col_idx] = NULL;
-
-  char *zSql = sqlite3_mprintf(
-      "SELECT rowid, n_vectors FROM " VEC0_SHADOW_IVF_CELLS_NAME
-      " WHERE centroid_id = ? AND n_vectors < %d LIMIT 1",
-      p->schemaName, p->tableName, col_idx, VEC0_IVF_CELL_MAX_VECTORS);
-  if (!zSql) return SQLITE_NOMEM;
-  // Cache this manually
+  // This owned cache needs all four format arguments, including capacity.
   if (!p->stmtIvfCellMeta[col_idx]) {
+    char *zSql = sqlite3_mprintf(
+        "SELECT rowid, n_vectors FROM " VEC0_SHADOW_IVF_CELLS_NAME
+        " WHERE centroid_id = ? AND n_vectors < %d LIMIT 1",
+        p->schemaName, p->tableName, col_idx, VEC0_IVF_CELL_MAX_VECTORS);
+    if (!zSql) return SQLITE_NOMEM;
     rc = sqlite3_prepare_v2(p->db, zSql, -1, &p->stmtIvfCellMeta[col_idx], NULL);
     sqlite3_free(zSql);
     if (rc != SQLITE_OK) return rc;
-  } else {
-    sqlite3_free(zSql);
   }
-
   sqlite3_stmt *stmt = p->stmtIvfCellMeta[col_idx];
   sqlite3_reset(stmt);
   sqlite3_bind_int64(stmt, 1, centroid_id);
-
-  if (sqlite3_step(stmt) == SQLITE_ROW) {
+  const int stepped = sqlite3_step(stmt);
+  if (stepped == SQLITE_ROW) {
     *out_cell_id = sqlite3_column_int64(stmt, 0);
     *out_n = sqlite3_column_int(stmt, 1);
-    return SQLITE_OK;
   }
-
-  // No cell with space — create new one
+  // Copy scalars, then end this exact module-owned lookup before xUpdate
+  // returns. Keeping the prepared cache does not require keeping a busy VM.
+  const int reset = sqlite3_reset(stmt);
+  if (stepped != SQLITE_ROW && stepped != SQLITE_DONE) return stepped;
+  if (reset != SQLITE_OK) return reset;
+  if (stepped == SQLITE_ROW) return SQLITE_OK;
   rc = ivf_cell_create(p, col_idx, centroid_id, out_cell_id);
   *out_n = 0;
   return rc;
@@ -605,10 +595,14 @@ static int ivf_delete(vec0_vtab *p, int col_idx, i64 rowid) {
   sqlite3_stmt *s = p->stmtIvfRowidMapLookup[col_idx];
   sqlite3_reset(s);
   sqlite3_bind_int64(s, 1, rowid);
-  if (sqlite3_step(s) == SQLITE_ROW) {
+  const int stepped = sqlite3_step(s);
+  if (stepped == SQLITE_ROW) {
     cell_id = sqlite3_column_int64(s, 0);
     slot = sqlite3_column_int(s, 1);
   }
+  const int reset = sqlite3_reset(s);
+  if (stepped != SQLITE_ROW && stepped != SQLITE_DONE) return stepped;
+  if (reset != SQLITE_OK) return reset;
   if (slot < 0) return SQLITE_OK;
 
   // Clear validity bit
@@ -684,9 +678,15 @@ static int ivf_get_vector_data(vec0_vtab *p, i64 rowid, int col_idx,
   sqlite3_stmt *s = p->stmtIvfRowidMapLookup[col_idx];
   sqlite3_reset(s);
   sqlite3_bind_int64(s, 1, rowid);
-  if (sqlite3_step(s) != SQLITE_ROW) return SQLITE_EMPTY;
-  cell_id = sqlite3_column_int64(s, 0);
-  slot = sqlite3_column_int(s, 1);
+  const int stepped = sqlite3_step(s);
+  if (stepped == SQLITE_ROW) {
+    cell_id = sqlite3_column_int64(s, 0);
+    slot = sqlite3_column_int(s, 1);
+  }
+  const int reset = sqlite3_reset(s);
+  if (stepped != SQLITE_ROW && stepped != SQLITE_DONE) return stepped;
+  if (reset != SQLITE_OK) return reset;
+  if (stepped == SQLITE_DONE) return SQLITE_EMPTY;
 
   void *buf = sqlite3_malloc(vecSize);
   if (!buf) return SQLITE_NOMEM;

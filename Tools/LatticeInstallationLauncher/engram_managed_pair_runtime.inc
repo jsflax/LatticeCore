@@ -70,6 +70,7 @@ int retained_engram_upgrade_session::run_managed_cohort_recovery(deadline end) {
             [owner](deadline until){owner->verify_retired(until);});
         return owner->namespace_transition->retain_after_managed_runtime(runtime_retired,old,end);
     }();
+    retired.drain_oversized_wals(end);
     const auto observed = retired.before_launch(end);
     fd generation(retired.duplicate_before_launch(end));
     const int control = owner->open_directory(owner->stage, "namespace", true, end);

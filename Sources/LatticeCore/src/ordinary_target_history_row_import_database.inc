@@ -5,6 +5,7 @@
 #include "ordinary_target_raw_history_storage_recipe.hpp"
 namespace lattice {
 struct database::target_staging_state::row_import_native {
+    terminal_native_outer_tail terminal_outer; // First: follows ALL actual outer member destruction.
     using arguments=std::vector<column_value_t>;
     using program_type=detail::ordinary_group_target_schema_original::row_import_program;
     struct phase;
@@ -21,11 +22,12 @@ struct database::target_staging_state::row_import_native {
     bool completed=false;
     std::exception_ptr first_failure;
     row_import_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
-        const std::shared_ptr<program_type>& input):shell(&actual),owner(receiving),
+        const std::shared_ptr<program_type>& input):terminal_outer(actual,receiving,this,1),shell(&actual),owner(receiving),
         schema(receiving->require_header_schema(*actual.target_staging_->connection.lock())),program(input),
         raw_storage(actual.target_staging_->history_chain->raw_storage),
         final_stage(actual.target_staging_->history_chain->final_stage),final_meta(actual.target_staging_->history_chain->final_meta) {
         bytes=receiving->require_header_original(*actual.target_staging_->connection.lock()).header.size();
+        terminal_outer.constructor_returned(); // Actual final constructor operation.
     }
 };
 struct database::target_staging_state::row_import_native::phase {

@@ -96,7 +96,10 @@ void ordinary_history_stage_writer::append(std::string_view page,std::string_vie
         // budget is intentionally not a cumulative whole-history charge.
         budget scratch{history_stage_limits};scratch.add(3*page.size()+1024);
         values row{s.identity.stage,static_cast<int64_t>(s.totals.pages),std::string(previous),std::string(digest),std::vector<uint8_t>(page.begin(),page.end()),static_cast<int64_t>(rows),static_cast<int64_t>(known),static_cast<int64_t>(unknown)};
-        row.emplace_back(history_seal("ordinary-paged-page-v1",row,8));register_mutation_guard(ordinary_export_storage_access::borrow(s.writer));mutation_scope permit(ordinary_export_storage_access::borrow(s.writer));
+        row.emplace_back(history_seal("ordinary-paged-page-v1",row,8));
+        // The private constructor installed this SAME connection's guard before
+        // streaming. Re-registering it while the source cursor is on ROW fails.
+        mutation_scope permit(ordinary_export_storage_access::borrow(s.writer));
         s.writer.execute("INSERT INTO main._lattice_ordered_history_page_v1 VALUES(?,?,?,?,?,?,?,?,?)",row);
         const auto actual=read(ordinary_export_storage_access::borrow(s.writer),"SELECT stage,page,previous,digest,payload,rows,known,unknown,seal FROM main._lattice_ordered_history_page_v1 WHERE stage=? AND page=?",{s.identity.stage,static_cast<int64_t>(s.totals.pages)},1,scratch);
         if(s.writer.changes()!=1||actual.size()!=1||actual[0]!=row)refuse("paged history page postimage differs");

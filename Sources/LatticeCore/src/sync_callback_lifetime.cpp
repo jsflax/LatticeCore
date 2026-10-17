@@ -4,20 +4,36 @@
 #include <limits>
 
 namespace lattice::detail {
+#ifndef __EMSCRIPTEN__
+namespace { const uint64_t retirement_lane_creator = database_native_process(); }
+#endif
 namespace sync_background_test_hooks {thread_local std::shared_ptr<const ack_schedule> ack;}
 
 struct sync_callback_lifetime::execution {
-    sync_callback_lifetime& cell;uint64_t generation;execution* prior;
-    std::shared_ptr<lattice_db> database;
-    execution(sync_callback_lifetime& c,uint64_t g,std::shared_ptr<lattice_db> db):cell(c),generation(g),prior(current_),database(std::move(db)){current_=this;}
+    // Allocate this Native-bearing custody before incrementing active_. The
+    // automatic execution frame itself owns only process DATA and a raw link,
+    // so a callback that forks cannot unwind the inherited owner in its child.
+    struct references {std::shared_ptr<lattice_db> database;};
+    sync_callback_lifetime& cell;const uint64_t creator,generation;execution* prior;
+    references* retained;
+    execution(sync_callback_lifetime& c,uint64_t g,references* db)noexcept
+        :cell(c),creator(c.creator_),generation(g),prior(current_),retained(db){current_=this;}
     ~execution(){
-        if(cell.configured_)database.reset();
+        auto* ended=retained;retained=nullptr;
+        if(creator!=database_native_process()){current_=prior;return;}
+        // Preserve configured cleanup ordering: its callback owner goes away
+        // before active settlement; ordinary ownership remains through wake.
+        const bool configured=static_cast<bool>(cell.configured_);
+        if(configured)ended->database.reset();
+        if(creator!=database_native_process()){current_=prior;return;}
         current_=prior;{std::lock_guard<std::mutex> lock(cell.mutex_);--cell.active_;}
-        cell.settled_.notify_all();if(cell.configured_)cell.configured_->wake();
+        cell.settled_.notify_all();if(configured)cell.configured_->wake();
+        if(creator!=database_native_process())return;
+        delete ended; // actual owner/capture ending remains outside the leaf
     }
 };
 thread_local sync_callback_lifetime::execution* sync_callback_lifetime::current_=nullptr;
-sync_callback_lifetime::sync_callback_lifetime(synchronizer_base* owner,const std::shared_ptr<lattice_db>& db):owner_(owner),database_(db){}
+sync_callback_lifetime::sync_callback_lifetime(synchronizer_base* owner,const std::shared_ptr<lattice_db>& db):creator_(database_native_process()),owner_(owner),database_(db){}
 void sync_callback_lifetime::configure(std::shared_ptr<configured_attempt_custody> custody,std::weak_ptr<configured_attempt> attempt){
     std::lock_guard<std::mutex> lock(mutex_);
     if(configured_||ever_connected_||active_)throw db_error("configured callback custody must precede publication");
@@ -54,7 +70,12 @@ void sync_callback_lifetime::wait_for_foreign(){
     settled_.wait(lock,[&]{return active_<=own;}); // wait releases leaf lock
 }
 bool sync_callback_lifetime::run(uint64_t generation,const std::function<void()>& work,bool require_live,const platform_transport_callbacks* attempt,bool terminal){
-    std::shared_ptr<lattice_db> db;
+    if(creator_!=database_native_process())return false;
+    // Allocation failure happens before any callback admission or active count.
+    // No Native owner has entered the staged capsule yet. Even a foreign
+    // allocator returning in a child cannot lead into an inherited leaf.
+    auto retained=std::make_unique<execution::references>();
+    if(creator_!=database_native_process()){(void)retained.release();return false;}
     {std::lock_guard<std::mutex> lock(mutex_);
         if(retired_||!owner_||generation_!=generation||(protected_&&(protected_generation_!=generation||(require_live&&!attempt_live_))))return false;
         if(active_==std::numeric_limits<uint64_t>::max())return false;
@@ -65,9 +86,9 @@ bool sync_callback_lifetime::run(uint64_t generation,const std::function<void()>
         // The endpoint check is one atomic load, never an endpoint lock,
         // callback, capture copy/destruction, SQL operation or scheduler call.
         if(attempt&&!attempt->current_attempt_for_owner(terminal))return false;
-        db=database_.lock();++active_;
+        retained->database=database_.lock();++active_;
     }
-    execution turn(*this,generation,std::move(db));work();return true;
+    execution turn(*this,generation,retained.release());work();return true;
 }
 void sync_callback_lifetime::transport(const std::function<void()>& work){
     uint64_t generation;{std::lock_guard<std::mutex> lock(mutex_);if(protected_&&!attempt_live_)return;generation=protected_?protected_generation_:generation_;}
@@ -155,6 +176,29 @@ void report_sync_background_error(std::shared_ptr<scheduler> scheduled,std::shar
             });
     } catch(...) {LOG_ERROR("synchronizer","background failure could not be delivered");}
 }
+void report_sync_background_error_dispatched(const std::function<void(const std::string&)>& error,
+    const std::exception_ptr& failure,const char* stage) noexcept {
+    // No Native-bearing automatic callback/string/exception custody survives
+    // an arbitrary user handler or what() that forks and returns in its child.
+    struct custody {
+        struct payload {std::function<void(const std::string&)> error;std::string message;};
+        const uint64_t creator=database_native_process();payload* held=nullptr;
+        bool current()const noexcept{return creator==database_native_process();}
+        ~custody(){if(!current()){held=nullptr;return;}auto* ended=held;held=nullptr;delete ended;}
+    } copied;
+    try {
+        copied.held=new custody::payload{error,std::string(stage)};
+        if(!copied.current())return;
+        auto& message=copied.held->message;message+=" failed: ";
+        try {if(failure)std::rethrow_exception(failure);message+="unknown error";}
+        catch(const std::exception& e){const char* what=e.what();if(!copied.current())return;size_t n=0;if(what)while(n<2048&&what[n])++n;message.append(what?what:"",n);}
+        catch(...){message+="unknown exception";}
+        if(!copied.current())return;
+        LOG_ERROR("synchronizer","%s",message.c_str());
+        if(copied.held->error)try{copied.held->error(message);}catch(...){
+            if(!copied.current())return;LOG_ERROR("synchronizer","background failure callback threw");}
+    }catch(...){if(!copied.current())return;LOG_ERROR("synchronizer","background failure could not be delivered");}
+}
 std::shared_ptr<scheduler> make_sync_lifetime_scheduler(std::shared_ptr<scheduler> target,std::shared_ptr<sync_callback_lifetime> lifetime){return std::make_shared<lifetime_scheduler>(std::move(target),std::move(lifetime));}
 
 #ifndef __EMSCRIPTEN__
@@ -169,6 +213,9 @@ sync_retirement_lane::~sync_retirement_lane(){
     ready_.notify_all();if(worker_.joinable())worker_.join();
 }
 std::shared_ptr<sync_retirement_lane> sync_retirement_lane::instance(){
+    // Immutable startup process DATA is read before the inherited function-local
+    // singleton initialization guard, shared_ptr or reaper mutex can be touched.
+    if(retirement_lane_creator!=database_native_process())throw db_error("retirement lane belongs to another process");
     // Production lifetime is process-wide. Individual callback retirement can
     // never destroy/join this lane on one of the transport callback threads.
     // Intentionally process-lived: a quarantined transport must not be finally
@@ -187,6 +234,15 @@ void sync_retirement_lane::reservation::bind(std::shared_ptr<sync_transport> tra
     if(slot.serial!=serial_||slot.state!=phase::reserved||slot.transport||slot.completed)
         throw db_error("configured native reservation already bound or retired");
     slot.transport=std::move(transport);slot.lifetime=std::move(lifetime);slot.completed=std::move(retained);
+}
+void sync_retirement_lane::reservation::bind_controller_thread(std::shared_ptr<void> custody,
+    std::function<void(sync_retirement_result)> callback){
+    if(!lane_||!custody)throw db_error("controller retirement requires actual thread custody");
+    auto retained=std::make_shared<const std::function<void(sync_retirement_result)>>(std::move(callback));
+    std::lock_guard<std::mutex> lock(lane_->mutex_);auto& slot=lane_->slots_[slot_];
+    if(slot.serial!=serial_||slot.state!=phase::reserved||slot.transport||slot.lifetime||slot.completed||slot.controller_thread_custody)
+        throw db_error("controller retirement reservation already bound or retired");
+    slot.controller_thread_custody=std::move(custody);slot.completed=std::move(retained);
 }
 void sync_retirement_lane::reservation::retire(std::thread pacer)noexcept{if(lane_){lane_->request(slot_,serial_,std::move(pacer));lane_.reset();}else if(pacer.joinable())std::terminate();}
 sync_retirement_lane::reservation sync_retirement_lane::reserve(std::shared_ptr<sync_transport> transport,std::shared_ptr<sync_callback_lifetime> lifetime){
@@ -213,7 +269,8 @@ void sync_retirement_lane::request(size_t i,uint64_t serial,std::thread pacer)no
 void sync_retirement_lane::cancel(size_t i,uint64_t serial)noexcept{
     std::shared_ptr<sync_transport> discarded;std::shared_ptr<sync_callback_lifetime> discarded_lifetime;
     std::shared_ptr<const std::function<void(sync_retirement_result)>> callback;
-    {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[i];if(s.serial==serial&&s.state==phase::reserved){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);callback=std::move(s.completed);s.state=phase::free;}}
+    std::shared_ptr<void> discarded_controller;
+    {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[i];if(s.serial==serial&&s.state==phase::reserved){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);callback=std::move(s.completed);discarded_controller=std::move(s.controller_thread_custody);s.state=phase::free;}}
     settled_.notify_all(); // discarded captures are released outside leaf lock
 }
 void sync_retirement_lane::loop(){
@@ -238,11 +295,12 @@ void sync_retirement_lane::loop(){
         const bool complete=result.first_error==0;
         std::shared_ptr<sync_transport> discarded;std::shared_ptr<sync_callback_lifetime> discarded_lifetime;
         std::shared_ptr<const std::function<void(sync_retirement_result)>> callback;
-        {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[index];callback=std::move(s.completed);if(complete){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);}else s.state=phase::quarantined;}
+        std::shared_ptr<void> discarded_controller;
+        {std::lock_guard<std::mutex> lock(mutex_);auto& s=slots_[index];callback=std::move(s.completed);if(complete){discarded=std::move(s.transport);discarded_lifetime=std::move(s.lifetime);discarded_controller=std::move(s.controller_thread_custody);}else s.state=phase::quarantined;}
         held.reset();discarded.reset();discarded_lifetime.reset();
         if(complete){std::lock_guard<std::mutex> lock(mutex_);slots_[index].state=phase::free;}
         if(callback&&*callback)try{(*callback)(result);}catch(...){}
-        callback.reset();
+        callback.reset();discarded_controller.reset(); // actual join/callback ended; off leaf
         settled_.notify_all();
     }
 }

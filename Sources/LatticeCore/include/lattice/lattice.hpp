@@ -11,6 +11,7 @@
 #include "sync.hpp"  // for sync_filter_entry (used by configuration)
 #include "ipc.hpp"   // for ipc_endpoint (used by setup_ipc)
 #include <vector>
+#include <list>
 #include <memory>
 #include <functional>
 #include <type_traits>
@@ -1490,44 +1491,71 @@ public:
     void append_to_change_buffer(const std::string& table, const std::string& op,
                                   int64_t row_id, const std::string& global_id) {
         std::lock_guard<std::mutex> lock(change_buffer_mutex_);
-        change_buffer_.emplace_back(table, op, row_id, global_id);
+        if (change_buffer_.empty()) change_buffer_.emplace_back();
+        change_buffer_.back().rows.emplace_back(table, op, row_id, global_id);
     }
 
-    /// Discard buffered-but-undelivered changes (rollback path — wired as the
-    /// rolled-back txn hook in setup_change_hook). Wholesale clear is correct:
-    /// the buffer only ever holds the currently-open transaction's rows —
-    /// every commit flushes it via the WAL hook or the post-statement drain.
+    /// Seal only a completed transaction. splice does not allocate or throw;
+    /// rollback may subsequently clear current rows without touching these.
+    void seal_change_buffer() noexcept {
+        std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+        if (change_buffer_.empty()) ++committed_empty_epochs_;
+        else {
+            auto& batch = change_buffer_.back();
+            batch.notify_local_objects = std::exchange(tls_notify_local_object_observers_, false);
+            batch.applying_remote = applying_remote_changes_.load(std::memory_order_acquire);
+            committed_change_buffer_.splice(committed_change_buffer_.end(), change_buffer_);
+        }
+    }
+
     void discard_change_buffer() {
         std::lock_guard<std::mutex> lock(change_buffer_mutex_);
         change_buffer_.clear();
     }
 
-    /// Flush buffered changes and notify observers. File DBs arrive here from
-    /// the WAL hook; memory/Emscripten DBs from the post-statement drain in
-    /// db.cpp (docs/design-deferred-memory-delivery.md). Broadcasts to all
+    /// Flush committed changes from the post-statement drain, outside every
+    /// SQLite C frame and statement mutex, for every storage kind. Broadcasts to all
     /// instances sharing this database path.
     ///
-    /// Returns true when at least one batch was delivered — the WAL hook
-    /// uses this to signal the invalidation hooks for empty-buffer commits
-    /// (bookkeeping-table-only transactions still grow the WAL a keeper
-    /// pins, so EVERY settled commit must signal; results spec §2.3).
+    /// Returns true when at least one committed batch or empty commit epoch
+    /// was delivered. Bookkeeping-only WAL commits still grow the WAL a
+    /// keeper pins, so every such commit must signal (results spec §2.3).
     ///
-    /// Bounded drain-until-empty: an observer callback that WRITES during
-    /// delivery buffers new entries while is_flushing_ suppresses its nested
-    /// flush — without the loop those entries would strand until the next
-    /// unrelated write. The cap guards against a callback that writes on
-    /// every fire; leftovers past the cap still deliver on the next write.
+    /// Drain finite snapshots of committed batches. The round limit bounds
+    /// observer feedback generations, not the number of transactions that
+    /// already committed before delivery started. Each callback can create
+    /// more work, but it cannot reduce the original snapshot's delivery budget.
+    /// A failed callback must not strand later committed batches; retain the
+    /// first exception and rethrow only after this bounded drain completes.
     bool flush_changes() {
-        constexpr int kMaxDrainIterations = 64;
+        constexpr int kMaxDrainRounds = 64;
         bool delivered_any = false;
-        for (int i = 0; i < kMaxDrainIterations; ++i) {
-            if (!flush_changes_once()) return delivered_any;
-            delivered_any = true;
+        std::exception_ptr first_failure;
+        auto finish = [&]() {
+            if (first_failure) std::rethrow_exception(first_failure);
+            return delivered_any;
+        };
+        for (int round = 0; round < kMaxDrainRounds; ++round) {
+            size_t batches = 0;
+            {
+                std::lock_guard<std::mutex> lock(change_buffer_mutex_);
+                if (is_flushing_) return finish();
+                batches = committed_change_buffer_.size();
+                if (batches == 0 && committed_empty_epochs_ != 0) batches = 1;
+            }
+            if (batches == 0) return finish();
+            for (size_t batch = 0; batch < batches; ++batch) {
+                try {
+                    if (!flush_changes_once()) return finish();
+                } catch (...) {
+                    if (!first_failure) first_failure = std::current_exception();
+                }
+                delivered_any = true;
+            }
         }
-        LOG_WARN("flush_changes", "change buffer still non-empty after %d drain iterations — "
-                 "an observer callback writes on every fire; remaining entries deliver on the next write",
-                 kMaxDrainIterations);
-        return delivered_any;
+        LOG_WARN("flush_changes", "observer feedback reached %d drain rounds — "
+                 "remaining entries deliver on the next write", kMaxDrainRounds);
+        return finish();
     }
 
     /// Single flush pass (implementation detail of flush_changes). Returns
@@ -1536,14 +1564,22 @@ public:
     /// caller re-checks the buffer for observer-callback writes.
     bool flush_changes_once() {
         LOG_DEBUG("flush_changes", "Called");
-        std::vector<std::tuple<std::string, std::string, int64_t, std::string>> changes;
+        std::list<std::tuple<std::string, std::string, int64_t, std::string>> changes;
+        uint64_t epochs = 0;
+        bool notify_local_objects = false, applying_remote = false;
         {
             std::lock_guard<std::mutex> lock(change_buffer_mutex_);
-            LOG_DEBUG("flush_changes", "buffer_empty=%d is_flushing=%d", change_buffer_.empty(), is_flushing_);
-            if (change_buffer_.empty() || is_flushing_) return false;
+            if ((committed_change_buffer_.empty() && committed_empty_epochs_ == 0) || is_flushing_) return false;
             is_flushing_ = true;
-            changes = std::move(change_buffer_);
-            change_buffer_.clear();
+            epochs = std::exchange(committed_empty_epochs_, 0);
+            if (!committed_change_buffer_.empty()) {
+                auto& batch = committed_change_buffer_.front();
+                notify_local_objects = batch.notify_local_objects;
+                applying_remote = batch.applying_remote;
+                changes.splice(changes.end(), batch.rows);
+                committed_change_buffer_.pop_front();
+                ++epochs;
+            }
         }
 
         // Exception-safe reset: observer exceptions propagate to the writer
@@ -1557,22 +1593,26 @@ public:
             }
         } reset_guard{this};
 
-        // Read-and-clear the one-shot upsert flag set by add()/add_bulk on THIS thread
-        // (flush_changes always runs on the writing thread). When set, populate
-        // changed_fields for local UPDATEs below so live object observers fire — an upsert
-        // mutates the row in SQL without a Swift setter, so nothing else notifies them.
-        // Cleared up-front (before any throwing DB query) so an exception can't leak it.
-        const bool notify_local_objects = tls_notify_local_object_observers_;
-        tls_notify_local_object_observers_ = false;
+        // Each WAL commit advances keeper epochs, including bookkeeping-only
+        // commits. Coalescing payload rows must not lose those empty epochs.
+        if (changes.empty()) {
+            for (uint64_t i = 0; i < epochs; ++i)
+                fire_invalidation_hooks({}, invalidation_reason::commit);
+            return true;
+        }
+        for (uint64_t i = 1; i < epochs; ++i)
+            fire_invalidation_hooks({}, invalidation_reason::commit);
 
+        // Notification mode was captured when this batch committed. Later
+        // nested writes cannot consume or replace the earlier batch's flags.
         LOG_DEBUG("flush_changes", "Processing %zu changes", changes.size());
 
-        // Backfill globalId for AuditLog INSERTs buffered by the update hook.
-        // The memory/Emscripten hook buffers them with an empty globalId — the
-        // row wasn't safely readable from inside the hook; here the transaction
-        // has settled and it is. One IN query covers the whole batch.
+        // Backfill exact AuditLog identities on the settled writer connection.
+        // Every storage kind buffers INSERT row IDs without reading inside the
+        // update hook. The ordinary reader may still hold an older snapshot;
+        // one writer-side IN query covers this committed batch.
+        std::string audit_id_list;
         {
-            std::string audit_id_list;
             for (const auto& [table, op, row_id, global_id] : changes) {
                 if (table == "AuditLog" && op == "INSERT" && global_id.empty()) {
                     if (!audit_id_list.empty()) audit_id_list += ",";
@@ -1581,7 +1621,7 @@ public:
             }
             if (!audit_id_list.empty()) {
                 std::unordered_map<int64_t, std::string> gid_by_id;
-                auto rows = query_read(
+                auto rows = db_->query(
                     "SELECT id, globalId FROM AuditLog WHERE id IN (" + audit_id_list + ")");
                 for (const auto& row : rows) {
                     auto id_it = row.find("id");
@@ -1723,11 +1763,12 @@ public:
                 // For local setter changes, changed_fields stays empty — the Swift setter
                 // already handles observation via withMutation.
                 std::string changed_fields;
-                if ((applying_remote_changes_.load(std::memory_order_acquire) || notify_local_objects)
-                    && row_id > 0 && table != "AuditLog") {
-                    auto cfn_rows = query_read(
+                if ((applying_remote || notify_local_objects)
+                    && row_id > 0 && table != "AuditLog" && !audit_id_list.empty()) {
+                    auto cfn_rows = db_->query(
                         "SELECT changedFieldsNames FROM AuditLog "
-                        "WHERE tableName = ? AND rowId = ? ORDER BY id DESC LIMIT 1",
+                        "WHERE tableName = ? AND rowId = ? AND id IN (" + audit_id_list + ") "
+                        "ORDER BY id DESC LIMIT 1",
                         {table, row_id}
                     );
                     if (!cfn_rows.empty()) {
@@ -1744,19 +1785,14 @@ public:
             }
         }
 
-        // Pass 2: AuditLog INSERT events for each non-internal model change.
-        // Skip derivation whenever the update hook buffers AuditLog INSERTs
-        // directly (pass 1): native memory stores and every Emscripten store.
-        // Emscripten persistent paths also use DELETE journal + deferred drain;
-        // classifying only by path would deliver each audit row twice.
-        // Native file stores derive entries after their WAL commit as before.
-        // Internal table AuditLog entries are skipped — handled in pass 3.
-#ifdef __EMSCRIPTEN__
+        // Every storage kind buffers exact AuditLog INSERTs in the update
+        // hook. Pass 1 includes them directly; never infer a later audit row
+        // for an earlier sealed model or link-table transaction.
         constexpr bool audit_inserts_buffered_directly = true;
-#else
-        const bool audit_inserts_buffered_directly = config_.is_in_memory();
-#endif
-        bool triggered_regular_audit = false;
+        bool triggered_regular_audit = std::any_of(changes.begin(), changes.end(),
+            [](const auto& change) {
+                return std::get<0>(change) == "AuditLog" && std::get<1>(change) == "INSERT";
+            });
         for (const auto& [table, op, row_id, global_id] : changes) {
             // Skip if this is already an AuditLog change (shouldn't happen, but be safe)
             if (table == "AuditLog") continue;
@@ -2008,9 +2044,8 @@ public:
                                     std::string,   // global_row_id
                                     std::string>;  // changed_fields_names
 
-    // Register a table observer. The callback fires once per flush — the WAL
-    // hook for file DBs, the transaction-settled drain for memory/Emscripten
-    // DBs (docs/design-deferred-memory-delivery.md) — with the batch of
+    // Register a table observer. The callback fires from the unlocked
+    // transaction-settled drain for every storage kind, with the batch of
     // rows from that flush whose tableName matches `table_name`. A single
     // logical transaction is one fire; per-row delivery is just the
     // degenerate case (one-element batch).
@@ -5901,9 +5936,19 @@ private:
     // -1 means lock not held (another process owns it, or sync not configured).
     int sync_lock_fd_ = -1;
 
-    // Change buffering - accumulates changes until WAL hook fires
+    // Current rows are rollbackable. Sealed rows await unlocked delivery.
     std::mutex change_buffer_mutex_;
-    std::vector<std::tuple<std::string, std::string, int64_t, std::string>> change_buffer_;  // (table, op, rowId, globalId)
+    using change_buffer = std::list<std::tuple<std::string, std::string, int64_t, std::string>>;
+    // A batch node is allocated with the first row, before commit. Sealing
+    // splices that node without allocation and preserves per-commit batches.
+    struct change_batch {
+        change_buffer rows;
+        bool notify_local_objects = false;
+        bool applying_remote = false;
+    };
+    std::list<change_batch> change_buffer_;
+    std::list<change_batch> committed_change_buffer_;
+    uint64_t committed_empty_epochs_ = 0;
     bool is_flushing_ = false;
 
 public:

@@ -196,6 +196,8 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/SchemaTests.cpp
     Tests/LatticeCoreTests/QueryTests.cpp
     Tests/LatticeCoreTests/DatabaseTextTests.cpp
+    Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
+    Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp
     Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp
     Tests/LatticeCoreTests/KeeperInitializationTests.cpp
     Tests/LatticeCoreTests/QuotedAttachmentTests.cpp
@@ -228,6 +230,11 @@ target_include_directories(LatticeCoreTests PRIVATE
 # fixed-path logging environment. TMPDIR selects all fixture output locations.
 add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
 target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
+
+# Focused actual-Core statement-lifetime regressions; no global TestHelpers log.
+add_executable(LatticeQueryStatementLifetimeTests Tests/LatticeCoreTests/DatabaseQueryStatementLifetimeTests.cpp
+    Tests/LatticeCoreTests/DatabaseCommittedAuditPayloadTests.cpp)
+target_link_libraries(LatticeQueryStatementLifetimeTests PRIVATE LatticeCore gtest_main)
 # The header-compile pin must be built as pure C11 (docs/CAPI-STABILITY.md).
 set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
     PROPERTIES COMPILE_OPTIONS "-std=c11")

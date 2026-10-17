@@ -106,42 +106,17 @@ void lattice_db::setup_change_hook(database& connection) {
                 return;
             }
 
-            // For AuditLog changes:
-            // - In-memory DBs: buffer + mark dirty (WAL hook won't fire; the
-            //   post-statement drain flushes at transaction close)
-            // - Emscripten: same (uses DELETE journal mode, no WAL)
-            // - File DBs: skip (let flush_changes handle it via WAL hook to avoid double notification)
+            // Buffer exact AuditLog INSERT identities for every storage kind.
+            // Delivery can be deferred past later commits, so reconstructing an
+            // audit event with a latest-row lookup would substitute later history.
             if (table == "AuditLog") {
-#ifdef __EMSCRIPTEN__
-                // Emscripten uses DELETE journal mode — WAL hook never fires,
-                // so always use the deferred-drain path.
-                constexpr bool use_deferred_drain = true;
-#else
-                const bool use_deferred_drain = self->config_.is_in_memory();
-#endif
-                if (use_deferred_drain) {
-                    // Deferred delivery (docs/design-deferred-memory-delivery.md):
-                    // buffer the AuditLog INSERT like any other row and let the
-                    // post-statement drain deliver it once the transaction
-                    // settles. globalId resolution moves to flush time — the
-                    // row is committed and readable there, which also removes
-                    // a same-connection SELECT from inside this hook.
-                    if (operation == SQLITE_INSERT) {
-                        LOG_DEBUG("update_hook", "AuditLog change (in-memory), buffering for txn-settled drain");
-                        self->append_to_change_buffer("AuditLog", "INSERT",
-                                                      static_cast<int64_t>(rowid), "");
-                        self->db_->mark_txn_dirty();
-                    }
-                } else {
-                    LOG_DEBUG("update_hook", "AuditLog change (file DB), skipping - WAL hook will handle");
-                    // Advance the cross-process cursor on ALL instances sharing
-                    // this path INSIDE the transaction, before the WAL commit
-                    // makes this entry visible to readers. This prevents
-                    // handle_cross_process_notification (on the inotify/GCD
-                    // thread) from seeing local entries and firing duplicate
-                    // observer callbacks — both on this instance and on other
-                    // same-process instances sharing the same database file.
-                    if (operation == SQLITE_INSERT) {
+                if (operation == SQLITE_INSERT) {
+                    self->append_to_change_buffer("AuditLog", "INSERT",
+                                                  static_cast<int64_t>(rowid), "");
+                    self->db_->mark_txn_dirty();
+                    // Preserve the in-transaction xproc cursor advance: another
+                    // same-path instance must not redispatch our local entries.
+                    if (!self->config_.is_in_memory()) {
                         instance_registry::instance().for_each_alive(self->config_.path,
                             [rowid](lattice_db* inst) {
                                 inst->last_seen_audit_id_.store(
@@ -180,28 +155,13 @@ void lattice_db::setup_change_hook(database& connection) {
                    table.c_str(), op.c_str(), (long long)rowid, global_id.c_str());
             self->append_to_change_buffer(table, op, static_cast<int64_t>(rowid), global_id);
 
-            // For in-memory databases the WAL hook won't fire, so mark the
-            // connection dirty; the post-statement drain in db.cpp flushes at
-            // transaction close — never from inside this hook, which would
-            // deliver mid-transaction on SQLite's C frames
-            // (docs/design-deferred-memory-delivery.md). Emscripten is the
-            // same: DELETE journal mode, no WAL hook.
-#ifdef __EMSCRIPTEN__
-            LOG_DEBUG("update_hook", "Emscripten: marking txn dirty for post-statement drain");
+            // All storage kinds seal and deliver from the C++ statement tail.
             self->db_->mark_txn_dirty();
-#else
-            if (self->config_.is_in_memory()) {
-                LOG_DEBUG("update_hook", "In-memory DB, marking txn dirty for post-statement drain");
-                self->db_->mark_txn_dirty();
-            } else {
-                LOG_DEBUG("update_hook", "File DB (path=%s), waiting for WAL hook", self->config_.path.c_str());
-            }
-#endif
         },
         this
     );
 
-    // WAL hook - flushes buffered changes on transaction commit (file-based DBs only)
+    // WAL hook records commit bookkeeping only; never deliver from SQLite C frames.
     sqlite3_wal_hook(connection.handle(),
         [](void* user_data, sqlite3*, const char*, int nframes) -> int {
             auto* self = static_cast<lattice_db*>(user_data);
@@ -220,45 +180,23 @@ void lattice_db::setup_change_hook(database& connection) {
                 self->wal_eviction_pending_.store(true, std::memory_order_relaxed);
             }
 
-            const bool delivered = self->flush_changes();
-            if (!delivered) {
-                // §2.3 epoch semantics: EVERY settled commit signals,
-                // observed tables or not — each commit grows the WAL that a
-                // keeper pins, including commits whose change buffer was
-                // empty (bookkeeping tables such as _lattice_sync_state,
-                // mark-synced AuditLog UPDATEs). The empty payload only
-                // means "no shape caches to drop"; the epoch bump — and the
-                // §3.4 advance the flag above requests — still delivers.
-                self->fire_invalidation_hooks({}, invalidation_reason::commit);
-            }
+            // Also arm empty-buffer bookkeeping commits. The post-statement
+            // tail seals the current buffer before allowing another writer.
+            self->db_->mark_txn_dirty();
             return SQLITE_OK;
         },
         this
     );
 
-    // Transaction-settled drain + rollback discard
-    // (docs/design-deferred-memory-delivery.md). The settled hook drains the
-    // change buffer after any successful statement that leaves the connection
-    // in autocommit mode — the memory/Emscripten replacement for the WAL
-    // hook. Harmless for file DBs: only the memory path ever sets the dirty
-    // flag. The rollback hook applies to ALL storage kinds — a rolled-back
-    // transaction must discard its buffered rows, or the next flush delivers
-    // them as phantoms.
-    //
-    // The rollback path ALSO signals the invalidation hooks (results spec
-    // §2.3): a rolled-back transaction delivers no change batch by design,
-    // so without this signal a memory-family capture that raced the
-    // transaction could serve a poisoned id vector forever (§4.1) — the
-    // rollback bump guarantees the next access re-captures. Runs inside
-    // sqlite3_rollback_hook's C frame: hook bodies are atomics-only by
-    // contract, and every lock on this path (change_buffer_mutex_, the
-    // hook-list and registry mutexes) is a leaf lock never held across SQL.
+    // Commit sealing and delivery are separate: a later rollback can clear
+    // only its current rows, while earlier committed rows await outer unlock.
     connection.set_txn_hooks(
         [this] { flush_changes(); },
         [this] {
             discard_change_buffer();
             fire_invalidation_hooks({}, invalidation_reason::rollback);
-        });
+        },
+        [this] { seal_change_buffer(); });
 }
 void lattice_db::setup_cross_process_notifier() {
     // Use the shared per-path notifier from instance_registry.

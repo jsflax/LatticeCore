@@ -279,3 +279,207 @@ TEST(ManagedObservation, ExactGlobalIdentityGuardsPhysicalRowAndReplacementNotif
         {held.id(), held.global_id()});
     EXPECT_EQ(calls, 1); EXPECT_EQ(held.name.detach(), "replacement");
 }
+
+#include <cstdint>
+#include <exception>
+
+namespace {
+class SharingPausedScheduler final : public lattice::scheduler {
+    mutable std::mutex mutex_;
+    std::deque<std::function<void()>> queue_;
+public:
+    void invoke(std::function<void()>&& work) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push_back(std::move(work));
+    }
+    bool is_on_thread() const noexcept override { return true; }
+    bool is_same_as(const scheduler* other) const noexcept override { return other == this; }
+    bool can_invoke() const noexcept override { return true; }
+    size_t pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+    bool run_one() {
+        std::function<void()> work;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (queue_.empty()) return false;
+            work.swap(queue_.front()); queue_.pop_front();
+        }
+        work(); // Actual payload destruction, including throw, is off the leaf.
+        return true;
+    }
+    void shutdown() override {
+        std::deque<std::function<void()>> retired;
+        { std::lock_guard<std::mutex> lock(mutex_); queue_.swap(retired); }
+    }
+};
+struct sharing_copy_state {
+    size_t copies = 0, live = 0;
+    std::vector<int> local_values;
+    std::exception_ptr copy_error;
+};
+struct sharing_copy_callback {
+    std::shared_ptr<sharing_copy_state> state;
+    mutable int local_value = 0;
+    explicit sharing_copy_callback(std::shared_ptr<sharing_copy_state> value) : state(std::move(value)) { ++state->live; }
+    sharing_copy_callback(const sharing_copy_callback& value) : state(value.state), local_value(value.local_value) {
+        ++state->copies;
+        if (state->copy_error) std::rethrow_exception(state->copy_error);
+        ++state->live;
+    }
+    sharing_copy_callback(sharing_copy_callback&& value) noexcept : state(std::move(value.state)), local_value(value.local_value) {}
+    ~sharing_copy_callback() { if (state) --state->live; }
+    template<typename T> void operator()(const T&) const { state->local_values.push_back(++local_value); }
+};
+struct sharing_capture_marker {
+    std::atomic<int>& destroyed;
+    explicit sharing_capture_marker(std::atomic<int>& value) : destroyed(value) {}
+    ~sharing_capture_marker() { ++destroyed; }
+};
+}
+
+TEST(ObserverDeliverySharing, ActualTransactionsKeepDistinctOriginalBatchesAfterUnregister) {
+    auto queue = std::make_shared<SharingPausedScheduler>();
+    auto owner = observer_owner(":memory:", queue);
+    const auto first = owner->add(TestPerson{"first", 1, std::nullopt});
+    const auto second = owner->add(TestPerson{"second", 2, std::nullopt});
+    ASSERT_EQ(queue->pending(), 0u);
+    using event = lattice::lattice_db::change_event;
+    std::vector<std::pair<int, std::vector<event>>> delivered;
+    std::vector<std::uintptr_t> vectors;
+    const auto a = owner->add_table_observer("TestPerson", [&](const auto& batch) {
+        vectors.push_back(reinterpret_cast<std::uintptr_t>(&batch)); delivered.emplace_back(1, batch);
+    });
+    const auto b = owner->add_table_observer("TestPerson", [&](const auto& batch) {
+        vectors.push_back(reinterpret_cast<std::uintptr_t>(&batch)); delivered.emplace_back(2, batch);
+    });
+    owner->begin_transaction();
+    owner->db().execute("UPDATE TestPerson SET age=11 WHERE id=?", {first.id()});
+    owner->db().execute("UPDATE TestPerson SET age=12 WHERE id=?", {second.id()});
+    owner->commit();
+    owner->db().execute("UPDATE TestPerson SET age=21 WHERE id=?", {first.id()});
+    ASSERT_EQ(queue->pending(), 2u);
+    EXPECT_TRUE(delivered.empty());
+    owner->remove_table_observer("TestPerson", a);
+    owner->remove_table_observer("TestPerson", b);
+    owner->db().execute("UPDATE TestPerson SET age=31 WHERE id=?", {second.id()});
+    EXPECT_EQ(queue->pending(), 2u);
+    ASSERT_TRUE(queue->run_one()); ASSERT_TRUE(queue->run_one());
+    ASSERT_EQ(delivered.size(), 4u); ASSERT_EQ(vectors.size(), 4u);
+    EXPECT_EQ(delivered[0].first, 1); EXPECT_EQ(delivered[1].first, 2);
+    EXPECT_EQ(delivered[2].first, 1); EXPECT_EQ(delivered[3].first, 2);
+    EXPECT_EQ(delivered[0].second, delivered[1].second);
+    EXPECT_EQ(delivered[2].second, delivered[3].second);
+    ASSERT_EQ(delivered[0].second.size(), 2u); ASSERT_EQ(delivered[2].second.size(), 1u);
+    EXPECT_EQ(std::get<2>(delivered[0].second[0]), first.id());
+    EXPECT_EQ(std::get<2>(delivered[0].second[1]), second.id());
+    EXPECT_EQ(std::get<2>(delivered[2].second[0]), first.id());
+    EXPECT_EQ(vectors[0], vectors[1]); // The same immutable table vector, not one per observer.
+    EXPECT_EQ(vectors[2], vectors[3]);
+    EXPECT_EQ(queue->pending(), 0u);
+}
+
+TEST(ObserverDeliverySharing, ObjectFieldsShareBackingButPreserveInputRowOrderAndSnapshots) {
+    auto queue = std::make_shared<SharingPausedScheduler>(); auto owner = observer_owner(":memory:", queue);
+    const auto row = owner->add(TestPerson{"fields", 1, std::nullopt});
+    std::vector<std::pair<int, std::string>> delivered;
+    std::vector<std::uintptr_t> strings;
+    const auto a = owner->add_object_observer("TestPerson", row.id(), [&](const auto& fields) {
+        strings.push_back(reinterpret_cast<std::uintptr_t>(&fields)); delivered.emplace_back(1, fields);
+    });
+    const auto b = owner->add_object_observer("TestPerson", row.id(), [&](const auto& fields) {
+        strings.push_back(reinterpret_cast<std::uintptr_t>(&fields)); delivered.emplace_back(2, fields);
+    });
+    std::vector<lattice::lattice_db::change_event> input{
+        {"TestPerson", "UPDATE", row.id(), row.global_id(), "[\"name\"]"},
+        {"TestPerson", "UPDATE", row.id(), row.global_id(), "[\"age\"]"}};
+    owner->notify_changes_batched(input); // The real public production delivery entry.
+    std::get<4>(input[0]) = "caller changed its own data"; input.clear();
+    owner->notify_changes_batched({{"TestPerson", "UPDATE", row.id(), row.global_id(), "[\"name\",\"age\"]"}});
+    owner->remove_all_object_observers("TestPerson", row.id());
+    ASSERT_EQ(queue->pending(), 2u);
+    ASSERT_TRUE(queue->run_one()); ASSERT_TRUE(queue->run_one());
+    EXPECT_EQ(delivered, (std::vector<std::pair<int, std::string>>{
+        {1,"[\"name\"]"},{2,"[\"name\"]"},{1,"[\"age\"]"},{2,"[\"age\"]"},
+        {1,"[\"name\",\"age\"]"},{2,"[\"name\",\"age\"]"}}));
+    ASSERT_EQ(strings.size(), 6u);
+    EXPECT_EQ(strings[0], strings[1]); EXPECT_EQ(strings[2], strings[3]); EXPECT_EQ(strings[4], strings[5]);
+    EXPECT_EQ(queue->pending(), 0u);
+}
+
+TEST(ObserverDeliverySharing, OpaqueCopiesAndMutableValueIsolationRemainPerQueuedTransaction) {
+    auto queue = std::make_shared<SharingPausedScheduler>(); auto owner = observer_owner(":memory:", queue);
+    const auto row = owner->add(TestPerson{"copies", 1, std::nullopt});
+    auto table = std::make_shared<sharing_copy_state>(), object = std::make_shared<sharing_copy_state>();
+    const auto a = owner->add_table_observer("TestPerson", sharing_copy_callback{table});
+    const auto b = owner->add_object_observer("TestPerson", row.id(), sharing_copy_callback{object});
+    const auto table_copies = table->copies, object_copies = object->copies;
+    const auto table_live = table->live, object_live = object->live;
+    for (int64_t age : {2,3,4}) owner->db().execute("UPDATE TestPerson SET age=? WHERE id=?", {age, row.id()});
+    ASSERT_EQ(queue->pending(), 3u);
+    EXPECT_EQ(table->copies, table_copies + 3); EXPECT_EQ(object->copies, object_copies + 3);
+    EXPECT_EQ(table->live, table_live + 3); EXPECT_EQ(object->live, object_live + 3);
+    EXPECT_TRUE(table->local_values.empty()); EXPECT_TRUE(object->local_values.empty());
+    owner->remove_table_observer("TestPerson", a); owner->remove_object_observer("TestPerson", row.id(), b);
+    EXPECT_EQ(table->live, 3u); EXPECT_EQ(object->live, 3u);
+    ASSERT_TRUE(queue->run_one()); ASSERT_TRUE(queue->run_one()); ASSERT_TRUE(queue->run_one());
+    EXPECT_EQ(table->local_values, (std::vector<int>{1,1,1}));
+    EXPECT_EQ(object->local_values, (std::vector<int>{1,1,1}));
+    EXPECT_EQ(table->live, 0u); EXPECT_EQ(object->live, 0u);
+}
+
+TEST(ObserverDeliverySharing, OpaqueCopyFailureStillOccursDuringNotificationBeforeSubmission) {
+    for (bool table : {true, false}) {
+        auto queue = std::make_shared<SharingPausedScheduler>(); auto owner = observer_owner(":memory:", queue);
+        const auto row = owner->add(TestPerson{"copy-failure", 1, std::nullopt});
+        auto state = std::make_shared<sharing_copy_state>();
+        const auto id = table ? owner->add_table_observer("TestPerson", sharing_copy_callback{state})
+            : owner->add_object_observer("TestPerson", row.id(), sharing_copy_callback{state});
+        const auto expected = std::make_exception_ptr(std::runtime_error("actual opaque callback copy failure"));
+        state->copy_error = expected;
+        std::exception_ptr actual;
+        try { owner->notify_changes_batched({{"TestPerson", "UPDATE", row.id(), row.global_id(), "[\"name\"]"}}); }
+        catch (...) { actual = std::current_exception(); }
+        EXPECT_EQ(actual, expected); EXPECT_EQ(queue->pending(), 0u); EXPECT_EQ(state->live, 1u);
+        state->copy_error = {};
+        if (table) owner->remove_table_observer("TestPerson", id);
+        else owner->remove_object_observer("TestPerson", row.id(), id);
+        EXPECT_EQ(state->live, 0u);
+    }
+}
+
+TEST(ObserverDeliverySharing, ThrowingActualQueuedCallbackReleasesItsCaptureAndPropagates) {
+    std::atomic<int> destroyed{0};
+    auto queue = std::make_shared<SharingPausedScheduler>(); auto owner = observer_owner(":memory:", queue);
+    const auto row = owner->add(TestPerson{"throw", 1, std::nullopt});
+    auto marker = std::make_shared<sharing_capture_marker>(destroyed);
+    const std::weak_ptr<sharing_capture_marker> weak = marker;
+    const auto expected = std::make_exception_ptr(std::runtime_error("actual observer callback failure"));
+    const auto id = owner->add_table_observer("TestPerson", [held = std::move(marker), expected](const auto&) { std::rethrow_exception(expected); });
+    owner->db().execute("UPDATE TestPerson SET age=8 WHERE id=?", {row.id()});
+    owner->remove_table_observer("TestPerson", id);
+    ASSERT_EQ(queue->pending(), 1u); ASSERT_FALSE(weak.expired());
+    std::exception_ptr actual;
+    try { queue->run_one(); } catch (...) { actual = std::current_exception(); }
+    EXPECT_EQ(actual, expected); EXPECT_TRUE(weak.expired()); EXPECT_EQ(destroyed.load(), 1);
+    EXPECT_EQ(queue->pending(), 0u);
+    EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT age FROM TestPerson WHERE id=?", {row.id()}).at(0).at("age")), 8);
+}
+
+TEST(ObserverDeliverySharing, ActualSchedulerCancellationReleasesQueuedUnregisteredCaptures) {
+    std::atomic<int> destroyed{0};
+    auto queue = std::make_shared<SharingPausedScheduler>(); auto owner = observer_owner(":memory:", queue);
+    const auto row = owner->add(TestPerson{"cancel", 1, std::nullopt});
+    auto marker = std::make_shared<sharing_capture_marker>(destroyed);
+    const std::weak_ptr<sharing_capture_marker> weak = marker;
+    int calls = 0;
+    const auto id = owner->add_table_observer("TestPerson", [held = std::move(marker), &calls](const auto&) { ++calls; });
+    owner->db().execute("UPDATE TestPerson SET age=17 WHERE id=?", {row.id()});
+    owner->remove_table_observer("TestPerson", id);
+    ASSERT_EQ(queue->pending(), 1u); ASSERT_FALSE(weak.expired());
+    queue->shutdown();
+    EXPECT_TRUE(weak.expired()); EXPECT_EQ(destroyed.load(), 1); EXPECT_EQ(calls, 0);
+    EXPECT_EQ(queue->pending(), 0u);
+    EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT age FROM TestPerson WHERE id=?", {row.id()}).at(0).at("age")), 17);
+}

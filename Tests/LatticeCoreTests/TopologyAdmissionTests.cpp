@@ -1,5 +1,7 @@
 #include "TestHelpers.hpp"
 #include <condition_variable>
+#include <array>
+#include <exception>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +22,10 @@ struct topology_admission_test_access {
         return owner.read_db_;
     }
     static sqlite3* raw(database& db) { return db.internal_handle(); }
+    static size_t actual_waiters(const database& db) { return db.topology_waiter_count_(); }
+    template<typename F> static void with_original_vec0_hold(lattice_db& owner, F&& body) {
+        owner.with_vec0_serialization("topology-turn-test", false, std::forward<F>(body));
+    }
     static bool valid(lattice_db& owner) {
         std::lock_guard<std::mutex> lock(owner.attach_mutex_);
         return owner.attachment_topology_valid_;
@@ -172,6 +178,228 @@ void expect_no_attachment(pair_fixture& fixture) {
 }
 }
 
+namespace {
+bool await_actual(const std::function<bool()>& predicate) {
+    const auto end = clock_type::now() + 3s;
+    while (!predicate()) {
+        if (clock_type::now() >= end) return false;
+        std::this_thread::sleep_for(1ms);
+    }
+    return true;
+}
+void report_actual_error(const char* label, const std::exception_ptr& error) {
+    if (!error) return;
+    try { std::rethrow_exception(error); }
+    catch (const std::exception& actual) { ADD_FAILURE() << label << ": " << actual.what(); }
+    catch (...) { ADD_FAILURE() << label << ": actual non-std exception"; }
+}
+}
+
+TEST(TopologyAdmission, ContinuousSameParentWriterOffersRealTopologyTurns) {
+    terminal_watchdog watchdog;
+    pair_fixture fixture;
+    auto writer = topology_access::writer(fixture.parent);
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> completed{0};
+    std::exception_ptr writer_error, topology_error;
+    std::thread writes([&] {
+        try {
+            while (!stop.load()) {
+                // Exactly the original failing legacy wrapper route; no yield,
+                // sleep, lock release hook or workload reduction is supplied.
+                fixture.parent.db().execute("UPDATE main.Fixture SET n = n + 1 WHERE id = 1");
+                completed.fetch_add(1);
+            }
+        } catch (...) { writer_error = std::current_exception(); }
+    });
+    const bool started = await_actual([&] { return completed.load() != 0; });
+    try {
+        if (started) for (int turn = 0; turn != 32; ++turn) {
+            fixture.parent.attach(fixture.arm);
+            fixture.parent.detach(fixture.arm);
+        }
+    } catch (...) { topology_error = std::current_exception(); }
+    stop.store(true); writes.join();
+    ASSERT_TRUE(started);
+    report_actual_error("writer", writer_error);
+    report_actual_error("topology", topology_error);
+    EXPECT_EQ(topology_access::actual_waiters(*writer), 0u);
+    const auto rows = writer->query("SELECT n FROM main.Fixture WHERE id=1");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("n")), 7 + completed.load());
+    expect_no_attachment(fixture);
+}
+
+TEST(TopologyAdmission, ActualSqlFunctionReentryDoesNotWaitOnItsOwnTopologyWaiter) {
+    terminal_watchdog watchdog;
+    pair_fixture fixture;
+    auto writer = topology_access::writer(fixture.parent);
+    struct callback_context {
+        database& writer;
+        std::atomic<bool> entered{false};
+        bool saw_waiter = false, returned = false;
+        std::exception_ptr error;
+    } context{*writer};
+    auto* raw = topology_access::raw(*writer); // Actual friend-owned test registration; no escaped flag reset.
+    const auto function = [](sqlite3_context* result, int, sqlite3_value**) noexcept {
+        auto& actual = *static_cast<callback_context*>(sqlite3_user_data(result));
+        try {
+            actual.entered.store(true);
+            actual.saw_waiter = await_actual([&] { return topology_access::actual_waiters(actual.writer) != 0; });
+            if (!actual.saw_waiter) throw std::runtime_error("actual parent topology waiter did not register");
+            actual.writer.execute("UPDATE main.Fixture SET n=n+1 WHERE id=1");
+            actual.returned = true;
+            sqlite3_result_int(result, 1);
+        } catch (...) {
+            actual.error = std::current_exception();
+            sqlite3_result_error(result, "actual recursive writer failed", -1);
+        }
+    };
+    ASSERT_EQ(sqlite3_create_function_v2(raw, "actual_recursive_writer", 0, SQLITE_UTF8,
+        &context, function, nullptr, nullptr, nullptr), SQLITE_OK);
+    struct clear_function {
+        sqlite3* raw;
+        ~clear_function() {
+            if (sqlite3_create_function_v2(raw, "actual_recursive_writer", 0, SQLITE_UTF8,
+                    nullptr, nullptr, nullptr, nullptr, nullptr) != SQLITE_OK) std::abort();
+        }
+    } cleanup{raw};
+    std::exception_ptr writer_error, topology_error;
+    std::thread topology([&] {
+        try {
+            if (!await_actual([&] { return context.entered.load(); }))
+                throw std::runtime_error("actual SQL function did not enter");
+            fixture.parent.attach(fixture.arm);
+        } catch (...) { topology_error = std::current_exception(); }
+    });
+    try { writer->execute("SELECT actual_recursive_writer()"); }
+    catch (...) { writer_error = std::current_exception(); }
+    topology.join();
+    EXPECT_TRUE(context.saw_waiter);
+    EXPECT_TRUE(context.returned);
+    report_actual_error("actual SQL callback", context.error);
+    report_actual_error("outer writer", writer_error);
+    report_actual_error("topology", topology_error);
+    EXPECT_EQ(topology_access::actual_waiters(*writer), 0u);
+    const auto rows = writer->query("SELECT n FROM main.Fixture WHERE id=1");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("n")), 8);
+    if (!topology_error) EXPECT_NO_THROW(fixture.parent.detach(fixture.arm));
+}
+
+TEST(TopologyAdmission, Vec0OwnedNativeBodyReentryDoesNotWaitOnItsOwnTopologyWaiter) {
+    terminal_watchdog watchdog;
+    pair_fixture fixture;
+    auto writer = topology_access::writer(fixture.parent);
+    std::atomic<bool> entered{false};
+    bool saw_real_waiter = false;
+    std::exception_ptr body_error, topology_error;
+    std::thread topology([&] {
+        try {
+            if (!await_actual([&] { return entered.load(); }))
+                throw std::runtime_error("actual vec0 body did not enter");
+            fixture.parent.attach(fixture.arm);
+        } catch (...) { topology_error = std::current_exception(); }
+    });
+    try {
+        // The genuine existing file vec0 serialization owns SQLite across
+        // this body. No fake mutex/current-scope flag is installed.
+        topology_access::with_original_vec0_hold(fixture.parent, [&] {
+            entered.store(true);
+            saw_real_waiter = await_actual([&] { return topology_access::actual_waiters(*writer) != 0; });
+            if (!saw_real_waiter) throw std::runtime_error("actual parent topology waiter did not register");
+            writer->execute("UPDATE main.Fixture SET n=n+1 WHERE id=1");
+        });
+    } catch (...) { body_error = std::current_exception(); }
+    topology.join();
+    EXPECT_TRUE(saw_real_waiter);
+    report_actual_error("vec0 body", body_error);
+    report_actual_error("topology", topology_error);
+    EXPECT_EQ(topology_access::actual_waiters(*writer), 0u);
+    const auto rows = writer->query("SELECT n FROM main.Fixture WHERE id=1");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("n")), 8);
+    if (!topology_error) EXPECT_NO_THROW(fixture.parent.detach(fixture.arm));
+}
+
+TEST(TopologyAdmission, ActualRawRecursiveMutexOwnerKeepsItsExistingSqlReentry) {
+    terminal_watchdog watchdog;
+    pair_fixture fixture;
+    auto writer = topology_access::writer(fixture.parent);
+    // Genuine public raw escape, not the legacy database& accessor. This
+    // caller really owns SQLite recursively while a different thread waits.
+    auto* raw = writer->handle();
+    auto* mutex = sqlite3_db_mutex(raw);
+    ASSERT_NE(mutex, nullptr);
+    sqlite3_mutex_enter(mutex);
+    std::exception_ptr writer_error, topology_error;
+    std::thread topology([&] {
+        try { fixture.parent.attach(fixture.arm); }
+        catch (...) { topology_error = std::current_exception(); }
+    });
+    const bool pending = await_actual([&] { return topology_access::actual_waiters(*writer) != 0; });
+    try { if (pending) writer->execute("UPDATE main.Fixture SET n=n+1 WHERE id=1"); }
+    catch (...) { writer_error = std::current_exception(); }
+    sqlite3_mutex_leave(mutex);
+    topology.join();
+    ASSERT_TRUE(pending);
+    report_actual_error("raw recursive writer", writer_error);
+    report_actual_error("topology", topology_error);
+    EXPECT_EQ(topology_access::actual_waiters(*writer), 0u);
+    const auto rows = writer->query("SELECT n FROM main.Fixture WHERE id=1");
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(rows[0].at("n")), 8);
+    if (!topology_error) EXPECT_NO_THROW(fixture.parent.detach(fixture.arm));
+}
+
+TEST(TopologyAdmission, SixtyFifthRealNativeWaiterRefusesAndCloseEndsAllOriginalCells) {
+    terminal_watchdog watchdog;
+    pair_fixture fixture;
+    auto source = topology_access::writer(fixture.arm);
+    held_connection held(source);
+    ASSERT_TRUE(held.await_ready());
+    std::array<std::thread, 64> waiting;
+    std::array<std::exception_ptr, 64> errors;
+    std::array<std::atomic<bool>, 64> returned{};
+    std::exception_ptr setup_error, overflow_error;
+    try {
+        for (size_t index = 0; index != waiting.size(); ++index) {
+            waiting[index] = std::thread([&, index] {
+                try { fixture.parent.attach(fixture.arm); }
+                catch (...) { errors[index] = std::current_exception(); }
+                returned[index].store(true);
+            });
+        }
+    } catch (...) { setup_error = std::current_exception(); }
+    // All public calls must have reached their genuine source mutex retry.
+    // No cell/count/deadline or completed result is fabricated by this fixture.
+    const bool full = !setup_error && await_actual([&] { return topology_access::actual_waiters(*source) == 64; });
+    std::string overflow;
+    try { if (full) overflow = refusal([&] { fixture.parent.attach(fixture.arm); }); }
+    catch (...) { overflow_error = std::current_exception(); }
+    source->close(); // Real logical close while the exact originals still wait.
+    held.release();
+    for (auto& thread : waiting) if (thread.joinable()) thread.join();
+    report_actual_error("actual waiter thread setup", setup_error);
+    report_actual_error("overflow call", overflow_error);
+    ASSERT_TRUE(full);
+    EXPECT_EQ(overflow, "topology admission waiter capacity exceeded");
+    EXPECT_FALSE(held.forced_release());
+    EXPECT_EQ(held.after_release_rc, SQLITE_OK);
+    EXPECT_EQ(topology_access::actual_waiters(*source), 0u);
+    for (size_t index = 0; index != errors.size(); ++index) {
+        SCOPED_TRACE(index);
+        EXPECT_TRUE(returned[index].load());
+        ASSERT_NE(errors[index], nullptr);
+        try { std::rethrow_exception(errors[index]); }
+        catch (const db_error& error) {
+            EXPECT_NE(std::string(error.what()).find("database closed"), std::string::npos);
+        }
+        catch (...) { ADD_FAILURE() << "original waiter did not preserve a real database close refusal"; }
+    }
+    expect_no_attachment(fixture);
+}
+
 TEST(TopologyAdmission, RecipientMutexRefusesBeforeCleanupAndLeavesNoTopologyEffects) {
     terminal_watchdog watchdog;
     pair_fixture fixture;
@@ -183,6 +411,7 @@ TEST(TopologyAdmission, RecipientMutexRefusesBeforeCleanupAndLeavesNoTopologyEff
     const bool forced = held.forced_release();
     held.release();
     expect_deadline(error);
+    EXPECT_EQ(topology_access::actual_waiters(*topology_access::writer(fixture.parent)), 0u);
     EXPECT_FALSE(forced);
     EXPECT_GE(elapsed, 2s);
     EXPECT_EQ(held.after_release_rc, SQLITE_OK);
@@ -247,6 +476,51 @@ TEST(TopologyAdmission, DetachRefusalKeepsPhysicalBindingButRetiresItsRoute) {
     EXPECT_FALSE(topology_access::valid(fixture.parent));
     EXPECT_NO_THROW(fixture.parent.detach(fixture.arm));
     EXPECT_FALSE(physically_attached(fixture.parent.db()));
+    EXPECT_TRUE(topology_access::valid(fixture.parent));
+}
+
+TEST(TopologyAdmission, PartialViewDropRefusalRetriesOnlyActualTemporaryViews) {
+    terminal_watchdog watchdog;
+    pair_fixture fixture;
+    fixture.parent.attach(fixture.arm);
+    auto writer = topology_access::writer(fixture.parent);
+    auto reader = topology_access::reader(fixture.parent);
+    ASSERT_NE(writer, nullptr);
+    ASSERT_NE(reader, nullptr);
+    const auto temp_views = [](database& db) {
+        return std::get<int64_t>(db.query(
+            "SELECT count(*) AS n FROM sqlite_temp_master WHERE type='view' AND name='Fixture'").at(0).at("n"));
+    };
+    ASSERT_EQ(temp_views(*writer), 1);
+    ASSERT_EQ(temp_views(*reader), 1);
+    held_connection held(reader);
+    ASSERT_TRUE(held.await_ready());
+    const auto error = refusal([&] { fixture.parent.detach(fixture.arm); });
+    const bool forced = held.forced_release();
+    held.release();
+    expect_deadline(error);
+    EXPECT_FALSE(forced);
+    EXPECT_EQ(held.after_release_rc, SQLITE_OK);
+    // The first real handle completed its DROP before the same operation
+    // refused on the reader. Its main table remains the original real table.
+    ASSERT_EQ(temp_views(*writer), 0);
+    ASSERT_EQ(temp_views(*reader), 1);
+    EXPECT_EQ(std::get<int64_t>(writer->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_EQ(std::get<int64_t>(reader->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_TRUE(physically_attached(*writer));
+    EXPECT_TRUE(physically_attached(*reader));
+    EXPECT_EQ(topology_access::tokens(fixture.parent), 0u);
+    EXPECT_FALSE(topology_access::valid(fixture.parent));
+    // This is a genuine later public cleanup episode after the actual holder
+    // returned; no first refusal, route token, or original deadline is reset.
+    ASSERT_NO_THROW(fixture.parent.detach(fixture.arm));
+    EXPECT_FALSE(physically_attached(*writer));
+    EXPECT_FALSE(physically_attached(*reader));
+    EXPECT_EQ(temp_views(*writer), 0);
+    EXPECT_EQ(temp_views(*reader), 0);
+    EXPECT_EQ(std::get<int64_t>(writer->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_EQ(std::get<int64_t>(reader->query("SELECT n FROM main.Fixture WHERE id=1").at(0).at("n")), 7);
+    EXPECT_EQ(topology_access::tokens(fixture.parent), 0u);
     EXPECT_TRUE(topology_access::valid(fixture.parent));
 }
 
@@ -935,3 +1209,68 @@ TEST(TopologyAdmission, CapturedTopologyObserverRefusesAuthenticInstallBeforeBeg
     parent->remove_table_observer("Fixture", token);
     EXPECT_NO_THROW(parent->detach(arm));
 }
+
+
+// Denial-only controller retry controls use real owners/cells, never a grant.
+namespace {
+using controller_intent=lattice::detail::recovery_writer_access::controller_admission_intent;
+struct intent_reader_state {
+    std::mutex mutex;std::condition_variable changed;
+    bool started=false,done=false;int64_t value=0;std::exception_ptr error;
+};
+struct intent_thread_ending {
+    controller_intent& intent;std::thread& worker;
+    ~intent_thread_ending(){intent.release();if(worker.joinable())worker.join();}
+};
+TEST(ControllerAdmissionIntent, ExactCellBypassDoesNotReleaseFreshReaderBeforeExplicitRetirement) {
+    local_paths paths;auto owner=std::make_shared<lattice_db>(paths.file("intent.sqlite"));
+    const auto writer=topology_access::writer(*owner);ASSERT_TRUE(writer);
+    controller_intent intent;intent.begin(owner,clock_type::now()+2s);
+    EXPECT_EQ(topology_access::actual_waiters(*writer),1u);
+    EXPECT_EQ(sqlite3_get_autocommit(topology_access::raw(*writer)),1);
+    intent_reader_state state;std::thread worker;
+    intent_thread_ending ending{intent,worker};
+    worker=std::thread([&]{
+        {std::lock_guard lock(state.mutex);state.started=true;}state.changed.notify_all();
+        try{const auto rows=writer->query("SELECT 911 AS n");state.value=std::get<int64_t>(rows.at(0).at("n"));}
+        catch(...){state.error=std::current_exception();}
+        {std::lock_guard lock(state.mutex);state.done=true;}state.changed.notify_all();
+    });
+    {std::unique_lock lock(state.mutex);ASSERT_TRUE(state.changed.wait_for(lock,1s,[&]{return state.started;}));}
+    {
+        controller_intent::turn own_turn(intent);
+        EXPECT_EQ(std::get<int64_t>(writer->query("SELECT 17 AS n").at(0).at("n")),17);
+        std::unique_lock lock(state.mutex);EXPECT_FALSE(state.changed.wait_for(lock,100ms,[&]{return state.done;}));
+    }
+    EXPECT_EQ(topology_access::actual_waiters(*writer),1u);
+    intent.release();EXPECT_EQ(topology_access::actual_waiters(*writer),0u);
+    {std::unique_lock lock(state.mutex);ASSERT_TRUE(state.changed.wait_for(lock,1s,[&]{return state.done;}));}
+    worker.join();EXPECT_FALSE(state.error);EXPECT_EQ(state.value,911);
+    EXPECT_EQ(sqlite3_get_autocommit(topology_access::raw(*writer)),1);owner->close();
+}
+TEST(ControllerAdmissionIntent, RepeatedBeginCannotExtendFirstPublishedDeadline) {
+    local_paths paths;auto owner=std::make_shared<lattice_db>(paths.file("deadline.sqlite"));
+    const auto writer=topology_access::writer(*owner);ASSERT_TRUE(writer);
+    controller_intent intent;intent.begin(owner,clock_type::now()+100ms);
+    intent.begin(owner,clock_type::now()+2s); // may tighten, never renew
+    EXPECT_EQ(topology_access::actual_waiters(*writer),1u);
+    intent_reader_state state;std::thread worker;
+    intent_thread_ending ending{intent,worker};
+    worker=std::thread([&]{try{
+        const auto rows=writer->query("SELECT 912 AS n");state.value=std::get<int64_t>(rows.at(0).at("n"));
+    }catch(...){state.error=std::current_exception();}
+        {std::lock_guard lock(state.mutex);state.done=true;}state.changed.notify_all();});
+    {std::unique_lock lock(state.mutex);ASSERT_TRUE(state.changed.wait_for(lock,1s,[&]{return state.done;}));}
+    worker.join();EXPECT_FALSE(state.error);EXPECT_EQ(state.value,912);
+    // Expiry allows ordinary work; it is not a refund/ending claim. The real
+    // owner must still retire its own fixed cell, exactly once.
+    EXPECT_EQ(topology_access::actual_waiters(*writer),1u);
+    intent.release();intent.release();EXPECT_EQ(topology_access::actual_waiters(*writer),0u);owner->close();
+}
+TEST(ControllerAdmissionIntent, ClosedOwnerCannotPublishDenialOrOpenTransaction) {
+    local_paths paths;auto owner=std::make_shared<lattice_db>(paths.file("closed.sqlite"));
+    const auto writer=topology_access::writer(*owner);ASSERT_TRUE(writer);owner->close();
+    controller_intent intent;EXPECT_THROW(intent.begin(owner,clock_type::now()+2s),db_error);
+    EXPECT_EQ(topology_access::actual_waiters(*writer),0u);intent.release();
+}
+} // namespace

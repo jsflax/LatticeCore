@@ -40,6 +40,7 @@ class recovery_reconciliation_descriptor final {
         std::shared_ptr<receiver_source_binding> source;
         receiver_source_binding::recovery_view view;
         std::shared_ptr<const predecessor> compatibility;
+        std::string receipt_decisions; // verified Q-order dispositions + resend bits
     };
     // First data member, destroyed LAST: physical capacity is released only
     // after all Q/journal/source/worker payloads below have been destroyed.
@@ -56,6 +57,7 @@ class recovery_reconciliation_descriptor final {
     std::vector<contribution> contributions_;
     canonical_scoped_limits limits_{};
     bool restart_revalidation_=false;
+    bool dispositions_unavailable_=false; // migrated v1: no-send refreeze only
     uint64_t controller_revision_=0;
     // Fixed at issuance. Every actual send in this cohort shares one retry
     // revision, so sibling delivery deadlines cannot each mint another pass.

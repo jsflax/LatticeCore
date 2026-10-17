@@ -9,6 +9,11 @@ namespace lattice::detail {
 // No definition of this access seam is linked into a production target.
 struct canonical_writer_custody_test_access {
     static sqlite3* fault_handle(database& writer) {return writer.internal_handle();}
+    // Invoke the genuine private gate for refusal qualification. This creates
+    // no Core origin, quarantine outcome, native handle escape or test grant.
+    static void enter_maintenance(database& original) {
+        database::maintenance_scope admitted(original);
+    }
     using identity_details = database::physical_identity_details;
     struct identity_observation {
         std::shared_ptr<const physical_store_identity> identity;

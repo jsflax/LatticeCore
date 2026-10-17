@@ -1,8 +1,13 @@
 #include "ordinary_cohort_attachment.hpp"
 #include "recovery_local_producer.hpp"
+#include "recovery_resume_commit_publication.hpp"
 #include "recovery_admission_test_probe.hpp"
 #include "recovery_producer_continuity.hpp"
 #include "recovery_receiver_controller.hpp"
+#ifndef __EMSCRIPTEN__
+#include "controller_store_ending.hpp"
+#include <lattice/native_retirement_storage.hpp>
+#endif
 #include "recovery_request_store.hpp"
 #ifndef __EMSCRIPTEN__
 #include "configured_recovery_connection.hpp"
@@ -29,6 +34,9 @@ namespace lattice::detail {
 namespace recovery_local_producer_test_hooks {
 thread_local const authorizer_fault* fault=nullptr;
 thread_local void (*after_inventory)()=nullptr;
+// Production-null observation at the exact already-validated upgrade WRITE.
+// Tests may install the existing restricting authorizer fault for this owner.
+thread_local void (*before_count_program_upgrade)(const lattice_db*)=nullptr;
 }
 namespace {
 using blob=std::vector<uint8_t>;
@@ -305,6 +313,15 @@ struct recovery_local_producer_adapter::context {
     std::shared_ptr<context> previous;
     std::vector<profile> profiles;
     std::shared_ptr<recovery_continuous_admission> continuous;
+    // Determined only by exact WHOLE generated-bundle comparison in bootstrap.
+    // This private spelling never grants write, receipt, or source authority.
+    bool legacy_distinct_count_programs=false;
+    bool matches_complete_programs(database& db)const {
+        std::set<std::string> checked;
+        for(const auto& p:profiles)for(const auto& [name,t]:p.schema.tables)
+            if(checked.insert(name).second&&actual_programs(db,name)!=t.enrolled)return false;
+        return true;
+    }
     const context* effective() const noexcept {
         const auto state=status.load(std::memory_order_acquire);
         if(state==2)return previous ? previous->effective() : nullptr;
@@ -680,8 +697,14 @@ std::shared_ptr<recovery_local_producer_adapter::context> recovery_local_produce
             }
             if(continuous) {
                 compile_continuous(owner,*c);
-                for(const auto& p:c->profiles)for(const auto& [name,t]:p.schema.tables)
-                    if(actual_programs(view,name)!=t.enrolled)refuse("continuous complete generated program differs");
+                if(!c->matches_complete_programs(view)) {
+                    if(!continuous_receiver_enabled(*c->continuous->state))refuse("continuous complete generated program differs");
+                    // One complete historical bundle is the only alternative.
+                    // Never select old/new programs separately by trigger or table.
+                    c->legacy_distinct_count_programs=true;
+                    compile_continuous(owner,*c);
+                    if(!c->matches_complete_programs(view))refuse("continuous complete generated program differs");
+                }
             }
         },recovery_continuous_producer::shared_install_domains(owner));
     if(!c) {
@@ -816,8 +839,9 @@ std::optional<bool> recovery_local_producer_adapter::export_protection_impl(std:
     if(automatic&&!owned_write) {
         // A busy SELECT without a main read transaction still needs provenance;
         // so does same-thread query/callback reentry even when main is idle.
-        if(database::maintenance_scope::controller_classify_locked(*writer)==
-                database::maintenance_scope::admission::engine_read_busy) {
+        const auto admission=database::maintenance_scope::controller_classify_locked(*writer, &owner->txn_owner_thread_);
+        if(admission==database::maintenance_scope::admission::engine_read_busy ||
+           admission==database::maintenance_scope::admission::core_write_busy) {
             validate_deferred_owner();return std::nullopt;
         }
     }else if(!idle&&!owned_write)

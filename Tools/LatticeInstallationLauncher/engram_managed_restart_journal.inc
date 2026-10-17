@@ -128,8 +128,9 @@
             launch.at("members").size()>256 || !launch.at("oldRefusals").is_array() ||
             launch.at("oldRefusals").size()<2 || launch.at("oldRefusals").size()>5)refused();
         const auto status=number(complete,"waitStatus");
-        if(status>std::uint64_t(std::numeric_limits<int>::max()) ||
-            (!WIFEXITED(static_cast<int>(status))&&!WIFSIGNALED(static_cast<int>(status))))refused();
+        if(status>std::uint64_t(std::numeric_limits<int>::max()))refused();
+        const int native_status=static_cast<int>(status);
+        if(!WIFEXITED(native_status)&&!WIFSIGNALED(native_status))refused();
         const auto child=managed_process(launch.at("child")),supervisor=managed_process(launch.at("supervisor"));
         if(child.parent!=supervisor.pid||number(incarnation,"pid")!=std::uint64_t(child.pid)||incarnation.size()!=5)refused();
         ordinary_launch::observed_incarnation original;

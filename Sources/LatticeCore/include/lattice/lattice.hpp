@@ -930,50 +930,50 @@ public:
         LOG_DEBUG("lattice_db", "ctor done");
     }
 
-    /// One-time repair at open: collapse audit entries whose per-sync state
-    /// rows already cover every registered replication slot. Historic
-    /// binaries compared against a stale config snapshot instead of the live
-    /// slot registry, leaving entries marked-synced-but-never-collapsed —
-    /// which also made the passive pending count (sync progress UI) grow
-    /// forever. Safe by construction: only touches entries every live slot
-    /// has acknowledged.
+    /// Best-effort repair at open: collapse entries acknowledged by every
+    /// currently registered slot. A checked negative snapshot avoids writer
+    /// admission on healthy stores; work becoming eligible afterward can wait
+    /// for the next repair. Positive work is rechecked under writer ownership.
     void heal_collapsed_sync_state() {
-        if (!db().table_exists("_lattice_sync_state") ||
-            !db().table_exists("_lattice_replication_slots")) {
-            return;
-        }
         try {
-            auto slot_rows = db().query(
-                "SELECT COUNT(*) AS cnt FROM _lattice_replication_slots", {});
-            int64_t slots = 0;
-            if (!slot_rows.empty()) {
-                auto it = slot_rows[0].find("cnt");
-                if (it != slot_rows[0].end() && std::holds_alternative<int64_t>(it->second)) {
-                    slots = std::get<int64_t>(it->second);
-                }
+            if (!db().table_exists("_lattice_sync_state") ||
+                !db().table_exists("_lattice_replication_slots")) {
+                return;
             }
-            if (slots < 1) return;
+            // Only LIVE slots count. Stale confirmations from a removed
+            // channel cannot substitute for an unacknowledged live channel.
+            // The inner join also makes zero registered slots a no-op.
+            const std::string candidates =
+                "SELECT st.audit_entry_id FROM _lattice_sync_state st"
+                " JOIN _lattice_replication_slots rs ON rs.sync_id = st.sync_id"
+                " WHERE st.is_synchronized = 1"
+                " GROUP BY st.audit_entry_id"
+                " HAVING COUNT(DISTINCT st.sync_id) ="
+                " (SELECT COUNT(*) FROM _lattice_replication_slots)";
+            auto repair_needed = [&]() {
+                const auto rows = db().query("SELECT EXISTS (" + candidates + ") AS needed");
+                if (rows.size() != 1) throw db_error("Invalid sync repair probe result");
+                const auto value = rows[0].find("needed");
+                if (value == rows[0].end()) throw db_error("Missing sync repair probe result");
+                const auto* needed = std::get_if<int64_t>(&value->second);
+                if (!needed || (*needed != 0 && *needed != 1))
+                    throw db_error("Invalid sync repair probe value");
+                return *needed == 1;
+            };
+            if (!repair_needed()) return;
 
-            db().begin_transaction();
-            db().execute(
-                "UPDATE AuditLog SET isSynchronized = 1 WHERE id IN ("
-                "  SELECT st.audit_entry_id FROM _lattice_sync_state st"
-                "  WHERE st.is_synchronized = 1"
-                "  GROUP BY st.audit_entry_id"
-                "  HAVING COUNT(DISTINCT st.sync_id) >= ?)",
-                {slots});
-            db().execute(
-                "DELETE FROM _lattice_sync_state WHERE audit_entry_id IN ("
-                "  SELECT audit_entry_id FROM _lattice_sync_state"
-                "  WHERE is_synchronized = 1"
-                "  GROUP BY audit_entry_id"
-                "  HAVING COUNT(DISTINCT sync_id) >= ?)",
-                {slots});
-            db().commit();
+            // Reuse maintenance ownership: exclude other connections and
+            // same-connection callers through the read, both writes and commit.
+            // Never reuse a pre-BEGIN slot count or candidate list.
+            with_audit_prune_transaction_([&]() -> int64_t {
+                if (!repair_needed()) return 0;
+                db().execute("UPDATE AuditLog SET isSynchronized = 1 WHERE id IN (" +
+                             candidates + ")");
+                db().execute("DELETE FROM _lattice_sync_state WHERE audit_entry_id IN (" +
+                             candidates + ")");
+                return 0;
+            });
         } catch (...) {
-            if (db().is_in_transaction()) {
-                try { db().rollback(); } catch (...) {}
-            }
             LOG_WARN("lattice_db", "heal_collapsed_sync_state failed (non-fatal)");
         }
     }

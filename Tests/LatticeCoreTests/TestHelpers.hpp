@@ -4,6 +4,8 @@
 #include <LatticeCore.hpp>
 #include <filesystem>
 #include <random>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <atomic>
@@ -50,7 +52,14 @@ private:
 class LatticeTestEnv : public ::testing::Environment {
 public:
     void SetUp() override {
-        log_file_ = fopen("/tmp/lattice_debug.log", "w");
+        const char* configured = std::getenv("LATTICE_TEST_LOG_PATH");
+        const char* path = configured ? configured : "/tmp/lattice_debug.log";
+        log_file_ = fopen(path, "w");
+        const int open_error = errno;
+        if (configured && !log_file_) {
+            FAIL() << "Cannot open configured LATTICE_TEST_LOG_PATH: " << path
+                   << ": " << std::strerror(open_error);
+        }
         if (log_file_) {
             lattice::set_log_file(log_file_);
             lattice::set_log_level(lattice::log_level::debug);

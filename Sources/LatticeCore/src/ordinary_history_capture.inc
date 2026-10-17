@@ -168,7 +168,7 @@ ordinary_mounted_history_source ordinary_export_access::register_mounted_history
         const auto physical=writer.physical_identity("main",{},true);if(!physical)refuse("mounted history physical owner unavailable");
         ordinary_export_frame frame;frame.wire_profile=true;
         capture_projected_tables(h,parent->recovery_schemas_,[](auto& out,const auto& property){lattice_db::serialize_property_for_fingerprint(out,property);},state->mounted,frame,scratch,false,nullptr,nullptr);
-        if(history_capacity_retained_payload+frame.schema.size()+frame.scope.size()+state->mounted.size()*sizeof(std::string)>ordinary_history_limits::owner_bytes-65536)refuse("mounted history owner retention bound");
+        if(history_capacity_retained_payload+sizeof(ordinary_mounted_history_source_state)+sizeof(ordinary_history_refund_cell)+frame.schema.size()+frame.scope.size()+state->mounted.size()*sizeof(std::string)>ordinary_history_limits::owner_bytes-65536)refuse("mounted history owner retention bound");
         state->scope=std::move(frame.scope);state->schema=std::move(frame.schema);state->device=std::to_string(physical->device);state->inode=std::to_string(physical->inode);
         const bool existing=inspect_storage(h,scratch);register_mutation_guard(h);mutation_scope permission(h);
         if(!existing){

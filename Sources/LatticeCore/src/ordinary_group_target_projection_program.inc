@@ -45,7 +45,7 @@ void ordinary_export_access::validate_receiver_group_target_projection(const ord
     try {
         // Exact normal selected-module validation precedes internal validation.
         // The sole private DB caller holds a genuine SAME Native read transaction.
-        out->metadata=std::make_shared<ordinary_schema_metadata>(validate_ordinary_schema(*out->plan,query));
+        out->metadata=std::make_shared<ordinary_schema_metadata>(observer_delivery_schema::validate(*held->declarations,*out->plan,query));
         out->add(out->metadata->copied_bytes);original.require_connection(connection,end);
         out->internal=std::make_shared<ordinary_internal_schema_metadata>(validate_ordinary_internal_schema(*held->declarations,*out->plan,*out->metadata,query));
         out->add(out->internal->copied_bytes);out->validation_returned=true;original.require_connection(connection,end);

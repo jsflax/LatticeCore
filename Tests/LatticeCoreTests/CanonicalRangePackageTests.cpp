@@ -1134,3 +1134,185 @@ TEST(CanonicalCursorInitial, InitialBitmapItselfStillConsumesTheDecodedScalarBud
         cursor_initial_matches(f.attempt,f.request,package.offer(),b,offset>=0);
     }
 }
+
+
+// This expectation switch belongs ONLY to this test TU. A genuine baseline
+// control compiles this unchanged appended test source against the frozen
+// preceding product. It never selects a product path or bypasses validation.
+namespace {
+constexpr uint64_t ready_reuse_shape_passes() {
+#if defined(LATTICE_READY_REUSE_BASELINE_EXPECTED_FIVE)
+    return 5;
+#else
+    return 4;
+#endif
+}
+PackageFixture ready_reuse_fixture(bool registered) {
+    PackageFixture f;
+    const sr::row_values values{{"integer",int64_t(-17)},{"real",1.25},{"null",nullptr},
+        {"blob",std::vector<uint8_t>{0,1,127,255}},
+        {"text",std::string("quote\" slash\\ nul")+std::string(1,'\0')+" caf\xc3\xa9 \xf0\x9f\x9a\x80"}};
+    f.rows={{{"PackageSourceRow","A"},cr::present{sr::encode_values(values,f.policy.codec.values)}},
+        f.row("B","second"),{{"PackageSourceRow","C"},cr::tombstone{}}};
+    f.request.receipts={{"original-a","namespace",{{"PackageSourceRow","A"}}},
+        {"original-b","namespace",{{"PackageSourceRow","B"}}},
+        {"original-c","namespace",{{"PackageSourceRow","C"}}}};
+    f.receipts={{"original-a",cr::committed{"namespace","coverage",cr::decision::applied,3,cr::identity{"PackageSourceRow","A"}}},
+        {"original-b",cr::unknown{cr::unknown_reason::missing_coverage}},
+        {"original-c",cr::unknown{cr::unknown_reason::legacy}}};
+    if(!registered)f.receipts[1].value=cr::not_committed{"namespace","coverage"};
+    if(registered){
+        f.request.registered_producer=recovery_receipt_binding{{"ready-producer",package_uuid('6')},package_uuid('7'),1,1};
+        f.request.receipt_namespace="namespace";
+        for(size_t i=0;i<f.receipts.size();++i){
+            f.request.receipts[i].operation_digest=std::string(64,char('c'+i));
+            f.receipts[i].operation_digest=f.request.receipts[i].operation_digest;
+        }
+    }
+    f.seal_request();return f;
+}
+cr::encoded_package ready_reuse_build(const PackageFixture& f) {
+    return cr::assemble_package(f.attempt,1,f.request,7,f.lease,f.rows,f.receipts,f.policy,
+        f.request.registered_producer?std::optional<uint64_t>{1}:std::nullopt);
+}
+// A fixed fixture oracle uses the unchanged strict public functions. Its two
+// records/page boundary is explicit, not the package partition algorithm.
+std::vector<std::string> ready_reuse_public_frames(const PackageFixture& f,const cr::manifest& m) {
+    const auto version=f.request.registered_producer?3u:2u;
+    std::vector<std::string> result{cr::encode({f.attempt,1,m,version},f.policy.codec)};
+    for(size_t first=0,index=0;first<f.rows.size();first+=2,++index){
+        cr::content_page page;page.manifest_digest=m.manifest_digest;page.index=index;
+        const auto stop=std::min(first+2,f.rows.size());
+        page.items.assign(f.rows.begin()+first,f.rows.begin()+stop);page.count=page.items.size();
+        for(const auto& item:page.items)page.bytes+=cr::content_record_bytes(item,f.policy.codec);
+        page.digest=cr::page_sha256(page,f.policy.codec);
+        result.push_back(cr::encode({f.attempt,1,page,version},f.policy.codec));
+    }
+    for(size_t first=0,index=0;first<f.receipts.size();first+=2,++index){
+        cr::receipt_page page;page.manifest_digest=m.manifest_digest;page.index=index;
+        const auto stop=std::min(first+2,f.receipts.size());
+        page.items.assign(f.receipts.begin()+first,f.receipts.begin()+stop);page.count=page.items.size();
+        for(const auto& item:page.items)page.bytes+=cr::receipt_record_bytes(item,f.policy.codec);
+        page.digest=cr::page_sha256(page,f.policy.codec);
+        result.push_back(cr::encode({f.attempt,1,page,version},f.policy.codec));
+    }
+    result.push_back(cr::encode({f.attempt,1,cr::end{m.manifest_digest},version},f.policy.codec));return result;
+}
+}
+
+TEST(CanonicalReadyPayloadReuse, ExactLegacyAndRegisteredFramesKeepPublicHashesBoundariesAndOneFewerShapePass) {
+    for(bool registered:{false,true}){
+        SCOPED_TRACE(registered);auto f=ready_reuse_fixture(registered);const auto rows=f.rows;
+        uint64_t calls=0;
+        const auto package=[&]{sequence_counter_scope count;auto value=ready_reuse_build(f);calls=count.value.content_shape_calls;return value;}();
+        EXPECT_EQ(calls,ready_reuse_shape_passes()*f.rows.size());EXPECT_EQ(f.rows,rows);
+        const auto& m=package.offer();
+        EXPECT_EQ(m.counts.identities,3u);EXPECT_EQ(m.counts.present,2u);EXPECT_EQ(m.counts.tombstones,1u);
+        EXPECT_EQ(m.counts.content_pages,2u);EXPECT_EQ(m.counts.receipt_pages,2u);EXPECT_EQ(m.counts.receipts,3u);
+        EXPECT_EQ(m.counts.rebase_identities,3u);EXPECT_EQ(package.frames().size(),6u);
+        uint64_t content_bytes=0,receipt_bytes=0;
+        for(const auto& row:f.rows)content_bytes+=cr::content_record_bytes(row,f.policy.codec);
+        for(const auto& row:f.receipts)receipt_bytes+=cr::receipt_record_bytes(row,f.policy.codec);
+        EXPECT_EQ(m.counts.content_bytes,content_bytes);EXPECT_EQ(m.counts.receipt_bytes,receipt_bytes);
+        EXPECT_EQ(cr::content_sha256(m,f.rows,f.policy.codec),m.content_digest);
+        EXPECT_EQ(cr::receipts_sha256(m,f.receipts,f.policy.codec),m.receipt_digest);
+        EXPECT_EQ(cr::rebase_sha256(f.attempt,f.request,f.policy.codec),m.rebase_digest);
+        EXPECT_EQ(cr::manifest_sha256(m,f.policy.codec),m.manifest_digest);
+        EXPECT_EQ(package.frames(),ready_reuse_public_frames(f,m));f.verify(package);
+        cr::validated_sequence cursor(f.attempt,f.request,m,f.policy.codec);
+        for(size_t i=1;i<package.frames().size();++i){
+            const auto frame=cr::decode(package.frames()[i],f.policy.codec);EXPECT_EQ(frame.version,registered?3u:2u);
+            cursor.advance(frame);
+        }
+        EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);
+        // Paired genuine old/current product qualification compares these exact
+        // complete wire strings, not just an independently recomputed digest.
+        RecordProperty(registered?"registered_frames":"legacy_frames",nlohmann::json(package.frames()).dump());
+        RecordProperty(registered?"registered_shape_calls":"legacy_shape_calls",std::to_string(calls));
+        RecordProperty(registered?"registered_wire_bytes":"legacy_wire_bytes",std::to_string(package.retained_wire_bytes()));
+    }
+}
+
+TEST(CanonicalReadyPayloadReuse, EmptyPresentAndTombstoneInputsKeepTheExactCountedPassReduction) {
+    for(unsigned shape=0;shape<4;++shape){
+        SCOPED_TRACE(shape);PackageFixture f;
+        if(shape==0)f.rows.clear();
+        if(shape==2)for(auto& row:f.rows)row.value=cr::tombstone{};
+        if(shape==3)f.rows[1].value=cr::tombstone{};
+        if(shape>=2){
+            // Full snapshots may carry tombstones only for requested refreshes.
+            EXPECT_THROW(f.build(),cr::protocol_error);
+            // These changed rows belong to a genuine advancing delta instead.
+            f.request.selection=cr::mode::delta;f.request.base=6;
+            f.request.expected={1,f.request.source,{cr::frontier_kind::position,6}};
+            f.seal_request();
+        }
+        uint64_t calls=0;
+        const auto package=[&]{sequence_counter_scope count;auto value=f.build();calls=count.value.content_shape_calls;return value;}();
+        EXPECT_EQ(calls,ready_reuse_shape_passes()*f.rows.size());f.verify(package);
+        RecordProperty("shape_"+std::to_string(shape)+"_calls",std::to_string(calls));
+        RecordProperty("shape_"+std::to_string(shape)+"_frames",nlohmann::json(package.frames()).dump());
+    }
+}
+
+TEST(CanonicalReadyPayloadReuse, InitialAdmissionStillRejectsMalformedSemanticPayloadBeforeReuse) {
+    PackageFixture f;const auto good=f.rows;const auto original=f.build().frames();
+    const std::vector<std::string> malformed{
+        "{\"body\":",R"({"body":{"kind":1,"value":true}})",
+        R"({"body":{"kind":2,"value":"a"},"body":{"kind":2,"value":"b"}})",
+        R"({"body":{"kind":2,"value":"\ud800"}})",R"({"body":{"kind":7,"value":1}})",
+        std::string("{\"body\":{\"kind\":2,\"value\":\"")+char(0xff)+"\"}}"};
+    for(size_t i=0;i<malformed.size();++i){
+        SCOPED_TRACE(i);f.rows=good;f.rows[0].value=cr::present{malformed[i]};const auto bad=f.rows;
+        {sequence_counter_scope count;EXPECT_THROW(f.build(),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+        EXPECT_EQ(f.rows,bad);
+    }
+    f.rows=good;EXPECT_EQ(f.build().frames(),original);
+    f.rows.push_back(f.rows.front());EXPECT_THROW(f.build(),cr::protocol_error);
+    f.rows=good;std::swap(f.rows[0],f.rows[1]);EXPECT_THROW(f.build(),cr::protocol_error);
+}
+
+TEST(CanonicalReadyPayloadReuse, FrozenPayloadAndValueBudgetsStillRefuseAtTheInitialPass) {
+    PackageFixture f;f.rows={f.row("A","12345678")};
+    const auto exact=std::get<cr::present>(f.rows[0].value).payload.size();
+    f.request.budget.payload_bytes=exact;f.seal_request();EXPECT_NO_THROW(f.build());
+    f.rows[0]=f.row("A","123456789");
+    {sequence_counter_scope count;EXPECT_THROW(f.build(),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+    f.rows[0]=f.row("A","12345678");f.policy.codec.values.value_bytes=7;
+    {sequence_counter_scope count;EXPECT_THROW(f.build(),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+}
+
+TEST(CanonicalReadyPayloadReuse, PublicMutableDtosAreRevalidatedAfterEverySuccessfulCall) {
+    PackageFixture f;const auto package=f.build();const auto valid=f.rows;
+    EXPECT_EQ(cr::content_sha256(package.offer(),f.rows,f.policy.codec),package.offer().content_digest);
+    f.rows[0].value=cr::present{R"({"body":{"kind":1,"value":true}})"};
+    {sequence_counter_scope count;EXPECT_THROW(cr::content_sha256(package.offer(),f.rows,f.policy.codec),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+    auto frame=cr::decode(package.frames()[1],f.policy.codec);auto& page=std::get<cr::content_page>(frame.body);
+    EXPECT_EQ(cr::page_sha256(page,f.policy.codec),page.digest);EXPECT_EQ(cr::encode(frame,f.policy.codec),package.frames()[1]);
+    page.items[0].value=f.rows[0].value;
+    {sequence_counter_scope count;EXPECT_THROW(cr::page_sha256(page,f.policy.codec),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+    {sequence_counter_scope count;EXPECT_THROW(cr::encode(frame,f.policy.codec),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+    cr::stream_hasher strict(package.offer(),cr::stream_kind::content,f.policy.codec);auto item=valid[0];strict.append(item);
+    item.key.id="B";item.value=f.rows[0].value;
+    {sequence_counter_scope count;EXPECT_THROW(strict.append(item),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+    cr::validated_sequence cursor(f.attempt,f.request,package.offer(),f.policy.codec);
+    cursor.advance(cr::decode(package.frames()[1],f.policy.codec));const auto before=cursor.snapshot();
+    auto next=cr::decode(package.frames()[2],f.policy.codec);std::get<cr::content_page>(next.body).items[0].value=f.rows[0].value;
+    {sequence_counter_scope count;EXPECT_THROW(cursor.advance(next),cr::protocol_error);EXPECT_EQ(count.value.content_shape_calls,1u);}
+    EXPECT_EQ(cursor.snapshot(),before);
+    for(size_t i=2;i<package.frames().size();++i)cursor.advance(cr::decode(package.frames()[i],f.policy.codec));
+    EXPECT_EQ(cursor.status(),cr::phase::sequence_complete_unverified);EXPECT_EQ(package.frames().front(),cr::encode({f.attempt,1,package.offer()},f.policy.codec));
+}
+
+TEST(CanonicalReadyPayloadReuse, PageAndLateOutputLimitsStillRefuseWithoutChangingEarlierPackage) {
+    PackageFixture f;const auto package=f.build();const auto retained=package.frames();
+    f.policy.retained_wire_bytes=package.retained_wire_bytes()-1;EXPECT_THROW(f.build(),cr::protocol_error);
+    f.policy.retained_wire_bytes=524288;f.policy.frames=package.frames().size()-1;EXPECT_THROW(f.build(),cr::protocol_error);
+    f.policy.frames=66;f.request.budget.content_pages=1;f.seal_request();EXPECT_THROW(f.build(),cr::protocol_error);
+    EXPECT_EQ(package.frames(),retained);
+    PackageFixture node;node.policy.codec.maximum.items_per_page=100;node.policy.codec.nodes=512;
+    node.request.budget=node.policy.codec.maximum;node.rows.clear();
+    for(unsigned i=100;i<180;++i)node.rows.push_back(node.row("id-"+std::to_string(i),"value"));
+    node.seal_request();const auto split=node.build();EXPECT_GT(split.offer().counts.content_pages,1u);node.verify(split);
+    RecordProperty("node_split_frames",nlohmann::json(split.frames()).dump());
+}

@@ -38,6 +38,7 @@ public:
 // Neither request selectors nor copied directory responses can construct it.
 class ordinary_receiver_wss_request final {
     friend class ordinary_export_access; // Existing schema-original issuer reads the same private request state.
+    friend class ordinary_target_staging_connection; // Ends only the same stopped request schema aliases.
     friend class ordinary_receiver_wss_access;
     friend class receiver_directory_completion;
     friend class ordinary_managed_wss_admission;

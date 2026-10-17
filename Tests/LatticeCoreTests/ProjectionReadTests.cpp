@@ -1,4 +1,5 @@
 #include "TestHelpers.hpp"
+#include "ExceptionObservation.hpp"
 #include <lattice/projection.hpp>
 #include <chrono>
 #include <functional>
@@ -805,6 +806,9 @@ TEST(ProjectionRead, PressureSnapshotsSurviveConcurrentHookWritesAndTopologyChan
     parent.add(1, "one"); arm.add(2, "two");
     parent.db.set_wal_keeper_eviction_threshold_bytes(1);
     std::atomic<bool> stop{false}, failed{false};
+    // Separate actual first errors: only writer writes its slot, read after join.
+    std::exception_ptr writer_first_error, topology_first_error;
+    int topology_iteration=-1;const char* topology_operation="not-started";
     const auto* diagnostic_flag = std::getenv("LATTICE_PROJECTION_STRESS_DIAGNOSTICS");
     const bool diagnostics = diagnostic_flag && std::strcmp(diagnostic_flag, "1") == 0;
     std::atomic<int> iteration{-1}, phase{0};
@@ -848,19 +852,26 @@ TEST(ProjectionRead, PressureSnapshotsSurviveConcurrentHookWritesAndTopologyChan
                 if (diagnostics) { writer_completed.fetch_add(1); writer_in_flight.store(false); }
             }
         } catch (...) {
+            if (!writer_first_error) writer_first_error=std::current_exception();
             if (diagnostics) writer_in_flight.store(false);
             failed.store(true);
         }
     });
     try {
         for (int i = 0; i < 32; ++i) {
+            topology_iteration=i;
             if (diagnostics) iteration.store(i);
-            mark_phase(1); parent.db.attach(arm.db); mark_phase(2);
-            mark_phase(3); parent.db.detach(arm.db); mark_phase(4);
+            topology_operation="attach";mark_phase(1); parent.db.attach(arm.db); mark_phase(2);
+            topology_operation="detach";mark_phase(3); parent.db.detach(arm.db); mark_phase(4);
         }
-    } catch (...) { failed.store(true); }
+    } catch (...) { if (!topology_first_error) topology_first_error=std::current_exception();failed.store(true); }
     stop.store(true); mark_phase(5); writer.join(); mark_phase(6);
-    EXPECT_FALSE(failed.load());
+    EXPECT_FALSE(failed.load())
+        << "writerFirstCaptured=" << bool(writer_first_error)
+        << " writerFirst=" << lattice_test::actual_exception_text(writer_first_error)
+        << " topologyFirstCaptured=" << bool(topology_first_error)
+        << " topologyIteration=" << topology_iteration << " topologyOperation=" << topology_operation
+        << " topologyFirst=" << lattice_test::actual_exception_text(topology_first_error);
     parent.db.close();
     for (const auto& source : projection_pressure_test_access::sources(parent.db)) EXPECT_FALSE(source->active.load());
     // Qualification requires native ASan/TSan; source review is not a race test.

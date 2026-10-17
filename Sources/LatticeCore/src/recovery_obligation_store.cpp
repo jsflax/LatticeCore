@@ -231,12 +231,15 @@ struct backend {
             entry_size(e,l,s.address.channel,code::corrupt_state)!=number(r,"bytes")) fail(code::corrupt_state,"obligation contradictory identity state");
         return e;
     }
+    void require_entry_covered(const scope_t& s,const entry_t& e) const {
+        const auto g=config();
+        if (g.usage.records<1 || g.usage.encoded_bytes<entry_size(e,l,s.address.channel) || g.record<e.sequence ||
+            (e.first_export_claim && g.export_claim<*e.first_export_claim)) fail(code::corrupt_state,"obligation counters do not cover addressed identity");
+    }
     entry_t required(const scope_t& s,const std::string& id) const {
         auto e=entry(s,uuid(id));
         if (!e) fail(code::conflict,"obligation original is not recorded for this scope");
-        const auto g=config();
-        if (g.usage.records<1 || g.usage.encoded_bytes<entry_size(*e,l,s.address.channel) || g.record<e->sequence ||
-            (e->first_export_claim && g.export_claim<*e->first_export_claim)) fail(code::corrupt_state,"obligation counters do not cover addressed identity");
+        require_entry_covered(s,*e);
         return *e;
     }
     recovery_obligation_record actual(const recovery_obligation_record& input) const {
@@ -446,7 +449,10 @@ entry_t recovery_obligation_store::record(const recovery_obligation_address& a,c
 }
 std::optional<entry_t> recovery_obligation_store::find(const recovery_obligation_address& a,const std::string& id) const {
     backend b{writer(),limits_,shared_domains_}; auto s=b.current(a); auto result=b.entry(s,uuid(id));
-    if (result) b.required(s,id); return result;
+    // The addressed entry is already decoded and checked in this exact owned
+    // transaction. Reuse it while retaining the original later config/counter
+    // coverage check; do not issue and discard a second identical entry read.
+    if (result) b.require_entry_covered(s,*result); return result;
 }
 recovery_obligation_export_ticket recovery_obligation_store::claim_export(const recovery_obligation_address& a,const std::vector<std::string>& ids) {
     backend b{writer(),limits_,shared_domains_};

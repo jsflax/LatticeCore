@@ -1,0 +1,123 @@
+name: Coherent Core qualification
+
+# Controlled qualification of one immutable source commit. Existing failures
+# remain failures; focused diagnostics cannot replace a failed full Core leg.
+on:
+  push:
+    branches: ["codex/recovery-coherent-qualification-*"]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact Core commit containing this wrapper
+        type: string
+        required: true
+      expected_tree:
+        description: Exact Core tree for that commit
+        type: string
+        required: true
+
+      old_companion_sha:
+        description: Optional exact NEW genuine-old-body provenance commit (missing means no old coverage)
+        type: string
+        required: false
+      old_companion_tree:
+        description: Exact tree for the optional old provenance commit
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coherent-core-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      CORE_SHA: ${{ inputs.expected_sha || github.sha }}
+      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
+      EVENT_KIND: ${{ github.event_name }}
+      EVENT_SHA: ${{ github.sha }}
+      CORE_TREE: ${{ inputs.expected_tree }}
+      OLD_COMPANION_SHA: ${{ inputs.old_companion_sha || '14688a8fe1b892e47e567730697b49eef4ec8939' }}
+      OLD_COMPANION_TREE: ${{ inputs.old_companion_tree || 'c3d3399ba8ab039d5a2944f4e081ae3595f1d7f8' }}
+    steps:
+      - name: Fetch exact source into owned localdev workspace
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CORE_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          test "$CORE_SHA" = "$EVENT_SHA"
+          if [[ "$EVENT_KIND" == workflow_dispatch ]]; then
+            [[ "$CORE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          umask 077
+          CORE_JOB_ROOT="$HOME/localdev/coherent-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$CORE_JOB_ROOT"
+          mkdir -p "$CORE_JOB_ROOT/bootstrap-tmp"
+          export TMPDIR="$CORE_JOB_ROOT/bootstrap-tmp" TMP="$CORE_JOB_ROOT/bootstrap-tmp" TEMP="$CORE_JOB_ROOT/bootstrap-tmp"
+          {
+            echo "CORE_JOB_ROOT=$CORE_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+          } >> "$GITHUB_ENV"
+          git init "$CORE_JOB_ROOT/source"
+          git -C "$CORE_JOB_ROOT/source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$CORE_SHA"
+          git -C "$CORE_JOB_ROOT/source" checkout --detach "$CORE_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SHA"
+          ACTUAL_TREE="$(git -C "$CORE_JOB_ROOT/source" rev-parse 'HEAD^{tree}')"
+          if [[ "$EVENT_KIND" == workflow_dispatch ]]; then
+            test "$ACTUAL_TREE" = "$CORE_TREE"
+          else
+            # Git's immutable push commit already binds this actual tree.
+            CORE_TREE="$ACTUAL_TREE"
+            echo "CORE_TREE=$CORE_TREE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Fetch explicitly supplied immutable genuine old-body source
+        if: env.OLD_COMPANION_SHA != '' || env.OLD_COMPANION_TREE != ''
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$OLD_COMPANION_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$OLD_COMPANION_TREE" =~ ^[0-9a-f]{40}$ ]]
+          git init "$CORE_JOB_ROOT/old-source"
+          git -C "$CORE_JOB_ROOT/old-source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$OLD_COMPANION_SHA"
+          git -C "$CORE_JOB_ROOT/old-source" checkout --detach "$OLD_COMPANION_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/old-source" rev-parse HEAD)" = "$OLD_COMPANION_SHA"
+          test "$(git -C "$CORE_JOB_ROOT/old-source" rev-parse 'HEAD^{tree}')" = "$OLD_COMPANION_TREE"
+          # No substitution of current product or an unbound released version.
+
+      - name: Clean all-consumer build, full Core, and focused failure diagnostics
+        timeout-minutes: 322
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          OLD_ARGUMENTS=()
+          if [[ -n "$OLD_COMPANION_SHA" || -n "$OLD_COMPANION_TREE" ]]; then
+            OLD_ARGUMENTS=(--old-source "$CORE_JOB_ROOT/old-source" --old-sha "$OLD_COMPANION_SHA" --old-tree "$OLD_COMPANION_TREE")
+          fi
+          python3 "$CORE_JOB_ROOT/source/scripts/recovery_coherent_qualification.py" \
+            --source "$CORE_JOB_ROOT/source" --root "$CORE_JOB_ROOT/qualification" \
+            --expected-sha "$CORE_SHA" --expected-tree "$CORE_TREE" "${OLD_ARGUMENTS[@]}"
+
+      - name: Preserve raw outcomes and retained namespaces, including failures
+        if: always() && env.CORE_JOB_ROOT != ''
+        timeout-minutes: 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: coherent-core-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CORE_JOB_ROOT }}/qualification/out
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

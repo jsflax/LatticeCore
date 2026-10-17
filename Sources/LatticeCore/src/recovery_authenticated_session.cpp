@@ -155,6 +155,30 @@ struct authenticated_mounted_source {
     std::mutex ready_mutex;
     std::map<std::string,std::weak_ptr<authenticated_ready_fence>> ready_fences;
     std::shared_ptr<const authenticated_ready_maintenance_test_observation::probe> maintenance_probe;
+    static std::shared_ptr<authenticated_mounted_source> create() {
+#if defined(__APPLE__) || defined(__linux__)
+        const auto pid=::getpid();auto* raw=new authenticated_mounted_source;
+        if(pid!=::getpid())reject("mounted source allocation crossed process");
+        // Probe/adapter/owner destructors may contain arbitrary application or
+        // SQLite tails. End one owner at a time, abandoning the remainder if a
+        // destructor actually forks instead of unwinding inherited resources.
+        std::shared_ptr<authenticated_mounted_source> value(raw,[pid](auto* source){
+            if(pid!=::getpid())return;
+            source->maintenance_probe.reset();if(pid!=::getpid())return;
+            source->ready_fences.clear();if(pid!=::getpid())return;
+            source->adapter.reset();if(pid!=::getpid())return;
+            source->owner.reset();if(pid!=::getpid())return;
+            source->owner_guard.reset();if(pid!=::getpid())return;
+            // Registry capacity outlives every Native-bearing source tail.
+            source->ready_budget.reset();if(pid!=::getpid())return;
+            delete source;
+        });
+        if(pid!=::getpid())reject("mounted source publication crossed process");
+        return value;
+#else
+        return std::make_shared<authenticated_mounted_source>();
+#endif
+    }
 };
 namespace {
 std::mutex maintenance_probe_mutex;
@@ -166,87 +190,172 @@ void observe_maintenance(const std::shared_ptr<authenticated_mounted_source>& so
 std::shared_ptr<const authenticated_ready_maintenance_test_observation::probe> authenticated_ready_maintenance_test_observation::exchange(std::shared_ptr<const probe> next) {
     std::shared_ptr<const probe> prior;{std::lock_guard lock(maintenance_probe_mutex);prior=std::move(maintenance_probe);maintenance_probe=std::move(next);}return prior;
 }
+// This immutable process witness is read BEFORE any inherited singleton guard,
+// atomic shared_ptr implementation lock, service mutex, or retained graph.
+#if defined(__APPLE__) || defined(__linux__)
+namespace { const pid_t maintenance_creator_process=::getpid(); }
+#endif
 // One bounded registration per existing physical registry slot. No per-tick
 // task queue and no SQL, callback or source destruction under the leaf mutex.
 struct authenticated_ready_maintenance {
 #if defined(__APPLE__) || defined(__linux__)
+    static constexpr size_t capacity=128;
     struct entry {
         std::shared_ptr<authenticated_mounted_source> source;
         bool armed=false,dirty=true,observed_empty=false;
         std::optional<std::chrono::steady_clock::time_point> due;
     };
     struct shared_state {
-        std::mutex mutex;std::condition_variable changed;bool stopped=false;
+        const pid_t creator=::getpid();
+        std::mutex mutex;std::condition_variable changed;bool stopped=false,worker_exited=false;
+        std::thread::id worker;
+        uint64_t requested=0,settled=0,boundaries=0;
+        size_t active_removal_originals=0;
         std::map<authenticated_mounted_source*,std::shared_ptr<entry>> entries;
     };
-    std::shared_ptr<shared_state> shared=std::make_shared<shared_state>();
+    struct entry_custody {
+        const pid_t creator=::getpid();
+        std::array<std::shared_ptr<entry>,capacity> values;
+        // Keep the actual registry charge through the witness decrement, not
+        // just through the source deleter's last Native-bearing release.
+        std::array<std::shared_ptr<authenticated_ready_budget>,capacity> budgets;
+        void reset()noexcept {
+            for(auto& item:values){if(creator!=::getpid())return;item.reset();}
+            for(auto& budget:budgets){if(creator!=::getpid())return;budget.reset();}
+        }
+    };
+    static std::shared_ptr<shared_state> active; // Published only through shared_ptr atomic free functions.
+    static std::atomic<uint64_t> launches;
+    static bool creator()noexcept{return maintenance_creator_process==::getpid();}
+    static void require_creator(){if(!creator())reject("inherited READY maintenance belongs to another process");}
+    static std::shared_ptr<shared_state> make_state() {
+        require_creator();const auto pid=::getpid();
+        auto* raw=new shared_state;
+        // A user allocator may have forked; the inherited graph is abandoned.
+        if(pid!=::getpid())reject("READY maintenance allocation crossed process");
+        std::shared_ptr<shared_state> value(raw,[pid](shared_state* state){if(pid==::getpid())delete state;});
+        require_creator();return value;
+    }
+    std::shared_ptr<shared_state> shared=make_state();
     std_thread_scheduler executor;
     authenticated_ready_maintenance() {
-        // The scheduler owns launch-failure cleanup/join/self-shutdown. If
-        // enqueue allocation throws its destructor settles the launched worker.
-        executor.invoke([keep=shared]{loop(keep);});
+        require_creator();
+        // The state deleter fences inherited graph teardown. The scheduler
+        // retains it through its real loop ending even after shutdown failure.
+        executor.invoke([keep=shared]{if(creator())loop(keep);});
+        require_creator();
+        std::atomic_store_explicit(&active,shared,std::memory_order_seq_cst); // before the first entry
+        launches.fetch_add(1,std::memory_order_relaxed);
     }
     ~authenticated_ready_maintenance() {
+        if(!creator())return;
         {std::lock_guard lock(shared->mutex);shared->stopped=true;}
         shared->changed.notify_all();
-        // A join failure restores the scheduler's thread custody. Its own
-        // destructor retries and provides the state-only detach fallback; do
-        // not let the first shutdown error escape this noexcept destructor.
         try{executor.shutdown();}catch(...){}
     }
-    static authenticated_ready_maintenance& instance(){static authenticated_ready_maintenance value;return value;}
+    static authenticated_ready_maintenance& instance(){require_creator();static authenticated_ready_maintenance value;return value;}
     static bool live(const std::shared_ptr<authenticated_mounted_source>& source) {
         return source->owner_guard&&source->owner_guard->alive.load(std::memory_order_seq_cst)&&
             source->adapter&&source->adapter->authenticated_active_guard()->load(std::memory_order_acquire);
     }
+    // All worker-owned Native-bearing batch values live in this creator-fenced
+    // allocation. Clear individual captures off leaf, checking after each last
+    // release; an inherited callback continuation abandons the remaining graph.
+    struct batch {
+        native_retirement_storage<std::array<std::shared_ptr<entry>,capacity>,
+            std::array<std::shared_ptr<entry>,capacity>,std::shared_ptr<authenticated_mounted_source>,
+            std::shared_ptr<entry>,canonical_ready_maintenance_result> held;
+        size_t work_count=0,retired_count=0;
+        bool clear_result()noexcept {
+            if(!held.in_creator_process())return false;
+            auto& result=held.get<4>();
+            for(auto* error:{&result.settlement.primary_error,&result.settlement.cleanup_error,
+                    &result.settlement.postcommit_error,&result.settlement.notification_error}) {
+                *error={};if(!held.in_creator_process())return false;
+            }
+            result={};return held.in_creator_process();
+        }
+        bool clear()noexcept {
+            if(!clear_result())return false;
+            if(!held.release<3>()||!held.release<2>())return false;
+            for(auto& item:held.get<0>()){item.reset();if(!held.in_creator_process())return false;}
+            for(auto& item:held.get<1>()){item.reset();if(!held.in_creator_process())return false;}
+            return true;
+        }
+        ~batch(){(void)clear();}
+    };
     static void loop(const std::shared_ptr<shared_state>& state) {
         for(;;) {
+            if(!creator())return;
+            // No prior try/catch/batch locals survive to this boundary. The
+            // ticket acknowledges capture destruction, not a per-item callback,
+            // map erase, successful maintenance SQL or physical connection end.
+            {
+                std::lock_guard lock(state->mutex);
+                state->worker=std::this_thread::get_id();
+                if(state->boundaries!=std::numeric_limits<uint64_t>::max())++state->boundaries;
+                if(state->active_removal_originals==0)state->settled=state->requested;
+                if(state->stopped&&state->entries.empty()&&state->active_removal_originals==0)state->worker_exited=true;
+            }
+            state->changed.notify_all();
+            {std::lock_guard lock(state->mutex);if(state->worker_exited)return;}
             try {
-                std::vector<std::shared_ptr<entry>> work,retired;
+                batch values;if(!creator())return;
+                auto& work=values.held.get<0>();auto& retired=values.held.get<1>();
+                bool oversized=false;
                 {
                     std::unique_lock lock(state->mutex);
                     auto wake=std::chrono::steady_clock::now()+std::chrono::seconds(1);
-                    for(const auto& [key,item]:state->entries)if(item->armed){
+                    for(const auto& [key,item]:state->entries)if(!state->stopped&&item->armed){
                         if(item->dirty){wake=std::chrono::steady_clock::now();break;}
                         if(item->due&&*item->due<wake)wake=*item->due;}
-                    state->changed.wait_until(lock,wake);
+                    // A ticket published between the boundary and this lock is
+                    // retained in the predicate; its notification cannot vanish.
+                    state->changed.wait_until(lock,wake,[&]{
+                        if(state->stopped&&!state->entries.empty())return true;
+                        if(state->requested!=state->settled&&state->active_removal_originals==0)return true;
+                        if(state->stopped)return false;
+                        const auto now=std::chrono::steady_clock::now();
+                        for(const auto& [key,item]:state->entries)
+                            if(item->armed&&(item->dirty||(item->due&&now>=*item->due)))return true;
+                        return false;
+                    });
+                    const bool retiring=state->requested!=state->settled&&state->active_removal_originals==0;
                     const auto now=std::chrono::steady_clock::now();
-                    for(auto it=state->entries.begin();it!=state->entries.end();) {
+                    oversized=state->entries.size()>capacity;
+                    if(!oversized)for(auto it=state->entries.begin();it!=state->entries.end();) {
                         const auto& item=it->second;
                         if(state->stopped||!item->source->owner_guard->alive.load(std::memory_order_seq_cst)) {
-                            retired.push_back(item);it=state->entries.erase(it);continue;
+                            retired[values.retired_count++]=std::move(it->second);it=state->entries.erase(it);continue;
                         }
-                        if(item->armed&&(item->dirty||(item->due&&now>=*item->due))) {
-                            // Do not consume the kick while building a batch:
-                            // allocation failure must leave every unrun item
-                            // eligible for the next bounded retry.
-                            work.push_back(item);
+                        if(!retiring&&item->armed&&(item->dirty||(item->due&&now>=*item->due))) {
+                            work[values.work_count++]=item;
                         }
                         ++it;
                     }
-                    if(state->stopped){lock.unlock();return;}
                 }
-                retired.clear(); // owner/adapter/callback destruction off leaf
-                for(const auto& item:work) {
-                    const auto source=item->source;canonical_ready_maintenance_result result;
+                if(oversized)reject("READY maintenance batch bound");
+                for(auto& item:retired){item.reset();if(!creator())return;}
+                for(size_t index=0;index<values.work_count;++index) {
+                    const auto& item=work[index];auto& source=values.held.get<2>();auto& dropped=values.held.get<3>();
+                    if(!values.held.release<2>())return;
+                    source=item->source;auto& result=values.held.get<4>();
+                    if(!values.clear_result())return;
                     {std::lock_guard lock(state->mutex);const auto found=state->entries.find(source.get());
                         if(state->stopped||found==state->entries.end()||found->second!=item)continue;
                         item->dirty=false;}
                     try {
-                        observe_maintenance(source,"before-maintenance");
+                        observe_maintenance(source,"before-maintenance");if(!creator())return;
                         if(live(source))result=source->adapter->maintain_authenticated_ready(source->owner);
-                        observe_maintenance(source,"maintenance-settled");
+                        if(!creator())return;
+                        observe_maintenance(source,"maintenance-settled");if(!creator())return;
                         if(result.observed&&!result.next_delay_ms)observe_maintenance(source,"empty-before-retire");
-                    } catch(...) {result.observed=false;}
+                    } catch(...) {if(!creator())return;result.observed=false;}
+                    if(!creator())return;
                     const bool still_live=live(source);
-                    std::shared_ptr<entry> dropped;
                     {
                         std::lock_guard lock(state->mutex);const auto found=state->entries.find(source.get());
                         if(found==state->entries.end()||found->second!=item)continue;
-                        // A concurrent mutation/last-setup release marks dirty
-                        // before this decision. It can never be overwritten by
-                        // an earlier empty observation; its post-operation kick
-                        // also covers a worker that ran before the owned write.
                         if(state->stopped||!still_live) {dropped=std::move(found->second);state->entries.erase(found);}
                         else if(item->dirty)item->due=std::chrono::steady_clock::now();
                         else if(result.settlement.state==recovery_install_state::committed&&result.observed&&
@@ -255,51 +364,78 @@ struct authenticated_ready_maintenance {
                             item->due=result.next_delay_ms?std::optional{std::chrono::steady_clock::now()+std::chrono::milliseconds(*result.next_delay_ms)}:std::nullopt;
                             if(item->observed_empty&&source->sessions.load(std::memory_order_acquire)==0){dropped=std::move(found->second);state->entries.erase(found);}
                         } else {
-                            // A refusal/error is not an empty source. Retain
-                            // custody and retry, without a hard wall-time claim
-                            // under indefinite contention or corruption.
                             item->observed_empty=false;item->due=std::chrono::steady_clock::now()+std::chrono::seconds(1);
                         }
                     }
-                    dropped.reset();
-                    observe_maintenance(source,"maintenance-published");
+                    if(!values.held.release<3>())return;
+                    observe_maintenance(source,"maintenance-published");if(!creator())return;
                 }
             }catch(...) {
-                std::unique_lock lock(state->mutex);if(state->stopped)return;
-                state->changed.wait_for(lock,std::chrono::seconds(1));
+                if(!creator())return;
+                std::unique_lock lock(state->mutex);
+                // Batch destruction has completed before this catch. A close
+                // ticket wakes the existing retry rather than waiting a new s.
+                if(!state->stopped&&(state->requested==state->settled||state->active_removal_originals!=0))
+                    state->changed.wait_for(lock,std::chrono::seconds(1),[&]{return state->stopped||
+                        (state->requested!=state->settled&&state->active_removal_originals==0);});
             }
         }
     }
     static void add(const std::shared_ptr<authenticated_mounted_source>& source,bool armed) {
-        if(!source->recipe.ready.orphan_resume_grace_ms)return;
-        observe_maintenance(source,"before-maintenance-register");
+        require_creator();if(!source->recipe.ready.orphan_resume_grace_ms)return;
+        observe_maintenance(source,"before-maintenance-register");require_creator();
         auto& worker=instance();
-        // Allocate before the leaf. The existing physical registry already
-        // charged this source slot; this is not another independent owner cap.
-        auto candidate=std::make_shared<entry>();candidate->source=source;candidate->armed=armed;
+        using entry_map=std::map<authenticated_mounted_source*,std::shared_ptr<entry>>;
+        native_retirement_storage<std::shared_ptr<entry>,entry_map,entry_map::node_type> retained;require_creator();
+        retained.get<0>()=std::make_shared<entry>();require_creator();
+        auto& candidate=retained.get<0>();candidate->source=source;candidate->armed=armed;
+        // Allocate an EMPTY node: an allocator may fork before emplace
+        // constructs its mapped value. Install Native ownership only after
+        // the post-allocation creator check, before entering the leaf.
+        retained.get<1>().emplace(source.get(),std::shared_ptr<entry>{});require_creator();
+        retained.get<2>()=retained.get<1>().extract(source.get());auto& node=retained.get<2>();
+        node.mapped()=candidate;const char* refusal=nullptr;
         {std::lock_guard lock(worker.shared->mutex);
-            if(worker.shared->stopped)reject("READY maintenance service stopped");
-            const auto [at,added]=worker.shared->entries.emplace(source.get(),candidate);
-            if(!added){at->second->armed|=armed;at->second->dirty=true;}}
+            if(worker.shared->stopped)refusal="READY maintenance service stopped";
+            else if(!source->owner_guard||!source->owner_guard->alive.load(std::memory_order_seq_cst))
+                refusal="READY maintenance owner retired before registration";
+            else {
+                const auto at=worker.shared->entries.find(source.get());
+                if(at!=worker.shared->entries.end()){at->second->armed|=armed;at->second->dirty=true;}
+                else if(worker.shared->entries.size()>=capacity)refusal="READY maintenance registration bound";
+                else worker.shared->entries.insert(std::move(node));
+                if(!refusal)source->owner_guard->authenticated_maintenance_registered.store(true,std::memory_order_release);
+            }}
+        if(refusal)reject(refusal);
         worker.shared->changed.notify_one();
     }
     static void kick(const std::shared_ptr<authenticated_mounted_source>& source)noexcept {
-        if(!source->recipe.ready.orphan_resume_grace_ms)return;
-        try{auto& worker=instance();{std::lock_guard lock(worker.shared->mutex);const auto at=worker.shared->entries.find(source.get());
-            if(at!=worker.shared->entries.end())at->second->dirty=true;}worker.shared->changed.notify_one();}catch(...){}
+        if(!creator()||!source->recipe.ready.orphan_resume_grace_ms)return;
+        try{native_retirement_storage<std::shared_ptr<shared_state>> held;if(!creator())return;
+            held.get<0>()=std::atomic_load_explicit(&active,std::memory_order_seq_cst);if(!creator())return;
+            const auto& state=held.get<0>();if(!state)return;
+            {std::lock_guard lock(state->mutex);const auto at=state->entries.find(source.get());
+                if(at!=state->entries.end())at->second->dirty=true;}state->changed.notify_one();}catch(...){}
     }
     static void arm(const std::shared_ptr<authenticated_mounted_source>& source)noexcept {
-        if(!source->recipe.ready.orphan_resume_grace_ms)return;
-        // Enrollment already owns an allocated registration. No callback or
-        // allocation may fail between its known COMMIT and arming the keeper.
-        try{auto& worker=instance();{std::lock_guard lock(worker.shared->mutex);const auto at=worker.shared->entries.find(source.get());
-            if(at!=worker.shared->entries.end()){at->second->armed=true;at->second->dirty=true;}}worker.shared->changed.notify_one();}catch(...){}
+        if(!creator()||!source->recipe.ready.orphan_resume_grace_ms)return;
+        try{native_retirement_storage<std::shared_ptr<shared_state>> held;if(!creator())return;
+            held.get<0>()=std::atomic_load_explicit(&active,std::memory_order_seq_cst);if(!creator())return;
+            const auto& state=held.get<0>();if(!state)return;
+            {std::lock_guard lock(state->mutex);const auto at=state->entries.find(source.get());
+                if(at!=state->entries.end()){at->second->armed=true;at->second->dirty=true;}}state->changed.notify_one();}catch(...){}
     }
     static void remove(const std::shared_ptr<authenticated_mounted_source>& source)noexcept {
-        if(!source->recipe.ready.orphan_resume_grace_ms)return;
-        try{auto& worker=instance();std::shared_ptr<entry> retired;
-            {std::lock_guard lock(worker.shared->mutex);const auto at=worker.shared->entries.find(source.get());if(at!=worker.shared->entries.end()){retired=std::move(at->second);worker.shared->entries.erase(at);}}
-            worker.shared->changed.notify_one();retired.reset();}catch(...){}
+        if(!creator()||!source->recipe.ready.orphan_resume_grace_ms)return;
+        try{native_retirement_storage<std::shared_ptr<shared_state>,std::shared_ptr<entry>> retired;if(!creator())return;
+            retired.get<0>()=std::atomic_load_explicit(&active,std::memory_order_seq_cst);if(!creator())return;
+            const auto& state=retired.get<0>();if(!state)return;
+            {std::lock_guard lock(state->mutex);const auto at=state->entries.find(source.get());if(at!=state->entries.end()){retired.get<1>()=std::move(at->second);state->entries.erase(at);}}
+            state->changed.notify_one();
+            // This failure-cleanup caller retains the original source in its
+            // supplied shared_ptr for the whole call. Entry destruction cannot
+            // be the final source/probe release; that caller remains separate.
+            (void)retired.release<1>();}catch(...){}
     }
 #else
     static void add(const std::shared_ptr<authenticated_mounted_source>& source,bool){if(source->recipe.ready.orphan_resume_grace_ms)reject("READY lifecycle platform unavailable");}
@@ -308,6 +444,115 @@ struct authenticated_ready_maintenance {
     static void remove(const std::shared_ptr<authenticated_mounted_source>&)noexcept{}
 #endif
 };
+#if defined(__APPLE__) || defined(__linux__)
+std::shared_ptr<authenticated_ready_maintenance::shared_state> authenticated_ready_maintenance::active;
+std::atomic<uint64_t> authenticated_ready_maintenance::launches{0};
+#endif
+lattice_close_result retire_authenticated_ready_maintenance(const std::shared_ptr<instance_guard>& guard,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    lattice_close_result result;
+#if defined(__APPLE__) || defined(__linux__)
+    if(!authenticated_ready_maintenance::creator()){result.cleanup_complete=false;return result;}
+    try {
+        native_retirement_storage<std::shared_ptr<authenticated_ready_maintenance::shared_state>> held;
+        if(!authenticated_ready_maintenance::creator()){result.cleanup_complete=false;return result;}
+        held.get<0>()=std::atomic_load_explicit(&authenticated_ready_maintenance::active,std::memory_order_seq_cst);
+        if(!authenticated_ready_maintenance::creator()){result.cleanup_complete=false;return result;}
+        if(!guard||guard->alive.load(std::memory_order_seq_cst))reject("READY maintenance retirement requires exact retired guard");
+        const auto& state=held.get<0>();if(!state)return result;
+        {
+            std::lock_guard lock(state->mutex);
+            // Add checks alive and sets this bit under this same leaf. A
+            // never-enrolled closed original cannot gain a late worker capture.
+            if(!guard->authenticated_maintenance_registered.load(std::memory_order_acquire))return result;
+            // A genuine terminal loop cannot acknowledge a newly issued ticket.
+            // Its actual ended state plus empty registrations/tails already
+            // proves the worker-only obligation; map absence alone never does.
+            if(state->stopped&&state->worker_exited&&state->entries.empty()&&state->active_removal_originals==0)return result;
+        }
+        native_retirement_storage<authenticated_ready_maintenance::entry_custody> removed;
+        if(!authenticated_ready_maintenance::creator()){result.cleanup_complete=false;return result;}
+        uint64_t ticket=0;size_t count=0;bool reentrant=false;const char* refusal=nullptr;
+        {
+            std::lock_guard lock(state->mutex);
+            if(guard->alive.load(std::memory_order_seq_cst))refusal="READY maintenance guard became live";
+            // The worker may have genuinely ended while removal storage was
+            // allocated off leaf. Revalidate the same terminal proof at the
+            // actual issuance boundary; stopped prevents later registration.
+            else if(state->stopped&&state->worker_exited&&state->entries.empty()&&state->active_removal_originals==0)return result;
+            else if(state->requested==std::numeric_limits<uint64_t>::max())refusal="READY maintenance retirement sequence exhausted";
+            else if(state->entries.size()>authenticated_ready_maintenance::capacity)refusal="READY maintenance retirement bound";
+            size_t matching=0;
+            if(!refusal)for(const auto& [key,item]:state->entries)if(item->source->owner_guard==guard)++matching;
+            if(!refusal&&(state->active_removal_originals>authenticated_ready_maintenance::capacity||
+                    matching>authenticated_ready_maintenance::capacity-state->active_removal_originals))
+                refusal="READY maintenance active removal bound";
+            if(!refusal)state->active_removal_originals+=matching; // before transfer/publication
+            if(!refusal)for(auto at=state->entries.begin();at!=state->entries.end();) {
+                if(at->second->source->owner_guard==guard) {
+                    removed.get<0>().budgets[count]=at->second->source->ready_budget;
+                    removed.get<0>().values[count++]=std::move(at->second);at=state->entries.erase(at);
+                }else ++at;
+            }
+            if(!refusal)ticket=++state->requested; // even map absence does not end copied work
+            reentrant=state->worker==std::this_thread::get_id();
+        }
+        if(refusal)reject(refusal);
+        state->changed.notify_all();
+        for(auto& item:removed.get<0>().values) {
+            item.reset();if(!authenticated_ready_maintenance::creator()){result.cleanup_complete=false;return result;}
+        }
+        // The source/probe destructors above are part of maintenance-derived
+        // retirement, not unrelated caller custody. Publish their actual tail
+        // ending under the same leaf before allowing ANY ticket to settle.
+        bool invalid_tail=false;
+        if(count) {
+            std::lock_guard lock(state->mutex);
+            invalid_tail=state->active_removal_originals<count;
+            if(!invalid_tail)state->active_removal_originals-=count;
+        }
+        state->changed.notify_all();
+        if(invalid_tail)reject("READY maintenance removal witness inconsistent");
+        for(auto& budget:removed.get<0>().budgets) {
+            budget.reset();if(!authenticated_ready_maintenance::creator()){result.cleanup_complete=false;return result;}
+        }
+        if(reentrant)reject("READY maintenance retirement is pending on its own worker");
+        if(std::chrono::steady_clock::now()>=deadline)reject("READY maintenance capture retirement deadline pending");
+        std::unique_lock lock(state->mutex);
+        const bool complete=state->changed.wait_until(lock,deadline,[&]{return state->settled>=ticket;});
+        lock.unlock();
+        if(!complete||std::chrono::steady_clock::now()>=deadline)reject("READY maintenance capture retirement deadline pending");
+    }catch(...) {
+        if(!authenticated_ready_maintenance::creator()){result.cleanup_complete=false;return result;}
+        result.remember(std::current_exception());
+    }
+#else
+    (void)guard;(void)deadline;
+#endif
+    return result;
+}
+authenticated_ready_maintenance_test_observation::retirement_observation
+ authenticated_ready_maintenance_test_observation::retirement(const instance_guard* guard) noexcept {
+    retirement_observation out;
+#if defined(__APPLE__) || defined(__linux__)
+    if(!authenticated_ready_maintenance::creator())return out;
+    try {
+        native_retirement_storage<std::shared_ptr<authenticated_ready_maintenance::shared_state>> held;
+        if(!authenticated_ready_maintenance::creator())return out;
+        out.launches=authenticated_ready_maintenance::launches.load(std::memory_order_relaxed);
+        held.get<0>()=std::atomic_load_explicit(&authenticated_ready_maintenance::active,std::memory_order_acquire);
+        if(!authenticated_ready_maintenance::creator())return {};
+        const auto& state=held.get<0>();if(!state)return out;
+        std::lock_guard lock(state->mutex);out.available=true;out.requested=state->requested;out.settled=state->settled;
+        out.boundaries=state->boundaries;out.active_removal_originals=state->active_removal_originals;
+        out.worker_exited=state->worker_exited;out.caller_is_worker=state->worker==std::this_thread::get_id();
+        for(const auto& [key,item]:state->entries)if(item->source->owner_guard.get()==guard)++out.matching_registrations;
+    }catch(...) {out.available=false;}
+#else
+    (void)guard;
+#endif
+    return out;
+}
 struct authenticated_ready_budget : canonical_ready_transport_limits {
     // Keep only the payload-free physical identity and bounded immutable recipe.
     // A queued result may outlive the last mounted source without retaining its
@@ -636,7 +881,7 @@ std::shared_ptr<authenticated_relay_setup> authenticated_relay_setup::open_impl(
     if(source&&source->recipe.key!=r.key)reject("relay source profile differs on actual owner");
     if(!source) {
         try {
-            source=std::make_shared<authenticated_mounted_source>();source->owner=owner;source->owner_guard=owner_guard;source->recipe=r;
+            source=r.ready.orphan_resume_grace_ms?authenticated_mounted_source::create():std::make_shared<authenticated_mounted_source>();source->owner=owner;source->owner_guard=owner_guard;source->recipe=r;
             source->ready_budget=budget;
             {std::lock_guard lock(maintenance_probe_mutex);source->maintenance_probe=maintenance_probe;}
             // Register/start before enrollment can publish durable state. The
@@ -864,6 +1109,7 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
         logical.channel_incarnation!=text(peer,"channelIncarnation",36)||logical.channel!=text(s->context.at("route"),"channel",64)||
         request->source!=ready_cr::source_binding{s->recipe.ready.authority,profile.source,profile.epoch,profile.scope,profile.schema})
         reject("READY request differs from actual authenticated source/receiver/channel");
+    if(auto* value=observed::current)value->logical_sequence=logical.sequence;
     for(const auto& item:request->receipts) {
         if(item.namespace_id!=std::optional<std::string>{s->recipe.selected_namespace})reject("READY requested namespace differs from actual peer admission");
         for(const auto& target:item.targets) {
@@ -940,6 +1186,7 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
     if(op=="discard") {
         if(lifecycle)return lifecycle_output(s->source->adapter->inspect_authenticated_ready(s->source->owner,ready_admission,logical,*request,true));
         const auto result=s->source->adapter->discard_authenticated_ready(s->source->owner,ready_admission,logical,*request);
+        if(auto* value=observed::current)observed::copy_discard(*value,result);
         response["settlement"]=ready_settlement(result);response["leaseAvailable"]=false;return output();
     }
     std::optional<canonical_ready_info> info;std::optional<canonical_ready_lease> lease;
@@ -956,6 +1203,7 @@ authenticated_ready_result authenticated_relay_setup::ready(const std::string& r
             value->preparation=canonical_ready_control_observation::copy(result.preparation);
             value->publication=canonical_ready_control_observation::copy(result.publication);
             value->capture_error=bool(result.capture_error);value->requires_full_request=result.requires_full_request;
+            value->capture_failure_copy=observed::copy_capture_failure(result.capture_error);
             value->mark(static_cast<size_t>(observed::point::prepare_returned));
         }
         response["preparation"]=ready_settlement(result.preparation);response["publication"]=ready_settlement(result.publication);

@@ -8,6 +8,7 @@
 #include <type_traits>
 namespace lattice {
 struct database::target_staging_state::history_projection_native {
+    terminal_native_static_tail terminal_static; // FIRST: rows/SQL and actual programme/scope references die before this.
     database* const shell;
     const std::weak_ptr<detail::ordinary_group_target_receiving_owner> owner;
     const std::weak_ptr<detail::ordinary_group_target_schema_original> schema;
@@ -38,13 +39,14 @@ struct database::target_staging_state::history_projection_native {
     history_projection_native(database& actual,const std::shared_ptr<detail::ordinary_group_target_receiving_owner>& receiving,
         const std::shared_ptr<detail::ordinary_group_target_schema_original>& original,
         const std::shared_ptr<detail::ordinary_group_target_schema_original::projection_program>& input)
-        :shell(&actual),owner(receiving),schema(original),program(input) {
+        :terminal_static(actual,this,original.get(),2,receiving),shell(&actual),owner(receiving),schema(original),program(input) {
         // All statement/call/ending capacity precedes the genuine BEGIN. Existing
         // header/latest-page originals share the unchanged 24 MiB staging pool.
         const auto held=actual.target_staging_;
         if(!held||!held->history_header)throw db_error("GROUP projection actual header capacity missing");
         add_stage(held->history_header->logical_bytes);
         if(held->history_page)add_stage(held->history_page->logical_bytes);
+        terminal_static.constructor_returned();
     }
     void add_stage(std::size_t bytes) {
         if(bytes>ordinary_history_limits::stage_scratch_bytes-logical_bytes)
@@ -266,12 +268,12 @@ void database::require_target_history_complete_(const detail::ordinary_target_st
         throw db_error("GROUP actual empty history/header content differs");
 }
 bool database::target_history_projection_cleanup_ending_()const noexcept {
-    const auto state=target_staging_;if(!state||!state->current_creator())return false;
+    const auto state=target_staging_;if(!state||!state->current_creator()||state->terminal_native_statics_attempted)return false;
     return !state->history_projection||state->history_projection->cleanup_known();
 }
 bool database::target_history_projection_native_ending_()const noexcept {
     const auto state=target_staging_;const auto native=state?state->history_projection:nullptr;
-    return state&&state->current_creator()&&native&&native->shell==this&&native->ending_known();
+    return state&&state->current_creator()&&!state->terminal_native_statics_attempted&&native&&native->shell==this&&native->ending_known();
 }
 void database::require_target_history_projection_ending_(const detail::ordinary_target_staging_connection& connection,
     const detail::ordinary_group_target_receiving_owner& receiving)const {

@@ -8,7 +8,7 @@ void projection_request::set_text(std::string& target, const std::string& value)
         if (value.size() > 65536) throw std::invalid_argument("projection SQL metadata exceeds bound");
         target = value;
     });
-    failed_ = failed_ || !last_bridge_error().empty();
+    failed_ = failed_ || last_bridge_call_failed();
 }
 void projection_request::set_table(const std::string& value) { set_text(query_.table, value); }
 void projection_request::set_where(const std::string& value) { set_text(query_.where_clause, value); }
@@ -19,7 +19,7 @@ void projection_request::add_order_column(const std::string& value) {
             throw std::invalid_argument("projection order-column metadata exceeds bound");
         query_.order_columns.push_back(value);
     });
-    failed_ = failed_ || !last_bridge_error().empty();
+    failed_ = failed_ || last_bridge_call_failed();
 }
 void projection_request::set_bounds(const std::string& column, double min_lat, double max_lat,
                                     double min_lon, double max_lon) {
@@ -29,7 +29,7 @@ void projection_request::set_bounds(const std::string& column, double min_lat, d
         query_.bounds = projection_bounds{column, min_lat, max_lat, min_lon, max_lon};
         query_.has_bounds = true;
     });
-    failed_ = failed_ || !last_bridge_error().empty();
+    failed_ = failed_ || last_bridge_call_failed();
 }
 void projection_request::set_group_by(const std::string& value) { set_text(query_.group_by, value); }
 void projection_request::set_distinct_by(const std::string& value) { set_text(query_.distinct_by, value); }
@@ -39,7 +39,7 @@ void projection_request::add_column(const std::string& value) {
             throw std::invalid_argument("projection selected-column metadata exceeds bound");
         query_.columns.push_back(value);
     });
-    failed_ = failed_ || !last_bridge_error().empty();
+    failed_ = failed_ || last_bridge_call_failed();
 }
 void projection_request::add_parameter(const column_value_t& value) {
     sealed([&] {
@@ -53,7 +53,7 @@ void projection_request::add_parameter(const column_value_t& value) {
         query_.parameters.push_back(value);
         binding_bytes_ += bytes;
     });
-    failed_ = failed_ || !last_bridge_error().empty();
+    failed_ = failed_ || last_bridge_call_failed();
 }
 std::string projection_batch::error_message() const {
     return sealed([&] { return failure_ ? std::string("projection bridge allocation failed") : value_.error_message(); });
@@ -63,7 +63,7 @@ column_value_t projection_batch::value(int64_t row, int64_t column) const {
 }
 projection_batch projection_operation::next_batch(int64_t max_rows) const {
     auto result = sealed([&] { return projection_batch(value_.next_batch(max_rows)); });
-    if (!last_bridge_error().empty()) {
+    if (last_bridge_call_failed()) {
         value_.close();
         result.failure_ = true;
     }

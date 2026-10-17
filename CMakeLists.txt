@@ -189,6 +189,7 @@ add_executable(LatticeCoreTests
     Tests/LatticeCoreTests/Vec0Tests.cpp
     Tests/LatticeCoreTests/MultiConnectionTests.cpp
     Tests/LatticeCoreTests/SyncUnitTests.cpp
+    Tests/LatticeCoreTests/StartupSyncRepairTests.cpp
     Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp
     Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp
     Tests/LatticeCoreTests/CascadeDeleteTests.cpp
@@ -222,6 +223,11 @@ target_include_directories(LatticeCoreTests PRIVATE
     Tests/LatticeCoreTests
     Tests/LatticeCAPIHeaderCheck/include
     Sources/LatticeCAPI/include)
+
+# Small real-Core regression target, without the unrelated suite's global
+# fixed-path logging environment. TMPDIR selects all fixture output locations.
+add_executable(LatticeStartupSyncRepairTests Tests/LatticeCoreTests/StartupSyncRepairTests.cpp)
+target_link_libraries(LatticeStartupSyncRepairTests PRIVATE LatticeCore gtest_main)
 # The header-compile pin must be built as pure C11 (docs/CAPI-STABILITY.md).
 set_source_files_properties(Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c
     PROPERTIES COMPILE_OPTIONS "-std=c11")

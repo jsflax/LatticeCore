@@ -230,8 +230,14 @@ foreach(kind IN ITEMS V1 V1Partial)
   else()
     set(helper_source Tests/LatticeCoreTests/RecoveryReceiptCoveragePartialControllerTests.cpp)
   endif()
-  add_executable(LatticeReceipt${kind}Helper "${helper_source}")
-  target_compile_definitions(LatticeReceipt${kind}Helper PRIVATE LATTICE_RECEIPT_RETENTION_LEGACY_WRITER=1)
+  # The real helper's adoption symbol is defined in this unchanged whole old TU.
+  # Its model and all 63 test registrations remain present in BOTH helper images.
+  add_executable(LatticeReceipt${kind}Helper "${helper_source}"
+    Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp)
+  # Preserve the actual original flags separately: only the receipt helper TU
+  # had this legacy-writer define; whole CanonicalDurableReadyTests did not.
+  set_source_files_properties("${helper_source}" PROPERTIES
+    COMPILE_DEFINITIONS LATTICE_RECEIPT_RETENTION_LEGACY_WRITER=1)
   target_include_directories(LatticeReceipt${kind}Helper PRIVATE
     Tests/LatticeCoreTests Tests/LatticeCAPIHeaderCheck/include Sources/LatticeCAPI/include)
   target_link_libraries(LatticeReceipt${kind}Helper PRIVATE LatticeCore LatticeSwiftCppBridge gtest_main)

@@ -256,8 +256,9 @@
                 !incarnation.is_object()||incarnation.size()!=5||child.parent!=supervisor.pid||
                 number(incarnation,"pid")!=std::uint64_t(child.pid))refused();
             const auto status=number(terminal,"waitStatus");
-            if(status>std::uint64_t(std::numeric_limits<int>::max())||
-                (!WIFEXITED(static_cast<int>(status))&&!WIFSIGNALED(static_cast<int>(status))))refused();
+            if(status>std::uint64_t(std::numeric_limits<int>::max()))refused();
+            const int native_status=static_cast<int>(status);
+            if(!WIFEXITED(native_status)&&!WIFSIGNALED(native_status))refused();
             ordinary_launch::observed_incarnation original;
             original.pid=child.pid;original.audit_token=token(text(incarnation,"auditToken",64));
             original.executable_device=number(incarnation,"imageDevice");original.executable_inode=number(incarnation,"imageInode");

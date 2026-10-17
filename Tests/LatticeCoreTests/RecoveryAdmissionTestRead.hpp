@@ -26,11 +26,12 @@ class held_read {
 public:
     std::exception_ptr error;
     size_t rows=0;
-    explicit held_read(lattice::database& db,bool managed=false,std::string sql="SELECT name FROM TestPerson",bool exact_statement=false)
+    explicit held_read(lattice::database& db,bool managed=false,std::string sql="SELECT name FROM TestPerson",bool exact_statement=false,
+        std::function<void(lattice::database&)> observe_held={})
     {
         // Launch only after every member, including error and rows below the
         // thread declaration, has completed construction.
-        worker=std::thread([this,&db,managed,sql=std::move(sql),exact_statement]{
+        worker=std::thread([this,&db,managed,sql=std::move(sql),exact_statement,observe_held=std::move(observe_held)]{
             bool signaled=false;
             try {
                 row_probe probe([&](auto& actual,auto* statement){
@@ -40,6 +41,10 @@ public:
                     // releases its mutex, not that nested globalId read.
                     if(exact_statement){const auto* actual_sql=sqlite3_sql(statement);if(!actual_sql||sql!=actual_sql)return;}
                     signaled=true;arrived_.set_value();
+                    // Optional test-only observation uses this actual engine
+                    // SELECT continuation, before its row/statement ends.
+                    // Existing callers are nil; no new admission is issued.
+                    if(observe_held)observe_held(db);
                     if(released.wait_for(std::chrono::seconds(12))!=std::future_status::ready)std::abort();
                 });
                 if(managed)rows=lattice::detail::canonical_writer_custody_test_access::query_managed_cell(db,"SELECT name FROM TestPerson WHERE id=?","name",1).has_value()?1:0;

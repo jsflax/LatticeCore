@@ -16,6 +16,7 @@
 #include <thread>
 
 #include <dynamic_object.hpp>
+#include <observer_delivery_input.hpp>
 #include <bulk_mutation.hpp>
 #include <projection.hpp>
 #include <recovery_export.hpp>
@@ -27,10 +28,14 @@
 #include "../../LatticeCore/src/ordinary_managed_history.hpp"
 #include "../../LatticeCore/src/ordinary_export.hpp"
 #include "../../LatticeCore/src/ordinary_cohort_attachment_qualification.hpp"
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+#include "../../LatticeCore/src/recovery_refresh.hpp"
+#endif
 #include <lattice/platform_retirement.hpp>
 #include <lattice/configured_platform.hpp>
 #include <list.hpp>
 #include <error.hpp>
+#include <transaction_receipt.hpp>
 
 #if defined(__BLOCKS__) && defined(__APPLE__) && !defined(__swift__)
 #include <Block.h>
@@ -39,6 +44,7 @@
 // Forward declarations
 namespace lattice {
 class swift_lattice_ref;
+class automatic_read_maintenance_fixture_access;
 class swift_migration_context_ref;
 namespace detail { class LatticeCache; }
 }
@@ -193,6 +199,13 @@ struct union_value {
     std::unordered_map<std::string, std::shared_ptr<dynamic_object>>& link_refs() { return link_refs_; }
 
 private:
+    friend class swift_lattice;
+    void swap_graph_value(union_value& other) noexcept {
+        case_name.swap(other.case_name);
+        string_fields_.swap(other.string_fields_); int_fields_.swap(other.int_fields_);
+        double_fields_.swap(other.double_fields_); blob_fields_.swap(other.blob_fields_);
+        link_refs_.swap(other.link_refs_);
+    }
     std::unordered_map<std::string, std::string> string_fields_;
     std::unordered_map<std::string, int64_t> int_fields_;
     std::unordered_map<std::string, double> double_fields_;
@@ -207,6 +220,57 @@ struct checkpoint_outcome {
     int64_t log_frames = -1;     // frames in the WAL before the call (-1 unavailable)
     int64_t checkpointed = -1;   // frames folded back (< log_frames = partial)
 };
+
+/// One checked maintenance observation, never an admission or cleanup grant.
+/// The conservative default cannot turn a refused Swift call into success.
+struct read_pool_maintenance_result {
+    bool completed = false;
+    bool pressure_pending = true;
+    std::string error;
+};
+
+/// Checked ready-original automatic maintenance enrollment. An ineligible
+/// memory/read-only owner returns completed=true, enabled=false; an actual
+/// admission/startup failure keeps the conservative default and its error.
+struct automatic_read_maintenance_enrollment_result {
+    bool completed = false;
+    bool enabled = false;
+    std::string error;
+};
+
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+/// Qualification-only control of the actual automatic actor. Copies share one
+/// opaque Native hold; explicit release retires it once without a callback or
+/// lock held by this wrapper. It grants no SQL/read/pressure-reset authority.
+class automatic_read_maintenance_fixture_token {
+    struct control {
+        std::shared_ptr<void> hold;
+        std::atomic<bool> released{false};
+        explicit control(std::shared_ptr<void> value) : hold(std::move(value)) {}
+    };
+    std::shared_ptr<control> control_;
+    bool busy_ = false;
+    explicit automatic_read_maintenance_fixture_token(std::shared_ptr<void> value)
+        : control_(value ? std::make_shared<control>(std::move(value)) : nullptr) {}
+    friend class automatic_read_maintenance_fixture_access;
+public:
+    automatic_read_maintenance_fixture_token() = default;
+    bool valid() const noexcept { return control_ && !control_->released.load(); }
+    // Only a genuine running tick at locked native admission permits retry.
+    // A default exception token is neither valid nor busy.
+    bool busy() const noexcept { return busy_; }
+    void release() const noexcept {
+        auto retained = control_;
+        if (retained && !retained->released.exchange(true)) retained->hold.reset();
+    }
+};
+struct automatic_read_maintenance_fixture_snapshot {
+    bool available = false;
+    bool enabled = false;
+    bool running = false;
+    uint64_t pause_count = 0, attempts = 0, quiet_returns = 0, deferred = 0, completed = 0;
+};
+#endif
 
 /// One audit row's HEADER — the columns that precede `changedFields` in the
 /// row, so reading them never walks the payload's overflow chain. What
@@ -909,6 +973,26 @@ private:
     void populate_swift_in_memory_state(const SchemaVector& schemas);
     /// Heal vec0 rows missed by other connections' triggers, asynchronously.
     void dispatch_vec0_reconcile(const SchemaVector& schemas);
+    friend struct dynamic_object;
+    friend struct link_list;
+    struct graph_mutation_plan;
+    using graph_objects = std::vector<std::shared_ptr<dynamic_object>>;
+    // Existing managed handles remain borrowed read targets only after exact
+    // physical owner comparison. Unmanaged roots are privately cloned PRE SQL.
+    void mutate_graph(const std::vector<dynamic_object*>& roots,
+                      graph_objects retained,
+                      const std::function<void(const graph_objects&)>& finish_body = {},
+                      const std::function<void()>& publish = {},
+                      const std::string& preserved_global_id = "");
+    // Closed borrowed input is admitted before a roots/holds/clone or managed
+    // result is allocated. The existing graph journal owns final adoption.
+    void add_observer_delivery(const detail::observer_delivery_swift_input::input&);
+    std::vector<managed<swift_dynamic_object>> add_observer_delivery_values(
+        const detail::observer_delivery_swift_input::input&);
+    void mutate_link(dynamic_object&, const std::string&, const std::shared_ptr<dynamic_object>&);
+    void mutate_list(link_list&, const std::shared_ptr<dynamic_object>&, std::optional<size_t>);
+    void mutate_union(dynamic_object&, const std::string&, const union_value&);
+    void mutate_list_remove(link_list&, std::optional<size_t>);
     void persist_union_values(swift_dynamic_object& unmanaged_obj,
                               const std::string& table_name, int64_t parent_id);
     // For an `allowsUpsert` constraint that includes a to-one link column, write
@@ -922,29 +1006,31 @@ public:
     void add(dynamic_object& obj);
     void add_preserving_global_id(dynamic_object& obj, const std::string& preserved_global_id);
     void add(const dynamic_object_ref& ref) {
+        if (!ref.impl_) throw std::runtime_error("Cannot add an empty object ref");
         add(*ref.impl_);
     }
     void add(const dynamic_object_ref& ref,
              cxx_error& err) {
-        try {
+        (void)sealed_with_error(err, [&] {
+            if (!ref.impl_) throw std::runtime_error("Cannot add an empty object ref");
+            if (is_closed()) throw std::runtime_error("Cannot add to a closed lattice");
             add(*ref.impl_);
-        } catch (std::exception& e) {
-            err = e;
-        }
+        });
     }
 
     void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id) {
+        if (!ref.impl_) throw std::runtime_error("Cannot add an empty object ref");
         add_preserving_global_id(*ref.impl_, preserved_global_id);
     }
 
     // Preserve identity without allowing a SQLite/C++ failure to unwind through Swift.
     void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id,
                                   cxx_error& err) {
-        try {
+        (void)sealed_with_error(err, [&] {
+            if (!ref.impl_) throw std::runtime_error("Cannot add an empty object ref");
+            if (is_closed()) throw std::runtime_error("Cannot add to a closed lattice");
             add_preserving_global_id(*ref.impl_, preserved_global_id);
-        } catch (std::exception& e) {
-            err = e;
-        }
+        });
     }
 
     void add_bulk(std::vector<dynamic_object>& objects);
@@ -960,6 +1046,8 @@ public:
         if (objects.empty()) {
             return {};
         }
+        if(detail::observer_delivery_enabled(*this))
+            return add_observer_delivery_values(detail::observer_delivery_swift_input::unmanaged(objects));
         // Use schema from first object (all objects in the batch should have the same schema)
         auto schema = objects[0].instance_schema();
         return lattice_db::add_bulk_with_schema(std::move(objects), schema);
@@ -1003,12 +1091,12 @@ public:
         const ColumnValueVector& params = {}) {
         // Never throws into Swift (interop cannot catch C++ exceptions) —
         // empty on failure, e.g. transient SQLITE_NOMEM under memory pressure.
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
         auto rows = query_rows(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
         return hydrate_swift_rows(std::move(rows), table_name);
         } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
+            record_bridge_error(e.what());
             LOG_ERROR("query", "objects(%s) failed: %s", table_name.c_str(), e.what());
             return {};
         }
@@ -1024,7 +1112,7 @@ public:
         // Never throws into Swift — empty on failure. A row missing '_type'
         // is a malformed union query; skip the row (it used to throw, which
         // terminated the process at the interop boundary).
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
         auto rows = query_union_rows(table_names, where_clause, order_by, limit, offset, params);
         std::vector<managed<swift_dynamic_object>> results;
@@ -1049,7 +1137,7 @@ public:
         }
         return results;
         } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
+            record_bridge_error(e.what());
             LOG_ERROR("query", "union_objects failed: %s", e.what());
             return {};
         }
@@ -1061,24 +1149,24 @@ public:
                  OptionalString group_by,
                  OptionalString distinct_by,
                  const ColumnValueVector& params = {}) {
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try { return lattice_db::count(table_name, where_clause, group_by, distinct_by, params); }
-        catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
+        catch (const std::exception& e) { record_bridge_error(e.what()); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
                  OptionalString group_by) {
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try { return lattice_db::count(table_name, where_clause, group_by); }
-        catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
+        catch (const std::exception& e) { record_bridge_error(e.what()); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name,
                  OptionalString where_clause) {
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try { return lattice_db::count(table_name, where_clause, std::nullopt); }
-        catch (const std::exception& e) { last_bridge_error() = e.what(); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
+        catch (const std::exception& e) { record_bridge_error(e.what()); LOG_ERROR("query", "count failed: %s", e.what()); return 0; }
     }
 
     size_t count(const std::string& table_name) {
@@ -1196,7 +1284,7 @@ public:
     /// processes should call this periodically — the automatic close-time
     /// optimize never runs when the process is killed.
     void optimize() {
-        try { db().execute("PRAGMA optimize", {}); } catch (...) {}
+        try { optimize_statistics_(); } catch (...) {}
     }
 
     int64_t rebuild_vec0(const std::string& table, const std::string& column, int dims) {
@@ -1218,10 +1306,8 @@ public:
     void train_untrained_vec0_tables()
         SWIFT_NAME(trainUntrainedVec0Tables()) {
         LOG_INFO("train_untrained", "Starting training scan");
-        // Disable WAL auto-checkpoint during training. compute-centroids writes
-        // ~78K WAL frames; auto-checkpoint mid-write conflicts with read connections
-        // holding stale snapshots, causing SQLITE_BUSY_SNAPSHOT.
-        db().execute("PRAGMA wal_autocheckpoint=0", {});
+        // Core owns this writer's WAL commit hook. wal_autocheckpoint would
+        // replace that hook and lose ordinary commit delivery after training.
         for (const auto& [table_name, schema] : schemas_) {
             for (const auto& [prop_name, prop] : schema) {
                 if (!prop.is_vector || prop.type != column_type::blob) continue;
@@ -1230,8 +1316,7 @@ public:
                 train_vec0(table_name, prop_name);
             }
         }
-        // Re-enable auto-checkpoint, refresh read connections, then checkpoint.
-        db().execute("PRAGMA wal_autocheckpoint=1000", {});
+        // Refresh read connections, then use the existing explicit checkpoint.
         close_read_db();
         try { db().query("PRAGMA wal_checkpoint(TRUNCATE)", {}); } catch (...) {}
         reopen_read_db();
@@ -1284,12 +1369,13 @@ public:
     void set_on_xproc_idle(void* context,
                            void (*callback)(void*),
                            void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = context || callback
+            ? std::shared_ptr<void>(context, destroy ? destroy : [](void*){})
+            : std::shared_ptr<void>{};
         if (!callback) {
             lattice_db::set_on_xproc_idle(nullptr);
-            if (context && destroy) { destroy(context); }
             return;
         }
-        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
         auto cb = callback;
         lattice_db::set_on_xproc_idle([shared_ctx, cb]() {
             cb(shared_ctx.get());
@@ -1308,14 +1394,15 @@ public:
                                                 int64_t received,
                                                 const char* sync_id),
                                void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = context || callback
+            ? std::shared_ptr<void>(context, destroy ? destroy : [](void*){})
+            : std::shared_ptr<void>{};
         LOG_INFO("swift_lattice", "set_on_sync_progress: callback=%s (db=%s)",
                  callback ? "SET" : "CLEAR", config().path.c_str());
         if (!callback) {
             lattice_db::set_on_sync_progress(nullptr);
-            if (context && destroy) { destroy(context); }
             return;
         }
-        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
         auto cb = callback;
         lattice_db::set_on_sync_progress(
             [shared_ctx, cb](const synchronizer::sync_progress& p) {
@@ -1328,12 +1415,13 @@ public:
     void set_on_sync_error(void* context,
                            void (*callback)(void* ctx, const char* error, int64_t len),
                            void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = context || callback
+            ? std::shared_ptr<void>(context, destroy ? destroy : [](void*){})
+            : std::shared_ptr<void>{};
         if (!callback) {
             lattice_db::set_on_sync_error(nullptr);
-            if (context && destroy) { destroy(context); }
             return;
         }
-        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
         auto cb = callback;
         lattice_db::set_on_sync_error(
             [shared_ctx, cb](const std::string& error) {
@@ -1345,12 +1433,13 @@ public:
     void set_on_sync_state_change(void* context,
                                   void (*callback)(void* ctx, bool connected),
                                   void (*destroy)(void*) = nullptr) {
+        auto shared_ctx = context || callback
+            ? std::shared_ptr<void>(context, destroy ? destroy : [](void*){})
+            : std::shared_ptr<void>{};
         if (!callback) {
             lattice_db::set_on_sync_state_change(nullptr);
-            if (context && destroy) { destroy(context); }
             return;
         }
-        auto shared_ctx = std::shared_ptr<void>(context, destroy ? destroy : [](void*){});
         auto cb = callback;
         lattice_db::set_on_sync_state_change(
             [shared_ctx, cb](bool connected) {
@@ -1648,7 +1737,7 @@ private:
     /// Diagnostics are best-effort at the Swift exception boundary. Recording
     /// an allocation failure must not itself allocate successfully to be safe.
     static void record_bbox_failure(const char* message) noexcept {
-        try { last_bridge_error() = message; }
+        try { record_bridge_error(message); }
         catch (...) {} // Preserve the sentinel return even if diagnostic text is lost.
     }
 
@@ -2000,6 +2089,36 @@ public:
         }
     }
 
+private:
+    /// Checked public maintenance path. Keep the legacy timer's void/catch
+    /// behavior unchanged; this distinct path lets its real error reach the
+    /// outer Swift boundary. No pressure flag or epoch is reset here.
+    read_pool_maintenance_result run_read_pool_maintenance_checked() {
+        require_creator_process();
+        detail::ordinary_require_creator(config().ordinary_context);
+        if (is_closed()) throw db_error("read-pool maintenance requires its live original owner");
+        lattice_db::run_read_pool_maintenance();
+        const bool pending = lattice_db::wal_eviction_pending();
+        if (is_closed()) throw db_error("read-pool maintenance owner closed during its tick");
+        read_pool_maintenance_result result;
+        result.completed = true;
+        result.pressure_pending = pending;
+        return result;
+    }
+
+    automatic_read_maintenance_enrollment_result enable_automatic_read_pool_maintenance_checked() {
+        require_creator_process();
+        detail::ordinary_require_creator(config().ordinary_context);
+        if (is_closed()) throw db_error("automatic read maintenance requires its live original owner");
+        const bool enabled = lattice_db::enable_automatic_read_pool_maintenance();
+        if (is_closed()) throw db_error("automatic read maintenance owner closed during enrollment");
+        automatic_read_maintenance_enrollment_result result;
+        result.completed = true;
+        result.enabled = enabled;
+        return result;
+    }
+
+public:
     // ---- Pool tunables (§1.7 ResultsTuning; forwarded per-Lattice from
     //      Swift in Commit 5). Plain atomic stores — nothrow by
     //      construction. ----
@@ -2117,7 +2236,7 @@ public:
         OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBoxShapeAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
         generation_read_stale_tl() = false;
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
             auto query = [&](const std::string& sql, const ColumnValueVector& params) {
                 auto rows = query_at_generation(generation_id, sql, params);
@@ -2313,7 +2432,7 @@ public:
         OptionalInt64 limit = std::nullopt, OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt)
         SWIFT_NAME(objectsWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
             std::vector<database::row_t> rows;
             {
@@ -2352,7 +2471,7 @@ public:
         OptionalString where_clause = std::nullopt,
         OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt)
         SWIFT_NAME(countWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:groupBy:distinctBy:)) {
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
             auto& connection = db();
             bbox_connection_guard guard(connection);
@@ -2389,7 +2508,7 @@ public:
         OptionalString where_clause = std::nullopt)
         SWIFT_NAME(geoNearest(table:geoColumn:lat:lon:radius:limit:sortByDistance:where:)) {
         // Never throws into Swift — empty on failure.
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
         // Convert radius to bounding box
         constexpr double METERS_PER_DEGREE = 111000.0;
@@ -2474,7 +2593,7 @@ public:
         }
         return results;
         } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
+            record_bridge_error(e.what());
             LOG_ERROR("query", "geo_nearest failed: %s", e.what());
             return {};
         }
@@ -2505,7 +2624,7 @@ public:
         OptionalString where_clause = std::nullopt)
         SWIFT_NAME(combinedQuery(table:vectorColumn:queryVector:k:metric:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
         // Never throws into Swift — empty on failure.
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
         // Determine distance function based on metric
         std::string distance_func;
@@ -2579,7 +2698,7 @@ public:
         }
         return results;
         } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
+            record_bridge_error(e.what());
             LOG_ERROR("query", "combined_query failed: %s", e.what());
             return {};
         }
@@ -2960,7 +3079,7 @@ public:
         // that is std::terminate() → SIGTRAP (observed live: db_error under
         // system memory pressure escaped here and killed the app). Empty on
         // failure; callers already treat empty as "no results".
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
         auto ctes_opt = build_combined_nearest_ctes_(table_name, bounds, vectors, geos, texts, where_clause);
         if (!ctes_opt) return CombinedQueryResultVector{};
@@ -3112,7 +3231,7 @@ public:
 
         return results;
         } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
+            record_bridge_error(e.what());
             LOG_ERROR("query", "combined_nearest_query failed: %s", e.what());
             return CombinedQueryResultVector{};
         }
@@ -3133,7 +3252,7 @@ public:
         OptionalString distinct_by = std::nullopt)
         SWIFT_NAME(combinedNearestQueryCount(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
         // Never throws into Swift — 0 on failure.
-        last_bridge_error().clear();
+        clear_bridge_outcome();
         try {
         auto ctes_opt = build_combined_nearest_ctes_(table_name, bounds, vectors, geos, texts, where_clause);
         if (!ctes_opt) return 0;
@@ -3193,7 +3312,7 @@ public:
         }
         return 0;
         } catch (const std::exception& e) {
-            last_bridge_error() = e.what();
+            record_bridge_error(e.what());
             LOG_ERROR("query", "combined_nearest_query_count failed: %s", e.what());
             return 0;
         }
@@ -3517,6 +3636,8 @@ template <typename ConfigT>
         // Append policy selectors after actual managed custody; neither selector issues a grant.
         ordinary_sync_policy ordinary_policy=ordinary_sync_policy::legacy_provisional;
         std::string ordinary_model_profile;
+        bool read_only = false; // Actual native access mode is part of owner identity.
+        std::optional<sqlite3_int64> wal_extent_limit_bytes;
 
         bool operator<(const LatticeRefCacheKey& other) const {
             if(managed_admission!=other.managed_admission)return managed_admission.owner_before(other.managed_admission);
@@ -3530,6 +3651,8 @@ template <typename ConfigT>
             if (recovery_expectation != other.recovery_expectation) return recovery_expectation < other.recovery_expectation;
             if (ordinary_policy != other.ordinary_policy) return ordinary_policy < other.ordinary_policy;
             if (ordinary_model_profile != other.ordinary_model_profile) return ordinary_model_profile < other.ordinary_model_profile;
+            if (read_only != other.read_only) return read_only < other.read_only;
+            if (wal_extent_limit_bytes != other.wal_extent_limit_bytes) return wal_extent_limit_bytes < other.wal_extent_limit_bytes;
             // Compare schedulers: both null, or use is_same_as
             if (!sched && !other.sched) return false;
             if (!sched) return true;  // null < non-null
@@ -3550,6 +3673,8 @@ template <typename ConfigT>
             if (recovery_expectation != other.recovery_expectation) return false;
             if (ordinary_policy != other.ordinary_policy) return false;
             if (ordinary_model_profile != other.ordinary_model_profile) return false;
+            if (read_only != other.read_only) return false;
+            if (wal_extent_limit_bytes != other.wal_extent_limit_bytes) return false;
             if (!sched && !other.sched) return true;
             if (!sched || !other.sched) return false;
             return sched->is_same_as(other.sched.get());
@@ -3573,6 +3698,9 @@ template <typename ConfigT>
             require_creator_process();
             detail::ordinary_before_open(config.path,config.ordinary_context);
             if(config.ordinary_context)throw std::runtime_error("managed opens require their receiver-issued cache entry");
+            // A cache hit must not bypass the selected native opening policy.
+            if(config.wal_extent_limit_bytes&&(*config.wal_extent_limit_bytes<=0||config.read_only||config.is_in_memory()))
+                throw std::runtime_error("bounded WAL cache open requires positive writable file policy");
             LOG_DEBUG("LatticeCache", "get_or_create() path=%s", config.path.c_str());
 
             // Build schema hash from table names and properties (sorted for
@@ -3611,7 +3739,7 @@ template <typename ConfigT>
             // current_version vs target_version and skips if already applied).
             bool skip_cache = config.path == ":memory:" || config.path.empty();
 
-            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, {}, {}, config.ordinary_policy, config.ordinary_model_profile};
+            LatticeRefCacheKey key{config.path, config.sched, config.websocket_url, schema_hash, config.target_schema_version, ipc_targets_fingerprint(config), sync_tuning_fingerprint(config), config.recovery_source_expectation, {}, {}, config.ordinary_policy, config.ordinary_model_profile, config.read_only,config.wal_extent_limit_bytes};
 
             // ---- :memory: path -------------------------------------------------
             // Constructs under the lock (unchanged). These opens are rare and fast,
@@ -3716,6 +3844,8 @@ template <typename ConfigT>
                 throw std::runtime_error("managed configuration differs from its receiver-issued context");
             config.ordinary_context=startup.context_;
             detail::ordinary_before_open(config.path,config.ordinary_context);
+            config.wal_extent_limit_bytes=detail::ordinary_select_wal_extent_limit(config.path,
+                config.ordinary_context,config.wal_extent_limit_bytes);
             if(config.is_in_memory()||config.read_only||config.is_sync_enabled()||config.is_ipc_enabled()||
                config.audit_retention_seconds!=0||config.migration_block||config.row_migration_fn_||
                !config.migration_schemas_.empty()||config.managed_product_credentials||config.target_schema_version<=0)
@@ -3725,12 +3855,12 @@ template <typename ConfigT>
             LatticeRefCacheKey key{config.path,config.sched,config.websocket_url,schema_identity,
                 config.target_schema_version,ipc_targets_fingerprint(config),sync_tuning_fingerprint(config),
                 config.recovery_source_expectation,config.ordinary_context,startup.admission_,
-                config.ordinary_policy,config.ordinary_model_profile};
+                config.ordinary_policy,config.ordinary_model_profile,config.read_only,config.wal_extent_limit_bytes};
             auto validate=[&](const std::shared_ptr<swift_lattice>& owner){
                 detail::ordinary_require_creator(config.ordinary_context);
                 detail::ordinary_before_open(config.path,config.ordinary_context);
                 if(!owner||!owner->owns_creator_process()||owner->is_closed())throw std::runtime_error("managed cached owner retired");
-                if(owner->config().path!=config.path||
+                if(owner->config().path!=config.path||owner->config().wal_extent_limit_bytes!=config.wal_extent_limit_bytes||
                    swift_lattice::managed_catalog_identity(owner->recovery_declarations())!=schema_identity)
                     throw std::runtime_error("managed cached catalog differs from actual declarations");
                 owner->validate_managed_ordinary();
@@ -3770,6 +3900,7 @@ template <typename ConfigT>
                 if(!owner||!owner->owns_creator_process()||owner->is_closed()||
                    owner->config().ordinary_context!=config.ordinary_context||owner->config().path!=config.path||
                    owner->config().target_schema_version!=config.target_schema_version||
+                   owner->config().wal_extent_limit_bytes!=config.wal_extent_limit_bytes||
                    swift_lattice::managed_catalog_identity(owner->recovery_declarations())!=schema_identity)
                     throw std::runtime_error("checked managed opener did not return its exact retained owner");
                 if(startup.admission_)detail::ordinary_export_access::enroll_managed_history(*owner,startup.admission_);
@@ -3965,11 +4096,48 @@ inline lattice_close_result swift_lattice::close_checked() noexcept {
         catch (...) { result.remember(std::current_exception()); }
         return result;
     }
+    // Refuse before cache eviction as well as before Core retirement. A
+    // catalog consumer must not mutate the parent's lookup identity on a
+    // close that cannot actually run.
+    try { require_catalog_callback_absent(); }
+    catch (...) { result.remember(std::current_exception()); return result; }
     try{detail::LatticeCache::instance().evict(this);}catch(...){result.remember(std::current_exception());}
     result.merge(lattice_db::close_checked());return result;
 }
 
+/// Owned result fields remain independent of text and every sealed copy.
+class owned_catalog_result {
+    catalog_stream_result result_;
+    explicit owned_catalog_result(catalog_stream_result value) noexcept : result_(std::move(value)) {}
+    friend class owned_catalog_operation;
+public:
+    owned_catalog_result() = default;
+    bool success() const noexcept { return result_.success(); }
+    bool cleanup_failed() const noexcept SWIFT_NAME(cleanupFailed()) { return result_.cleanup_failed(); }
+    int32_t finalize_code() const noexcept SWIFT_NAME(finalizeCode()) { return result_.finalize_code(); }
+    int32_t transaction_code() const noexcept SWIFT_NAME(transactionCode()) { return result_.transaction_code(); }
+    int32_t rollback_code() const noexcept SWIFT_NAME(rollbackCode()) { return result_.rollback_code(); }
+    int32_t stop_code() const noexcept SWIFT_NAME(stopCode()) { return result_.stop_code(); }
+    std::string error_message() const SWIFT_NAME(errorMessage()) {
+        return sealed([&] { return result_.error_message(); });
+    }
+};
+class owned_catalog_operation {
+    catalog_stream_operation operation_;
+    explicit owned_catalog_operation(catalog_stream_operation value) : operation_(std::move(value)) {}
+    friend class swift_lattice_ref;
+public:
+    owned_catalog_operation() = default;
+    bool valid() const noexcept { return operation_.valid(); }
+    void cancel() const noexcept { operation_.cancel(); }
+    owned_catalog_result capture(void* context,
+        bool (*callback)(void*, int32_t, const uint8_t*, int64_t)) const noexcept SWIFT_NAME(capture(context:callback:)) {
+        return owned_catalog_result(operation_.capture(context, callback));
+    }
+};
+
 class swift_lattice_ref {
+    friend class automatic_read_maintenance_fixture_access;
 public:
     // FRT path: the factories return a heap `swift_lattice_ref*` foreign
     // reference. Value path (iOS 15): they return a `swift_lattice_ref` by value
@@ -4264,23 +4432,107 @@ public:
     // value path returns an empty ref instead of nullptr).
     bool valid() const SWIFT_NAME(isValid()) { return impl_ != nullptr; }
 
+    // C++-only minting boundary: callers already possess the actual owner.
+    // This exposes an opaque weak identity, never the private creator predicate.
+    static bridge_owner_identity identity_for_owner(const std::shared_ptr<swift_lattice>& owner) noexcept {
+        if (!owner || !owner->owns_creator_process()) return {};
+        return bridge_owner_identity(owner);
+    }
+    bridge_owner_identity owner_identity() const noexcept SWIFT_NAME(ownerIdentity()) {
+        return identity_for_owner(impl_);
+    }
+
     // const so it's callable on a `let` value-type ref below the FRT floor.
     int64_t hash_value() const {
         return reinterpret_cast<intptr_t>(impl_.get());
     }
 
-    std::string path() const {
-        return impl().path();
-    }
+    std::string path() const { return sealed([&] { return impl().path(); }); }
 
 private:
-    // Single deref point for the forwarders below. Asserts (debug builds) on an
+    // Single deref point for the forwarders below. Its callback refusal throws
+    // only INSIDE each exported forwarder's exception boundary. Asserts on an
     // empty ref: calling db ops on an invalid handle is a programmer error on
     // both paths — the FRT factories return nullptr instead, and the value-path
     // factories return an empty ref that callers must isValid()-check first.
     swift_lattice& impl() const {
         assert(impl_ && "swift_lattice_ref used while empty/invalid");
+        impl_->require_catalog_callback_absent();
         return *impl_;
+    }
+
+    // A typed error overload must report admission failure in its caller's
+    // cxx_error, in addition to the ordinary thread-local diagnostic. Call the
+    // throwing underlying overload here so both std and foreign exceptions
+    // are contained at this actual Swift boundary.
+    template <typename F>
+    static bool sealed_error(cxx_error& error, F&& body) noexcept {
+        return sealed_with_error(error, std::forward<F>(body));
+    }
+
+    swift_lattice& checked_add_owner() const {
+        if (!impl_) throw std::runtime_error("Cannot add through an empty lattice ref");
+        auto& owner = impl(); // retain the existing real catalog callback guard
+        if (owner.is_closed()) throw std::runtime_error("Cannot add to a closed lattice");
+        return owner;
+    }
+
+    template <typename Objects>
+    void checked_bulk_body(Objects& objects) const {
+        for (const auto& object : objects) {
+#if LATTICE_HAS_FRT
+            if (!object || !object->valid()) throw std::runtime_error("Bulk add requires valid object refs");
+#else
+            if (!object.valid()) throw std::runtime_error("Bulk add requires valid object refs");
+#endif
+        }
+        checked_add_owner().add_bulk(objects);
+    }
+
+    // Existing observer/setter APIs consume their context on every outcome.
+    // Keep it here until impl() admits the call, then transfer exactly once to
+    // the underlying trampoline (which takes custody before any other work).
+    // Observer registrations already consume null context. The four callback
+    // setters preserve their distinct nil-context + nil-callback clear contract:
+    // that pair never invokes a supplied destroy(nullptr), even on refusal.
+    template <typename F>
+    decltype(auto) sealed_context(void* context, void (*destroy)(void*), F&& body,
+                                  bool consumes_null_context = true) const {
+        return sealed([&] {
+            struct pending_context {
+                void* value;
+                void (*destroy)(void*);
+                bool consumes_null;
+                bool pending = true;
+                ~pending_context() noexcept {
+                    if (pending && destroy && (value || consumes_null)) { try { destroy(value); } catch (...) {} }
+                }
+            } pending{context, destroy, consumes_null_context};
+            auto& owner = impl();
+            pending.pending = false;
+            return body(owner);
+        });
+    }
+
+    // The generation surface has an independent stale signal; an outer
+    // callback refusal must not become an apparently genuine empty image.
+    template <typename F>
+    auto sealed_generation(F&& body) const {
+        using R = decltype(body());
+        bool completed = false;
+        auto result = sealed([&] { auto value = body(); completed = true; return value; });
+        if (!completed) {
+            swift_lattice::generation_read_stale_tl() = true;
+            if constexpr (std::is_integral_v<R>) return R(-1);
+        }
+        return result;
+    }
+
+    template <typename F, typename R>
+    static R sealed_or(F&& body, R failure) {
+        bool completed = false;
+        auto result = sealed([&] { auto value = body(); completed = true; return value; });
+        return completed ? result : failure;
     }
 
 public:
@@ -4344,19 +4596,28 @@ public:
     int32_t migrate_relay_receipt_coverage(const std::string& prior,const std::string& next)const noexcept
         SWIFT_NAME(migrateRelayReceiptCoverage(prior:next:));
 
-    // CRUD
-    void add(const dynamic_object_ref& ref, cxx_error& err) const { impl().add(ref, err); }
-    void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id) const {
-        impl().add_preserving_global_id(ref, preserved_global_id);
+    // CRUD: checked status is independent of message allocation/empty what().
+    bool add_checked(const dynamic_object_ref& ref, cxx_error& err) const noexcept {
+        return sealed_error(err, [&] { checked_add_owner().add(ref); });
+    }
+    void add(const dynamic_object_ref& ref, cxx_error& err) const { (void)add_checked(ref, err); }
+    void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id) const { sealed([&] { checked_add_owner().add_preserving_global_id(ref, preserved_global_id); }); }
+    bool add_preserving_global_id_checked(const dynamic_object_ref& ref, const std::string& preserved_global_id,
+                                         cxx_error& err) const noexcept {
+        return sealed_error(err, [&] { checked_add_owner().add_preserving_global_id(ref, preserved_global_id); });
     }
     void add_preserving_global_id(const dynamic_object_ref& ref, const std::string& preserved_global_id,
-                                  cxx_error& err) const {
-        impl().add_preserving_global_id(ref, preserved_global_id, err);
-    }
+                                  cxx_error& err) const { (void)add_preserving_global_id_checked(ref, preserved_global_id, err); }
 #if LATTICE_HAS_FRT
-    void add_bulk(std::vector<dynamic_object_ref*>& objects) const { impl().add_bulk(objects); }
+    bool add_bulk_checked(std::vector<dynamic_object_ref*>& objects, cxx_error& err) const noexcept {
+        return sealed_error(err, [&] { checked_bulk_body(objects); });
+    }
+    void add_bulk(std::vector<dynamic_object_ref*>& objects) const { sealed([&] { checked_bulk_body(objects); }); }
 #else
-    void add_bulk(std::vector<dynamic_object_ref>& objects) const { impl().add_bulk(objects); }
+    bool add_bulk_checked(std::vector<dynamic_object_ref>& objects, cxx_error& err) const noexcept {
+        return sealed_error(err, [&] { checked_bulk_body(objects); });
+    }
+    void add_bulk(std::vector<dynamic_object_ref>& objects) const { sealed([&] { checked_bulk_body(objects); }); }
 #endif
     bool remove(const dynamic_object_ref& obj) const {
         return sealed([&] { return impl().remove(obj); });
@@ -4379,19 +4640,13 @@ public:
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt,
         OptionalString distinct_by = std::nullopt,
-        const ColumnValueVector& params = {}) const {
-        return impl().objects(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params);
-    }
+        const ColumnValueVector& params = {}) const { return sealed([&] { return impl().objects(table_name, where_clause, order_by, limit, offset, group_by, distinct_by, params); }); }
 
     // Dynamic (schema-from-file) introspection — forwarders to the schema
     // reconstructed by a dynamic open. See swift_lattice::open_dynamic.
-    std::vector<std::string> dynamic_table_names() const SWIFT_NAME(dynamicTableNames()) {
-        return impl().dynamic_table_names();
-    }
+    std::vector<std::string> dynamic_table_names() const SWIFT_NAME(dynamicTableNames()) { return sealed([&] { return impl().dynamic_table_names(); }); }
     std::vector<property_descriptor> dynamic_properties_for(const std::string& table_name) const
-        SWIFT_NAME(dynamicPropertiesFor(_:)) {
-        return impl().dynamic_properties_for(table_name);
-    }
+        SWIFT_NAME(dynamicPropertiesFor(_:)) { return sealed([&] { return impl().dynamic_properties_for(table_name); }); }
 
     std::vector<managed<swift_dynamic_object>> union_objects(
         const std::vector<std::string>& table_names,
@@ -4399,16 +4654,12 @@ public:
         OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
-        const ColumnValueVector& params = {}) const {
-        return impl().union_objects(table_names, where_clause, order_by, limit, offset, params);
-    }
+        const ColumnValueVector& params = {}) const { return sealed([&] { return impl().union_objects(table_names, where_clause, order_by, limit, offset, params); }); }
     size_t count(const std::string& table_name,
                  OptionalString where_clause,
                  OptionalString group_by,
                  OptionalString distinct_by,
-                 const ColumnValueVector& params = {}) const {
-        return impl().count(table_name, where_clause, group_by, distinct_by, params);
-    }
+                 const ColumnValueVector& params = {}) const { return sealed([&] { return impl().count(table_name, where_clause, group_by, distinct_by, params); }); }
     bool delete_where(const std::string& table_name, std::optional<std::string> where_clause,
                       const ColumnValueVector& params = {}) const {
         return sealed([&] { return impl().delete_where(table_name, where_clause, params); });
@@ -4431,7 +4682,12 @@ public:
     /// VACUUM + TRUNCATE checkpoint in the order WAL mode needs; see swift_lattice::reclaim_space.
     reclaim_result reclaim_space(int max_passes = 2) const
         SWIFT_NAME(reclaimSpace(maxPasses:)) {
-        return sealed([&] { return impl().reclaim_space(max_passes); });
+        auto result = sealed([&] { return impl().reclaim_space(max_passes); });
+        if (last_bridge_call_failed()) {
+            result.ok = false;
+            try { result.error = last_bridge_error(); } catch (...) {}
+        }
+        return result;
     }
     int64_t safe_compact_audit_log(int64_t stale_threshold_seconds = 0) const {
         return sealed([&] { return impl().safe_compact_audit_log(stale_threshold_seconds); });
@@ -4475,17 +4731,26 @@ public:
     int64_t force_compact_audit_log() const {
         return sealed([&] { return impl().force_compact_audit_log(); });
     }
-    void backdate_replication_slots(int64_t seconds) const { impl().backdate_replication_slots(seconds); }
+    void backdate_replication_slots(int64_t seconds) const { sealed([&] { impl().backdate_replication_slots(seconds); }); }
     /// The TRUNCATE checkpoint's real outcome (busy / partial / complete).
-    checkpoint_outcome checkpoint() const { return impl().checkpoint(); }
+    checkpoint_outcome checkpoint() const { return sealed([&] { return impl().checkpoint(); }); }
     /// Frames checkpointed; -1 when nothing could run; -2 when the call THREW
     /// (distinct from a legitimate 0 — the sealed default used to collide).
     int64_t checkpoint_bounded(int64_t busy_budget_ms = 250) const
         SWIFT_NAME(checkpointBounded(busyBudgetMs:)) {
         const int64_t frames = sealed([&] { return impl().checkpoint_bounded(busy_budget_ms); });
-        return last_bridge_error().empty() ? frames : -2;
+        return last_bridge_call_failed() ? -2 : frames;
     }
-    void optimize() const { impl().optimize(); }
+    void optimize() const { sealed([&] { impl().optimize(); }); }
+
+    owned_catalog_operation make_owned_catalog_operation(const std::string& tables_json,
+        int64_t timeout_nanoseconds) const SWIFT_NAME(makeOwnedCatalogOperation(tablesJSON:timeoutNanoseconds:)) {
+        return sealed([&] {
+            (void)impl(); // Actual callback/owner validation before control creation.
+            return owned_catalog_operation(lattice::make_catalog_stream_operation(
+                std::static_pointer_cast<lattice_db>(impl_), tables_json, timeout_nanoseconds));
+        });
+    }
 
     projection_operation start_projection(const projection_request& request) const
         SWIFT_NAME(startProjection(_:)) {
@@ -4512,6 +4777,63 @@ public:
     // means subsequent writes autocommit individually (atomicity degrades,
     // process survives), and the paired commit/rollback no-op-fails into
     // the same slot instead of trapping.
+private:
+    swift_transaction_result begin_transaction_receipt_impl(bool strict) const noexcept {
+        swift_transaction_result result;
+        sealed([&] {
+            auto& owner = impl();
+            auto issued = owner.begin_transaction_receipt_(strict);
+            result.receipt_ = swift_transaction_receipt(std::move(issued), owner_identity());
+        });
+        result.capture(borrow_bridge_outcome());
+        return result;
+    }
+public:
+    swift_transaction_result begin_transaction_receipt() const noexcept
+        SWIFT_NAME(beginTransactionReceipt()) { return begin_transaction_receipt_impl(true); }
+    // Legacy explicit APIs keep their existing raw-access/waiting contract.
+    // Their receipt is only ending/bookkeeping DATA; it never relaxes the
+    // strict expected-receipt SQL settlement used by withTransaction.
+    swift_transaction_result begin_legacy_transaction_receipt() const noexcept
+        SWIFT_NAME(beginLegacyTransactionReceipt()) { return begin_transaction_receipt_impl(false); }
+private:
+    swift_transaction_result settle_transaction_receipt(
+        const swift_transaction_receipt& receipt, bool rollback, bool expected = true) const noexcept {
+        swift_transaction_result result;
+        result.receipt_ = receipt;
+        sealed([&] {
+            if (!receipt.valid() || !owner_identity().matches(receipt.owner_))
+                throw std::runtime_error("Transaction receipt does not belong to this owner");
+            auto& owner = impl();
+            try {
+                if (expected) {
+                    if (rollback) owner.rollback_transaction_receipt_(receipt.core_);
+                    else owner.commit_transaction_receipt_(receipt.core_);
+                } else {
+                    // This is the existing public "settle current" contract.
+                    // The captured receipt controls only which Swift frame
+                    // may retire after the actual old original ended.
+                    if (rollback) owner.rollback();
+                    else owner.commit();
+                }
+            } catch (...) {
+                result.ended_ = owner.transaction_receipt_ended_(receipt.core_);
+                throw;
+            }
+            result.ended_ = owner.transaction_receipt_ended_(receipt.core_);
+        });
+        result.capture(borrow_bridge_outcome());
+        return result;
+    }
+public:
+    swift_transaction_result commit_transaction_receipt(const swift_transaction_receipt& receipt) const noexcept
+        SWIFT_NAME(commitTransactionReceipt(_:)) { return settle_transaction_receipt(receipt, false); }
+    swift_transaction_result rollback_transaction_receipt(const swift_transaction_receipt& receipt) const noexcept
+        SWIFT_NAME(rollbackTransactionReceipt(_:)) { return settle_transaction_receipt(receipt, true); }
+    swift_transaction_result commit_legacy_transaction_receipt(const swift_transaction_receipt& receipt) const noexcept
+        SWIFT_NAME(commitLegacyTransactionReceipt(_:)) { return settle_transaction_receipt(receipt, false, false); }
+    swift_transaction_result rollback_legacy_transaction_receipt(const swift_transaction_receipt& receipt) const noexcept
+        SWIFT_NAME(rollbackLegacyTransactionReceipt(_:)) { return settle_transaction_receipt(receipt, true, false); }
     void begin_transaction() const { sealed([&] { impl().begin_transaction(); }); }
     void commit() const { sealed([&] { impl().commit(); }); }
     void rollback() const { sealed([&] { impl().rollback(); }); }
@@ -4531,21 +4853,19 @@ public:
         // Legacy compatibility remains nonthrowing and records an error without
         // conflating a pending/disconnected close with completed remote ACKs.
         try {
-            last_bridge_error().clear();
+            clear_bridge_outcome();
             if(result.failed_)record_bridge_error(result.message_.empty()?"C++ close failed (message unavailable)":result.message_.c_str());
             else if(result.sync_!=static_cast<int32_t>(sync_drain_state::drained)&&result.sync_!=static_cast<int32_t>(sync_drain_state::not_attempted))
                 record_bridge_error("Closed with synchronization incomplete; inspect closeChecked result");
         }catch(...) {record_bridge_error("C++ close diagnostic unavailable");}
     }
-    bool is_closed() const SWIFT_NAME(isClosed()) { return impl().is_closed(); }
-    bool has_attached_stores() const SWIFT_NAME(hasAttachedStores()) {
-        return impl().has_attached_stores();
-    }
+    bool is_closed() const SWIFT_NAME(isClosed()) { return sealed_or([&] { return impl().is_closed(); }, true); }
+    bool has_attached_stores() const SWIFT_NAME(hasAttachedStores()) { return sealed([&] { return impl().has_attached_stores(); }); }
 
     // Sync status
-    bool is_sync_agent() const { return impl().is_sync_agent(); }
-    bool is_sync_connected() const { return impl().is_sync_connected(); }
-    void clear_sync_filter() const { impl().clear_sync_filter(); }
+    bool is_sync_agent() const { return sealed([&] { return impl().is_sync_agent(); }); }
+    bool is_sync_connected() const { return sealed([&] { return impl().is_sync_connected(); }); }
+    void clear_sync_filter() const { sealed([&] { impl().clear_sync_filter(); }); }
 
     // Spatial (R*Tree)
     std::vector<managed<swift_dynamic_object>> objects_within_bbox(
@@ -4558,19 +4878,15 @@ public:
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt) const
-        SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
-        return impl().objects_within_bbox(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
-                                          where_clause, order_by, limit, offset, group_by);
-    }
+        SWIFT_NAME(objectsWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) { return sealed([&] { return impl().objects_within_bbox(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+                                          where_clause, order_by, limit, offset, group_by); }); }
     int64_t count_within_bbox(
         const std::string& table_name,
         const std::string& geo_column,
         double min_lat, double max_lat,
         double min_lon, double max_lon,
         OptionalString where_clause = std::nullopt) const
-        SWIFT_NAME(countWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:)) {
-        return impl().count_within_bbox(table_name, geo_column, min_lat, max_lat, min_lon, max_lon, where_clause);
-    }
+        SWIFT_NAME(countWithinBBox(table:geoColumn:minLat:maxLat:minLon:maxLon:where:)) { return sealed([&] { return impl().count_within_bbox(table_name, geo_column, min_lat, max_lat, min_lon, max_lon, where_clause); }); }
 
     std::vector<managed<swift_dynamic_object>> objects_within_bbox_shape(
         const std::string& table_name, const std::string& geo_column,
@@ -4578,19 +4894,15 @@ public:
         OptionalString where_clause = std::nullopt, OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt, OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt) const
-        SWIFT_NAME(objectsWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
-        return impl().objects_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
-            where_clause, order_by, limit, offset, group_by, distinct_by);
-    }
+        SWIFT_NAME(objectsWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) { return sealed([&] { return impl().objects_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+            where_clause, order_by, limit, offset, group_by, distinct_by); }); }
     int64_t count_within_bbox_shape(
         const std::string& table_name, const std::string& geo_column,
         double min_lat, double max_lat, double min_lon, double max_lon,
         OptionalString where_clause = std::nullopt,
         OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt) const
-        SWIFT_NAME(countWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:groupBy:distinctBy:)) {
-        return impl().count_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
-            where_clause, group_by, distinct_by);
-    }
+        SWIFT_NAME(countWithinBBoxShape(table:geoColumn:minLat:maxLat:minLon:maxLon:where:groupBy:distinctBy:)) { return sealed([&] { return impl().count_within_bbox_shape(table_name, geo_column, min_lat, max_lat, min_lon, max_lon,
+            where_clause, group_by, distinct_by); }); }
 
     // Combined proximity
     CombinedQueryResultVector combined_nearest_query(
@@ -4604,10 +4916,8 @@ public:
         int64_t limit,
         OptionalString group_by = std::nullopt,
         OptionalString distinct_by = std::nullopt) const
-        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
-        return impl().combined_nearest_query(table_name, bounds, vectors, geos, texts,
-                                             where_clause, sort, limit, group_by, distinct_by);
-    }
+        SWIFT_NAME(combinedNearestQuery(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) { return sealed([&] { return impl().combined_nearest_query(table_name, bounds, vectors, geos, texts,
+                                             where_clause, sort, limit, group_by, distinct_by); }); }
     int64_t combined_nearest_query_count(
         const std::string& table_name,
         const BoundsConstraintVector& bounds,
@@ -4619,23 +4929,21 @@ public:
         int64_t limit,
         OptionalString group_by = std::nullopt,
         OptionalString distinct_by = std::nullopt) const
-        SWIFT_NAME(combinedNearestQueryCount(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) {
-        return impl().combined_nearest_query_count(table_name, bounds, vectors, geos, texts,
-                                                   where_clause, sort, limit, group_by, distinct_by);
-    }
+        SWIFT_NAME(combinedNearestQueryCount(table:bounds:vectors:geos:texts:where:sort:limit:groupBy:distinctBy:)) { return sealed([&] { return impl().combined_nearest_query_count(table_name, bounds, vectors, geos, texts,
+                                                   where_clause, sort, limit, group_by, distinct_by); }); }
 
     // Attach another lattice's underlying handle. Takes a swift_lattice_ref so the
     // argument is iOS-15-safe (vs the raw swift_lattice). On the FRT path the ref
     // is a foreign-reference class (heap-only) so it must be passed by pointer; on
     // the value path it's a plain value passed by copy (shares impl_).
 #if LATTICE_HAS_FRT
-    bool attach(swift_lattice_ref* other) const { return impl().attach(*other->get()); }
-    bool detach(swift_lattice_ref* other) const { return impl().detach(*other->get()); }
+    bool attach(swift_lattice_ref* other) const { return sealed([&] { if (!other || !other->valid()) throw std::invalid_argument("attachment owner is empty"); return impl().attach(other->impl()); }); }
+    bool detach(swift_lattice_ref* other) const { return sealed([&] { if (!other || !other->valid()) throw std::invalid_argument("attachment owner is empty"); return impl().detach(other->impl()); }); }
 #else
-    bool attach(swift_lattice_ref other) const { return impl().attach(*other.get()); }
-    bool detach(swift_lattice_ref other) const { return impl().detach(*other.get()); }
+    bool attach(swift_lattice_ref other) const { return sealed([&] { if (!other.valid()) throw std::invalid_argument("attachment owner is empty"); return impl().attach(other.impl()); }); }
+    bool detach(swift_lattice_ref other) const { return sealed([&] { if (!other.valid()) throw std::invalid_argument("attachment owner is empty"); return impl().detach(other.impl()); }); }
 #endif
-    OptionalString last_attach_error() const { return impl().last_attach_error(); }
+    OptionalString last_attach_error() const { return sealed([&] { return impl().last_attach_error(); }); }
 
     // Sync data ingestion
     // Exact held owner on both FRT and value paths. Empty/retired owners return
@@ -4684,7 +4992,7 @@ public:
             return 0;
         }
     }
-    std::vector<std::string> receive_sync_data(const ByteVector& data) const { return impl().receive_sync_data(data); }
+    std::vector<std::string> receive_sync_data(const ByteVector& data) const { return sealed([&] { return impl().receive_sync_data(data); }); }
     ordinary_sync_export_ref capture_ordinary_export(const std::vector<std::string>& models)const noexcept
         SWIFT_NAME(captureOrdinaryExport(models:)) {
         try{if(!valid()||impl().is_closed())return {};return ordinary_sync_export_ref::capture(impl(),models);}catch(...){return {};}
@@ -4697,7 +5005,7 @@ public:
         SWIFT_NAME(captureOrdinaryHistoryExport(models:)) {
         try{if(!valid()||impl().is_closed())return {};return ordinary_history_export_ref::capture(impl(),models);}catch(...){return {};}
     }
-    OptionalString last_receive_error() const { return impl().last_receive_error(); }
+    OptionalString last_receive_error() const { return sealed([&] { return impl().last_receive_error(); }); }
 
     /// The sealed query surface's error slot (see error.hpp): nullopt if
     /// the last sealed call on THIS THREAD succeeded, else its failure
@@ -4710,28 +5018,18 @@ public:
     }
 
     // Sync filter
-    void update_sync_filter(const SyncFilterVector& filter) const { impl().update_sync_filter(filter); }
-    void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter) const {
-        impl().update_sync_filter_for_channel(channel, filter);
-    }
-    void clear_sync_filter_for_channel(const std::string& channel) const {
-        impl().clear_sync_filter_for_channel(channel);
-    }
-    void remove_sync_channel_state(const std::string& sync_id) const {
-        impl().remove_sync_channel_state(sync_id);
-    }
+    void update_sync_filter(const SyncFilterVector& filter) const { sealed([&] { impl().update_sync_filter(filter); }); }
+    void update_sync_filter_for_channel(const std::string& channel, const SyncFilterVector& filter) const { sealed([&] { impl().update_sync_filter_for_channel(channel, filter); }); }
+    void clear_sync_filter_for_channel(const std::string& channel) const { sealed([&] { impl().clear_sync_filter_for_channel(channel); }); }
+    void remove_sync_channel_state(const std::string& sync_id) const { sealed([&] { impl().remove_sync_channel_state(sync_id); }); }
     /// Hard-delete rows with the no-relay marker (admin tombstone purge) —
     /// see lattice_db::delete_rows_no_relay for why a normal delete is
     /// catastrophic on a shared group DB.
     int64_t delete_rows_no_relay(const std::string& table,
-                                 const std::vector<std::string>& global_row_ids) const {
-        return impl().delete_rows_no_relay(table, global_row_ids);
-    }
+                                 const std::vector<std::string>& global_row_ids) const { return sealed([&] { return impl().delete_rows_no_relay(table, global_row_ids); }); }
 
     // Observers
-    void remove_table_observer(const std::string& table_name, uint64_t observer_id) const {
-        impl().remove_table_observer(table_name, observer_id);
-    }
+    void remove_table_observer(const std::string& table_name, uint64_t observer_id) const { sealed([&] { impl().remove_table_observer(table_name, observer_id); }); }
     uint64_t add_table_observer(const std::string& table_name,
                                 void* context,
                                 void (*callback)(void* ctx,
@@ -4739,29 +5037,19 @@ public:
                                                  const int64_t* row_ids,
                                                  const char* const* global_row_ids,
                                                  size_t count),
-                                void (*destroy)(void*) = nullptr) const {
-        return impl().add_table_observer(table_name, context, callback, destroy);
-    }
+                                void (*destroy)(void*) = nullptr) const { return sealed_context(context, destroy, [&](auto& owner) { return owner.add_table_observer(table_name, context, callback, destroy); }); }
     uint64_t add_object_observer(const std::string& table_name,
                                  int64_t row_id,
                                  void* context,
                                  void (*callback)(const char* changed_field_names, void* ctx),
-                                 void (*destroy)(void*) = nullptr) const {
-        return impl().add_object_observer(table_name, row_id, context, callback, destroy);
-    }
-    void remove_object_observer(const std::string& table_name, int64_t row_id, uint64_t observer_id) const {
-        impl().remove_object_observer(table_name, row_id, observer_id);
-    }
+                                 void (*destroy)(void*) = nullptr) const { return sealed_context(context, destroy, [&](auto& owner) { return owner.add_object_observer(table_name, row_id, context, callback, destroy); }); }
+    void remove_object_observer(const std::string& table_name, int64_t row_id, uint64_t observer_id) const { sealed([&] { impl().remove_object_observer(table_name, row_id, observer_id); }); }
 
     uint64_t add_recovery_refresh_observer(void* context, void (*callback)(void*),
-                                           void (*destroy)(void*) = nullptr) const {
-        return impl().add_recovery_refresh_observer(context, callback, destroy);
-    }
-    void remove_recovery_refresh_observer(uint64_t token) const {
-        impl().remove_recovery_refresh_observer(token);
-    }
+                                           void (*destroy)(void*) = nullptr) const { return sealed_context(context, destroy, [&](auto& owner) { return owner.add_recovery_refresh_observer(context, callback, destroy); }); }
+    void remove_recovery_refresh_observer(uint64_t token) const { sealed([&] { impl().remove_recovery_refresh_observer(token); }); }
 
-    int64_t pending_sync_entry_count() const { return impl().pending_sync_entry_count(); }
+    int64_t pending_sync_entry_count() const { return sealed([&] { return impl().pending_sync_entry_count(); }); }
 
     // Sync callbacks (C trampolines)
     void set_on_sync_progress(void* context,
@@ -4771,24 +5059,16 @@ public:
                                                int64_t acked,
                                                int64_t received,
                                                const char* sync_id),
-                              void (*destroy)(void*) = nullptr) const {
-        impl().set_on_sync_progress(context, callback, destroy);
-    }
+                              void (*destroy)(void*) = nullptr) const { sealed_context(context, destroy, [&](auto& owner) { owner.set_on_sync_progress(context, callback, destroy); }, callback != nullptr); }
     void set_on_sync_error(void* context,
                            void (*callback)(void* ctx, const char* error, int64_t len),
-                           void (*destroy)(void*) = nullptr) const {
-        impl().set_on_sync_error(context, callback, destroy);
-    }
+                           void (*destroy)(void*) = nullptr) const { sealed_context(context, destroy, [&](auto& owner) { owner.set_on_sync_error(context, callback, destroy); }, callback != nullptr); }
     void set_on_sync_state_change(void* context,
                                   void (*callback)(void* ctx, bool connected),
-                                  void (*destroy)(void*) = nullptr) const {
-        impl().set_on_sync_state_change(context, callback, destroy);
-    }
+                                  void (*destroy)(void*) = nullptr) const { sealed_context(context, destroy, [&](auto& owner) { owner.set_on_sync_state_change(context, callback, destroy); }, callback != nullptr); }
     void set_on_xproc_idle(void* context,
                            void (*callback)(void*),
-                           void (*destroy)(void*) = nullptr) const {
-        impl().set_on_xproc_idle(context, callback, destroy);
-    }
+                           void (*destroy)(void*) = nullptr) const { sealed_context(context, destroy, [&](auto& owner) { owner.set_on_xproc_idle(context, callback, destroy); }, callback != nullptr); }
 
     // ---- Read generations + synchronous invalidation hooks (item A
     //      Commit 4). Const forwarders to the catch-all wrappers on
@@ -4857,9 +5137,7 @@ public:
                                                     const char* const* changed_tables,
                                                     size_t count,
                                                     int reason),
-                                   void (*destroy)(void*) = nullptr) const {
-        return impl().add_invalidation_hook(context, callback, destroy);
-    }
+                                   void (*destroy)(void*) = nullptr) const { return sealed_context(context, destroy, [&](auto& owner) { return owner.add_invalidation_hook(context, callback, destroy); }); }
     uint64_t add_invalidation_hook_with_fields(
         void* context,
         void (*callback)(void* ctx,
@@ -4867,40 +5145,58 @@ public:
                          const char* const* changed_fields,
                          size_t count,
                          int reason),
-        void (*destroy)(void*) = nullptr) const {
-        return impl().add_invalidation_hook_with_fields(context, callback, destroy);
-    }
-    void remove_invalidation_hook(uint64_t token) const {
-        impl().remove_invalidation_hook(token);
+        void (*destroy)(void*) = nullptr) const { return sealed_context(context, destroy, [&](auto& owner) { return owner.add_invalidation_hook_with_fields(context, callback, destroy); }); }
+    void remove_invalidation_hook(uint64_t token) const { sealed([&] { impl().remove_invalidation_hook(token); }); }
+
+    uint64_t acquire_read_generation() const { return sealed([&] { return impl().acquire_read_generation(); }); }
+    bool retain_read_generation(uint64_t generation_id) const { return sealed([&] { return impl().retain_read_generation(generation_id); }); }
+    void release_read_generation(uint64_t generation_id) const { sealed([&] { impl().release_read_generation(generation_id); }); }
+    void retire_all_read_generations() const { sealed([&] { impl().retire_all_read_generations(); }); }
+    size_t read_generations_outstanding() const { return sealed([&] { return impl().read_generations_outstanding(); }); }
+    size_t local_read_generations_outstanding() const { return sealed([&] { return impl().local_read_generations_outstanding(); }); }
+    void run_read_pool_maintenance() const { sealed([&] { impl().run_read_pool_maintenance(); }); }
+
+    read_pool_maintenance_result run_read_pool_maintenance_checked() const
+        SWIFT_NAME(runReadPoolMaintenanceChecked()) {
+        auto result = sealed([&] {
+            // Keep exactly this creator owner alive through the complete tick
+            // and its same-owner pending observation, even if a public alias
+            // is dropped. The ordinary callback guard latches any reentry.
+            auto retained = impl_;
+            if (!retained) throw db_error("read-pool maintenance original owner unavailable");
+            retained->require_catalog_callback_absent();
+            return retained->run_read_pool_maintenance_checked();
+        });
+        if (last_bridge_call_failed()) {
+            result.completed = false;
+            result.pressure_pending = true;
+            try { result.error = last_bridge_error(); } catch (...) {}
+        }
+        return result;
     }
 
-    uint64_t acquire_read_generation() const { return impl().acquire_read_generation(); }
-    bool retain_read_generation(uint64_t generation_id) const {
-        return impl().retain_read_generation(generation_id);
+    automatic_read_maintenance_enrollment_result enable_automatic_read_pool_maintenance_checked() const
+        SWIFT_NAME(enableAutomaticReadPoolMaintenanceChecked()) {
+        auto result = sealed([&] {
+            auto retained = impl_;
+            if (!retained) throw db_error("automatic read maintenance original owner unavailable");
+            retained->require_catalog_callback_absent();
+            return retained->enable_automatic_read_pool_maintenance_checked();
+        });
+        if (last_bridge_call_failed()) {
+            result.completed = false;
+            result.enabled = false;
+            try { result.error = last_bridge_error(); } catch (...) {}
+        }
+        return result;
     }
-    void release_read_generation(uint64_t generation_id) const {
-        impl().release_read_generation(generation_id);
-    }
-    void retire_all_read_generations() const { impl().retire_all_read_generations(); }
-    size_t read_generations_outstanding() const { return impl().read_generations_outstanding(); }
-    size_t local_read_generations_outstanding() const {
-        return impl().local_read_generations_outstanding();
-    }
-    void run_read_pool_maintenance() const { impl().run_read_pool_maintenance(); }
 
-    void set_read_generation_ttl_ms(int64_t ms) const {
-        impl().set_read_generation_ttl_ms(ms);
-    }
-    void set_read_generation_max_age_ms(int64_t ms) const {
-        impl().set_read_generation_max_age_ms(ms);
-    }
-    void set_wal_keeper_eviction_threshold_bytes(int64_t bytes) const {
-        impl().set_wal_keeper_eviction_threshold_bytes(bytes);
-    }
-    int64_t wal_keeper_eviction_threshold_bytes() const {
-        return impl().wal_keeper_eviction_threshold_bytes();
-    }
-    bool wal_eviction_pending() const { return impl().wal_eviction_pending(); }
+
+    void set_read_generation_ttl_ms(int64_t ms) const { sealed([&] { impl().set_read_generation_ttl_ms(ms); }); }
+    void set_read_generation_max_age_ms(int64_t ms) const { sealed([&] { impl().set_read_generation_max_age_ms(ms); }); }
+    void set_wal_keeper_eviction_threshold_bytes(int64_t bytes) const { sealed([&] { impl().set_wal_keeper_eviction_threshold_bytes(bytes); }); }
+    int64_t wal_keeper_eviction_threshold_bytes() const { return sealed([&] { return impl().wal_keeper_eviction_threshold_bytes(); }); }
+    bool wal_eviction_pending() const { return sealed([&] { return impl().wal_eviction_pending(); }); }
 
     std::vector<managed<swift_dynamic_object>> objects_at(
         uint64_t generation_id,
@@ -4911,18 +5207,14 @@ public:
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt,
         OptionalString distinct_by = std::nullopt,
-        const ColumnValueVector& params = {}) const {
-        return impl().objects_at(generation_id, table_name, where_clause, order_by,
-                                 limit, offset, group_by, distinct_by, params);
-    }
+        const ColumnValueVector& params = {}) const { return sealed_generation([&] { return impl().objects_at(generation_id, table_name, where_clause, order_by,
+                                 limit, offset, group_by, distinct_by, params); }); }
     int64_t count_at(uint64_t generation_id,
                      const std::string& table_name,
                      OptionalString where_clause = std::nullopt,
                      OptionalString group_by = std::nullopt,
                      OptionalString distinct_by = std::nullopt,
-                     const ColumnValueVector& params = {}) const {
-        return impl().count_at(generation_id, table_name, where_clause, group_by, distinct_by, params);
-    }
+                     const ColumnValueVector& params = {}) const { return sealed_generation([&] { return impl().count_at(generation_id, table_name, where_clause, group_by, distinct_by, params); }); }
     std::vector<managed<swift_dynamic_object>> objects_within_bbox_at(
         uint64_t generation_id,
         const std::string& table_name,
@@ -4934,11 +5226,9 @@ public:
         OptionalInt64 limit = std::nullopt,
         OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt) const
-        SWIFT_NAME(objectsWithinBBoxAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) {
-        return impl().objects_within_bbox_at(generation_id, table_name, geo_column,
+        SWIFT_NAME(objectsWithinBBoxAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:)) { return sealed_generation([&] { return impl().objects_within_bbox_at(generation_id, table_name, geo_column,
                                              min_lat, max_lat, min_lon, max_lon,
-                                             where_clause, order_by, limit, offset, group_by);
-    }
+                                             where_clause, order_by, limit, offset, group_by); }); }
     std::vector<managed<swift_dynamic_object>> objects_within_bbox_shape_at(
         uint64_t generation_id,
         const std::string& table_name, const std::string& geo_column,
@@ -4946,17 +5236,13 @@ public:
         OptionalString where_clause = std::nullopt, OptionalString order_by = std::nullopt,
         OptionalInt64 limit = std::nullopt, OptionalInt64 offset = std::nullopt,
         OptionalString group_by = std::nullopt, OptionalString distinct_by = std::nullopt) const
-        SWIFT_NAME(objectsWithinBBoxShapeAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) {
-        return impl().objects_within_bbox_shape_at(generation_id, table_name, geo_column,
-            min_lat, max_lat, min_lon, max_lon, where_clause, order_by, limit, offset, group_by, distinct_by);
-    }
+        SWIFT_NAME(objectsWithinBBoxShapeAt(generation:table:geoColumn:minLat:maxLat:minLon:maxLon:where:orderBy:limit:offset:groupBy:distinctBy:)) { return sealed_generation([&] { return impl().objects_within_bbox_shape_at(generation_id, table_name, geo_column,
+            min_lat, max_lat, min_lon, max_lon, where_clause, order_by, limit, offset, group_by, distinct_by); }); }
     std::vector<int64_t> query_ids_at(const std::string& table_name,
                                       OptionalString where_clause = std::nullopt,
                                       OptionalString order_by = std::nullopt,
-                                      const ColumnValueVector& params = {}) const {
-        return impl().query_ids_at(table_name, where_clause, order_by, params);
-    }
-    int64_t data_version() const { return impl().data_version(); }
+                                      const ColumnValueVector& params = {}) const { return sealed_generation([&] { return impl().query_ids_at(table_name, where_clause, order_by, params); }); }
+    int64_t data_version() const { return sealed_or([&] { return impl().data_version(); }, int64_t(-1)); }
     /// Per-thread stale flag for the generation reads above — see
     /// swift_lattice::last_generation_read_stale(). Instance-shaped for
     /// call-site convenience; the flag itself is thread-local.
@@ -4977,6 +5263,12 @@ public:
     }
 
 private:
+    // Kept private and unconditional: the separate fixture SPI uses the
+    // existing swift_lattice_ref friendship without exposing native custody.
+    static bool automatic_fixture_owns_creator(
+        const std::shared_ptr<swift_lattice>& retained) noexcept {
+        return retained && retained->owns_creator_process();
+    }
     swift_lattice_ref() = default;
 
     std::shared_ptr<swift_lattice> impl_;
@@ -4995,6 +5287,55 @@ private:
 #endif
 #undef LATTICE_SLREF_RET
 #undef LATTICE_SLREF_UNRETAINED
+
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+// Test-only type, separate from swift_lattice_ref: enabling this SPI for the
+// test importer changes neither the production class definition nor layout.
+// All access still uses the real retained creator and sealed callback fence.
+class automatic_read_maintenance_fixture_access {
+public:
+    static automatic_read_maintenance_fixture_token pause_automatic_maintenance(
+        const swift_lattice_ref& ref) SWIFT_NAME(pauseAutomaticMaintenance(ref:)) {
+        return sealed([&] {
+            auto retained = ref.impl_;
+            if (!retained || !swift_lattice_ref::automatic_fixture_owns_creator(retained) || retained->is_closed())
+                throw db_error("automatic maintenance pause requires its live creator");
+            retained->require_catalog_callback_absent();
+            auto hold = detail::recovery_refresh_test_access::pause_automatic_maintenance(*retained);
+            automatic_read_maintenance_fixture_token result(std::move(hold));
+            result.busy_ = !result.control_; // Native null means actual running only.
+            return result;
+        });
+    }
+    static automatic_read_maintenance_fixture_snapshot automatic_maintenance_snapshot(
+        const swift_lattice_ref& ref) SWIFT_NAME(automaticMaintenanceSnapshot(ref:)) {
+        return sealed([&] {
+            auto retained = ref.impl_;
+            if (!retained || !swift_lattice_ref::automatic_fixture_owns_creator(retained))
+                throw db_error("automatic maintenance observation requires its creator");
+            retained->require_catalog_callback_absent();
+            const auto actual = detail::recovery_refresh_test_access::automatic_snapshot(*retained);
+            automatic_read_maintenance_fixture_snapshot result;
+            result.available = true;
+            result.enabled = actual.enabled;
+            result.running = actual.running;
+            result.pause_count = actual.pause_count;
+            result.attempts = actual.attempts;
+            result.quiet_returns = actual.quiet_returns;
+            result.deferred = actual.deferred;
+            result.completed = actual.completed;
+            return result;
+        });
+    }
+    static automatic_read_maintenance_fixture_token fail_next_automatic_enrollment()
+        SWIFT_NAME(failNextAutomaticEnrollment()) {
+        return sealed([&] {
+            return automatic_read_maintenance_fixture_token(
+                detail::recovery_refresh_test_access::fail_next_automatic_enrollment());
+        });
+    }
+};
+#endif
 
 // ============================================================================
 // Migration Lookup Functions

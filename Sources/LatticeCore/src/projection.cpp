@@ -26,6 +26,12 @@ constexpr bool kMemoryCaptureEnabled = true;
 constexpr size_t kMaxLeases = 2; // Explicit resource choice; not a measured optimum.
 constexpr int64_t kMaxRequestBytes = 1024 * 1024;
 std::atomic<uint64_t> next_operation_id{1};
+uint64_t reserve_projection_operation_id() noexcept {
+    auto current = next_operation_id.load(std::memory_order_relaxed);
+    while (current != 0 && current != std::numeric_limits<uint64_t>::max())
+        if (next_operation_id.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) return current;
+    return 0; // Sticky exhaustion, never reuse a live physical-store token.
+}
 
 std::string quote_sql_identifier(const std::string& name) {
     std::string value = "\"";
@@ -119,7 +125,7 @@ private:
 };
 
 struct projection_operation_state : std::enable_shared_from_this<projection_operation_state> {
-    uint64_t id = next_operation_id.fetch_add(1, std::memory_order_relaxed);
+    uint64_t id = reserve_projection_operation_id();
     std::shared_ptr<projection_service> service;
     projection_query query;
     std::shared_ptr<database_read_control> control = std::make_shared<database_read_control>();
@@ -340,6 +346,9 @@ projection_status projection_store_ticket::publish(uint64_t operation_id, const 
     }
     state_->operation_id = operation_id;
     return projection_status::batch;
+}
+projection_status projection_store_ticket::publish_unique(const std::shared_ptr<database_read_control>& control) const {
+    return publish(reserve_projection_operation_id(), control);
 }
 void projection_store_ticket::release() noexcept { state_.reset(); }
 std::shared_ptr<projection_pressure_source> make_projection_pressure_source(const std::shared_ptr<const physical_store_identity>& identity) {
@@ -739,6 +748,7 @@ projection_read_operation projection_service::start(const projection_query& quer
         else if (operations_.size() >= kMaxOperations) { rejection = projection_status::admission_rejected; reason = "projection pending operation bound exceeded"; }
         state = std::make_shared<projection_operation_state>(shared_from_this(),
             rejection == projection_status::batch ? query : projection_query{}, deadline);
+        if (state->id == 0) { rejection = projection_status::admission_rejected; reason = "projection operation identity exhausted"; }
         if (rejection != projection_status::batch) {
             state->error = reason;
             state->control->stop_code.store(static_cast<int32_t>(rejection));
@@ -1128,6 +1138,7 @@ column_value_t projection_read_batch::value(int64_t row, int64_t column) const {
 }
 
 projection_read_operation lattice_db::start_projection(const projection_query& query) {
+    require_catalog_callback_absent();
     note_history_uncaptured_connection(); // Before a private projection connection or service can be admitted.
     std::shared_ptr<projection_service> service;
     {

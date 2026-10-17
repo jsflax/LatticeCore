@@ -1,4 +1,5 @@
 #include "ordinary_normal_startup.hpp"
+#include "ordinary_wal_policy.hpp"
 #include "ordinary_managed_history.hpp"
 #ifdef LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE
 #include "ordinary_target_reclamation_fixture.hpp"
@@ -424,6 +425,10 @@ normal_launch_offer decode_normal_offer(const std::vector<std::uint8_t>& bytes) 
 #include "ordinary_managed_cohort_link.inc"
 #ifdef LATTICE_ORDINARY_NORMAL_POSIX
 struct ordinary_open_context::implementation {
+    // Initial engineering policy, subject to real workload/cutover qualification.
+    // Only actual receiver construction or an existing exact-path view supplies it.
+    const std::int64_t wal_extent_limit_bytes;
+    explicit implementation(std::int64_t limit=ordinary_managed_wal_limit_bytes):wal_extent_limit_bytes(limit){}
     std::shared_ptr<const ordinary_managed_child_admission> managed;
     std::string managed_path;
     fd_owner data, control, root, installer_parent, normal_root, main;
@@ -515,6 +520,27 @@ std::string ordinary_open_context::primary_path() const {
     normal_fail("managed normal context unsupported");
 #endif
 }
+std::int64_t ordinary_open_context::wal_extent_limit_bytes(const std::string& path) const {
+    require_attachment_creator();
+#ifdef LATTICE_ORDINARY_NORMAL_POSIX
+    if(!impl_ || path!=(impl_->managed?impl_->managed_path:impl_->path) || impl_->wal_extent_limit_bytes<=0)
+        normal_fail("managed WAL policy requires its exact retained path");
+    return impl_->wal_extent_limit_bytes;
+#else
+    (void)path;normal_fail("managed WAL policy unavailable");
+#endif
+}
+std::optional<std::int64_t> ordinary_select_wal_extent_limit(const std::string& path,
+    const ordinary_context& context,std::optional<std::int64_t> requested) {
+    if(!context)return requested;
+    ordinary_require_creator(context);
+    // This adds no memory permission. The caller's existing before-open gate
+    // must already have accepted this exact isolated in-memory typed route.
+    if(path==":memory:")return requested;
+    const auto issued=context->wal_extent_limit_bytes(path);
+    if(requested && *requested!=issued)normal_fail("managed WAL policy differs from receiver-issued extent");
+    return issued;
+}
 std::vector<std::string> ordinary_open_context::managed_paths() const {
     require_attachment_creator();
 #ifdef LATTICE_ORDINARY_NORMAL_POSIX
@@ -529,7 +555,7 @@ std::shared_ptr<const ordinary_open_context> ordinary_open_context::for_managed_
 #ifdef LATTICE_ORDINARY_NORMAL_POSIX
     if(!impl_ || !impl_->managed)normal_fail("managed history family required");
     impl_->managed->validate_open(path);
-    auto view=std::make_shared<implementation>();view->managed=impl_->managed;view->managed_path=path;
+    auto view=std::make_shared<implementation>(impl_->wal_extent_limit_bytes);view->managed=impl_->managed;view->managed_path=path;
     return std::shared_ptr<const ordinary_open_context>(new ordinary_open_context(std::move(view)));
 #else
     (void)path;normal_fail("managed history unavailable");

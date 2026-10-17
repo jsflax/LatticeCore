@@ -1,4 +1,5 @@
 #include "recovery_writer_access.hpp"
+#include "recovery_resume_commit_publication.hpp"
 #include "ordinary_history_final_install.hpp"
 #include "receive_delivery_guard.hpp"
 #include "recovery_admission_test_probe.hpp"
@@ -72,11 +73,25 @@ database* recovery_writer_access::active_writer(lattice_db& owner) {
     }
     // Refuse another thread before any SQLite call: the admitted maintenance
     // frame may hold that connection while waiting for this caller to finish.
-    if (owner.is_closed() || owner.txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id() ||
-        !owner.owns_write_transaction()) return nullptr;
+    if (owner.is_closed() || owner.txn_owner_thread_.load(std::memory_order_acquire) != std::this_thread::get_id())
+        return nullptr;
     auto& writer = owner.db();
     auto* h = writer.internal_handle();
-    if (writer.is_closed() || writer.channel_reset_unsettled_.load(std::memory_order_acquire) || sqlite3_get_autocommit(h) != 0 ||
+    if (!h || writer.is_closed()) return nullptr;
+    auto* mutex = sqlite3_db_mutex(h);
+#ifndef __EMSCRIPTEN__
+    if (!mutex) return nullptr;
+#endif
+    if (sqlite3_mutex_try(mutex) != SQLITE_OK) return nullptr;
+    struct unlock {sqlite3_mutex* mutex;~unlock(){sqlite3_mutex_leave(mutex);}} release{mutex};
+    // The old routing stamp is only a necessary check. Actual database
+    // settlement retires physical Core origin; a raw successor cannot inherit
+    // it. A recycled thread id must also match this live TLS original. Public
+    // native escape prevents proving any later external settlement sequence.
+    if (writer.is_closed() || writer.raw_handle_escaped_.load(std::memory_order_acquire) ||
+        writer.core_transaction_thread_ != std::this_thread::get_id() ||
+        !writer.core_transaction_origin_current_locked_() || !owner.owns_write_transaction() ||
+        writer.channel_reset_unsettled_.load(std::memory_order_acquire) || sqlite3_get_autocommit(h) != 0 ||
         sqlite3_txn_state(h, "main") != SQLITE_TXN_WRITE) return nullptr;
     return &writer;
 }
@@ -459,6 +474,24 @@ struct recovery_writer_access::install_owner {
     explicit operator bool()const noexcept{return pointer!=nullptr;}
 };
 
+thread_local recovery_writer_access::controller_admission_intent::turn* recovery_writer_access::controller_admission_intent::turn::current_=nullptr;
+void recovery_writer_access::controller_admission_intent::begin(const std::shared_ptr<lattice_db>& owner,std::chrono::steady_clock::time_point deadline) {
+    if(!owner)throw db_error("controller admission intent requires current owner");
+    owner->require_creator_process();std::shared_ptr<database> writer;
+    {std::lock_guard lock(owner->connection_ownership_mutex_);
+        if(owner->closed_.load()||!owner->db_)throw db_error("controller admission intent owner closed");
+        writer=owner->db_;
+    }
+    writer->require_creator_();
+    retired_custody retired;
+    {std::lock_guard lock(mutex_);
+        if(writer_==writer&&waiting_.active()){waiting_.tighten_until(deadline);return;}
+        waiting_.release();retired={std::move(writer_),waiting_.take_retired_original()};
+        writer_=std::move(writer);waiting_.begin_until(*writer_,deadline);
+    } // old strong writer destruction is outside the intent metadata leaf
+
+}
+
 recovery_install_result recovery_writer_access::install_impl(std::shared_ptr<lattice_db> owner,
     const std::function<void(database&)>& body, const std::function<void()>& after_unlock,
     const std::function<void()>& after_writer_capture, bool* initial_admission_busy, bool controller_try) {
@@ -512,11 +545,12 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
         };
         using admission = database::maintenance_scope::admission;
         const auto deferred_reason = [](admission value) {
-            return value == admission::mutex_busy ? recovery_install_deferred::connection_mutex
-                                                  : recovery_install_deferred::engine_read;
+            if (value == admission::mutex_busy) return recovery_install_deferred::connection_mutex;
+            if (value == admission::core_write_busy) return recovery_install_deferred::core_write;
+            return recovery_install_deferred::engine_read;
         };
         if (controller_try) {
-            const auto initial = database::maintenance_scope::controller_probe(*writer);
+            const auto initial = database::maintenance_scope::controller_probe(*writer, &owner->txn_owner_thread_);
             if (initial != admission::ready) { defer(deferred_reason(initial)); return result; }
             if (recovery_admission_test_hooks::after_initial_probe) recovery_admission_test_hooks::after_initial_probe();
         } else if (initial_admission_busy) {
@@ -545,7 +579,8 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
                 } else memory_gate = std::unique_lock<std::recursive_timed_mutex>(owner->vec0_memory_maintenance_gate_);
             }
             admission admitted = admission::ready;
-            database::maintenance_scope maintenance(*writer, controller_try ? &admitted : nullptr);
+            database::maintenance_scope maintenance(*writer, controller_try ? &admitted : nullptr,
+                controller_try ? &owner->txn_owner_thread_ : nullptr);
             if (admitted != admission::ready) { defer(deferred_reason(admitted)); return result; }
             auto* context = writer->lattice_update_hook_context_.get();
             {
@@ -660,6 +695,14 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
             }
             if (settlement.state == phase::committed && own_commit_started) {
                 result.state = recovery_install_state::committed;
+                // This closed producer helper can consume only the exact
+                // controller resume armed in this owned WRITE. Publish after
+                // successful known COMMIT, before any fresh Native admission
+                // or synchronous invalidation/observer callback can run.
+                if (!result.primary_error && !result.cleanup_error) {
+                    try { publish_controller_resume_after_owned_commit(*owner,*writer); }
+                    catch (...) { result.postcommit_error=std::current_exception(); }
+                }
                 if (batch.audit_frontier) {
                     const auto frontier = *batch.audit_frontier;
                     auto advance = [frontier](lattice_db* target) {
@@ -690,7 +733,12 @@ recovery_install_result recovery_writer_access::install_owned_impl(install_owner
         try {
             if (after_unlock) after_unlock(); // private committed publication/test boundary, before delivery
             deliver(*owner, batch);
-        } catch (...) { result.postcommit_error = std::current_exception(); }
+        } catch (...) {
+            // Retain the first committed-publication failure as primary tail
+            // evidence; an additional actual delivery failure is distinct.
+            if (!result.postcommit_error) result.postcommit_error=std::current_exception();
+            else if (!result.notification_error) result.notification_error=std::current_exception();
+        }
     } else if (writer && settlement.state != phase::not_started) {
         // This belongs to a possible ordinary successor, never to the failed
         // install. Preserve both failures and never run its activation tail.

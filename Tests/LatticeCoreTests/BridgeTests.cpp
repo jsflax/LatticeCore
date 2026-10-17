@@ -1,5 +1,7 @@
 #include "TestHelpers.hpp"
 #ifndef __linux__
+#include <cstring>
+#include "CanonicalWriterTestAccess.hpp"
 #include <lattice.hpp>          // swift_lattice, swift_lattice_ref
 #include <dynamic_object.hpp>   // dynamic_object, dynamic_object_ref
 
@@ -830,6 +832,46 @@ TEST(Bridge, CacheConcurrentSamePathDedup) {
     for (auto* r : refs) delete r;
 }
 
+TEST(BridgeCacheReadOnlyPolicy, WritableFirstKeepsReadOnlyOwnerSeparate) {
+    TempDB file{"bridge-cache-writable-first"};
+    const lattice::SchemaVector schemas={make_schema("ReadOnlyCacheRow",{{"name",text_prop("name")}})};
+    lattice::swift_configuration write_config(file.str());
+    auto& cache=lattice::detail::LatticeCache::instance();
+    auto writer=cache.get_or_create(write_config,schemas);
+    writer->db().execute("INSERT INTO ReadOnlyCacheRow(globalId,name) VALUES('00000000-0000-4000-8000-000000000001','original')");
+    auto read_config=write_config;read_config.read_only=true;
+    auto reader=cache.get_or_create(read_config,schemas);
+    ASSERT_NE(reader.get(),writer.get());
+    EXPECT_EQ(sqlite3_db_readonly(reader->db().handle(),"main"),1);
+    EXPECT_EQ(sqlite3_db_readonly(writer->db().handle(),"main"),0);
+    EXPECT_EQ(cache.get_or_create(read_config,schemas),reader);
+    EXPECT_EQ(cache.get_or_create(write_config,schemas),writer);
+    EXPECT_THROW(reader->db().execute("UPDATE ReadOnlyCacheRow SET name='forbidden'"),lattice::db_error);
+    writer->db().execute("UPDATE ReadOnlyCacheRow SET name='committed'");
+    EXPECT_EQ(std::get<std::string>(reader->db().query("SELECT name FROM ReadOnlyCacheRow").at(0).at("name")),"committed");
+}
+
+TEST(BridgeCacheReadOnlyPolicy, ReadOnlyFirstDoesNotReplaceRequestedWritableOwner) {
+    TempDB file{"bridge-cache-readonly-first"};
+    const lattice::SchemaVector schemas={make_schema("ReadOnlyCacheRow",{{"name",text_prop("name")}})};
+    lattice::swift_configuration write_config(file.str());
+    {
+        lattice::swift_lattice seed(write_config,schemas);
+        seed.db().execute("INSERT INTO ReadOnlyCacheRow(globalId,name) VALUES('00000000-0000-4000-8000-000000000002','original')");
+    }
+    auto read_config=write_config;read_config.read_only=true;
+    auto& cache=lattice::detail::LatticeCache::instance();
+    auto reader=cache.get_or_create(read_config,schemas);
+    auto writer=cache.get_or_create(write_config,schemas);
+    ASSERT_NE(reader.get(),writer.get());
+    EXPECT_EQ(sqlite3_db_readonly(reader->db().handle(),"main"),1);
+    EXPECT_EQ(sqlite3_db_readonly(writer->db().handle(),"main"),0);
+    EXPECT_EQ(cache.get_or_create(read_config,schemas),reader);
+    EXPECT_EQ(cache.get_or_create(write_config,schemas),writer);
+    EXPECT_NO_THROW(writer->db().execute("UPDATE ReadOnlyCacheRow SET name='writable'"));
+    EXPECT_EQ(std::get<std::string>(reader->db().query("SELECT name FROM ReadOnlyCacheRow").at(0).at("name")),"writable");
+}
+
 TEST(Bridge, CacheConcurrentCreateResolveStress) {
     // TSan target: hammer get_or_create's cache-hit path and get_by_pointer
     // (the per-object hot path) concurrently. A seed ref keeps the cached
@@ -978,7 +1020,7 @@ TEST(Bridge, ListPositionsSkipDanglingLinks) {
     auto bands = db.objects("FpBand");
     ASSERT_EQ(bands.size(), 1u);
     auto field = bands[0].get_managed_field<std::vector<lattice::swift_dynamic_object*>>("albums");
-    lattice::link_list list(field);
+    lattice::link_list list(field, lattice::swift_lattice_ref::shared_for_lattice(&db));
 
     EXPECT_EQ(list.size(), 2u);  // live membership only
 
@@ -1055,7 +1097,7 @@ TEST(Bridge, UpsertRebindsToExistingRowAndAppendIsIdempotent) {
     auto owners = db.objects("FpOwner");
     ASSERT_EQ(owners.size(), 1u);
     auto field = owners[0].get_managed_field<std::vector<lattice::swift_dynamic_object*>>("sigs");
-    lattice::link_list list(field);
+    lattice::link_list list(field, lattice::swift_lattice_ref::shared_for_lattice(&db));
     auto* obj2_ref = lattice::dynamic_object_ref::wrap(obj2);
     list.push_back(*obj2_ref);
 
@@ -1488,6 +1530,49 @@ TEST(BridgeTuning, DifferentTuningDoesNotShareInstance) {
     EXPECT_EQ(ib.get(), ic.get());
 }
 
+// A selected WAL bound must survive both cached and derived owner openings.
+TEST(BridgeWalPolicy, CachedUnboundedOwnerCannotSatisfyBoundedRequest) {
+    const auto path=std::filesystem::temp_directory_path()/
+        ("bridge_wal_policy_"+lattice::uuid_t::generate().to_string()+".sqlite");
+    lattice::swift_configuration legacy(path.string());
+    auto& cache=lattice::detail::LatticeCache::instance();
+    auto unbounded=cache.get_or_create(legacy,lattice::SchemaVector{});
+    auto bounded=legacy;bounded.wal_extent_limit_bytes=1024*1024;
+    auto first=cache.get_or_create(bounded,lattice::SchemaVector{});
+    ASSERT_NE(first.get(),unbounded.get());
+    EXPECT_EQ(first->config().wal_extent_limit_bytes,bounded.wal_extent_limit_bytes);
+    auto same=cache.get_or_create(bounded,lattice::SchemaVector{});
+    EXPECT_EQ(same.get(),first.get());
+    auto tighter=bounded;tighter.wal_extent_limit_bytes=512*1024;
+    // Cache identity is tested on an actually eligible tighter WAL. Bootstrap
+    // traffic may already exceed512KiB; do not turn this into a cap exception.
+    const auto wal=path.string()+"-wal";
+    const auto prior_extent=std::filesystem::exists(wal)?std::filesystem::file_size(wal):0;
+    RecordProperty("pre_tighter_wal_bytes",std::to_string(prior_extent));
+    const auto checkpoint=first->db().wal_checkpoint(/*truncate=*/true,/*busy_budget_ms=*/250);
+    RecordProperty("tighter_checkpoint_rc",checkpoint.rc);
+    RecordProperty("tighter_checkpoint_busy",checkpoint.busy);
+    RecordProperty("tighter_checkpoint_log",std::to_string(checkpoint.log_frames));
+    RecordProperty("tighter_checkpoint_done",std::to_string(checkpoint.checkpointed));
+    ASSERT_EQ(checkpoint.rc,SQLITE_OK);ASSERT_EQ(checkpoint.busy,0);
+    ASSERT_EQ(checkpoint.log_frames,0);ASSERT_EQ(checkpoint.checkpointed,0);
+    const auto admitted_extent=std::filesystem::exists(wal)?std::filesystem::file_size(wal):0;
+    RecordProperty("admitted_tighter_wal_bytes",std::to_string(admitted_extent));
+    ASSERT_EQ(admitted_extent,0u);
+    auto second=cache.get_or_create(tighter,lattice::SchemaVector{});
+    EXPECT_NE(second.get(),first.get());
+    EXPECT_EQ(second->config().wal_extent_limit_bytes,tighter.wal_extent_limit_bytes);
+    auto read_only=bounded;read_only.read_only=true;
+    EXPECT_THROW(cache.get_or_create(read_only,lattice::SchemaVector{}),std::runtime_error);
+    auto invalid=bounded;invalid.wal_extent_limit_bytes=0;
+    EXPECT_THROW(cache.get_or_create(invalid,lattice::SchemaVector{}),std::runtime_error);
+    second->close();first->close();unbounded->close();
+    second.reset();same.reset();first.reset();unbounded.reset();
+    std::filesystem::remove(path);
+    std::filesystem::remove(path.string()+"-wal");
+    std::filesystem::remove(path.string()+"-shm");
+}
+
 TEST(BridgeTuning, InvalidTuningValuesAreIgnored) {
     lattice::swift_configuration cfg(":memory:");
     cfg.set_sync_chunk_size(0);
@@ -1865,7 +1950,7 @@ TEST(BridgeGeneration, ChangedFieldsDeliveredThroughHookPayload) {
     auto owners = db.objects("CfOwner");
     ASSERT_EQ(owners.size(), 1u);
     auto field = owners[0].get_managed_field<std::vector<lattice::swift_dynamic_object*>>("sigs");
-    lattice::link_list list(field);
+    lattice::link_list list(field, lattice::swift_lattice_ref::shared_for_lattice(&db));
     auto* obj_ref = lattice::dynamic_object_ref::wrap(obj);
     list.push_back(*obj_ref);
     delete obj_ref;
@@ -2141,4 +2226,338 @@ TEST(Bridge, ManagedRowFactoryKeepsAttachedEqualIDsOnTheirPhysicalRoute) {
     EXPECT_EQ(std::get<int64_t>(local_values[0].at("age")), 10);
     EXPECT_EQ(std::get<int64_t>(arm_values[0].at("age")), 44);
 }
+
+
+namespace {
+lattice::SchemaVector readonly_version_schemas() {
+    return {make_schema("ReadOnlyVersionRow",{{"name",text_prop("name")}})};
+}
+void make_readonly_version_file(const std::string& path) {
+    lattice::swift_configuration config(path);config.target_schema_version=40;
+    lattice::swift_lattice writer(config,readonly_version_schemas());
+    writer.db().execute("INSERT INTO ReadOnlyVersionRow(globalId,name) VALUES('readonly-version-row','original')");
+}
+struct readonly_version_snapshot {
+    std::vector<lattice::database::row_t> meta,schema,rows,cookie;
+};
+readonly_version_snapshot read_version_snapshot(lattice::database& reader) {
+    return {reader.query("SELECT key,value FROM _lattice_meta ORDER BY key"),
+        reader.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"),
+        reader.query("SELECT globalId,name FROM ReadOnlyVersionRow ORDER BY id"),
+        reader.query("PRAGMA schema_version")};
+}
+void expect_same_version_snapshot(const readonly_version_snapshot& a,const readonly_version_snapshot& b) {
+    EXPECT_EQ(a.meta,b.meta);EXPECT_EQ(a.schema,b.schema);EXPECT_EQ(a.rows,b.rows);EXPECT_EQ(a.cookie,b.cookie);
+}
+void count_readonly_migration(const char*,void* raw) {++*static_cast<int*>(raw);}
+}
+
+TEST(BridgeReadOnlySchemaVersion, ConstAndRvalueTypedOpensRefuseNewerRealFileWithoutMutation) {
+    TempDB file{"readonly-version-newer"};make_readonly_version_file(file.str());
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);
+    const auto before=read_version_snapshot(observer);int callbacks=0;
+    const auto schemas=readonly_version_schemas();
+    lattice::swift_configuration old(file.str());old.read_only=true;old.target_schema_version=36;
+    old.setRowMigrationCallback(&callbacks,count_readonly_migration);
+    const auto& const_config=old;
+    try {lattice::swift_lattice refused(const_config,schemas);FAIL()<<"newer schema was admitted";}
+    catch(const std::runtime_error& e){EXPECT_NE(std::string(e.what()).find("(40) is newer than this binary supports (36)"),std::string::npos);}
+    old.target_schema_version=37;
+    try {lattice::swift_lattice refused(std::move(old),schemas);FAIL()<<"newer schema was admitted";}
+    catch(const std::runtime_error& e){EXPECT_NE(std::string(e.what()).find("(40) is newer than this binary supports (37)"),std::string::npos);}
+    EXPECT_EQ(callbacks,0);expect_same_version_snapshot(before,read_version_snapshot(observer));
+}
+
+TEST(BridgeReadOnlySchemaVersion, SupportedTypedVersionsReadWithoutMigrationOrSchemaWrites) {
+    TempDB file{"readonly-version-supported"};make_readonly_version_file(file.str());
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);
+    const auto before=read_version_snapshot(observer);int callbacks=0;
+    const auto schemas=readonly_version_schemas();
+    lattice::swift_configuration exact(file.str());exact.read_only=true;exact.target_schema_version=40;
+    exact.setRowMigrationCallback(&callbacks,count_readonly_migration);
+    {
+        const auto& const_config=exact;lattice::swift_lattice reader(const_config,schemas);
+        EXPECT_EQ(std::get<std::string>(reader.db().query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+        EXPECT_EQ(sqlite3_db_readonly(reader.db().handle(),"main"),1);
+    }
+    exact.target_schema_version=41; // Read-only admission never requests migration to the larger supported bound.
+    {
+        lattice::swift_lattice reader(std::move(exact),schemas);
+        EXPECT_EQ(std::get<std::string>(reader.db().query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+    }
+    EXPECT_EQ(callbacks,0);expect_same_version_snapshot(before,read_version_snapshot(observer));
+}
+
+TEST(BridgeReadOnlySchemaVersion, MalformedAndUnreadableMetadataRefuseWithoutDefaultingToZero) {
+    TempDB file{"readonly-version-malformed"};make_readonly_version_file(file.str());
+    const auto schemas=readonly_version_schemas();
+    for(const auto& value:{std::string("not-a-version"),std::string("40trailing"),std::string("999999999999999999999999")}) {
+        {lattice::database writer(file.str());writer.execute("UPDATE _lattice_meta SET value=? WHERE key='schema_version'",{value});}
+        lattice::database observer(file.str(),lattice::database::open_mode::read_only);const auto before=read_version_snapshot(observer);
+        lattice::swift_configuration config(file.str());config.read_only=true;config.target_schema_version=36;
+        const auto& const_config=config;EXPECT_THROW({lattice::swift_lattice refused(const_config,schemas);},std::exception);
+        EXPECT_THROW({lattice::swift_lattice refused(std::move(config),schemas);},std::exception);
+        expect_same_version_snapshot(before,read_version_snapshot(observer));
+    }
+    {lattice::database writer(file.str());writer.execute("DROP TABLE _lattice_meta");}
+    lattice::swift_configuration unreadable(file.str());unreadable.read_only=true;unreadable.target_schema_version=36;
+    const auto& const_config=unreadable;EXPECT_THROW({lattice::swift_lattice refused(const_config,schemas);},std::exception);
+    EXPECT_THROW({lattice::swift_lattice refused(std::move(unreadable),schemas);},std::exception);
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);
+    EXPECT_FALSE(observer.table_exists("_lattice_meta"));
+    EXPECT_EQ(std::get<std::string>(observer.query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+}
+
+TEST(BridgeReadOnlySchemaVersion, NoSchemaDynamicAndEmptySchemaOpensKeepTheirUnversionedContract) {
+    TempDB file{"readonly-version-dynamic"};make_readonly_version_file(file.str());
+    lattice::database observer(file.str(),lattice::database::open_mode::read_only);const auto before=read_version_snapshot(observer);
+    lattice::swift_configuration config(file.str());config.read_only=true; // Default target1 is not a typed schema claim.
+    {
+        auto copy=config;lattice::swift_lattice dynamic(std::move(copy));dynamic.open_dynamic();
+        EXPECT_EQ(std::get<std::string>(dynamic.db().query("SELECT name FROM ReadOnlyVersionRow").at(0).at("name")),"original");
+    }
+    {const auto& const_config=config;lattice::swift_lattice empty(const_config,{});}
+    {lattice::swift_lattice empty(std::move(config),{});}
+    expect_same_version_snapshot(before,read_version_snapshot(observer));
+}
+
+
+// Regression for the real Swift factory lifetime: logical close alone does
+// not run the database destructor. Every wrapper and linked object must end
+// before checking the persisted fingerprint cookie and reopening.
+TEST(Bridge, ClosedCreatorFinalReleasePreservesCheckedMountedFingerprint) {
+    TempDB file{"closed_creator_fingerprint"};
+    auto value=text_prop("value");value.nullable=false;
+    auto child=make_schema("ClosedCreatorFpChild",{{"value",value}});
+    auto link=int_prop("child");link.kind=lattice::property_kind::link;
+    link.target_table=child.table_name;link.link_table="ClosedCreatorFpParent";link.nullable=true;
+    auto parent=make_schema("ClosedCreatorFpParent",{{"value",value},{"child",link}});
+    lattice::SchemaVector schemas{parent,child};
+    lattice::swift_configuration config(file.str());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+    int64_t original_cookie=-1;
+    std::vector<lattice::database::row_t> original_markers;
+    std::weak_ptr<lattice::swift_lattice> actual_creator;
+    const auto marker_sql="SELECT key,value FROM main._lattice_meta WHERE key LIKE 'schema_fingerprint:%' ORDER BY key";
+    const auto stat_sql="SELECT count(*) AS n FROM main.sqlite_schema WHERE type='table' AND name='sqlite_stat1'";
+    {
+#if LATTICE_HAS_FRT
+        std::unique_ptr<lattice::swift_lattice_ref> creator(lattice::swift_lattice_ref::create(config,schemas));
+        auto* view=creator.get();
+#else
+        auto creator=lattice::swift_lattice_ref::create(config,schemas);auto* view=&creator;
+#endif
+        ASSERT_TRUE(view);auto* owner=view->get();ASSERT_TRUE(owner);
+        actual_creator=lattice::detail::LatticeCache::instance().get_by_pointer(owner);
+        ASSERT_FALSE(actual_creator.expired());
+        auto child_row=make_sdo(child.table_name,child.properties);child_row.values["value"]=std::string("preserved-child");
+        auto managed_child=std::make_shared<lattice::dynamic_object>(child_row);owner->add(*managed_child);
+        auto parent_row=make_sdo(parent.table_name,parent.properties);parent_row.values["value"]=std::string("preserved-parent");
+        parent_row.link_values["child"]=managed_child;lattice::dynamic_object managed_parent(parent_row);owner->add(managed_parent);
+        original_cookie=std::get<int64_t>(owner->db().query("PRAGMA main.schema_version").at(0).at("schema_version"));
+        original_markers=owner->db().query(marker_sql);ASSERT_GE(original_markers.size(),2u);
+        for(const auto& marker:original_markers)EXPECT_EQ(std::get<std::string>(marker.at("value")),std::to_string(original_cookie));
+        ASSERT_EQ(std::get<int64_t>(owner->db().query(stat_sql).at(0).at("n")),0);
+        const auto closed=owner->close_checked();EXPECT_FALSE(closed.error);EXPECT_FALSE(closed.cleanup_error);EXPECT_TRUE(closed.cleanup_complete);
+    }
+    ASSERT_TRUE(actual_creator.expired()); // Real final owner release, not a logical-close proxy.
+    {
+        lattice::database observed(file.str(),lattice::database::open_mode::read_only,100);
+        EXPECT_EQ(std::get<int64_t>(observed.query("PRAGMA main.schema_version").at(0).at("schema_version")),original_cookie);
+        EXPECT_EQ(observed.query(marker_sql),original_markers);
+        EXPECT_EQ(std::get<int64_t>(observed.query(stat_sql).at(0).at("n")),0);
+    }
+    for(int attempt=0;attempt<2;++attempt) {
+#if LATTICE_HAS_FRT
+        std::unique_ptr<lattice::swift_lattice_ref> checked(lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas));
+        auto* view=checked.get();
+#else
+        auto checked=lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas);auto* view=&checked;
+#endif
+        ASSERT_TRUE(view);auto* owner=view->get();ASSERT_TRUE(owner)<<lattice::last_bridge_error();
+        EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT count(*) AS n FROM ClosedCreatorFpParent").at(0).at("n")),1);
+        EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT count(*) AS n FROM ClosedCreatorFpChild").at(0).at("n")),1);
+        const auto closed=owner->close_checked();EXPECT_FALSE(closed.error);EXPECT_FALSE(closed.cleanup_error);EXPECT_TRUE(closed.cleanup_complete);
+    }
+    // Genuine unrelated DDL must still invalidate the strict checked cookie.
+    {lattice::database changed(file.str());changed.execute("CREATE TABLE ClosedCreatorExternalDDL(x INTEGER)");changed.close();}
+#if LATTICE_HAS_FRT
+    std::unique_ptr<lattice::swift_lattice_ref> refused(lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas));
+    EXPECT_TRUE(!refused||!refused->get());
+#else
+    auto refused=lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas);EXPECT_FALSE(refused.get());
+#endif
+    EXPECT_NE(lattice::last_bridge_error().find("fingerprint/cookie differs"),std::string::npos);
+}
+
+
+
+namespace {
+// Use the normal cached Swift factory and destroy every creator wrapper
+// before any later checked reopen. No direct-constructor substitution.
+template<class Body>
+void with_live_stats_creator(const lattice::swift_configuration& config,
+    const lattice::SchemaVector& schemas, Body&& body) {
+#if LATTICE_HAS_FRT
+    std::unique_ptr<lattice::swift_lattice_ref> creator(lattice::swift_lattice_ref::create(config,schemas));
+    auto* view=creator.get();
+#else
+    auto creator=lattice::swift_lattice_ref::create(config,schemas);auto* view=&creator;
+#endif
+    ASSERT_TRUE(view);auto* owner=view->get();ASSERT_TRUE(owner)<<lattice::last_bridge_error();
+    body(*owner);
+    const auto closed=owner->close_checked();EXPECT_FALSE(closed.error);EXPECT_FALSE(closed.cleanup_error);EXPECT_TRUE(closed.cleanup_complete);
+}
+const char* live_stats_markers="SELECT key,value FROM main._lattice_meta WHERE key LIKE 'schema_fingerprint:%' ORDER BY key";
+const char* live_stats_count="SELECT count(*) AS n FROM main.sqlite_schema WHERE type='table' AND name='sqlite_stat1'";
+int64_t live_stats_cookie(lattice::database& db) {
+    return std::get<int64_t>(db.query("PRAGMA main.schema_version").at(0).at("schema_version"));
+}
+void seed_live_stats_row(lattice::swift_lattice& owner,const lattice::swift_schema_entry& schema) {
+    auto row=make_sdo(schema.table_name,schema.properties);row.values["value"]=std::string("preserved-live-statistics-row");
+    lattice::dynamic_object object(row);owner.add(object);
+}
+struct LiveStatsCommitDenial {
+    sqlite3* actual;unsigned commits=0,rollbacks=0;int installed=SQLITE_MISUSE,removed=SQLITE_MISUSE;
+    static int authorize(void* raw,int action,const char* one,const char*,const char*,const char*) {
+        auto& self=*static_cast<LiveStatsCommitDenial*>(raw);
+        if(action==SQLITE_TRANSACTION&&one) {
+            if(std::strcmp(one,"COMMIT")==0){++self.commits;return SQLITE_DENY;}
+            if(std::strcmp(one,"ROLLBACK")==0)++self.rollbacks;
+        }
+        return SQLITE_OK;
+    }
+    explicit LiveStatsCommitDenial(lattice::database& db):actual(lattice::detail::canonical_writer_custody_test_access::fault_handle(db)) {
+        installed=sqlite3_set_authorizer(actual,&authorize,this);
+    }
+    ~LiveStatsCommitDenial(){removed=sqlite3_set_authorizer(actual,nullptr,nullptr);EXPECT_EQ(removed,SQLITE_OK);}
+};
+}
+
+TEST(Bridge, LiveOptimizeCreatesStatsAndPreservesCheckedMountedReopen) {
+    TempDB file{"live_optimize_reopen"};auto value=text_prop("value");value.nullable=false;
+    auto schema=make_schema("LiveStatsReopenRow",{{"value",value}});lattice::SchemaVector schemas{schema};
+    lattice::swift_configuration config(file.str());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+    std::weak_ptr<lattice::swift_lattice> actual_creator;
+    with_live_stats_creator(config,schemas,[&](lattice::swift_lattice& owner){
+        actual_creator=lattice::detail::LatticeCache::instance().get_by_pointer(&owner);
+        ASSERT_FALSE(actual_creator.expired());seed_live_stats_row(owner,schema);
+        const auto cookie=live_stats_cookie(owner.db());const auto markers=owner.db().query(live_stats_markers);ASSERT_EQ(markers.size(),2u);
+        ASSERT_EQ(std::get<int64_t>(owner.db().query(live_stats_count).at(0).at("n")),0);
+        owner.optimize();const auto current=live_stats_cookie(owner.db());EXPECT_GT(current,cookie);
+        EXPECT_EQ(std::get<int64_t>(owner.db().query(live_stats_count).at(0).at("n")),1);
+        const auto refreshed=owner.db().query(live_stats_markers);ASSERT_EQ(refreshed.size(),markers.size());
+        for(size_t n=0;n<markers.size();++n){EXPECT_EQ(refreshed[n].at("key"),markers[n].at("key"));EXPECT_EQ(std::get<std::string>(refreshed[n].at("value")),std::to_string(current));}
+        owner.optimize();EXPECT_EQ(owner.db().query(live_stats_markers),refreshed);
+        EXPECT_EQ(std::get<int64_t>(owner.db().query("SELECT count(*) AS n FROM LiveStatsReopenRow").at(0).at("n")),1);
+    });
+    ASSERT_TRUE(actual_creator.expired());
+    for(int attempt=0;attempt<2;++attempt){
+#if LATTICE_HAS_FRT
+        std::unique_ptr<lattice::swift_lattice_ref> checked(lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas));auto* view=checked.get();
+#else
+        auto checked=lattice::swift_lattice_ref::create_checked_mounted_server(config,schemas);auto* view=&checked;
+#endif
+        ASSERT_TRUE(view);auto* owner=view->get();ASSERT_TRUE(owner)<<lattice::last_bridge_error();
+        EXPECT_EQ(std::get<int64_t>(owner->db().query("SELECT count(*) AS n FROM LiveStatsReopenRow").at(0).at("n")),1);
+        const auto closed=owner->close_checked();EXPECT_FALSE(closed.error);EXPECT_FALSE(closed.cleanup_error);EXPECT_TRUE(closed.cleanup_complete);
+    }
+}
+
+TEST(Bridge, LiveOptimizeDoesNotJoinOrSettleCallerTransaction) {
+    TempDB file{"live_optimize_caller"};auto schema=make_schema("LiveStatsCallerRow",{{"value",text_prop("value")}});
+    lattice::swift_configuration config(file.str());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+    with_live_stats_creator(config,{schema},[&](lattice::swift_lattice& owner){
+        const auto cookie=live_stats_cookie(owner.db());const auto markers=owner.db().query(live_stats_markers);
+        owner.begin_transaction();seed_live_stats_row(owner,schema);ASSERT_TRUE(owner.db().is_in_transaction());
+        owner.optimize();EXPECT_TRUE(owner.db().is_in_transaction());EXPECT_EQ(live_stats_cookie(owner.db()),cookie);
+        EXPECT_EQ(owner.db().query(live_stats_markers),markers);EXPECT_EQ(std::get<int64_t>(owner.db().query(live_stats_count).at(0).at("n")),0);
+        EXPECT_EQ(std::get<int64_t>(owner.db().query("SELECT count(*) AS n FROM LiveStatsCallerRow").at(0).at("n")),1);
+        owner.rollback();EXPECT_FALSE(owner.db().is_in_transaction());
+        EXPECT_EQ(std::get<int64_t>(owner.db().query("SELECT count(*) AS n FROM LiveStatsCallerRow").at(0).at("n")),0);
+    });
+}
+
+TEST(Bridge, LiveOptimizeCommitDenialRollsBackStatsAndMarkerUpdatesTogether) {
+    TempDB file{"live_optimize_commit"};auto schema=make_schema("LiveStatsCommitRow",{{"value",text_prop("value")}});
+    lattice::swift_configuration config(file.str());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+    with_live_stats_creator(config,{schema},[&](lattice::swift_lattice& owner){
+        seed_live_stats_row(owner,schema);const auto cookie=live_stats_cookie(owner.db());const auto markers=owner.db().query(live_stats_markers);
+        {LiveStatsCommitDenial fault(owner.db());ASSERT_EQ(fault.installed,SQLITE_OK);owner.optimize();EXPECT_EQ(fault.commits,1u);EXPECT_EQ(fault.rollbacks,1u);}
+        EXPECT_FALSE(owner.db().is_in_transaction());EXPECT_EQ(live_stats_cookie(owner.db()),cookie);EXPECT_EQ(owner.db().query(live_stats_markers),markers);
+        EXPECT_EQ(std::get<int64_t>(owner.db().query(live_stats_count).at(0).at("n")),0);
+        EXPECT_EQ(std::get<int64_t>(owner.db().query("SELECT count(*) AS n FROM LiveStatsCommitRow").at(0).at("n")),1);
+        owner.optimize();EXPECT_GT(live_stats_cookie(owner.db()),cookie);
+        EXPECT_EQ(std::get<int64_t>(owner.db().query(live_stats_count).at(0).at("n")),1);
+    });
+}
+
+TEST(Bridge, LiveOptimizeCannotRepairForeignDDLOrNoncanonicalMarkerText) {
+    for(unsigned kind=0;kind<5;++kind){
+        SCOPED_TRACE(kind);TempDB file{"live_optimize_foreign"};auto schema=make_schema("LiveStatsForeignRow",{{"value",text_prop("value")}});
+        lattice::swift_configuration config(file.str());config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+        with_live_stats_creator(config,{schema},[&](lattice::swift_lattice& owner){
+            seed_live_stats_row(owner,schema);
+            if(kind==1){lattice::database outside(file.str());outside.execute("CREATE TABLE LiveStatsUnrelatedDDL(x INTEGER)");outside.close();}
+            else if(kind==2)owner.db().execute("DELETE FROM main._lattice_meta WHERE key='schema_version'");
+            else if(kind==3)owner.db().execute("UPDATE main._lattice_meta SET value='1junk' WHERE key='schema_version'");
+            else {const auto first=owner.db().query(live_stats_markers).at(0);owner.db().execute("UPDATE main._lattice_meta SET value=? WHERE key=?",{kind==4?std::string(65536,'9'):std::get<std::string>(first.at("value"))+"junk",first.at("key")});}
+            const auto cookie=live_stats_cookie(owner.db());const auto markers=owner.db().query(live_stats_markers);
+            const auto shape=owner.db().query("SELECT type,name,tbl_name,rootpage,sql FROM main.sqlite_schema ORDER BY type,name");
+            const auto version=owner.db().query("SELECT key,value FROM main._lattice_meta WHERE key='schema_version'");
+            owner.optimize();EXPECT_EQ(live_stats_cookie(owner.db()),cookie);EXPECT_EQ(owner.db().query(live_stats_markers),markers);
+            EXPECT_EQ(owner.db().query("SELECT key,value FROM main._lattice_meta WHERE key='schema_version'"),version);
+            EXPECT_EQ(std::get<int64_t>(owner.db().query("SELECT count(*) AS n FROM LiveStatsForeignRow").at(0).at("n")),1);
+            EXPECT_EQ(owner.db().query("SELECT type,name,tbl_name,rootpage,sql FROM main.sqlite_schema ORDER BY type,name"),shape);
+            EXPECT_EQ(std::get<int64_t>(owner.db().query(live_stats_count).at(0).at("n")),0);
+        });
+    }
+}
+
+// The public Bridge scan must retain Core's real writer commit delivery.
+// Observe actual committed model IDs; do not query/replace the SQLite hook.
+TEST(Bridge, FileVectorTrainingRetainsActualCommitNotifications) {
+    TempDB file{"ivf_training_commit_delivery"};
+    auto schema=make_schema("TrainingCommitDoc",{
+        {"title",text_prop("title")},{"embedding",blob_prop("embedding")}});
+    lattice::swift_configuration config(file.str());
+    config.audit_retention_seconds=0;config.busy_timeout_ms=100;
+    with_live_stats_creator(config,{schema},[&](lattice::swift_lattice& owner){
+        owner.wait_for_vec0_training();
+        auto insert=[&](const std::string& title,float value){
+            auto raw=make_sdo(schema.table_name,schema.properties);
+            raw.values["title"]=title;
+            raw.values["embedding"]=pack_floats({value,1.0f,2.0f,3.0f});
+            lattice::dynamic_object row(raw);owner.add(row);
+        };
+        for(int i=0;i<32;++i)insert("seed-"+std::to_string(i),float(i));
+        lattice::lattice_db& native=owner;
+        std::vector<std::string> observed;
+        const auto token=native.add_table_observer(schema.table_name,
+            [&](const std::vector<lattice::lattice_db::change_event>& events){
+                for(const auto& event:events)observed.push_back(std::get<3>(event));
+            });
+        struct remove_observer {
+            lattice::lattice_db& owner;std::string table;decltype(token) id;
+            ~remove_observer(){owner.remove_table_observer(table,id);}
+        } remove{native,schema.table_name,token};
+        ASSERT_NO_THROW(owner.train_untrained_vec0_tables());
+        EXPECT_TRUE(observed.empty()) << "derived-index training must not invent model edits";
+        // No intervening diagnostic query/drain may hide a missing training tail.
+        ASSERT_NO_THROW(insert("after-training-0",100.0f));
+        EXPECT_EQ(observed.size(),1u);
+        ASSERT_NO_THROW(insert("after-training-1",101.0f));
+        EXPECT_EQ(observed.size(),2u);
+        const auto rows=owner.db().query(
+            "SELECT globalId FROM main.TrainingCommitDoc "
+            "WHERE title LIKE 'after-training-%' ORDER BY title");
+        ASSERT_EQ(rows.size(),2u);ASSERT_EQ(observed.size(),rows.size());
+        for(size_t i=0;i<rows.size();++i)
+            EXPECT_EQ(observed[i],std::get<std::string>(rows[i].at("globalId")));
+        const auto centroids=owner.db().query(
+            "SELECT count(*) AS n FROM _TrainingCommitDoc_embedding_vec_ivf_centroids00");
+        ASSERT_EQ(centroids.size(),1u);EXPECT_GT(std::get<int64_t>(centroids[0].at("n")),0);
+        EXPECT_FALSE(owner.db().is_in_transaction());
+    });
+}
+
 #endif // !__linux__

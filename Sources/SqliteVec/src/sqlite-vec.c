@@ -10070,6 +10070,20 @@ int vec0Update_UpdateVectorColumn(vec0_vtab *p, i64 chunk_id, i64 chunk_offset,
     goto cleanup;
   }
 
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+  if (p->vector_columns[i].index_type == VEC0_INDEX_TYPE_IVF) {
+    // IVF INSERT stores this column in cells and its optional full-precision
+    // KV table; it never creates a flat _vector_chunks BLOB for the column.
+    // Replace only its IVF entry under the same original rowid/xUpdate.
+    rc = ivf_delete(p, i, rowid);
+    if (rc == SQLITE_OK)
+      rc = ivf_insert(p, i, rowid, vector,
+                      (int)vector_column_byte_size(p->vector_columns[i]));
+    if (rc != SQLITE_OK) ivf_first_error(p, rc);
+    goto cleanup;
+  }
+#endif
+
 #if SQLITE_VEC_ENABLE_RESCORE
   if (p->vector_columns[i].index_type == VEC0_INDEX_TYPE_RESCORE) {
     // For rescore columns, update _rescore_vectors and _rescore_chunks
@@ -10253,15 +10267,12 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv) {
       continue;
     }
 
-    // Block vector UPDATE for index types that don't implement it —
-    // the DiskANN graph / IVF lists would become stale.
+    // DiskANN still has no implemented vector replacement. IVF replacement
+    // below updates its checked cell/map entry and optional full-precision KV.
     {
       enum Vec0IndexType idx_type = p->vector_columns[vector_idx].index_type;
       const char *idx_name = NULL;
       if (idx_type == VEC0_INDEX_TYPE_DISKANN) idx_name = "DiskANN";
-#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
-      else if (idx_type == VEC0_INDEX_TYPE_IVF) idx_name = "IVF";
-#endif
       if (idx_name) {
         vtab_set_error(
           &p->base,
@@ -10276,7 +10287,7 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv) {
     rc = vec0Update_UpdateVectorColumn(p, chunk_id, chunk_offset, vector_idx,
                                        valueVector, rowid);
     if (rc != SQLITE_OK) {
-      return SQLITE_ERROR;
+      return rc;
     }
   }
 

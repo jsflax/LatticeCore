@@ -15,18 +15,18 @@ public:
 
     void add_object(const dynamic_object_ref& object) SWIFT_NAME(addObject(_:)) {
         sealed([&] { objects_.push_back(object.shared()); });
-        failed_ = failed_ || !last_bridge_error().empty();
+        failed_ = failed_ || last_bridge_call_failed();
     }
     /// V1 permits finite REAL values only (Swift restricts these to Date).
     void set(const std::string& column, const column_value_t& value)
         SWIFT_NAME(set(column:value:)) {
         sealed([&] { operations_.push_back({column, value, false}); });
-        failed_ = failed_ || !last_bridge_error().empty();
+        failed_ = failed_ || last_bridge_call_failed();
     }
     void increment_int64(const std::string& column, int64_t delta)
         SWIFT_NAME(incrementInt64(column:by:)) {
         sealed([&] { operations_.push_back({column, column_value_t(delta), true}); });
-        failed_ = failed_ || !last_bridge_error().empty();
+        failed_ = failed_ || last_bridge_call_failed();
     }
 
 private:

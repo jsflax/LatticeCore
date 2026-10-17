@@ -4,12 +4,22 @@
 #endif
 #include "ordinary_owned_launch.hpp"
 #include "ordinary_target_history_spool.hpp"
+#include "ordinary_target_scope_root_tail.hpp"
 #include <memory>
+#include <array>
+#include <exception>
 #include <cstddef>
 #include <string>
 #include <cstdint>
 #include <utility>
 #include <sqlite3.h>
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+#include "ordinary_target_lifetime_observation.hpp"
+#include "ordinary_target_raw_object_observation.hpp"
+#include "ordinary_target_programme_observation.hpp"
+#include "ordinary_target_schema_root_observation.hpp"
+#include "ordinary_target_scope_root_observation.hpp"
+#endif
 
 namespace lattice { class database; }
 namespace lattice::detail {
@@ -24,6 +34,7 @@ struct ordinary_target_history_read_span;
 template<bool Receiving> class ordinary_resource_reservation;
 class database_retirement_state;
 class ordinary_group_target_schema_original;
+struct ordinary_target_schema_roots_ending;
 class ordinary_group_target_receiving_owner;
 struct ordinary_history_progress;
 struct ordinary_history_descriptor;
@@ -32,6 +43,7 @@ struct ordinary_history_decoded_page;
 // Private exact-original descriptor custody. No SQL/import/current/publication
 // accessor or caller-selected path/profile/quota is created by this type.
 class ordinary_target_staging_connection final {
+    class database_scope;
 #ifdef LATTICE_MANAGED_TARGET_RECLAMATION_FIXTURE
     friend struct ordinary_target_reclamation_fixture;
 #endif
@@ -47,6 +59,17 @@ class ordinary_target_staging_connection final {
 #if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
     friend class ordinary_receiver_reclamation_fixture;
     std::uint64_t qualification_disposition_observation()const noexcept;
+    ordinary_target_lifetime_observation qualification_lifetime_observation(
+        const ordinary_group_target_receiving_owner&)const noexcept;
+    ordinary_target_raw_object_observation qualification_raw_object_observation(
+        const ordinary_group_target_receiving_owner&)const noexcept;
+    ordinary_target_programme_observation qualification_programme_observation(
+        const ordinary_group_target_receiving_owner&)const noexcept;
+    ordinary_target_scope_root_observation qualification_scope_root_observation(const ordinary_group_target_receiving_owner&)const noexcept;
+    ordinary_target_scope_root_observation qualification_scope_root_observation_from_native(const ordinary_group_target_receiving_owner&,
+        const std::unique_ptr<database_scope>*,const std::unique_ptr<database_scope>*,const std::unique_ptr<database_scope>*)const noexcept;
+    ordinary_target_schema_root_observation qualification_schema_root_observation(
+        const ordinary_group_target_receiving_owner&)const noexcept;
 #if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_EXTRA_ENTRY)
     bool qualification_create_extra_entry()noexcept;
 #endif
@@ -105,6 +128,70 @@ class ordinary_target_staging_connection final {
     bool terminal_native_decoder_payloads_ended(const ordinary_group_target_receiving_owner&)const noexcept;
     bool retire_terminal_native_phases(const ordinary_group_target_receiving_owner&)noexcept;
     bool terminal_native_phases_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool retire_terminal_native_outer_roots(const ordinary_group_target_receiving_owner&)noexcept;
+    bool terminal_native_outer_roots_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool retire_terminal_native_pages(const ordinary_group_target_receiving_owner&)noexcept;
+    bool terminal_native_pages_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool retire_terminal_native_statics(const ordinary_group_target_receiving_owner&)noexcept;
+    bool terminal_native_statics_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool retire_terminal_raw_objects(const ordinary_group_target_receiving_owner&)noexcept;
+    bool terminal_raw_objects_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool terminal_raw_objects_binding_known(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool terminal_raw_objects_history_known(const ::lattice::database&)const noexcept;
+    bool terminal_raw_objects_context_known(const ordinary_group_target_receiving_owner&,
+        const void*&,std::uint64_t&)const noexcept;
+    bool retire_terminal_schema_programmes(ordinary_group_target_receiving_owner&)noexcept;
+    bool terminal_schema_programmes_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool retire_terminal_schema_roots(ordinary_group_target_receiving_owner&)noexcept;
+    bool terminal_schema_roots_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool terminal_schema_roots_first_history_known(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool terminal_scope_predecessor_snapshot(const ordinary_group_target_receiving_owner&,
+        ordinary_target_scope_predecessor_fact&)const noexcept;
+    bool terminal_scope_predecessor_matches(const ordinary_group_target_receiving_owner&,
+        const ordinary_target_scope_predecessor_fact&)const noexcept;
+    bool retire_terminal_scope_roots(ordinary_group_target_receiving_owner&)noexcept;
+    bool terminal_scope_roots_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool terminal_receiving_payloads_selected()const noexcept;
+    bool retire_terminal_receiving_payloads(ordinary_group_target_receiving_owner&)noexcept;
+    struct terminal_collection_record;
+    static bool retire_terminal_collection(ordinary_group_target_receiving_owner&,std::shared_ptr<terminal_collection_record>&,
+        bool&,std::exception_ptr&,
+        std::shared_ptr<ordinary_target_staging_connection>&,std::shared_ptr<ordinary_target_staging_connection>&,
+        std::shared_ptr<ordinary_target_staging_io>&,std::shared_ptr<ordinary_target_staging_io>&,
+        std::shared_ptr<const ordinary_unpublished_group_target>&,std::shared_ptr<const ordinary_unpublished_group_target>&,
+        std::shared_ptr<ordinary_target_schema_roots_ending>&,std::shared_ptr<ordinary_resource_reservation<true>>&)noexcept;
+    static bool terminal_collection_ended(const std::shared_ptr<terminal_collection_record>&,
+        const ordinary_group_target_receiving_owner*)noexcept;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_FIXTURE)
+    static std::array<std::uint64_t,10> qualification_terminal_collection_observation(
+        const std::shared_ptr<terminal_collection_record>&)noexcept;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_HISTORY_EXTRA_ALIAS)
+    static std::array<std::uint64_t,28> qualification_terminal_collection_preflight(
+        const ordinary_group_target_receiving_owner&,
+        const std::shared_ptr<ordinary_target_staging_connection>&,const std::shared_ptr<ordinary_target_staging_connection>&,
+        const std::shared_ptr<ordinary_target_staging_io>&,const std::shared_ptr<ordinary_target_staging_io>&,
+        const std::shared_ptr<const ordinary_unpublished_group_target>&,const std::shared_ptr<const ordinary_unpublished_group_target>&,
+        const std::shared_ptr<ordinary_target_schema_roots_ending>&,const std::shared_ptr<ordinary_resource_reservation<true>>&,
+        bool,const std::shared_ptr<terminal_collection_record>&,const std::exception_ptr&)noexcept;
+#endif
+#endif
+    bool terminal_receiving_payloads_ended(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool terminal_io_payload_context(const ordinary_target_staging_io&,const ordinary_group_target_receiving_owner&,
+        std::array<std::shared_ptr<ordinary_target_scope_environment_record>,3>&,std::size_t&,const void*&)const noexcept;
+    std::size_t terminal_io_predecessor_peak_bytes(const ordinary_target_staging_io&,
+        const ordinary_group_target_receiving_owner&,const void*)const noexcept;
+    bool terminal_scope_roots_history_known(const ordinary_group_target_receiving_owner&)const noexcept;
+    bool terminal_scope_roots_shell_history_known(const ::lattice::database&)const noexcept;
+    bool terminal_scope_root_identity_matches(const ordinary_group_target_receiving_owner&,const void*,std::uint64_t)const noexcept;
+    bool terminal_programme_history_known(const ordinary_group_target_receiving_owner&,const void*,
+        const std::array<const void*,4>&,const std::array<std::exception_ptr,4>&)const noexcept;
+#if defined(LATTICE_MANAGED_TARGET_RECLAMATION_OWNER_FIXTURE)
+    ordinary_target_programme_observation qualification_programme_after_schema_observation(
+        const ordinary_group_target_receiving_owner&)const noexcept;
+#endif
+    bool terminal_programme_originals_known(const ordinary_group_target_receiving_owner&,
+        const ordinary_group_target_schema_original&,const std::array<const void*,4>&,
+        const std::array<std::exception_ptr,4>&)const noexcept;
     bool terminal_receiver_input_context_known(const ordinary_group_target_receiving_owner&,
         const void*&,std::uint64_t&)const noexcept;
     bool terminal_receiver_input_history_matches(const ordinary_group_target_receiving_owner&,
@@ -140,7 +227,11 @@ class ordinary_target_staging_connection final {
         const ordinary_group_target_receiving_owner&,const ::lattice::database&,const void*,
         const ordinary_target_history_page_reader&,ordinary_launch::deadline)const;
     bool history_spool_retirement_admissible(const ordinary_target_history_spool*)const noexcept;
+    bool retire_terminal_scope_roots_from_native(ordinary_group_target_receiving_owner&,
+        const ordinary_target_scope_native_fact&,std::unique_ptr<database_scope>*,std::unique_ptr<database_scope>*,
+        std::unique_ptr<database_scope>*)noexcept;
     struct state;
+    ordinary_target_scope_root_tail terminal_receiving_tail_{this,5}; // First: state and all facade members end first.
     std::shared_ptr<state> state_;
     explicit ordinary_target_staging_connection(std::shared_ptr<state>);
     class database_scope final {
@@ -149,6 +240,7 @@ class ordinary_target_staging_connection final {
         friend class ::lattice::database;
         friend class ordinary_target_history_page_reader;
         struct scope_state;
+        ordinary_target_scope_root_tail terminal_scope_root_{this,0}; // First: real wrapper member tail.
         std::shared_ptr<scope_state> held_;
         explicit database_scope(std::shared_ptr<scope_state>);
         void require_current(const ::lattice::database&)const;
@@ -172,6 +264,28 @@ class ordinary_target_staging_connection final {
         void record_schema_finalized(const ::lattice::database&,int)noexcept;
         void record_sqlite_close(const ::lattice::database&,int)noexcept;
         bool checked_native_close_known(const ::lattice::database&)const noexcept;
+        struct terminal_page_scope_history {
+            const void* scope_original=nullptr;
+            const void* retirement_original=nullptr;
+            const void* ledger_original=nullptr;
+            const void* environment_original=nullptr;
+            std::uint64_t generation=0,active_callback_generation=0,settling_callback_generation=0,settling_callback_high_generation=0;
+            std::size_t call_count=0,active_callback_slot=64,settling_callback_slot=64,schema_finalizations=0;
+            bool detached_known=false,published=false,left=false,failed=false,ending=false;
+            bool leave_returned=false,leave_joined=false,callback_credit_sealed=false;
+            bool schema_begin_observed=false,schema_commit_observed=false,schema_rollback_observed=false,schema_finalization_failed=false;
+            int schema_begin_rc=SQLITE_MISUSE,schema_commit_rc=SQLITE_MISUSE,schema_rollback_rc=SQLITE_MISUSE;
+        };
+        struct terminal_static_scope_history {
+            terminal_page_scope_history common;
+            std::size_t kind=4; // 0catalog,1header,2projection,3suspension; no Native authority.
+        };
+        terminal_static_scope_history terminal_static_detached_history(const ::lattice::database&,
+            const ordinary_target_staging_connection&,const ordinary_group_target_receiving_owner&,
+            const void*,std::uint64_t,std::size_t)const noexcept;
+        terminal_page_scope_history terminal_page_detached_history(const ::lattice::database&,
+            const ordinary_target_staging_connection&,const ordinary_group_target_receiving_owner&,
+            const void*,std::uint64_t)const noexcept;
         bool abandon_unpublished_main(const ::lattice::database&)noexcept;
         bool join_native_files(const ::lattice::database&)noexcept;
         bool leave(const ::lattice::database&)noexcept;

@@ -34,6 +34,36 @@ let capiTestTargets: [Target] = [
     ),
 ]
 
+// The closed Bridge producer controls use the genuine ordinary public factory
+// in a separate process/catalog. Never link their model registrations into the
+// broad CoreTests application. The actual controls are not implemented on Linux.
+#if os(Linux)
+let observerDeliveryBridgeTestProducts: [Product] = []
+let observerDeliveryBridgeTestTargets: [Target] = []
+#else
+let observerDeliveryBridgeTestProducts: [Product] = [
+    .executable(name: "LatticeObserverDeliveryBridgeTests", targets: ["LatticeObserverDeliveryBridgeTests"]),
+]
+let observerDeliveryBridgeTestTargets: [Target] = [
+    .executableTarget(
+        name: "LatticeObserverDeliveryBridgeTests",
+        dependencies: ["LatticeCore", "LatticeSwiftCppBridge", "GoogleTest"],
+        path: "Tests/LatticeCoreTests",
+        sources: ["ObserverDeliveryBridgeSetterTests.cpp"],
+        cxxSettings: [
+            .headerSearchPath("vendor"),
+            .headerSearchPath("../../Sources/LatticeSwiftCppBridge/include"),
+            .headerSearchPath("../../Sources/GoogleTest/include"),
+            .define("ASIO_STANDALONE"),
+            .define("_WEBSOCKETPP_CPP11_THREAD_"),
+            .unsafeFlags(["-std=c++20"]),
+            .unsafeFlags(["-fno-implicit-module-maps"], .when(platforms: [.macOS, .iOS])),
+        ],
+        linkerSettings: [.linkedLibrary("sqlite3")]
+    ),
+]
+#endif
+
 let package = Package(
     name: "LatticeCore",
     platforms: [
@@ -64,7 +94,7 @@ let package = Package(
             name: "LatticeCoreTests",
             targets: ["LatticeCoreTests"]
         ),
-    ] + capiTestProducts,
+    ] + capiTestProducts + observerDeliveryBridgeTestProducts,
     targets: [
         .target(
             name: "SqliteVec",
@@ -127,6 +157,7 @@ let package = Package(
                 "src/ordinary_group_target_projection_program.inc",
                 "src/ordinary_group_target_receiving_owner.inc",
                 "src/ordinary_group_target_row_import_program.inc",
+                "src/ordinary_receiver_history_lifecycle_fixture.inc",
                 "src/ordinary_target_abandoned_raw.inc",
                 "src/ordinary_target_abandonment_database.inc",
                 "src/ordinary_target_catalog_database.inc",
@@ -145,9 +176,25 @@ let package = Package(
                 "src/ordinary_target_staging_database.inc",
                 "src/ordinary_target_terminal_call_evidence.inc",
                 "src/ordinary_target_terminal_decoder_database.inc",
+                "src/ordinary_target_terminal_outer_database.inc",
+                "src/ordinary_target_terminal_outer_tail_database.inc",
+                "src/ordinary_target_terminal_page_database.inc",
+                "src/ordinary_target_terminal_page_tail_database.inc",
                 "src/ordinary_target_terminal_phase_database.inc",
                 "src/ordinary_target_terminal_phase_tail_database.inc",
+                "src/ordinary_target_terminal_programme_database.inc",
+                "src/ordinary_target_terminal_programmes.inc",
+                "src/ordinary_target_terminal_raw_objects.inc",
+                "src/ordinary_target_terminal_schema_roots.inc",
                 "src/ordinary_target_terminal_scope.inc",
+                "src/ordinary_target_terminal_scope_roots_database.inc",
+                "src/ordinary_target_terminal_shell_database.inc",
+                "src/ordinary_target_terminal_receiving_payloads.inc",
+                "src/ordinary_target_terminal_collection.inc",
+                "src/ordinary_target_terminal_scope_roots.inc",
+                "src/ordinary_target_scope_environment_history.inc",
+                "src/ordinary_target_terminal_static_database.inc",
+                "src/ordinary_target_terminal_static_tail_database.inc",
                 "src/ordinary_target_terminal_vfs.inc",
             ],
             sources: ["src"],
@@ -262,7 +309,7 @@ let package = Package(
             name: "LatticeCoreTests",
             dependencies: ["LatticeCore", "LatticeSwiftCppBridge", "GoogleTest", "LatticeCAPIHeaderCheck"],
             path: "Tests/LatticeCoreTests",
-            exclude: ["vendor", "LatticeCoreTests_legacy.cpp.bak", "IPCTests.hpp", "SyncIntegrationTests.hpp"],
+            exclude: ["vendor", "LatticeCoreTests_legacy.cpp.bak", "IPCTests.hpp", "SyncIntegrationTests.hpp", "ObserverDeliveryBridgeSetterTests.cpp"],
             cxxSettings: [
                 .headerSearchPath("vendor"),
                 .headerSearchPath("../../Sources/LatticeSwiftCppBridge/include"),
@@ -281,6 +328,6 @@ let package = Package(
         //             dependencies: ["LatticeSwiftCppBridge"],
         //             cxxSettings: [],
         //             swiftSettings: [.interoperabilityMode(.Cxx)])
-    ] + capiTestTargets,
+    ] + capiTestTargets + observerDeliveryBridgeTestTargets,
     cxxLanguageStandard: .cxx20
 )

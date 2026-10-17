@@ -5,6 +5,8 @@ bool ordinary_target_staging_connection::terminal_scope_history_binding_known(
     const ::lattice::database& actual)const noexcept {
     try {
         const auto native=state_;
+        if(native&&native->creator_current()&&native->scope_roots_attempted)
+            return terminal_scope_roots_shell_history_known(actual);
         if(!native||!native->creator_current()||native->facade.lock().get()!=this||
            native->shell.get()!=&actual||!native->target||!native->io||!native->cleanup_attempted||
            native->abandoned_main.selected||!terminal_cleanup_pending(actual))return false;
@@ -130,6 +132,7 @@ std::uint64_t ordinary_target_staging_connection::terminal_environment_ending_ge
 bool ordinary_target_staging_connection::terminal_raw_ending_after_scope_known(
     const ::lattice::database& actual)const noexcept {
     try {
+        if(state_&&state_->creator_current()&&state_->raw_objects_attempted)return terminal_raw_objects_history_known(actual);
 #ifdef LATTICE_TARGET_MAIN_POSIX
         const auto native=state_;
         if(!native||!native->creator_current()||native->facade.lock().get()!=this||

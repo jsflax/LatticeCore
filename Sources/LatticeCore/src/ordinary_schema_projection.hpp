@@ -56,6 +56,22 @@ struct ordinary_identifier_less {
     }
 };
 
+// SwiftSchema is an unordered_map. Its traversal order is not part of the
+// ordinary logical schema or wire column identity. Borrow only these immutable
+// declaration pointers for this synchronous call; never change the retained
+// owner catalog or its independent continuous-producer descriptor/programs.
+template<class Charge>
+inline std::vector<const property_descriptor*> ordinary_projection_property_order(
+    const model_schema& model,bool swift,const Charge& charge) {
+    if(model.properties.size()>ordinary_sync_limits::properties)
+        throw std::runtime_error("ordinary projection property order bound exceeded");
+    charge(model.properties.size()*sizeof(const property_descriptor*));
+    std::vector<const property_descriptor*> properties;properties.reserve(model.properties.size());
+    for(const auto& property:model.properties)properties.push_back(&property);
+    if(swift)std::sort(properties.begin(),properties.end(),[](const auto* left,const auto* right){return left->name<right->name;});
+    return properties;
+}
+
 inline ordinary_schema_projection describe_ordinary_projection(const recovery_owner_schema& catalog,
                                                                const std::vector<std::string>& requested) {
     using caps=ordinary_sync_limits;
@@ -113,7 +129,8 @@ inline ordinary_schema_projection describe_ordinary_projection(const recovery_ow
     for(const auto& name:result.models) {
         const auto* declaration=catalog.find(name);require(declaration&&name.front()!='_',"ordinary projection root declaration missing");
         model_schema stored;stored.table_name=name;
-        for(const auto& p:declaration->properties) {
+        for(const auto* property:ordinary_projection_property_order(*declaration,catalog.swift_models.count(name),charge)) {
+            const auto& p=*property;
             identifier(p.name);
             if(catalog.swift_models.count(name)) {
                 if(p.kind==property_kind::union_type){auto q=p;q.type=column_type::text;q.nullable=true;stored.properties.push_back(std::move(q));}
@@ -148,7 +165,8 @@ inline ordinary_schema_projection describe_ordinary_projection(const recovery_ow
     }
     for(const auto& name:result.models) {
         const auto& model=*catalog.find(name);auto& parent=result.tables.at(name);
-        for(const auto& p:model.properties) {
+        for(const auto* property:ordinary_projection_property_order(model,catalog.swift_models.count(name),charge)) {
+            const auto& p=*property;
             if(p.kind==property_kind::union_type||p.is_union) {
                 const auto& target=p.union_desc.union_table_name;identifier(target);
                 for(const auto& c:p.union_desc.cases){identifier(c.case_name);for(const auto& v:c.values)if(!v.param_name.empty())identifier(v.param_name);}
@@ -203,10 +221,12 @@ inline ordinary_schema_projection describe_ordinary_projection(const recovery_ow
             }
         }
         if(catalog.swift_models.count(name)) {
-            for(const auto& p:model.properties)if(p.is_indexed&&
-                (p.kind==property_kind::primitive||p.kind==property_kind::union_type||
-                 (p.kind==property_kind::list&&p.is_geo_bounds)))
-                program(parent.index_programs,ordinary_property_index_program(name,p.name));
+            for(const auto* property:ordinary_projection_property_order(model,true,charge)) {
+                const auto& p=*property;
+                if(p.is_indexed&&(p.kind==property_kind::primitive||p.kind==property_kind::union_type||
+                    (p.kind==property_kind::list&&p.is_geo_bounds)))
+                    program(parent.index_programs,ordinary_property_index_program(name,p.name));
+            }
             const auto constraints=catalog.swift_constraints.find(name);require(constraints!=catalog.swift_constraints.end(),"ordinary projection Swift constraints missing");
             for(size_t i=0;i<constraints->second.size();++i) {
                 const auto& constraint=constraints->second[i];if(constraint.columns.empty())continue;

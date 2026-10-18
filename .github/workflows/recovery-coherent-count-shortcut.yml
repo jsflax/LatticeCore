@@ -1,0 +1,113 @@
+name: Genuine count-shortcut migration qualification
+
+# Separate coverage job; the full Core qualifier keeps every existing failure
+# and six-count coverage refusal. This workflow never edits product/test bodies.
+on:
+  push:
+    branches: ["codex/count-shortcut-qualification-*"]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact current Core commit containing this workflow and module
+        type: string
+        required: true
+      expected_tree:
+        description: Exact current Core tree
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coherent-count-shortcut-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  count-shortcut-macos:
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      CORE_SHA: ${{ inputs.expected_sha || github.sha }}
+      CORE_TREE: ${{ inputs.expected_tree }}
+      CORE_SOURCE_REPOSITORY: ${{ github.repository }}
+      EVENT_SHA: ${{ github.sha }}
+      EVENT_KIND: ${{ github.event_name }}
+      OLD_SEED_SHA: f0c1eef8a857bb01d398378d177f6ed5ea72fcef
+      OLD_SEED_TREE: c8b96d9c8bdaa47f63a4bbf9348c9328e115da7a
+    steps:
+      - name: Fetch exact current source under actual hosted HOME/localdev
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CORE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$EVENT_KIND" == workflow_dispatch ]]; then
+            [[ "$CORE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          [[ "$CORE_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          test "$CORE_SHA" = "$EVENT_SHA"
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          umask 077
+          COUNT_JOB_ROOT="$HOME/localdev/coherent-count-shortcut-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$COUNT_JOB_ROOT"
+          mkdir -p "$COUNT_JOB_ROOT/bootstrap-tmp"
+          export TMPDIR="$COUNT_JOB_ROOT/bootstrap-tmp" TMP="$COUNT_JOB_ROOT/bootstrap-tmp" TEMP="$COUNT_JOB_ROOT/bootstrap-tmp"
+          {
+            echo "COUNT_JOB_ROOT=$COUNT_JOB_ROOT"
+            echo "TMPDIR=$TMPDIR"
+            echo "TMP=$TMP"
+            echo "TEMP=$TEMP"
+          } >> "$GITHUB_ENV"
+          git init "$COUNT_JOB_ROOT/source"
+          git -C "$COUNT_JOB_ROOT/source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$CORE_SHA"
+          git -C "$COUNT_JOB_ROOT/source" checkout --detach "$CORE_SHA"
+          test "$(git -C "$COUNT_JOB_ROOT/source" rev-parse HEAD)" = "$CORE_SHA"
+          ACTUAL_TREE="$(git -C "$COUNT_JOB_ROOT/source" rev-parse 'HEAD^{tree}')"
+          if [[ "$EVENT_KIND" == workflow_dispatch ]]; then
+            test "$ACTUAL_TREE" = "$CORE_TREE"
+          else
+            CORE_TREE="$ACTUAL_TREE"
+            echo "CORE_TREE=$CORE_TREE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Fetch fixed faithful241-unit old source without current substitution
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022 # Immutable old logical source bodies are exactly0644.
+          git init "$COUNT_JOB_ROOT/old-source"
+          git -C "$COUNT_JOB_ROOT/old-source" fetch --depth=1 "https://github.com/${CORE_SOURCE_REPOSITORY}.git" "$OLD_SEED_SHA"
+          git -C "$COUNT_JOB_ROOT/old-source" checkout --detach "$OLD_SEED_SHA"
+          test "$(git -C "$COUNT_JOB_ROOT/old-source" rev-parse HEAD)" = "$OLD_SEED_SHA"
+          test "$(git -C "$COUNT_JOB_ROOT/old-source" rev-parse 'HEAD^{tree}')" = "$OLD_SEED_TREE"
+
+      - name: Fresh all-target current build, faithful old build, six seeds and six parents
+        # Module owner300minutes includes its final20-second ending reserve.
+        # Two 10-minute bootstraps + this302 + upload8 fit the360-minute job ceiling.
+        timeout-minutes: 302
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          python3 "$COUNT_JOB_ROOT/source/scripts/recovery_coherent_count_shortcut.py" \
+            --source "$COUNT_JOB_ROOT/source" --old-source "$COUNT_JOB_ROOT/old-source" \
+            --root "$COUNT_JOB_ROOT/qualification" \
+            --expected-sha "$CORE_SHA" --expected-tree "$CORE_TREE"
+
+      - name: Preserve known-ended raw outcomes, source proof and first failures
+        # Unknown-ending outputs stay uncopied; immutable ending-debt metadata
+        # is still published. No recursive cleanup and no old seed reuse.
+        if: always() && env.COUNT_JOB_ROOT != ''
+        timeout-minutes: 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: coherent-count-shortcut-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.COUNT_JOB_ROOT }}/qualification/out/upload
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

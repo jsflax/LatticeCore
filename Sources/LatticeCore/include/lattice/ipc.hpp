@@ -16,6 +16,10 @@ namespace lattice {
 /// Resolve a channel name to a platform-specific Unix domain socket path.
 /// macOS: ~/Library/Caches/Lattice/ipc/<channel>.sock
 /// Linux: $XDG_RUNTIME_DIR/lattice/<channel>.sock (fallback: /tmp/lattice-<uid>/<channel>.sock)
+/// Fitting names remain unchanged. Overlong default names use a versioned,
+/// deterministic full-SHA256 base64url basename in the same directory.
+/// Empty/NUL/overlong final paths refuse before namespace or socket effects;
+/// explicit paths are never shortened or redirected.
 std::string resolve_ipc_socket_path(const std::string& channel);
 
 // ============================================================================

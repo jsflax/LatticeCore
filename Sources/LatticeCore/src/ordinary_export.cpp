@@ -13,6 +13,7 @@
 #include "ordinary_projection_recipe.hpp"
 #include "ordinary_row_recipe.hpp"
 #include "ordinary_internal_schema.hpp"
+#include "observer_delivery_schema.hpp"
 #include "ordinary_vector_integrity.hpp"
 #include "ordinary_v2_property.hpp"
 #include "ordinary_v2_audit_json.hpp"
@@ -638,7 +639,7 @@ void capture_projected_tables(sqlite3* handle,const recovery_owner_schema& catal
     try {
         auto projection=describe_ordinary_projection(catalog,names);retained.add(projection.logical_bytes);
         const ordinary_metadata_query query=[&](const auto& sql,const auto& args,size_t limit){return read_metadata(handle,sql,args,limit,retained);};
-        auto metadata=validate_ordinary_schema(projection,query);
+        auto metadata=observer_delivery_schema::validate(catalog,projection,query);
         // Both validators run synchronously on this exact owned SQLite view,
         // before any source-cut or receiver-ledger mutation. Module validation
         // must precede the internal helper validator's broader FK inspection.
@@ -1344,6 +1345,20 @@ void hydrate_canonical_original(ordinary_wire_original_turn& turn,const std::str
 
 #include "ordinary_delivery_storage.inc"
 
+void observer_delivery_schema::validate_database(database& writer,const recovery_owner_schema& catalog) {
+    auto* handle=ordinary_export_storage_access::borrow(writer);
+    if(!handle||sqlite3_get_autocommit(handle)!=0||sqlite3_txn_state(handle,"main")==SQLITE_TXN_NONE)
+        refuse("delivery schema validation requires the caller's actual retained main transaction");
+    budget retained;
+    auto projection=describe_ordinary_projection(catalog,{});retained.add(projection.logical_bytes);
+    const ordinary_metadata_query query=[&](const auto& sql,const auto& args,size_t limit) {
+        return read_metadata(handle,sql,args,limit,retained);
+    };
+    auto metadata=validate(catalog,projection,query);
+    const auto internal=validate_ordinary_internal_schema(catalog,projection,metadata,query);
+    retained.add(metadata.copied_bytes);retained.add(internal.copied_bytes);
+}
+
 void ordinary_wire_original_turn::finish() {
     auto& s=*state_;s.usable();
     if(s.current_usage&&original_capacity(s.writer,false,s.retained)!=*s.current_usage)refuse("canonical current final capacity changed");
@@ -1510,6 +1525,10 @@ std::vector<audit_log_entry> ordinary_export_access::upload_query(database& writ
         }
         for(auto* statement=sqlite3_next_stmt(handle,nullptr);statement;statement=sqlite3_next_stmt(handle,statement))
             if(sqlite3_stmt_busy(statement)&&!sqlite3_stmt_readonly(statement))refuse("upload cannot reenter an active mutation");
+        // Denial-only classification precedes the upload cursor. A protected
+        // read-only owner must refuse without first running an export query.
+        // Keep the same physical mutex and all later per-route guards.
+        require_continuous_legacy_export_absent(writer);
         const int autocommit=sqlite3_get_autocommit(handle);
         const auto changes=sqlite3_total_changes64(handle);
         // COUNT always produces one ROW, including genuine absence. Retaining
@@ -1703,7 +1722,7 @@ std::vector<std::string> ordinary_export_access::observation_tables(lattice_db& 
             // Metadata only: main values, AuditLog and source/receiver ledgers
             // are not read or mutated. The validator preflights owned module
             // definitions before targeted metadata can connect those modules.
-            (void)validate_ordinary_schema(projection,[&](const auto& sql,const auto& args,size_t limit){
+            (void)observer_delivery_schema::validate(owner.recovery_schemas_,projection,[&](const auto& sql,const auto& args,size_t limit){
                 return read_metadata(handle,sql,args,limit,retained);
             });
             retained.add(projection.tables.size()*sizeof(std::string));result.reserve(projection.tables.size());
@@ -1726,7 +1745,8 @@ recovery_owner_schema ordinary_export_access::managed_clone_catalog(lattice_db& 
     if(parent.is_closed() || !parent.recovery_schemas_.valid() || !config.ordinary_context ||
         config.ordinary_context!=parent.config_.ordinary_context || config.path!=parent.config_.path ||
         config.is_sync_enabled() || config.is_ipc_enabled() || config.is_in_memory() ||
-        config.read_only!=parent.config_.read_only || config.audit_retention_seconds!=0)
+        config.read_only!=parent.config_.read_only || config.audit_retention_seconds!=0||
+        config.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes)
         refuse("managed attachment clone requires its actual parent configuration");
     const auto settled=recovery_writer_access::ordinary_owned_write(parent,[&](database& writer){
         const auto profile=parent.ordinary_managed_profile_.load(std::memory_order_acquire);
@@ -1769,6 +1789,7 @@ void ordinary_export_access::admit_managed_clone(lattice_db& parent,lattice_db& 
     if(&parent==&child || parent.is_closed() || child.is_closed() ||
         child.config_.ordinary_context!=parent.config_.ordinary_context ||
         child.config_.path!=parent.config_.path || child.config_.is_sync_enabled() || child.config_.is_ipc_enabled() ||
+        child.config_.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes ||
         child.ordinary_managed_profile_.load(std::memory_order_acquire))
         refuse("managed attachment clone publication refused");
     std::shared_ptr<const ordinary_managed_profile> retained;
@@ -1799,6 +1820,9 @@ bool ordinary_export_access::fresh_origin(const lattice_db& owner,const physical
 std::unique_ptr<lattice_db> ordinary_export_access::child(lattice_db& parent,const configuration& config,
     std::shared_ptr<ordinary_history_child_connections>* history_custody) {
     if(parent.is_closed()||!parent.recovery_schemas_.valid())refuse("ordinary child parent/catalog unavailable");
+    if((parent.config_.ordinary_context||parent.config_.wal_extent_limit_bytes)&&
+       config.wal_extent_limit_bytes!=parent.config_.wal_extent_limit_bytes)
+        refuse("ordinary child WAL extent policy differs from its retained parent");
     // The immutable catalog is the actual parent's declaration snapshot. The
     // unexposed child does not synthesize Swift declarations from physical SQL.
     std::unique_ptr<lattice_db> child;

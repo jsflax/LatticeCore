@@ -99,6 +99,139 @@ TEST(RecoveryInstallTransaction, ExplicitAndRawTransactionsAreRefusedWithoutJoin
     owner->db().rollback();
 }
 
+TEST(RecoveryInstallTransaction, DatabaseSettlementCannotLendCoreAuthorityToSameThreadRawSuccessor) {
+    watchdog bounded;
+    for (int ending=0;ending!=6;++ending) {
+        TempDB file{"strict_database_settlement"};
+        for (const auto& path:{std::string(":memory:"),file.str()}) {
+            SCOPED_TRACE(path);
+            SCOPED_TRACE(ending);
+            auto owner=store(path);auto& writer=owner->db();
+            owner->begin_transaction();
+            EXPECT_EQ(access::active_writer(*owner),&writer);
+            insert(writer,"strict-original");
+            switch(ending) {
+            case 0: writer.commit();break;
+            case 1: writer.rollback();break;
+            case 2: writer.execute("COMMIT");break;
+            case 3: writer.execute("ROLLBACK");break;
+            case 4: (void)writer.query("COMMIT");break;
+            case 5: (void)writer.query("ROLLBACK");break;
+            }
+            ASSERT_FALSE(writer.is_in_transaction());
+            writer.execute("BEGIN IMMEDIATE");insert(writer,"strict-raw-successor");
+            const auto schema=writer.query("SELECT name,type FROM main.sqlite_master ORDER BY name,type");
+            lattice::detail::receive_ledger ledger(*owner,{4,128,16,1024,8,512,64});
+            EXPECT_EQ(access::active_writer(*owner),nullptr);
+            EXPECT_THROW(ledger.initialize(),lattice::detail::receive_ledger_error);
+            EXPECT_EQ(writer.query("SELECT name,type FROM main.sqlite_master ORDER BY name,type"),schema);
+            EXPECT_TRUE(writer.is_in_transaction());EXPECT_EQ(count(writer,"strict-raw-successor"),1);
+            EXPECT_EQ(count(writer,"strict-original"),ending%2==0?1:0);
+            // Retiring the ended Core original cannot settle its raw successor.
+            // The raw caller must settle that successor explicitly before a new
+            // genuine Core BEGIN issues usable strict authority afterward.
+            owner->rollback();
+            EXPECT_TRUE(writer.is_in_transaction());EXPECT_EQ(count(writer,"strict-raw-successor"),1);
+            writer.rollback();ASSERT_FALSE(writer.is_in_transaction());
+            EXPECT_EQ(count(writer,"strict-raw-successor"),0);
+            owner->begin_transaction();EXPECT_EQ(access::active_writer(*owner),&writer);
+            EXPECT_NO_THROW(ledger.initialize());owner->rollback();
+        }
+    }
+}
+
+TEST(RecoveryInstallTransaction, ActualFailedLiveCommitRetainsStrictCoreAuthority) {
+    watchdog bounded;auto owner=store();auto& writer=owner->db();
+    writer.execute("PRAGMA foreign_keys=ON");
+    writer.execute("CREATE TABLE _strict_parent(id INTEGER PRIMARY KEY)");
+    writer.execute("CREATE TABLE _strict_child(parent INTEGER REFERENCES _strict_parent(id) DEFERRABLE INITIALLY DEFERRED)");
+    owner->begin_transaction();writer.execute("INSERT INTO _strict_child VALUES(7)");
+    EXPECT_THROW(owner->commit(),lattice::db_error);
+    ASSERT_TRUE(writer.is_in_transaction());EXPECT_EQ(access::active_writer(*owner),&writer);
+    EXPECT_EQ(writer.query("PRAGMA foreign_key_check").size(),1u);
+    lattice::detail::receive_ledger ledger(*owner,{4,128,16,1024,8,512,64});
+    EXPECT_NO_THROW(ledger.initialize());
+    owner->rollback();EXPECT_TRUE(writer.query("SELECT parent FROM _strict_child").empty());
+    EXPECT_EQ(access::active_writer(*owner),nullptr);
+}
+
+TEST(RecoveryInstallTransaction, ActualNativeEscapeRefusesPublicOriginButKeepsPrivateInstallFrame) {
+    watchdog bounded;auto owner=store();auto& writer=owner->db();
+    owner->begin_transaction();insert(writer,"strict-native-original");
+    auto* handle=writer.handle();ASSERT_NE(handle,nullptr);
+    EXPECT_EQ(access::active_writer(*owner),nullptr);
+    ASSERT_EQ(sqlite3_exec(handle,"COMMIT; BEGIN IMMEDIATE",nullptr,nullptr,nullptr),SQLITE_OK);
+    insert(writer,"strict-native-successor");
+    lattice::detail::receive_ledger ledger(*owner,{4,128,16,1024,8,512,64});
+    EXPECT_EQ(access::active_writer(*owner),nullptr);
+    EXPECT_THROW(ledger.initialize(),lattice::detail::receive_ledger_error);
+    EXPECT_TRUE(writer.is_in_transaction());EXPECT_EQ(count(writer,"strict-native-successor"),1);
+    owner->rollback();EXPECT_EQ(count(writer,"strict-native-original"),1);EXPECT_EQ(count(writer,"strict-native-successor"),0);
+    const auto result=access::install(owner,[&](auto& actual) {
+        EXPECT_EQ(access::active_writer(*owner),&actual);ledger.initialize();
+    });
+    EXPECT_EQ(result.state,state::committed);EXPECT_FALSE(result.primary_error);
+}
+
+TEST(RecoveryInstallTransaction, JoinedCoreThreadCannotLendAuthorityToActuallyRecycledNativeID) {
+    watchdog bounded;auto owner=store();std::thread::id original;std::exception_ptr first_error;
+    std::thread first([&] {
+        try {owner->begin_transaction();insert(owner->db(),"strict-abandoned");original=std::this_thread::get_id();}
+        catch(...){first_error=std::current_exception();}
+    });
+    first.join();if(first_error)std::rethrow_exception(first_error);
+    ASSERT_NE(original,std::thread::id{});ASSERT_TRUE(owner->db().is_in_transaction());
+    bool recycled=false;std::exception_ptr successor_error;
+    std::thread successor([&] {
+        recycled=std::this_thread::get_id()==original;
+        if(!recycled)return;
+        try {
+            EXPECT_EQ(access::active_writer(*owner),nullptr);
+            lattice::detail::receive_ledger ledger(*owner,{4,128,16,1024,8,512,64});
+            EXPECT_THROW(ledger.initialize(),lattice::detail::receive_ledger_error);
+            EXPECT_TRUE(owner->db().is_in_transaction());EXPECT_EQ(count(owner->db(),"strict-abandoned"),1);
+        }catch(...){successor_error=std::current_exception();}
+    });
+    successor.join();owner->rollback();if(successor_error)std::rethrow_exception(successor_error);
+    RecordProperty("actual_native_thread_id_reused",recycled?"true":"false");
+    if(!recycled)GTEST_SKIP()<<"One actual successor did not reuse the joined native thread id; no forged id or retry loop";
+}
+
+namespace {
+struct late_core_lifetime_observation {
+    bool called=false,accepted=false,refused_for_ended_lifetime=false;
+    std::exception_ptr error;
+};
+struct late_core_lifetime_probe {
+    std::shared_ptr<lattice::lattice_db> owner;
+    std::shared_ptr<late_core_lifetime_observation> observation;
+    ~late_core_lifetime_probe() noexcept {
+        if(!owner)return;
+        observation->called=true;
+        try {owner->begin_transaction();observation->accepted=true;owner->rollback();}
+        catch(const lattice::db_error& error) {
+            observation->refused_for_ended_lifetime=std::string(error.what())=="Core transaction thread lifetime has ended";
+        } catch(...) {observation->error=std::current_exception();}
+    }
+};
+}
+TEST(RecoveryInstallTransaction, LaterActualThreadLocalDestructorCannotReissueCoreLifetime) {
+    watchdog bounded;auto owner=store();auto observation=std::make_shared<late_core_lifetime_observation>();
+    std::exception_ptr error;
+    std::thread worker([&] {
+        // This actual destructor was registered before the private Core TLS
+        // holder, so C++ executes it after the genuine lifetime ending tail.
+        static thread_local late_core_lifetime_probe probe;
+        probe.owner=owner;probe.observation=observation;
+        try {owner->begin_transaction();insert(owner->db(),"strict-before-thread-exit");owner->commit();}
+        catch(...){error=std::current_exception();}
+    });
+    worker.join();if(error)std::rethrow_exception(error);
+    if(observation->error)std::rethrow_exception(observation->error);
+    EXPECT_TRUE(observation->called);EXPECT_FALSE(observation->accepted);EXPECT_TRUE(observation->refused_for_ended_lifetime);
+    EXPECT_FALSE(owner->db().is_in_transaction());EXPECT_EQ(count(owner->db(),"strict-before-thread-exit"),1);
+}
+
 TEST(RecoveryInstallTransaction, PrivateAuthorityWorksForRealLedgerAndEndsBeforeTail) {
     watchdog bounded;
     auto owner = store();
@@ -545,6 +678,20 @@ TEST(RecoveryControllerAdmission, EngineReadAndManagedCellDeferWithoutChangingDe
         EXPECT_EQ(count(owner->db(),"after-read"),1);ASSERT_EQ(observer.batches.size(),1u);
         owner->db().execute("DELETE FROM TestPerson WHERE globalId='after-read'");
     }
+}
+TEST(RecoveryControllerAdmission, JoinedCoreThreadIsFatalRatherThanLiveContentionDeferral) {
+    watchdog bounded;auto owner=store();std::exception_ptr error;
+    std::thread first([&] {
+        try {owner->begin_transaction();insert(owner->db(),"strict-joined-core");}
+        catch(...){error=std::current_exception();}
+    });
+    first.join();if(error)std::rethrow_exception(error);
+    ASSERT_TRUE(owner->db().is_in_transaction());ASSERT_EQ(count(owner->db(),"strict-joined-core"),1);
+    bool body=false;const auto result=try_access::attempt(owner,[&](auto&){body=true;});
+    EXPECT_EQ(result.deferred,deferred::none);EXPECT_EQ(result.state,state::refused);
+    EXPECT_TRUE(result.primary_error);EXPECT_FALSE(result.cleanup_error);EXPECT_FALSE(result.postcommit_error);
+    EXPECT_FALSE(body);EXPECT_TRUE(owner->db().is_in_transaction());EXPECT_EQ(count(owner->db(),"strict-joined-core"),1);
+    owner->rollback();EXPECT_EQ(count(owner->db(),"strict-joined-core"),0);
 }
 TEST(RecoveryControllerAdmission, SQLiteMutexHeldByActualReadCallbackDefersBeforeBody) {
     watchdog bounded;auto owner=store();auto* handle=owner->db().handle();

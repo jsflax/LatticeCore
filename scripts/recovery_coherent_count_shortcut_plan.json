@@ -1,0 +1,286 @@
+{
+  "schema": 1,
+  "status": "SOURCE_ONLY_UNRUN_SEPARATE_COUNT_COVERAGE_JOB",
+  "old": {
+    "commit": "f0c1eef8a857bb01d398378d177f6ed5ea72fcef",
+    "tree": "c8b96d9c8bdaa47f63a4bbf9348c9328e115da7a",
+    "canonicalBodies": 560,
+    "trackedFiles": 563,
+    "wholeCodegens": 241,
+    "wholeTestUnits": 148,
+    "inventoryCount": 2805,
+    "metadata": {
+      "SOURCE-MAP.json": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261018-002/SOURCE-MAP.json",
+        "bytes": 1683731,
+        "sha256": "1e0c1c7c86524c9c9cd2602b03d3696fe7dbf9897cdc926ff2df64eddebfc611"
+      },
+      "CMakeLists.txt": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261018-002/CMakeLists.txt",
+        "bytes": 19440,
+        "sha256": "6177da589b8a32bbd5cabf42f42be5ce1227f2b9c8dfbfa0837bf632d60c02cb"
+      },
+      "EXPECTED-HELPER-NAMES.json": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261018-002/EXPECTED-HELPER-NAMES.json",
+        "bytes": 233668,
+        "sha256": "1bb618084ce98f97f83f1ad7157bc5137aab2923b0efac594cc9a14005ee03bb"
+      }
+    }
+  },
+  "helperCase": "CountShortcutUpgrade.GenuinePredecessorSeedsEnabledOldBundle",
+  "helperTarget": "LatticeCountShortcutSeedHelper",
+  "seeds": [
+    {
+      "name": "preserve",
+      "parent": "CountShortcutUpgrade.OriginalEnabledStoreUpgradesAllProgramsAndPreservesEveryDurableCell"
+    },
+    {
+      "name": "idempotent",
+      "parent": "CountShortcutUpgrade.CompletedUpgradeReopenIsProgramAndCookieIdempotent"
+    },
+    {
+      "name": "rollback",
+      "parent": "CountShortcutUpgrade.ActualUpgradeCommitDenialRollsBackProgramsMarkersAndLineage"
+    },
+    {
+      "name": "mixed",
+      "parent": "CountShortcutUpgrade.MixedHistoricalAndCurrentProgramsRefuseWithoutAnyRepair"
+    },
+    {
+      "name": "tamper",
+      "parent": "CountShortcutUpgrade.TamperedHistoricalProgramRefusesWithoutAnyRepair"
+    },
+    {
+      "name": "marker",
+      "parent": "CountShortcutUpgrade.NoncanonicalCurrentMarkerRefusesWithoutCookieOrProgramHealing"
+    }
+  ],
+  "currentParentTU": {
+    "relative": "Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+    "bytes": 229148,
+    "sha256": "a8dbcba3ef58b0ce5281884cf005b36cdb916f75a83c0a00fe67b22e200a397c",
+    "originalBodies": [
+      {
+        "name": "CountShortcutUpgrade.OriginalEnabledStoreUpgradesAllProgramsAndPreservesEveryDurableCell",
+        "bytes": 807,
+        "sha256": "f4ee4a97fc174ec9596d6e2774e0f9ca5374f4ab3bc723dd480c7decfc6d9fd2",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.CompletedUpgradeReopenIsProgramAndCookieIdempotent",
+        "bytes": 528,
+        "sha256": "de3189296009ce81a22fdb2a87d5b3dd3745e705565048d42ad0fd000af94d1e",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.ActualUpgradeCommitDenialRollsBackProgramsMarkersAndLineage",
+        "bytes": 902,
+        "sha256": "b4b11a9f0e10b4236bd239356a48281c9816e27f93583d25ef8cfa0c2409d3cb",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.MixedHistoricalAndCurrentProgramsRefuseWithoutAnyRepair",
+        "bytes": 1056,
+        "sha256": "06b43be795a29ae7533789c310a5de67a7b188723118af3aebc937786688e319",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.TamperedHistoricalProgramRefusesWithoutAnyRepair",
+        "bytes": 967,
+        "sha256": "476c8f00ecf8b9dbffa74bf1c18254e92155bc006604111d77e9345929422dff",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.NoncanonicalCurrentMarkerRefusesWithoutCookieOrProgramHealing",
+        "bytes": 645,
+        "sha256": "aec5b8cdc69f7e91ce40dc01fc6387db98d8e32033d3ec4fecfa326d55a01c8e",
+        "exactOriginalCurrentBody": true
+      }
+    ]
+  },
+  "originalFlags": {
+    "SqliteVec": [
+      {
+        "count": 1,
+        "flags": [
+          "-DSQLITE_CORE",
+          "-DSQLITE_VEC_ENABLE_NEON",
+          "-DSQLITE_VEC_EXPERIMENTAL_IVF_ENABLE",
+          "-DSQLITE_VEC_STATIC",
+          "-g",
+          "-mmacosx-version-min=14.0",
+          "-fPIC",
+          "-fvisibility=hidden"
+        ]
+      }
+    ],
+    "LatticeCore": [
+      {
+        "count": 80,
+        "flags": [
+          "-DSQLITE_CORE",
+          "-g",
+          "-std=gnu++20",
+          "-mmacosx-version-min=14.0",
+          "-fPIC",
+          "-fvisibility=hidden",
+          "-fvisibility-inlines-hidden"
+        ]
+      }
+    ],
+    "LatticeSwiftCppBridge": [
+      {
+        "count": 10,
+        "flags": [
+          "-g",
+          "-std=gnu++20",
+          "-mmacosx-version-min=14.0",
+          "-fPIC",
+          "-fvisibility=hidden",
+          "-fvisibility-inlines-hidden"
+        ]
+      }
+    ],
+    "gtest": [
+      {
+        "count": 1,
+        "flags": [
+          "-g",
+          "-std=gnu++20",
+          "-mmacosx-version-min=14.0",
+          "-fPIC"
+        ]
+      }
+    ],
+    "gtest_main": [
+      {
+        "count": 1,
+        "flags": [
+          "-g",
+          "-std=gnu++20",
+          "-mmacosx-version-min=14.0",
+          "-fPIC"
+        ]
+      }
+    ],
+    "LatticeCoreTests": [
+      {
+        "count": 147,
+        "flags": [
+          "-g",
+          "-std=gnu++20",
+          "-mmacosx-version-min=14.0",
+          "-fPIE"
+        ]
+      },
+      {
+        "count": 1,
+        "flags": [
+          "-g",
+          "-mmacosx-version-min=14.0",
+          "-fPIE",
+          "-std=c11"
+        ]
+      }
+    ]
+  },
+  "exactHelperFlags": [
+    "-DLATTICE_COUNT_SHORTCUT_PREDECESSOR_HELPER=1",
+    "-g",
+    "-std=gnu++20",
+    "-mmacosx-version-min=14.0",
+    "-fPIE"
+  ],
+  "originalArchiveOrder": [
+    "libLatticeCore.a",
+    "libLatticeSwiftCppBridge.a",
+    "libgtest_main.a",
+    "libLatticeCore.a",
+    "libSqliteVec.a",
+    "libgtest.a"
+  ],
+  "caps": {
+    "ownerSeconds": 18000,
+    "endingReserveSeconds": 20,
+    "currentConfigure": 120,
+    "oldConfigure": 120,
+    "currentBuild": 7200,
+    "oldBuild": 7200,
+    "currentInventory": 60,
+    "oldInventory": 180,
+    "seed": 60,
+    "currentParents": 900,
+    "dataCommand": 30
+  },
+  "resources": {
+    "buildJobs": 2,
+    "initialFreeBytes": 18253611008,
+    "minimumFreeBytes": 12884901888
+  },
+  "evidenceBounds": {
+    "xmlBytes": 67108864,
+    "inventoryBytes": 4194304,
+    "namespaceEntries": 20000,
+    "perSeedSnapshotBytes": 1073741824
+  },
+  "authorities": {
+    "RECIPE.json": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-count-shortcut-old-seed-companion-source-20261016-001/RECIPE.json",
+      "bytes": 8263,
+      "sha256": "c0247814c0f57b5088bafe95d6904d280ca2ebc7e9cebe42456dbcdd5191ee7c"
+    },
+    "SOURCE-MAP.json": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-count-shortcut-old-seed-companion-source-20261016-001/SOURCE-MAP.json",
+      "bytes": 1683731,
+      "sha256": "1e0c1c7c86524c9c9cd2602b03d3696fe7dbf9897cdc926ff2df64eddebfc611"
+    },
+    "ACTUAL-ORIGINAL-FLAGS.json": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-count-shortcut-old-seed-companion-source-20261016-001/ACTUAL-ORIGINAL-FLAGS.json",
+      "bytes": 2703,
+      "sha256": "86bf5c77ca14dc3d07affb81785cddf006f902bcbf9d6fc80b2a317850df9ebf"
+    },
+    "SEED-SOURCE-CONTRACT.json": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-count-shortcut-old-seed-companion-source-20261016-001/SEED-SOURCE-CONTRACT.json",
+      "bytes": 16084,
+      "sha256": "ec2a7110c5a014fa2b681175000dacb6db0b55d036137579164851ae41cd6928"
+    },
+    "HISTORICAL-SEED-EVIDENCE.json": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-count-shortcut-old-seed-companion-source-20261016-001/HISTORICAL-SEED-EVIDENCE.json",
+      "bytes": 33672,
+      "sha256": "9affee10b4eb153754a8815bd61efcfa6769caf6c2c402fd776b83257639f74f"
+    },
+    "SEAL.json": {
+      "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-count-shortcut-old-seed-companion-source-20261016-001/SEAL.json",
+      "bytes": 3289,
+      "sha256": "b957eeb4981126287f7e6be1357215c34a0c56806e8b6c3ec9af2305dcb522a8"
+    }
+  },
+  "rootProvenance": {
+    "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/recovery-count-shortcut-seed-provenance-snapshot-20261018-002/RESULT.json",
+    "bytes": 3715,
+    "sha256": "a6bc9b04bd59a7ef2e269176eae0b2c993942efaf58333492a619eddc5fb2ecf"
+  },
+  "rootSourceReview": {
+    "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/preparation/ordinary-count-shortcut-old-seed-root-review-20261016-005/RESULT.json",
+    "bytes": 1912,
+    "sha256": "0e04a4a1ccb6007a3737e26ff9814209556f2a054996cdd9803c8ad06b9d6e2d"
+  },
+  "claims": {
+    "currentAllTargetBuildRequired": true,
+    "noOldObjectReuse": true,
+    "sixCoverageFailureInExistingQualifierUnchanged": true,
+    "fullCoreSuite": false,
+    "fullSDKSuite": false,
+    "performance": false,
+    "resourceProfile": false,
+    "release": false
+  },
+  "timing": "Owner 300 minutes begins in module; work ends ownerEnd-20 seconds. A full stage cap must fit workEnd before launch. Existing supervisor has at most20 seconds of owned ending attempts; no deadline refresh/retry. Workflow reserves two10-minute bootstraps, <=302-minute module step,8-minute upload within360-minute job.",
+  "unresolved": [
+    "Current expanded registry/schema-fingerprint compatibility must pass the six unchanged original parents; no pruning or oracle rewrite",
+    "All configure/build/dependency/archive/link/inventory/seed/parent work UNRUN",
+    "Source-only new provenance snapshot is not historical Git identity",
+    "This independent count component does not turn existing failed/skipped full-suite qualification green",
+    "Unknown process ending prevents hashing/copying its mutable outputs; immutable ending-debt metadata is uploaded instead"
+  ]
+}

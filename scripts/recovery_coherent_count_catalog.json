@@ -1,0 +1,2351 @@
+{
+  "schema": 1,
+  "sourceOnly": true,
+  "runtimeQualified": false,
+  "oldSha": "a37345d7a8f0e0a5e8f4359b62575cfe0197dde7",
+  "oldTree": "c76599fb8ca348305342a97b60bae2cfddcd8426",
+  "helperTarget": "LatticeCountShortcutCurrentHelper",
+  "helperMain": {
+    "relative": "Tests/LatticeCoreTests/CountShortcutCurrentHelperMain.cpp",
+    "bytes": 7693,
+    "sha256": "0025cd70377deb2c8d533bb75b34811eb1c21dce7524109c566da1f8dfe223cf"
+  },
+  "cmake": {
+    "relative": "CMakeLists.txt",
+    "bytes": 39947,
+    "sha256": "1c3354298366a804130cf3b43c0ed26212428bfb17593a4bc04695dcde9340c0"
+  },
+  "helperWholeTestSources": [
+    "Tests/LatticeCoreTests/WalExtentBudgetTests.cpp",
+    "Tests/LatticeCoreTests/HistoricalWalCheckpointTests.cpp",
+    "Tests/LatticeCoreTests/Vec0Tests.cpp",
+    "Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp",
+    "Tests/LatticeCoreTests/ExactVectorRowsTests.cpp",
+    "Tests/LatticeCoreTests/MultiConnectionTests.cpp",
+    "Tests/LatticeCoreTests/SyncUnitTests.cpp",
+    "Tests/LatticeCoreTests/SyncPartialConstructionTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryReceiverSourceTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryReceiverControllerTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryOriginalIdentityTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalReceiptCoverageRangeTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryReceiptCoverageControllerTests.cpp",
+    "Tests/LatticeCoreTests/SyncCommitProbeTests.cpp",
+    "Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp",
+    "Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp",
+    "Tests/LatticeCoreTests/StartupSyncHealingTests.cpp",
+    "Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp",
+    "Tests/LatticeCoreTests/SyncCanonicalRangeTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp",
+    "Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp",
+    "Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp",
+    "Tests/LatticeCoreTests/AuthenticatedRelaySessionTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp",
+    "Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryOwnedTransactionTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryWitnessTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryRefreshWorkerTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryRefreshBridgeTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryErrorDiagnosticBridgeTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryRefreshAdmissionTests.cpp",
+    "Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp",
+    "Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp",
+    "Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp",
+    "Tests/LatticeCoreTests/ScopedRecoveryDeltaTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalScopedInstallTests.cpp",
+    "Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryObligationStoreTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+    "Tests/LatticeCoreTests/ReceiveDeliveryGuardTests.cpp",
+    "Tests/LatticeCoreTests/ReceiveResetAdmissionTests.cpp",
+    "Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp",
+    "Tests/LatticeCoreTests/SyncCallbackLifetimeTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp",
+    "Tests/LatticeCoreTests/SyncDiscoveryDeferralTests.cpp",
+    "Tests/LatticeCoreTests/SyncDiscoveryAdmissionTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryUploadJsonTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryServerExportTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryOwnerSchemaTests.cpp",
+    "Tests/LatticeCoreTests/OrdinarySchemaRecipeTests.cpp",
+    "Tests/LatticeCoreTests/RecoverySwiftContinuityTests.cpp",
+    "Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp",
+    "Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp",
+    "Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp",
+    "Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp",
+    "Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp",
+    "Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp",
+    "Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp",
+    "Tests/LatticeCoreTests/VectorClearTests.cpp",
+    "Tests/LatticeCoreTests/DerivedFtsProgramTests.cpp",
+    "Tests/LatticeCoreTests/DerivedProfileTests.cpp",
+    "Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp",
+    "Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp",
+    "Tests/LatticeCoreTests/CascadeDeleteTests.cpp",
+    "Tests/LatticeCoreTests/SchemaTests.cpp",
+    "Tests/LatticeCoreTests/QueryTests.cpp",
+    "Tests/LatticeCoreTests/DatabaseTextTests.cpp",
+    "Tests/LatticeCoreTests/DatabaseRetirementTests.cpp",
+    "Tests/LatticeCoreTests/ConfiguredRetirementTests.cpp",
+    "Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryStoreAdmissionTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryOwnedLaunchTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryOwnedExportTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryOwnedHelperTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryHelperUploadIntegrityTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryOwnedExportRestartTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryCurrentManagedConsumerTests.cpp",
+    "Tests/LatticeCoreTests/InheritedOwnerQuarantineTests.cpp",
+    "Tests/LatticeCoreTests/KeeperInitializationTests.cpp",
+    "Tests/LatticeCoreTests/QuotedAttachmentTests.cpp",
+    "Tests/LatticeCoreTests/ManagedObservationTests.cpp",
+    "Tests/LatticeCoreTests/ObservationTests.cpp",
+    "Tests/LatticeCoreTests/LinuxNotifierTests.cpp",
+    "Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp",
+    "Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp",
+    "Tests/LatticeCoreTests/ReaderLifetimeTests.cpp",
+    "Tests/LatticeCoreTests/ReadGenerationTests.cpp",
+    "Tests/LatticeCoreTests/InstanceLifecycleTests.cpp",
+    "Tests/LatticeCoreTests/AttachTests.cpp",
+    "Tests/LatticeCoreTests/DeferredDeliveryTests.cpp",
+    "Tests/LatticeCoreTests/FilterRemovalGateTests.cpp",
+    "Tests/LatticeCoreTests/HistoryAndReclaimTests.cpp",
+    "Tests/LatticeCoreTests/LogTests.cpp",
+    "Tests/LatticeCoreTests/MultiChannelSyncSetTests.cpp",
+    "Tests/LatticeCoreTests/NamedMemoryTests.cpp",
+    "Tests/LatticeCoreTests/NoHistoryTests.cpp",
+    "Tests/LatticeCoreTests/SkewToleranceTests.cpp",
+    "Tests/LatticeCoreTests/SyncIntegerWidthTests.cpp",
+    "Tests/LatticeCoreTests/SynthesisNoClobberTests.cpp",
+    "Tests/LatticeCoreTests/IPCFramingRegressionTests.cpp",
+    "Tests/LatticeCoreTests/BridgeTests.cpp",
+    "Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp",
+    "Tests/LatticeCoreTests/BulkMutationTests.cpp",
+    "Tests/LatticeCoreTests/ProjectionReadTests.cpp",
+    "Tests/LatticeCoreTests/OwnedCatalogStreamTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryPagedHistoryTests.cpp",
+    "Tests/LatticeCoreTests/OrdinaryFingerprintTests.cpp",
+    "Tests/LatticeCoreTests/TopologyAdmissionTests.cpp",
+    "Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp",
+    "Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp",
+    "Tests/LatticeCoreTests/ProjectionMemoryServiceTests.cpp",
+    "Tests/LatticeCoreTests/SpatialShapeBridgeTests.cpp",
+    "Tests/LatticeCoreTests/ManagedPhysicalRouteTests.cpp",
+    "Tests/LatticeCoreTests/VirtualUnionRouteTests.cpp",
+    "Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp",
+    "Tests/LatticeCoreTests/UnmanagedConstructionTests.cpp",
+    "Tests/LatticeCoreTests/LiveScalarReadTests.cpp",
+    "Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp",
+    "Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp",
+    "Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp",
+    "Tests/LatticeCoreTests/AttachViewIntegrityTests.cpp",
+    "Tests/LatticeCoreTests/AuditHygieneTests.cpp",
+    "Tests/LatticeCoreTests/AuditRetentionTests.cpp",
+    "Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp",
+    "Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp",
+    "Tests/LatticeCoreTests/SyncPerfBench.cpp",
+    "Tests/LatticeCoreTests/CAPISurfaceTests.cpp",
+    "Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c"
+  ],
+  "currentWholeTUs": [
+    {
+      "relative": "Tests/LatticeCoreTests/WalExtentBudgetTests.cpp",
+      "bytes": 16308,
+      "sha256": "b62e6a94dad0d477abe6027491edebc2b9e83bec6f3258012a44f4ccacbed158"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/HistoricalWalCheckpointTests.cpp",
+      "bytes": 11162,
+      "sha256": "2bed1c040b478877df7e343493db99e0ae512e835d1c2a2b3b6234ff00cfc7a2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/Vec0Tests.cpp",
+      "bytes": 57137,
+      "sha256": "da9cca8846c48cb405bb70f0b4e267d16eb2e68d300ee22251c819d2c6da8468"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp",
+      "bytes": 11996,
+      "sha256": "b7fa53329b112503377169b8f9d2933803dc6feeb1b2d6b28b963331276f7cf2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ExactVectorRowsTests.cpp",
+      "bytes": 19333,
+      "sha256": "354daf03b88b26e9ac4b50d128de917ee4c20ebed11fb1f14ff3644c5b36ddc2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/MultiConnectionTests.cpp",
+      "bytes": 7463,
+      "sha256": "8904f6d378e06acc4a213c4568228233bcb38f57a7a4460235104c132ee1eae4"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncUnitTests.cpp",
+      "bytes": 127950,
+      "sha256": "04afbf1c138d8c358b83a330f99d248c20010a2e86acc52378e9ae416aedece1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncPartialConstructionTests.cpp",
+      "bytes": 17501,
+      "sha256": "7eb109c424fcc5687ece1f42e4f09468096eefac142cb0c207f5e496f3351870"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryReceiverSourceTests.cpp",
+      "bytes": 27188,
+      "sha256": "39062b5665727b0a3c23f3ed5f4c81fedf81f77c4a175092a0df9100b5b27a9e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryReceiverControllerTests.cpp",
+      "bytes": 444212,
+      "sha256": "8607a7434d5e230ffed188dce2c5390e677d5576eb7c2528ab94014842efe702"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryOriginalIdentityTests.cpp",
+      "bytes": 12279,
+      "sha256": "29ec327a91609442a3e7f9a335ef752a26a5e2b44f4fafda9b2789f5a82d6d3b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalReceiptCoverageRangeTests.cpp",
+      "bytes": 24175,
+      "sha256": "e2aa3fedf0f1f565716e02ccd7bf505b57721ed7bc6903c4323d768a2e80812f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryReceiptCoverageControllerTests.cpp",
+      "bytes": 142392,
+      "sha256": "fff0925dd226ae7347b730f9dd2199511e3c2ad8a4e4c2157e6787ca1216e760"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncCommitProbeTests.cpp",
+      "bytes": 29121,
+      "sha256": "0df2671f3841bfb9c3be6d563c05f03bd41e1add3d9784881b76d910fe3e31cf"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp",
+      "bytes": 7939,
+      "sha256": "4c6d45b697ffe4a1d34ea93048b2ab0626ca0240b157e6ee555f4efc19a542e8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp",
+      "bytes": 16665,
+      "sha256": "0798f071019e7a571c425876915e1048fc94349ba290cd32c0046bedd364cce1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/StartupSyncHealingTests.cpp",
+      "bytes": 6792,
+      "sha256": "5437342ee63da7c520d026490ed310c61a529c5660135e13b5aa358450197c3f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp",
+      "bytes": 15326,
+      "sha256": "c02392132b204af978e973acba868f659057da207cc935bfdbf0f03f33297c6c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncCanonicalRangeTests.cpp",
+      "bytes": 31506,
+      "sha256": "840c927e687a3cbed7ecac47c47c630d1492b602ce4b6e8c1ed29ddd2b588abd"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp",
+      "bytes": 90227,
+      "sha256": "96ff2c5ea3254654b320c054f59d63877f3766ead9a2567f85130330290ab0c7"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp",
+      "bytes": 52121,
+      "sha256": "21a3e5d26ba542567a2981533b9c3e905aa2c0a1a6a31a1fc20c2a60c638fb49"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp",
+      "bytes": 7219,
+      "sha256": "7b674c34f846f177f8fbbfc330900864928ecfe6f3e61e93945813527fc60ff8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp",
+      "bytes": 19648,
+      "sha256": "9ab4d38ca8aeb60d3a0c1927b0050f595fadef557831cf4acfb104b98dfe16c1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp",
+      "bytes": 23042,
+      "sha256": "6cdbf9c9887f043a6d706e8cfddaccabf044c7252743c4da993d77432cf43090"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp",
+      "bytes": 17191,
+      "sha256": "25beca3e8bd63956cd9cb6b4f754b94d8a60f00d58b83f127a614467bd783151"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp",
+      "bytes": 50092,
+      "sha256": "69d11544d02d462abda66f07005896d5f3041e141f04e91abbb978f38abaa2bc"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp",
+      "bytes": 31304,
+      "sha256": "ab58bd40596d0248c1d2cfbc2158529b7df49159337ea4b914bf4ae419ced78e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp",
+      "bytes": 94118,
+      "sha256": "627c58a1caeca7a6177b1ba6da401a869ddb297120fb4fa6cc4ea7dd359709e3"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuthenticatedRelaySessionTests.cpp",
+      "bytes": 302950,
+      "sha256": "85aeb0b84aecde6b4b154d7a481abf2e676f8b90e7466abada7eef7767ec6746"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp",
+      "bytes": 25753,
+      "sha256": "4a38f8d32d9def38498c389d8564fc479446fe939e5e8d444851ae1e6e60f29c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp",
+      "bytes": 20575,
+      "sha256": "379827c967260118eae3066631f2a8fc23075f0fb9a4c4fce7fb031dd66c7bdd"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp",
+      "bytes": 41599,
+      "sha256": "7c7618ae57e39e7d0d2f90d6f10a70b0e8b16921fb4a917a41d362d962331610"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedTransactionTests.cpp",
+      "bytes": 13135,
+      "sha256": "ce581f12e516fd1d2745c97e55f8116a54929564da3c05abe81bce294d037f2e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp",
+      "bytes": 22543,
+      "sha256": "2566f2406a78614b758d4bf6091a62abf8cd32ba1543fc350ae827b0bf02f9b7"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryWitnessTests.cpp",
+      "bytes": 19278,
+      "sha256": "8a0523696cd25b8743a7c57f2c7ce90bc89fd9e82a2b1370220bdc6912fc5217"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRefreshWorkerTests.cpp",
+      "bytes": 25376,
+      "sha256": "134469b72956b42bf27562d0642432b730506bcbb127c28ba55098d0b48d4f9d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRefreshBridgeTests.cpp",
+      "bytes": 4152,
+      "sha256": "dc6ef95988269ba95655171be70c10eefaa7062adbfe8eb0d7f1274ff104788a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryErrorDiagnosticBridgeTests.cpp",
+      "bytes": 30054,
+      "sha256": "1a14358b2f5b3d1af93476c99019acb4adbcc593032db6d849f079c28f79b631"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRefreshAdmissionTests.cpp",
+      "bytes": 8107,
+      "sha256": "70a0b19f79bb67ec93527cb367ddf5fe7cdc6b6648eb6314da9883006d15cc0a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp",
+      "bytes": 27412,
+      "sha256": "18a5d976d5aa25b21f987154a6719e9ff1a293fcfd13c764bbb229b45bb3f900"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp",
+      "bytes": 24793,
+      "sha256": "eee4f1b77a07b35cc80d7976188f1276fa87cd1f476077a88f7767f9525e8d9e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp",
+      "bytes": 23401,
+      "sha256": "4a8c03011ef77c6177f08bd2352fc7d949e00c4bc14909f85eafc5c12560e58c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ScopedRecoveryDeltaTests.cpp",
+      "bytes": 19148,
+      "sha256": "3f2270ab844652fc5ca98132c722e4d3be2694b1eb42109730dfabb82791fdeb"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalScopedInstallTests.cpp",
+      "bytes": 69193,
+      "sha256": "5a87835c2104932cfcfa0212cee275f6c1de3dda29579e98cda02b202657b0a6"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp",
+      "bytes": 25339,
+      "sha256": "d7ea674a4b8b9d1af5656408cedfceb570315db4b9cd347553a7aa71aa3681da"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryObligationStoreTests.cpp",
+      "bytes": 58640,
+      "sha256": "3465b9a1d7f731aa393ecf909338b53626d3c513d70ec6741410d694c3aea7c0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp",
+      "bytes": 54238,
+      "sha256": "de14044ff968110d9ed5e76948003a65feaa4f9c87baf166c554fe2a59b69be7"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+      "bytes": 229148,
+      "sha256": "a8dbcba3ef58b0ce5281884cf005b36cdb916f75a83c0a00fe67b22e200a397c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReceiveDeliveryGuardTests.cpp",
+      "bytes": 34280,
+      "sha256": "b5966207cca3b389a914e14ea0adba24ee079513948dc7463161afa288e3058f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReceiveResetAdmissionTests.cpp",
+      "bytes": 6809,
+      "sha256": "2c4054c4e058b8c9d20d7c70532f6034c41703a53df6f99e26696aa07fe06483"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp",
+      "bytes": 28335,
+      "sha256": "fe4a29259f48949490ebc38d41261f7f758118440ab2f6f1b38c1e04f4e45326"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncCallbackLifetimeTests.cpp",
+      "bytes": 31270,
+      "sha256": "4abfd2d01d2d8abca1e67fd86b4c40ef943d99e8f21f0db55d1bbd27ebd83731"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp",
+      "bytes": 29055,
+      "sha256": "984f6aa9fcfde9b65bcaa4d47437806b3e54d8b5dc44d5f02575e1f30c6c9ad0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp",
+      "bytes": 5385,
+      "sha256": "012b343bd343742bd495b99d077ce10b698c2464b9c17111cee01ad009117aee"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp",
+      "bytes": 7988,
+      "sha256": "dc418c9f2cfc14557acaed27073fe4ad100c742636915364b92a1182861e78b4"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncDiscoveryDeferralTests.cpp",
+      "bytes": 72832,
+      "sha256": "b925e122ccd3250021d1eb2d5b8a54310d74b70bd0eac259ba6a7adb87aee4af"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncDiscoveryAdmissionTests.cpp",
+      "bytes": 37287,
+      "sha256": "6a849ac1dfdfdebb560067aebb6a61b130f89137e04e6a13f601c2dbe79a9961"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp",
+      "bytes": 18722,
+      "sha256": "c79dfe5a8225d0bed1180560d566ee32a35001f1c6563035a6b9c7d009429f1c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp",
+      "bytes": 19751,
+      "sha256": "a320171007358818de7eb931cee17fd72d599f69d1beabb94547e960f610cac1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp",
+      "bytes": 22964,
+      "sha256": "b71084df60febd2e322992f7231e9639b0fd5aec3c7c155c0a832639ec6f2e8e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryUploadJsonTests.cpp",
+      "bytes": 16172,
+      "sha256": "8d161cff764de17bcee188acf24ec5c9e681fedfcd46d16feb6f495c31950f3d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp",
+      "bytes": 27326,
+      "sha256": "c566c9131af0036c29fe2de60269ee0f1a64ed75b5256f2773c16882422cf5df"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp",
+      "bytes": 27738,
+      "sha256": "3907edc358bc5ff0ff1aa2c7b77d33cf30902c99cb505f81cf193403e7eb1c34"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryServerExportTests.cpp",
+      "bytes": 27185,
+      "sha256": "038b41c208e2920803ef3f4e4bf2b4c27fe884ec5e64d1d74788743b4338344e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryOwnerSchemaTests.cpp",
+      "bytes": 26585,
+      "sha256": "916cc2f452cb620c6dba736a9e73060b6c39a20988f8253453dc701c80b14324"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinarySchemaRecipeTests.cpp",
+      "bytes": 11956,
+      "sha256": "95169ae2c122bb6408a7460c8aa0f0ed9d55a43b495834ed2bb5123770cf45d2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoverySwiftContinuityTests.cpp",
+      "bytes": 15112,
+      "sha256": "b065c6668d27477aee6e205d1bde7f7e56d262b7737625eb38ef3d916516c33f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp",
+      "bytes": 16201,
+      "sha256": "789f8dfc3f2aee95e4fbd652f0d2db5b32499c24ecf92645d013a48b3403aba1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp",
+      "bytes": 12384,
+      "sha256": "bdc0697519fbf6346a8faca936c932da383ad1ec0eafe1a99f43edf1c359c12b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp",
+      "bytes": 27310,
+      "sha256": "bfc6e01909a08f470e15d5655d44883da631987cd3139899356761e0691f42b6"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp",
+      "bytes": 13123,
+      "sha256": "b9c5e34c7fa4dbb48300ab706109d09a50c9143db85769ac90a098ea0cad8947"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp",
+      "bytes": 21089,
+      "sha256": "320e12af0090d032f98fa1b2762c531cddced8a4edbc8a171d994151c40e033f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp",
+      "bytes": 36455,
+      "sha256": "2b10979471a1fdb12f8fe407749b8ecb26d34485d651c8ec9721617452d17f51"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp",
+      "bytes": 29100,
+      "sha256": "dcdebd77180c39548ebc39e17222928e80f72c5212440aa73cdbc592e10e545b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp",
+      "bytes": 19105,
+      "sha256": "dfd69e4172ec284766cb994349b5db107d513f82f0014bd4185f28d99da21f74"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp",
+      "bytes": 34623,
+      "sha256": "a50e2fd6c9648bf07456092e4e66bd46d44988af4e1c37ce250f0e9a077a60fe"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp",
+      "bytes": 25822,
+      "sha256": "a8dba13faab6acc600e53108e1eba5d645f36583e060ca6b380ea6e7777cebca"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp",
+      "bytes": 15146,
+      "sha256": "57150aec497346849bcc8b94f9f2fe76c999dde7c73b215fc1417346abfaef23"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/VectorClearTests.cpp",
+      "bytes": 29230,
+      "sha256": "1032c43ce15e603feb11e3896f2fcf2d221126b18c8da67a7f2dd69043bb5629"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DerivedFtsProgramTests.cpp",
+      "bytes": 6518,
+      "sha256": "a60b29beef615c2f65e5d2f090136b1627be05d872f23c1f40c44a4cb4cf1532"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DerivedProfileTests.cpp",
+      "bytes": 25613,
+      "sha256": "f54227256736b875e37ee48af7848998124d232e68dacaef1356f80d58fe1c5f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp",
+      "bytes": 10625,
+      "sha256": "bca633521f4c096528ba0ed6de45dbb00c150a04d1e7a3fd3febadec4a216de9"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp",
+      "bytes": 20196,
+      "sha256": "810d267d64f842d8287f8e1bc725b3497a8107a140f5a01b21b053adfb119e25"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CascadeDeleteTests.cpp",
+      "bytes": 7078,
+      "sha256": "7bbef11d658541367327c6c82eb475abbfc434c922ea9ebecfbf81dfb19d57d5"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SchemaTests.cpp",
+      "bytes": 22128,
+      "sha256": "79c23dc9ab217f7c01240c7622f3fa1a7f8f94d43bb9417a2841192752087fe0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/QueryTests.cpp",
+      "bytes": 16907,
+      "sha256": "340d4225a6b55bfa3549e0e4c3e30ba14796f7e056915d1e5258c795f2ddf006"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DatabaseTextTests.cpp",
+      "bytes": 4376,
+      "sha256": "0653d73967f44b00cc04e123de1ddfcaf4b856a071860c95b4247a246061fa4d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DatabaseRetirementTests.cpp",
+      "bytes": 13617,
+      "sha256": "e7a120209a97aa336d58111a0dd38ab98f8e4d45c10d0eda9a61ff498e581f03"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ConfiguredRetirementTests.cpp",
+      "bytes": 12008,
+      "sha256": "4457b18cbe0b7b190b8d1cf77301f496111de3d18fdea4ddb6deebc693bb3cdd"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp",
+      "bytes": 28041,
+      "sha256": "286282cd88cfda687838c5470886dece2ca022072bb7a15dd3d1662531e707ee"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryStoreAdmissionTests.cpp",
+      "bytes": 42166,
+      "sha256": "6dbc22ebf8afde33e84ec7f873c003d22cf030f1610ba08adff79e9c158a579d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedLaunchTests.cpp",
+      "bytes": 38042,
+      "sha256": "318b14a7353feeb2b69a613cbc1d5f5b64fd33000d49926bc0bb07a1ef765905"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedExportTests.cpp",
+      "bytes": 25175,
+      "sha256": "e3dc5eb81bab9b6f2ad9223f51c6d960e98bcb5b19f5563fac3444bb3403c857"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedHelperTests.cpp",
+      "bytes": 20038,
+      "sha256": "765f35bd44dbe3de28a4c5a1b404cfa87a4d095c02ee40a89c94c9597318ab5e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryHelperUploadIntegrityTests.cpp",
+      "bytes": 14938,
+      "sha256": "3c14e058c38b0feda8fe3d93623b6da8d566aa4537d2b83e3348ef8bb1fe3fe1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedExportRestartTests.cpp",
+      "bytes": 9464,
+      "sha256": "86de9351be3df111f5f7c8e8e210f7748cee5ea46016207939119bd219b514eb"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryCurrentManagedConsumerTests.cpp",
+      "bytes": 7543,
+      "sha256": "dc73cb3e802a59989b13d6d9625c502048d82f246712588dc9661e879546f0e0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/InheritedOwnerQuarantineTests.cpp",
+      "bytes": 17398,
+      "sha256": "dea4c65f70701328736d8e26eeefe473bd66cfd6436f838c65de44233599c351"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/KeeperInitializationTests.cpp",
+      "bytes": 5061,
+      "sha256": "13079c3f228c45bd65987ab96acc0354106e68b6fa5b58ede45c2b8f1c2ce7ac"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/QuotedAttachmentTests.cpp",
+      "bytes": 2854,
+      "sha256": "a6be490760678b2e43fa4b1b0daa75cc3b7d28c2719cf5969321ec3922114360"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ManagedObservationTests.cpp",
+      "bytes": 26888,
+      "sha256": "4cf67fa031aa6ada9a97f52ca3c9d3732e493a857df2894a01070a244b668abe"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObservationTests.cpp",
+      "bytes": 6920,
+      "sha256": "9db10892050e784daf630b53b13a18d2f2c945f465e55379ce3549b36f250fe6"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LinuxNotifierTests.cpp",
+      "bytes": 3248,
+      "sha256": "5b4a6b67582cf0af1fd0d3acd571453e99b0946a38eafed9ee37abaaf8bbf9db"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp",
+      "bytes": 7602,
+      "sha256": "248ea17b1bd4811abccf2fa3038dabb002331379043965166b5a2d90b859f447"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp",
+      "bytes": 9763,
+      "sha256": "5cb38509541d4303cf17793f3e3e35a2e02db74c000429832f102daee0962c0d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReaderLifetimeTests.cpp",
+      "bytes": 37585,
+      "sha256": "f573089103b1b2ab5fbdb9f8e1038e6607123c13922f93e2ddfa0a31644cc70f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReadGenerationTests.cpp",
+      "bytes": 36629,
+      "sha256": "7a7a6925e5461477bb7d2cbea6c08d6d831d63b2db3529c68528f96ef9d8e711"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/InstanceLifecycleTests.cpp",
+      "bytes": 31577,
+      "sha256": "b1ea905348f0d6708d95006b44ffd6e09e458f11926375295d5791878c2a1b61"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AttachTests.cpp",
+      "bytes": 7154,
+      "sha256": "3920164730431bacfe866beb56d39cbd855343a3b3b852fedc7c201dc90e3097"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DeferredDeliveryTests.cpp",
+      "bytes": 16282,
+      "sha256": "6a67045d49c6e9164dce181999e7394772080a3d4008c6d18144a45b94e25ec0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/FilterRemovalGateTests.cpp",
+      "bytes": 6807,
+      "sha256": "77046b734531113617d3930d7ede63f38cc22c99baa6e68920a81134cebdc97d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/HistoryAndReclaimTests.cpp",
+      "bytes": 10827,
+      "sha256": "f8843b67f91637083b953a8f110167b2426af3e6f9fcadf773a8d20933508d02"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LogTests.cpp",
+      "bytes": 6906,
+      "sha256": "8c53dc3c98fe372ff1bc1da3f586009b14f05af8c7d6f60ac2ec5398c27db346"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/MultiChannelSyncSetTests.cpp",
+      "bytes": 16965,
+      "sha256": "84b193c55898189922c8129f3031bb95dca27cb65bef506403fe28ad79bd9ec8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/NamedMemoryTests.cpp",
+      "bytes": 3849,
+      "sha256": "02721a56f61301f5a36daaf256f0be20a4c5c56e8d5921cd5fb8958287c2385d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/NoHistoryTests.cpp",
+      "bytes": 16670,
+      "sha256": "6d2c327fe56a3e92661957abb88911b2bcfdbd84185a527bee8f8acb3a7ac5b3"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SkewToleranceTests.cpp",
+      "bytes": 4374,
+      "sha256": "111a6a7fdbd8e118c707f6a05b0d5811a50288279d1e588c82f9b6d000468f2a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncIntegerWidthTests.cpp",
+      "bytes": 6084,
+      "sha256": "ba85dac16168ad760c40b03435934954229c60e78af61b875bab856867a85e23"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SynthesisNoClobberTests.cpp",
+      "bytes": 4635,
+      "sha256": "56855543a1900f8a2d25c235eeeab342e0b6ed55a51c3dcec1a85261c3fecbeb"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/IPCFramingRegressionTests.cpp",
+      "bytes": 6552,
+      "sha256": "e89ddde924bc11ff987f763d5baa09358e13f4340c5d0f65512dcc0230bcc587"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/BridgeTests.cpp",
+      "bytes": 127683,
+      "sha256": "ac09b0994ebced38ac51c4bf756a060f6664c5ba216815a7ad026a8ef344ddc8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp",
+      "bytes": 5889,
+      "sha256": "a2488605de1d970acf368e28a3132ff0eb3da9ceeb3ce0f8285b57fff1b5cd5d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/BulkMutationTests.cpp",
+      "bytes": 34470,
+      "sha256": "2d9456f53efa66744de79ac52deb9f5c70d7416ea15741d73357cb9b583b3bbc"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionReadTests.cpp",
+      "bytes": 56807,
+      "sha256": "634cf876f94c3aba3dd46794147eeb58ea2d01ba9452eb4a70b402210f445f07"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OwnedCatalogStreamTests.cpp",
+      "bytes": 37138,
+      "sha256": "4756795571e4de97bae6fd88dd7365453fd760cf2afdab7aad55c5464045276d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryPagedHistoryTests.cpp",
+      "bytes": 50511,
+      "sha256": "592446b39ce299da9a488dad9dcfc8f1d04cde0e7388f7f3324f1510738525c1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryFingerprintTests.cpp",
+      "bytes": 3927,
+      "sha256": "466b15080b5954499777478309150de01cfea4513bea5dd868d5aee327f1cb14"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/TopologyAdmissionTests.cpp",
+      "bytes": 58471,
+      "sha256": "0b1777df2ceb3e0e90dd238e57cefd071d8fe83ef049da8008029733d1fc0c19"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp",
+      "bytes": 14079,
+      "sha256": "b43df192d089390d857c4b612894ad1b4c2dbe577ea01614eabc99e835b7b1b9"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp",
+      "bytes": 26286,
+      "sha256": "d7208720bd5480288cc64bd1b2bfd20ad468c4525b45d315ce630232b9c893de"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionMemoryServiceTests.cpp",
+      "bytes": 13421,
+      "sha256": "24e1ca2bdd6fbc47e83921fdcf31d05ce6731be2160105791c66cdb237911f21"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SpatialShapeBridgeTests.cpp",
+      "bytes": 14136,
+      "sha256": "a62daa53c675031fba4f54d572a03bb5225b60f86dff0599ef9f5dd55870b510"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ManagedPhysicalRouteTests.cpp",
+      "bytes": 19507,
+      "sha256": "273aa081ed0fe9a70725ddbde86dc35962625e9e4a5b5d627df55833015b5489"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/VirtualUnionRouteTests.cpp",
+      "bytes": 9959,
+      "sha256": "5e63c27f0b9a68d4a323bec8652900c636ce03b063c698e9d9754c470401d17c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp",
+      "bytes": 1864,
+      "sha256": "4f2740226569667f9a3d85f257c5328bda563797d6726f85276ead709f7025b3"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/UnmanagedConstructionTests.cpp",
+      "bytes": 5639,
+      "sha256": "0093b83b790151d6f590a85bf57a0111bac0945796fadb517acebf914917897b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LiveScalarReadTests.cpp",
+      "bytes": 28094,
+      "sha256": "3065b8d4ea5d365b0fd93423f643f701cd42c991d890ac24490fe5dc452589e7"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp",
+      "bytes": 10850,
+      "sha256": "bca2ed9d9783d517eda7bfc2b1699c9591c101e29fe7d0028ea7913b9d81fd56"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp",
+      "bytes": 12837,
+      "sha256": "39cc29a199482ed75f82e6af1874f6c4e8f8dddda05dea71b4fc71347afe1980"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp",
+      "bytes": 9920,
+      "sha256": "2db0bbcc3cbb389ecf8e03a3fd17511dc9130eb86954b26ca0f5888f57859781"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AttachViewIntegrityTests.cpp",
+      "bytes": 8816,
+      "sha256": "defdcfdaa65c8a3313da512bb3339e54baa59802031a108a13847d9acb97f707"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuditHygieneTests.cpp",
+      "bytes": 27958,
+      "sha256": "535f9f424688c7e8d227ea3559a84cfa9147566dd4459a9257ca5b428b9d3490"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuditRetentionTests.cpp",
+      "bytes": 20913,
+      "sha256": "7bcf5116943f90e6c6f33d2d7e44cd0035bc1e199d92d4481c2bd5fbf26c03e4"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp",
+      "bytes": 30203,
+      "sha256": "448e306a03b75eeb1044642e5a9b2fa680deb19e03ebc3bf5c5ee4420549c5f8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp",
+      "bytes": 29654,
+      "sha256": "9524c6d03eb061309ba568f6b6494e6fcbae75096e18f3a7e7e0900926d560f0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncPerfBench.cpp",
+      "bytes": 18934,
+      "sha256": "1b73b991e5e5b4754b52e1e169a82f75557fceb0b81eed84c5e73cd166f1a0d9"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CAPISurfaceTests.cpp",
+      "bytes": 10255,
+      "sha256": "b59465dfcaec8cdc51a1fa638467418fad8d5477dfba161d2885da9686a4ffbe"
+    },
+    {
+      "relative": "Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c",
+      "bytes": 2947,
+      "sha256": "e59573d522dbc263ea86a918b671149891a2074e89b93583dc84d79461387208"
+    }
+  ],
+  "oldWholeTUs": [
+    {
+      "relative": "Tests/LatticeCoreTests/WalExtentBudgetTests.cpp",
+      "bytes": 16308,
+      "sha256": "b62e6a94dad0d477abe6027491edebc2b9e83bec6f3258012a44f4ccacbed158"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/HistoricalWalCheckpointTests.cpp",
+      "bytes": 11162,
+      "sha256": "2bed1c040b478877df7e343493db99e0ae512e835d1c2a2b3b6234ff00cfc7a2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/Vec0Tests.cpp",
+      "bytes": 34770,
+      "sha256": "b1855d056d598a27a73a9e9057b46f1b9ea72479aeec4c96eb04ca1a9c159ac2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ExactVectorSelectionTests.cpp",
+      "bytes": 11996,
+      "sha256": "b7fa53329b112503377169b8f9d2933803dc6feeb1b2d6b28b963331276f7cf2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ExactVectorRowsTests.cpp",
+      "bytes": 19333,
+      "sha256": "354daf03b88b26e9ac4b50d128de917ee4c20ebed11fb1f14ff3644c5b36ddc2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/MultiConnectionTests.cpp",
+      "bytes": 7463,
+      "sha256": "8904f6d378e06acc4a213c4568228233bcb38f57a7a4460235104c132ee1eae4"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncUnitTests.cpp",
+      "bytes": 127950,
+      "sha256": "04afbf1c138d8c358b83a330f99d248c20010a2e86acc52378e9ae416aedece1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncPartialConstructionTests.cpp",
+      "bytes": 17501,
+      "sha256": "7eb109c424fcc5687ece1f42e4f09468096eefac142cb0c207f5e496f3351870"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryReceiverSourceTests.cpp",
+      "bytes": 27188,
+      "sha256": "39062b5665727b0a3c23f3ed5f4c81fedf81f77c4a175092a0df9100b5b27a9e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryReceiverControllerTests.cpp",
+      "bytes": 336565,
+      "sha256": "47d2fce3a3ad68eb7a7c7f2d36585674dcdbd080fc089e7d3ae05c4ba62e3a3a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryOriginalIdentityTests.cpp",
+      "bytes": 12279,
+      "sha256": "29ec327a91609442a3e7f9a335ef752a26a5e2b44f4fafda9b2789f5a82d6d3b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalReceiptCoverageRangeTests.cpp",
+      "bytes": 24175,
+      "sha256": "e2aa3fedf0f1f565716e02ccd7bf505b57721ed7bc6903c4323d768a2e80812f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryReceiptCoverageControllerTests.cpp",
+      "bytes": 97305,
+      "sha256": "9513ef875a3dd3aabe2476543ff52c7ca381c0702dd6c70d000512ad03f70acb"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncCommitProbeTests.cpp",
+      "bytes": 29121,
+      "sha256": "0df2671f3841bfb9c3be6d563c05f03bd41e1add3d9784881b76d910fe3e31cf"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/GlobalIdentityConcurrencyTests.cpp",
+      "bytes": 7939,
+      "sha256": "4c6d45b697ffe4a1d34ea93048b2ab0626ca0240b157e6ee555f4efc19a542e8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncProtocolRegressionTests.cpp",
+      "bytes": 16665,
+      "sha256": "0798f071019e7a571c425876915e1048fc94349ba290cd32c0046bedd364cce1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/StartupSyncHealingTests.cpp",
+      "bytes": 6792,
+      "sha256": "5437342ee63da7c520d026490ed310c61a529c5660135e13b5aa358450197c3f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryProtocolTests.cpp",
+      "bytes": 15326,
+      "sha256": "c02392132b204af978e973acba868f659057da207cc935bfdbf0f03f33297c6c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncCanonicalRangeTests.cpp",
+      "bytes": 31506,
+      "sha256": "840c927e687a3cbed7ecac47c47c630d1492b602ce4b6e8c1ed29ddd2b588abd"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp",
+      "bytes": 77720,
+      "sha256": "9c6be94058735c96909604c6c25db31eb5cba01f64579f950ab5f8fc6d8bb6f5"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp",
+      "bytes": 52121,
+      "sha256": "21a3e5d26ba542567a2981533b9c3e905aa2c0a1a6a31a1fc20c2a60c638fb49"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryValueTests.cpp",
+      "bytes": 7219,
+      "sha256": "7b674c34f846f177f8fbbfc330900864928ecfe6f3e61e93945813527fc60ff8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncSnapshotSourceTests.cpp",
+      "bytes": 19648,
+      "sha256": "9ab4d38ca8aeb60d3a0c1927b0050f595fadef557831cf4acfb104b98dfe16c1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp",
+      "bytes": 23042,
+      "sha256": "6cdbf9c9887f043a6d706e8cfddaccabf044c7252743c4da993d77432cf43090"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp",
+      "bytes": 17191,
+      "sha256": "25beca3e8bd63956cd9cb6b4f754b94d8a60f00d58b83f127a614467bd783151"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp",
+      "bytes": 50092,
+      "sha256": "69d11544d02d462abda66f07005896d5f3041e141f04e91abbb978f38abaa2bc"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp",
+      "bytes": 31304,
+      "sha256": "ab58bd40596d0248c1d2cfbc2158529b7df49159337ea4b914bf4ae419ced78e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp",
+      "bytes": 94118,
+      "sha256": "627c58a1caeca7a6177b1ba6da401a869ddb297120fb4fa6cc4ea7dd359709e3"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuthenticatedRelaySessionTests.cpp",
+      "bytes": 282998,
+      "sha256": "082964e950ff5422b7bec19666f0eebdca2699f191aa94bb4cbcb5ca7f7d2343"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp",
+      "bytes": 25753,
+      "sha256": "4a38f8d32d9def38498c389d8564fc479446fe939e5e8d444851ae1e6e60f29c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncEntryRollbackTests.cpp",
+      "bytes": 20575,
+      "sha256": "379827c967260118eae3066631f2a8fc23075f0fb9a4c4fce7fb031dd66c7bdd"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryInstallTransactionTests.cpp",
+      "bytes": 41330,
+      "sha256": "131abe5a524e46d34516f05fca4818d0ccabccc3cc1a78f5792ac22a2d8e92d4"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedTransactionTests.cpp",
+      "bytes": 13135,
+      "sha256": "ce581f12e516fd1d2745c97e55f8116a54929564da3c05abe81bce294d037f2e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryObserverBatchTests.cpp",
+      "bytes": 22543,
+      "sha256": "2566f2406a78614b758d4bf6091a62abf8cd32ba1543fc350ae827b0bf02f9b7"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryWitnessTests.cpp",
+      "bytes": 19278,
+      "sha256": "8a0523696cd25b8743a7c57f2c7ce90bc89fd9e82a2b1370220bdc6912fc5217"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRefreshWorkerTests.cpp",
+      "bytes": 25376,
+      "sha256": "134469b72956b42bf27562d0642432b730506bcbb127c28ba55098d0b48d4f9d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRefreshBridgeTests.cpp",
+      "bytes": 4152,
+      "sha256": "dc6ef95988269ba95655171be70c10eefaa7062adbfe8eb0d7f1274ff104788a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryErrorDiagnosticBridgeTests.cpp",
+      "bytes": 14219,
+      "sha256": "5bff6842387dd8602e448469a2daa143e93880178a961b47d61b2fa922282b6a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRefreshAdmissionTests.cpp",
+      "bytes": 8107,
+      "sha256": "70a0b19f79bb67ec93527cb367ddf5fe7cdc6b6648eb6314da9883006d15cc0a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncReceiveLedgerTests.cpp",
+      "bytes": 27412,
+      "sha256": "18a5d976d5aa25b21f987154a6719e9ff1a293fcfd13c764bbb229b45bb3f900"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ScopedRecoveryInstallTests.cpp",
+      "bytes": 24793,
+      "sha256": "eee4f1b77a07b35cc80d7976188f1276fa87cd1f476077a88f7767f9525e8d9e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ScopedRecoveryUUIDTests.cpp",
+      "bytes": 23401,
+      "sha256": "4a8c03011ef77c6177f08bd2352fc7d949e00c4bc14909f85eafc5c12560e58c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ScopedRecoveryDeltaTests.cpp",
+      "bytes": 19148,
+      "sha256": "3f2270ab844652fc5ca98132c722e4d3be2694b1eb42109730dfabb82791fdeb"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalScopedInstallTests.cpp",
+      "bytes": 69193,
+      "sha256": "5a87835c2104932cfcfa0212cee275f6c1de3dda29579e98cda02b202657b0a6"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReceiveInstallStateTests.cpp",
+      "bytes": 25339,
+      "sha256": "d7ea674a4b8b9d1af5656408cedfceb570315db4b9cd347553a7aa71aa3681da"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryObligationStoreTests.cpp",
+      "bytes": 58640,
+      "sha256": "3465b9a1d7f731aa393ecf909338b53626d3c513d70ec6741410d694c3aea7c0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp",
+      "bytes": 54238,
+      "sha256": "de14044ff968110d9ed5e76948003a65feaa4f9c87baf166c554fe2a59b69be7"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+      "bytes": 229148,
+      "sha256": "a8dbcba3ef58b0ce5281884cf005b36cdb916f75a83c0a00fe67b22e200a397c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReceiveDeliveryGuardTests.cpp",
+      "bytes": 34280,
+      "sha256": "b5966207cca3b389a914e14ea0adba24ee079513948dc7463161afa288e3058f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReceiveResetAdmissionTests.cpp",
+      "bytes": 6809,
+      "sha256": "2c4054c4e058b8c9d20d7c70532f6034c41703a53df6f99e26696aa07fe06483"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp",
+      "bytes": 28335,
+      "sha256": "fe4a29259f48949490ebc38d41261f7f758118440ab2f6f1b38c1e04f4e45326"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncCallbackLifetimeTests.cpp",
+      "bytes": 7597,
+      "sha256": "fdbbc5b30ca2b6031d61c52fcc62cc3555f1309336fca1cce1fd1f206d82121b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp",
+      "bytes": 29055,
+      "sha256": "984f6aa9fcfde9b65bcaa4d47437806b3e54d8b5dc44d5f02575e1f30c6c9ad0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp",
+      "bytes": 5385,
+      "sha256": "012b343bd343742bd495b99d077ce10b698c2464b9c17111cee01ad009117aee"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp",
+      "bytes": 7988,
+      "sha256": "dc418c9f2cfc14557acaed27073fe4ad100c742636915364b92a1182861e78b4"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncDiscoveryDeferralTests.cpp",
+      "bytes": 72832,
+      "sha256": "b925e122ccd3250021d1eb2d5b8a54310d74b70bd0eac259ba6a7adb87aee4af"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncDiscoveryAdmissionTests.cpp",
+      "bytes": 37287,
+      "sha256": "6a849ac1dfdfdebb560067aebb6a61b130f89137e04e6a13f601c2dbe79a9961"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp",
+      "bytes": 18722,
+      "sha256": "c79dfe5a8225d0bed1180560d566ee32a35001f1c6563035a6b9c7d009429f1c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp",
+      "bytes": 19751,
+      "sha256": "a320171007358818de7eb931cee17fd72d599f69d1beabb94547e960f610cac1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp",
+      "bytes": 22964,
+      "sha256": "b71084df60febd2e322992f7231e9639b0fd5aec3c7c155c0a832639ec6f2e8e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryUploadJsonTests.cpp",
+      "bytes": 16172,
+      "sha256": "8d161cff764de17bcee188acf24ec5c9e681fedfcd46d16feb6f495c31950f3d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp",
+      "bytes": 27326,
+      "sha256": "c566c9131af0036c29fe2de60269ee0f1a64ed75b5256f2773c16882422cf5df"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp",
+      "bytes": 27738,
+      "sha256": "3907edc358bc5ff0ff1aa2c7b77d33cf30902c99cb505f81cf193403e7eb1c34"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryServerExportTests.cpp",
+      "bytes": 27185,
+      "sha256": "038b41c208e2920803ef3f4e4bf2b4c27fe884ec5e64d1d74788743b4338344e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryOwnerSchemaTests.cpp",
+      "bytes": 26585,
+      "sha256": "916cc2f452cb620c6dba736a9e73060b6c39a20988f8253453dc701c80b14324"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinarySchemaRecipeTests.cpp",
+      "bytes": 11956,
+      "sha256": "95169ae2c122bb6408a7460c8aa0f0ed9d55a43b495834ed2bb5123770cf45d2"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoverySwiftContinuityTests.cpp",
+      "bytes": 15112,
+      "sha256": "b065c6668d27477aee6e205d1bde7f7e56d262b7737625eb38ef3d916516c33f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp",
+      "bytes": 16201,
+      "sha256": "789f8dfc3f2aee95e4fbd652f0d2db5b32499c24ecf92645d013a48b3403aba1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp",
+      "bytes": 12384,
+      "sha256": "bdc0697519fbf6346a8faca936c932da383ad1ec0eafe1a99f43edf1c359c12b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryObligationProducerTests.cpp",
+      "bytes": 27310,
+      "sha256": "bfc6e01909a08f470e15d5655d44883da631987cd3139899356761e0691f42b6"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CheckpointOwnershipTests.cpp",
+      "bytes": 13123,
+      "sha256": "b9c5e34c7fa4dbb48300ab706109d09a50c9143db85769ac90a098ea0cad8947"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryOutboxTests.cpp",
+      "bytes": 21089,
+      "sha256": "320e12af0090d032f98fa1b2762c531cddced8a4edbc8a171d994151c40e033f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncRecoveryStagingTests.cpp",
+      "bytes": 36455,
+      "sha256": "2b10979471a1fdb12f8fe407749b8ecb26d34485d651c8ec9721617452d17f51"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalChangeStoreTests.cpp",
+      "bytes": 29100,
+      "sha256": "dcdebd77180c39548ebc39e17222928e80f72c5212440aa73cdbc592e10e545b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp",
+      "bytes": 19105,
+      "sha256": "dfd69e4172ec284766cb994349b5db107d513f82f0014bd4185f28d99da21f74"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp",
+      "bytes": 34623,
+      "sha256": "a50e2fd6c9648bf07456092e4e66bd46d44988af4e1c37ce250f0e9a077a60fe"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp",
+      "bytes": 25822,
+      "sha256": "a8dba13faab6acc600e53108e1eba5d645f36583e060ca6b380ea6e7777cebca"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncVectorSavepointTests.cpp",
+      "bytes": 15146,
+      "sha256": "57150aec497346849bcc8b94f9f2fe76c999dde7c73b215fc1417346abfaef23"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/VectorClearTests.cpp",
+      "bytes": 29230,
+      "sha256": "1032c43ce15e603feb11e3896f2fcf2d221126b18c8da67a7f2dd69043bb5629"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DerivedFtsProgramTests.cpp",
+      "bytes": 6518,
+      "sha256": "a60b29beef615c2f65e5d2f090136b1627be05d872f23c1f40c44a4cb4cf1532"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DerivedProfileTests.cpp",
+      "bytes": 25613,
+      "sha256": "f54227256736b875e37ee48af7848998124d232e68dacaef1356f80d58fe1c5f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncImmediateSchedulerTests.cpp",
+      "bytes": 10625,
+      "sha256": "bca633521f4c096528ba0ed6de45dbb00c150a04d1e7a3fd3febadec4a216de9"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/StdThreadSchedulerLifetimeTests.cpp",
+      "bytes": 20196,
+      "sha256": "810d267d64f842d8287f8e1bc725b3497a8107a140f5a01b21b053adfb119e25"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CascadeDeleteTests.cpp",
+      "bytes": 7078,
+      "sha256": "7bbef11d658541367327c6c82eb475abbfc434c922ea9ebecfbf81dfb19d57d5"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SchemaTests.cpp",
+      "bytes": 22128,
+      "sha256": "79c23dc9ab217f7c01240c7622f3fa1a7f8f94d43bb9417a2841192752087fe0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/QueryTests.cpp",
+      "bytes": 16907,
+      "sha256": "340d4225a6b55bfa3549e0e4c3e30ba14796f7e056915d1e5258c795f2ddf006"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DatabaseTextTests.cpp",
+      "bytes": 4376,
+      "sha256": "0653d73967f44b00cc04e123de1ddfcaf4b856a071860c95b4247a246061fa4d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DatabaseRetirementTests.cpp",
+      "bytes": 13617,
+      "sha256": "e7a120209a97aa336d58111a0dd38ab98f8e4d45c10d0eda9a61ff498e581f03"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ConfiguredRetirementTests.cpp",
+      "bytes": 12008,
+      "sha256": "4457b18cbe0b7b190b8d1cf77301f496111de3d18fdea4ddb6deebc693bb3cdd"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp",
+      "bytes": 28041,
+      "sha256": "286282cd88cfda687838c5470886dece2ca022072bb7a15dd3d1662531e707ee"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryStoreAdmissionTests.cpp",
+      "bytes": 42166,
+      "sha256": "6dbc22ebf8afde33e84ec7f873c003d22cf030f1610ba08adff79e9c158a579d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedLaunchTests.cpp",
+      "bytes": 38042,
+      "sha256": "318b14a7353feeb2b69a613cbc1d5f5b64fd33000d49926bc0bb07a1ef765905"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedExportTests.cpp",
+      "bytes": 25175,
+      "sha256": "e3dc5eb81bab9b6f2ad9223f51c6d960e98bcb5b19f5563fac3444bb3403c857"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedHelperTests.cpp",
+      "bytes": 20038,
+      "sha256": "765f35bd44dbe3de28a4c5a1b404cfa87a4d095c02ee40a89c94c9597318ab5e"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryHelperUploadIntegrityTests.cpp",
+      "bytes": 14938,
+      "sha256": "3c14e058c38b0feda8fe3d93623b6da8d566aa4537d2b83e3348ef8bb1fe3fe1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryOwnedExportRestartTests.cpp",
+      "bytes": 9464,
+      "sha256": "86de9351be3df111f5f7c8e8e210f7748cee5ea46016207939119bd219b514eb"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryCurrentManagedConsumerTests.cpp",
+      "bytes": 7543,
+      "sha256": "dc73cb3e802a59989b13d6d9625c502048d82f246712588dc9661e879546f0e0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/InheritedOwnerQuarantineTests.cpp",
+      "bytes": 17398,
+      "sha256": "dea4c65f70701328736d8e26eeefe473bd66cfd6436f838c65de44233599c351"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/KeeperInitializationTests.cpp",
+      "bytes": 5061,
+      "sha256": "13079c3f228c45bd65987ab96acc0354106e68b6fa5b58ede45c2b8f1c2ce7ac"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/QuotedAttachmentTests.cpp",
+      "bytes": 2854,
+      "sha256": "a6be490760678b2e43fa4b1b0daa75cc3b7d28c2719cf5969321ec3922114360"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ManagedObservationTests.cpp",
+      "bytes": 15161,
+      "sha256": "efb028e3d4929f70ca10aac4da09a5b5df8b87a9f4a16b9a966051715c27e3ed"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObservationTests.cpp",
+      "bytes": 6920,
+      "sha256": "9db10892050e784daf630b53b13a18d2f2c945f465e55379ce3549b36f250fe6"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LinuxNotifierTests.cpp",
+      "bytes": 3248,
+      "sha256": "5b4a6b67582cf0af1fd0d3acd571453e99b0946a38eafed9ee37abaaf8bbf9db"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp",
+      "bytes": 6876,
+      "sha256": "a2843d36f857440898bce6e2801426a3e03d69634e19c1a756bc5a9f4e98c6a0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObserverRemovalRegressionTests.cpp",
+      "bytes": 9763,
+      "sha256": "5cb38509541d4303cf17793f3e3e35a2e02db74c000429832f102daee0962c0d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReaderLifetimeTests.cpp",
+      "bytes": 37585,
+      "sha256": "f573089103b1b2ab5fbdb9f8e1038e6607123c13922f93e2ddfa0a31644cc70f"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ReadGenerationTests.cpp",
+      "bytes": 36629,
+      "sha256": "7a7a6925e5461477bb7d2cbea6c08d6d831d63b2db3529c68528f96ef9d8e711"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/InstanceLifecycleTests.cpp",
+      "bytes": 31577,
+      "sha256": "b1ea905348f0d6708d95006b44ffd6e09e458f11926375295d5791878c2a1b61"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AttachTests.cpp",
+      "bytes": 7154,
+      "sha256": "3920164730431bacfe866beb56d39cbd855343a3b3b852fedc7c201dc90e3097"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/DeferredDeliveryTests.cpp",
+      "bytes": 16282,
+      "sha256": "6a67045d49c6e9164dce181999e7394772080a3d4008c6d18144a45b94e25ec0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/FilterRemovalGateTests.cpp",
+      "bytes": 6807,
+      "sha256": "77046b734531113617d3930d7ede63f38cc22c99baa6e68920a81134cebdc97d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/HistoryAndReclaimTests.cpp",
+      "bytes": 10827,
+      "sha256": "f8843b67f91637083b953a8f110167b2426af3e6f9fcadf773a8d20933508d02"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LogTests.cpp",
+      "bytes": 6906,
+      "sha256": "8c53dc3c98fe372ff1bc1da3f586009b14f05af8c7d6f60ac2ec5398c27db346"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/MultiChannelSyncSetTests.cpp",
+      "bytes": 16965,
+      "sha256": "84b193c55898189922c8129f3031bb95dca27cb65bef506403fe28ad79bd9ec8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/NamedMemoryTests.cpp",
+      "bytes": 3849,
+      "sha256": "02721a56f61301f5a36daaf256f0be20a4c5c56e8d5921cd5fb8958287c2385d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/NoHistoryTests.cpp",
+      "bytes": 16670,
+      "sha256": "6d2c327fe56a3e92661957abb88911b2bcfdbd84185a527bee8f8acb3a7ac5b3"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SkewToleranceTests.cpp",
+      "bytes": 4374,
+      "sha256": "111a6a7fdbd8e118c707f6a05b0d5811a50288279d1e588c82f9b6d000468f2a"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncIntegerWidthTests.cpp",
+      "bytes": 6084,
+      "sha256": "ba85dac16168ad760c40b03435934954229c60e78af61b875bab856867a85e23"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SynthesisNoClobberTests.cpp",
+      "bytes": 4635,
+      "sha256": "56855543a1900f8a2d25c235eeeab342e0b6ed55a51c3dcec1a85261c3fecbeb"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/IPCFramingRegressionTests.cpp",
+      "bytes": 6552,
+      "sha256": "e89ddde924bc11ff987f763d5baa09358e13f4340c5d0f65512dcc0230bcc587"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/BridgeTests.cpp",
+      "bytes": 106764,
+      "sha256": "d6bfbfb2782f50b25092bfd07f3299cabbcabd248285f23a73b87cbfbc7329e5"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CoarseInvalidationBridgeTests.cpp",
+      "bytes": 5889,
+      "sha256": "a2488605de1d970acf368e28a3132ff0eb3da9ceeb3ce0f8285b57fff1b5cd5d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/BulkMutationTests.cpp",
+      "bytes": 34470,
+      "sha256": "2d9456f53efa66744de79ac52deb9f5c70d7416ea15741d73357cb9b583b3bbc"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionReadTests.cpp",
+      "bytes": 56807,
+      "sha256": "634cf876f94c3aba3dd46794147eeb58ea2d01ba9452eb4a70b402210f445f07"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OwnedCatalogStreamTests.cpp",
+      "bytes": 37138,
+      "sha256": "4756795571e4de97bae6fd88dd7365453fd760cf2afdab7aad55c5464045276d"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryPagedHistoryTests.cpp",
+      "bytes": 34597,
+      "sha256": "ee55ad1aa128c1db4df57c843c79b4940143efd34834167190189903ab840904"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/OrdinaryFingerprintTests.cpp",
+      "bytes": 3927,
+      "sha256": "466b15080b5954499777478309150de01cfea4513bea5dd868d5aee327f1cb14"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/TopologyAdmissionTests.cpp",
+      "bytes": 54418,
+      "sha256": "6a9aab79fab9062aa8d6358f86aee7e9ccc8394406985d1c0126c00e90f943f1"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionMemoryFoundationTests.cpp",
+      "bytes": 14079,
+      "sha256": "b43df192d089390d857c4b612894ad1b4c2dbe577ea01614eabc99e835b7b1b9"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionMemoryPolicyTests.cpp",
+      "bytes": 26286,
+      "sha256": "d7208720bd5480288cc64bd1b2bfd20ad468c4525b45d315ce630232b9c893de"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ProjectionMemoryServiceTests.cpp",
+      "bytes": 13421,
+      "sha256": "24e1ca2bdd6fbc47e83921fdcf31d05ce6731be2160105791c66cdb237911f21"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SpatialShapeBridgeTests.cpp",
+      "bytes": 14136,
+      "sha256": "a62daa53c675031fba4f54d572a03bb5225b60f86dff0599ef9f5dd55870b510"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ManagedPhysicalRouteTests.cpp",
+      "bytes": 19507,
+      "sha256": "273aa081ed0fe9a70725ddbde86dc35962625e9e4a5b5d627df55833015b5489"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/VirtualUnionRouteTests.cpp",
+      "bytes": 9959,
+      "sha256": "5e63c27f0b9a68d4a323bec8652900c636ce03b063c698e9d9754c470401d17c"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ManagedDoubleFallbackTests.cpp",
+      "bytes": 1864,
+      "sha256": "4f2740226569667f9a3d85f257c5328bda563797d6726f85276ead709f7025b3"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/UnmanagedConstructionTests.cpp",
+      "bytes": 5639,
+      "sha256": "0093b83b790151d6f590a85bf57a0111bac0945796fadb517acebf914917897b"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LiveScalarReadTests.cpp",
+      "bytes": 28094,
+      "sha256": "3065b8d4ea5d365b0fd93423f643f701cd42c991d890ac24490fe5dc452589e7"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AttachKnnCrossArmTests.cpp",
+      "bytes": 10850,
+      "sha256": "bca2ed9d9783d517eda7bfc2b1699c9591c101e29fe7d0028ea7913b9d81fd56"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncOnlyVecReconcileTests.cpp",
+      "bytes": 12837,
+      "sha256": "39cc29a199482ed75f82e6af1874f6c4e8f8dddda05dea71b4fc71347afe1980"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/Vec0MaintenanceTests.cpp",
+      "bytes": 9920,
+      "sha256": "2db0bbcc3cbb389ecf8e03a3fd17511dc9130eb86954b26ca0f5888f57859781"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AttachViewIntegrityTests.cpp",
+      "bytes": 8816,
+      "sha256": "defdcfdaa65c8a3313da512bb3339e54baa59802031a108a13847d9acb97f707"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuditHygieneTests.cpp",
+      "bytes": 27958,
+      "sha256": "535f9f424688c7e8d227ea3559a84cfa9147566dd4459a9257ca5b428b9d3490"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuditRetentionTests.cpp",
+      "bytes": 20913,
+      "sha256": "7bcf5116943f90e6c6f33d2d7e44cd0035bc1e199d92d4481c2bd5fbf26c03e4"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp",
+      "bytes": 30203,
+      "sha256": "448e306a03b75eeb1044642e5a9b2fa680deb19e03ebc3bf5c5ee4420549c5f8"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp",
+      "bytes": 29654,
+      "sha256": "9524c6d03eb061309ba568f6b6494e6fcbae75096e18f3a7e7e0900926d560f0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncPerfBench.cpp",
+      "bytes": 18934,
+      "sha256": "1b73b991e5e5b4754b52e1e169a82f75557fceb0b81eed84c5e73cd166f1a0d9"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CAPISurfaceTests.cpp",
+      "bytes": 10255,
+      "sha256": "b59465dfcaec8cdc51a1fa638467418fad8d5477dfba161d2885da9686a4ffbe"
+    },
+    {
+      "relative": "Tests/LatticeCAPIHeaderCheck/capi_header_compiles.c",
+      "bytes": 2947,
+      "sha256": "e59573d522dbc263ea86a918b671149891a2074e89b93583dc84d79461387208"
+    }
+  ],
+  "wholeEqualInputs": [
+    {
+      "relative": "Tests/LatticeCoreTests/TestHelpers.hpp",
+      "bytes": 5021,
+      "sha256": "218900b5d9b7d5f695d672ad4dbbe3fe25b08462270f43f6b1112c5f84fb75d0"
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp",
+      "bytes": 94118,
+      "sha256": "627c58a1caeca7a6177b1ba6da401a869ddb297120fb4fa6cc4ea7dd359709e3"
+    },
+    {
+      "relative": "Sources/LatticeCore/src/schema.cpp",
+      "bytes": 3616,
+      "sha256": "d89f066e184494667cb3af62090053a682aec16d4f1e7fff0437b56761cbcbed"
+    },
+    {
+      "relative": "Sources/LatticeCore/include/lattice/recovery_schema.hpp",
+      "bytes": 1870,
+      "sha256": "9a468954f8c7015997a689b88f76f975501c8d72f2dc8c736e4ecb3e2c0cda18"
+    },
+    {
+      "relative": "Sources/LatticeCore/include/lattice/types.hpp",
+      "bytes": 9038,
+      "sha256": "d24656647f8343b494a3ba48ce59982df1b021d97fb72ab0a0c83102b46d4d8d"
+    }
+  ],
+  "reviewedSchemaMacroPair": {
+    "relative": "Sources/LatticeCore/include/lattice/schema.hpp",
+    "old": {
+      "bytes": 17665,
+      "sha256": "16ef8db11f0bddcdd8e48501bcebd4e6c51e540c0cddfd9582696bacb7b96c4e"
+    },
+    "current": {
+      "bytes": 19889,
+      "sha256": "55392e2faadafa742338a7c9781eb1304c9463d58ddc6bad24fdc6e124d66161"
+    }
+  },
+  "registrationBearingInputs": [
+    {
+      "relative": "Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp",
+        "bytes": 30203,
+        "sha256": "448e306a03b75eeb1044642e5a9b2fa680deb19e03ebc3bf5c5ee4420549c5f8",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/AuditMaintenanceOwnershipTests.cpp",
+        "bytes": 30203,
+        "sha256": "448e306a03b75eeb1044642e5a9b2fa680deb19e03ebc3bf5c5ee4420549c5f8",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp",
+        "bytes": 94118,
+        "sha256": "627c58a1caeca7a6177b1ba6da401a869ddb297120fb4fa6cc4ea7dd359709e3",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalDurableReadyTests.cpp",
+        "bytes": 94118,
+        "sha256": "627c58a1caeca7a6177b1ba6da401a869ddb297120fb4fa6cc4ea7dd359709e3",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp",
+        "bytes": 31304,
+        "sha256": "ab58bd40596d0248c1d2cfbc2158529b7df49159337ea4b914bf4ae419ced78e",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalNamespaceTests.cpp",
+        "bytes": 31304,
+        "sha256": "ab58bd40596d0248c1d2cfbc2158529b7df49159337ea4b914bf4ae419ced78e",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp",
+        "bytes": 77720,
+        "sha256": "9c6be94058735c96909604c6c25db31eb5cba01f64579f950ab5f8fc6d8bb6f5",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp",
+        "bytes": 90227,
+        "sha256": "96ff2c5ea3254654b320c054f59d63877f3766ead9a2567f85130330290ab0c7",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp",
+        "bytes": 52121,
+        "sha256": "21a3e5d26ba542567a2981533b9c3e905aa2c0a1a6a31a1fc20c2a60c638fb49",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalRangeStagingTests.cpp",
+        "bytes": 52121,
+        "sha256": "21a3e5d26ba542567a2981533b9c3e905aa2c0a1a6a31a1fc20c2a60c638fb49",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp",
+        "bytes": 25753,
+        "sha256": "4a38f8d32d9def38498c389d8564fc479446fe939e5e8d444851ae1e6e60f29c",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalRetentionCustodyTests.cpp",
+        "bytes": 25753,
+        "sha256": "4a38f8d32d9def38498c389d8564fc479446fe939e5e8d444851ae1e6e60f29c",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp",
+        "bytes": 23042,
+        "sha256": "6cdbf9c9887f043a6d706e8cfddaccabf044c7252743c4da993d77432cf43090",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalSourceCaptureTests.cpp",
+        "bytes": 23042,
+        "sha256": "6cdbf9c9887f043a6d706e8cfddaccabf044c7252743c4da993d77432cf43090",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp",
+        "bytes": 17191,
+        "sha256": "25beca3e8bd63956cd9cb6b4f754b94d8a60f00d58b83f127a614467bd783151",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalSourceSessionTests.cpp",
+        "bytes": 17191,
+        "sha256": "25beca3e8bd63956cd9cb6b4f754b94d8a60f00d58b83f127a614467bd783151",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp",
+        "bytes": 50092,
+        "sha256": "69d11544d02d462abda66f07005896d5f3041e141f04e91abbb978f38abaa2bc",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalTransferRetentionTests.cpp",
+        "bytes": 50092,
+        "sha256": "69d11544d02d462abda66f07005896d5f3041e141f04e91abbb978f38abaa2bc",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp",
+        "bytes": 25822,
+        "sha256": "a8dba13faab6acc600e53108e1eba5d645f36583e060ca6b380ea6e7777cebca",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalUpstreamTests.cpp",
+        "bytes": 25822,
+        "sha256": "a8dba13faab6acc600e53108e1eba5d645f36583e060ca6b380ea6e7777cebca",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp",
+        "bytes": 19105,
+        "sha256": "dfd69e4172ec284766cb994349b5db107d513f82f0014bd4185f28d99da21f74",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalWriterAdapterTests.cpp",
+        "bytes": 19105,
+        "sha256": "dfd69e4172ec284766cb994349b5db107d513f82f0014bd4185f28d99da21f74",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp",
+        "bytes": 34623,
+        "sha256": "a50e2fd6c9648bf07456092e4e66bd46d44988af4e1c37ce250f0e9a077a60fe",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/CanonicalWriterCustodyTests.cpp",
+        "bytes": 34623,
+        "sha256": "a50e2fd6c9648bf07456092e4e66bd46d44988af4e1c37ce250f0e9a077a60fe",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp",
+        "bytes": 28041,
+        "sha256": "286282cd88cfda687838c5470886dece2ca022072bb7a15dd3d1662531e707ee",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/ConfiguredConnectionTests.cpp",
+        "bytes": 28041,
+        "sha256": "286282cd88cfda687838c5470886dece2ca022072bb7a15dd3d1662531e707ee",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp",
+        "bytes": 29654,
+        "sha256": "9524c6d03eb061309ba568f6b6494e6fcbae75096e18f3a7e7e0900926d560f0",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/HistoryGenerationOwnershipTests.cpp",
+        "bytes": 29654,
+        "sha256": "9524c6d03eb061309ba568f6b6494e6fcbae75096e18f3a7e7e0900926d560f0",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp",
+        "bytes": 16201,
+        "sha256": "789f8dfc3f2aee95e4fbd652f0d2db5b32499c24ecf92645d013a48b3403aba1",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/LegacySyncWriteAdmissionTests.cpp",
+        "bytes": 16201,
+        "sha256": "789f8dfc3f2aee95e4fbd652f0d2db5b32499c24ecf92645d013a48b3403aba1",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp",
+        "bytes": 28335,
+        "sha256": "fe4a29259f48949490ebc38d41261f7f758118440ab2f6f1b38c1e04f4e45326",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/MaintenanceSuccessorTests.cpp",
+        "bytes": 28335,
+        "sha256": "fe4a29259f48949490ebc38d41261f7f758118440ab2f6f1b38c1e04f4e45326",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp",
+        "bytes": 6876,
+        "sha256": "a2843d36f857440898bce6e2801426a3e03d69634e19c1a756bc5a9f4e98c6a0",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp",
+        "bytes": 7602,
+        "sha256": "248ea17b1bd4811abccf2fa3038dabb002331379043965166b5a2d90b859f447",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp",
+        "bytes": 29055,
+        "sha256": "984f6aa9fcfde9b65bcaa4d47437806b3e54d8b5dc44d5f02575e1f30c6c9ad0",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportAdmissionTests.cpp",
+        "bytes": 29055,
+        "sha256": "984f6aa9fcfde9b65bcaa4d47437806b3e54d8b5dc44d5f02575e1f30c6c9ad0",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp",
+        "bytes": 19751,
+        "sha256": "a320171007358818de7eb931cee17fd72d599f69d1beabb94547e960f610cac1",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportCallbackTests.cpp",
+        "bytes": 19751,
+        "sha256": "a320171007358818de7eb931cee17fd72d599f69d1beabb94547e960f610cac1",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp",
+        "bytes": 18722,
+        "sha256": "c79dfe5a8225d0bed1180560d566ee32a35001f1c6563035a6b9c7d009429f1c",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportCoverageTests.cpp",
+        "bytes": 18722,
+        "sha256": "c79dfe5a8225d0bed1180560d566ee32a35001f1c6563035a6b9c7d009429f1c",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp",
+        "bytes": 7988,
+        "sha256": "dc418c9f2cfc14557acaed27073fe4ad100c742636915364b92a1182861e78b4",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportDiscoveryTests.cpp",
+        "bytes": 7988,
+        "sha256": "dc418c9f2cfc14557acaed27073fe4ad100c742636915364b92a1182861e78b4",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp",
+        "bytes": 27326,
+        "sha256": "c566c9131af0036c29fe2de60269ee0f1a64ed75b5256f2773c16882422cf5df",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportHistoryTests.cpp",
+        "bytes": 27326,
+        "sha256": "c566c9131af0036c29fe2de60269ee0f1a64ed75b5256f2773c16882422cf5df",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp",
+        "bytes": 22964,
+        "sha256": "b71084df60febd2e322992f7231e9639b0fd5aec3c7c155c0a832639ec6f2e8e",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportPayloadTests.cpp",
+        "bytes": 22964,
+        "sha256": "b71084df60febd2e322992f7231e9639b0fd5aec3c7c155c0a832639ec6f2e8e",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp",
+        "bytes": 12384,
+        "sha256": "bdc0697519fbf6346a8faca936c932da383ad1ec0eafe1a99f43edf1c359c12b",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportPublicCallbackTests.cpp",
+        "bytes": 12384,
+        "sha256": "bdc0697519fbf6346a8faca936c932da383ad1ec0eafe1a99f43edf1c359c12b",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp",
+        "bytes": 5385,
+        "sha256": "012b343bd343742bd495b99d077ce10b698c2464b9c17111cee01ad009117aee",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryExportTimestampTests.cpp",
+        "bytes": 5385,
+        "sha256": "012b343bd343742bd495b99d077ce10b698c2464b9c17111cee01ad009117aee",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp",
+        "bytes": 54238,
+        "sha256": "de14044ff968110d9ed5e76948003a65feaa4f9c87baf166c554fe2a59b69be7",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryLocalProducerTests.cpp",
+        "bytes": 54238,
+        "sha256": "de14044ff968110d9ed5e76948003a65feaa4f9c87baf166c554fe2a59b69be7",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+        "bytes": 229148,
+        "sha256": "a8dbcba3ef58b0ce5281884cf005b36cdb916f75a83c0a00fe67b22e200a397c",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+        "bytes": 229148,
+        "sha256": "a8dbcba3ef58b0ce5281884cf005b36cdb916f75a83c0a00fe67b22e200a397c",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp",
+        "bytes": 27738,
+        "sha256": "3907edc358bc5ff0ff1aa2c7b77d33cf30902c99cb505f81cf193403e7eb1c34",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryRetainedDeleteExportTests.cpp",
+        "bytes": 27738,
+        "sha256": "3907edc358bc5ff0ff1aa2c7b77d33cf30902c99cb505f81cf193403e7eb1c34",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/RecoveryServerExportTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/RecoveryServerExportTests.cpp",
+        "bytes": 27185,
+        "sha256": "038b41c208e2920803ef3f4e4bf2b4c27fe884ec5e64d1d74788743b4338344e",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/RecoveryServerExportTests.cpp",
+        "bytes": 27185,
+        "sha256": "038b41c208e2920803ef3f4e4bf2b4c27fe884ec5e64d1d74788743b4338344e",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SchemaTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/SchemaTests.cpp",
+        "bytes": 22128,
+        "sha256": "79c23dc9ab217f7c01240c7622f3fa1a7f8f94d43bb9417a2841192752087fe0",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/SchemaTests.cpp",
+        "bytes": 22128,
+        "sha256": "79c23dc9ab217f7c01240c7622f3fa1a7f8f94d43bb9417a2841192752087fe0",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/SyncCommitProbeTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/SyncCommitProbeTests.cpp",
+        "bytes": 29121,
+        "sha256": "0df2671f3841bfb9c3be6d563c05f03bd41e1add3d9784881b76d910fe3e31cf",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/SyncCommitProbeTests.cpp",
+        "bytes": 29121,
+        "sha256": "0df2671f3841bfb9c3be6d563c05f03bd41e1add3d9784881b76d910fe3e31cf",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/TestHelpers.hpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/TestHelpers.hpp",
+        "bytes": 5021,
+        "sha256": "218900b5d9b7d5f695d672ad4dbbe3fe25b08462270f43f6b1112c5f84fb75d0",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/TestHelpers.hpp",
+        "bytes": 5021,
+        "sha256": "218900b5d9b7d5f695d672ad4dbbe3fe25b08462270f43f6b1112c5f84fb75d0",
+        "mode": "0o644"
+      }
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/VectorClearTests.cpp",
+      "old": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/recovery-count-shortcut-seed-provenance-20261016-001/Tests/LatticeCoreTests/VectorClearTests.cpp",
+        "bytes": 29230,
+        "sha256": "1032c43ce15e603feb11e3896f2fcf2d221126b18c8da67a7f2dd69043bb5629",
+        "mode": "0o644"
+      },
+      "current": {
+        "path": "/Users/jason/localdev/lattice-sync-perf-stability-20260919/core-recovery-coherent-20261016-001/Tests/LatticeCoreTests/VectorClearTests.cpp",
+        "bytes": 29230,
+        "sha256": "1032c43ce15e603feb11e3896f2fcf2d221126b18c8da67a7f2dd69043bb5629",
+        "mode": "0o644"
+      }
+    }
+  ],
+  "identicalProducerSlices": [
+    {
+      "relative": "Sources/LatticeCore/include/lattice/lattice.hpp",
+      "start": "    static void serialize_property_for_fingerprint",
+      "end": "    /// Fingerprint key",
+      "bytes": 1229,
+      "sha256": "2a158f0aa7f8dcb0d3a8bd25ee60745672e524f4d4bd89bbe8264fcd3b9c2480",
+      "exact": true
+    },
+    {
+      "relative": "Sources/LatticeCore/include/lattice/lattice.hpp",
+      "start": "    std::string compute_core_fingerprint_key() const {",
+      "end": "    /// Current value of SQLite",
+      "bytes": 1352,
+      "sha256": "fd26800a7094d182b2d5ff0949b6cd3dd81a8f8668aabe3146468d5633b026f8",
+      "exact": true
+    },
+    {
+      "relative": "Sources/LatticeCore/include/lattice/schema.hpp",
+      "start": "    void add_property_descriptor(",
+      "end": "#define LATTICE_PROP_DESC",
+      "bytes": 2157,
+      "sha256": "90860f424e18658b2a84b663a0884a042503285894d051fe1763a1031be37509",
+      "exact": true
+    },
+    {
+      "relative": "Sources/LatticeCore/include/lattice/schema.hpp",
+      "start": "        static const ::lattice::model_schema& schema() {",
+      "end": "        /* Object-level observation",
+      "bytes": 378,
+      "sha256": "96c27717519afd43e1b02ab4fab3e6099f0de8f27ed2997c3e5f6c54399a5a5a",
+      "exact": true
+    }
+  ],
+  "identicalDeclarationSlices": [
+    {
+      "relative": "Tests/LatticeCoreTests/CanonicalRangePackageTests.cpp",
+      "declaration": "struct PackageSourceRow { std::string body; };\nLATTICE_SCHEMA(PackageSourceRow,body);",
+      "bytes": 85,
+      "sha256": "9b454fc098f7408426d6984e9d6e254dd59895d6282b32161cb8cea3504b85c9",
+      "oldCurrentExact": true
+    },
+    {
+      "relative": "Tests/LatticeCoreTests/ObserverCursorRegressionTests.cpp",
+      "declaration": "struct CursorRegressionItem { int sequence; };\nLATTICE_SCHEMA(CursorRegressionItem, sequence);",
+      "bytes": 94,
+      "sha256": "28784862e3ffa46a10305255bd6c27c64e66434437dc3dca5065091d24717013",
+      "oldCurrentExact": true
+    }
+  ],
+  "nativeModels": [
+    "AuditMaintenanceRow",
+    "CanonicalCaptureRecord",
+    "CanonicalStageKeptModel",
+    "ConfiguredConnectionRow",
+    "ContinuousLocalRow",
+    "ContinuousSharedRow",
+    "CursorRegressionItem",
+    "CustodyRecord",
+    "DurableReadyRow",
+    "ExportCallbackRow",
+    "ExportCoverageOther",
+    "ExportCoverageRow",
+    "ExportDiscoveryRow",
+    "ExportFailureRow",
+    "ExportHistoryOther",
+    "ExportHistoryRow",
+    "ExportPayloadDoc",
+    "ExportPayloadLeaf",
+    "ExportPayloadRoot",
+    "ExportPublicCallbackRow",
+    "ExportTimestampRow",
+    "HistoryOwnedEmpty",
+    "HistoryOwnedRow",
+    "LegacyAdmissionRow",
+    "LocalOriginalLeaf",
+    "LocalOriginalRoot",
+    "LocalOriginalStream",
+    "MaintenanceProducerRow",
+    "NamespaceRow",
+    "PackageSourceRow",
+    "RetainedDeleteRow",
+    "RetentionCustodyRow",
+    "RetentionRow",
+    "ServerExportRow",
+    "SourceSessionLeaf",
+    "SourceSessionLocal",
+    "SourceSessionRecord",
+    "SourceSessionRoot",
+    "TestAllTypes",
+    "TestDog",
+    "TestLandmark",
+    "TestOwner",
+    "TestPerson",
+    "TestPet",
+    "TestPlace",
+    "TestRegion",
+    "TestTrip",
+    "UpstreamLeaf",
+    "UpstreamNode",
+    "UpstreamRoot",
+    "WriterMarkerLeaf",
+    "WriterMarkerNode",
+    "WriterMarkerRoot"
+  ],
+  "nativeModelCountSourcePrediction": 53,
+  "parents": [
+    "CountShortcutUpgrade.OriginalEnabledStoreUpgradesAllProgramsAndPreservesEveryDurableCell",
+    "CountShortcutUpgrade.CompletedUpgradeReopenIsProgramAndCookieIdempotent",
+    "CountShortcutUpgrade.ActualUpgradeCommitDenialRollsBackProgramsMarkersAndLineage",
+    "CountShortcutUpgrade.MixedHistoricalAndCurrentProgramsRefuseWithoutAnyRepair",
+    "CountShortcutUpgrade.TamperedHistoricalProgramRefusesWithoutAnyRepair",
+    "CountShortcutUpgrade.NoncanonicalCurrentMarkerRefusesWithoutCookieOrProgramHealing"
+  ],
+  "catalogMarker": "count verification native catalog=AuditMaintenanceRow,CanonicalCaptureRecord,CanonicalStageKeptModel,ConfiguredConnectionRow,ContinuousLocalRow,ContinuousSharedRow,CursorRegressionItem,CustodyRecord,DurableReadyRow,ExportCallbackRow,ExportCoverageOther,ExportCoverageRow,ExportDiscoveryRow,ExportFailureRow,ExportHistoryOther,ExportHistoryRow,ExportPayloadDoc,ExportPayloadLeaf,ExportPayloadRoot,ExportPublicCallbackRow,ExportTimestampRow,HistoryOwnedEmpty,HistoryOwnedRow,LegacyAdmissionRow,LocalOriginalLeaf,LocalOriginalRoot,LocalOriginalStream,MaintenanceProducerRow,NamespaceRow,PackageSourceRow,RetainedDeleteRow,RetentionCustodyRow,RetentionRow,ServerExportRow,SourceSessionLeaf,SourceSessionLocal,SourceSessionRecord,SourceSessionRoot,TestAllTypes,TestDog,TestLandmark,TestOwner,TestPerson,TestPet,TestPlace,TestRegion,TestTrip,UpstreamLeaf,UpstreamNode,UpstreamRoot,WriterMarkerLeaf,WriterMarkerNode,WriterMarkerRoot; DurableReadyRow.body.no_history=1",
+  "inventoryMarker": "count helper inventory count verification native catalog=AuditMaintenanceRow,CanonicalCaptureRecord,CanonicalStageKeptModel,ConfiguredConnectionRow,ContinuousLocalRow,ContinuousSharedRow,CursorRegressionItem,CustodyRecord,DurableReadyRow,ExportCallbackRow,ExportCoverageOther,ExportCoverageRow,ExportDiscoveryRow,ExportFailureRow,ExportHistoryOther,ExportHistoryRow,ExportPayloadDoc,ExportPayloadLeaf,ExportPayloadRoot,ExportPublicCallbackRow,ExportTimestampRow,HistoryOwnedEmpty,HistoryOwnedRow,LegacyAdmissionRow,LocalOriginalLeaf,LocalOriginalRoot,LocalOriginalStream,MaintenanceProducerRow,NamespaceRow,PackageSourceRow,RetainedDeleteRow,RetentionCustodyRow,RetentionRow,ServerExportRow,SourceSessionLeaf,SourceSessionLocal,SourceSessionRecord,SourceSessionRoot,TestAllTypes,TestDog,TestLandmark,TestOwner,TestPerson,TestPet,TestPlace,TestRegion,TestTrip,UpstreamLeaf,UpstreamNode,UpstreamRoot,WriterMarkerLeaf,WriterMarkerNode,WriterMarkerRoot; DurableReadyRow.body.no_history=1",
+  "postRunMarker": "count helper selected six catalog unchanged after run",
+  "wholeProducerTUUnchanged": {
+    "relative": "Tests/LatticeCoreTests/RecoveryProducerContinuityTests.cpp",
+    "bytes": 229148,
+    "sha256": "a8dbcba3ef58b0ce5281884cf005b36cdb916f75a83c0a00fe67b22e200a397c",
+    "originalBodies": [
+      {
+        "name": "CountShortcutUpgrade.OriginalEnabledStoreUpgradesAllProgramsAndPreservesEveryDurableCell",
+        "bytes": 807,
+        "sha256": "f4ee4a97fc174ec9596d6e2774e0f9ca5374f4ab3bc723dd480c7decfc6d9fd2",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.CompletedUpgradeReopenIsProgramAndCookieIdempotent",
+        "bytes": 528,
+        "sha256": "de3189296009ce81a22fdb2a87d5b3dd3745e705565048d42ad0fd000af94d1e",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.ActualUpgradeCommitDenialRollsBackProgramsMarkersAndLineage",
+        "bytes": 902,
+        "sha256": "b4b11a9f0e10b4236bd239356a48281c9816e27f93583d25ef8cfa0c2409d3cb",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.MixedHistoricalAndCurrentProgramsRefuseWithoutAnyRepair",
+        "bytes": 1056,
+        "sha256": "06b43be795a29ae7533789c310a5de67a7b188723118af3aebc937786688e319",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.TamperedHistoricalProgramRefusesWithoutAnyRepair",
+        "bytes": 967,
+        "sha256": "476c8f00ecf8b9dbffa74bf1c18254e92155bc006604111d77e9345929422dff",
+        "exactOriginalCurrentBody": true
+      },
+      {
+        "name": "CountShortcutUpgrade.NoncanonicalCurrentMarkerRefusesWithoutCookieOrProgramHealing",
+        "bytes": 645,
+        "sha256": "aec5b8cdc69f7e91ce40dc01fc6387db98d8e32033d3ec4fecfa326d55a01c8e",
+        "exactOriginalCurrentBody": true
+      }
+    ]
+  },
+  "reference008Common148InventoryCount": 2887,
+  "referenceCountIsNotFutureExpectedInventory": true,
+  "inventoryAuthority": "actual current full-binary gtest-list XML file/line mapping subset of exact148 whole TUs; exact current helper stdout+XML must equal it",
+  "noLateRegistrationProof": "Initial registry population includes LATTICE_SCHEMA static registrars and the identical pinned static schema customizations in the reviewed old/current TUs. Remaining register_model calls are inside unrelated Schema/VectorClear tests. Selected six direct seeded/config/open bodies and base fixture contain no registry registration or child spawn. No global test environments in reviewed148 source graph. Runner rechecks OnTestStart before each selected fixture/body, OnTestEnd and after run; actual factory fingerprint guard remains mandatory."
+}

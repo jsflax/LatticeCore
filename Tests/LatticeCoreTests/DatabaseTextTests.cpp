@@ -1,10 +1,92 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <LatticeCore.hpp>
 #include <memory>
 #include <string>
 #include <vector>
 
 using namespace lattice;
+
+TEST(GroupedCounts, ScalarProjectionDoesNotReadPayloadAndUsesOneStatement) {
+    database db(":memory:");
+    db.execute("CREATE TABLE Item(id INTEGER PRIMARY KEY,globalId TEXT,topic TEXT,project TEXT,content TEXT,embedding BLOB)");
+    const std::string project = "O'Brien ? --";
+    for (int64_t i = 0; i < 180; ++i) {
+        db.execute("INSERT INTO Item VALUES(?,?,?,?,?,zeroblob(4096))",
+                   {i + 1, std::to_string(i), "topic-" + std::to_string(i), project, std::string(4096, 'x')});
+    }
+    // Refuse even preparing a read of a body/vector column. The real SQL
+    // builder must remain a projection, independent of payload size.
+    ASSERT_EQ(sqlite3_set_authorizer(db.handle(), [](void*, int action, const char*,
+                                                   const char* column, const char*, const char*) {
+        if (action == SQLITE_READ && column
+            && (std::string(column) == "content" || std::string(column) == "embedding")) return SQLITE_DENY;
+        return SQLITE_OK;
+    }, nullptr), SQLITE_OK);
+    int statements = 0;
+    ASSERT_EQ(sqlite3_trace_v2(db.handle(), SQLITE_TRACE_STMT,
+        [](unsigned, void* context, void*, void*) { ++*static_cast<int*>(context); return 0; },
+        &statements), SQLITE_OK);
+    const auto sql = lattice_db::build_grouped_counts_sql("Item", "topic", "project = ?", "globalId");
+    const auto rows = db.query(sql, {project});
+    EXPECT_EQ(statements, 1);
+    ASSERT_EQ(rows.size(), 180u);
+    for (const auto& row : rows) {
+        EXPECT_EQ(row.size(), 2u);
+        EXPECT_EQ(std::get<int64_t>(row.at("cnt")), 1);
+    }
+    EXPECT_TRUE(db.query(sql, {std::string("not the project")}).empty());
+    sqlite3_trace_v2(db.handle(), 0, nullptr, nullptr);
+    sqlite3_set_authorizer(db.handle(), nullptr, nullptr);
+}
+
+TEST(GroupedCounts, ConflictingCopiesRetainIndependentPerGroupDistinctCounts) {
+    database db(":memory:");
+    db.execute("CREATE TABLE Item(id INTEGER PRIMARY KEY,globalId TEXT,topic TEXT,deletedAt REAL)");
+    // Both keys have an unambiguous representative. Shared's two copies
+    // still count in BOTH emitted groups; sum(counts) is deliberately > total.
+    db.execute("INSERT INTO Item VALUES(1,'shared','a',NULL),(2,'shared','b',NULL),"
+               "(3,'only-a','a',NULL),(4,'only-b','b',NULL),(5,'deleted','x',1)");
+    const auto sql = lattice_db::build_grouped_counts_sql("Item", "topic", "deletedAt IS NULL", "globalId");
+    const auto rows = db.query(sql);
+    ASSERT_EQ(rows.size(), 2u);
+    for (const auto& row : rows) EXPECT_EQ(std::get<int64_t>(row.at("cnt")), 2);
+    // Compare to the existing two-stage contract, not a partition of one
+    // arbitrarily chosen physical copy per globalId.
+    const auto old_groups = db.query(lattice_db::build_query_rows_sql(
+        "Item", "deletedAt IS NULL", std::nullopt, std::nullopt, std::nullopt, "topic", "globalId"));
+    ASSERT_EQ(old_groups.size(), rows.size());
+    for (const auto& group : old_groups) {
+        const auto key = std::get<std::string>(group.at("topic"));
+        const auto old_count = db.query(lattice_db::build_count_sql(
+            "Item", "deletedAt IS NULL AND topic = ?", std::nullopt, "globalId"), {key});
+        auto found = std::find_if(rows.begin(), rows.end(), [&](const auto& row) {
+            return std::get<std::string>(row.at("key")) == key;
+        });
+        ASSERT_NE(found, rows.end());
+        EXPECT_EQ(std::get<int64_t>(found->at("cnt")), std::get<int64_t>(old_count[0].at("cnt")));
+    }
+}
+
+TEST(GroupedCounts, ConflictOnlyRepresentativeIsUnspecifiedWithOrWithoutCoveringIndex) {
+    database db(":memory:");
+    db.execute("CREATE TABLE Item(id INTEGER PRIMARY KEY,globalId TEXT,topic TEXT)");
+    db.execute("INSERT INTO Item VALUES(1,'shared','a'),(2,'shared','b')");
+    for (int variant = 0; variant < 2; ++variant) {
+        if (variant == 1) db.execute("CREATE INDEX covering ON Item(globalId,topic DESC)");
+        const auto rows = db.query(lattice_db::build_grouped_counts_sql(
+            "Item", "topic", std::nullopt, "globalId"));
+        ASSERT_EQ(rows.size(), 1u);
+        const auto key = std::get<std::string>(rows[0].at("key"));
+        EXPECT_TRUE(key == "a" || key == "b");
+        EXPECT_EQ(std::get<int64_t>(rows[0].at("cnt")), 1);
+        const auto old_groups = db.query(lattice_db::build_query_rows_sql(
+            "Item", std::nullopt, std::nullopt, std::nullopt, std::nullopt, "topic", "globalId"));
+        EXPECT_EQ(old_groups.size(), 1u);
+        // Both APIs promise one representative, not which physical copy a
+        // bare-column GROUP BY picks under a different query plan.
+    }
+}
 
 TEST(DatabaseText, BindingPreservesBytesAgainstRawSQLiteOracle) {
     database db(":memory:");

@@ -3199,6 +3199,49 @@ public:
         return sql;
     }
 
+    /// Scalar counterpart of group(...), followed by a count per group.
+    /// With distinct_by, keys come from the deduplicated representatives,
+    /// but each count includes all filtered copies with that key. This is
+    /// intentionally NOT a partition of the representatives: conflicting
+    /// copies may contribute to more than one emitted group's count. As in
+    /// group(...), conflicting representatives are unspecified and can change
+    /// with the query plan; exact representative equality is not promised.
+    /// The shared CTE carries only the key and distinct column, never payloads.
+    static std::string build_grouped_counts_sql(
+        const std::string& table_name, const std::string& group_by,
+        const std::optional<std::string>& where_clause = std::nullopt,
+        const std::optional<std::string>& distinct_by = std::nullopt) {
+        auto quoted = [](const std::string& name) {
+            std::string result = "\"";
+            for (char c : name) { result += c; if (c == '"') result += '"'; }
+            return result + "\"";
+        };
+        const auto key = quoted(group_by);
+        const auto table = quoted(table_name);
+        const auto filter = where_clause && !where_clause->empty()
+            ? " WHERE " + *where_clause : "";
+        if (!distinct_by || distinct_by->empty()) {
+            return "SELECT " + key + " AS key, COUNT(*) AS cnt FROM " + table
+                + filter + " GROUP BY " + key;
+        }
+        return "WITH filtered AS MATERIALIZED (SELECT " + key
+            + " AS group_key, " + quoted(*distinct_by) + " AS distinct_key FROM "
+            + table + filter + "), representatives AS (SELECT group_key FROM filtered"
+              " GROUP BY distinct_key) SELECT group_key AS key,"
+              " COUNT(DISTINCT distinct_key) AS cnt FROM filtered"
+              " WHERE group_key IN (SELECT group_key FROM representatives)"
+              " GROUP BY group_key";
+    }
+
+    std::vector<database::row_t> grouped_counts(
+        const std::string& table_name, const std::string& group_by,
+        const std::optional<std::string>& where_clause = std::nullopt,
+        const std::optional<std::string>& distinct_by = std::nullopt,
+        const std::vector<column_value_t>& params = {}) {
+        return query_read(build_grouped_counts_sql(table_name, group_by,
+                                                   where_clause, distinct_by), params);
+    }
+
     size_t count(const std::string& table_name,
                  std::optional<std::string> where_clause = std::nullopt,
                  std::optional<std::string> group_by = std::nullopt,

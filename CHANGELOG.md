@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.2.0] - 2026-10-18
+
+### Added
+- Add a scalar grouped-count query and Swift bridge result containing only a
+  string key and count. Bound predicates and the existing read connection are
+  preserved; complete model bodies and vectors are not hydrated.
+- Preserve independent per-key distinct counts across filtered copies. Counts
+  may overlap when the same distinct identity has conflicting keys. As with
+  existing grouped queries, the selected representative for conflicting
+  copies is unspecified and can vary with the query plan.
+
+### Compatibility
+- This release adds a compatible Core and Swift bridge API. Rebuild Core and
+  generated C++/Swift bridge consumers together. Persistent schema, sync wire
+  format and public C ABI signatures are unchanged.
+- The aggregation change removes per-key query amplification for adopting
+  consumers; it does not claim a measured end-to-end latency improvement.
+
 ## [2.1.0] - 2026-10-17
 
 ### Added

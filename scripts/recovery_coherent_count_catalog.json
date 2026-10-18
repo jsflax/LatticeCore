@@ -2,8 +2,8 @@
   "schema": 1,
   "sourceOnly": true,
   "runtimeQualified": false,
-  "oldSha": "a37345d7a8f0e0a5e8f4359b62575cfe0197dde7",
-  "oldTree": "c76599fb8ca348305342a97b60bae2cfddcd8426",
+  "oldSha": "f0c1eef8a857bb01d398378d177f6ed5ea72fcef",
+  "oldTree": "c8b96d9c8bdaa47f63a4bbf9348c9328e115da7a",
   "helperTarget": "LatticeCountShortcutCurrentHelper",
   "helperMain": {
     "relative": "Tests/LatticeCoreTests/CountShortcutCurrentHelperMain.cpp",

@@ -24,7 +24,7 @@ sys.dont_write_bytecode = True
 from recovery_coherent_supervisor import file_fact, run_stage, write_json
 
 PLAN_SHA256 = '591009115a41796c7970ba117a5300614aed3a680f9e8b31641d83030f94aae4'
-COUNT_CURRENT_CATALOG_SHA256 = '3e08f50a10b20918b08d957784717797c2f0e3bbcec7db85127b15f8f184e2cc'
+COUNT_CURRENT_CATALOG_SHA256 = 'e0ffe557fedc3d5d93a04530ef5618c0e27c150e51ab5f952cdf4c9725c77f4b'
 GIB = 1024**3
 
 
